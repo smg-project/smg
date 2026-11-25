@@ -4013,7 +4013,7 @@ fn a_routed_output_keeps_its_request_id_and_frees_the_step_frame() {
             ..Default::default()
         },
     );
-    let decoded = VllmProtocol::decode_batch(&frames, &()).expect("decode");
+    let decoded = VllmProtocol::decode_batch(&frames, &Default::default()).expect("decode");
     let output = decoded.outputs.into_iter().next().expect("one output");
     assert!(
         lies_within(&frames[0], output.request_id().as_bytes()),

@@ -4,20 +4,25 @@
 //! The engine's inbound messages: the generate request with its multimodal features and sampling
 //! parameters, the utility call, and the request types that tag them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+};
 
+use bytemuck::cast_slice;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeTuple, Deserialize, Serialize, Serializer};
 use serde_default::DefaultFromSerde;
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
     codec::{
-        tensor::{TensorFields, WireArrayData},
+        tensor::{serialize_ext, TensorFields, WireArrayData, CUSTOM_TYPE_RAW_VIEW},
         OpaqueValue,
     },
     protocol::vllm::{
         lora, multimodal::MmFeatures, pooling::PoolingParams, sampling::EngineCoreSamplingParams,
+        VllmLayout,
     },
     Error, Result,
 };
@@ -98,8 +103,9 @@ impl MmFeaturesPayload {
 ///
 /// This is a msgspec `array_like=True` struct: it serializes as a positional
 /// msgpack array of exactly 21 elements. **Field order is the wire contract** —
-/// do not reorder. Mirrors Python `EngineCoreRequest`.
-#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
+/// do not reorder. Mirrors Python `EngineCoreRequest`. The write side names
+/// every field once more (`OnWire`).
+#[derive(Debug, Clone, PartialEq, Deserialize_tuple, DefaultFromSerde)]
 pub struct EngineCoreRequest {
     pub request_id: String,
     pub prompt_token_ids: Option<Vec<u32>>,
@@ -164,6 +170,131 @@ impl EngineCoreRequest {
             });
         }
         Ok(())
+    }
+
+    /// This request as an engine of `layout` reads it.
+    pub(super) fn on_wire(&self, layout: VllmLayout) -> OnWire<'_> {
+        OnWire {
+            request: Cow::Borrowed(self),
+            layout,
+        }
+    }
+}
+
+/// The list form, which every release before 0.34 reads.
+impl Serialize for EngineCoreRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.on_wire(VllmLayout::TokenList).serialize(serializer)
+    }
+}
+
+/// An add-request as an engine of `layout` reads it: the one writer of the
+/// positional array. The request stays borrowed unless its large tensors
+/// leave for auxiliary frames, which rewrites a copy.
+#[derive(Debug, Clone)]
+pub(super) struct OnWire<'a> {
+    request: Cow<'a, EngineCoreRequest>,
+    layout: VllmLayout,
+}
+
+impl Serialize for OnWire<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // Every field is named: one added to the struct does not compile
+        // until it is written here.
+        let EngineCoreRequest {
+            request_id,
+            prompt_token_ids,
+            mm_features,
+            sampling_params,
+            pooling_params,
+            arrival_time,
+            lora_request,
+            cache_salt,
+            data_parallel_rank,
+            prompt_embeds,
+            prompt_is_token_ids,
+            client_index,
+            current_wave,
+            priority,
+            trace_headers,
+            resumable,
+            external_req_id,
+            reasoning_ended,
+            reasoning_parser_kwargs,
+            abort_immediately,
+            session_id,
+        } = &*self.request;
+        let mut wire = serializer.serialize_tuple(21)?;
+        wire.serialize_element(request_id)?;
+        match (prompt_token_ids, self.layout) {
+            (Some(ids), VllmLayout::TokenArray) => wire.serialize_element(&TokenArray(ids))?,
+            (ids, _) => wire.serialize_element(ids)?,
+        }
+        wire.serialize_element(mm_features)?;
+        wire.serialize_element(sampling_params)?;
+        wire.serialize_element(pooling_params)?;
+        wire.serialize_element(arrival_time)?;
+        wire.serialize_element(lora_request)?;
+        wire.serialize_element(cache_salt)?;
+        wire.serialize_element(data_parallel_rank)?;
+        wire.serialize_element(prompt_embeds)?;
+        wire.serialize_element(prompt_is_token_ids)?;
+        wire.serialize_element(client_index)?;
+        wire.serialize_element(current_wave)?;
+        wire.serialize_element(priority)?;
+        wire.serialize_element(trace_headers)?;
+        wire.serialize_element(resumable)?;
+        wire.serialize_element(external_req_id)?;
+        wire.serialize_element(reasoning_ended)?;
+        wire.serialize_element(reasoning_parser_kwargs)?;
+        wire.serialize_element(abort_immediately)?;
+        wire.serialize_element(session_id)?;
+        wire.end()
+    }
+}
+
+impl TensorFields for OnWire<'_> {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.request.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.request.to_mut().for_each_tensor_mut(visit);
+    }
+}
+
+/// Prompt token ids as 0.34 reads them: an `int32` array in the engine's
+/// `(dtype, shape, data)` form, its bytes inline as a raw view. The engine's
+/// own frontend moves a long array to an auxiliary frame to spare itself a
+/// copy; its decoder reads inline data at any size.
+struct TokenArray<'a>(&'a [u32]);
+
+impl Serialize for TokenArray<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        struct RawView<'a>(&'a [u8]);
+
+        impl Serialize for RawView<'_> {
+            fn serialize<S: Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                serialize_ext(CUSTOM_TYPE_RAW_VIEW, self.0, serializer)
+            }
+        }
+
+        // numpy's spelling of the host's `int32`; a token id is below 2^31,
+        // so the bytes of its `u32` are that `int32`.
+        const INT32: &str = if cfg!(target_endian = "little") {
+            "<i4"
+        } else {
+            ">i4"
+        };
+
+        let mut array = serializer.serialize_tuple(3)?;
+        array.serialize_element(INT32)?;
+        array.serialize_element(&[self.0.len()])?;
+        array.serialize_element(&RawView(cast_slice(self.0)))?;
+        array.end()
     }
 }
 
@@ -255,7 +386,32 @@ mod tests {
                 ..EngineCoreSamplingParams::for_test()
             }),
             arrival_time: 1234.5,
+            lora_request: Some(lora::LoraRequest::new(
+                "adapter".to_string(),
+                11,
+                "/adapters/a".to_string(),
+                true,
+                false,
+            )),
+            cache_salt: Some("salt".to_string()),
+            data_parallel_rank: Some(1),
+            prompt_is_token_ids: Some(vec![true, true, true]),
             client_index: 7,
+            current_wave: 9,
+            trace_headers: Some(BTreeMap::from([(
+                "traceparent".to_string(),
+                "00-ab".to_string(),
+            )])),
+            resumable: true,
+            external_req_id: Some("ext-1".to_string()),
+            reasoning_ended: Some(true),
+            reasoning_parser_kwargs: Some(ReasoningParserKwargs {
+                chat_template_kwargs: HashMap::from([(
+                    "enable_thinking".to_string(),
+                    serde_json::json!(false),
+                )]),
+            }),
+            session_id: Some("sess-1".to_string()),
             ..EngineCoreRequest::default()
         };
 
@@ -271,8 +427,13 @@ mod tests {
         assert_eq!(array[0], Value::from("req-1"));
         assert_eq!(array[2], Value::Nil); // mm_features
         assert_eq!(array[4], Value::Nil); // pooling_params
-        assert_eq!(array[10], Value::Nil); // prompt_is_token_ids
+        assert_eq!(array[10], Value::Array(vec![Value::from(true); 3])); // prompt_is_token_ids
         assert_eq!(array[11], Value::from(7)); // client_index
+
+        // The reader takes its order from the struct, so neighbours of one
+        // type written in each other's place are read back exchanged.
+        let decoded: EngineCoreRequest = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded, request);
     }
 
     /// A pooling request carries typed `pooling_params` at position 4 and no
