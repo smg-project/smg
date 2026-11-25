@@ -11,7 +11,6 @@ use std::{
 use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::RwLock;
 use rustc_hash::FxBuildHasher;
-use tracing::debug;
 
 use super::{
     common::{intern_tenant, MatchResult, TenantId, MATCHED_TENANTS_CAP},
@@ -691,29 +690,43 @@ impl Tree {
             .or_insert(0);
 
         // Descend from the root inserting the whole text.
-        self.insert_from(Arc::clone(&self.root), text, tenant_id, naming);
+        self.insert_from(text, None, tenant_id, naming);
     }
 
-    /// Insert `remaining` for `tenant_id` starting the descent at `start` (treated
-    /// as the parent of the first edge), reusing [`Self::insert_text`]'s node-split
-    /// / tenant-attach / leaf-timestamp logic. The caller owns the root bookkeeping
+    /// Insert `text` for `tenant_id`, reusing [`Self::insert_text`]'s node-split
+    /// / tenant-attach / leaf-timestamp logic. The descent starts at the root,
+    /// or at `resume`: a node the caller matched, given as the edge that
+    /// reaches it (its parent and that edge's char), the node, and the bytes
+    /// of `text` its path covers. The caller owns the root bookkeeping
     /// (`tenant_last_access_time` / `tenant_char_count` entries) and, when resuming
     /// below the root, attaching `tenant_id` to the ancestor nodes on the matched
     /// path (which this method does not touch).
     ///
-    /// [`Self::match_and_insert_with`] resumes below the root only while its
-    /// replay found every recorded edge in place; after a lost edge (an eviction
-    /// detached a path node while the caller chose the tenant) it descends again
-    /// from the root over the whole text, and this method credits only the edges
-    /// it newly attaches, so nothing is counted twice.
+    /// Below the root each step is made under the edge that reaches the node
+    /// it stands on: the edge is confirmed to still name the node and its
+    /// shard read guard is held through the step, as the replay of
+    /// [`Self::match_and_insert_with`] holds it for an attach. An eviction
+    /// detaches a node only while it is empty, under that shard's write lock
+    /// (see `detach_if_empty`), so a node a suffix is spliced under is in the
+    /// tree and stays there. After a lost edge (the node was detached or
+    /// split since the descent reached it) the descent starts again at the
+    /// root over the whole text; this method credits only the edges it newly
+    /// attaches, so nothing is counted twice. The access-time stamp behind the
+    /// loop is written with no edge held.
     fn insert_from(
         &self,
-        start: NodeRef,
-        mut remaining: &str,
+        text: &str,
+        resume: Option<(NodeRef, char, NodeRef, usize)>,
         tenant_id: TenantId,
         naming: Naming,
     ) {
-        let mut prev = start;
+        // The edge that reaches `prev` (none at the root, which never leaves
+        // the tree), the node the next step is made under, and the text
+        // still to insert below it.
+        let (mut above, mut prev, mut remaining) = match resume {
+            Some((parent, key, node, covered)) => (Some((parent, key)), node, &text[covered..]),
+            None => (None, Arc::clone(&self.root), text),
+        };
 
         // Result type to carry state out of the match block
         // This allows the entry guard to be dropped before we update prev
@@ -726,6 +739,19 @@ impl Tree {
         }
 
         while let Some(first_char) = remaining.chars().next() {
+            let edge = above
+                .as_ref()
+                .and_then(|(parent, key)| parent.children.get(key));
+            if above.is_some()
+                && !edge
+                    .as_ref()
+                    .is_some_and(|edge| Arc::ptr_eq(edge.value(), &prev))
+            {
+                drop(edge);
+                (above, prev, remaining) = (None, Arc::clone(&self.root), text);
+                continue;
+            }
+
             // Use entry API for atomic check-and-insert semantics (required for thread safety)
             let step = match prev.children.entry(first_char) {
                 Entry::Vacant(entry) => {
@@ -839,12 +865,11 @@ impl Tree {
                         // Ensure tenant exists at this intermediate node,
                         // counting only on first attach (atomic) so a
                         // concurrent same-tenant attach can't double-credit.
-                        if matched_node.attach_tenant_if_absent(&tenant_id, 0) {
-                            self.add_tenant_chars(
-                                &tenant_id,
-                                matched_node_text_count + NODE_WEIGHT,
-                            );
-                        }
+                        self.attach_counted(
+                            &matched_node,
+                            &tenant_id,
+                            matched_node_text_count + NODE_WEIGHT,
+                        );
 
                         InsertStep::Continue {
                             next_prev: matched_node,
@@ -855,12 +880,14 @@ impl Tree {
             };
 
             // Entry guard is now dropped - safe to update prev
+            drop(edge);
             match step {
                 InsertStep::Done => return, // New leaf created with timestamp, we're done
                 InsertStep::Continue {
                     next_prev,
                     advance_bytes,
                 } => {
+                    above = Some((prev, first_char));
                     prev = next_prev;
                     remaining = &remaining[advance_bytes..];
                 }
@@ -1186,9 +1213,7 @@ impl Tree {
             // match-time count would over-credit a node truncated since.
             // Count only on first attach (atomic).
             let text_guard = node.text.read();
-            if node.attach_tenant_if_absent(&tenant_id, 0) {
-                self.add_tenant_chars(&tenant_id, text_guard.char_count() + NODE_WEIGHT);
-            }
+            self.attach_counted(node, &tenant_id, text_guard.char_count() + NODE_WEIGHT);
             drop(text_guard);
             drop(edge);
         }
@@ -1201,8 +1226,8 @@ impl Tree {
             // splices the suffix under live nodes, so the prompt is cached.
             // One extra descent, in the rare case.
             self.insert_from(
-                Arc::clone(&self.root),
                 text,
+                None,
                 tenant_id,
                 path_hash.map_or(Naming::None, Naming::Newest),
             );
@@ -1222,13 +1247,22 @@ impl Tree {
             // Fall-off: splice only the unmatched suffix below `current`,
             // reusing insert_text's exact loop (handles split-continue + the
             // final-leaf real timestamp). The matched prefix is not re-walked.
-            let fall_off = match current {
-                Some(i) => Arc::clone(&path[i]),
-                None => Arc::clone(&self.root),
-            };
+            // The replay passed `current` unchecked where the tenant stood on
+            // it already, and an eviction may have emptied and detached it
+            // since: the splice confirms the edge that reaches it and holds
+            // it (see `insert_from`).
+            let resume = current.map(|i| {
+                let parent = if i == 0 { &self.root } else { &path[i - 1] };
+                (
+                    Arc::clone(parent),
+                    keys[i],
+                    Arc::clone(&path[i]),
+                    text.len() - remaining.len(),
+                )
+            });
             self.insert_from(
-                fall_off,
-                remaining,
+                text,
+                resume,
                 tenant_id,
                 path_hash.map_or(Naming::None, Naming::Newest),
             );
@@ -1422,11 +1456,6 @@ impl Tree {
             }
         }
 
-        debug!("Before eviction - Used size per tenant:");
-        for entry in &self.tenant_char_count {
-            debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
-        }
-
         // Process eviction until the tree-wide total obeys the budget
         while self.total_char_size() > max_size {
             let Some(Reverse(entry)) = pq.pop() else {
@@ -1498,11 +1527,6 @@ impl Tree {
         // that crossed the node's detach) leaves here, so the map never
         // outgrows the tree's hashed nodes by more than one eviction pass.
         self.hashed.retain(|_, node| node.strong_count() > 0);
-
-        debug!("After eviction - Used size per tenant:");
-        for entry in &self.tenant_char_count {
-            debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
-        }
     }
 
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {
@@ -1565,9 +1589,12 @@ impl Tree {
     /// by another tenant may have handed the tenant's prefix to a node
     /// the walk never saw. A node a split makes in the last pass between
     /// the walk and its child's removal stays the tenant's, counted, until
-    /// its next purge. What can still drift is a count with no node behind
-    /// it: a node attached ahead of the walk whose insert counts behind the
-    /// debit. Such a count stays with the tenant's entry.
+    /// its next purge. An insert counts a node ahead of attaching the tenant
+    /// to it (see `attach_counted`), so that count is written when the purge
+    /// takes the ownership. What can still drift is a count with no node
+    /// behind it where a merge or a restore attached the node ahead of the
+    /// walk and counts behind the debit. Such a count stays with the
+    /// tenant's entry.
     pub fn remove_tenant_all(&self, tenant_id: &TenantId) {
         let expected_chars = self.tenant_char_size(tenant_id);
 
@@ -1673,7 +1700,8 @@ impl Tree {
     /// under the same char after the caller's emptiness check, and the fused
     /// walk's insert replay attaches a tenant to this very node under this
     /// entry's shard read guard once it has confirmed the edge (see
-    /// `match_and_insert_dyn`). Removing the key unconditionally would drop that
+    /// `match_and_insert_dyn`), as an insert splices a suffix below this node
+    /// (see `insert_from`). Removing the key unconditionally would drop that
     /// live replacement, or a node whose tenant was just credited for it, with
     /// every descendant it owns: the index silently shrinks or the credit leaks.
     /// `remove_if` evaluates the predicate under the shard lock, so the checks
@@ -1793,6 +1821,35 @@ impl Tree {
             .and_modify(|count| *count += chars)
             .or_insert(chars);
         self.total_char_count.fetch_add(chars, Ordering::Relaxed);
+    }
+
+    /// Attach `tenant_id` to `node` where it does not stand there yet, and
+    /// count `size` for it. The count is written ahead of the ownership and
+    /// taken back where another insert attached the tenant first: a removal
+    /// that takes the ownership finds its count written, so the debit is
+    /// whole and no count is left with no node behind it.
+    fn attach_counted(&self, node: &NodeRef, tenant_id: &TenantId, size: usize) {
+        if node
+            .tenant_last_access_time
+            .contains_key(tenant_id.as_ref())
+        {
+            return;
+        }
+        self.add_tenant_chars(tenant_id, size);
+        if !node.attach_tenant_if_absent(tenant_id, 0) {
+            self.sub_tenant_chars(tenant_id, size);
+            // A removal of the tenant that ran since the count was written
+            // took it off the root and found the row above zero, so the row
+            // leaves at zero, as it does behind a removal. An eviction never
+            // takes the root and keeps a zero row: the tenant stays registered.
+            if !self
+                .root
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+            {
+                self.drop_count_at_zero(tenant_id);
+            }
+        }
     }
 
     /// Subtract evicted `chars` from a tenant's count and the tree-wide

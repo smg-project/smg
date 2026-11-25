@@ -319,8 +319,8 @@ impl Placement<'static> {
         if !pair {
             if !told {
                 // One expression, so that a build can write the side where
-                // it is returned. Behind the two arms of `new` it copies
-                // the placement at each step on the way.
+                // it is returned. Handed through a call, the placement is
+                // copied at each step on the way.
                 let whole = PlacementSide {
                     side: Side::Single,
                     profile,
@@ -328,7 +328,7 @@ impl Placement<'static> {
                 };
                 return (whole, None);
             }
-            let whole = PlacementSide::new(Side::Single, profile, Of::Whole(self), told);
+            let whole = PlacementSide::told(Side::Single, profile, Of::Whole(self));
             return (whole, None);
         }
         let decode_profile = self.decode_profile.unwrap_or(profile);
@@ -336,35 +336,47 @@ impl Placement<'static> {
             placement: self,
             held_end: None,
         }));
-        let shared = Of::Shared(Arc::clone(&pair));
-        let prefill = PlacementSide::new(Side::Prefill, profile, shared, told);
-        let decode = PlacementSide::new(Side::Decode, decode_profile, Of::Shared(pair), told);
+        let shared = Arc::clone(&pair);
+        if !told {
+            // As a single request's side above: each side is written where
+            // the pair is returned. Handed through a call, a side is copied
+            // whole on the way: one shared pointer in a placement's room.
+            return (
+                PlacementSide {
+                    side: Side::Prefill,
+                    profile,
+                    kept: Kept::Own(Of::Shared(shared)),
+                },
+                Some(PlacementSide {
+                    side: Side::Decode,
+                    profile: decode_profile,
+                    kept: Kept::Own(Of::Shared(pair)),
+                }),
+            );
+        }
+        let prefill = PlacementSide::told(Side::Prefill, profile, Of::Shared(shared));
+        let decode = PlacementSide::told(Side::Decode, decode_profile, Of::Shared(pair));
         (prefill, Some(decode))
     }
 }
 
 impl PlacementSide {
-    /// `side` of the placement `of`, shared with the handles on its end
-    /// where a report through one is `told` to a stage.
+    /// `side` of the placement `of`, shared with the handles on its end: a
+    /// side under a document one of whose stages takes an end.
     ///
-    /// A single request's side kept by itself is built in
-    /// [`Placement::sides`] directly, so its placement is not moved
-    /// through here.
-    fn new(side: Side, profile: &'static str, of: Of, told: bool) -> Self {
-        let kept = if told {
-            Kept::Told(Arc::new(Mutex::new(Told {
-                side,
-                of,
-                reported: None,
-                dropped: None,
-            })))
-        } else {
-            Kept::Own(of)
-        };
+    /// A side kept by itself is built in [`Placement::sides`] directly, so
+    /// that neither a placement nor a side is moved through here.
+    fn told(side: Side, profile: &'static str, of: Of) -> Self {
+        let handles = Arc::new(Mutex::new(Told {
+            side,
+            of,
+            reported: None,
+            dropped: None,
+        }));
         Self {
             side,
             profile,
-            kept,
+            kept: Kept::Told(handles),
         }
     }
 
@@ -1337,6 +1349,14 @@ mod tests {
 
         let host = Host::of_singles();
         assert_eq!(host.single().profile(), "round_robin");
+    }
+
+    /// A side that keeps its placement by itself answers the same labels:
+    /// the case above, run under a document none of whose stages takes an
+    /// end.
+    #[test]
+    fn a_sides_label_stands_where_no_stage_takes_an_end() {
+        without_an_end(a_side_answers_the_label_of_the_profile_that_picked_it);
     }
 
     /// A pair's placement whose host took the decode worker out stops a

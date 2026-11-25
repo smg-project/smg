@@ -1567,6 +1567,7 @@ mod tests {
     async fn a_served_controller_decides_under_its_next_term_past_a_terms_mark() {
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
         let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let workers = controller.workers();
         let (stop, stopped) = oneshot::channel::<()>();
         let serve = controller.serve(async {
             let _ = stopped.await;
@@ -1577,7 +1578,7 @@ mod tests {
                 assert!(begun.elapsed() < wait, "no first take");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            bed::fleet(&store);
+            bed::fleet(&store, &workers);
             let applied = store.apply(bed::preset("random", 1));
             applied.expect("above the unbound start");
             store.spend_ids(u32::MAX - TERM_MARK + 4);
@@ -1620,10 +1621,7 @@ mod tests {
                 assert!(begun.elapsed() < wait, "no first take");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            let (singles, sides) = bed::fleet(&store);
-            // The fleet is written through the store's own entries: the
-            // case follows the store itself, as no task does.
-            workers.follow(&*store);
+            let (singles, sides) = bed::fleet(&store, &workers);
             let applied = store.apply(bed::preset("cache_aware", 1));
             applied.expect("above the unbound start");
             let records = || store.deciding(|world| world.front().affinity().held());

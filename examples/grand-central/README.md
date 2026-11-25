@@ -113,7 +113,7 @@ profiles:
 `Pack` takes a weight from the document and nothing else:
 `- pack: { weight: 2 }`. A bare name weighs one. A scorer with settings of
 its own registers with `scorer_with` and reads them from the document as
-typed parameters: the crate's README shows one. The command line is the
+typed parameters: the crate's [reference](../../crates/grand_central/REFERENCE.md#register-a-rust-stage) shows one. The command line is the
 crate's, and it refuses a flag it does not know.
 
 The stock `not-overloaded` filter is where `pack` stops filling a worker. It

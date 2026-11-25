@@ -57,7 +57,7 @@ use crate::{
         grpc::{
             backend_client::{BackendConnector, Fronting},
             multimodal::MultimodalConfigRegistry,
-            regular::symphony::{check_names, named_table},
+            regular::symphony::{check_names, named_table, names_template},
             utils::{Names, ALIASES},
         },
     },
@@ -577,17 +577,19 @@ impl AppContextBuilder {
             );
             return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
+        // `hf` names no table either, but selects the response template's, so it is not warned
+        // of here.
         if router_config.parser == ParserChoice::Symphony
             && names.tool.is_some()
             && named_table(&names).is_none()
+            && !names_template(&names)
         {
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
                 "The configured tool-call parser name selects no Symphony table, so under \
-                 --parser symphony every model the registry does not know is read by the legacy \
-                 parsers (the registry's table reads the models it knows, a worker's own labels \
-                 aside); a table's name, a legacy name that reads a table's format (qwen, \
+                 --parser symphony every model, the registry's included, is read by the legacy \
+                 parsers (a worker's own labels aside); a table's name, a legacy name that reads a table's format (qwen, \
                  qwen_xml, ...), a launcher's name for a family whose table has no older \
                  parser (muse), or an engine's exact name for a table (llama4_pythonic), reads \
                  those models with that table"
@@ -1075,7 +1077,7 @@ impl AppContextBuilder {
     /// answered, with its checked form. It is the last step of the start,
     /// so the engine is handed where this process keeps its workers' data,
     /// each once: the worker registry, the load monitor's channel, and the
-    /// cache-event monitor with the token trees the engine is lent
+    /// cache-event monitor with the trees the engine is lent
     /// ([`Self::engine_caches`]).
     fn with_engine(self, policy: Option<(PolicySpec, AppliedSpec)>) -> Result<Self, String> {
         let Some((document, spec)) = policy else {
@@ -1110,7 +1112,7 @@ impl AppContextBuilder {
 
     /// What the engine is handed of this process's caches, as one object
     /// ([`EngineCaches`]): `events`, the cache-event monitor where the
-    /// process keeps one, and the token trees the engine is lent.
+    /// process keeps one, and the trees the engine is lent.
     ///
     /// With the engine on no classic policy object is built, so no policy
     /// keeps the trees of the prompts this process sent. The start asks the
@@ -1171,7 +1173,7 @@ impl AppContextBuilder {
     /// configuration that leaves Grand Central off starts nothing.
     /// The engine is handed the test's worker registry and its load
     /// monitor's channel. Such a context keeps no cache-event monitor, so
-    /// the engine is handed none, and the token trees it is lent where its
+    /// the engine is handed none, and the trees it is lent where its
     /// document reads them (`engine_caches`).
     #[cfg(any(test, feature = "test-util"))]
     pub fn start_engine_by_hand(
@@ -1199,7 +1201,7 @@ impl AppContextBuilder {
     /// them for a test. The engine is handed the bench's worker registry and
     /// `loads`, the channel of the load feed the bench publishes where a
     /// monitor would. A bench keeps no cache-event monitor, so the engine is
-    /// handed none, and the token trees it is lent where its document reads
+    /// handed none, and the trees it is lent where its document reads
     /// them (`engine_caches`). A configuration that leaves Grand
     /// Central off starts nothing.
     #[cfg(any(test, feature = "test-util"))]

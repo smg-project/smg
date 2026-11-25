@@ -908,7 +908,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        store::{MemoryStore, Signals, WorkerFacts, WorkersStore},
+        store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkersStore},
         worker_host::Members,
     };
 
@@ -995,8 +995,19 @@ mod tests {
                 Objects::new(Arc::new(WorkerRegistry::new()))
                     .with_kv_tables(Arc::clone(&self.tables)),
             );
-            objects.follow(self.store.as_ref());
+            laid(&objects, &self.store);
             KvHost::new(objects)
+        }
+    }
+
+    /// Have `objects` lay the rows `store` holds already. Each row is
+    /// written again through the holder: the store refuses a write over a
+    /// row it holds, and the holder lays the record that stands there.
+    fn laid(objects: &Objects<Members>, store: &MemoryStore) {
+        let (_, rows) = store.all_rows();
+        for row in rows {
+            let written = objects.upsert(store, row.facts, Registrant::Control);
+            assert_eq!(written, None, "the row stood in the store already");
         }
     }
 
@@ -2303,7 +2314,7 @@ mod tests {
         let old = registry.get_by_url(URL).expect("the worker's object");
         // The row's facts move, so the holder lays another object in the
         // place of the first.
-        f.store.upsert(WorkerFacts {
+        let moved = WorkerFacts {
             key: URL.into(),
             engine: URL.into(),
             incarnation: 1,
@@ -2316,8 +2327,9 @@ mod tests {
                 ..Signals::default()
             },
             ..WorkerFacts::default()
-        });
-        host.objects.follow(f.store.as_ref());
+        };
+        let written = host.objects.upsert(&f.store, moved, Registrant::Control);
+        assert!(written.is_some(), "the store takes the write");
         let new = registry.get_by_url(URL).expect("the row's new object");
         assert!(!Arc::ptr_eq(&old, &new));
         assert_eq!(host.enroll(&old, MODEL), Err(SkipReason::NoRow));
@@ -2352,7 +2364,7 @@ mod tests {
     fn a_host_over_a_holder_handed_no_tables_indexes_nothing() {
         let f = Fixture::single(Some(BLOCK_SIZE));
         let objects = Arc::new(Objects::new(Arc::new(WorkerRegistry::new())));
-        objects.follow(f.store.as_ref());
+        laid(&objects, &f.store);
         assert!(objects.kv_tables().is_none());
         let host: KvHost<Members> = KvHost::new(objects);
         let worker = host
@@ -2738,8 +2750,8 @@ mod tests {
         }
     }
 
-    /// An engine of three ranks: its rank 0 row, the host that follows the
-    /// store, and the feed the host opened for that row.
+    /// An engine of three ranks: its rank 0 row, the host whose holder
+    /// writes the store, and the feed the host opened for that row.
     struct Ranked {
         store: Arc<MemoryStore>,
         /// The tables the holder was handed: it makes each row's lane.
@@ -2753,12 +2765,12 @@ mod tests {
         /// Rank 0's row alone: rank 1's is laid by [`Self::upper`].
         fn new() -> Self {
             let store = Arc::new(MemoryStore::new());
-            let lower = store.upsert(rank_facts(URL, URL, 0)).id();
             let tables = Arc::new(KvTables::default());
             let objects = Arc::new(
                 Objects::new(Arc::new(WorkerRegistry::new())).with_kv_tables(Arc::clone(&tables)),
             );
-            objects.follow(store.as_ref());
+            let lower = objects.upsert(&store, rank_facts(URL, URL, 0), Registrant::Control);
+            let lower = lower.expect("the store takes the write").id();
             let host = KvHost::new(objects);
             let worker = host
                 .objects
@@ -2778,18 +2790,22 @@ mod tests {
             }
         }
 
+        /// Write the row `facts` state through the host's holder: its id.
+        fn write(&self, facts: WorkerFacts) -> WorkerId {
+            let objects = &self.host.objects;
+            let written = objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write").id()
+        }
+
         /// Rank 1's row, laid where it is not yet.
         fn upper(&self) -> WorkerId {
-            let upper = self.store.upsert(rank_facts(UPPER, URL, 1)).id();
-            self.host.objects.follow(self.store.as_ref());
-            upper
+            self.write(rank_facts(UPPER, URL, 1))
         }
 
         /// The rank 0 row of another engine at `key`, laid, with its feed
         /// opened by the host.
         fn other(&self, key: &str) -> WorkerId {
-            let row = self.store.upsert(rank_facts(key, key, 0)).id();
-            self.host.objects.follow(self.store.as_ref());
+            let row = self.write(rank_facts(key, key, 0));
             let worker = self
                 .host
                 .objects
@@ -2978,9 +2994,8 @@ mod tests {
         // The same registration names the other engine now: the row keeps
         // its id, and the first engine has no row of rank 1.
         let other = f.other(OTHER);
-        let moved = f.store.upsert(rank_facts(UPPER, OTHER, 1)).id();
+        let moved = f.write(rank_facts(UPPER, OTHER, 1));
         assert_eq!(moved, upper);
-        f.host.objects.follow(f.store.as_ref());
         assert_eq!(f.admit(1, 6, store(2)), BatchOutcome::Skipped);
 
         // The other engine's stream takes the row, below its old cursor.
@@ -3007,8 +3022,7 @@ mod tests {
     fn a_feeds_row_that_becomes_another_engines_rank_leaves_its_own_stream() {
         let f = Ranked::new();
         let own = f.other(OTHER);
-        let third = f.store.upsert(rank_facts(THIRD, URL, 2)).id();
-        f.host.objects.follow(f.store.as_ref());
+        let third = f.write(rank_facts(THIRD, URL, 2));
         let store = |hash| Data::Stored(wide_store(hash, 16));
         // One batch on the row's own stream.
         let late = |rank, sequence, hash| {
@@ -3023,9 +3037,8 @@ mod tests {
         // The same registration states rank 1 of the first engine now. A
         // late batch of the row's own stream reaches no row of that engine,
         // before its stream takes the row and after.
-        let moved = f.store.upsert(rank_facts(OTHER, URL, 1)).id();
+        let moved = f.write(rank_facts(OTHER, URL, 1));
         assert_eq!(moved, own);
-        f.host.objects.follow(f.store.as_ref());
         assert_eq!(late(2, 4, 7), BatchOutcome::Skipped);
         assert_eq!(f.admit(1, 2, store(2)), BatchOutcome::Applied);
         assert_eq!(f.tables.indexed_blocks(own, 1), 1);
@@ -3036,10 +3049,9 @@ mod tests {
         // Its facts state rank 0 of its first engine again and no feed was
         // opened for that: the row is still the other stream's, so its old
         // stream writes no rank of its first engine either.
-        let fourth = f.store.upsert(rank_facts(FOURTH, OTHER, 1)).id();
-        let back = f.store.upsert(rank_facts(OTHER, OTHER, 0)).id();
+        let fourth = f.write(rank_facts(FOURTH, OTHER, 1));
+        let back = f.write(rank_facts(OTHER, OTHER, 0));
         assert_eq!(back, own);
-        f.host.objects.follow(f.store.as_ref());
         assert_eq!(late(1, 1, 4), BatchOutcome::Skipped);
         assert_eq!(f.tables.indexed_blocks(fourth, 1), 0);
 
@@ -3055,8 +3067,7 @@ mod tests {
     #[test]
     fn a_ticket_from_before_the_row_was_laid_again_opens_nothing() {
         let f = Ranked::new();
-        let row = f.store.upsert(rank_facts(OTHER, OTHER, 0)).id();
-        f.host.objects.follow(f.store.as_ref());
+        let row = f.write(rank_facts(OTHER, OTHER, 0));
         let worker = f
             .host
             .objects
@@ -3068,9 +3079,8 @@ mod tests {
 
         // Between the enrollment and the open the row becomes the first
         // engine's rank 1, and that engine's stream writes it.
-        let moved = f.store.upsert(rank_facts(OTHER, URL, 1)).id();
+        let moved = f.write(rank_facts(OTHER, URL, 1));
         assert_eq!(moved, row);
-        f.host.objects.follow(f.store.as_ref());
         let store = Data::Stored(wide_store(1, 16));
         assert_eq!(f.admit(1, 2, store), BatchOutcome::Applied);
         assert_eq!(f.tables.indexed_blocks(row, 1), 1);
@@ -3090,9 +3100,8 @@ mod tests {
         let store = |hash| Data::Stored(wide_store(hash, 16));
         assert_eq!(f.admit(1, 5, store(1)), BatchOutcome::Applied);
         let other = f.other(OTHER);
-        let moved = f.store.upsert(rank_facts(UPPER, OTHER, 1)).id();
+        let moved = f.write(rank_facts(UPPER, OTHER, 1));
         assert_eq!(moved, upper);
-        f.host.objects.follow(f.store.as_ref());
         // One batch of rank 1 on the other engine's stream.
         let late = |sequence, hash| {
             let one = batch([store(hash)]);

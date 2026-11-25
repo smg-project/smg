@@ -28,6 +28,17 @@ ignore = [
     # when the backend changes. Review by 2027-01-15.
     "RUSTSEC-2026-0387",
 
+    # RUSTSEC-2026-0600: kube-client 3.1, whose `openssl-tls` connector trusts OpenSSL's default CA
+    # store beside the cluster CA a kubeconfig names; fixed in 4.2.1 and in 5.2.0. The advisory
+    # covers that connector alone: the `rustls-tls` connector trusts only the configured CA. Every
+    # manifest that pulls the client builds it on rustls: model_gateway and crates/service_discovery
+    # take kube's default features and crates/grand_central names them (`client`, `rustls-tls`,
+    # `ring`), so `openssl-tls` is off under every feature set of the workspace, and Cargo.lock
+    # holds no hyper-openssl, which that feature requires. The entry must go before any manifest
+    # turns `openssl-tls` on, and goes with the move to a fixed kube release and the k8s-openapi
+    # release it requires. Review by 2027-01-15.
+    "RUSTSEC-2026-0600",
+
     # Warning-level advisories: unmaintained crates without a release that drops them. cargo-audit
     # reports them as warnings (the job stays green); they are listed so that a new warning stands
     # out in the job's output and each one carries its exit and a review date.

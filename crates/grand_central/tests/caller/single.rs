@@ -34,7 +34,9 @@ use smg_worker::{
 use tokio::{task::JoinHandle, time::sleep};
 
 use crate::{
-    program::{settings, Answer, Asked, InFlight, Program, Stated, ATTEMPTS},
+    program::{
+        settings, Answer, Asked, InFlight, Program, Stated, ATTEMPTS, OWN_ANSWER, UNANSWERED,
+    },
     served, started, under, url, worker, workers, MODEL,
 };
 
@@ -43,6 +45,7 @@ const PLAIN: Asked<'static> = Asked {
     model: MODEL,
     headers: None,
     items: &[],
+    tokens: None,
 };
 
 /// A first attempt of [`PLAIN`], placed for a case that keeps the attempt
@@ -66,7 +69,7 @@ fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeMap<&'a str,
 ///
 /// The classic router rotates the list it is given the same way: its case
 /// `a_pinned_wire_under_round_robin_rotates_the_workers_on_it`
-/// (`model_gateway/src/routers/common/placement.rs:5604-5632`).
+/// (`model_gateway/src/routers/common/placement.rs:5713-5741`).
 #[test]
 fn plain_requests_take_each_worker_in_turn() {
     let fleet = workers(3);
@@ -79,13 +82,33 @@ fn plain_requests_take_each_worker_in_turn() {
     assert_eq!(times.into_values().collect::<Vec<_>>(), [3, 3, 3]);
 }
 
+/// A program whose route sends a pair in turn sends a single request once,
+/// as a program that sends at once does: the route's word is of a pair's
+/// decode, and a single request has none. Nine requests over three workers,
+/// three each, one send a request.
+///
+/// The gateway's sequential dispatch is of a pair's two sides
+/// (`model_gateway/src/routers/grpc/sequential_pd.rs:1-8`).
+#[test]
+fn a_single_request_of_a_program_in_turn_is_sent_once() {
+    let fleet = workers(3);
+    let (program, _loads, _task) = under(PolicySettings::RoundRobin, &fleet, served);
+    let program = program.in_turn();
+    let answers: Vec<Answer> = (0..9).map(|_| program.serve(&PLAIN)).collect();
+    for answer in &answers {
+        assert_eq!((answer.status, answer.sent.len()), (200, 1), "{answer:?}");
+    }
+    let times = sends(&answers);
+    assert_eq!(times.into_values().collect::<Vec<_>>(), [3, 3, 3]);
+}
+
 /// Callers that ask at the same moment do not pile on one worker: four
 /// callers ask together, a barrier a round, over 256 idle workers, 64
 /// rounds, and every worker takes exactly one request.
 ///
 /// The classic router answers so: its case
 /// `callers_that_pick_at_once_take_each_idle_worker_once`
-/// (`model_gateway/src/routers/common/placement.rs:5857-5894`).
+/// (`model_gateway/src/routers/common/placement.rs:5966-6003`).
 #[test]
 fn callers_that_ask_at_once_take_each_idle_worker_once() {
     const CALLERS: usize = 4;
@@ -125,8 +148,8 @@ fn callers_that_ask_at_once_take_each_idle_worker_once() {
 ///
 /// The classic router lets the workers a request tried step aside while
 /// another is left, and uses the list whole otherwise
-/// (`model_gateway/src/routers/common/placement.rs:1620-1640`, its case
-/// `:5781-5815`).
+/// (`model_gateway/src/routers/common/placement.rs:1728-1748`, its case
+/// `:5890-5924`).
 #[test]
 fn a_retry_names_the_worker_it_tried_and_goes_to_another() {
     let fleet = workers(2);
@@ -161,15 +184,19 @@ fn a_retry_names_the_worker_it_tried_and_goes_to_another() {
 
 /// A send is asked again for the statuses a gateway's retry layer asks
 /// again for, a 408 and a 429 among them, and for no other: a 501 or a 505
-/// is the client's answer after one send.
+/// is the client's answer after one send. A 500 is asked again at a worker
+/// that did not give it: a worker's own answer is its last word on the
+/// request (`caller/rule.rs`), so two workers that both answer it take one
+/// send each.
 ///
 /// The gateway's set is `is_retryable_status`
 /// (`crates/external_router/src/retry.rs:10-19`).
 #[test]
 fn a_send_is_asked_again_for_the_statuses_a_gateway_asks_again_for() {
-    let again = [408, 429, 500, 502, 503, 504].map(|status| (status, ATTEMPTS));
+    let again = [408, 429, 502, 503, 504].map(|status| (status, ATTEMPTS));
+    let own = [(OWN_ANSWER, 2)];
     let once = [400, 404, 501, 505].map(|status| (status, 1));
-    for (status, sends) in again.into_iter().chain(once) {
+    for (status, sends) in again.into_iter().chain(own).chain(once) {
         let fleet = workers(2);
         let (program, _loads, _task) = under(PolicySettings::RoundRobin, &fleet, move |_| status);
         let answer = program.serve(&PLAIN);
@@ -188,8 +215,8 @@ fn a_send_is_asked_again_for_the_statuses_a_gateway_asks_again_for() {
 /// 503.
 ///
 /// The classic router keeps a worker that is available
-/// (`model_gateway/src/routers/common/placement.rs:1600-1603`), and answers a
-/// list with none a 503 with the same hint (`:1641-1644`, `:1746`, `:1767`).
+/// (`model_gateway/src/routers/common/placement.rs:1708-1711`), and answers a
+/// list with none a 503 with the same hint (`:1749-1752`, `:1854`, `:1875`).
 #[test]
 fn a_worker_that_cannot_be_sent_to_takes_no_request() {
     let fleet = workers(4);
@@ -430,10 +457,11 @@ pub(crate) fn taken(heard: &Heard) -> Vec<String> {
 /// and in that order, and the program says the dispatch before the send
 /// goes out; a send answered a server error completes so, and its retry is
 /// a request of its own to the stages. A send answered a client error
-/// completes as one, and a 408 or a 504 as a timeout. A placement dropped
-/// before its send is a release, one dropped behind it an end of class
-/// cancelled, and a placement kept ends on another thread than the one
-/// that placed it.
+/// completes as one, and a 408 or a 504 as a timeout. A send no worker
+/// answered completes as one that reached no worker, under the status the
+/// client reads for it. A placement dropped before its send is a release,
+/// one dropped behind it an end of class cancelled, and a placement kept
+/// ends on another thread than the one that placed it.
 #[tokio::test(start_paused = true)]
 async fn the_engine_hears_each_requests_end() {
     let (program, heard, fails, task) = hearing().await;
@@ -471,11 +499,17 @@ async fn the_engine_hears_each_requests_end() {
     ended.join().expect("the stream's thread ends");
     assert_eq!(taken(&heard), ["issued", "dispatched", "completed 200 Ok"]);
 
-    for (status, class) in [(404, "ClientError"), (408, "Timeout"), (504, "Timeout")] {
+    let ends = [
+        (404, "404 ClientError"),
+        (408, "408 Timeout"),
+        (504, "504 Timeout"),
+        (UNANSWERED, "502 ConnectFailed"),
+    ];
+    for (answered, end) in ends {
         let mut ended = placed(&program);
         ended.sent();
-        ended.ended(Side::Single, status);
-        let completed = format!("completed {status} {class}");
+        ended.ended(Side::Single, answered);
+        let completed = format!("completed {end}");
         assert_eq!(taken(&heard), ["issued", "dispatched", completed.as_str()]);
     }
     task.abort();
@@ -489,7 +523,7 @@ async fn the_engine_hears_each_requests_end() {
 /// address that object states. A leave that finds no worker tells nothing.
 ///
 /// The classic router's registry resolves such an address the same way
-/// (`resolve_url_to_id`, `crates/worker/src/registry.rs:534-560`).
+/// (`resolve_url_to_id`, `crates/worker/src/registry.rs:543-569`).
 #[tokio::test(start_paused = true)]
 async fn a_worker_that_leaves_is_forgotten_under_the_address_it_states() {
     let (program, heard, _fails, task) = hearing().await;

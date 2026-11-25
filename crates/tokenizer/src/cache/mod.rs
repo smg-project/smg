@@ -596,6 +596,10 @@ impl Tokenizer for CachedTokenizer {
         self.inner.eos_token_ids()
     }
 
+    fn max_token_id(&self) -> Option<TokenIdType> {
+        self.inner.max_token_id()
+    }
+
     fn added_token_strings(&self) -> Vec<String> {
         self.inner.added_token_strings()
     }

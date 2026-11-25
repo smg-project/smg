@@ -145,7 +145,11 @@ const NO_STAGE: &str = "none";
 /// It ends in the place picked. It reads no fact of a request, so none is
 /// made ahead of it, and nothing a host is handed of a pick is built here.
 /// Under a document that takes no word on a lease the place is the whole
-/// answer. Under any other the pick is noted ([`noted`]).
+/// answer. Under one whose session table alone takes a word it is the whole
+/// answer where its worker reads ready a second time ([`still_ready`]): the
+/// table has no word for a pick made under a binding that states no rule,
+/// as a whole pass's lease has it ([`issued`]). Any other pick is noted
+/// ([`noted`]).
 pub(super) fn alone(
     own: Loaded<'_, '_>,
     model: &str,
@@ -164,6 +168,24 @@ pub(super) fn alone(
         profile: profile.0,
         generation: own.document.spec.generation(),
     })
+}
+
+/// Whether the worker at the place `pick` names reads ready now
+/// ([`super::place::ready`]): the second read of it, behind the one that
+/// found it eligible, as a noted pick's target has at its walk. Under a
+/// document whose session table alone takes a word on a lease a place is
+/// the whole answer where this holds. A pick whose worker turned not
+/// ready between the two reads is noted ([`noted`]) and takes its lease,
+/// and the walk of its target reads that worker once more.
+///
+/// Out of line: no decision of a document that takes no word runs it.
+#[cold]
+#[inline(never)]
+pub(super) fn still_ready(pick: AlonePick, members: &PoolMembers) -> bool {
+    members
+        .workers()
+        .get(pick.place as usize)
+        .is_some_and(|worker| super::place::ready(worker.as_ref()))
 }
 
 /// The short path's pick under a document that takes a word on a lease,
@@ -761,6 +783,22 @@ pub(crate) mod tests {
         InProcess::new(AppliedSpec::validate(&document).expect("the document validates"))
     }
 
+    /// `document` with a binding ahead of its first that states a sessions
+    /// rule for the models `ruled-*`: the rule of the preset `manual`, its
+    /// keys placed by the binding's own stages. The document's session
+    /// table takes a lease's words, whatever its stages take.
+    pub(crate) fn ruled_ahead(mut document: PolicySpec) -> PolicySpec {
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        document.view.headers.clone_from(&manual.view.headers);
+        let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+        rule.assignment = Assignment::Delegate;
+        let mut ruled = document.bindings[0].clone();
+        ruled.matcher.model = "ruled-*".to_owned();
+        ruled.sessions = Some(rule);
+        document.bindings.insert(0, ruled);
+        document
+    }
+
     pub(crate) fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
         (0..workers)
             .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
@@ -1109,6 +1147,32 @@ pub(crate) mod tests {
         let taken = engine.leases.0.load(Ordering::Relaxed);
         assert_eq!(taken, ID_RUN, "eight ids, one write of the shared word");
         assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+    }
+
+    /// Under a document whose session table alone takes a word on a lease,
+    /// a plain request of a place one pick decides is answered the place,
+    /// as under a document that takes no word: its binding states no rule,
+    /// so the table has no word for its pick. No request is made and no
+    /// lease takes an id.
+    #[test]
+    fn a_place_picked_under_a_table_that_alone_takes_a_word_is_the_whole_answer() {
+        let document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let spec = AppliedSpec::validate(&ruled_ahead(document)).expect("the document validates");
+        let engine = InProcess::new(spec);
+        let hears = engine.in_force().hears.intersects(EventSet::LEASE);
+        let beside = engine.in_force().hears_beside_table;
+        assert!(
+            hears && !beside.intersects(EventSet::LEASE),
+            "the session table alone takes a word"
+        );
+        let list = pool(4);
+        let members = PublishedList::new(Arc::clone(&list));
+        let mut plain = request();
+        plain.facts.session_key = Identity::plain("a-key");
+        let asks = Asks::of(plain, Some(&members));
+        placed(&engine, &asks);
+        assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+        assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
     }
 
     /// A request that is not plain, and a plain one the turn finds no

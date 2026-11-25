@@ -50,15 +50,84 @@ impl OpenDecisions {
     }
 }
 
-/// The decision open on a thread and its budget, in microseconds of the
-/// request's: numbered and seeded by its first open, drawn down by every
-/// call of every plugin and side the decision opens, forgotten by its last
-/// close.
+/// What is left of a decision's budget on its thread, and the budget as
+/// seeded, in microseconds of the request's. The decision's first open
+/// seeds it ([`OpenDecision::open`]), and every call of every plugin and
+/// side the decision opens draws it down here and nowhere else
+/// ([`Budget::draw`]): the remainder only falls, and never below zero.
+#[derive(Debug, Default)]
+pub(crate) struct Budget {
+    remaining_micros: u64,
+    seed_micros: u64,
+}
+
+impl Budget {
+    /// A budget of `micros` that no decision seeded: what a call outside
+    /// every decision runs under (a lifecycle event, a destructor), a bound
+    /// of its own. Its seed is zero. So [`own_bound`] answers yes for every
+    /// call under it, and such a call's frame names no decision: its run-out
+    /// is its plugin's own and is never laid on a decision's budget.
+    #[cfg(feature = "wasm")]
+    pub(crate) fn alone(micros: u32) -> Self {
+        Self {
+            remaining_micros: u64::from(micros),
+            seed_micros: 0,
+        }
+    }
+
+    /// Seeds the budget from the request's: a decision's first open.
+    fn seed(&mut self, micros: u32) {
+        self.remaining_micros = u64::from(micros);
+        self.seed_micros = u64::from(micros);
+    }
+
+    /// Draws `micros` from the remainder, which never falls below zero: the
+    /// one write after the seed.
+    pub(crate) fn draw(&mut self, micros: u64) {
+        self.remaining_micros = self.remaining_micros.saturating_sub(micros);
+    }
+
+    /// Whether nothing is left: an open or a call that asks now gets no
+    /// frame.
+    pub(crate) fn is_spent(&self) -> bool {
+        self.remaining_micros == 0
+    }
+
+    /// What is left.
+    pub(crate) fn remaining_micros(&self) -> u64 {
+        self.remaining_micros
+    }
+
+    /// What is left, in the width a frame and the wire carry it. A budget
+    /// is seeded from a `u32` and only falls, so nothing is cut off.
+    pub(crate) fn remaining_micros_u32(&self) -> u32 {
+        u32::try_from(self.remaining_micros).unwrap_or(u32::MAX)
+    }
+
+    /// What is left, as fuel at `fuel_per_micro`.
+    #[cfg(feature = "wasm")]
+    pub(crate) fn fuel(&self, fuel_per_micro: u64) -> u64 {
+        self.remaining_micros.saturating_mul(fuel_per_micro)
+    }
+
+    /// The budget as seeded: a plugin's own spend reads against it.
+    pub(crate) fn seed_micros(&self) -> u64 {
+        self.seed_micros
+    }
+
+    /// The budget as seeded, in the width a frame carries it.
+    #[cfg(feature = "controller")]
+    pub(crate) fn seed_micros_u32(&self) -> u32 {
+        u32::try_from(self.seed_micros).unwrap_or(u32::MAX)
+    }
+}
+
+/// The decision open on a thread and its budget: numbered and seeded by its
+/// first open, drawn down by every call of every plugin and side the
+/// decision opens, forgotten by its last close.
 #[derive(Debug, Default)]
 pub(crate) struct OpenDecision {
-    pub(crate) remaining_micros: u64,
-    /// The request's budget as seeded: a plugin's own spend reads against it.
-    pub(crate) seed_micros: u64,
+    budget: Budget,
     /// The decision's number on this thread, never zero once one opened: a
     /// plugin keys its part in the decision by it ([`Part`]).
     number: u64,
@@ -73,11 +142,15 @@ impl OpenDecision {
     pub(crate) fn open(&mut self, budget_micros: u32) -> u64 {
         self.opens += 1;
         if self.opens == 1 {
-            self.remaining_micros = u64::from(budget_micros);
-            self.seed_micros = u64::from(budget_micros);
+            self.budget.seed(budget_micros);
             self.number = self.number.wrapping_add(1).max(1);
         }
         self.number
+    }
+
+    /// The decision's budget: the one way to it.
+    pub(crate) fn budget(&mut self) -> &mut Budget {
+        &mut self.budget
     }
 
     /// One close of the decision on this thread: after its last, the next
@@ -226,7 +299,12 @@ impl Part {
 
 #[cfg(test)]
 mod tests {
-    use super::{own_bound, reaches_the_budget, OpenDecisions, Part};
+    use super::{own_bound, reaches_the_budget, Budget, OpenDecisions, Part};
+
+    /// What is left of a budget, and the budget as seeded.
+    fn left_and_seed(budget: &Budget) -> (u64, u64) {
+        (budget.remaining_micros(), budget.seed_micros())
+    }
 
     #[test]
     fn the_first_open_numbers_and_seeds_and_later_opens_draw_the_same_remainder() {
@@ -234,40 +312,85 @@ mod tests {
         let mut decision = open.on_this_thread();
         let first = decision.open(900);
         assert_ne!(first, 0, "a decision's number is never zero");
-        assert_eq!(
-            (decision.remaining_micros, decision.seed_micros),
-            (900, 900)
-        );
-        decision.remaining_micros -= 400;
+        assert_eq!(left_and_seed(decision.budget()), (900, 900));
+        decision.budget().draw(400);
         // The other side of a pair, or another plugin: the same decision,
         // whatever budget its facts carry, and the remainder as drawn.
         assert_eq!(decision.open(700), first);
-        assert_eq!(
-            (decision.remaining_micros, decision.seed_micros),
-            (500, 900)
-        );
+        assert_eq!(left_and_seed(decision.budget()), (500, 900));
         decision.close();
         assert_eq!(decision.open(700), first, "an open is still to close");
         decision.close();
         decision.close();
         let second = decision.open(300);
         assert_ne!(second, first, "the last close ended the decision");
-        assert_eq!(
-            (decision.remaining_micros, decision.seed_micros),
-            (300, 300)
+        assert_eq!(left_and_seed(decision.budget()), (300, 300));
+    }
+
+    /// The remainder only falls, and never below zero: a draw past it
+    /// leaves nothing, and the seed stands.
+    #[test]
+    fn a_draw_past_the_remainder_leaves_nothing() {
+        let open = OpenDecisions::new();
+        let mut decision = open.on_this_thread();
+        decision.open(900);
+        let budget = decision.budget();
+        assert!(!budget.is_spent());
+        budget.draw(899);
+        assert_eq!(left_and_seed(budget), (1, 900));
+        assert_eq!(budget.remaining_micros_u32(), 1);
+        budget.draw(5);
+        assert!(
+            budget.is_spent(),
+            "a draw past the remainder leaves nothing"
         );
+        budget.draw(u64::MAX);
+        assert_eq!(left_and_seed(budget), (0, 900));
+    }
+
+    /// The widest budget a request states is read whole in the width a
+    /// frame carries: nothing is cut off.
+    #[test]
+    fn the_widest_budget_is_read_whole_in_a_frames_width() {
+        let open = OpenDecisions::new();
+        let mut decision = open.on_this_thread();
+        decision.open(u32::MAX);
+        let budget = decision.budget();
+        assert_eq!(
+            left_and_seed(budget),
+            (u64::from(u32::MAX), u64::from(u32::MAX))
+        );
+        assert_eq!(budget.remaining_micros_u32(), u32::MAX);
+        #[cfg(feature = "controller")]
+        assert_eq!(budget.seed_micros_u32(), u32::MAX);
+    }
+
+    /// A budget no decision seeded holds its own bound and a seed of zero,
+    /// so every bound under it is its plugin's own; its remainder as fuel
+    /// saturates.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn a_budget_alone_holds_its_bound_and_a_seed_of_zero() {
+        let mut alone = Budget::alone(250);
+        assert_eq!(left_and_seed(&alone), (250, 0));
+        assert!(own_bound(false, 0, 0, alone.seed_micros()));
+        assert_eq!(alone.fuel(4), 1_000);
+        assert_eq!(alone.fuel(u64::MAX), u64::MAX, "the fuel saturates");
+        alone.draw(250);
+        assert!(alone.is_spent());
+        assert_eq!(alone.fuel(4), 0);
     }
 
     #[test]
     fn each_thread_holds_a_decision_of_its_own() {
         let open = OpenDecisions::new();
         let here = open.on_this_thread().open(900);
-        open.on_this_thread().remaining_micros = 1;
+        open.on_this_thread().budget().draw(899);
         let there = std::thread::scope(|scope| {
             let other = scope.spawn(|| {
                 let mut decision = open.on_this_thread();
                 let number = decision.open(500);
-                (number, decision.remaining_micros)
+                (number, decision.budget().remaining_micros())
             });
             other.join()
         });
@@ -280,7 +403,7 @@ mod tests {
             here,
             "this thread's decision is the one it opened"
         );
-        assert_eq!(open.on_this_thread().remaining_micros, 1);
+        assert_eq!(open.on_this_thread().budget().remaining_micros(), 1);
     }
 
     #[test]

@@ -300,7 +300,7 @@ pub(crate) mod tests {
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
             memory::seam, DecodeSide, GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore,
-            MemoryStore, PickRecord, WorkerFacts, WorkersStore,
+            MemoryStore, PickRecord, Registrant, WorkerFacts, WorkersStore,
         },
         tracking::{
             lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
@@ -333,20 +333,22 @@ pub(crate) mod tests {
         Hand::new(gateway)
     }
 
-    /// A worker the store holds a row for.
+    /// What a worker of the cases states under `key`.
+    fn stated(key: &str) -> WorkerFacts {
+        WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            models: vec!["m".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        }
+    }
+
+    /// A worker the store holds a row for, in a store no holder of worker
+    /// objects stands over.
     pub(crate) fn worker(store: &MemoryStore, key: &str) -> WorkerId {
-        WorkersStore::upsert(
-            store,
-            WorkerFacts {
-                key: key.to_owned(),
-                engine: key.to_owned(),
-                incarnation: 1,
-                models: vec!["m".to_owned()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            },
-        )
-        .id()
+        WorkersStore::upsert(store, stated(key)).id()
     }
 
     pub(crate) fn a_dispatched(lease: u64) -> proto::Dispatched {
@@ -1306,9 +1308,17 @@ pub(crate) mod tests {
     /// new.
     #[test]
     fn a_dispatch_of_an_older_generations_lease_enters_the_standing_generations_sends() {
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         let t0 = Instant::now();
-        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let first = counting(&store, 1);
         issued_on(&store, 1, 1, served, t0);
         let standing = counting_under(&store, 2, Some(60_000));
@@ -1324,9 +1334,17 @@ pub(crate) mod tests {
     /// counted in it once.
     #[test]
     fn an_apply_keeps_the_count_of_an_unchanged_profile_with_its_sends() {
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         let t0 = Instant::now();
-        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let first = counting(&store, 1);
         for id in 1..=2 {
             issued_on(&store, id, 1, served, t0);
@@ -1372,9 +1390,17 @@ pub(crate) mod tests {
     /// only rise. The case files one by hand.
     #[test]
     fn a_lease_above_the_generation_in_force_tells_no_stage_and_its_send_is_counted() {
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         let t0 = Instant::now();
-        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let (count, heard) = counting_and_hearing(&store, 1);
         let mut record = lease(A, 1, t0);
         record.lease.generation = 2;
@@ -1406,9 +1432,24 @@ pub(crate) mod tests {
     #[test]
     fn a_send_said_inside_an_apply_is_read_by_the_count_built_for_its_generation() {
         let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         let t0 = Instant::now();
-        let known = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
-        let fresh = ready(&store, "b", COUNTED, Role::Single, WireModes::HTTP);
+        let known = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
+        let fresh = ready(
+            &store,
+            &objects,
+            "b",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let first = counting(&store, 1);
         for (id, target) in [(1, known), (2, known), (3, fresh)] {
             issued_on(&store, id, 1, target, t0);
@@ -1473,9 +1514,17 @@ pub(crate) mod tests {
     /// the session's pin moved all the same.
     #[test]
     fn a_stage_that_panics_at_a_dispatch_leaves_the_send_counted_and_the_pin_moved() {
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         let t0 = Instant::now();
-        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let mut catalog = StageRegistry::builtin();
         catalog
             .picker("bursts", || Box::new(Bursts))
@@ -1513,12 +1562,25 @@ pub(crate) mod tests {
         let objects = holder(&store);
         tells(&store, &objects);
         let t0 = Instant::now();
-        let left = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
-        let stays = ready(&store, "b", COUNTED, Role::Single, WireModes::HTTP);
+        let left = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
+        let stays = ready(
+            &store,
+            &objects,
+            "b",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let count = counting(&store, 1);
         issued_on(&store, 1, 1, left, t0);
         issued_on(&store, 2, 1, stays, t0);
-        objects.follow(&*store);
         let row = WorkersStore::get(&*store, left).expect("the row");
         let removed = objects.remove(&store, left, row.revision);
         assert!(removed.is_some(), "the row leaves");
@@ -1543,8 +1605,16 @@ pub(crate) mod tests {
         let objects = holder(&store);
         tells(&store, &objects);
         let t0 = Instant::now();
-        let [prefill, stays, left] =
-            ["p", "a", "b"].map(|key| ready(&store, key, COUNTED, Role::Single, WireModes::HTTP));
+        let [prefill, stays, left] = ["p", "a", "b"].map(|key| {
+            ready(
+                &store,
+                &objects,
+                key,
+                COUNTED,
+                Role::Single,
+                WireModes::HTTP,
+            )
+        });
         let first = counting(&store, 1);
         // Two pairs of the first generation, each on a decode of its own.
         for (id, decode) in [(1, stays), (2, left)] {
@@ -1552,7 +1622,6 @@ pub(crate) mod tests {
         }
         let standing = counting_under(&store, 2, Some(60_000));
         assert!(!Arc::ptr_eq(&first, &standing), "a count built new");
-        objects.follow(&*store);
         let row = WorkersStore::get(&*store, left).expect("the row");
         let removed = objects.remove(&store, left, row.revision);
         assert!(removed.is_some(), "the row leaves");
@@ -1582,8 +1651,8 @@ pub(crate) mod tests {
         tells(&store, &objects);
         let t0 = Instant::now();
         let count = counting(&store, 1);
-        let joined = worker(&store, "late");
-        objects.follow(&*store);
+        let written = objects.upsert(&store, stated("late"), Registrant::Control);
+        let joined = written.expect("the store takes the write").id();
         issued_on(&store, 1, 1, joined, t0);
         let listed = store.deciding(|world| world.booked_of(joined).is_some());
         assert!(!listed, "the world lists the worker inside its window");
@@ -1596,9 +1665,17 @@ pub(crate) mod tests {
     /// takes none.
     #[test]
     fn an_apply_hands_the_standing_sends_to_the_generation_it_takes() {
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         let t0 = Instant::now();
-        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let first = counting(&store, 1);
         issued_on(&store, 1, 1, served, t0);
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");

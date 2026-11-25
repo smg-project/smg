@@ -1127,7 +1127,8 @@ impl MockScheduler {
     }
 
     /// The KV-event subscription every wire serves alike (the batches are the
-    /// shared proto's). Realistic mode with prefix caching: the ranks' KV
+    /// shared proto's). Realistic mode with prefix caching, and
+    /// `--grpc-kv-events` left on: the ranks' KV
     /// events on one stream, each batch stamped with its rank and carrying
     /// the load record a servicer attaches for that rank; one record state
     /// over the merged stream, as the Rust relay keeps one per subscription
@@ -1169,7 +1170,7 @@ impl MockScheduler {
             .ranks
             .iter()
             .enumerate()
-            .filter(|(_, rank)| rank.engine.kv_enabled())
+            .filter(|(_, rank)| self.cfg.grpc_kv_events && rank.engine.kv_enabled())
             .map(|(index, rank)| {
                 RankLoadSource::of(rank, self.cfg.grpc_wire, self.load_values(index))
             })
@@ -1178,7 +1179,8 @@ impl MockScheduler {
             // Unimplemented, on which the gateway's KvEventMonitor gives up
             // cleanly instead of keeping an idle per-worker task.
             return Err(Status::unimplemented(
-                "mock-worker (KV events require --engine realistic with --prefix-cache true)",
+                "mock-worker (KV events require --engine realistic with --prefix-cache true \
+                 and --grpc-kv-events true)",
             ));
         }
         if sources.len() > 1 && request.start_sequence_number != 0 {
@@ -3314,6 +3316,63 @@ mod tests {
                 .is_some_and(|rate| rate > 0.0),
             "the poll reports it too: {rank1:?}"
         );
+    }
+
+    /// `--grpc-kv-events false`: the engine keeps its prefix cache, so a
+    /// prompt sent again reads its blocks from it, and the subscription to
+    /// its KV events is refused as by an engine without the call, while the
+    /// load records alone stay served.
+    #[tokio::test]
+    async fn a_worker_without_grpc_kv_events_keeps_its_cache() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                realistic: true,
+                grpc_kv_events: false,
+                engine: engine::EngineParams {
+                    timing: engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            65_143,
+        );
+        let mut cached = Vec::new();
+        for id in ["quiet-1", "quiet-2"] {
+            let mut request = generate_request(id, None, 4);
+            request.tokenized = Some(ts::TokenizedInput {
+                input_ids: (100..180).collect(),
+                ..Default::default()
+            });
+            let mut stream = service
+                .generate(Request::new(request))
+                .await
+                .expect("accepted")
+                .into_inner();
+            while let Some(frame) = stream.next().await {
+                if let Some(ts::generate_response::Response::Complete(complete)) =
+                    frame.expect("a frame").response
+                {
+                    cached.push(complete.cached_tokens);
+                }
+            }
+        }
+        assert_eq!(cached, [0, 64], "the second reads the first's blocks");
+        let subscribe = |loads_only| {
+            service.subscribe_kv_events(Request::new(common::SubscribeKvEventsRequest {
+                start_sequence_number: 0,
+                load_records_before_first_batch: true,
+                loads_only,
+            }))
+        };
+        let refused = subscribe(false).await.err().expect("no KV events");
+        assert_eq!(refused.code(), Code::Unimplemented);
+        let mut records = subscribe(true).await.expect("load records").into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(5), records.next())
+            .await
+            .expect("a record in time")
+            .expect("an item")
+            .expect("a record");
+        assert!(first.load.is_some_and(|load| load.load_only));
     }
 
     /// One subscription carries every rank's stream with one record state,

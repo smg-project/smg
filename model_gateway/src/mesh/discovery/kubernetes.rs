@@ -17,7 +17,6 @@ use kube::{
         watcher::{watcher, Event},
         WatchStreamExt,
     },
-    Client,
 };
 use rustls::crypto::ring;
 use smg_mesh::{
@@ -25,7 +24,7 @@ use smg_mesh::{
     member_transition_line, status_of, ClusterState,
 };
 use smg_service_discovery::{
-    build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string,
+    build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string, watch_client,
 };
 use tokio::task;
 use tracing::{debug, error, info, warn};
@@ -274,39 +273,31 @@ pub async fn start_mesh_discovery(
         ));
     }
 
-    let _ = ring::default_provider().install_default();
-    let client = Client::try_default().await?;
-    Ok(run_mesh_discovery(
-        client,
-        config,
-        cluster_state,
-        default_mesh_port,
-    ))
+    let inferred = kube::Config::infer()
+        .await
+        .map_err(kube::Error::InferConfig)?;
+    start_mesh_discovery_on(inferred, config, cluster_state, default_mesh_port)
 }
 
-/// Run router discovery against an injected client. Compiled only for this
-/// crate's own integration tests, which point it at a scripted API server.
-#[cfg(feature = "test-util")]
-pub fn start_mesh_discovery_with_client(
-    client: Client,
+/// Run router discovery on the client configuration `inferred`, for a config
+/// that names a router selector: the one start of the watch, so nothing runs
+/// it on a client with the client library's defaults. The module exports it
+/// only under `test-util`, for this crate's own integration tests: they hand
+/// it the configuration of a scripted API server, and the watch they start
+/// runs on the client a served gateway's watch runs on.
+pub fn start_mesh_discovery_on(
+    inferred: kube::Config,
     config: MeshDiscoveryConfig,
     cluster_state: ClusterState,
     default_mesh_port: u16,
-) -> task::JoinHandle<()> {
-    assert!(
+) -> Result<task::JoinHandle<()>, kube::Error> {
+    debug_assert!(
         config.is_enabled(),
         "mesh router discovery requires a router selector"
     );
     let _ = ring::default_provider().install_default();
-    run_mesh_discovery(client, config, cluster_state, default_mesh_port)
-}
+    let client = watch_client(inferred)?;
 
-fn run_mesh_discovery(
-    client: Client,
-    config: MeshDiscoveryConfig,
-    cluster_state: ClusterState,
-    default_mesh_port: u16,
-) -> task::JoinHandle<()> {
     info!(
         "Router node discovery enabled | selector: '{}' | mesh port annotation: '{}'",
         config.label_selector(),
@@ -317,7 +308,7 @@ fn run_mesh_discovery(
         clippy::disallowed_methods,
         reason = "router discovery runs for the lifetime of the server; shutdown aborts the handle"
     )]
-    task::spawn(async move {
+    let handle = task::spawn(async move {
         let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
             Api::namespaced(client, namespace)
         } else {
@@ -335,7 +326,9 @@ fn run_mesh_discovery(
         }
 
         error!("K8s router watcher stream ended; router discovery no longer receives updates");
-    })
+    });
+
+    Ok(handle)
 }
 
 #[cfg(test)]

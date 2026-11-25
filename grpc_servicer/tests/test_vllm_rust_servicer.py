@@ -920,6 +920,20 @@ def test_model_info_leaves_the_mooncake_flag_off_without_a_mooncake_connector():
     assert info["runs_mooncake"] is False
 
 
+def test_model_info_reports_the_tail_a_pd_decode_side_computes_itself():
+    """A decode side computes its last prompt token itself after the pull, and
+    the drafter's prefill lookahead where that is longer (vLLM 0.31+'s
+    ``num_prefill_lookahead_tokens``, which NIXL pulls short of); an older
+    config without the property, or one without a drafter, reports the last
+    token alone."""
+    config = _config()
+    assert rust.model_info_from_config(config)["pd_local_tail"] == 1
+    config.num_prefill_lookahead_tokens = 0
+    assert rust.model_info_from_config(config)["pd_local_tail"] == 1
+    config.num_prefill_lookahead_tokens = 3
+    assert rust.model_info_from_config(config)["pd_local_tail"] == 3
+
+
 def test_model_info_projects_a_multi_connector_onto_the_child_that_moves_the_kv():
     """The Rust servicer reports the connector the launcher hands it, so the
     launcher hands it the wrapper's mover: the one P2P child whatever rides

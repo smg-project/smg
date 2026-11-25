@@ -1196,14 +1196,29 @@ impl Loaded<'_, '_> {
                     // No stage takes a word of the request and the
                     // document keeps no sample: the place is the whole
                     // answer.
-                    if !self.document.leases_or_samples {
+                    let document = self.document;
+                    if !document.leases_or_samples {
                         return Ok(Some(pick));
                     }
                     // A document that keeps a sample and takes no word: the
                     // place is the whole answer all the same, counted
                     // toward the thread's next sample behind the pick.
-                    if !self.document.hears.intersects(EventSet::LEASE) {
+                    if !document.hears.intersects(EventSet::LEASE) {
                         sample::place(self, maker, pick, members, clock);
+                        return Ok(Some(pick));
+                    }
+                    // The session table alone takes a word, and it has none
+                    // for the pick, made under a binding that states no
+                    // rule: the place is the whole answer where its worker
+                    // reads ready a second time, as a noted pick's target
+                    // is read at its walk. A worker that turned not ready
+                    // behind the pick is noted.
+                    if !document.hears_beside_table.intersects(EventSet::LEASE)
+                        && single::still_ready(pick, members)
+                    {
+                        if document.samples {
+                            sample::place(self, maker, pick, members, clock);
+                        }
                         return Ok(Some(pick));
                     }
                     picked = Some((pick, members, plain));

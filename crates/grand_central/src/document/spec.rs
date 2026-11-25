@@ -254,12 +254,17 @@ pub struct Needs {
     /// Load reports per worker.
     pub loads: bool,
     /// KV events into an index. A stage that declares this beside
-    /// `token_hashes` reads the request's holders from the index, and a
-    /// host names the index's holders ahead of the record's for its
-    /// profile. A stage that reads the events for another fact of a row,
-    /// as a warm-up does, declares no hashes beside it.
+    /// `token_hashes` reads the request's holders from the index. For its
+    /// profile a host names a single request of token ids by the index
+    /// alone where the model's index holds a block, and every other
+    /// request's holders in the index ahead of the record's. A stage that
+    /// reads the events for another fact of a row, as a warm-up does,
+    /// declares no hashes beside it.
     pub events: bool,
-    /// The stage reads the prefixes sent to each worker.
+    /// The stage reads the prefixes sent to each worker. Beside a stage of
+    /// its profile that reads a request's holders from the index, it is
+    /// named none for a single request of token ids under a model whose
+    /// index holds a block: the index names that request alone.
     #[serde(default)]
     pub sent_prefixes: bool,
     /// A consistent-hash ring per model. A host that keeps one lends it with
@@ -697,7 +702,8 @@ pub enum AffinitySource {
     /// Each worker by what it has: its cache events where it publishes
     /// them, and the prefixes sent to it where it does not. A request
     /// hashed by its text reads the prefixes sent to every worker: cache
-    /// events are token blocks.
+    /// events are token blocks. A single request of token ids under a
+    /// model whose index holds a block is read from the index alone.
     #[default]
     Merged,
 }
@@ -5717,12 +5723,6 @@ pub struct ViewListPositions {
     pub zone: u16,
     /// One bit for each label selector the worker meets.
     pub labels: u64,
-    /// The worker names an engine family, and the list holds entries and
-    /// not that one.
-    pub engine_outside: bool,
-    /// The worker names a zone, and the list holds entries and not that
-    /// one.
-    pub zone_outside: bool,
 }
 
 impl ViewLists {
@@ -5765,20 +5765,16 @@ impl ViewLists {
         zone: Option<&str>,
         labels: &BTreeMap<String, String>,
     ) -> ViewListPositions {
-        let (engine_at, engine_outside) = self.engine(engine);
-        let (zone_at, zone_outside) = self.zone(zone);
         ViewListPositions {
-            engine_kind: engine_at.unwrap_or(0),
-            zone: zone_at.unwrap_or(0),
+            engine_kind: self.engine(engine).0.unwrap_or(0),
+            zone: self.zone(zone).0.unwrap_or(0),
             labels: self.met(labels),
-            engine_outside,
-            zone_outside,
         }
     }
 
     /// Whether a worker's engine family and its zone stand outside these
-    /// lists, the family first: the two bits [`Self::positions`] answers,
-    /// for a reader that keeps nothing else of that read. No label is read.
+    /// lists, the family first: the worker names one, and its list holds
+    /// entries and not that one. No label is read.
     #[must_use]
     pub(crate) fn outside(&self, engine: &str, zone: Option<&str>) -> (bool, bool) {
         (self.engine(engine).1, self.zone(zone).1)
@@ -7603,36 +7599,39 @@ mod tests {
         let held = labels(&[("tier", "gold"), ("note", "a=b")]);
         let gold = lists.positions("beta", Some("west"), &held);
         assert_eq!((gold.engine_kind, gold.zone, gold.labels), (2, 2, 0b111));
-        assert!(!gold.engine_outside && !gold.zone_outside);
+        assert_eq!(lists.outside("beta", Some("west")), (false, false));
         let held = labels(&[("tier", "silver"), ("note", "a")]);
         let silver = lists.positions("alpha", Some("east"), &held);
         assert_eq!(
             (silver.engine_kind, silver.zone, silver.labels),
             (1, 1, 0b001)
         );
+        // Each position is read from its own list: this worker's family
+        // stands second among the families, and its zone first among the
+        // zones.
+        let apart = lists.positions("beta", Some("east"), &labels(&[]));
+        assert_eq!((apart.engine_kind, apart.zone), (2, 1));
         // A bit is the selector's place in the list, whatever the keys'
         // order: two selectors of one key stand apart here.
         let mixed = spec_with_view(r#"{"labels":["z","b=1","m","b","a=2","q=x"]}"#);
         let mixed = AppliedSpec::validate(&mixed).expect("the document validates");
         let held = labels(&[("a", "2"), ("b", "1"), ("c", "9"), ("m", ""), ("q", "y")]);
         assert_eq!(mixed.lists().positions("", None, &held).labels, 0b01_1110);
-        // A name the list does not hold reads 0 and says so. No name reads
-        // 0 and is not outside.
+        // A name the list does not hold reads 0, and the narrow reader says
+        // it stands outside. No name reads 0 and is not outside.
         let stray = lists.positions("gamma", Some("north"), &labels(&[]));
         assert_eq!((stray.engine_kind, stray.zone, stray.labels), (0, 0, 0));
-        assert!(stray.engine_outside && stray.zone_outside);
+        assert_eq!(lists.outside("gamma", Some("north")), (true, true));
         for zone in [None, Some("")] {
             assert_eq!(
                 lists.positions("", zone, &labels(&[])),
                 ViewListPositions::default()
             );
+            assert_eq!(lists.outside("", zone), (false, false));
         }
-        // The narrow reader answers those two bits alone, the family's
-        // first.
-        assert_eq!(lists.outside("beta", Some("west")), (false, false));
+        // The narrow reader answers its two bits apart, the family's first.
         assert_eq!(lists.outside("gamma", Some("west")), (true, false));
         assert_eq!(lists.outside("beta", Some("north")), (false, true));
-        assert_eq!(lists.outside("", Some("")), (false, false));
         // No list: every worker reads 0 and none is outside.
         let none = AppliedSpec::validate(&spec_with_view("{}")).expect("the document validates");
         assert!(none.lists().is_empty() && AppliedSpec::unbound().lists().is_empty());
@@ -9329,17 +9328,21 @@ mod tests {
         assert!(AppliedSpec::unbound()
             .key_sources_for("chat/a", Phase::Single)
             .is_none());
-        // One binding of the three keys by the request's own id, so the
-        // document does. The same document without that source does not,
-        // and neither does one that binds nothing.
+        // The first binding of the three keys by the request's own id, so
+        // the document does. So does one where the second binding does,
+        // behind a sessions rule's. That document less its one source does
+        // not, and neither does one that binds nothing.
         assert!(applied.reads_request_id());
-        let headers_alone = AppliedSpec::validate(&doc(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}},"bindings":[
-                {"match":{"model":"chat/*"},"profile":"p","routing_key":{"sources":[{"header":"x-smg-routing-key"},{"header":"cookie"}]}},
-                {"profile":"p"}]}"#,
-        ))
-        .expect("the document validates");
-        assert!(!headers_alone.reads_request_id());
+        let second = r#"{"apiVersion":"smg.policy/v1","view":{"headers":["x-session-id","x-tenant-session"]},"profiles":{"p":{"pick":"best"}},"bindings":[
+            {"match":{"model":"code/*"},"profile":"p","sessions":{"sticky_header":"x-session-id","headers":["x-tenant-session","x-session-id"]}},
+            {"match":{"model":"chat/*"},"profile":"p","routing_key":{"sources":[{"header":"x-smg-routing-key"},{"rid":true}]}},
+            {"profile":"p"}]}"#;
+        let reads = |text: &str| {
+            let applied = AppliedSpec::validate(&doc(text));
+            applied.expect("the document validates").reads_request_id()
+        };
+        assert!(reads(second));
+        assert!(!reads(&second.replace(r#",{"rid":true}"#, "")));
         assert!(!AppliedSpec::unbound().reads_request_id());
     }
 
