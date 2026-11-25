@@ -83,7 +83,7 @@ use std::{
     time::Instant,
 };
 
-use smg_worker::identity::basic::Worker;
+use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 
 use super::{
     encode::{splits, EncodeLists},
@@ -1408,8 +1408,9 @@ pub enum Unplaced {
     ///
     /// For a single request, for a pair and for an encode request's pair,
     /// a rule that answers each worker one way within a call is not the
-    /// cause: a request whose rule takes no worker of a list is shed under
-    /// the rule's name (`admits`), and one whose rule takes some is
+    /// cause: a request whose rule takes no worker of a list is shed,
+    /// under the rule's name (`admits`) or by its first decision's shed as
+    /// saturated where that stands, and one whose rule takes some is
     /// decided among them. Under a profile that filters by health a list
     /// with no ready worker is shed by that filter. So this answer is left
     /// for a worker that stopped being ready between a decision's read of
@@ -1432,7 +1433,12 @@ pub enum Unplaced {
 /// a worker at the instant of a send. The overload veto and the liveness
 /// veto are the decision's own, and a pick that lifted one stands.
 pub(super) fn ready(worker: &dyn Worker) -> bool {
-    let state = worker.routing_state();
+    ready_by(worker.routing_state())
+}
+
+/// [`ready`] by a state its caller read: one read of a worker says its
+/// vetoes too.
+pub(super) const fn ready_by(state: RoutingState) -> bool {
     state.healthy && state.can_execute
 }
 
@@ -1455,6 +1461,8 @@ const ENCODE_ITEMS: &str = "encode-items";
 
 /// What a request is shed under where its route's rule takes no worker of
 /// its list: the rule's own name on a request ([`PlaceRequest::admits`]).
+/// A pair's first decision's shed as saturated is the answer in its place
+/// where that shed stands ([`pair::again`]).
 const ADMITS: &str = "admits";
 
 /// What a request is shed under where its call's earlier decisions left
@@ -1625,7 +1633,8 @@ pub(super) fn give_up(
 ///
 /// The shed of a request whose rule takes no worker of the list
 /// ([`ShedReason::NoEndpoints`], under `admits`): no further decision is
-/// made.
+/// made. A pair's routine answers its first decision's shed as saturated
+/// in its place, where that shed stands ([`pair::again`]).
 #[cold]
 #[inline(never)]
 fn hold_to_rule(
@@ -1724,14 +1733,6 @@ pub(super) struct Call {
     /// its prefill under every document, as a pair held on both sides
     /// does: a decode asked again would count no number.
     named_decode: Option<u32>,
-    /// Whether the call's last decision shed an encode request as
-    /// saturated over its encoders, by that decision's own word
-    /// ([`EncodePlaced::shed_over_encoders`]). The route's rule is asked
-    /// of no encoder, so such a shed stands and no rule is asked behind
-    /// it ([`encode`]).
-    ///
-    /// [`EncodePlaced::shed_over_encoders`]: crate::engine::framework::EncodePlaced::shed_over_encoders
-    over_encoders: bool,
     /// The instant of the call's first ask, for a request that states a
     /// budget: the budget is counted from it ([`Call::left`]). `None` for
     /// a request that states no budget: no clock is read for its budget.
@@ -1961,13 +1962,24 @@ impl InProcess {
     /// attempt tried is handed again where no other is left. The call's
     /// two later decisions are made among them: three decisions a call.
     /// A request whose rule takes no worker of a list is shed
-    /// with no endpoint, under `admits`. One whose rule takes workers none
-    /// of which is ready, or workers of a pair's two lists no two of which
-    /// pair, is answered by the decision held to them, which names what
-    /// left nobody. An encode request is held so over its pair's two
-    /// lists, with the items it carries or with none: the rule is asked of
-    /// no encoder, and the encoders' list is decided as its caller lent
-    /// it.
+    /// with no endpoint, under `admits`. A pair that states no hard demand,
+    /// and whose host states no places of the prefills or the decodes
+    /// ([`PairLists::prefill_places`](crate::engine::PairLists::prefill_places),
+    /// [`PairLists::decode_places`](crate::engine::PairLists::decode_places)),
+    /// is answered otherwise in two cases, behind a first decision that
+    /// shed it as saturated and said the list it shed over, which a
+    /// decision does under a document that sheds a list wholly over its
+    /// thresholds. That shed is its answer where the rule takes no prefill
+    /// and the decision shed over the prefills. It is its answer too where
+    /// the rule takes a prefill and no decode: where one of its prefills
+    /// can take the request and the decision shed over the decodes, and
+    /// where none can, one is ready and every ready one is over its
+    /// thresholds. One whose rule takes workers none of which is ready, or
+    /// workers of a pair's two lists no two of which pair, is answered by
+    /// the decision held to them, which names what left nobody. An encode
+    /// request is held so over its pair's two lists, with the items it
+    /// carries or with none: the rule is asked of no encoder, and the
+    /// encoders' list is decided as its caller lent it.
     ///
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
@@ -2117,8 +2129,10 @@ impl InProcess {
     /// The overload test is the engine's. The decision leaves out a worker
     /// over its overload thresholds (the `not-overloaded` filter), and the
     /// binding's own rule answers a list whose every worker is over them.
-    /// This call asks it of no worker again, so a caller that asks this
-    /// call for every request keeps no overload test of its own.
+    /// This call asks it of no worker a decision picked again, so a caller
+    /// that asks this call for every request keeps no overload test of its
+    /// own. Behind a pair's saturated shed the call reads the rule's own
+    /// prefills once more, to say which shed is its answer.
     ///
     /// A program that asks this call states no worker id of its own
     /// ([`FixedFacts::id`](crate::engine::FixedFacts::id)): a placement

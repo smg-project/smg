@@ -1,5 +1,6 @@
 //! The cases of a request with an encode request's three lists.
 
+mod rows;
 mod ruled;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};

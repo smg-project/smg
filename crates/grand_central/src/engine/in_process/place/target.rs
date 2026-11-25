@@ -641,9 +641,10 @@ fn held_pair<'a>(
 /// The pair's shed with no endpoint, under [`TARGET_WORKER`]: the
 /// decision's own, where the number reaches no partner of its pick or the
 /// decode it reaches is shed, and the call's, where no pair its asks named
-/// could be sent to. The shed of a request whose rule takes no prefill,
-/// under `admits`. Any other answer of [`super::pair::place`] stands as it
-/// is.
+/// could be sent to. The shed of a request whose rule takes no prefill:
+/// with no endpoint under `admits`, or its first decision's shed as
+/// saturated where that stands ([`super::pair::again`]). Any other answer
+/// of [`super::pair::place`] stands as it is.
 ///
 /// [`Engine::lifts_prefills`]: crate::engine::framework::Engine::lifts_prefills
 #[inline(never)]

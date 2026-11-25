@@ -548,25 +548,86 @@ fn lifted_cx<'a>(cx: &Constraints<'a>, steers: bool, doubt: bool) -> Constraints
 }
 
 /// The rows as they read with no doubt, into `rows`: each row of
-/// `candidates` with its stalled bit cleared where its breaker bit is
-/// clear, in the same order, so a stage handed a row reads the lift
-/// whatever it reads of the row. A row that carries both bits is one a hold
-/// of the host stands on, where the host wrote its rows. It keeps both, as
-/// a held row stays in the mask beside lent rows. The pass that lifts the
-/// liveness veto is shown these where a row's own bit is set. Rows the
-/// host's mask alone doubts are read as they are, with the mask cut to the
-/// rows a hold stands on. A stage that answers from its own scope answers
-/// as it did: the scope was opened over the decision's rows. One pool of
-/// rows a scratch, sized at the first pass that needs it.
+/// `candidates` with no doubt on it ([`with_no_doubt`]), in the same
+/// order, so a stage handed a row reads the lift whatever it reads of the
+/// row. The pass that lifts the liveness veto is shown these where a row's
+/// own bit is set. Rows the host's mask alone doubts are read as they are,
+/// with the mask cut to the rows a hold stands on. A stage that answers
+/// from its own scope answers as it did: the scope was opened over the
+/// decision's rows. One pool of rows a scratch, sized at the first pass
+/// that needs it.
 fn undoubted(candidates: &[Candidate], rows: &mut Vec<Candidate>) {
     rows.clear();
-    rows.extend(candidates.iter().map(|row| Candidate {
+    rows.extend(candidates.iter().map(with_no_doubt));
+}
+
+/// A row as it reads with no doubt: its stalled bit cleared where its
+/// breaker bit is clear. A row that carries both bits is one a hold of the
+/// host stands on, where the host wrote its rows. It keeps both, as a held
+/// row stays in the mask beside lent rows.
+fn with_no_doubt(row: &Candidate) -> Candidate {
+    Candidate {
         health: Health {
             stalled: row.health.stalled && row.health.breaker_open,
             ..row.health
         },
         ..*row
-    }));
+    }
+}
+
+/// Whether the gateway's own pair selection would read `rows` as wholly
+/// over their thresholds: one of them is ready and over them, and none
+/// that is ready is under them (`all_overloaded`,
+/// `model_gateway/src/routers/common/overload.rs:58-74`, on main
+/// `56773d28d`). A pair's decision says the list it shed over by this
+/// count ([`Engine::decide_pair`]).
+///
+/// That selection counts a worker under a liveness doubt as ready. So a
+/// row is ready here as the pass that lifts the liveness veto reads it
+/// ([`doubted`]): by the health stage's own test of the row with no doubt
+/// on it ([`with_no_doubt`]), under that pass's constraints
+/// ([`lifted_cx`]), in which a hold of the host stays. A row is over its
+/// thresholds by the overload veto's own test, under the decision's
+/// constraints. Each test is its stage's, so the count and the stages
+/// cannot part.
+///
+/// A row under a doubt and under its thresholds keeps its list from being
+/// wholly over them, though the passes of the decision that shed kept no
+/// such row. Under a veto its host lifted no row is over its thresholds,
+/// and no list is wholly over them.
+///
+/// Cold and out of line: asked behind a pair's saturated shed alone.
+#[cold]
+#[inline(never)]
+pub(super) fn wholly_over<'a>(
+    rows: impl Iterator<Item = &'a Candidate>,
+    facts: &RequestFacts<'_>,
+    cx: &Constraints<'_>,
+) -> bool {
+    let lifted = lifted_cx(cx, false, true);
+    let mut over = false;
+    for row in rows {
+        if !Healthy.keep(facts, &with_no_doubt(row), &lifted) {
+            continue;
+        }
+        if NotOverloaded.keep(facts, row, cx) {
+            return false;
+        }
+        over = true;
+    }
+    over
+}
+
+/// Whether `row`, a prefill, has a decode to pair with anywhere in
+/// `decodes`, in whatever state and at whatever place. The gateway's list
+/// of the prefills that pair is the pool's own and no request's: it holds
+/// no prefill that pairs with no decode
+/// (`model_gateway/src/routers/common/pair_index.rs:158-161`, on main
+/// `56773d28d`).
+pub(super) fn pairs_in(row: &Candidate, table: &PairTable<'_>, decodes: &[Candidate]) -> bool {
+    let classes = table.of(&row.pair_class);
+    let mut decodes = decodes.iter();
+    decodes.any(|partner| classed(classes, partner.pair_class))
 }
 
 /// Whether the liveness veto alone refuses a row of these bits: the row
@@ -785,11 +846,7 @@ pub(super) fn paired(
     // The pools as the gateway judges them: the prefills at the places that
     // have a decode to pair with, in whatever state and at whatever place,
     // and every decode at the places.
-    let pairs = |row: &&Candidate| {
-        let classes = table.of(&row.pair_class);
-        let mut decodes = decode.rows.iter();
-        decodes.any(|partner| classed(classes, partner.pair_class))
-    };
+    let pairs = |row: &&Candidate| pairs_in(row, table, decode.rows);
     let mut prefills = prefill.places().filter(pairs);
     let stands = |side: &Half<'_>, row: &Candidate| side.stands(row, side.cx);
     if partnered.any(|row| prefill.stands(row, &lift))

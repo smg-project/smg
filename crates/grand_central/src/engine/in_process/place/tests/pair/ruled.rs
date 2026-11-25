@@ -154,9 +154,11 @@ fn a_pair_is_placed_on_the_rules_prefill_though_an_earlier_attempt_tried_it() {
 }
 
 /// A pair whose rule takes no worker of one list is shed with no endpoint
-/// under the rule's name, behind one decision. The rule is asked of that
-/// decision's picks, then of every prefill, then of every decode, ready or
-/// not, and no second decision is made.
+/// under the rule's name, behind one decision that picked. The rule is
+/// asked of that decision's picks, then of every prefill, then of every
+/// decode, ready or not, and no second decision is made. Behind a first
+/// decision that sheds the request as saturated, that shed stands in two
+/// cases ([`rows`](super::rows)).
 ///
 /// The classic router's pair pass finds nobody open on a side none of
 /// whose workers the rule takes
@@ -675,12 +677,16 @@ fn a_pair_shed_as_saturated_twice_does_not_wait_for_its_prefills_limit() {
 /// worker of one list, is shed with no endpoint under the rule's name. The
 /// rule is asked of the prefill and then of the two decodes, it takes
 /// neither decode, and no second decision is made. The saturated shed does
-/// not stand: a rule that takes no worker of a list is told first.
+/// not stand here. The binding steers, and an idle decode that pairs with
+/// no prefill keeps the decode list from being wholly over its thresholds:
+/// the decision says no list of its shed. Where it says one, the shed
+/// stands where the rule's prefills let it ([`rows`](super::rows)).
 ///
-/// The classic router's pair pass finds nobody open on a side none of
-/// whose workers the rule takes
-/// (`model_gateway/src/routers/common/placement.rs:2495-2500` on main
-/// `77d6a42d3`).
+/// The classic router's pair pass judges the decode list whole where the
+/// rule takes none of it, and answers that it has no worker where a decode
+/// of that list is under its thresholds
+/// (`model_gateway/src/routers/common/placement.rs:2909-2936`,
+/// `:1831-1852` on main `56773d28d`).
 #[test]
 fn a_pair_shed_as_saturated_whose_rule_takes_no_worker_of_a_list_is_shed_under_its_name() {
     let (engine, heard) = paired(false);

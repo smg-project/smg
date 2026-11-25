@@ -30,7 +30,9 @@
 //! rule for such a list has loads to steer by. `--refused limit` puts every
 //! prefill of a pair's cell at its host's admission limit, and `--refused
 //! partners` takes its every decode out of service: each decision is then
-//! refused, and a turn refused that way counts. `--shadow twin` names a
+//! refused, and a turn refused that way counts. `--refused overload` puts
+//! its every decode over its thresholds under a binding that sheds such a
+//! list: each request is then shed as saturated. `--shadow twin` names a
 //! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
@@ -954,12 +956,15 @@ fn warm_stack() {
 fn main() {
     let run = run();
     // A pair's cell hands two lists and an encode request's three: such a
-    // run is its file's.
-    if pair::runs(&run) || encode::runs(&run) {
+    // run is its file's. A pair's cell alone runs refused.
+    if pair::runs(&run) {
         return;
     }
     let open = run.refused == pair::Refused::No;
     assert!(open, "a pair's cell alone runs refused");
+    if encode::runs(&run) {
+        return;
+    }
     let Cell {
         behind,
         document,

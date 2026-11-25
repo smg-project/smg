@@ -1192,6 +1192,41 @@ pub struct Scratch {
     /// two entries ([`Engine::shadow`]).
     #[cfg(debug_assertions)]
     kept_last: bool,
+    /// The list the last pair's decision or encode decision made with
+    /// this scratch shed its request over as saturated
+    /// ([`Self::shed_over`]).
+    shed_over: Option<ShedOver>,
+}
+
+/// The list a decision shed its request over as saturated, by the
+/// decision's own word ([`Scratch::shed_over`]). A decision says one under
+/// a binding that sheds a list wholly over its thresholds, and under no
+/// other. A shed's trace does not say it: a pair's shed made over its
+/// decodes carries the prefill's trace, as one made over its prefills
+/// does.
+///
+/// A pair's decision says a list of its two where the gateway's own pair
+/// selection would read that list as wholly over its thresholds too
+/// ([`vetoed::wholly_over`]), and says none where the two counts part: the
+/// decision's own passes leave out a worker under a liveness doubt, and
+/// that selection counts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShedOver {
+    /// An encode request's encoders: the overload veto left none of them
+    /// open ([`Engine::decide_encode_pair`]).
+    Encoders,
+    /// A pair's prefills: no prefill at the request's places stands but for
+    /// a veto, the overload veto took the last of them, and the prefills
+    /// at those places that pair with a decode of the pool are wholly over
+    /// their thresholds. A prefill that pairs with no decode is no part of
+    /// that count: the gateway's own selection holds no such prefill
+    /// ([`vetoed::pairs_in`]).
+    Prefills,
+    /// A pair's decodes, beside a prefill that stands: the overload veto
+    /// took the last of that prefill's partners, and the whole decode list
+    /// at the request's places is wholly over its thresholds, a decode that
+    /// pairs with no prefill too.
+    Decodes,
 }
 
 /// What a live decision under a sessions rule learned of its key, step
@@ -1298,6 +1333,27 @@ impl Buffers {
 impl Scratch {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The list the last pair's decision or encode decision made with
+    /// this scratch shed its request over as saturated, where it says
+    /// one ([`ShedOver`]). Each such decision takes the word back where it
+    /// begins and writes it at the one place it makes that shed, so the
+    /// word is that decision's alone: `None` behind its every other
+    /// answer. An encode decision that hands its pair's decision a part
+    /// of a list says none of the pair's two: that decision judged the
+    /// part. A caller reads the word behind a decision's shed as
+    /// saturated, and behind nothing else: a request that is answered
+    /// ahead of both decisions leaves the word of the one before.
+    #[cfg_attr(
+        not(any(test, feature = "in-process")),
+        expect(
+            dead_code,
+            reason = "the one reader is the engine over worker lists, built under `in-process`"
+        )
+    )]
+    pub(crate) fn shed_over(&self) -> Option<ShedOver> {
+        self.shed_over
     }
 }
 
@@ -8039,6 +8095,9 @@ impl Engine {
         decode_cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
+        // The word of the list a shed is made over is this decision's: one
+        // an earlier decision left goes here ([`Scratch::shed_over`]).
+        scratch.shed_over = None;
         let bare = Trace {
             seed: facts.seed,
             generation: pool.generation,
@@ -8314,6 +8373,10 @@ impl Engine {
                         Half::new(prefill_profile, first, &prefill_facts, prefills, cx),
                         Half::new(decode_profile, second, &decode_facts, decodes, decode_cx),
                     ];
+                    // The decision says the list it sheds over as saturated
+                    // under a binding that sheds a list wholly over its
+                    // thresholds, and under no other ([`ShedOver`]).
+                    let says = vetoed == AllVetoed::Shed;
                     let words = (vetoed == AllVetoed::Steer, self.weighs(first));
                     if let Some(pair) = vetoed::paired(sides, &pools.table, words, pool, scratch) {
                         return pair;
@@ -8357,6 +8420,24 @@ impl Engine {
                             Set::side(prefills, None, None),
                         )
                         .unwrap_or("none");
+                        // No prefill of the request's stands but for a
+                        // veto. The overload veto's shed is made over the
+                        // prefills, and the decision says so where the
+                        // prefills that pair with a decode of the pool are
+                        // wholly over their thresholds
+                        // ([`vetoed::wholly_over`]): the pool the pair's
+                        // default above judged. The rows are read once
+                        // more, behind such a shed alone: for each prefill
+                        // at the request's places a decode that pairs with
+                        // it is looked for, at worst every decode once a
+                        // prefill, and no filter of the profile runs again.
+                        if says && reason_of(stage) == ShedReason::Saturated {
+                            let pairs = |c: &&Candidate| vetoed::pairs_in(c, &pools.table, decodes);
+                            let paired = takes.places().filter(pairs);
+                            if vetoed::wholly_over(paired, &prefill_facts, run_cx) {
+                                scratch.shed_over = Some(ShedOver::Prefills);
+                            }
+                        }
                         return shed(reason_of(stage), stage, prefill_shed.trace);
                     }
                     if scratch.classes.is_empty() {
@@ -8376,6 +8457,20 @@ impl Engine {
                     )
                     .filter(|&stage| stage != "none")
                     {
+                        // The partners of the prefills that stand are
+                        // refused whole. The overload veto's shed is made
+                        // over the decodes where the whole decode list is
+                        // wholly over its thresholds, a decode that pairs
+                        // with no prefill too ([`vetoed::wholly_over`]):
+                        // the decision says so there, and nowhere else.
+                        // The rows are read once more, behind such a shed
+                        // alone, and no filter of the profile runs again.
+                        if says && reason_of(stage) == ShedReason::Saturated {
+                            let listed = places::rows(decodes, decode_cx);
+                            if vetoed::wholly_over(listed, &decode_facts, decode_cx) {
+                                scratch.shed_over = Some(ShedOver::Decodes);
+                            }
+                        }
                         return shed(reason_of(stage), stage, prefill_shed.trace);
                     }
                 }
@@ -12652,6 +12747,259 @@ mod tests {
             }
             other => panic!("a saturated decode fleet answered {other:?}"),
         }
+    }
+
+    /// A pair's decision with `scratch`, which keeps the decision's word of
+    /// the list it shed over.
+    fn decide_pair_with(
+        engine: &Engine,
+        prefills: &[Candidate],
+        decodes: &[Candidate],
+        scratch: &mut Scratch,
+    ) -> Decision {
+        decide_pair_at(engine, prefills, decodes, [None; 2], scratch)
+    }
+
+    /// [`decide_pair_with`] for a request held to places of each list: the
+    /// prefills', then the decodes', and `None` for every place.
+    fn decide_pair_at(
+        engine: &Engine,
+        prefills: &[Candidate],
+        decodes: &[Candidate],
+        places: [Option<&[u32]>; 2],
+        scratch: &mut Scratch,
+    ) -> Decision {
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let pools = PairPools {
+            prefills,
+            decodes,
+            ..PairPools::default()
+        };
+        let [prefill_cx, decode_cx] = places.map(|places| Constraints {
+            places,
+            ..Constraints::default()
+        });
+        let pool = PoolFacts::default();
+        engine.decide_pair(&facts, &pool, pools, &prefill_cx, &decode_cx, scratch)
+    }
+
+    /// A row of a pair's pool: of pair class `class`, over its thresholds
+    /// where `over`, and not healthy where `down`.
+    fn pair_row(position: u32, class: u32, over: bool, down: bool) -> Candidate {
+        let mut row = candidate(position, 0);
+        row.pair_class = class;
+        row.health.overloaded = over;
+        row.health.healthy = !down;
+        row
+    }
+
+    /// A pair's decision says the list it sheds its request over as
+    /// saturated, under a binding that sheds a list wholly over its
+    /// thresholds. The prefills, where no prefill stands but for the veto.
+    /// The decodes, where the whole decode list is over its thresholds. No
+    /// list where a decode that pairs with no prefill is under them: the
+    /// shed is then made over the partners alone. Under a binding that
+    /// steers the same sheds say no list.
+    #[test]
+    fn a_pairs_decision_says_the_list_it_sheds_over() {
+        let steering = || {
+            Engine::new(
+                vec![strict_profile()],
+                vec![pair_binding()],
+                1,
+                Needs::default(),
+            )
+        };
+        let shedding = || {
+            let mut engine = steering();
+            engine.shed_when_all_vetoed(0);
+            engine
+        };
+        let saturated = Some((ShedReason::Saturated, "not-overloaded"));
+        // The prefill is over its thresholds beside a decode that is down:
+        // no pair is left to steer to, and the shed is the prefills'.
+        let prefills = [pair_row(0, 7, true, false)];
+        let decodes = [pair_row(0, 7, false, true)];
+        for (engine, over) in [(shedding(), Some(ShedOver::Prefills)), (steering(), None)] {
+            let mut scratch = Scratch::new();
+            let decision = decide_pair_with(&engine, &prefills, &decodes, &mut scratch);
+            assert_eq!(shed_of(&decision), saturated);
+            assert_eq!(scratch.shed_over(), over, "the prefills");
+        }
+        // Every decode is over its thresholds beside a prefill that stands.
+        let prefills = [pair_row(0, 7, false, false)];
+        let decodes = [pair_row(0, 7, true, false), pair_row(1, 7, true, false)];
+        let mut scratch = Scratch::new();
+        let decision = decide_pair_with(&shedding(), &prefills, &decodes, &mut scratch);
+        assert_eq!(shed_of(&decision), saturated);
+        assert_eq!(scratch.shed_over(), Some(ShedOver::Decodes), "the decodes");
+        // The prefill's partner is over its thresholds beside an idle decode
+        // of a class no prefill pairs with: the decode list is not wholly
+        // over them, under either binding.
+        let decodes = [pair_row(0, 7, true, false), pair_row(1, 9, false, false)];
+        for engine in [shedding(), steering()] {
+            let mut scratch = Scratch::new();
+            let decision = decide_pair_with(&engine, &prefills, &decodes, &mut scratch);
+            assert_eq!(shed_of(&decision), saturated);
+            assert_eq!(scratch.shed_over(), None, "the partners alone");
+        }
+    }
+
+    /// A pair's decision says a list where the gateway's own selection
+    /// would read it as wholly over its thresholds, and no list where the
+    /// two counts part ([`vetoed::wholly_over`]). A worker under its thresholds
+    /// and under a liveness doubt keeps its list from being wholly over
+    /// them, though no pass of the decision keeps it: a decode that pairs
+    /// with no prefill for the decodes, a prefill for the prefills. Over
+    /// its thresholds too, it does not. A prefill that pairs with no
+    /// decode is no part of the prefills' count: the one over its
+    /// thresholds beside a partnered prefill that is down shows no
+    /// overload of the list, and beside a partnered one over its
+    /// thresholds it changes nothing.
+    ///
+    /// That selection counts a worker that is healthy with a closed
+    /// breaker, whatever doubt stands on it
+    /// (`model_gateway/src/routers/common/overload.rs:58-74`), and holds
+    /// the prefills that pair with a decode alone
+    /// (`model_gateway/src/routers/common/pair_index.rs:158-161`, on main
+    /// `56773d28d`).
+    #[test]
+    fn a_pairs_decision_says_a_list_by_the_gateways_own_count() {
+        let mut engine = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        engine.shed_when_all_vetoed(0);
+        let doubted = |mut row: Candidate| {
+            row.health.stalled = true;
+            row
+        };
+        let said = |prefills: &[Candidate], decodes: &[Candidate]| {
+            let mut scratch = Scratch::new();
+            let decision = decide_pair_with(&engine, prefills, decodes, &mut scratch);
+            assert_eq!(
+                shed_of(&decision),
+                Some((ShedReason::Saturated, "not-overloaded")),
+                "{decision:?}"
+            );
+            scratch.shed_over()
+        };
+        let open = pair_row(0, 7, false, false);
+        let over = pair_row(0, 7, true, false);
+        let down = pair_row(0, 7, false, true);
+        // The partner is over its thresholds beside a decode of a class no
+        // prefill pairs with, which is under a doubt.
+        let idle = doubted(pair_row(1, 9, false, false));
+        assert_eq!(said(&[open], &[over, idle]), None, "a decode under a doubt");
+        let busy = doubted(pair_row(1, 9, true, false));
+        assert_eq!(said(&[open], &[over, busy]), Some(ShedOver::Decodes));
+        // One prefill is over its thresholds beside one under a doubt, and
+        // the decode is down.
+        let idle = doubted(pair_row(1, 7, false, false));
+        assert_eq!(
+            said(&[over, idle], &[down]),
+            None,
+            "a prefill under a doubt"
+        );
+        let busy = doubted(pair_row(1, 7, true, false));
+        assert_eq!(said(&[over, busy], &[down]), Some(ShedOver::Prefills));
+        // The one prefill over its thresholds is of a class no decode is of.
+        let alone = pair_row(1, 9, true, false);
+        assert_eq!(
+            said(&[down, alone], &[open]),
+            None,
+            "a prefill with no decode"
+        );
+        assert_eq!(said(&[over, alone], &[open]), Some(ShedOver::Prefills));
+    }
+
+    /// A pair's decision counts a list at the request's places alone. The
+    /// first prefill is over its thresholds and is the one place the
+    /// request may take: the decision says the prefills, though the second
+    /// prefill is under its thresholds. So it is for the decodes. Held to
+    /// no place, the same lists hold a pair that takes the request.
+    #[test]
+    fn a_pairs_decision_counts_a_list_at_the_requests_places() {
+        let mut engine = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        engine.shed_when_all_vetoed(0);
+        let said = |prefills: &[Candidate], decodes: &[Candidate], places: [Option<&[u32]>; 2]| {
+            let mut scratch = Scratch::new();
+            let decision = decide_pair_at(&engine, prefills, decodes, places, &mut scratch);
+            (shed_of(&decision), scratch.shed_over())
+        };
+        let saturated = Some((ShedReason::Saturated, "not-overloaded"));
+        let (open, over) = (pair_row(0, 7, false, false), pair_row(0, 7, true, false));
+        let second = pair_row(1, 7, false, false);
+        let first: &[u32] = &[0];
+        assert_eq!(
+            said(&[over, second], &[open], [Some(first), None]),
+            (saturated, Some(ShedOver::Prefills))
+        );
+        assert_eq!(
+            said(&[open], &[over, second], [None, Some(first)]),
+            (saturated, Some(ShedOver::Decodes))
+        );
+        assert_eq!(said(&[over, second], &[open], [None; 2]), (None, None));
+        assert_eq!(said(&[open], &[over, second], [None; 2]), (None, None));
+    }
+
+    /// The word of the list a shed was made over is its decision's alone:
+    /// the next pair's decision made with the same scratch takes it back
+    /// where it begins, whether it picks, sheds for another reason or is
+    /// declined ahead of every profile.
+    #[test]
+    fn a_pairs_decision_takes_back_the_word_of_the_one_before() {
+        let mut engine = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        engine.shed_when_all_vetoed(0);
+        let over = [pair_row(0, 7, true, false)];
+        let open = [pair_row(0, 7, false, false)];
+        let down = [pair_row(0, 7, false, true)];
+        let mut scratch = Scratch::new();
+        let shed_over_the_prefills = |scratch: &mut Scratch| {
+            let decision = decide_pair_with(&engine, &over, &open, scratch);
+            assert_eq!(
+                scratch.shed_over(),
+                Some(ShedOver::Prefills),
+                "{decision:?}"
+            );
+        };
+        // A decision that picks.
+        shed_over_the_prefills(&mut scratch);
+        let decision = decide_pair_with(&engine, &open, &open, &mut scratch);
+        assert!(decision.pick().is_some(), "{decision:?}");
+        assert_eq!(scratch.shed_over(), None, "behind a pick");
+        // A decision that sheds with no endpoint.
+        shed_over_the_prefills(&mut scratch);
+        let decision = decide_pair_with(&engine, &down, &open, &mut scratch);
+        assert_eq!(
+            shed_of(&decision),
+            Some((ShedReason::NoEndpoints, "healthy"))
+        );
+        assert_eq!(scratch.shed_over(), None, "behind another shed");
+        // A decision declined ahead of every profile: no binding matches.
+        shed_over_the_prefills(&mut scratch);
+        let unbound = Engine::new(vec![strict_profile()], vec![], 1, Needs::default());
+        let decision = decide_pair_with(&unbound, &over, &open, &mut scratch);
+        assert_eq!(
+            shed_of(&decision),
+            Some((ShedReason::PolicyDeclined, "binding"))
+        );
+        assert_eq!(scratch.shed_over(), None, "behind a decline");
     }
 
     #[test]

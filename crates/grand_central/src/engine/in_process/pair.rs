@@ -109,7 +109,7 @@
 )]
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt,
     sync::{atomic::Ordering, Arc},
     time::Instant,
@@ -123,7 +123,7 @@ use crate::{
         decision::{shed, Decision, Pick, ShadowKind, ShedReason, Target, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         demands::{Demands, UnmetDemand},
-        framework::{Engine, PairPools, PairSide, Scratch, ShadowRows},
+        framework::{Engine, PairPools, PairSide, Scratch, ShadowRows, ShedOver},
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
@@ -689,8 +689,14 @@ impl<'a> PairLists<'a> {
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
             // A stage asked for a decision from inside its own, on this
-            // thread: that decision takes buffers of its own.
-            Err(_) => decide(&mut Buffers::default()),
+            // thread: that decision takes buffers of its own, and its word
+            // of a shed is kept for its call ([`said_apart`]).
+            Err(_) => {
+                let mut own = Buffers::default();
+                let decision = decide(&mut own);
+                said_apart(&own.scratch);
+                decision
+            }
         });
         // The thread's list goes back for its next retry.
         if let Some(tried) = tried {
@@ -871,6 +877,39 @@ thread_local! {
     /// The calling thread's own buffers, so a pair's decision allocates
     /// nothing after a thread's first decisions over lists of a size.
     pub(super) static BUFFERS: RefCell<Buffers> = RefCell::new(Buffers::default());
+
+    /// The word of the list it shed over that the thread's last decision
+    /// on buffers of its own left ([`said_apart`]).
+    static SAID_APART: Cell<Option<ShedOver>> = const { Cell::new(None) };
+}
+
+/// Keeps the word of a decision made on buffers of its own, with `scratch`:
+/// the list it shed its request over as saturated, where it says one
+/// ([`Scratch::shed_over`]). A stage asked for that decision from inside
+/// another of this thread, which holds the thread's buffers, and the
+/// scratch goes with the decision: its call reads the word here
+/// ([`shed_over`]). Out of line: a decision on the thread's buffers runs
+/// none of it.
+#[cold]
+#[inline(never)]
+pub(super) fn said_apart(scratch: &Scratch) {
+    SAID_APART.set(scratch.shed_over());
+}
+
+/// The list the calling thread's last pair's decision or encode decision
+/// shed its request over as saturated, by that decision's own word
+/// ([`Scratch::shed_over`]). The call that asked for the decision reads it
+/// behind that decision's shed as saturated and behind nothing else, ahead
+/// of anything else it asks on this thread ([`place`](super::place)): a
+/// request answered ahead of its decision leaves the word of the decision
+/// before.
+pub(super) fn shed_over() -> Option<ShedOver> {
+    BUFFERS.with(|buffers| match buffers.try_borrow() {
+        Ok(buffers) => buffers.scratch.shed_over(),
+        // The call stands inside a decision of this thread, which holds
+        // the buffers: its own decision was made on buffers of its own.
+        Err(_) => SAID_APART.get(),
+    })
 }
 
 /// Writes on the two lists' records what a pair's decision reads beside a
