@@ -1615,6 +1615,61 @@ mod tests {
         assert_eq!(whole(text), (64, 200));
     }
 
+    /// A request the engine makes of a prompt's token ids with no block
+    /// hashed is sized as the one it makes with its list. The stage reads
+    /// the list's length alone, under a `max` with the count the prompt's
+    /// size gives ([`Gates::whole`], [`RequestFacts::blocks`]), and the
+    /// list the engine makes is never longer than that count: one hash for
+    /// each whole block, as deep as the document reads at most, one for a
+    /// shorter prompt, none for an empty one. So an empty prompt, one
+    /// under one block, one that ends on a block's edge, one that ends
+    /// inside a block and one longer than the document reads each state
+    /// one size both ways: the prompt's own.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_request_made_with_no_block_hashed_is_sized_as_the_one_hashed() {
+        use crate::{
+            document::spec::AppliedSpec,
+            engine::prompt_hashes::{HashSeeds, PromptHashes},
+        };
+        let document = PolicySpec::preset("cache_aware").expect("a preset");
+        let spec = AppliedSpec::validate(&document).expect("the preset validates");
+        let gates = Gates::of(None, None, Some(16));
+        // A prompt's tokens, the hashes of its list and its size in blocks.
+        let prompts = [
+            (0_u32, 0, 1),
+            (7, 1, 1),
+            (16, 1, 1),
+            (54, 3, 3),
+            (64, 4, 4),
+            (1_600, 100, 100),
+            (100_000, 256, 6_250),
+        ];
+        for (tokens, hashes, blocks) in prompts {
+            let prompt: Vec<u32> = (0..tokens).collect();
+            let listed = PromptHashes::under_document(
+                &spec,
+                Some(16),
+                Some(&prompt),
+                None,
+                HashSeeds::PLAIN,
+            );
+            let unhashed = PromptHashes::unhashed(&spec, Some(16), &prompt, HashSeeds::PLAIN);
+            let mut with_list = RequestFacts::default();
+            listed.write_to(&mut with_list);
+            let mut without = RequestFacts::default();
+            unhashed.write_to(&mut without);
+            assert_eq!(with_list.block_hashes.len(), hashes, "{tokens}");
+            assert!(without.block_hashes.is_empty(), "{tokens}");
+            let counted = (with_list.blocks(16), without.blocks(16));
+            assert_eq!(counted, (blocks, blocks), "{tokens}");
+            let size = (16, tokens.max(16));
+            let (full, bare) = (gates.whole(&with_list), gates.whole(&without));
+            assert_eq!((full.block, full.size), size, "{tokens}");
+            assert_eq!((bare.block, bare.size), size, "{tokens}");
+        }
+    }
+
     /// The engine of the built-in `cache_aware` document.
     fn built_in() -> Engine {
         PolicySpec::preset("cache_aware")

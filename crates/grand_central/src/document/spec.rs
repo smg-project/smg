@@ -4283,7 +4283,16 @@ type BuiltProfile = (Profile, bool, Option<usize>);
 /// The two depths of one generation: how deep its stages read a request's
 /// block hashes, and how deep a stage reads them itself. The
 /// prefix-affinity stage declares the hashes and reads none of them: the
-/// lookup that names a request's holders reads them for it.
+/// lookup that names a request's holders reads them for it. Of the list
+/// the stage reads the length alone, where it sizes the request
+/// (`Gates::whole`, `RequestFacts::blocks`), and only under a `max` with
+/// the count the prompt's size gives. The list the engine's own call makes
+/// of a prompt's token ids is never longer than that count: one hash for
+/// each whole block, as deep as the document reads at most, one for a
+/// shorter prompt, none for an empty one. So the engine sizes such a
+/// request the same with its list and with none. Facts a host states
+/// itself can hold more hashes than their size gives: those are sized by
+/// the list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HashDepths {
     /// The deepest read under the generation.
@@ -6028,6 +6037,8 @@ impl AppliedSpec {
     /// where no stage declares any.
     /// The engine's own call then hashes a prompt where that lookup reads
     /// the list, and not for a request it decides inside a lent token tree.
+    /// A request that call makes of a prompt's token ids with no block
+    /// hashed is sized as the one it makes with its list (`HashDepths`).
     #[cfg_attr(
         not(feature = "in-process"),
         expect(dead_code, reason = "the engine's own placing call reads it")
