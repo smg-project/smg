@@ -1728,6 +1728,23 @@ mod tests {
             .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
             .collect();
         assert_eq!(text, "hello");
+
+        // A content event that brings the prompt behind the role and closes
+        // the choice goes out after its own text: the closing event carries
+        // the key once, behind the event's text, and the text is whole.
+        let closing = "data: {\"id\":\"x\",\"prompt_text\":\"user: hi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let evs = events(&run(&[role, closing]));
+        assert_eq!(evs.len(), 3, "{evs:?}");
+        assert!(
+            evs[..2].iter().all(|e| e.get("prompt_text").is_none()),
+            "{evs:?}"
+        );
+        assert_eq!(
+            evs[1]["choices"][0]["delta"]["content"],
+            Value::from("hello")
+        );
+        assert_eq!(evs[2]["prompt_text"], Value::from("user: hi"));
+        assert_eq!(evs[2]["choices"][0]["finish_reason"], Value::from("stop"));
     }
 
     #[test]
