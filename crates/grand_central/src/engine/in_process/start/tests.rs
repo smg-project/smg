@@ -25,8 +25,8 @@ use crate::{
             InProcess,
         },
         list_cell::{ModelLists, PublishedList},
-        prompt_hashes::HashSeeds,
-        view::RequestFacts,
+        prompt_hashes::{HashSeeds, PromptHashes},
+        view::{HashKind, RequestFacts, TEXT_BYTES_PER_TOKEN},
         WorkerData,
     },
     store::GatewayId,
@@ -243,6 +243,61 @@ async fn a_started_engine_reads_the_cache_indexes_it_was_handed() {
         hashes.write_to(&mut asked.request.facts);
         let place = picked(engine, &asked);
         assert_eq!(place, place_of(&list, 5), "seed {seed}: the holder");
+    }
+    task.abort();
+}
+
+/// Beside an index of cache events that holds a block for every worker of
+/// its list, a request of text is placed by the prefixes the engine sent:
+/// each request of the text goes to the worker its first one went to,
+/// whatever its seed. An index speaks of token blocks, so the engine's
+/// record of sent prefixes speaks for every worker on such a request, as
+/// the classic router's tree of sent texts does
+/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`). A
+/// request of token ids goes to the worker the index holds its blocks for,
+/// as before.
+#[tokio::test(start_paused = true)]
+async fn a_started_engine_places_a_text_by_the_prefix_it_sent_beside_the_index() {
+    let registry = registry(8);
+    let index = Arc::new(ChainIndex::new());
+    let data = WorkerData {
+        registry: handed(&registry),
+        loads: None,
+        cache_indexes: Some(indexes(&index)),
+    };
+    let (engine, task) = InProcess::start(preset("cache_aware"), data);
+    let task = spawned(task).await;
+
+    let tokens: Vec<u32> = (0..1_024).collect();
+    let by_tokens = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+    let mut stated = RequestFacts::default();
+    by_tokens.write_to(&mut stated);
+    store(&index, 5, stated.block_hashes);
+    for at in (0..8_usize).filter(|&at| at != 5) {
+        store(&index, at, &[at as u64 + 1]);
+    }
+    let text: String = (0..512).map(|at| format!("{at:07} ")).collect();
+    let by_text = engine.prompt_hashes(MODEL, None, Some(&text), HashSeeds::PLAIN);
+    let mut stated = RequestFacts::default();
+    by_text.write_to(&mut stated);
+    let window = (INDEX_BLOCK * TEXT_BYTES_PER_TOKEN) as usize;
+    assert_eq!(
+        (stated.hash_kind, stated.block_hashes.len()),
+        (HashKind::Text, text.len() / window)
+    );
+
+    let list = list(&registry);
+    let members = PublishedList::new(Arc::clone(&list));
+    let placed = |seed: u64, hashes: &PromptHashes| {
+        let mut asked = asks(seed, &members, None);
+        hashes.write_to(&mut asked.request.facts);
+        picked(engine, &asked)
+    };
+    let sent = placed(0, &by_text);
+    for seed in 1..32 {
+        assert_eq!(placed(seed, &by_text), sent, "seed {seed}: the text");
+        let holder = place_of(&list, 5);
+        assert_eq!(placed(seed, &by_tokens), holder, "seed {seed}: the holder");
     }
     task.abort();
 }

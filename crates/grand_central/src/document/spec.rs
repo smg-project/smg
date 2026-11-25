@@ -699,7 +699,9 @@ pub enum AffinitySource {
     /// The record of the prefixes sent alone.
     Predictor,
     /// Each worker by what it has: its cache events where it publishes
-    /// them, and the prefixes sent to it where it does not.
+    /// them, and the prefixes sent to it where it does not. A request
+    /// hashed by its text reads the prefixes sent to every worker: cache
+    /// events are token blocks.
     #[default]
     Merged,
 }
