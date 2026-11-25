@@ -1141,8 +1141,8 @@ impl ByEngine {
 }
 
 /// The model's hash ring as one request lends it to Grand Central
-/// ([`LentRing`]), read where the engine's document places by a ring and
-/// nowhere else.
+/// ([`LentRing`]), read where the engine's document places a request of
+/// its phases by a ring and nowhere else.
 ///
 /// A classic ring policy is handed the model's ring for every list a
 /// request is placed over: the pool's own, the part of it on a retry's
@@ -1151,7 +1151,8 @@ impl ByEngine {
 /// classic policy does ([`HashRing::find_healthy_url`]), so a routing value
 /// keeps the worker it has.
 enum ModelRing<'a> {
-    /// The document places by no ring: none is read.
+    /// The document places no request of these phases by a ring: none is
+    /// read.
     Unread,
     /// The ring of the generation the request's list is read from, once it
     /// is filled. It is borrowed from that snapshot: the request takes no
@@ -1168,16 +1169,36 @@ enum ModelRing<'a> {
 }
 
 impl<'a> ModelRing<'a> {
-    /// The ring for a request of `model_id` whose list is read from
-    /// `generation`.
+    /// Whether some decision of one of `phases` places by a ring under the
+    /// document in force
+    /// ([`needs_for_phase`](smg_grand_central::engine::Engine::needs_for_phase)).
+    /// A request names the phases it is decided in: a ring that another
+    /// phase's profile alone walks is not read for it, as the encode side's
+    /// is not for a pair. The whole document's word is read first: where no
+    /// profile places by a ring it is the one read, and no phase is asked.
+    /// Each is one word, read with no counted reference of the document.
+    fn walked_in(engine: &InProcess, phases: &[Phase]) -> bool {
+        engine.with_spec(|spec| {
+            if !spec.needs().ring {
+                return false;
+            }
+            let engine = spec.engine();
+            phases
+                .iter()
+                .any(|&phase| engine.needs_for_phase(phase).ring)
+        })
+    }
+
+    /// The ring for a request of `model_id` decided in `phases`, whose list
+    /// is read from `generation`.
     fn of(
         engine: &InProcess,
         policies: &PolicyRegistry,
         model_id: &str,
         generation: &'a ModelWorkerSnapshot,
+        phases: &[Phase],
     ) -> Self {
-        // One word of the document, read with no counted reference of it.
-        if !engine.with_spec(|spec| spec.needs().ring) {
+        if !Self::walked_in(engine, phases) {
             return Self::Unread;
         }
         match generation.hash_ring() {
@@ -1186,16 +1207,17 @@ impl<'a> ModelRing<'a> {
         }
     }
 
-    /// The ring for a request whose caller holds no snapshot: the one the
-    /// registry answers for `model_id` now, as the classic selection reads
-    /// it for such a list.
+    /// The ring for a request decided in `phases` whose caller holds no
+    /// snapshot: the one the registry answers for `model_id` now, as the
+    /// classic selection reads it for such a list.
     fn read(
         engine: &InProcess,
         policies: &PolicyRegistry,
         registry: &WorkerRegistry,
         model_id: &str,
+        phases: &[Phase],
     ) -> Self {
-        if !engine.with_spec(|spec| spec.needs().ring) {
+        if !Self::walked_in(engine, phases) {
             return Self::Unread;
         }
         Self::standing(policies.hash_ring(registry, model_id))
@@ -1466,7 +1488,7 @@ fn single_of_by_engine(
     stated: impl FnOnce() -> Stated,
 ) -> Option<Placed> {
     let stated = stated();
-    let ring = ModelRing::of(engine, policies, model_id, snapshot);
+    let ring = ModelRing::of(engine, policies, model_id, snapshot, &[Phase::Single]);
     let ring = ring.lent();
     let lent = snapshot.lent(pool);
     placed_by_engine(engine, policies, model_id, lent, ring, wire, inputs, stated)
@@ -2630,7 +2652,8 @@ fn with_pair_request<R>(
     tried_ids(prefill.workers, inputs.tried, &mut tried);
     tried_ids(decode.workers, inputs.tried, &mut decodes_tried);
     tried.append(&mut decodes_tried);
-    let ring = ModelRing::read(engine, policies, registry, model_id);
+    let sides = [Phase::Prefill, Phase::Decode];
+    let ring = ModelRing::read(engine, policies, registry, model_id, &sides);
     let mut request = place_request(
         model_id,
         WorkerLists::Pair(lists),
@@ -9034,6 +9057,89 @@ pub(crate) mod tests {
         };
         assert!(!fills_the_ring("round_robin"));
         assert!(fills_the_ring("consistent_hashing"));
+    }
+
+    /// The engine's request reads the model's ring for the phases it is
+    /// decided in alone. The three-sided settings' document walks a ring on
+    /// its encode side, the side's default policy, whatever its other sides
+    /// run. A pair is decided in the prefill and the decode phase: it fills
+    /// the ring where one of those two sides walks it, and not for the
+    /// encode side's sake. A single request of a gateway of many routers is
+    /// decided under the main policy: it fills the ring where that policy
+    /// walks it.
+    #[test]
+    fn the_engine_reads_the_ring_for_a_requests_own_phases() {
+        use crate::config::{RouterConfig, RoutingMode};
+
+        let ring = || Some(PolicyConfig::ConsistentHashing);
+        let turns = || Some(PolicyConfig::RoundRobin);
+        let engine_of = |main: PolicyConfig, prefill, decode, many_routers: bool| {
+            let settings = RouterConfig {
+                mode: RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![],
+                    prefill_urls: vec![],
+                    decode_urls: vec![],
+                    encode_policy: None,
+                    prefill_policy: prefill,
+                    decode_policy: decode,
+                },
+                policy: main,
+                enable_igw: many_routers,
+                ..Default::default()
+            };
+            let policies = PolicyRegistry::for_engine(
+                settings.policy.clone(),
+                settings.routing_key_override.clone(),
+            );
+            let document = settings.policy_document().expect("the settings' document");
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            assert!(spec.needs().ring, "the encode side walks the ring");
+            engine_on(&policies, spec);
+            policies
+        };
+        let pair_fills = |prefill, decode| {
+            let registry = pd_registry(&[
+                ("grpc://p1:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://p2:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d1:1", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d2:1", WorkerType::Decode, Some("NixlConnector")),
+            ]);
+            let policies = engine_of(PolicyConfig::RoundRobin, prefill, decode, false);
+            let pairs = pairs_of(&registry, &policies);
+            let headers = keyed_headers();
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                with_headers(&headers),
+                Stated::nothing,
+            );
+            assert!(pair.is_ok(), "a pair is open");
+            assert_eq!(policies.classic_made_or_asked(), 0);
+            registry.get_routing_snapshot(MODEL).hash_ring_is_filled()
+        };
+        assert!(!pair_fills(None, None), "for the encode side's sake");
+        assert!(pair_fills(ring(), None), "the prefill side walks it");
+        assert!(pair_fills(None, ring()), "the decode side walks it");
+        let single_fills = |main: PolicyConfig| {
+            let registry = http_registry(&["http://h:1", "http://h:2"]);
+            let policies = engine_of(main, turns(), turns(), true);
+            let headers = keyed_headers();
+            pick(&registry, &policies, with_headers(&headers));
+            assert_eq!(policies.classic_made_or_asked(), 0);
+            registry.get_routing_snapshot(MODEL).hash_ring_is_filled()
+        };
+        assert!(
+            !single_fills(PolicyConfig::RoundRobin),
+            "for the encode side's sake"
+        );
+        assert!(
+            single_fills(PolicyConfig::ConsistentHashing),
+            "the main policy walks it"
+        );
     }
 
     /// The selection metric's lines for [`MODEL`] as a recorder renders

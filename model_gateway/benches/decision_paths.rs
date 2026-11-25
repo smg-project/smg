@@ -46,6 +46,14 @@
 //! its two side policies, or by the engine, whose document plans the pair
 //! alone. `--not-ready` and `--ready` then hold for each side.
 //!
+//! `--encode-side true` makes a pair cell's gateway a three-sided one: its
+//! settings name the encode mode, so the engine's document plans an encode
+//! side beside the pair's two, under that side's default policy, which
+//! places by the model's ring. The cell's requests carry no item: each is
+//! placed as a pair, and the encode side places nothing. The cell counts
+//! what a pair pays for a side it does not use. Only a pair cell on the
+//! engine's path takes it.
+//!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
 //! header `x-smg-routing-key`: a policy that places by a key places by it.
 //! `0`, the default, sends no key.
@@ -219,6 +227,9 @@ struct Cell {
     /// A pair gateway: `workers` prefill workers and as many decode
     /// workers a model, and a request placed as a pair.
     pair: bool,
+    /// A pair cell's settings name the encode mode: the engine's document
+    /// plans an encode side beside the pair's two.
+    encode_side: bool,
     /// The routing keys the requests carry in turn; `0` for none.
     keys: usize,
     /// The prompts the requests carry in turn.
@@ -251,6 +262,7 @@ fn cell() -> Cell {
         overloaded: false,
         models: 1,
         pair: false,
+        encode_side: false,
         keys: 0,
         prompts: 1,
         text: false,
@@ -286,6 +298,7 @@ fn cell() -> Cell {
             "--overloaded" => cell.overloaded = value.parse().unwrap(),
             "--models" => cell.models = value.parse().unwrap(),
             "--pair" => cell.pair = value.parse().unwrap(),
+            "--encode-side" => cell.encode_side = value.parse().unwrap(),
             "--keys" => cell.keys = value.parse().unwrap(),
             "--prompts" => cell.prompts = value.parse().unwrap(),
             "--text" => cell.text = value.parse().unwrap(),
@@ -643,12 +656,27 @@ fn build(cell: &Cell) -> Built {
         policy: policy_config(&cell.policy),
         ..RouterConfig::default()
     };
+    assert!(
+        !cell.encode_side || (cell.pair && cell.path == "engine"),
+        "an encode side is planned for a pair cell on the engine's path"
+    );
     if cell.pair {
-        config.mode = RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
+        config.mode = if cell.encode_side {
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            }
+        } else {
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            }
         };
         // The cell's workers are on the gRPC wire, and its settings say so:
         // a pair gateway of one router over gRPC plans the pair alone, where
@@ -943,7 +971,7 @@ fn main() {
         println!("prompt=text");
     }
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} end={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} encode_side={} end={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -955,6 +983,7 @@ fn main() {
         cell.overloaded,
         cell.models,
         cell.pair,
+        cell.encode_side,
         cell
             .end
             .map_or_else(|| "dropped".to_owned(), |end| format!("{end:?}").to_lowercase()),
