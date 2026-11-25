@@ -42,6 +42,7 @@ use crate::{
 const PLAIN: Asked<'static> = Asked {
     model: MODEL,
     headers: None,
+    items: &[],
 };
 
 /// How often each worker was sent to over `answers`, by its address.
@@ -443,11 +444,11 @@ async fn the_engine_hears_each_requests_end() {
     ];
     assert_eq!(taken(&heard), [failed, served].concat());
 
-    let unsent = program.place(&PLAIN, &[]).expect("a placement");
+    let unsent = program.place(&PLAIN, 0, &[]).expect("a placement");
     drop(unsent);
     assert_eq!(taken(&heard), ["issued", "released Abandoned"]);
 
-    let mut cut = program.place(&PLAIN, &[]).expect("a placement");
+    let mut cut = program.place(&PLAIN, 0, &[]).expect("a placement");
     cut.sent();
     drop(cut);
     let cancelled = taken(&heard);
@@ -455,14 +456,14 @@ async fn the_engine_hears_each_requests_end() {
     assert!(cancelled[2].ends_with("Cancelled"), "{cancelled:?}");
     assert_eq!(cancelled.len(), 3);
 
-    let mut streamed = program.place(&PLAIN, &[]).expect("a placement");
+    let mut streamed = program.place(&PLAIN, 0, &[]).expect("a placement");
     streamed.sent();
     let ended = thread::spawn(move || streamed.ended(Side::Single, 200));
     ended.join().expect("the stream's thread ends");
     assert_eq!(taken(&heard), ["issued", "dispatched", "completed 200 Ok"]);
 
     for (status, class) in [(404, "ClientError"), (408, "Timeout"), (504, "Timeout")] {
-        let mut ended = program.place(&PLAIN, &[]).expect("a placement");
+        let mut ended = program.place(&PLAIN, 0, &[]).expect("a placement");
         ended.sent();
         ended.ended(Side::Single, status);
         let completed = format!("completed {status} {class}");
@@ -576,7 +577,7 @@ fn a_request_is_placed_over_the_generation_that_stands() {
     // A request is under way on the worker that leaves.
     let leaving = url(1);
     let mut under_way = loop {
-        let attempt = program.place(&PLAIN, &[]).expect("a placement");
+        let attempt = program.place(&PLAIN, 0, &[]).expect("a placement");
         if attempt.placement.worker.url() == leaving {
             break attempt;
         }

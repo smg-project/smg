@@ -6,8 +6,8 @@
 //! of each membership generation ([`Lists`]). That value keeps the members
 //! the registry published. At its first lending it cuts them into one list
 //! for each kind of worker the program routes to, each with an empty cell
-//! of its own ([`PublishedList`]): the single workers, and the prefills and
-//! the decodes of a pair.
+//! of its own ([`PublishedList`]): the single workers, the prefills and the
+//! decodes of a pair, and the encoders of an encode request.
 //!
 //! The engine takes the registry and the load monitor's channel once, at
 //! its start ([`InProcess::start`]), and reads both in place: the program
@@ -22,13 +22,18 @@
 //! ([`RoutingSettings::policy_document`]): the program writes settings as a
 //! configuration file would, and no document. The settings' mode says the
 //! kinds of worker the program routes to as well ([`Plan`]): single workers
-//! ([`settings`]), or pairs of a prefill worker and a decode worker
-//! ([`pair_settings`]).
+//! ([`settings`]), pairs of a prefill worker and a decode worker
+//! ([`pair_settings`]), or such pairs behind encoders that take a request's
+//! items ([`encode_settings`]).
 //!
 //! Of the engine the program asks what [`Engine`] lists, and nothing else.
 //! It keeps no circuit breaker's count and chooses no rank inside a worker:
 //! both are a route's own, behind the engine's answer. It keeps no limit of
 //! its own on a pair's workers either ([`NoLimit`]).
+//!
+//! An encode request here carries items and no more: the program states no
+//! fact of a worker, so it serves no image, no demand and no item handed as
+//! a reference.
 
 use std::{
     future::Future,
@@ -39,9 +44,11 @@ use http::HeaderMap;
 use smg_grand_central::{
     document::{AppliedSpec, ModeSettings, PolicySettings, RoutingSettings},
     engine::{
-        HeaderRead, InProcess, LentList, ModelLists, PairAdmission, PairLists, PartnerClasses,
-        PlaceRequest, PublishedList, Unplaced, WorkerData, WorkerId, WorkerLists,
+        EncodeClasses, EncodeItems, EncodeLists, EncodeMember, EncoderFacts, HeaderRead, Identity,
+        InProcess, LentList, ModelLists, PairAdmission, PairLists, PartnerClasses, PlaceRequest,
+        PublishedList, Unplaced, WorkerData, WorkerId, WorkerLists,
     },
+    store::{EncodeHandoff, EncodeOffer},
     tracking::{Outcome, Placement, Side, TransportClass},
 };
 use smg_worker::{
@@ -61,6 +68,11 @@ pub const NO_WORKER: u16 = 503;
 /// The statuses a send is asked again for: the set a gateway's retry layer
 /// asks again for.
 pub const ASKED_AGAIN: [u16; 6] = [408, 429, 500, 502, 503, 504];
+
+/// The runtime the program says each of its workers runs, for the encode
+/// handoff ([`Lists::cut`]). It is opaque text: the rule compares it and
+/// reads nothing in it.
+const RUNTIME: &str = "example";
 
 /// The routing settings of a gateway that sets `policy` and nothing else:
 /// each other setting at the value a configuration that leaves it out gets
@@ -85,6 +97,21 @@ pub fn pair_settings(policy: PolicySettings) -> RoutingSettings {
     }
 }
 
+/// The routing settings of a gateway that routes to such pairs behind
+/// encoders, every side under `policy` but the encode side, which keeps the
+/// policy a configuration that names none gets, and sets nothing else
+/// ([`settings`]).
+pub fn encode_settings(policy: PolicySettings) -> RoutingSettings {
+    RoutingSettings {
+        mode: ModeSettings::EncodePrefillDecode {
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        ..settings(policy)
+    }
+}
+
 /// The kinds of worker the program routes to: what each of its requests
 /// lends the engine. It is the settings' word, as a gateway's mode is, and
 /// is not read off a model's workers.
@@ -95,6 +122,9 @@ pub enum Plan {
     /// Pairs of a prefill worker and a decode worker: a request lends the
     /// two lists.
     Pair,
+    /// Such pairs behind encoders: a request lends the three lists, and
+    /// one that carries items states them.
+    Encode,
 }
 
 impl Plan {
@@ -104,15 +134,8 @@ impl Plan {
         match settings.mode {
             ModeSettings::Regular => Some(Self::Single),
             ModeSettings::PrefillDecode { .. } => Some(Self::Pair),
+            ModeSettings::EncodePrefillDecode { .. } => Some(Self::Encode),
             _ => None,
-        }
-    }
-
-    /// The workers one attempt under the plan is sent to.
-    const fn sends(self) -> usize {
-        match self {
-            Self::Single => 1,
-            Self::Pair => 2,
         }
     }
 }
@@ -129,15 +152,27 @@ pub struct Lists {
 }
 
 /// A generation's members by the kind of worker each is: each kind's list
-/// in the registry's order with an empty cell beside it, and the pair
-/// classes of the prefills and the decodes. Which workers pair is the
-/// program's own word: here every prefill pairs with every decode.
+/// in the registry's order with an empty cell beside it, the pair classes
+/// of the prefills and the decodes, and what the encode side reads of the
+/// encoders and of the prefills. Which workers pair is the program's own
+/// word: here every prefill pairs with every decode. Which encoder hands an
+/// item to which prefill is derived by the crate's one rule
+/// ([`EncodeClasses::derive`]) from what the program says each worker
+/// states: here a rendezvous under one runtime, so every encoder hands to
+/// every prefill.
 #[derive(Debug)]
 struct Cut {
     single: PublishedList,
     prefill: PublishedList,
     decode: PublishedList,
+    encode: PublishedList,
     classes: PartnerClasses,
+    /// What the encode side reads of each encoder, by its place in the
+    /// encoders' list.
+    encoder_facts: Box<[EncoderFacts]>,
+    /// The encode class each prefill names, by its place in the prefills'
+    /// list.
+    prefill_classes: Box<[u32]>,
 }
 
 impl Generation for Lists {
@@ -168,14 +203,33 @@ impl Lists {
                 of_kind.cloned().collect()
             };
             let (prefills, decodes) = (of(WorkerType::Prefill), of(WorkerType::Decode));
+            let encoders = of(WorkerType::Encode);
             // Each prefill states every place of the decode list.
             let every: Vec<u32> = (0u32..).take(decodes.len()).collect();
             let partners = prefills.iter().map(|_| every.as_slice());
+            // What each worker states of the encode handoff: a rendezvous
+            // under the one runtime.
+            let offer = EncodeOffer {
+                handoff: EncodeHandoff::Rendezvous,
+                ..EncodeOffer::default()
+            };
+            let member = EncodeMember {
+                runtime: RUNTIME,
+                offer: &offer,
+            };
+            let ends = EncodeClasses::derive(
+                encoders.iter().map(|_| member),
+                prefills.iter().map(|_| member),
+            );
+            let classed = (0..prefills.len()).map(|place| ends.prefill_class(place));
             Cut {
                 classes: PartnerClasses::number(decodes.len(), partners),
+                encoder_facts: ends.encoder_facts(encoders.iter().map(|_| &offer)),
+                prefill_classes: classed.collect(),
                 single: PublishedList::new(of(WorkerType::Regular)),
                 prefill: PublishedList::new(prefills),
                 decode: PublishedList::new(decodes),
+                encode: PublishedList::new(encoders),
             }
         })
     }
@@ -201,6 +255,23 @@ impl Lists {
             prefill_held: &[],
             decode_stalled: &[],
             decode_held: &[],
+        }
+    }
+
+    /// An encode request's three lists lent: the pair's two as a pair lends
+    /// them, the encoders with their cell, and what the encode side reads
+    /// of the encoders and of the prefills, under no veto of the program's
+    /// own.
+    fn encode(&self) -> EncodeLists<'_> {
+        let cut = self.cut();
+        EncodeLists {
+            pair: self.pair(),
+            encoders: cut.encode.lent(),
+            encoders_places: None,
+            encoders_stalled: &[],
+            encoders_held: &[],
+            facts: &cut.encoder_facts,
+            prefill_classes: &cut.prefill_classes,
         }
     }
 }
@@ -240,7 +311,7 @@ impl ModelLists for PublishedLists {
             return;
         };
         let cut = lists.cut();
-        for list in [&cut.single, &cut.prefill, &cut.decode] {
+        for list in [&cut.single, &cut.prefill, &cut.decode, &cut.encode] {
             if !list.workers().is_empty() {
                 hand(list.lent());
             }
@@ -250,9 +321,9 @@ impl ModelLists for PublishedLists {
 
 /// Every call the program makes of the engine once it is started: one.
 ///
-/// [`Engine::place`] is the host contract's one call for a request, a
-/// single one and a pair alike. The start ([`Program::start`]) is the one
-/// other place that names the engine.
+/// [`Engine::place`] is the host contract's one call for a request: a
+/// single one, a pair and an encode request alike. The start
+/// ([`Program::start`]) is the one other place that names the engine.
 struct Engine(&'static InProcess);
 
 impl Engine {
@@ -269,11 +340,17 @@ pub struct Asked<'a> {
     pub model: &'a str,
     /// The request's headers, where it carries any.
     pub headers: Option<&'a HeaderMap>,
+    /// The keys of the request's encode items, its caller's content hash of
+    /// each. Empty for a request with none. A program that routes to no
+    /// encoder reads none.
+    pub items: &'a [Identity<'a>],
 }
 
 /// One attempt of a request on its way: the placement, and the load guard
-/// of each worker it names, a pair's decode as well as its prefill. A route
-/// keeps them to the end of the response, streamed or not.
+/// of each worker the request goes to, a pair's decode as well as its
+/// prefill. A route keeps them to the end of the response, streamed or not.
+/// No guard of an encoder stands here: an item is counted on its encoder
+/// while its own send runs ([`Program::serve`]).
 pub struct InFlight {
     /// The placement, kept: it owns all it holds.
     pub placement: Placement<'static>,
@@ -326,7 +403,8 @@ impl InFlight {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Answer {
     /// The address of the worker each send went to, in order. A pair's
-    /// attempt is two sends: its prefill, then its decode.
+    /// attempt is two sends: its prefill, then its decode. An encode
+    /// request's first attempt sends each item to its encoder ahead of them.
     pub sent: Vec<String>,
     /// The status the client reads: the last attempt's, or [`NO_WORKER`]
     /// where the engine named no worker.
@@ -411,31 +489,52 @@ impl Program {
     }
 
     /// One attempt placed: the engine asked once over the generation that
-    /// stands, for a request that already tried `tried`. It lends what the
-    /// program's plan says: the single workers' list, or a pair's two. The
-    /// answer is the placement kept with the load guard of each worker it
-    /// names, taken under the routing key the placement names.
+    /// stands, for the attempt of number `attempt`, `0` the first, of a
+    /// request that already tried `tried`. The number is stated and not
+    /// counted off `tried`: a failed attempt of a pair names two workers.
+    /// It lends what the program's plan says: the single workers' list, a
+    /// pair's two, or an encode request's three. The items a request
+    /// carries are stated with those three lists, at its first attempt
+    /// alone: a retry states none and is placed as the pair. A model that
+    /// has no generation lends no list and states no item. The answer is
+    /// the placement kept with the load guard of each worker the request
+    /// goes to, under the routing key the placement names. An item's
+    /// encoder takes its guard at the item's send, and no sooner
+    /// ([`Self::serve`]).
     ///
     /// # Errors
     ///
     /// Why the engine named no worker.
-    pub fn place(&self, asked: &Asked<'_>, tried: &[WorkerId]) -> Result<InFlight, Unplaced> {
+    pub fn place(
+        &self,
+        asked: &Asked<'_>,
+        attempt: u8,
+        tried: &[WorkerId],
+    ) -> Result<InFlight, Unplaced> {
         let lists = self.published(asked.model);
         let lent = match (lists.as_deref(), self.plan) {
             (None, _) => WorkerLists::None,
             (Some(lists), Plan::Single) => WorkerLists::Single(lists.lent()),
             (Some(lists), Plan::Pair) => WorkerLists::Pair(lists.pair()),
+            (Some(lists), Plan::Encode) => WorkerLists::Encode(lists.encode()),
         };
         let headers: &dyn HeaderRead = match asked.headers {
             Some(headers) => headers,
             None => &(),
         };
-        // A failed attempt states each worker it was sent to as tried, a
-        // pair's two: the attempt's number is counted in attempts.
-        let attempt = tried.len() / self.plan.sends();
+        // Items go with an encode request's three lists and with no other:
+        // those lists with none stated are placed as their pair, and a model
+        // that lends no list states none. They go out once a request, so the
+        // first attempt alone states them. The type takes no literal outside
+        // the library, so the keys are written over its default.
+        let mut items = EncodeItems::default();
+        items.keys = asked.items;
+        let lends = matches!(lent, WorkerLists::Encode(_));
+        let carries = attempt == 0 && lends && !asked.items.is_empty();
         let request = PlaceRequest {
             headers,
-            attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
+            encode: carries.then_some(items),
+            attempt,
             tried,
             ..PlaceRequest::of(asked.model, lent)
         };
@@ -457,13 +556,31 @@ impl Program {
     /// the next attempt past the workers tried, up to [`ATTEMPTS`]
     /// attempts. Both sides of a pair are sent, whatever the first answered:
     /// the attempt's status is its prefill's where that one failed, and its
-    /// decode's otherwise. A route does more than this: it waits between two
-    /// attempts, and a response can say that it is not to be asked again.
+    /// decode's otherwise.
+    ///
+    /// An encode request's items go out once a request, with its first
+    /// attempt: each to the encoder the placement names for it, ahead of
+    /// the pair. That order is this program's own: a gateway whose workers
+    /// state a rendezvous launches the items beside the pair. An item is
+    /// counted on its encoder while its send runs, under no routing key,
+    /// as a gateway's encode stage counts it: the key is the pair's, and an
+    /// encoder that answered holds the request no more. Nothing is said of
+    /// an encoder, since no lease stands for one.
+    ///
+    /// An encoder's failure is the request's answer: neither side of the
+    /// pair is sent, the placement's drop gives the pair up, and no attempt
+    /// follows. A retry behind a failed side of the pair states no item and
+    /// sends none: it is placed as the pair alone, with the pair's two
+    /// workers as tried and no encoder, as a gateway's retry is.
+    ///
+    /// A route does more than this: it waits between two attempts, and a
+    /// response can say that it is not to be asked again.
     pub fn serve(&self, asked: &Asked<'_>) -> Answer {
-        let (mut tried, mut sent, mut attempts) = (Vec::new(), Vec::new(), 0);
+        let (mut tried, mut sent, mut attempts) = (Vec::new(), Vec::new(), 0u8);
         loop {
+            let placed = self.place(asked, attempts, &tried);
             attempts += 1;
-            let mut attempt = match self.place(asked, &tried) {
+            let mut attempt = match placed {
                 Ok(attempt) => attempt,
                 Err(unplaced) => {
                     return Answer {
@@ -473,19 +590,40 @@ impl Program {
                     };
                 }
             };
-            attempt.sent();
+            // The first send that failed is the attempt's answer. Every item
+            // goes out, whatever an earlier one's encoder answered.
             let mut status = 0;
+            for encoder in attempt.placement.encoders.workers() {
+                let answered = {
+                    // Counted on its encoder until the send ends.
+                    let _counted = WorkerLoadGuard::with_key(Arc::clone(encoder), None);
+                    (self.sends)(encoder.as_ref())
+                };
+                sent.push(encoder.url().to_owned());
+                if status < 400 {
+                    status = answered;
+                }
+            }
+            if status >= 400 {
+                // An item goes out once a request: its encoder's failure is
+                // the request's answer, and neither side of the pair is sent.
+                return Answer {
+                    sent,
+                    status,
+                    unplaced: None,
+                };
+            }
+            attempt.sent();
             for &side in attempt.sides() {
                 let worker = Arc::clone(attempt.worker(side));
                 let answered = (self.sends)(worker.as_ref());
                 attempt.ended(side, answered);
                 sent.push(worker.url().to_owned());
-                // The first side that failed is the attempt's answer.
                 if status < 400 {
                     status = answered;
                 }
             }
-            if !ASKED_AGAIN.contains(&status) || attempts == ATTEMPTS {
+            if !ASKED_AGAIN.contains(&status) || usize::from(attempts) == ATTEMPTS {
                 return Answer {
                     sent,
                     status,

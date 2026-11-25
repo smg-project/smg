@@ -8,13 +8,15 @@
 //! ([`InProcess::place`]): it keeps the placement to the request's end
 //! and says when the request went out and how it ended.
 //!
-//! `program.rs` is the program. This file runs it twice, over workers that
-//! serve nothing: a send is a line on the output. The first run is over
+//! `program.rs` is the program. This file runs it three times, over workers
+//! that serve nothing: a send is a line on the output. The first run is over
 //! three single workers, one of which answers every send with a server
 //! error, so a request that meets it is asked again past it. The second is
 //! over pairs of a prefill worker and a decode worker: the settings' mode
 //! says so, a request lends the two lists, and the same one call names both
-//! of its workers.
+//! of its workers. The third is over such a pair behind two encoders: a
+//! request lends the three lists, one that carries an item states it, and
+//! the call names the item's encoder too.
 //!
 //! `engine_load.rs` is a stage of the program's own, a scorer added in
 //! code. This file shows it once over records made by hand, as a program
@@ -34,10 +36,12 @@
 use std::{error::Error, sync::Arc};
 
 use engine_load::{decided_by_engine_load, stages};
-use program::{pair_settings, settings, Asked, Plan, Program};
+use program::{encode_settings, pair_settings, settings, Asked, Plan, Program};
 use smg_grand_central::{
     document::{AppliedSpec, PolicySettings, PolicySpec},
-    engine::{Candidate, Constraints, PoolFacts, RequestFacts, Role, Scratch, Target, WorkerId},
+    engine::{
+        Candidate, Constraints, Identity, PoolFacts, RequestFacts, Role, Scratch, Target, WorkerId,
+    },
 };
 use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -141,6 +145,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let asked = Asked {
         model: MODEL,
         headers: None,
+        items: &[],
     };
     for request in 1..=4 {
         println!("request {request}:");
@@ -162,6 +167,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         answer.unplaced
     );
     pairs(&asked).await?;
+    encodes(&asked).await?;
     own_stage()
 }
 
@@ -195,5 +201,46 @@ async fn pairs(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
         let answer = program.serve(asked);
         println!("  the client reads {}", answer.status);
     }
+    Ok(())
+}
+
+/// The program over a pair behind encoders: the same settings under the
+/// mode of a gateway that sends a request's items to encode workers. Each
+/// request lends the three lists. One that carries an item states it, and
+/// its one call names the item's encoder beside the pair: this program
+/// sends the item first. The same request with no item is placed as its
+/// pair.
+async fn encodes(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let settings = encode_settings(PolicySettings::RoundRobin);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let fleet = [
+        ("http://encode-0:8000", WorkerType::Encode),
+        ("http://encode-1:8000", WorkerType::Encode),
+        ("http://prefill-0:8000", WorkerType::Prefill),
+        ("http://decode-0:8000", WorkerType::Decode),
+    ];
+    for (address, kind) in fleet {
+        assert!(program.join(worker(address, kind)), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    // An item's key is its caller's hash of the item's content.
+    let items = [Identity::plain("the hash of an item's content")];
+    let carrying = Asked {
+        items: &items,
+        ..*asked
+    };
+    println!("an encode request of one item:");
+    let answer = program.serve(&carrying);
+    println!("  the client reads {}", answer.status);
+    println!("the same request with no item:");
+    let answer = program.serve(asked);
+    println!("  the client reads {}", answer.status);
     Ok(())
 }
