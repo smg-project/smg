@@ -171,6 +171,16 @@ pub struct PixelNorm {
 }
 
 impl PixelNorm {
+    /// Keep each pixel at its original byte level.
+    pub(crate) fn identity(channel_block: usize) -> Self {
+        Self {
+            scale: 1.0,
+            offset: [0.0; 3],
+            divisor: [1.0; 3],
+            channel_block,
+        }
+    }
+
     /// The `f32` each byte maps to, per channel.
     pub fn table_f32(&self) -> [[f32; 256]; 3] {
         std::array::from_fn(|channel| {

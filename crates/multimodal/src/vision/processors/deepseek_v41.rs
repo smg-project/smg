@@ -157,6 +157,7 @@ pub struct DeepseekV41Processor {
     max_n_token: usize,
     min_pixels: usize,
     max_wh_ratio: Option<f64>,
+    normalize: bool,
 }
 
 impl Default for DeepseekV41Processor {
@@ -168,13 +169,7 @@ impl Default for DeepseekV41Processor {
 impl DeepseekV41Processor {
     /// Processor with the checkpoint's `vision_config` defaults.
     pub fn new() -> Self {
-        Self {
-            patch_size: DEFAULT_PATCH_SIZE,
-            downsample_ratio: DEFAULT_DOWNSAMPLE_RATIO,
-            max_n_token: DEFAULT_MAX_NUM_TOKENS,
-            min_pixels: DEFAULT_MIN_PIXELS,
-            max_wh_ratio: None,
-        }
+        Self::from_preprocessor_config(&PreProcessorConfig::default())
     }
 
     /// Build from a preprocessor config, falling back to the checkpoint
@@ -197,6 +192,7 @@ impl DeepseekV41Processor {
                 .max(MIN_MAX_NUM_TOKENS),
             min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
             max_wh_ratio: config.get_extra("max_wh_ratio"),
+            normalize: config.do_rescale.unwrap_or(true) || config.do_normalize.unwrap_or(true),
         }
     }
 
@@ -259,18 +255,13 @@ impl DeepseekV41Processor {
         }
     }
 
-    /// Normalize (`/ 255`, then `(x - 0.5) / 0.5`) fused with patchification,
-    /// appended to `out`: patch `(i, j)` in row-major order holds `[c, dy, dx]`
-    /// elements, matching the reference
-    /// `reshape(3, n_vit_h, p, n_vit_w, p).permute(1, 3, 0, 2, 4)`. `table`
-    /// is [`value_table`]: the normalized value of every byte, so the pass is
-    /// a lookup per element, written once in patch order.
-    fn patchify_into(
+    /// Append patches in row-major order with `[c, dy, dx]` within each patch.
+    fn patchify_into<T>(
         &self,
         image: &RgbImage,
         plan: &GridPlan,
-        table: &[f32; 256],
-        out: &mut Vec<f32>,
+        map: &impl Fn(u8) -> T,
+        out: &mut Vec<T>,
     ) {
         let p = self.patch_size;
         let raw = image.as_raw();
@@ -280,12 +271,7 @@ impl DeepseekV41Processor {
                 for c in 0..3 {
                     for dy in 0..p {
                         let row = &raw[(i * p + dy) * row_stride + j * p * 3..][..p * 3];
-                        out.extend(
-                            row.as_chunks::<3>()
-                                .0
-                                .iter()
-                                .map(|pixel| table[usize::from(pixel[c])]),
-                        );
+                        out.extend(row.as_chunks::<3>().0.iter().map(|pixel| map(pixel[c])));
                     }
                 }
             }
@@ -322,6 +308,36 @@ impl DeepseekV41Processor {
                 }
             }
         }
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "the patch buffer is sized from the plans it is reshaped by"
+    )]
+    fn preprocess_patches<T>(
+        &self,
+        images: &[&DynamicImage],
+        plans: &[GridPlan],
+        map: impl Fn(u8) -> T,
+    ) -> Result<Array4<T>, TransformError> {
+        let total_patches: usize = plans.iter().map(|plan| plan.n_vit_h * plan.n_vit_w).sum();
+        let p = self.patch_size;
+        // Every image's patches land in the one buffer the engine reads, in
+        // order; no per-image copy.
+        let mut encoder_input = Vec::new();
+        encoder_input
+            .try_reserve_exact(output_len(&[total_patches, 3, p, p])?)
+            .map_err(refused)?;
+        for (image, plan) in images.iter().zip(plans) {
+            let transformed = self.transform(image, plan)?;
+            self.patchify_into(&transformed, plan, &map, &mut encoder_input);
+        }
+
+        // The engine consumes patches as `(np, 3, p, p)` (see its
+        // `DeepseekV4VLImagePixelInputs`).
+        let encoder_input = Array4::from_shape_vec((total_patches, 3, p, p), encoder_input)
+            .expect("the patch buffer matches its shape by construction");
+        Ok(encoder_input)
     }
 
     /// The resize plan of every image of the batch, in order.
@@ -406,7 +422,7 @@ fn wire_norm(patch_size: usize) -> PixelNorm {
         scale: 1.0,
         offset: [127.5; 3],
         divisor: [127.5; 3],
-        channel_block: patch_size * patch_size,
+        channel_block: patch_size.saturating_mul(patch_size),
     }
 }
 
@@ -471,49 +487,41 @@ impl VisionPreProcessor for DeepseekV41Processor {
         [0.5, 0.5, 0.5]
     }
 
-    #[expect(
-        clippy::expect_used,
-        reason = "the patch buffer is written in patch order and sized by the plans it is reshaped by"
-    )]
+    fn emits_pixel_bytes(&self) -> bool {
+        !self.normalize
+    }
+
     fn preprocess(
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         TransformError::if_empty(images)?;
-
         let plans = self.plans(images);
-        let total_patches: usize = plans.iter().map(|plan| plan.n_vit_h * plan.n_vit_w).sum();
-        let p = self.patch_size;
-        // Every image's patches land in the one buffer the engine reads, in
-        // order; no per-image copy.
-        let mut encoder_input = Vec::new();
-        encoder_input
-            .try_reserve_exact(output_len(&[total_patches, 3, p, p])?)
-            .map_err(refused)?;
-        let table = value_table();
-        for (image, plan) in images.iter().zip(&plans) {
-            let transformed = self.transform(image, plan)?;
-            self.patchify_into(&transformed, plan, &table, &mut encoder_input);
-        }
-
-        // The engine consumes patches as `(np, 3, p, p)` (see its
-        // `DeepseekV4VLImagePixelInputs`).
-        let encoder_input = Array4::from_shape_vec((total_patches, 3, p, p), encoder_input)
-            .expect("the patch buffer matches its shape by construction");
-        Ok(with_spans(images, &plans, encoder_input.into()))
+        let input = if self.normalize {
+            let levels = value_table();
+            self.preprocess_patches(images, &plans, |v| levels[usize::from(v)])?
+                .into()
+        } else {
+            let patches = self.preprocess_patches(images, &plans, |v| v)?;
+            EncoderInput::bytes(
+                patches,
+                PixelNorm::identity(self.patch_size * self.patch_size),
+            )
+        };
+        Ok(with_spans(images, &plans, input))
     }
 
     /// The batch written once in `dtype` through the crate's writer, for
     /// `bfloat16` and `float16`: every byte's value there is the float
     /// path's value narrowed. `None` for `float32`, where the values of the
     /// normalization a wire carries are not the reference's (the two-pass
-    /// path serves them), and for `uint8` (the processor emits floats).
+    /// path serves them). Raw output is emitted by `preprocess`.
     fn preprocess_wire(
         &self,
         images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
-        if !matches!(dtype, EncoderDtype::BFloat16 | EncoderDtype::Float16) {
+        if !self.normalize || !matches!(dtype, EncoderDtype::BFloat16 | EncoderDtype::Float16) {
             return None;
         }
         let writer = WireWriter::new(&wire_norm(self.patch_size), dtype)?;
@@ -691,6 +699,41 @@ mod tests {
     }
 
     #[test]
+    fn raw_patches_preserve_padding_layout_and_span() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 48, Rgb([10, 200, 30])));
+        let defaults = PreProcessorConfig::default();
+        let config = PreProcessorConfig {
+            do_normalize: Some(false),
+            do_rescale: Some(false),
+            ..defaults.clone()
+        };
+        let processor = DeepseekV41Processor::from_preprocessor_config(&config);
+        let baseline = DeepseekV41Processor::from_preprocessor_config(&defaults)
+            .preprocess(&[&image])
+            .unwrap();
+        let raw = processor.preprocess(&[&image]).unwrap();
+        assert!(processor.emits_pixel_bytes());
+        assert_eq!(raw.feature_token_counts, baseline.feature_token_counts);
+        assert_eq!(raw.item_sizes, baseline.item_sizes);
+        assert_eq!(raw.encoder_input.shape(), baseline.encoder_input.shape());
+        assert!(!DeepseekV41Processor::new().emits_pixel_bytes());
+        assert!(matches!(baseline.encoder_input, EncoderInput::F32(_)));
+        assert!(processor
+            .preprocess_wire(&[&image], EncoderDtype::BFloat16)
+            .is_none());
+        let EncoderInput::U8 { patches, norm } = raw.encoder_input else {
+            panic!("expected raw DeepSeek patches");
+        };
+        assert_eq!(norm, PixelNorm::identity(14 * 14));
+        assert_eq!(patches[[0, 0, 0, 0]], 127);
+        let levels = value_table();
+        assert!(patches
+            .iter()
+            .zip(baseline.encoder_input.as_f32().iter())
+            .all(|(&byte, &value)| levels[usize::from(byte)].to_bits() == value.to_bits()));
+    }
+
+    #[test]
     fn preprocess_emits_engine_contract() {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 48, Rgb([10, 200, 30])));
         let processor = DeepseekV41Processor::new();
@@ -800,8 +843,8 @@ mod tests {
     /// `float16`, the writer's value of every byte is the float path's value
     /// narrowed. In `float32` the normalization a wire carries rounds once
     /// where the reference rounds twice, and half of the bytes differ: that
-    /// dtype is left to the two-pass path, as `uint8` is (the processor
-    /// emits floats). The empty batch answers as `preprocess` does.
+    /// dtype is written via the float input's exact lookup. The empty batch
+    /// answers as `preprocess` does.
     #[test]
     fn the_wire_is_written_only_where_its_values_are_the_float_paths() {
         let processor = DeepseekV41Processor::new();

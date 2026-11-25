@@ -56,11 +56,11 @@
 use std::borrow::Cow;
 
 use image::DynamicImage;
-use ndarray::{Array2, ArrayD, IxDyn};
+use ndarray::{ArrayD, IxDyn};
 use serde_json::{json, Value};
 
 use crate::{
-    encoder_inputs::ModelSpecificValue,
+    encoder_inputs::{EncoderInput, ModelSpecificValue, PixelNorm},
     types::{RgbFrameRef, VideoSamplingInfo},
     vision::{
         preprocessor_config::PreProcessorConfig,
@@ -69,8 +69,8 @@ use crate::{
             VisionPreprocessingContext,
         },
         transforms::{
-            resize_bicubic_torch_aa_f32, resize_bicubic_torch_aa_f32_strips, rgb_bytes,
-            TransformError,
+            resize_bicubic_torch_aa_f32, resize_bicubic_torch_aa_f32_strips,
+            resize_bicubic_torch_aa_rgb, rgb_bytes, TransformError,
         },
     },
 };
@@ -326,9 +326,12 @@ enum Layout {
     Reference,
 }
 
+type FloatNormalization = ([f32; 3], [f32; 3]);
+
 /// C-RADIO image and video preprocessor for the Nemotron VL / Omni family.
 #[derive(Debug, Clone)]
 pub struct NemotronOmniProcessor {
+    normalization: Option<FloatNormalization>,
     geometry: NemotronGeometry,
     layout: Layout,
 }
@@ -344,32 +347,48 @@ impl NemotronOmniProcessor {
     /// for that checkpoint's 16-pixel patch, so the geometry is not a
     /// parameter.
     pub fn new() -> Self {
-        Self {
-            geometry: NemotronGeometry {
-                patch_size: PATCH_SIZE,
-                downsample_ratio: 0.5,
-                image_size: 512,
-                use_thumbnail: true,
-                norm_mean: CLIP_MEAN,
-                norm_std: CLIP_STD,
-                dynamic: Some((MIN_NUM_PATCHES, MAX_NUM_PATCHES)),
-                video_frame_size: VideoFrameSize::Patches {
-                    patches: VIDEO_TARGET_PATCHES,
-                    keep_aspect: true,
-                },
-                video_temporal_patch_size: VIDEO_TEMPORAL_PATCH_SIZE,
-                max_num_tiles: DEFAULT_MAX_NUM_TILES,
+        let geometry = NemotronGeometry {
+            patch_size: PATCH_SIZE,
+            downsample_ratio: 0.5,
+            image_size: 512,
+            use_thumbnail: true,
+            norm_mean: CLIP_MEAN,
+            norm_std: CLIP_STD,
+            dynamic: Some((MIN_NUM_PATCHES, MAX_NUM_PATCHES)),
+            video_frame_size: VideoFrameSize::Patches {
+                patches: VIDEO_TARGET_PATCHES,
+                keep_aspect: true,
             },
+            video_temporal_patch_size: VIDEO_TEMPORAL_PATCH_SIZE,
+            max_num_tiles: DEFAULT_MAX_NUM_TILES,
+        };
+        Self {
             layout: Layout::Packed,
+            ..Self::reference(geometry)
         }
     }
 
     /// The Reference processor of a checkpoint's geometry.
     pub fn reference(geometry: NemotronGeometry) -> Self {
         Self {
+            normalization: Some(Self::normalization(&geometry)),
             geometry,
             layout: Layout::Reference,
         }
+    }
+
+    fn normalization(geometry: &NemotronGeometry) -> FloatNormalization {
+        (
+            geometry.norm_mean.map(|value| value as f32),
+            geometry.norm_std.map(|value| value as f32),
+        )
+    }
+
+    pub(crate) fn with_pixel_config(mut self, config: &PreProcessorConfig) -> Self {
+        self.normalization = (config.do_rescale.unwrap_or(true)
+            || config.do_normalize.unwrap_or(true))
+        .then(|| Self::normalization(&self.geometry));
+        self
     }
 
     /// The checkpoint config field, as a JSON pointer, whose value differs from
@@ -628,11 +647,10 @@ impl NemotronOmniProcessor {
         rows: usize,
         cols: usize,
         out: &mut Vec<f32>,
+        (mean, scale): FloatNormalization,
     ) -> Result<(), TransformError> {
         let p = PATCH_SIZE;
         let (out_w, out_h) = (cols * p, rows * p);
-        let scale = CLIP_STD.map(|s| s as f32);
-        let mean = CLIP_MEAN.map(|m| m as f32);
         // The resize hands over one row of patches at a time, so the resized
         // image never stands whole in memory.
         let patch_row = move |strip: &[f32]| {
@@ -665,11 +683,27 @@ impl NemotronOmniProcessor {
         Ok(())
     }
 
+    fn append_packed_patches(
+        pixels: &mut Pixels,
+        raw: &[u8],
+        (width, height): (u32, u32),
+        (rows, cols): (usize, usize),
+    ) -> Result<(), TransformError> {
+        let patch = PATCH_SIZE;
+        match pixels {
+            Pixels::Float(out, normalization) => {
+                Self::patches(raw, width, height, rows, cols, out, *normalization)
+            }
+            Pixels::Raw(_) => pixels.append_windows(
+                raw,
+                (width as usize, height as usize),
+                (cols * patch, rows * patch),
+                windows(rows, cols, patch),
+            ),
+        }
+    }
+
     /// Packed: one clip's frames as patches plus its `video_grid_thw`.
-    #[expect(
-        clippy::expect_used,
-        reason = "the patch buffer is sized from the grid it is reshaped by"
-    )]
     fn video_patches(
         &self,
         frames: &[RgbFrameRef<'_>],
@@ -678,7 +712,8 @@ impl NemotronOmniProcessor {
         let (out_h, out_w) = self.plan_video_size(first.width, first.height);
         let (rows, cols) = (out_h / PATCH_SIZE, out_w / PATCH_SIZE);
         let patch_len = 3 * PATCH_SIZE * PATCH_SIZE;
-        let mut encoder_input = Vec::with_capacity(frames.len() * rows * cols * patch_len);
+        let mut pixels =
+            Pixels::with_capacity(self.normalization, frames.len() * rows * cols * patch_len);
         for frame in frames {
             if (frame.width, frame.height) != (first.width, first.height) {
                 return Err(TransformError::ShapeError(format!(
@@ -686,19 +721,18 @@ impl NemotronOmniProcessor {
                     first.width, first.height, frame.width, frame.height
                 )));
             }
-            Self::patches(
+            Self::append_packed_patches(
+                &mut pixels,
                 frame.data,
-                frame.width,
-                frame.height,
-                rows,
-                cols,
-                &mut encoder_input,
+                (frame.width, frame.height),
+                (rows, cols),
             )?;
         }
         let tubelets = frames.len().div_ceil(VIDEO_TEMPORAL_PATCH_SIZE);
-        let encoder_input =
-            Array2::from_shape_vec((frames.len() * rows * cols, patch_len), encoder_input)
-                .expect("frame patches match their shape by construction");
+        let encoder_input = pixels.into_encoder(
+            &[frames.len() * rows * cols, patch_len],
+            PATCH_SIZE * PATCH_SIZE,
+        )?;
         Ok(PreprocessedEncoderInputs::new(
             encoder_input,
             vec![tubelets * grid_tokens(rows, cols)],
@@ -738,32 +772,6 @@ impl NemotronOmniProcessor {
         resize_bicubic_torch_aa_f32(raw, w, h, ow, oh)
     }
 
-    /// Reference: append the `(x, y, w, h)` window of a resized image
-    /// `stride` pixels wide, channel-major, as `(x / 255 - mean) / std`.
-    fn push_window(
-        &self,
-        out: &mut Vec<f32>,
-        resized: &[f32],
-        stride: usize,
-        (x0, y0, w, h): (usize, usize, usize, usize),
-    ) {
-        let mean = self.geometry.norm_mean.map(|m| m as f32);
-        let std = self.geometry.norm_std.map(|s| s as f32);
-        let (pixels, _) = resized.as_chunks::<3>();
-        for c in 0..3 {
-            let (mean, std) = (mean[c], std[c]);
-            for y in y0..y0 + h {
-                let row = &pixels[y * stride + x0..][..w];
-                out.extend(row.iter().map(|px| (px[c] / 255.0 - mean) / std));
-            }
-        }
-    }
-
-    fn encoder_input(data: Vec<f32>, shape: [usize; 4]) -> Result<ArrayD<f32>, TransformError> {
-        ArrayD::from_shape_vec(IxDyn(&shape), data)
-            .map_err(|e| TransformError::ShapeError(format!("{shape:?}: {e}")))
-    }
-
     /// Reference: one batch of a call's tiled images.
     fn preprocess_tiled(
         &self,
@@ -778,37 +786,29 @@ impl NemotronOmniProcessor {
             .iter()
             .map(|&(columns, rows)| self.tile_count(columns, rows))
             .sum();
-        let mut pixels = Vec::with_capacity(total_tiles * 3 * side * side);
+        let mut pixels = Pixels::with_capacity(self.normalization, total_tiles * 3 * side * side);
         let mut tiles_per_image = Vec::with_capacity(images.len());
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
         for (image, &(columns, rows)) in images.iter().zip(&plans) {
             let (width, height, raw) = Self::rgb_on_white(image);
             let (out_w, out_h) = (columns * side, rows * side);
-            {
-                let resized = Self::resized(&raw, (width, height), (out_w, out_h))?;
-                for row in 0..rows {
-                    for column in 0..columns {
-                        self.push_window(
-                            &mut pixels,
-                            &resized,
-                            out_w,
-                            (column * side, row * side, side, side),
-                        );
-                    }
-                }
-            }
+            pixels.append_windows(
+                &raw,
+                (width, height),
+                (out_w, out_h),
+                windows(rows, columns, side),
+            )?;
             let tiles = self.tile_count(columns, rows);
             if tiles > columns * rows {
-                let thumbnail = Self::resized(&raw, (width, height), (side, side))?;
-                self.push_window(&mut pixels, &thumbnail, side, (0, 0, side, side));
+                pixels.append_windows(&raw, (width, height), (side, side), windows(1, 1, side))?;
             }
             tiles_per_image.push(tiles as i64);
             feature_token_counts.push(tiles * self.geometry.tile_tokens());
             item_sizes.push((image.width(), image.height()));
         }
         Ok(PreprocessedEncoderInputs::new(
-            Self::encoder_input(pixels, [total_tiles, 3, side, side])?,
+            pixels.into_encoder(&[total_tiles, 3, side, side], side * side)?,
             feature_token_counts,
             item_sizes,
         )
@@ -833,7 +833,7 @@ impl NemotronOmniProcessor {
         let shuffle = self.geometry.shuffle();
         let planned = self.plan_grids(&sizes, context.token_budget)?;
         let total_patches: usize = planned.iter().map(|&(rows, cols)| rows * cols).sum();
-        let mut pixels = Vec::with_capacity(total_patches * 3 * p * p);
+        let mut pixels = Pixels::with_capacity(self.normalization, total_patches * 3 * p * p);
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
         let mut resized_sizes = Vec::with_capacity(images.len());
@@ -842,12 +842,12 @@ impl NemotronOmniProcessor {
         for (image, &(rows, cols)) in images.iter().zip(&planned) {
             let (width, height, raw) = Self::rgb_on_white(image);
             let (out_w, out_h) = (cols * p, rows * p);
-            let resized = Self::resized(&raw, (width, height), (out_w, out_h))?;
-            for row in 0..rows {
-                for column in 0..cols {
-                    self.push_window(&mut pixels, &resized, out_w, (column * p, row * p, p, p));
-                }
-            }
+            pixels.append_windows(
+                &raw,
+                (width, height),
+                (out_w, out_h),
+                windows(rows, cols, p),
+            )?;
             let tokens = rows * cols / (shuffle * shuffle);
             feature_token_counts.push(tokens);
             item_sizes.push((image.width(), image.height()));
@@ -855,8 +855,7 @@ impl NemotronOmniProcessor {
             tokens_per_image.push(tokens as i64);
             patches_per_image.push((rows * cols) as i64);
         }
-        let encoder_input = Array2::from_shape_vec((total_patches, 3 * p * p), pixels)
-            .map_err(|e| TransformError::ShapeError(format!("dynamic image patches: {e}")))?;
+        let encoder_input = pixels.into_encoder(&[total_patches, 3 * p * p], p * p)?;
         Ok(
             PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes)
                 .with_extra("imgs_sizes", ModelSpecificValue::TupleVec(resized_sizes))
@@ -901,7 +900,8 @@ impl NemotronOmniProcessor {
             )));
         }
         let (out_h, out_w) = self.plan_video_size(first.width, first.height);
-        let mut pixels = Vec::with_capacity(frames.len() * 3 * out_w * out_h);
+        let mut pixels =
+            Pixels::with_capacity(self.normalization, frames.len() * 3 * out_w * out_h);
         for frame in frames {
             if (frame.width, frame.height) != (first.width, first.height) {
                 return Err(TransformError::ShapeError(format!(
@@ -910,15 +910,14 @@ impl NemotronOmniProcessor {
                 )));
             }
             let size = (frame.width as usize, frame.height as usize);
-            let resized = Self::resized(frame.data, size, (out_w, out_h))?;
-            self.push_window(&mut pixels, &resized, out_w, (0, 0, out_w, out_h));
+            pixels.append_windows(frame.data, size, (out_w, out_h), [(0, 0, out_w, out_h)])?;
         }
         let p = self.geometry.patch_size;
         let tokens =
             self.geometry.tubelets(frames.len()) * self.geometry.frame_tokens(out_h / p, out_w / p);
         let indices: Vec<i64> = sampling.frame_indices.iter().map(|&i| i as i64).collect();
         Ok(PreprocessedEncoderInputs::new(
-            Self::encoder_input(pixels, [frames.len(), 3, out_h, out_w])?,
+            pixels.into_encoder(&[frames.len(), 3, out_h, out_w], out_h * out_w)?,
             vec![tokens],
             vec![(first.width, first.height)],
         )
@@ -937,7 +936,104 @@ impl NemotronOmniProcessor {
     }
 }
 
+/// A preprocessing batch uses one resize precision and one output dtype.
+enum Pixels {
+    Float(Vec<f32>, FloatNormalization),
+    Raw(Vec<u8>),
+}
+
+impl Pixels {
+    fn with_capacity(normalization: Option<FloatNormalization>, capacity: usize) -> Self {
+        match normalization {
+            Some(normalization) => Self::Float(Vec::with_capacity(capacity), normalization),
+            None => Self::Raw(Vec::with_capacity(capacity)),
+        }
+    }
+
+    fn append_windows(
+        &mut self,
+        raw: &[u8],
+        size: (usize, usize),
+        target: (usize, usize),
+        windows: impl IntoIterator<Item = (usize, usize, usize, usize)>,
+    ) -> Result<(), TransformError> {
+        let (out_w, out_h) = target;
+        match self {
+            Self::Raw(out) => {
+                let resized = resize_bicubic_torch_aa_rgb(
+                    raw,
+                    size.0 as u32,
+                    size.1 as u32,
+                    out_w as u32,
+                    out_h as u32,
+                )?;
+                for window in windows {
+                    append_window(out, resized.as_raw(), out_w, window, |pixel, _| pixel);
+                }
+            }
+            Self::Float(out, (mean, std)) => {
+                let resized = NemotronOmniProcessor::resized(raw, size, target)?;
+                for window in windows {
+                    append_window(out, &resized, out_w, window, |pixel, channel| {
+                        (pixel / 255.0 - mean[channel]) / std[channel]
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_encoder(
+        self,
+        shape: &[usize],
+        channel_block: usize,
+    ) -> Result<EncoderInput, TransformError> {
+        let error = |err| TransformError::ShapeError(format!("{shape:?}: {err}"));
+        match self {
+            Self::Raw(values) => ArrayD::from_shape_vec(IxDyn(shape), values)
+                .map(|pixels| EncoderInput::bytes(pixels, PixelNorm::identity(channel_block)))
+                .map_err(error),
+            Self::Float(values, _) => ArrayD::from_shape_vec(IxDyn(shape), values)
+                .map(EncoderInput::from)
+                .map_err(error),
+        }
+    }
+}
+
+fn windows(
+    rows: usize,
+    cols: usize,
+    side: usize,
+) -> impl Iterator<Item = (usize, usize, usize, usize)> {
+    (0..rows).flat_map(move |row| (0..cols).map(move |col| (col * side, row * side, side, side)))
+}
+
+/// Append a window from interleaved RGB in channel-major order.
+fn append_window<T: Copy>(
+    out: &mut Vec<T>,
+    resized: &[T],
+    stride: usize,
+    (x, y, width, height): (usize, usize, usize, usize),
+    map: impl Fn(T, usize) -> T,
+) {
+    let (pixels, _) = resized.as_chunks::<3>();
+    for channel in 0..3 {
+        for row in y..y + height {
+            let start = row * stride + x;
+            out.extend(
+                pixels[start..][..width]
+                    .iter()
+                    .map(|pixel| map(pixel[channel], channel)),
+            );
+        }
+    }
+}
+
 impl VisionPreProcessor for NemotronOmniProcessor {
+    fn emits_pixel_bytes(&self) -> bool {
+        self.normalization.is_none()
+    }
+
     /// The packed layout only, and only without a token budget, which the
     /// call's images share.
     fn supports_per_image_preprocessing(&self) -> bool {
@@ -961,10 +1057,6 @@ impl VisionPreProcessor for NemotronOmniProcessor {
 
     /// One batch: packed and tiled images always join, and reference
     /// dynamic-resolution images join as flat patches whatever their sizes.
-    #[expect(
-        clippy::expect_used,
-        reason = "the patch buffer is filled from the planned grids it is reshaped by"
-    )]
     fn preprocess_with_context(
         &self,
         images: &[&DynamicImage],
@@ -983,34 +1075,30 @@ impl VisionPreProcessor for NemotronOmniProcessor {
             .collect();
         let planned = self.plan_grids(&sizes, context.token_budget)?;
         let patch_len = 3 * PATCH_SIZE * PATCH_SIZE;
-        let mut encoder_input = Vec::with_capacity(
-            planned
-                .iter()
-                .map(|(rows, cols)| rows * cols * patch_len)
-                .sum(),
-        );
+        let total_patches = planned
+            .iter()
+            .map(|(rows, cols)| rows * cols)
+            .sum::<usize>();
+        let mut pixels = Pixels::with_capacity(self.normalization, total_patches * patch_len);
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len() * 2);
         let mut patches_per_image = Vec::with_capacity(images.len());
         for (image, &(rows, cols)) in images.iter().zip(&planned) {
             let (width, height, raw) = Self::rgb_on_white(image);
-            Self::patches(
+            Self::append_packed_patches(
+                &mut pixels,
                 &raw,
-                width as u32,
-                height as u32,
-                rows,
-                cols,
-                &mut encoder_input,
+                (width as u32, height as u32),
+                (rows, cols),
             )?;
             feature_token_counts.push(grid_tokens(rows, cols));
             item_sizes.push((image.width(), image.height()));
             grids.extend([rows as i64, cols as i64]);
             patches_per_image.push((rows * cols) as i64);
         }
-        let total_patches = encoder_input.len() / patch_len;
-        let encoder_input = Array2::from_shape_vec((total_patches, patch_len), encoder_input)
-            .expect("concatenated patch buffer matches its shape by construction");
+        let encoder_input =
+            pixels.into_encoder(&[total_patches, patch_len], PATCH_SIZE * PATCH_SIZE)?;
         Ok(
             PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes)
                 .with_extra(
@@ -1261,7 +1349,17 @@ mod tests {
             .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
             .collect();
         let mut patches = Vec::new();
-        NemotronOmniProcessor::patches(&raw, width, height, rows, cols, &mut patches).unwrap();
+        let geometry = NemotronOmniProcessor::new().geometry;
+        NemotronOmniProcessor::patches(
+            &raw,
+            width,
+            height,
+            rows,
+            cols,
+            &mut patches,
+            NemotronOmniProcessor::normalization(&geometry),
+        )
+        .unwrap();
 
         let p = PATCH_SIZE;
         let resized =
@@ -1573,6 +1671,67 @@ mod tests {
         // The thumbnail squeezes both halves into one tile.
         assert_eq!(values[[2, 0, 0, 0]], black);
         assert!((values[[2, 0, 0, 511]] - white).abs() < 1e-4);
+    }
+
+    #[test]
+    fn packed_and_reference_processors_output_raw_images_and_sampled_frames() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(4, 4, |x, y| {
+            image::Rgb([if (x + y) % 2 == 0 { 90 } else { 250 }, 87, 241])
+        }));
+        let image_bytes = image.as_rgb8().unwrap().as_raw();
+        let frames = [RgbFrameRef {
+            width: image.width(),
+            height: image.height(),
+            data: image_bytes,
+        }];
+        let sampling = VideoSamplingInfo {
+            source_fps: 20.0,
+            frame_indices: vec![7],
+        };
+        let clip = VideoClipOptions::sampled_at(20.0);
+        let config = PreProcessorConfig {
+            do_rescale: Some(false),
+            do_normalize: Some(false),
+            ..PreProcessorConfig::default()
+        };
+        for baseline in [
+            NemotronOmniProcessor::new(),
+            processor("omni"),
+            processor("v2"),
+        ] {
+            let raw = baseline.clone().with_pixel_config(&config);
+            assert!(raw.emits_pixel_bytes());
+            for (value, reference) in [
+                (raw.preprocess(&[&image]), baseline.preprocess(&[&image])),
+                (
+                    raw.preprocess_video_rgb_sampled(&frames, &clip, Some(&sampling)),
+                    baseline.preprocess_video_rgb_sampled(&frames, &clip, Some(&sampling)),
+                ),
+            ] {
+                let (value, reference) = (value.unwrap(), reference.unwrap());
+                assert_eq!(value.feature_token_counts, reference.feature_token_counts);
+                assert_eq!(value.item_sizes, reference.item_sizes);
+                assert_eq!(value.encoder_input.shape(), reference.encoder_input.shape());
+                if value.model_specific.contains_key("frames_indices") {
+                    assert_eq!(ints(value.model_specific.get("frames_indices")), [7]);
+                }
+                let EncoderInput::U8 { patches, norm } = value.encoder_input else {
+                    panic!("expected raw Nemotron pixels");
+                };
+                assert_eq!(norm, PixelNorm::identity(norm.channel_block));
+                let pixels = patches.as_slice().unwrap();
+                // PyTorch antialiased bicubic, 4x4 -> 512x512. Resizing
+                // the red checkerboard in float and rounding gives 45 here.
+                assert_eq!(
+                    [
+                        pixels[0],
+                        pixels[norm.channel_block],
+                        pixels[2 * norm.channel_block]
+                    ],
+                    [47, 87, 241]
+                );
+            }
+        }
     }
 
     /// Reference: a clip's frames in order, with their source indices,
