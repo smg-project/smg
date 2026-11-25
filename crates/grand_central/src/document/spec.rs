@@ -2402,7 +2402,7 @@ pub struct SessionsSpec {
     /// Whether a single request this rule placed alone is the profile's
     /// own (default `told`). Under `untold` no stage hears that request's
     /// issue or its dispatch, it is none of the profile's sends, and
-    /// neither the engine's record of sent prefixes nor a lent token tree
+    /// neither the engine's record of sent prefixes nor a lent tree
     /// takes its prompt. The session table still hears its dispatch,
     /// and the stages its completion and its release. A pair's sides are
     /// told under either word. A controller keeps the word on the lease it

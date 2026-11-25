@@ -15,7 +15,7 @@
 //! cache-event monitor, so the engine is handed no index of cache events.
 //! Where the document reads the prefixes sent to each worker, as
 //! `cache_aware`'s does, the start lends the engine the gateway's token
-//! trees.
+//! trees and string trees.
 //! The paths `object` and `records` are refused by name: they are no
 //! longer part of this bench.
 //!
@@ -67,6 +67,16 @@
 //! the cell publishes them: a cell read for this column also runs with
 //! `--reports false`.
 //!
+//! `--text true` makes each request hold its prompt as text and no token
+//! ids, as a request the HTTP router did not tokenize does: the same
+//! prompts and conversations, each token written as four letters. A policy
+//! that keeps its prompts by text then places by it, as `cache_aware` does
+//! by its string tree. The cell's line is as it was, and a line
+//! `prompt=text` stands ahead of it. `false`, the default, sends token ids
+//! on either route. A pair cell sends token ids alone, and a cell of text
+//! takes no `--end`: the bench has no route that tells the end of a
+//! request of text.
+//!
 //! `--publish-ms N` publishes the fleet's reports again, as a new load
 //! snapshot, every `N` milliseconds while the callers run: the load monitor
 //! publishes pushed reports at most once in 20 milliseconds. `0`, the
@@ -110,6 +120,7 @@
 )]
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     hint::black_box,
     sync::{
@@ -193,6 +204,8 @@ struct Cell {
     keys: usize,
     /// The prompts the requests carry in turn.
     prompts: usize,
+    /// The requests hold their prompt as text and no token ids.
+    text: bool,
     /// Milliseconds between two publications of the fleet's reports while
     /// the callers run; `0` for the one publication before the first
     /// request.
@@ -221,6 +234,7 @@ fn cell() -> Cell {
         pair: false,
         keys: 0,
         prompts: 1,
+        text: false,
         publish_ms: 0,
         grow: 0,
         end: None,
@@ -255,6 +269,7 @@ fn cell() -> Cell {
             "--pair" => cell.pair = value.parse().unwrap(),
             "--keys" => cell.keys = value.parse().unwrap(),
             "--prompts" => cell.prompts = value.parse().unwrap(),
+            "--text" => cell.text = value.parse().unwrap(),
             "--publish-ms" => cell.publish_ms = value.parse().unwrap(),
             "--grow" => cell.grow = value.parse().unwrap(),
             "--end" => {
@@ -504,6 +519,75 @@ impl Conversation {
     }
 }
 
+/// The letters a token is written as under `--text`: the engine reads a
+/// text's size in tokens as its bytes over four.
+const TOKEN_BYTES: usize = 4;
+
+/// A caller's requests as text, under `--text`: the tokens of its last
+/// request and their text. A request that carries the last one on has the
+/// tokens it adds written behind that text, as a conversation's next turn
+/// is its last one and more. Any other request is written whole.
+struct AsText {
+    tokens: Vec<u32>,
+    text: String,
+}
+
+impl AsText {
+    /// The text of `tokens`: each token as four letters of its mix (`mix`),
+    /// so two prompts' texts part where their tokens do, but for one pair
+    /// of tokens in some 450,000.
+    fn of(&mut self, tokens: &[u32]) -> &str {
+        if !tokens.starts_with(&self.tokens) {
+            self.tokens.clear();
+            self.text.clear();
+        }
+        let kept = self.tokens.len();
+        for &token in &tokens[kept..] {
+            let mut bits = mix(u64::from(token));
+            for _ in 0..TOKEN_BYTES {
+                self.text.push(char::from(b'a' + (bits % 26) as u8));
+                bits /= 26;
+            }
+        }
+        self.tokens.extend_from_slice(&tokens[kept..]);
+        &self.text
+    }
+}
+
+thread_local! {
+    /// The calling thread's requests as text: each caller is a thread.
+    static AS_TEXT: RefCell<AsText> = const {
+        RefCell::new(AsText {
+            tokens: Vec::new(),
+            text: String::new(),
+        })
+    };
+}
+
+/// A text cell's routing call: the same call for a request that holds its
+/// prompt as text. A closure of its own over a route of its own: a cell
+/// without `--text` runs the code it ran before this flag.
+fn text_routing(
+    registry: Arc<WorkerRegistry>,
+    policies: Arc<PolicyRegistry>,
+    models: Vec<String>,
+    keys: Vec<HeaderMap>,
+    route: Route,
+) -> Routing {
+    use smg::routers::common::bench_support::route_text;
+    Box::new(move |tokens, turn| {
+        let model = &models[(turn % models.len() as u64) as usize];
+        let headers = match keys.len() {
+            0 => None,
+            count => keys.get((turn % count as u64) as usize),
+        };
+        AS_TEXT.with_borrow_mut(|as_text| {
+            let text = as_text.of(tokens);
+            route_text(&registry, &policies, model, route, text, headers)
+        })
+    })
+}
+
 /// The load feed of a cell and the reports it publishes: one a worker.
 struct Feed {
     feed: TestFeed,
@@ -640,6 +724,16 @@ fn build(cell: &Cell) -> Built {
         !(cell.grow > 0 && cell.models > 1),
         "a growing conversation is one model's"
     );
+    if cell.text {
+        assert!(!pair, "a pair cell sends token ids");
+        assert!(end.is_none(), "a cell of text takes no --end");
+        let keys = keyed_headers(cell.keys);
+        return Built {
+            routing: text_routing(registry, policies, models, keys, route),
+            feed,
+            runtime,
+        };
+    }
     let keys = keyed_headers(cell.keys);
     let routing: Routing = match end {
         None => Box::new(move |tokens, turn| {
@@ -816,6 +910,11 @@ fn main() {
     } else {
         returned as f64 / turns as f64
     };
+    if cell.text {
+        // A line of its own, ahead of the cell's: the cell's line stands as
+        // it was before this flag.
+        println!("prompt=text");
+    }
     println!(
         "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} end={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,

@@ -24,7 +24,7 @@ use std::{
 };
 
 use smg_grand_central::{
-    engine::{Identity, PlaceRequest, Prompt, TokenEntry, TokenKey, WorkerLists},
+    engine::{Identity, PlaceRequest, Prompt, PromptEntry, TokenKey, WorkerLists},
     policies::consistent_hashing::LentRing,
     tracking::{Outcome, Placement, Side, TransportClass},
 };
@@ -39,7 +39,7 @@ pub(super) static PROMPT: [u32; 1_024] = [0; 1_024];
 /// partition.
 struct Whole;
 
-impl TokenEntry for Whole {
+impl PromptEntry for Whole {
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
         Some(TokenKey {
             tokens: Cow::Borrowed(&PROMPT),

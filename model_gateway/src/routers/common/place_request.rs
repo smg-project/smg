@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use smg_grand_central::engine::{
-    worker_id, Demands, FixedFacts, HashSeeds, HeaderRead, PlaceRequest, Prompt, TokenEntry,
-    TokenKey, WorkerId, WorkerLists, WorkerRule,
+    worker_id, Demands, FixedFacts, HashSeeds, HeaderRead, PlaceRequest, Prompt, PromptEntry,
+    TextKey, TokenKey, WorkerId, WorkerLists, WorkerRule,
 };
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker};
 
@@ -52,15 +52,26 @@ pub(crate) fn tried_ids(workers: &[Arc<dyn Worker>], tried: &[String], ids: &mut
     );
 }
 
-/// A request's entry in the token tree the gateway lends the engine: the
-/// key the classic policy matches and writes its own tree by
-/// ([`CacheNamespace::keyed_tokens`]), under the request's cache partition
-/// and at the tree's page. A request that holds no token ids names none.
-impl TokenEntry for PlacementInputs<'_> {
+/// A request's entry in the trees the gateway lends the engine: the key
+/// the classic policy matches and writes its own trees by, under the
+/// request's cache partition. A request with token ids names its entry in
+/// the token tree, at the tree's page ([`CacheNamespace::keyed_tokens`]).
+/// One that holds its prompt as text alone names its entry in the string
+/// tree ([`CacheNamespace::keyed_text`]): token ids win, as in the classic
+/// policy's selection. A request that holds neither names none.
+impl PromptEntry for PlacementInputs<'_> {
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
         let (tokens, marker) =
             CacheNamespace::keyed_tokens(self.cache_namespace, self.tokens?, page);
         Some(TokenKey { tokens, marker })
+    }
+
+    fn text_key(&self) -> Option<TextKey<'_>> {
+        if self.tokens.is_some() {
+            return None;
+        }
+        let (text, marker) = CacheNamespace::keyed_text(self.cache_namespace, self.text?);
+        Some(TextKey { text, marker })
     }
 }
 
@@ -119,10 +130,10 @@ pub(crate) fn stated_facts(workers: &[Arc<dyn Worker>]) -> Box<[FixedFacts]> {
 /// - The prompt's text and token ids, and the two seeds of its cache
 ///   partition. The engine hashes the prompt under them, where a classic
 ///   policy keys its trees under the partition's marker.
-/// - The prompt's entry in the token tree the gateway lends the engine
-///   ([`TokenEntry`]): the inputs themselves, which name the classic
-///   policy's key. The engine asks for it where a decision reads that tree,
-///   and of no other request.
+/// - The prompt's entry in the tree the gateway lends the engine for it
+///   ([`PromptEntry`]): the inputs themselves, which name the classic
+///   policy's key, by the prompt's token ids or by its text. The engine
+///   asks for it where a decision reads that tree, and of no other request.
 /// - The headers, and the body's `rid` as the request states it
 ///   ([`PlacementInputs::rid`]). The engine derives the request's routing
 ///   value from the sources its document names, and takes the id's retry
@@ -203,8 +214,9 @@ mod tests {
     use smg_grand_central::engine::{LentList, ListCell};
 
     use super::*;
-    use crate::routers::{
-        common::placement::PipelinePin, grpc::backend_client::BasicWorkerBuilder,
+    use crate::{
+        policies::{CacheAwarePolicy, SelectWorkerInfo, TEXT_MARKER_LEN},
+        routers::{common::placement::PipelinePin, grpc::backend_client::BasicWorkerBuilder},
     };
 
     const MODEL: &str = "m";
@@ -421,11 +433,18 @@ mod tests {
     /// keys its own tree by ([`CacheNamespace::keyed_tokens`]): the token
     /// ids behind the partition's marker, which fills whole pages of the
     /// tree asked for, and the ids alone for a request in no partition. A
-    /// request that holds no token ids names no entry.
+    /// request that holds no token ids names no token entry.
     ///
     /// The classic policy keys its tree by the same function at its own
     /// page (`model_gateway/src/policies/cache_aware.rs`, `keyed_tokens`,
     /// read by `select_worker_with_tokens`).
+    ///
+    /// A request that holds its prompt as text alone names its entry in a
+    /// lent string tree, and it is the key the classic policy's own
+    /// function gives the same text (`keyed_text`, read by
+    /// `select_worker_with_text`): the text behind the partition's marker,
+    /// and the text alone for a request in no partition. Token ids win, and
+    /// a request that holds neither names no entry.
     #[test]
     fn a_requests_entry_is_the_classic_policys_key() {
         let tokens: Vec<u32> = (0..40).collect();
@@ -467,6 +486,53 @@ mod tests {
             ..PlacementInputs::default()
         };
         assert_eq!(key_of(&worded, 16), None);
+
+        let text_of = |inputs: &PlacementInputs<'_>| {
+            let nothing = Stated::nothing();
+            let request = place_request(MODEL, WorkerLists::None, inputs, &[], None, nothing);
+            let entry = request.prompt.entry.expect("a request states its entry");
+            let key = entry.text_key()?;
+            Some((key.text.into_owned(), key.marker))
+        };
+        // The classic policy's own key for the same text and partition.
+        let classic = |cache_namespace: Option<CacheNamespace>, text: &str| {
+            let info = SelectWorkerInfo {
+                request_text: Some(text),
+                cache_namespace,
+                ..SelectWorkerInfo::default()
+            };
+            let (key, marker) = CacheAwarePolicy::keyed_text(&info, text);
+            Some((key.into_owned(), marker))
+        };
+        let keyed = namespace.prefixed_text("a prompt");
+        assert_eq!(text_of(&worded), Some((keyed, TEXT_MARKER_LEN)));
+        assert_eq!(text_of(&worded), classic(Some(namespace), "a prompt"));
+        // A text of several bytes a char, and one that forges a marker.
+        for text in ["a prompt", "un prompt d'été", "\u{1}0123\u{1}forged"] {
+            let plain = PlacementInputs {
+                text: Some(text),
+                ..PlacementInputs::default()
+            };
+            assert_eq!(text_of(&plain), classic(None, text), "{text:?}");
+            let partitioned = PlacementInputs {
+                cache_namespace: Some(namespace),
+                ..plain
+            };
+            let same = classic(Some(namespace), text);
+            assert_eq!(text_of(&partitioned), same, "{text:?}");
+        }
+        assert_eq!(text_of(&plain), None, "token ids win");
+        assert_eq!(text_of(&partitioned), None, "token ids win");
+        let both = PlacementInputs {
+            text: Some("a prompt"),
+            ..plain
+        };
+        assert_eq!(
+            text_of(&both),
+            None,
+            "token ids win over a text beside them"
+        );
+        assert_eq!(text_of(&PlacementInputs::default()), None, "no prompt");
     }
 
     /// A first attempt that hands nothing states its model alone, as the

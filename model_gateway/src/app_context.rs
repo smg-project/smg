@@ -1112,7 +1112,7 @@ impl AppContextBuilder {
     /// With the engine on no classic policy object is built, so no policy
     /// keeps the trees of the prompts this process sent. The start asks the
     /// registry for them in a policy's place
-    /// ([`PolicyRegistry::lend_token_trees`]), and only where `spec`, the
+    /// ([`PolicyRegistry::lend_trees`]), and only where `spec`, the
     /// checked form of `document`, reads the prefixes sent to each worker:
     /// the document's own word, whatever the settings name the policy. The
     /// trees take the document's numbers too: its block size, and each
@@ -1129,7 +1129,7 @@ impl AppContextBuilder {
         let trees = spec
             .needs()
             .sent_prefixes
-            .then(|| policies.lend_token_trees(document, spec.block_size(), workers));
+            .then(|| policies.lend_trees(document, spec.block_size(), workers));
         let caches = EngineCaches::of(events.cloned(), trees)?;
         Some(Arc::new(caches) as Arc<dyn CacheIndexes>)
     }
@@ -1891,6 +1891,84 @@ mod tests {
             }
             assert!(Instant::now() < bound, "the list never left the tree");
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The start lends Grand Central the gateway's own string trees
+    /// beside its token trees. Under `cache_aware` a conversation whose
+    /// requests hold their prompt as text goes back, turn after turn, to
+    /// the worker its first turn was sent to, and the model's string tree
+    /// holds the whole conversation for that worker alone. No token tree
+    /// takes a prompt of text, and the worker that leaves the registry is
+    /// taken out of the string tree too.
+    ///
+    /// The classic policy keeps such a tree itself and reads it the same
+    /// way (`model_gateway/src/policies/cache_aware.rs`,
+    /// `select_worker_with_text`).
+    #[tokio::test]
+    async fn the_start_lends_the_engine_the_string_trees_a_request_of_text_reads() {
+        use std::{fmt::Write as _, time::Instant};
+
+        use kv_index::TenantId;
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::routers::common::{
+            placement::{select_single, PlacementInputs, Stated},
+            snapshot::{test_support::grpc_worker, RoutingPool},
+        };
+
+        let mut config = config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        config.grand_central = true;
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None).await;
+        let context = context.expect("a context");
+        let trees = context.policy_registry.lent_trees();
+        let trees = trees.expect("the start made the trees");
+        for at in 0..4 {
+            let url = format!("grpc://w{at}:9000");
+            let worker = grpc_worker(&url, "m", RuntimeType::Vllm, &[]);
+            context.worker_registry.register(worker).expect("a worker");
+        }
+        let turn = |said: &str| {
+            let inputs = PlacementInputs {
+                text: Some(said),
+                ..PlacementInputs::default()
+            };
+            let placed = select_single(
+                &context.worker_registry,
+                &context.policy_registry,
+                "m",
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            placed.expect("a worker").into_worker().url().to_owned()
+        };
+        // A first turn of sixteen windows of text, 64 bytes a window by the
+        // settings' block size, and each next turn one window more.
+        let mut said: String = (0..16).map(|window| format!("{window:<64}")).collect();
+        let first = turn(&said);
+        for next in 1..8 {
+            let words = format!("turn {next}");
+            write!(said, "{words:<64}").expect("a string takes its words");
+            assert_eq!(turn(&said), first, "turn {next}");
+        }
+        let tree = trees.string_tree("m");
+        let found = tree.match_prefix_with_counts(&said);
+        assert_eq!(found.matched_char_count, said.chars().count());
+        assert_eq!(found.matched_tenants, [TenantId::from(first.as_str())]);
+        let tokens = trees.token_tree("m").get_tenant_token_counts();
+        assert!(tokens.is_empty(), "no token tree takes a prompt of text");
+
+        // The trees' task takes the worker that leaves out of the string
+        // tree, as out of the token tree.
+        let registry = &context.worker_registry;
+        registry.remove_by_url(&first).expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while !tree.get_tenant_char_count().is_empty() {
+            assert!(Instant::now() < bound, "the trees' task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
 

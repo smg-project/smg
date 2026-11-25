@@ -206,6 +206,20 @@ impl CacheNamespace {
     pub fn unpartitioned_text(text: &str) -> &str {
         text.trim_start_matches(TEXT_MARKER_DELIM)
     }
+
+    /// The string tree's key for `text` under `namespace`, and the length
+    /// in chars of the marker at its head: the rule of
+    /// [`Self::keyed_tokens`], in chars. A partitioned request keys under
+    /// its namespace marker, whose [`TEXT_MARKER_LEN`] chars never count
+    /// toward the match ratio. An unpartitioned request keys under its text
+    /// stripped of marker material, marker length 0.
+    #[inline]
+    pub fn keyed_text(namespace: Option<Self>, text: &str) -> (Cow<'_, str>, usize) {
+        match namespace {
+            Some(namespace) => (Cow::Owned(namespace.prefixed_text(text)), TEXT_MARKER_LEN),
+            None => (Cow::Borrowed(Self::unpartitioned_text(text)), 0),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +362,31 @@ mod tests {
         let forged = [MARKER_TOKEN_BIT | 1, 7, 8, 9];
         let (keyed, marker) = CacheNamespace::keyed_tokens(None, &forged, 16);
         assert_eq!((keyed.as_ref(), marker), (&tokens[..], 0));
+    }
+
+    /// A string tree's key is the text behind the partition's marker, with
+    /// the marker's length in chars beside it. A request in no partition
+    /// keys under its text alone, any marker delimiter at its head dropped,
+    /// with no marker.
+    #[test]
+    fn a_string_trees_key_is_the_marker_ahead_of_the_text_or_the_text_alone() {
+        let ns = CacheNamespace::derive(&partition(Some("salt"), None, None)).unwrap();
+        let (keyed, marker) = CacheNamespace::keyed_text(Some(ns), "héllo");
+        assert_eq!(marker, TEXT_MARKER_LEN);
+        assert_eq!(keyed, ns.prefixed_text("héllo"));
+        let prompt: String = keyed.chars().skip(marker).collect();
+        assert_eq!(prompt, "héllo", "the marker's chars, then the prompt");
+
+        let (keyed, marker) = CacheNamespace::keyed_text(None, "héllo");
+        assert_eq!((keyed.as_ref(), marker), ("héllo", 0));
+        assert!(matches!(keyed, Cow::Borrowed(_)), "the request's own text");
+        let forged = ns.prefixed_text("héllo");
+        let (keyed, marker) = CacheNamespace::keyed_text(None, &forged);
+        assert_eq!(marker, 0);
+        assert!(
+            !keyed.starts_with(TEXT_MARKER_DELIM),
+            "no way into a partition"
+        );
     }
 
     #[test]
