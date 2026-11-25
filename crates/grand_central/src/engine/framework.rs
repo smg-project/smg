@@ -777,8 +777,9 @@ pub trait Picker: Lifecycle + Debug {
     /// itself asks such a picker for one pick and nothing else of a
     /// decision ([`Engine::place_for`]). The default is no. The engine reads
     /// it where such a caller asks for a place's profile, and at a pair's
-    /// decode decided again under a scorer ([`Engine::decide_decode`]): at
-    /// no other decision.
+    /// decode decided again under a scorer: of the call's decode profile
+    /// ([`Engine::decide_decode`]), and of the decode's shadow profile asked
+    /// beside that call. It reads it at no other decision.
     fn picks_alone(&self) -> bool {
         false
     }
@@ -789,13 +790,14 @@ pub trait Picker: Lifecycle + Debug {
     /// must read no value of the seed's stream: the engine hands it the
     /// request's own seed and asserts in a debug build that none was read.
     /// The default is no. The engine reads it at a pair's decode decided
-    /// again, handed the decode of the pair's first decision
-    /// ([`Engine::decide_decode`]), and once at its build, for a profile
-    /// that draws for every request. The row such a picker's draw lands on
-    /// is its rule's answer, so the draw is asked at every pool size over a
-    /// pool that lends its own word ([`PoolFacts::word`]), and a session a
-    /// sessions rule leaves to the profile ([`Assignment::Delegate`]) takes
-    /// the pool's turn.
+    /// again, handed the decode of the pair's first decision: of the call's
+    /// decode profile ([`Engine::decide_decode`]), and of the decode's
+    /// shadow profile asked beside that call. It reads it once at its build
+    /// too, for a profile that draws for every request. The row such a
+    /// picker's draw lands on is its rule's answer, so the draw is asked at
+    /// every pool size over a pool that lends its own word
+    /// ([`PoolFacts::word`]), and a session a sessions rule leaves to the
+    /// profile ([`Assignment::Delegate`]) takes the pool's turn.
     fn takes_turns(&self) -> bool {
         false
     }
