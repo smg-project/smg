@@ -60,11 +60,11 @@ fn answering(own: String, idle: String) -> impl Fn(&dyn Worker) -> u16 + Send + 
 ///
 /// The gateway's ledger refuses a retry the workers that answered the
 /// request definitively (`AttemptLedger::admits`,
-/// `model_gateway/src/routers/common/attempt_ledger.rs:168-177`), and hands
+/// `model_gateway/src/routers/common/attempt_ledger.rs:176-185`), and hands
 /// its rule to the selection behind such an answer alone
-/// (`with_candidate_filter`, `:179-200`): its case
+/// (`with_candidate_filter`, `:187-208`): its case
 /// `a_candidate_filter_is_handed_only_after_a_definitive_answer`
-/// (`:353-397`).
+/// (`:361-405`).
 #[test]
 fn a_worker_that_answered_a_request_itself_takes_no_retry_of_it() {
     let fleet = workers(2);
@@ -88,9 +88,9 @@ fn a_worker_that_answered_a_request_itself_takes_no_retry_of_it() {
 /// The gateway ends such a request with the answer as it is, where no
 /// available worker that its ledger admits is left
 /// (`AttemptLedger::settle`,
-/// `model_gateway/src/routers/common/attempt_ledger.rs:202-240`): its case
+/// `model_gateway/src/routers/common/attempt_ledger.rs:210-248`): its case
 /// `a_definitive_answer_excludes_its_worker_and_ends_the_window_when_alone`
-/// (`:309-331`). It ends the request ahead of another call, where the
+/// (`:317-339`). It ends the request ahead of another call, where the
 /// program asks the engine once more and reads its word.
 #[test]
 fn a_request_no_other_worker_can_take_ends_with_the_workers_own_answer() {
@@ -123,7 +123,7 @@ fn a_request_no_other_worker_can_take_ends_with_the_workers_own_answer() {
 /// and a connect failure or a timeout stays replayable
 /// (`model_gateway/src/routers/common/attempt_ledger.rs:17-18`,
 /// `is_definitive_failure`, `:99-105`): its case
-/// `only_the_workers_own_500_is_definitive` (`:334-350`).
+/// `only_the_workers_own_500_is_definitive` (`:342-358`).
 #[test]
 fn a_send_no_worker_answered_refuses_nobody() {
     for (answered, read) in [(UNANSWERED, NOT_REACHED), (504, 504)] {
@@ -155,7 +155,7 @@ fn a_send_no_worker_answered_refuses_nobody() {
 /// A gateway differs here: it ends the request with the worker's own
 /// answer where no available worker that its ledger admits is left, ahead
 /// of another call (`AttemptLedger::settle`,
-/// `model_gateway/src/routers/common/attempt_ledger.rs:202-240`).
+/// `model_gateway/src/routers/common/attempt_ledger.rs:210-248`).
 #[test]
 fn a_shed_for_another_cause_at_a_retry_is_answered_as_at_a_first_attempt() {
     let not_ready = workers(2);
@@ -182,8 +182,8 @@ fn a_shed_for_another_cause_at_a_retry_is_answered_as_at_a_first_attempt() {
 /// it and the engine picks among the whole list by the third attempt.
 ///
 /// The gateway's ledger keeps an engine by its base address
-/// (`model_gateway/src/routers/common/attempt_ledger.rs:135-140`): its case
-/// `a_ranks_answer_stands_for_its_engine` (`:400-429`).
+/// (`model_gateway/src/routers/common/attempt_ledger.rs:143-148`): its case
+/// `a_ranks_answer_stands_for_its_engine` (`:408-437`).
 #[test]
 fn a_ranks_answer_stands_for_its_engine() {
     const ENGINE: &str = "http://engine-0:8000";
@@ -224,10 +224,10 @@ fn a_ranks_answer_stands_for_its_engine() {
 /// The gateway's ledger closes a request's window on the side that
 /// answered and leaves its partner selectable: its case
 /// `a_failed_side_excludes_its_worker_alone_and_ends_the_window_without_another_of_its_kind`
-/// (`model_gateway/src/routers/common/attempt_ledger.rs:432-463`). Its pair
+/// (`model_gateway/src/routers/common/attempt_ledger.rs:440-471`). Its pair
 /// route goes further where no pair is left without the worker that
 /// answered, and refuses the partner instead (`settle_attempt`,
-/// `model_gateway/src/routers/http/pd_router.rs:1525-1564`). The program
+/// `model_gateway/src/routers/http/pd_router.rs:1525-1563`). The program
 /// keeps the plain rule alone.
 #[test]
 fn a_pairs_side_that_answered_itself_is_refused_and_its_partner_is_not() {
@@ -240,6 +240,30 @@ fn a_pairs_side_that_answered_itself_is_refused_and_its_partner_is_not() {
         assert_eq!((status, sends), (502, 2 * ATTEMPTS), "{answer:?}");
         assert_eq!(times(&answer, &prefill(0)), 1, "{answer:?}");
         assert_eq!(times(&answer, &decode(0)), ATTEMPTS, "{answer:?}");
+    }
+}
+
+/// The rule holds a pair's decode as it holds its prefill. One prefill and
+/// two decodes, sent at once: the prefill serves, the first decode answers
+/// each request itself, and the second is not serving. A decode's own
+/// answer behind a prefill that served is the decode's word on the request,
+/// so each request is sent to the first decode once and takes its other
+/// attempts at the second, and its prefill goes out with every attempt.
+///
+/// The gateway's pair route marks a decode's refusal as the decode's own
+/// failure, and settles that side (`side_refused` and `decode_refused`,
+/// `model_gateway/src/routers/http/pd_router.rs:1472-1511`).
+#[test]
+fn a_pairs_decode_that_answered_itself_is_refused_and_its_prefill_is_not() {
+    let fleet = fleet(1, 2);
+    let sends = answering(decode(0), decode(1));
+    let (program, _loads, _task) = under_pairs(PolicySettings::RoundRobin, &fleet, sends);
+    for _ in 0..4 {
+        let answer = program.serve(&PLAIN);
+        let (status, sends) = (answer.status, answer.sent.len());
+        assert_eq!((status, sends), (502, 2 * ATTEMPTS), "{answer:?}");
+        assert_eq!(times(&answer, &decode(0)), 1, "{answer:?}");
+        assert_eq!(times(&answer, &prefill(0)), ATTEMPTS, "{answer:?}");
     }
 }
 
@@ -329,7 +353,7 @@ fn a_pair_in_turn_refuses_the_decode_that_answered_itself() {
 /// The gateway's ledger closes a request's window on the side that
 /// answered: its case
 /// `a_failed_side_excludes_its_worker_alone_and_ends_the_window_without_another_of_its_kind`
-/// (`model_gateway/src/routers/common/attempt_ledger.rs:432-463`).
+/// (`model_gateway/src/routers/common/attempt_ledger.rs:440-471`).
 #[test]
 fn a_pair_in_turn_refuses_the_prefill_that_answered_itself() {
     let fleet = fleet(2, 1);
