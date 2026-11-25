@@ -34,6 +34,7 @@ use crate::{
                 stage_output, AttemptStamp, ClientSelection, EncodeOutputs, ExecutionPlan,
                 RequestContext, RequestType, WorkerSelection,
             },
+            harmony::grammar::VllmHarmonyGrammar,
             multimodal::{
                 assemble_media_refs, assemble_multimodal_data,
                 assemble_multimodal_data_after_encode, assembly_error_response,
@@ -521,7 +522,7 @@ pub(crate) enum ToolConstraintStamp {
     /// too.
     Table(Arc<dyn TagForStart>),
     /// Re-render a Harmony turn when a retry selects another XGrammar vocabulary.
-    Harmony(crate::routers::grpc::harmony::grammar::VllmHarmonyGrammar),
+    Harmony(VllmHarmonyGrammar),
 }
 
 impl ToolConstraintStamp {

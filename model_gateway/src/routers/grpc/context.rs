@@ -902,6 +902,7 @@ pub(crate) enum PreparationOutput {
 
 /// SMG builds an entire assistant-turn constraint for vLLM. Other engines and
 /// caller-supplied structural tags keep their original activation behavior.
+#[derive(Debug)]
 pub(crate) struct HarmonyConstraint {
     pub tag: String,
     pub vllm_grammar: Option<super::harmony::grammar::VllmHarmonyGrammar>,

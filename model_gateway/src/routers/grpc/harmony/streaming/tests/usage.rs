@@ -171,7 +171,12 @@ async fn harmony_chat_reports_the_dispatch_adapter_in_every_response_frame() {
             }
         } else {
             let (response, _) = HarmonyResponseProcessor::new()
-                .process_non_streaming_chat_response(execution, request, dispatch, &[])
+                .process_non_streaming_chat_response(
+                    execution,
+                    request,
+                    dispatch,
+                    &Default::default(),
+                )
                 .await
                 .unwrap_or_else(|response| panic!("{}", response.status()));
             assert_eq!(
