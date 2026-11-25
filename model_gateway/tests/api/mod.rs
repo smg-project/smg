@@ -10,6 +10,7 @@ mod messages_test;
 mod messages_threads_test;
 mod parser_endpoints_test;
 mod path_refusals_conversations_test;
+mod policy_explain_test;
 mod query_path_refusals_test;
 mod request_formats_test;
 #[cfg(feature = "provider-openai")]

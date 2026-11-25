@@ -5708,7 +5708,10 @@ impl Engine {
             (self.seat_flags & !SAMPLES_DECISIONS) | (u8::from(sample != 0) * SAMPLES_DECISIONS);
     }
 
-    pub(crate) fn explain_sample(&self) -> u32 {
+    /// The document's `explain.sample`, zero where it states none: under
+    /// zero no decision is kept to be read later. A host that answers a
+    /// kept decision reads here whether the document keeps any.
+    pub fn explain_sample(&self) -> u32 {
         self.explain_sample
     }
 
