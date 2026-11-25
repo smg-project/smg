@@ -84,7 +84,7 @@ fn config() -> Config {
     Config {
         controller_id: "test-controller".to_owned(),
         listeners: vec![
-            listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+            listener("gateway", &[Scope::Gateway]),
             listener("control", &[Scope::Control]),
             listener("replication", &[Scope::Replication]),
         ],
@@ -159,7 +159,6 @@ async fn the_listeners_serve_health_and_the_admin_endpoints_on_ephemeral_ports()
     ports.dedup();
     assert_eq!(ports.len(), 4, "four ephemeral ports, each its own");
     assert!(ports.iter().all(|port| *port != 0));
-    assert_eq!(addresses.of(Scope::Ingestion), addresses.of(Scope::Gateway));
     assert_ne!(
         addresses.of(Scope::Control),
         addresses.of(Scope::Replication)

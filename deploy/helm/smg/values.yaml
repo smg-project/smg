@@ -535,7 +535,7 @@ grandCentral:
   specStoreClaim: ""
 
   # -- The listeners' container ports, each passed as its --*-listen flag: the
-  #    gateways and the relays (gateway), the operators (control), the standbys
+  #    gateways (gateway), the operators (control), the standbys
   #    (replication) and the HTTP admin listener with the probes and /metrics
   #    (admin). Two listeners on one port are refused at render: the
   #    controller refuses them at start.

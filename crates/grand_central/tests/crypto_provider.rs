@@ -37,7 +37,7 @@ async fn a_bind_installs_the_process_crypto_provider() {
     let config = Config {
         controller_id: "test-controller".to_owned(),
         listeners: vec![
-            listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+            listener("gateway", &[Scope::Gateway]),
             listener("control", &[Scope::Control]),
             listener("replication", &[Scope::Replication]),
         ],

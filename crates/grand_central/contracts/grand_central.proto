@@ -1,7 +1,6 @@
-// smg.policy.v1: Grand Central's gateway, ingestion, control and
+// smg.policy.v1: Grand Central's gateway, control and
 // replication protocol (design 5.2 and appendix A). The view and decision
-// vocabulary is in policy_plugin.proto; the relay frames carry the engine
-// wire's own messages (smg.grpc.common) unchanged.
+// vocabulary is in policy_plugin.proto.
 //
 // Versioning: design appendix A (additive within v1). The package is
 // pre-release until the first shipped release that carries it; the rule
@@ -11,12 +10,11 @@
 // FAILED_PRECONDITION, the status message naming the range and the
 // controller's version.
 //
-// Scopes and principals: design 5.2. Four credentialed scopes, each
+// Scopes and principals: design 5.2. Three credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
 // metadata, never a field a peer fills in. Gateway: Session, Decide,
 // WatchWorkers and Leader; a Hello whose gateway_id is not the verified
-// subject is refused with UNAUTHENTICATED and the stream closes. Ingestion:
-// PushLoad and PushKvEvents; the relay's subject is the RELAY origin.
+// subject is refused with UNAUTHENTICATED and the stream closes.
 // Control: `user` reads (GetSnapshot, Explain, GetPolicySpec, Leader,
 // WatchRegime), `admin` writes the rest; every call writes an audit event.
 // Replication: Replicate, whose stream carries a re-sync's snapshot in parts;
@@ -85,7 +83,7 @@
 // same), a veto of no kind, a Hello whose veto_count is not its list's
 // length, or a DecideRequest field out of its range in this protocol version
 // (the status message names the field, and the stream closes);
-// RESOURCE_EXHAUSTED a relay over its per-subscriber budget, a WatchWorkers
+// RESOURCE_EXHAUSTED a WatchWorkers
 // past its principal's ceiling of 4 open watches or past the replica's
 // ceiling of watching principals, a
 // Decide stream past its gateway's Welcome.max_decide_streams, a Session
@@ -115,7 +113,7 @@
 // call, a frame kind or a mode this build does not serve, or a spec call
 // of a controller given no spec source, by its name;
 // OUT_OF_RANGE and
-// DATA_LOSS raised by no handler, forwarded as RelayResync. The
+// DATA_LOSS raised by no handler. The
 // transport answers OUT_OF_RANGE itself to a request over its limit of
 // 4 MiB on a call of one request message; on a Session or Decide stream
 // the reader answers that finding RESOURCE_EXHAUSTED. Any other read of
@@ -128,7 +126,6 @@ syntax = "proto3";
 package smg.policy.v1;
 
 import "policy_plugin.proto";
-import "common.proto";
 
 service GrandCentral {
   // Gateway scope, one bidirectional stream per gateway: identity, leases,
@@ -142,9 +139,6 @@ service GrandCentral {
   // resumes after the last event it took. A principal holds at most 4
   // watches open at a replica: one more is refused RESOURCE_EXHAUSTED.
   rpc WatchWorkers(WatchWorkersRequest) returns (stream WorkerEvent);
-  // Ingestion scope (relays only), client streams answered once at the end.
-  rpc PushLoad(stream LoadReport) returns (Ack);
-  rpc PushKvEvents(stream RelayKvFrame) returns (Ack);
   // Control scope, unary. An answer says the row as written. A registration,
   // its refresh and a patch owe a build of the pools: it starts within one
   // publication window (20 ms) of their answer, and they are in force for
@@ -353,7 +347,10 @@ message Principal {
   enum Scope {
     SCOPE_UNSPECIFIED = 0;
     SCOPE_GATEWAY = 1;
-    SCOPE_INGESTION = 2;
+    // The ingestion scope's, which held two relay calls: no later scope
+    // takes its number or its name.
+    reserved 2;
+    reserved "SCOPE_INGESTION";
     SCOPE_CONTROL = 3;
     SCOPE_REPLICATION = 4;
   }
@@ -862,63 +859,6 @@ message Signals {
   uint32 scrape_interval_ms = 4;
   // The scrape source's engine-family name.
   string scrape_family = 5;
-}
-
-// --- Ingestion scope: relays only -------------------------------------------
-
-// One load record of one rank: the engine wire's EngineLoad unchanged, with
-// the worker, the rank and the relay's receipt; a gateway in front of a
-// host-local wire forwards what it received, its verified subject the origin.
-message LoadReport {
-  fixed64 worker_id = 1;
-  // When the relay has no id yet (a worker it registered itself).
-  string registration_key = 2;
-  uint32 dp_rank = 3;
-  smg.grpc.common.EngineLoad record = 4;
-  // EVENTS, POLL or SCRAPE at the relay; the controller records the RELAY hop.
-  SignalSource source = 5;
-  // The relay's receipt, microseconds since its stream opened.
-  uint64 received_offset_micros = 6;
-  uint64 relay_seq = 7;
-}
-
-// The engine wire's event batch unchanged, or the stream status the relay saw.
-message RelayKvFrame {
-  fixed64 worker_id = 1;
-  string registration_key = 2;
-  oneof frame {
-    smg.grpc.common.KvEventBatch batch = 3;
-    RelaySubscribed subscribed = 4;
-    RelayResync resync = 5;
-    RelayEnded ended = 6;
-  }
-  uint64 received_offset_micros = 7;
-}
-
-message RelaySubscribed {
-  uint64 start_sequence_number = 1;
-  bool loads_only = 2;
-  uint32 dp_size = 3;
-}
-
-// The engine wire's status codes and stream ends as frames.
-message RelayResync {
-  enum Reason {
-    REASON_UNSPECIFIED = 0;
-    REASON_OUT_OF_RANGE = 1;
-    REASON_DATA_LOSS = 2;
-    REASON_STREAM_ENDED = 3;
-    REASON_SNAPSHOT_ABANDONED = 4;
-    REASON_RELAY_RESTART = 5;
-    REASON_ENGINE_REPLACED = 6;
-  }
-  Reason reason = 1;
-  uint32 dp_rank = 2;
-  uint64 resume_from = 3;
-}
-
-message RelayEnded {
-  string reason = 1;
 }
 
 // --- Control scope: membership ----------------------------------------------

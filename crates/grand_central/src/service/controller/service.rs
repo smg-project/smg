@@ -386,8 +386,6 @@ pub(crate) enum Call {
     Session,
     Decide,
     WatchWorkers,
-    PushLoad,
-    PushKvEvents,
     RegisterWorker,
     PatchWorker,
     DeregisterWorker,
@@ -404,12 +402,10 @@ pub(crate) enum Call {
 impl Call {
     /// Every call, in the contract's order.
     #[cfg(test)]
-    pub(crate) const ALL: [Call; 16] = [
+    pub(crate) const ALL: [Call; 14] = [
         Call::Session,
         Call::Decide,
         Call::WatchWorkers,
-        Call::PushLoad,
-        Call::PushKvEvents,
         Call::RegisterWorker,
         Call::PatchWorker,
         Call::DeregisterWorker,
@@ -429,8 +425,6 @@ impl Call {
             Call::Session => "Session",
             Call::Decide => "Decide",
             Call::WatchWorkers => "WatchWorkers",
-            Call::PushLoad => "PushLoad",
-            Call::PushKvEvents => "PushKvEvents",
             Call::RegisterWorker => "RegisterWorker",
             Call::PatchWorker => "PatchWorker",
             Call::DeregisterWorker => "DeregisterWorker",
@@ -449,7 +443,6 @@ impl Call {
     pub(crate) const fn scopes(self) -> &'static [Scope] {
         match self {
             Call::Session | Call::Decide | Call::WatchWorkers => &[Scope::Gateway],
-            Call::PushLoad | Call::PushKvEvents => &[Scope::Ingestion],
             Call::GetSnapshot
             | Call::RegisterWorker
             | Call::PatchWorker
@@ -832,20 +825,6 @@ impl GrandCentral for Service {
         let watchers = &self.shared.watchers;
         let watching = watch_workers::open(source, watchers, by, start, asked.models.clone())?;
         Ok(Response::new(watching))
-    }
-
-    async fn push_load(
-        &self,
-        request: Request<Streaming<proto::LoadReport>>,
-    ) -> Result<Response<proto::Ack>, Status> {
-        self.unserved(Call::PushLoad, &request)
-    }
-
-    async fn push_kv_events(
-        &self,
-        request: Request<Streaming<proto::RelayKvFrame>>,
-    ) -> Result<Response<proto::Ack>, Status> {
-        self.unserved(Call::PushKvEvents, &request)
     }
 
     async fn register_worker(
@@ -1829,12 +1808,10 @@ mod tests {
     /// a change of a call's scopes is made in both.
     #[test]
     fn every_call_keeps_the_scopes_copied_here_from_the_contracts_header() {
-        let expected: [(&str, &[Scope]); 16] = [
+        let expected: [(&str, &[Scope]); 14] = [
             ("Session", &[Scope::Gateway]),
             ("Decide", &[Scope::Gateway]),
             ("WatchWorkers", &[Scope::Gateway]),
-            ("PushLoad", &[Scope::Ingestion]),
-            ("PushKvEvents", &[Scope::Ingestion]),
             ("RegisterWorker", &[Scope::Control]),
             ("PatchWorker", &[Scope::Control]),
             ("DeregisterWorker", &[Scope::Control]),
@@ -1863,7 +1840,7 @@ mod tests {
     #[test]
     fn a_listener_admits_the_calls_of_its_scopes_from_a_caller_with_a_principal() {
         let listeners: [&[Scope]; 4] = [
-            &[Scope::Gateway, Scope::Ingestion],
+            &[Scope::Gateway],
             &[Scope::Control],
             &[Scope::Replication],
             &Scope::ALL,
@@ -1905,7 +1882,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unserved_call_is_denied_off_its_scope_and_unimplemented_to_a_principal_on_it() {
-        let (_elector, _standing, gateway) = service(&[Scope::Gateway, Scope::Ingestion]);
+        let (_elector, _standing, gateway) = service(&[Scope::Gateway]);
         let (_elector, _standing, control) = service(&[Scope::Control]);
         let (_elector, _standing, replication) = service(&[Scope::Replication]);
 
@@ -2137,9 +2114,13 @@ mod tests {
     /// unimplemented, `Session` is reached (the empty message is no
     /// `Hello`), and registration, watching rows, snapshots and Explain
     /// are refused by a replica that does not lead. The names are read
-    /// from the contract, so a method added there joins the case.
+    /// from the contract, so a method added there joins the case. A name
+    /// the contract dropped is no method: whoever calls it, the transport
+    /// answers unimplemented and no body admits the call first.
     #[tokio::test]
     async fn every_method_of_the_contract_answers_by_its_calls_scopes_and_its_callers_principal() {
+        /// The relays' two calls, which left the contract.
+        const DROPPED: [&str; 2] = ["PushLoad", "PushKvEvents"];
         let methods = methods();
         assert_eq!(
             methods.len(),
@@ -2147,7 +2128,7 @@ mod tests {
             "one call a method, and Leader: {methods:?}"
         );
         let listeners = [
-            &[Scope::Gateway, Scope::Ingestion][..],
+            &[Scope::Gateway][..],
             &[Scope::Control],
             &[Scope::Replication],
         ];
@@ -2178,7 +2159,7 @@ mod tests {
                 .await
                 .expect("the listener accepts");
             let mut client = Grpc::new(channel);
-            for method in &methods {
+            for method in methods.iter().chain(&DROPPED) {
                 let path = PathAndQuery::try_from(format!("/smg.policy.v1.GrandCentral/{method}"))
                     .expect("a path");
                 client.ready().await.expect("the channel is ready");
@@ -2192,6 +2173,15 @@ mod tests {
                     .unary(request, path, ProstCodec::<(), ()>::default())
                     .await;
                 let round = format!("{method} on {scopes:?}, {layer:?}, a name stated: {stated}");
+                if DROPPED.contains(method) {
+                    let status = answered.expect_err("the contract holds no such method");
+                    assert_eq!(
+                        (status.code(), status.message()),
+                        (Code::Unimplemented, ""),
+                        "{round}"
+                    );
+                    continue;
+                }
                 if *method == "Leader" {
                     assert!(answered.is_ok(), "{round}: {answered:?}");
                     continue;
@@ -2508,7 +2498,7 @@ mod tests {
     #[tokio::test]
     async fn leader_answers_on_every_listener_and_for_every_model() {
         for scopes in [
-            &[Scope::Gateway, Scope::Ingestion][..],
+            &[Scope::Gateway][..],
             &[Scope::Control],
             &[Scope::Replication],
         ] {
@@ -2535,7 +2525,7 @@ mod tests {
     #[tokio::test]
     async fn the_read_call_answers_the_standing_document_once_a_source_applied_one() {
         let (_elector, _standing, control) = service(&[Scope::Control]);
-        let (_elector, _standing, gateway) = service(&[Scope::Gateway, Scope::Ingestion]);
+        let (_elector, _standing, gateway) = service(&[Scope::Gateway]);
         for service in [&control, &gateway] {
             service
                 .shared

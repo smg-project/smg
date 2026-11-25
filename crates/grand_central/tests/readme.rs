@@ -15,6 +15,8 @@
 //! - the page names, each in a code span, every flag of the standalone
 //!   binary, every call of the controller's contract and every series the
 //!   controller exports: each list is read off the files that declare it.
+//!   Each is read the other way too: a row of the page's flag tables, of
+//!   its call table or of its metrics table names none that is gone.
 
 use std::{
     fs,
@@ -42,10 +44,14 @@ const REFUSALS: usize = 2;
 /// The flags the standalone binary declares, at the least: a walk that
 /// finds fewer has lost the shape of a source file, and a change that
 /// takes a flag away lowers the count.
-const FLAGS: usize = 56;
+const FLAGS: usize = 55;
+
+/// The flags the argument parser adds by itself: a row of the page names
+/// them, and no line of the command line's declaration does.
+const PARSERS_OWN: [&str; 2] = ["--help", "--version"];
 
 /// The calls the controller's contract holds, at the least.
-const CALLS: usize = 17;
+const CALLS: usize = 15;
 
 /// The series the standalone controller exports, at the least.
 const SERIES: usize = 22;
@@ -294,6 +300,25 @@ fn left_out<'a>(page: &str, declared: impl IntoIterator<Item = &'a str>) -> Vec<
         .collect()
 }
 
+/// The code spans of one cell of a table's row, the first cell being 1.
+fn spans(row: &str, cell: usize) -> impl Iterator<Item = &str> {
+    row.split('|')
+        .nth(cell)
+        .into_iter()
+        .flat_map(|cell| cell.split('`').skip(1).step_by(2))
+}
+
+/// The names the page's table under the heading row `heading` holds: the
+/// code spans of one cell of each of its rows.
+fn table<'a>(page: &'a str, heading: &str, cell: usize) -> Vec<&'a str> {
+    page.lines()
+        .skip_while(|line| !line.starts_with(heading))
+        .skip(2)
+        .take_while(|line| line.starts_with('|'))
+        .flat_map(|row| spans(row, cell))
+        .collect()
+}
+
 #[test]
 fn the_page_names_every_flag_of_the_standalone_binary() {
     let page = fs::read_to_string(readme()).expect("the README is readable");
@@ -308,6 +333,26 @@ fn the_page_names_every_flag_of_the_standalone_binary() {
         left_out.is_empty(),
         "the README's flag table leaves out {left_out:?}"
     );
+    // The other way: a row of the flag tables names no flag that is gone.
+    let named: Vec<&str> = page
+        .lines()
+        .filter(|line| line.starts_with("| `--"))
+        .flat_map(|row| spans(row, 1))
+        .collect();
+    assert!(
+        named.len() >= FLAGS,
+        "the README's flag rows name {} flags by this walk",
+        named.len()
+    );
+    let gone: Vec<&str> = named
+        .iter()
+        .copied()
+        .filter(|name| !PARSERS_OWN.contains(name) && !flags.iter().any(|flag| flag == name))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "the README's flag table names {gone:?}, which the command line does not declare"
+    );
 }
 
 #[test]
@@ -319,10 +364,26 @@ fn the_page_names_every_call_of_the_contract() {
         "the contract holds {} calls by this walk",
         calls.len()
     );
-    let left_out = left_out(&page, calls);
+    let left_out = left_out(&page, calls.iter().copied());
     assert!(
         left_out.is_empty(),
         "the README's call table leaves out {left_out:?}"
+    );
+    // The other way: the table of calls names no call that is gone.
+    let named = table(&page, "| Scope | Call |", 2);
+    assert!(
+        named.len() >= CALLS,
+        "the README's call table names {} calls by this walk",
+        named.len()
+    );
+    let gone: Vec<&str> = named
+        .iter()
+        .copied()
+        .filter(|name| !calls.contains(name))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "the README's call table names {gone:?}, which the contract does not hold"
     );
 }
 
@@ -335,9 +396,25 @@ fn the_page_names_every_series_the_controller_exports() {
         "the metrics module declares {} series by this walk",
         series.len()
     );
-    let left_out = left_out(&page, series);
+    let left_out = left_out(&page, series.iter().copied());
     assert!(
         left_out.is_empty(),
         "the README's metrics table leaves out {left_out:?}"
+    );
+    // The other way: the table of series names none that is gone.
+    let named = table(&page, "| Metric | What it measures |", 1);
+    assert!(
+        named.len() >= SERIES,
+        "the README's metrics table names {} series by this walk",
+        named.len()
+    );
+    let gone: Vec<&str> = named
+        .iter()
+        .copied()
+        .filter(|name| !series.contains(name))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "the README's metrics table names {gone:?}, which the metrics module does not declare"
     );
 }

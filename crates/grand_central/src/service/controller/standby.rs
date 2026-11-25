@@ -1980,8 +1980,6 @@ mod tests {
         session(Streaming<proto::GatewayFrame>) -> Unscripted<proto::ControllerFrame>;
         decide(Streaming<proto::DecideRequest>) -> Unscripted<proto::DecideAnswer>;
         watch_workers(proto::WatchWorkersRequest) -> Unscripted<proto::WorkerEvent>;
-        push_load(Streaming<proto::LoadReport>) -> proto::Ack;
-        push_kv_events(Streaming<proto::RelayKvFrame>) -> proto::Ack;
         register_worker(proto::RegisterWorkerRequest) -> proto::WorkerEvent;
         patch_worker(proto::PatchWorkerRequest) -> proto::WorkerEvent;
         deregister_worker(proto::DeregisterWorkerRequest) -> proto::WorkerEvent;

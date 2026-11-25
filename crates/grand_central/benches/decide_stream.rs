@@ -955,7 +955,7 @@ fn config(deciders: usize) -> Config {
     Config {
         controller_id: "bench-controller".to_owned(),
         listeners: vec![
-            listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+            listener("gateway", &[Scope::Gateway]),
             listener("control", &[Scope::Control]),
             listener("replication", &[Scope::Replication]),
         ],

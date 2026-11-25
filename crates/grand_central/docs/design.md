@@ -2207,7 +2207,7 @@ switch is made in steps: 10.1 says what is on main.
 ### 10.1 On main
 
 It starts from a policy document (a watched file, or a folder it keeps). It serves gRPC on three
-listeners (gateways, operators, standbys; a fourth, for ingestion, only when asked for) and HTTP
+listeners (gateways, operators, standbys) and HTTP
 on an admin listener (probes, version, metrics). It elects a leader by a leader lease, held in the
 process, in a file, or in a Kubernetes Lease object. That lease is not the lease of section 6.
 
@@ -2218,8 +2218,8 @@ Its data is one in-memory store (`store/memory.rs`):
 | worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls, and the leader's own discovery | discovery is behind a feature the image leaves out; a record it writes asks for the worker's cache events where the document in force at the find reads them for the worker's first model, and a document applied later does not write that word again |
 | worker objects | the write of each worker record, in one step with it: a call's or the discovery's on the leader, the applier's on a standby | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, which its start states (8 queued requests and 0.8 usage by its flags' defaults), an external record's over none, and the load monitor judges by them while the replica leads; an object's status leads its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
-| loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' streams | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store holds no load table |
-| cache index | a follower of each worker's cache events | an index in the worker host's KV tables (`worker_host::KvTables`), which the holder of the worker objects is handed; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
+| loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' streams | a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store holds no load table |
+| cache index | a follower of each worker's cache events | an index in the worker host's KV tables (`worker_host::KvTables`), which the holder of the worker objects is handed; a single request's decision reads none yet, only the engine's own record of sent prompts |
 | leases | decisions | not replicated to a standby; a lease that counts for its session key steps that key's count on its worker's object, which a controller's in-flight cap reads (10.2); a single request's session pins are the engine's own table, one for each document |
 
 The gRPC service (`crates/grand_central/contracts/grand_central.proto`):
@@ -2234,7 +2234,7 @@ The gRPC service (`crates/grand_central/contracts/grand_central.proto`):
 | `GetSnapshot`, `Explain` | operators | served by the leader; `Explain` only for decisions that were sampled |
 | `Leader` | anyone | served by every replica |
 | `Replicate` (stream) | a standby follows the leader | served |
-| `PushLoad`, `PushKvEvents`, `StepDown`, `WatchRegime` | | not served |
+| `StepDown`, `WatchRegime` | | not served |
 
 A `Decide` request of the single phase is decided on one of a fixed set of threads (the model
 picks the thread) by `InProcess::decide_without_lease`, over the list of the model's workers
@@ -2344,10 +2344,7 @@ streams its load records alone: the leader reads its load from that stream, and 
 while its records are not fresh. A worker that refuses that stream has none, and the leader polls
 it at every interval. A standby holds that stream too, so a take finds it open.
 
-The contract has two calls that would push the same data to a controller, `PushLoad` and
-`PushKvEvents`. They are a relay's calls, not a worker's. A relay is a gateway in front of a
-worker that only it can reach, and it would forward what that worker's stream brought. Neither
-call is served, and this design names no use for them.
+The contract has no call that would push the same data to a controller.
 
 What leaves the crate with that switch: the store's copies of the worker data that a worker
 object holds, and the adapters that write worker state into the

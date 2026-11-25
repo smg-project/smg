@@ -132,7 +132,7 @@ where
     let config = |port| Config {
         controller_id: "replication-0".to_owned(),
         listeners: vec![
-            listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+            listener("gateway", &[Scope::Gateway]),
             listener("control", &[Scope::Control]),
             Listener {
                 addr: SocketAddr::new(LEADER, port),
@@ -1660,7 +1660,7 @@ impl Replica {
         let config = |port| Config {
             controller_id: id.to_owned(),
             listeners: vec![
-                listener("gateway", &[Scope::Gateway, Scope::Ingestion], 0),
+                listener("gateway", &[Scope::Gateway], 0),
                 listener("control", &[Scope::Control], 0),
                 listener("replication", &[Scope::Replication], port),
             ],
