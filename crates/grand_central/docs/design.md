@@ -349,18 +349,31 @@ that finds the model with none decides, and the binding leaves with the model's 
 name is resolved as classic resolves it, and an unknown name adds no binding.
 
 The gateway then puts the new document in force on the running engine. A document put in force keeps
-the stages of a profile that did not change, under the rules of section 5.1: its name stands in
-both documents, its stages are built from the same text (the profile's own block, `view` and
-`signals`), over one stage table, and each stage built again says of itself what the standing one
-says. Such a profile's stages keep what they hold, and a decision under way and a new one run the
-same stage objects. A profile that changed, and a new one, start empty, and read the count of
-sends that the profiles kept beside them read. So a label's binding resets
-nothing of another model's policy where it leaves the document's `view` and `signals` as they
-stand. A label whose binding writes into them restarts every profile's stages. A label writes
-no signal, and into the view only headers the view does not list yet: a `manual` label its key's
-headers, and under the sticky override a label of a policy the override places adds the
-override's headers, beside a main policy whose binding lists none (`consistent_hashing`). A
-`cache_aware` label also writes the document's `index` block where the settings wrote none.
+the stages of a profile that did not change, under the rules of section 5.1. Its name stands in
+both documents, and its stages are built from the same text: the profile's own block, `view` and
+`signals`. Both documents were validated over one stage table, and each stage built again says of
+itself what the standing one says.
+
+Such a profile's stages keep what they hold, and a decision under way and a new one run the same
+stage objects. A profile that changed, and a new one, start empty, and read the count of sends that
+the profiles kept beside them read.
+
+So a label's binding resets nothing of another model's policy where it leaves the document's `view`
+and `signals` as they stand. A label whose binding writes into them restarts every profile's stages.
+A label writes no signal, and into the view only headers the view does not list yet. A `manual`
+label adds its key's headers. Under the sticky override a label of a policy the override places
+adds the override's headers, beside a main policy whose binding lists none (`consistent_hashing`).
+
+A `cache_aware` label writes its model's own entry of the document's `index` block, where it differs
+from what the document answers for that model without it. The block size and the cache boundaries
+stay one for the document, and a label that names another one is refused.
+
+The engine reads one entry and keeps one record of sent prefixes for a model, whatever the phase.
+Classic keeps a tree for each policy object, and the gateway lends a tree for a single request's
+model alone. So where one model id is served by labelled regular workers and by a pair at once, the
+pair's side of that model reads the label's entry. It reads the entry's kind, and its bound of the
+engine's record.
+
 Where the new document cannot be built, the document in force stays and the registration is
 answered with a warning.
 
