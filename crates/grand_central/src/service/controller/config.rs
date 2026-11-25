@@ -176,6 +176,9 @@ fn addresses_overlap(first: SocketAddr, second: SocketAddr) -> bool {
         || (a.is_ipv4() && b.is_ipv4() && (a == b || a.is_unspecified() || b.is_unspecified()))
 }
 
+/// The number of [`Config::MAX_DECIDE_SHARDS`], named by the refusal too.
+const DECIDE_SHARDS_CEILING: usize = 256;
+
 impl Config {
     /// The default settle window, the gateway's.
     pub const DEFAULT_SHUTDOWN_SETTLE: Duration = Duration::from_secs(5);
@@ -200,7 +203,7 @@ impl Config {
         token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
     };
     /// The most deciding threads a controller starts.
-    pub const MAX_DECIDE_SHARDS: usize = 256;
+    pub const MAX_DECIDE_SHARDS: usize = DECIDE_SHARDS_CEILING;
 
     /// The deciding threads a controller starts when its operator names no
     /// count: one a CPU available to the process, eight at most, the
@@ -548,7 +551,7 @@ pub enum ConfigError {
     #[error("the default overload threshold of usage is not above 0 and at most 1: a worker at or above it is vetoed")]
     OverloadTokenUsageOutOfRange,
     /// A count of deciding threads outside its range.
-    #[error("{0} deciding threads: the count is from 1 to {max}", max = Config::MAX_DECIDE_SHARDS)]
+    #[error("{0} deciding threads: the count is from 1 to {max}", max = DECIDE_SHARDS_CEILING)]
     DecideShards(usize),
     /// A settle window the grace period cannot hold twice.
     #[error("the shutdown settle window of {settle:?} is over half the grace period of {grace:?}")]
@@ -753,6 +756,7 @@ pub(crate) mod tests {
             ConfigError::DecideShards(0).to_string(),
             "0 deciding threads: the count is from 1 to 256"
         );
+        assert_eq!(Config::MAX_DECIDE_SHARDS, 256, "the words' ceiling");
         assert!((1..=8).contains(&Config::default_decide_shards()));
     }
 
