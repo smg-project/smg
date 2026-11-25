@@ -2624,18 +2624,24 @@ pub(crate) mod test_support {
     }
 
     /// The shadow series of the second binding's single requests in a
-    /// scrape, by kind: agreed, other target, other outcome, skipped.
-    /// `None` where the scrape holds no such series.
+    /// scrape ([`side_kinds`]).
     pub(crate) fn shadow_kinds(rendered: &str) -> [Option<u64>; 4] {
+        side_kinds(rendered, 1, "single")
+    }
+
+    /// The shadow series of the binding at `binding`, asked beside `side`,
+    /// in a scrape, by kind: agreed, other target, other outcome, skipped.
+    /// `None` where the scrape holds no such series.
+    pub(crate) fn side_kinds(rendered: &str, binding: u32, side: &str) -> [Option<u64>; 4] {
         ["agreed", "other-target", "other-outcome", "skipped"].map(|kind| {
             let labels = [
-                r#"binding="1""#,
-                r#"side="single""#,
-                &format!(r#"kind="{kind}""#),
+                format!(r#"binding="{binding}""#),
+                format!(r#"side="{side}""#),
+                format!(r#"kind="{kind}""#),
             ];
             let of_kind = |line: &&str| {
                 line.starts_with("smg_policy_shadow_decisions_total{")
-                    && labels.iter().all(|label| line.contains(label))
+                    && labels.iter().all(|label| line.contains(label.as_str()))
             };
             let line = rendered.lines().find(of_kind)?;
             line.rsplit(' ').next()?.parse().ok()

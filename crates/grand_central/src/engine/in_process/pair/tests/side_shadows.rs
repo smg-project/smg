@@ -393,6 +393,26 @@ fn a_decode_call_that_picks_no_decode_counts_its_shadow_as_skipped() {
     assert_eq!(again_kinds(&host), [0, 0, 0, 1], "none counted");
 }
 
+/// A decode's shadow that picks no decode beside a call that picks one was
+/// asked, and its answer is another outcome: at the pair's first decision,
+/// and at its decode decided again. Neither is counted as skipped, which
+/// says a shadow that was due was not asked.
+#[test]
+fn a_later_decodes_shadow_that_picks_no_decode_is_another_outcome() {
+    let (host, seen) = bed([Rule::Place(0); 2], [None, Some(Rule::Nobody)]);
+    let classes = every(2, 2);
+    let asks = host.asks(&classes, true);
+    let now = Instant::now();
+    let first = leased(&host, &asks, now);
+    assert_eq!(side_kinds(&host), [[0; 4], [0, 0, 1, 0]]);
+    let held = target_at(&first.decision, 0);
+    let again = decode_again(&host, &asks, (&first, &held), now);
+    assert!(again.lease.is_some(), "the call issues the decode");
+    assert_eq!(host.picked(&again.decision), host.picked(&first.decision));
+    assert_eq!((again_kinds(&host), seen.asks()), ([0, 0, 1, 0], [0, 2]));
+    assert_eq!(side_kinds(&host), [[0; 4], [0, 0, 1, 0]]);
+}
+
 /// A later decode's shadow that panics costs its call nothing: the call
 /// issues the decode its live profile takes, the fault is counted with the
 /// engine's and the side counts nothing.
