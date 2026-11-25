@@ -296,8 +296,9 @@ impl MemoryStore {
     /// count it booked: its end is handed to the file as a removed
     /// worker's release ([`ReleaseReason::WorkerRemoved`]) and told as a
     /// frame's is, by the file's decider at work or by the restore where
-    /// that decider rests. The engine of the lease's own generation hears
-    /// it once, where that generation stands. The restore returns when
+    /// that decider rests. The stages that stood at the lease's issue hear
+    /// it once, where a generation that holds them stands. The restore
+    /// returns when
     /// every end is handed: a lease of a file whose decider works stands,
     /// its count booked, until that decider's next take, and a full ring
     /// holds the restore's thread until then. A gateway's
@@ -434,7 +435,7 @@ impl MemoryStore {
             self.pins_follow(old, new);
         }
         self.swap_world(&workers);
-        self.tell_members(&workers);
+        Self::tell_members(&workers, |list| self.tell_engine(list));
         Some(ended)
     }
 
@@ -679,15 +680,23 @@ impl MemoryStore {
     /// the load lock, as a membership write does: a writer's wait, never a
     /// decision's.
     ///
-    /// The generation's engine is then told every member once, by id
+    /// In a build with the `in-process` feature the generation keeps the
+    /// standing one's stage objects, with what they hold, for each profile
+    /// that did not change, as an engine does where it takes a new document
+    /// itself. A build without that feature keeps nothing: every stage is
+    /// built new. The generation's engine is built behind the workers
+    /// lock, where the standing generation cannot move. A number that does
+    /// not rise builds none: a generation the store refuses keeps nothing.
+    /// The stages it built new are then told every member once, by id
     /// ([`Membership::Snapshot`]), under the workers lock and with the load
-    /// lock let go: its stages start empty, and each membership write after
-    /// it is told behind the same lock, in its order. One thing does not
-    /// start empty: a count of sends, which the engine takes over from
-    /// the standing generation's count under the same two settings, or
-    /// else by its profile's name, or else one that is left, before the
-    /// publication
-    /// ([`Engine::succeed`](crate::engine::Engine::succeed)).
+    /// lock let go: they start empty, and a stage kept heard each member as
+    /// it came. Each membership write after it is told behind the same
+    /// lock, in its order. A count of sends stands where a profile that
+    /// reads it is kept. One thing built new does not start empty: a count
+    /// of sends none of whose readers is kept, which the engine takes over
+    /// from the standing generation's count under the same two settings,
+    /// or else by its profile's name, or else one that is left, before the
+    /// publication ([`Engine::succeed`](crate::engine::Engine::succeed)).
     ///
     /// The journal is told the generation's number there too, behind the
     /// publication ([`Journal::generation`]).
@@ -754,30 +763,59 @@ impl MemoryStore {
         spec: AppliedSpec,
         admit: impl FnOnce() -> bool,
     ) -> Result<bool, StaleGeneration> {
-        // The writer takes a second reference: when it refuses, the last
-        // one is this one, let go after the lock.
-        let spec = Arc::new(Applied::new(spec, self.origin, &self.engine_faults));
         let generation = spec.generation();
+        // The writer takes a second reference: where `admit` refuses, the
+        // last one is this one, let go after the lock.
+        let built;
         let before = {
             // Taken before the lock, so dropped after it: the journal
             // wakes its readers with the membership lock let go.
             let _released = self.released();
             let workers = self.workers.lock();
+            // Behind the workers lock no apply moves the standing
+            // generation: what the new one keeps of its stages is what
+            // stands. A number that does not rise builds nothing, as an
+            // engine refuses it ahead of its keep: a refused generation
+            // keeps nothing, and is let go after the lock. The load lock is
+            // taken behind the build: a taker of that lock alone, as a
+            // scrape's counts and the read of what is due, does not wait
+            // for the build.
+            built = {
+                let world = self.world.load();
+                let standing = world.spec();
+                if generation > standing.generation() {
+                    Ok(Arc::new(Applied::after(
+                        standing,
+                        spec,
+                        self.origin,
+                        &self.engine_faults,
+                    )))
+                } else {
+                    Err(StaleGeneration {
+                        standing: standing.generation(),
+                        offered: generation,
+                    })
+                }
+            };
             let mut loads = self.loads.lock();
             // The last word, behind every lock this entry waits for: what
             // follows is the publication.
             if !admit() {
                 return Ok(false);
             }
+            // A number that did not rise is refused here, behind that word,
+            // as the writer refused it.
+            let spec = built.as_ref().map_err(|stale| *stale)?;
             let writer = &mut loads.writer;
-            let (world, before) = writer.apply(Arc::clone(&spec), workers.members())?;
+            let (world, before) = writer.apply(Arc::clone(spec), workers.members())?;
             spec.engine().succeed(self.world.load().spec().engine());
             // The pools are published as they stood: a build the membership
             // writes left owed is left to its window, and with it the table
             // of the members no world named.
             writer.replaced(self.world.swap(world));
             drop(loads);
-            self.tell_members(&workers);
+            // A stage the generation kept heard each member as it came.
+            Self::tell_members(&workers, |list| spec.tell_built_new(list));
             if let Some(journal) = &self.journal {
                 journal.generation(at, generation);
             }
@@ -840,16 +878,15 @@ impl MemoryStore {
         self.listed();
     }
 
-    /// Tell the standing generation's engine every member once, by id
-    /// ([`Membership::Snapshot`]): what an apply tells the generation it
-    /// applied and a snapshot the one that stands. Called under the workers
-    /// lock, after the world of those members is shown and with the load
-    /// lock let go.
-    fn tell_members(&self, workers: &Workers) {
+    /// Tell every member once, by id ([`Membership::Snapshot`]), through
+    /// `tell`: a snapshot tells the engine of the generation that stands,
+    /// and an apply the stages its generation built new
+    /// ([`Applied::tell_built_new`]). Called under the workers lock, after
+    /// the world of those members is shown and with the load lock let go.
+    fn tell_members(workers: &Workers, tell: impl FnOnce(&Membership<'_>)) {
         let mut members: Vec<WorkerId> = workers.rows.keys().copied().collect();
         members.sort_unstable();
-        let told = Membership::Snapshot(&members);
-        self.tell_engine(&told);
+        tell(&Membership::Snapshot(&members));
     }
 
     /// Tell the engine of the world the store shows one membership word:

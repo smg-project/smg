@@ -1556,9 +1556,10 @@ const fn busy_of(refused: DecodeRefused) -> Reason {
 /// Takes back the issue of a decode call whose answer does not leave: the
 /// side stands as the call found it and its booking is freed
 /// ([`MemoryStore::unissue_decode`]), then the engine that heard the issue
-/// is told the side's release, once: the engine of the lease's generation
-/// ([`issuing`]), where it still stands. A side that moved since was ended
-/// or issued anew by another hand, and nothing is told of it here.
+/// is told the side's release, once: the engine of the lease's generation,
+/// or what a later one kept of its stages ([`issuing`]). A side that moved
+/// since was ended or issued anew by another hand, and nothing is told of
+/// it here.
 fn take_back(
     store: &MemoryStore,
     world: &StoreSnapshot,
@@ -1568,7 +1569,7 @@ fn take_back(
     reason: ReleaseReason,
 ) {
     if store.unissue_decode(gateway, lease.id, issue) {
-        if let Some(engine) = issuing(world.spec(), lease) {
+        if let Some(engine) = issuing(world, lease).engine() {
             engine.on_released(lease, reason);
         }
     }
@@ -4876,8 +4877,9 @@ pub(crate) mod tests {
     }
 
     /// An abandoned lease is told to the engine whose generation issued it
-    /// and to no later one: a later generation's stages never saw the
-    /// issue. The lease is ended all the same.
+    /// and to no stage a later one built new: such a stage never saw the
+    /// issue. Each generation here is validated over a stage table of its
+    /// own, so the later one keeps none. The lease is ended all the same.
     #[tokio::test]
     async fn a_later_generations_engine_is_not_told_of_a_lease_it_did_not_issue() {
         let told = Arc::new(Mutex::new(Vec::new()));
@@ -5956,12 +5958,30 @@ pub(crate) mod tests {
         told: &Arc<Mutex<SideCalls>>,
         edit: impl FnOnce(&mut PolicySpec),
     ) -> AppliedSpec {
+        hearing_sides(&mut catalog, told);
+        later_spec_over(&catalog, generation, edit)
+    }
+
+    /// Adds to `catalog` the stage of [`later_bed`]'s decode side, which
+    /// keeps what its engine tells it in `told`.
+    fn hearing_sides(catalog: &mut StageRegistry, told: &Arc<Mutex<SideCalls>>) {
         let kept = Arc::clone(told);
         catalog
             .scorer("heard-sides", move || {
                 Box::new(HeardSides(Arc::clone(&kept)))
             })
             .expect("a free name");
+    }
+
+    /// The document of [`later_bed`] as `generation`, validated over
+    /// `catalog`, which holds its decode side's stage ([`hearing_sides`]).
+    /// Two documents validated over one catalog are a controller's: the
+    /// later one keeps the stages of a profile both state alike.
+    fn later_spec_over(
+        catalog: &StageRegistry,
+        generation: u64,
+        edit: impl FnOnce(&mut PolicySpec),
+    ) -> AppliedSpec {
         let mut document: PolicySpec = serde_json::from_str(
             r#"{
               "apiVersion": "smg.policy/v1",
@@ -5981,7 +6001,7 @@ pub(crate) mod tests {
         document.generation = generation;
         edit(&mut document);
         let digest = document.digest().expect("the document digests");
-        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+        AppliedSpec::validate_digested(&document, digest, catalog, &[])
             .expect("the catalog holds the stage")
     }
 
@@ -6835,6 +6855,39 @@ pub(crate) mod tests {
         assert_eq!(booked(&bed, [prefill, chosen, other]), [2, 1, 0]);
         assert_eq!(*reloaded.lock(), []);
         assert_eq!(told.lock().len(), before);
+    }
+
+    /// A call's issue behind a reload that states the decode side's
+    /// profile as it stood is told to that profile's stage, which the
+    /// reload kept, and so is its take-back: the stage stood when the lease
+    /// was issued. Both documents are validated over one catalog, as a
+    /// controller validates its documents.
+    #[tokio::test]
+    async fn a_decode_issued_and_taken_back_behind_a_reload_is_told_to_the_stage_it_kept() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut catalog = StageRegistry::builtin();
+        hearing_sides(&mut catalog, &told);
+        let first = later_spec_over(&catalog, 1, |_| {});
+        let mut bed = bed(Some(first), true, (1, 8), []);
+        ready(&bed.store, "d1", MODEL, Role::Decode, WireModes::NONE);
+        let prefill = side_of(&bed, Role::Prefill);
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let before = told.lock().len();
+        let applied = store.apply(later_spec_over(&catalog, 2, |_| {}));
+        applied.expect("a later generation");
+        let steps = [Step::At(Duration::ZERO), Step::At(FENCED)];
+        bed.script.steps.lock().extend(steps);
+        let answer = bed.ask(call(1, id)).await;
+        assert_eq!(busy(&answer), Reason::NotLeader);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, chosen));
+        assert_eq!(booked(&bed, [prefill, chosen, other]), [2, 1, 0]);
+        // The side's issue on the decode the call picked, then its release.
+        let heard = told.lock()[before..].to_vec();
+        let [(Side::Decode, issued, None), (Side::Decode, released, Some(_))] = heard[..] else {
+            panic!("the stage kept heard {heard:?}");
+        };
+        assert_eq!((issued, released), (other, other));
     }
 
     /// A replica that does not lead says so for a request it has no

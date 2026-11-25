@@ -1256,8 +1256,9 @@ pub(crate) fn decide_decode(
 /// ([`MemoryStore::unissue_decode`]). `None` for a shed, which files none.
 ///
 /// The engine told is the one of the lease's own generation ([`issuing`]):
-/// behind a reload the engine of this instant decided the side and hears
-/// nothing of the lease. The issue is dated at this call
+/// behind a reload the engine of this instant decided the side, and of
+/// its stages the ones it kept hear of the lease. The issue is dated at
+/// this call
 /// ([`issued_later`]). A stage that panics there is held and counted, as
 /// under a report, and the caller still gets the pick the file holds.
 ///
@@ -1297,9 +1298,9 @@ pub(crate) fn issue_decode(
     let slot = world
         .booked_of(chosen.decode_id)
         .or_else(|| store.filed_slot(chosen.decode_id));
-    let spec = world.spec();
     let told = |lease: &Lease| {
-        let Some(engine) = issuing(spec, lease) else {
+        let issuing = issuing(world, lease);
+        let Some(engine) = issuing.engine() else {
             return;
         };
         let heard = || issued_later(world, engine, lease, decision, taken.now);
