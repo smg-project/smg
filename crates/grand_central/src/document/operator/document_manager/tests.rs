@@ -234,14 +234,25 @@ fn lists_of_labels_alone_leave_no_member_outside_and_the_next_lists_count_every_
     assert_eq!(view("labels: [tier]"), outside(0, 0));
     assert_eq!(join("http://a:8000"), outside(0, 0));
     assert_eq!(join("http://b:8000"), outside(0, 0));
+    // The store keeps no member's read under the selectors alone: the
+    // lists pass ran at neither build.
+    assert_eq!(store.listed_members(), 0);
     // A list of families counts both members at its apply, and the member
     // that joins behind it at its build.
     assert_eq!(view("engines: [alpha]"), outside(2, 0));
+    // Under such a list the store keeps a read for each member: the
+    // apply's two, then the build's third.
+    assert_eq!(store.listed_members(), 2);
     assert_eq!(join("http://c:8000"), outside(3, 0));
+    assert_eq!(store.listed_members(), 3);
     // The selectors alone again: none is outside, at the apply and at a
     // build.
     assert_eq!(view("labels: [tier]"), outside(0, 0));
+    // The apply let go of the three reads and read no member.
+    assert_eq!(store.listed_members(), 0);
     assert_eq!(join("http://d:8000"), outside(0, 0));
+    // The build behind the join kept none either.
+    assert_eq!(store.listed_members(), 0);
     // A list of zones counts the four at its apply and the fifth at its
     // build.
     assert_eq!(view("zones: [east]"), outside(0, 4));

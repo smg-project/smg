@@ -848,6 +848,13 @@ impl Writer {
         self.listed.clear();
     }
 
+    /// How many members' reads under the standing generation's lists are
+    /// kept ([`Self::list`], [`Self::relist`]).
+    #[cfg(test)]
+    pub(super) fn listed(&self) -> usize {
+        self.listed.len()
+    }
+
     /// What the members of a membership build read under the standing
     /// generation's lists, and the count of those outside them: carried
     /// from the last read where a member's row stands at the revision it

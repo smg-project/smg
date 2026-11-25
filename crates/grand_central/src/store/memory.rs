@@ -1186,6 +1186,14 @@ impl MemoryStore {
         self.stats().outside
     }
 
+    /// How many members' reads under the standing generation's lists the
+    /// store keeps: one a member under lists that name an engine family or
+    /// a zone, and none under any other.
+    #[cfg(test)]
+    pub(crate) fn listed_members(&self) -> usize {
+        self.loads.lock().writer.listed()
+    }
+
     /// How many members the table of the ones no world lists holds.
     #[cfg(test)]
     pub(super) fn filed_members(&self) -> usize {
