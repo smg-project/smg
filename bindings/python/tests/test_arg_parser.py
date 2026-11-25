@@ -2077,8 +2077,8 @@ class TestParserFlag:
 
 class TestParserNames:
     """--tool-call-parser and --reasoning-parser take the legacy parsers' names, Symphony's tables'
-    names, and a name a table answers to that no legacy parser has, which a launcher passes for a
-    model family whose table has no older parser."""
+    names, and every name a table answers to: a legacy parser's of either kind, and one a
+    launcher passes for a model family whose table has no older parser."""
 
     def test_a_tables_name_without_a_legacy_parser_is_a_choice_of_both_flags(self):
         for choices in (get_available_tool_call_parsers(), get_available_reasoning_parsers()):
@@ -2086,9 +2086,13 @@ class TestParserNames:
             assert "muse" in choices
             assert "muse_spark" in choices
             assert "hf" in choices
-        # A legacy parser's name stays a choice of its own flag only.
+        # A legacy parser's name a table answers to is a choice of both flags; one no table
+        # answers to stays a choice of its own flag only.
         assert "qwen_xml" in get_available_tool_call_parsers()
-        assert "qwen_xml" not in get_available_reasoning_parsers()
+        assert "qwen_xml" in get_available_reasoning_parsers()
+        assert "minimax" in get_available_tool_call_parsers()
+        assert "pythonic" in get_available_tool_call_parsers()
+        assert "pythonic" not in get_available_reasoning_parsers()
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
         args = RouterArgs.from_cli_args(
