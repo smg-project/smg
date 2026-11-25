@@ -258,6 +258,9 @@ pub struct FactPastBound {
 impl WorkerFacts {
     /// What a row's numbers are charged in [`Self::weight`].
     pub const NUMBERS: usize = 160;
+    /// What a row is charged beside its numbers where its worker states a
+    /// fact for a request's hard demands: the wire's block at its widest.
+    pub const DEMAND_FACTS: usize = 22;
     /// What a text is charged beside its own bytes.
     pub const FRAME: usize = 5;
     /// The most a row weighs.
@@ -271,6 +274,9 @@ impl WorkerFacts {
             Self::NUMBERS + 2 * text(&self.key) + text(&self.engine) + text(&self.engine_kind);
         if self.signals.scrape_interval_ms > 0 {
             bytes += text(&self.engine_kind);
+        }
+        if self.demand_facts != crate::engine::DemandFacts::default() {
+            bytes += Self::DEMAND_FACTS;
         }
         if let Some(zone) = &self.zone {
             bytes += text(zone);

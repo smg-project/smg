@@ -2634,6 +2634,10 @@ crate's own client states for no request.
 - **No hard demand crosses.** A frame states none in this protocol version, and a host decides a
   request that states one by itself. So the controller's count leaves no worker out for a demand.
   It ends when a frame states a request's demands **[planned]**.
+  What a worker states for such a demand crosses already **[built]**: a registration states it
+  and the log's row tells it, so a standby and a watcher hold it. A worker whose row states none
+  meets no demand for a runtime, for media by reference or for a way to decide a constraint, and
+  it takes a request of any size. Whether a worker takes images crosses in no registration yet.
 - **A named prefill at its admission limit is not waited for.** A gateway's own process waits for
   the prefill a pair names where it stands at that gateway's admission limit (section 8.2). A
   controller keeps no gate: its count takes the prefill, and the gateway finds the limit. It ends
