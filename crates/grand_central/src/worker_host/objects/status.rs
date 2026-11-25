@@ -121,7 +121,7 @@ impl<G: Generation> Objects<G> {
     /// write calls ([`Objects`]): its caller asks its term itself, so the
     /// call hands the store no last word.
     pub fn connect_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
-        self.row_status(store, row, revision, Write::Connect);
+        self.row_status(store, row, revision, &|| true, Write::Connect);
     }
 
     /// The drain of the row `row`, read at `revision`, as
@@ -129,7 +129,7 @@ impl<G: Generation> Objects<G> {
     /// `store` is told. Whether the row's object moved: a row that left
     /// the revision, or left, moves nothing, and a draining object stands.
     pub fn drain_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) -> bool {
-        self.row_status(store, row, revision, Write::Drain)
+        self.row_status(store, row, revision, &|| true, Write::Drain)
             .is_some()
     }
 
@@ -137,23 +137,42 @@ impl<G: Generation> Objects<G> {
     /// a write that laid the object in another's place: it took the
     /// standing object's status there, and the table holds its own.
     pub(super) fn tell_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
-        self.row_status(store, row, revision, Write::Tell(None));
+        self.row_status(store, row, revision, &|| true, Write::Tell(None));
+    }
+
+    /// Settle the status of the object that stands for `row` with the
+    /// table's, behind a lay outside a write call that put the object in
+    /// another's place: it took the standing object's status there, and a
+    /// move a health driver made on that one ahead of its telling tells
+    /// nothing ([`Self::status_under`]). `leads` is the caller's own word
+    /// of its lead. Where it holds, the table is told the object's status,
+    /// as [`Self::tell_row`] tells it. Where it does not, the table is not
+    /// written, and the object takes the status its row holds.
+    pub(super) fn settle_row(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        leads: &dyn Fn() -> bool,
+    ) {
+        self.row_status(store, row, revision, leads, Write::Tell(None));
     }
 
     /// A status write that names its row: on the object that stands for
-    /// `row`, where it was built from `revision`.
-    fn row_status(&self, store: &MemoryStore, row: WorkerId, revision: u64, write: Write) -> Moved {
+    /// `row`, where it was built from `revision`, under its writer's word
+    /// of its lead.
+    fn row_status(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        leads: &dyn Fn() -> bool,
+        write: Write,
+    ) -> Moved {
         let id = self.object(row)?;
         let object = self.registry.get(&id)?;
-        self.status_under(
-            store,
-            &id,
-            object.revision(),
-            Some(revision),
-            &|| true,
-            write,
-        )
-        .1
+        self.status_under(store, &id, object.revision(), Some(revision), leads, write)
+            .1
     }
 
     /// One status write, under the object's mutation lock: the writer's

@@ -2195,7 +2195,7 @@ Its data is one in-memory store (`store/memory.rs`):
 | Data | Filled by | Note |
 |---|---|---|
 | worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls, and the leader's own discovery | discovery is behind a feature the image leaves out; a record it writes asks for the worker's cache events where the document in force at the find reads them for the worker's first model, and a document applied later does not write that word again |
-| worker objects | the write of each worker record, in one step with it: a call's or the discovery's on the leader, the applier's on a standby | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, which its start states (8 queued requests and 0.8 usage by its flags' defaults), an external record's over none, and the load monitor judges by them while the replica leads; an object's status leads its record's, and a single request's decision reads the workers here |
+| worker objects | the write of each worker record, in one step with it: a call's or the discovery's on the leader, the applier's on a standby | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, which its start states (8 queued requests and 0.8 usage by its flags' defaults), an external record's over none, as every record's is while the document in force switches the default off, and the load monitor judges by them while the replica leads; an object's status leads its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' streams | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store holds no load table |
 | cache index | a follower of each worker's cache events | an index in the worker host's KV tables (`worker_host::KvTables`), which the holder of the worker objects is handed; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
@@ -2405,7 +2405,7 @@ whole record read back (step 1 below). Of the 24 facts a worker's record holds:
 | the wire modes | the one protocol the object speaks | the other protocols of the set |
 | the engine's kind | the runtime the worker crate reads the name as | a name that crate does not know, and a known name as it was written |
 | the health policy | the checks in whole seconds, each threshold at least one, off where the controller cannot dial the worker | a part of a second, a threshold of none, and the policy of a worker built with its checks off |
-| the overload thresholds | where a program asks for them, as the controller's does, an engine's worker's own over the program's defaults and an external worker's own alone | which of them an engine's worker stated |
+| the overload thresholds | where a program asks for them, as the controller's does, an engine's worker's own over the program's defaults, and its own alone for an external worker or while the document in force switches the defaults off | which of them an engine's worker stated |
 | the drain window | the window in force | a window stated equal to the object's default, which reads back as none |
 
 - Ten are not carried to the worker object: the incarnation, the zone, the pairing facts, the
@@ -2804,7 +2804,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Part | Mark | What is missing |
 |---|---|---|
 | The policy document: profiles, bindings by model and phase, plans, a binding's shed word and its refusal of an overload number, routing key, sessions | **[built]** | |
-| A binding's overload switch (`overload.enabled`) under worker objects | **[partly]** | a gateway that runs a supplied document reads it at its start, where it builds its workers' default: one word for the bindings a host runs (decision 10); a controller does not read it there yet |
+| A binding's overload switch (`overload.enabled`) under worker objects | **[built]** | |
 | Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that writes one is refused as not in this build |
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; it runs a pair's shadows by side at the pair's first decision in a host's own process; no gateway takes a document that names them yet, and no served controller asks them, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where no route reads a record yet (decision 7) |
@@ -3012,15 +3012,21 @@ registers it with no threshold at all. What that leaves of a binding's block:
   flags' defaults are 8 queued requests and 0.8 usage.
 - **Its shed word [built].** A binding keeps whether a request is shed when every worker is
   vetoed. A decision reads it.
-- **Its switch [partly].** Whether the program's default vetoes at all is one word for the
+- **Its switch [built].** Whether the program's default vetoes at all is one word for the
   bindings a host runs, because the default is the program's: one for every worker object that
   takes one. The host reads it where it
   builds that default. A gateway that runs a supplied document reads it at its start, and
   refuses a document whose bindings disagree on it, or on the shed word: its routes read one
   shed word for the process. It also refuses one whose block is on where the gateway states
   neither number. With the switch off the gateway builds its worker objects with no default. A
-  binding with no block says the defaults. A controller's reader of the switch is planned: it
-  does not read it on its worker objects yet. A worker's own thresholds veto either way.
+  binding with no block says the defaults. A standalone controller reads it at each document
+  that takes force: its document door states the word on the holder of its worker objects
+  behind each generation's entry, under the door's lock, and the objects the word changes are
+  built again before the entry returns. Its default is off where every binding switches it
+  off. Bindings that disagree keep it on, and a controller refuses no document for them. At a
+  standby's restore the snapshot's rows are built ahead of its generation: where that
+  generation moves the word, a row it changes is built twice. A worker's own thresholds veto
+  either way.
 
 ### Decision 11: the crate in CI and in the published set
 

@@ -165,6 +165,12 @@ pub(crate) struct Checked {
 pub(crate) type Validate =
     fn(&PolicySpec, Digest, &StageRegistry, &[&str]) -> Result<AppliedSpec, SpecError>;
 
+/// What a host does behind a generation's entry, where it handed its door
+/// one ([`DocumentManager::telling`]): [`DocumentManager::enter`] calls it
+/// with the store the generation now stands in.
+#[cfg(feature = "controller")]
+pub(crate) type Entered = Box<dyn Fn(&MemoryStore) + Send + Sync>;
+
 /// How a document's own `generation` line is read, by the source that hands
 /// the document over.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -404,6 +410,10 @@ pub struct DocumentManager {
     catalog: Arc<StageRegistry>,
     denied_headers: Vec<String>,
     validate: Validate,
+    /// The host's hook behind a generation's entry, where it handed one
+    /// ([`Self::telling`]).
+    #[cfg(feature = "controller")]
+    entered: Option<Entered>,
     /// One apply at a time: the standing number is read, the document's
     /// pass run and the store's entry called under this lock, and a spec
     /// store's directory is written under it alone. No reader takes it. It
@@ -465,6 +475,8 @@ impl DocumentManager {
             catalog,
             denied_headers,
             validate,
+            #[cfg(feature = "controller")]
+            entered: None,
             applying: Mutex::new(None),
             binding: Mutex::new(()),
             dir: OnceLock::new(),
@@ -477,6 +489,16 @@ impl DocumentManager {
             applied: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
         }
+    }
+
+    /// The door with a host's hook behind each generation that enters
+    /// ([`Self::enter`]): handed once, at the door's making, as its
+    /// validator is. A door that was handed none calls nothing.
+    #[cfg(feature = "controller")]
+    #[must_use]
+    pub(crate) fn telling(mut self, entered: Entered) -> Self {
+        self.entered = Some(entered);
+        self
     }
 
     /// Applies a source's document through the store's own entry. A host
@@ -570,6 +592,16 @@ impl DocumentManager {
     /// Publishes `next` and keeps its bytes under the lock a reader takes,
     /// so the number and the bytes move together. A publication that
     /// lands is reported under that lock, then counted and logged once.
+    ///
+    /// Every generation that takes force passes here, under the door's
+    /// lock its caller holds: an apply's, a spec store's bind's, a store's
+    /// write's and a followed generation's. So a host's hook
+    /// ([`Self::telling`]) runs here, once a generation: behind the store's
+    /// entry and outside the document lock, and under the door's lock
+    /// still, so two entries run it in the order they entered. It runs
+    /// behind the count and the log's line. A publication that does not
+    /// land runs none. A hook that panics leaves the generation in force,
+    /// counted and logged, with what the hook had not done yet.
     pub(crate) fn enter(
         &self,
         next: AppliedSpec,
@@ -595,6 +627,10 @@ impl DocumentManager {
             bytes,
             "policy spec applied"
         );
+        #[cfg(feature = "controller")]
+        if let Some(entered) = &self.entered {
+            entered(&self.store);
+        }
         Ok(true)
     }
 

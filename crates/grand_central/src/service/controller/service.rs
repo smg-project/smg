@@ -275,7 +275,13 @@ impl Shared {
                 counts: Arc::default(),
             },
         )?;
-        let generations = Arc::new(Generations::new(Arc::clone(&store), catalog));
+        // The door states each generation's overload switch on the worker
+        // objects the deciding threads read.
+        let generations = Arc::new(Generations::stating(
+            Arc::clone(&store),
+            catalog,
+            Arc::clone(&objects),
+        ));
         Ok(Self {
             controller_id,
             address,
