@@ -1615,7 +1615,9 @@ struct ModelArgs {
 
     // ==================== Parsers ====================
     /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
+    /// symphony, a worker's labels decide for its model (a family's bare
+    /// name on them leaves the model to a registry table whose name
+    /// begins with it), else Symphony's
     /// registry for a model it knows, and this flag for the models the
     /// registry does not know: a Symphony table's name here (and in
     /// --tool-call-parser, or there alone) reads them with that table, and
@@ -1627,7 +1629,9 @@ struct ModelArgs {
     reasoning_parser: Option<String>,
 
     /// Parser for tool-call interactions (e.g., json, qwen). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
+    /// symphony, a worker's labels decide for its model (a family's bare
+    /// name on them leaves the model to a registry table whose name
+    /// begins with it), else Symphony's
     /// registry for a model it knows, and this flag for the models the
     /// registry does not know: a Symphony table's name here (and in
     /// --reasoning-parser, or here alone) reads them with that table, and
@@ -1640,7 +1644,9 @@ struct ModelArgs {
 
     /// Which parser reads a chat completion's reasoning and tool calls:
     /// Symphony (the default) or the per-model parsers (legacy). With
-    /// Symphony, a model's worker labels decide, else Symphony's registry
+    /// Symphony, a model's worker labels decide (a family's bare name on
+    /// them leaves the model to a registry table whose name begins with
+    /// it), else Symphony's registry
     /// for a model it knows, else --tool-call-parser and
     /// --reasoning-parser: a Symphony table's name reads with that table,
     /// and so does a legacy parser's name whose format a table reads (qwen

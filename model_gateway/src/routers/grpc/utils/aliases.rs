@@ -7,7 +7,9 @@
 //! every legacy name is a table's own, one of its [`ALIASES`], or in [`UNANSWERED`] with the
 //! reason, never both and never neither, which the test over both legacy registries holds
 //! (`regular::symphony`). The crate knows a table by its own name only (`Table::named`): these
-//! names are the gateway's, and live with its parser resolution.
+//! names are the gateway's, and live with its parser resolution. On a worker's labels a family's
+//! bare name (`FAMILIES`: `qwen`) defers to the registry's table for a model the registry reads
+//! with a table whose name begins with that name.
 
 use symphony::formats::Table;
 
@@ -133,6 +135,32 @@ pub fn gives_way(name: &str) -> bool {
     GIVING_WAY
         .iter()
         .any(|legacy| legacy.eq_ignore_ascii_case(name))
+}
+
+/// The families' bare names ([`names_family_of`]). Each selects one table, the family's first,
+/// as an alias of it (`deepseek`, `llama`, `minimax` the M2 line's, `qwen`) or as that table's
+/// own name (`glm`, `inkling`, `kimi` the K2 line's calls, `mistral`), while the registry gives
+/// the family's other lines tables of their own, named after the family (`minimax_m3`,
+/// `kimi_k3`). A model of the family is one the registry reads with a table whose name begins
+/// with the family's name, whoever made the model: `qwen` reaches every group on `qwen2.5`,
+/// `qwen3_tagged` and `qwen3_tagged_direct`, other makers' models among them, and `llama` the
+/// Llama Nemotron line. On a worker's labels such a name reads a model of the family with the
+/// registry's table for it, as a worker without labels is read, so no label selects the table
+/// `inkling`, `kimi` or `mistral` for a model the registry gives another table of the family
+/// (`glm` keeps the alias `glm47_moe`); any other name (`minimax_m2`, `kimi_k2`) reads as
+/// written, and so does a family's name for a model the registry does not know or gives a
+/// table of another family.
+pub(crate) const FAMILIES: [&str; 8] = [
+    "deepseek", "glm", "inkling", "kimi", "llama", "minimax", "mistral", "qwen",
+];
+
+/// Whether `name` says the family `table` is a line of: one of [`FAMILIES`], which the table's
+/// own name begins with.
+pub(crate) fn names_family_of(name: &str, table: Table) -> bool {
+    let name = name.trim();
+    FAMILIES
+        .iter()
+        .any(|family| family.eq_ignore_ascii_case(name) && table.name().starts_with(family))
 }
 
 #[cfg(test)]

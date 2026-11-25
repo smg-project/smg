@@ -1232,7 +1232,8 @@ wrapper state for the block, an arguments state per call):
   from behind its last `◁think▷`, and not at all where it holds none. A call's id is minted, not
   the header's: the older parsers left the ids of this name to the gateway, which numbers them by
   the conversation for a model it knows as Kimi by its name, and still does. No group of the
-  registry reads with it: an operator names it. Under the gateway the name read alone gives way:
+  registry reads with it: an operator names it, and as a tool-call name on a worker's labels it
+  says the family: the registry's table reads a model it gives a Kimi table. Under the gateway the name read alone gives way:
   the registry's table reads a model it knows, and a table another source's names select reads the
   others, as before the table came; `kimi` reads where nothing else does. Two departures from the
   older `kimi` parser: text before `◁think▷` is content when the output is read whole, as the

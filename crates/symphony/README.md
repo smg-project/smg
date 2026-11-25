@@ -218,7 +218,9 @@ difference. **Pending** means no table yet.
 `--tool-call-parser` and `--reasoning-parser` names its registries resolve from the model id, as
 in `smg serve --model-path Qwen/Qwen3-8B --tool-call-parser qwen --reasoning-parser qwen3`; none
 means passthrough, the output read as content. Under `--parser symphony` (the gateway's default), a worker's parser labels
-decide for its model, else the registry's table for a model it knows, else the two flags, for the
+decide for its model (a family's bare name as the label, `minimax` or `qwen`, leaves the model to
+the registry's table where that table's name begins with it, whoever made the model), else the
+registry's table for a model it knows, else the two flags, for the
 models the registry does not know: a table's name in them reads those models with that table, and
 the name `hf` reads each with the table its tokenizer's `response_template` compiles into
 (`smg-response-template`). Symphony's tables carry one name each, the **Table** column, and the

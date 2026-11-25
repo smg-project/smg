@@ -12,7 +12,7 @@ use symphony::{
 use super::{telemetry, template::Templates, SymphonyError};
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
-    routers::grpc::utils::{answering_to, gives_way, ModelNames, Names},
+    routers::grpc::utils::{answering_to, gives_way, names_family_of, ModelNames, Names},
 };
 
 /// The legacy parser that leaves its channel as written: an operator's choice no table reads
@@ -149,9 +149,13 @@ fn nothing_reason(names: &ModelNames<'_>) -> Fallback {
 /// `--reasoning-parser`, for a model the registry does not know; else the legacy parsers, with
 /// their own detection, the reason named ([`Fallback`]). So a fleet-wide name reads the models
 /// the registry has no table for and never a family it has one for, and a worker's labels read
-/// their model whatever the registry has. A table the labels select reads a model the registry
-/// gives the same table with the model's own turn opener; another model, or one the registry
-/// does not know, replays from the table's own. A reasoning name alone that gives way
+/// their model whatever the registry has, a family's bare name excepted. A table the labels
+/// select reads a model the registry gives the same table with the model's own turn opener;
+/// another model, or one the registry does not know, replays from the table's own. A family's
+/// bare name on the labels ([`names_family_of`]: `minimax`, `kimi`) says the family, not the
+/// first table of it the name selects: the registry's table reads a model it gives a line of
+/// that family, as it reads the model of a worker without labels. A reasoning name alone that
+/// gives way
 /// ([`gives_way`]: `kimi`) is passed over in either source, as before its table came, and its
 /// table reads the model where the legacy parsers would read with the name: neither source
 /// selects anything, and it is the reasoning name in force, the labels' before the flags'. The
@@ -161,7 +165,19 @@ pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
         Selection::Template => Decision::Template,
         Selection::Legacy => Decision::Legacy(legacy_reason(&names.labels)),
         Selection::Table(table) => Decision::Table(match for_model_shared(model) {
-            Some(format) if table_for(model) == Some(table) => format,
+            Some(format)
+                if table_for(model).is_some_and(|line| {
+                    line == table
+                        || names
+                            .labels
+                            .tool
+                            .as_deref()
+                            .or(names.labels.reasoning.as_deref())
+                            .is_some_and(|name| names_family_of(name, line))
+                }) =>
+            {
+                format
+            }
             _ => table.shared(),
         }),
         Selection::Nothing => match for_model_shared(model) {
@@ -1352,6 +1368,79 @@ mod tests {
                 .each_ref()
                 .map(|(.., table)| Ok(table.map(str::to_string)))
         );
+    }
+
+    /// A family's bare name on a worker's labels reads a model the registry gives a line of
+    /// that family with the registry's table, a family a row, the name where the registration
+    /// takes it (`minimax` as the reasoning name: the tool-call position refuses it, the last
+    /// line); any other name (`minimax_m2`) reads as written, and so does a family's name for a
+    /// model the registry does not know or gives a table of another family.
+    #[test]
+    fn a_familys_name_on_the_labels_reads_a_model_of_the_family_with_the_registrys_table() {
+        let cases = [
+            (
+                Some("deepseek"),
+                None,
+                "deepseek-ai/DeepSeek-V4.1-Flash",
+                "deepseek_v4.1",
+            ),
+            (Some("glm"), None, "zai-org/GLM-4.6", "glm4"),
+            (
+                Some("inkling"),
+                None,
+                "thinkingmachines/Inkling-2-Small",
+                "inkling2",
+            ),
+            (Some("kimi"), None, "moonshotai/Kimi-K3", "kimi_k3"),
+            (
+                Some("llama"),
+                None,
+                "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+                "llama4",
+            ),
+            (None, Some("minimax"), "MiniMaxAI/MiniMax-M3", "minimax_m3"),
+            (
+                Some("mistral"),
+                None,
+                "mistralai/Ministral-3-3B-Instruct-2512",
+                "mistral_v13",
+            ),
+            (Some("qwen"), None, "Qwen/Qwen3.5-9B", "qwen3_tagged"),
+            (
+                Some("minimax_m2"),
+                None,
+                "MiniMaxAI/MiniMax-M3",
+                "minimax_m2",
+            ),
+            (Some("kimi"), None, "acme/kimi-k3-w4a16", "kimi"),
+            (Some("kimi"), None, "MiniMaxAI/MiniMax-M3", "kimi"),
+        ];
+        let flags = Names::default();
+        for (tool, reasoning, model, table) in cases {
+            let labels = pair(tool, reasoning);
+            let names = ModelNames {
+                labels,
+                flags: &flags,
+            };
+            assert_eq!(check(ParserChoice::Symphony, &names), Ok(()), "{model}");
+            let read = reads(ParserChoice::Symphony, &names, model, &templates())
+                .expect("no template is asked")
+                .expect("a table reads");
+            // The copy itself, not its name: a format of `qwen3_tagged` is named `qwen3`. The
+            // registry's copy where the registry gives the model that table, else the table's.
+            let expected = if table_for(model) == Table::named(table) {
+                for_model_shared(model)
+            } else {
+                Table::named(table).map(Table::shared)
+            };
+            assert!(
+                expected.is_some_and(|expected| Arc::ptr_eq(&read, &expected)),
+                "{tool:?} / {reasoning:?} for {model} reads with a copy of {}, not with {table}",
+                read.name()
+            );
+        }
+        // No worker carries `minimax` as its tool-call name: the registration refuses it.
+        assert!(check(ParserChoice::Symphony, &names(Some("minimax"), None)).is_err());
     }
 
     /// The legacy parsers read for a reason the decision names: one source's way back

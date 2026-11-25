@@ -57,6 +57,9 @@ pub enum ParserChoice {
     /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name
     /// alone that no table answers to selects nothing, `passthrough` excepted; any other legacy
     /// tool-call parser's name, `passthrough`, and a model no table reads, keep the legacy parsers.
+    /// On a worker's labels a family's bare name (`minimax`, `kimi`, `qwen`) defers to the
+    /// registry's table for a model the registry reads with a table whose name begins with that
+    /// name, whoever made the model.
     #[default]
     Symphony,
 }
