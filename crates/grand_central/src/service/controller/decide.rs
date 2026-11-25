@@ -713,7 +713,7 @@ mod tests {
             &elector,
             (looks, stopped, role, lag),
             (Arc::clone(&store), feed, Arc::clone(&objects), loads),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             deciders,
         )
         .expect("the deciders start");

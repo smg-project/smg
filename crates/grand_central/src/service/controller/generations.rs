@@ -10,16 +10,17 @@
 //! log holds the number, and the document crosses where it still stands.
 //!
 //! The door holds who writes, under its one lock. Under a shared lease the
-//! source's entry reads the replica's fence there, as a decision reads it
-//! ([`Generations::under`]): the source writes while its replica leads.
+//! source's entry reads the replica's fence there, as a decision reads it:
+//! the door is built under that fence ([`Generations::stating`]), and the
+//! source writes while its replica leads.
 //! A watch that read under a lead that has since ended cannot publish
 //! those bytes ([`ApplyOutcome::Waits`]). A replica that has yet to lead
 //! applies nothing of its own.
 //!
 //! A replica under a shared lease applies no document at its start
-//! ([`Generations::defer`]): the start passes its file's document, and it
-//! is applied under the replica's first lead where the replica runs
-//! nothing by then, at the take or behind the lead's opening
+//! ([`Generations::start_with`]): the start passes its file's document,
+//! and it is applied under the replica's first lead where the replica
+//! runs nothing by then, at the take or behind the lead's opening
 //! ([`Generations::deferred_now`]). So a replica that starts runs no number
 //! of its own, and follows its leader's generation whatever its number.
 //! A leader runs what its file says: the door counts the takes, and behind
@@ -54,7 +55,7 @@ use std::{
     ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -97,11 +98,12 @@ pub(crate) enum Leading {
     Term(u64),
 }
 
-/// The lead a replica writes under now, by the cell of its fence: alone
-/// where the cell holds none, else the term the fence shows by the clock
-/// ([`Generations::lead`]). One read of the fence, and no wait.
-fn lead_under(fence: &OnceLock<Arc<Fence>>) -> Option<Leading> {
-    match fence.get() {
+/// The lead a replica writes under now, by the fence its door was built
+/// under: alone where it was built under none, else the term the fence
+/// shows by the clock ([`Generations::lead`]). One read of the fence, and
+/// no wait.
+fn lead_under(fence: Option<&Fence>) -> Option<Leading> {
+    match fence {
         None => Some(Leading::Alone),
         Some(fence) => fence.leader_term(Instant::now()).map(Leading::Term),
     }
@@ -174,12 +176,14 @@ pub(crate) struct Generations {
     /// A file is this door's source: a start passed its document
     /// ([`Generations::defer`]). Never unset.
     file_sourced: AtomicBool,
-    /// The fence of a replica under a shared lease
-    /// ([`Generations::under`]): the source's entry is admitted while it
-    /// shows the term the entry's bytes were read under. None for a
-    /// replica alone over its lease, whose source writes always. The
-    /// door's hook reads the same cell ([`Generations::stating`]).
-    fence: Arc<OnceLock<Arc<Fence>>>,
+    /// The fence of a replica under a shared lease, handed where the door
+    /// is built ([`Generations::stating`]): the source's entry is admitted
+    /// while it shows the term the entry's bytes were read under, and a
+    /// file's start passes its document and applies none
+    /// ([`Generations::start_with`]). None for a replica alone over its
+    /// lease, whose source writes always. The door's hook reads the same
+    /// fence.
+    fence: Option<Arc<Fence>>,
     /// The takes this replica made ([`Generations::at_take`]): behind one
     /// the file's watch reads its file as a start does, while the file's
     /// document has not stood here since the file took it.
@@ -260,10 +264,10 @@ fn one_switch(
 /// the replica's own word of its lead, read by `fence` as the door reads it
 /// ([`Generations::lead`]): a leader's table is told the object's status,
 /// and a replica that does not lead writes no row.
-fn states_on(holder: Arc<Objects<Members>>, fence: Arc<OnceLock<Arc<Fence>>>) -> Entered {
+fn states_on(holder: Arc<Objects<Members>>, fence: Option<Arc<Fence>>) -> Entered {
     Box::new(move |store: &MemoryStore| {
         let switch = store.with_snapshot(|world| world.spec().overload_switch());
-        let leads = || lead_under(&fence).is_some();
+        let leads = || lead_under(fence.as_deref()).is_some();
         holder.state_overload_switch(store, switch != OverloadSwitch::Off, &leads);
     })
 }
@@ -282,14 +286,26 @@ impl Generations {
     /// force and the rows it had not laid under the old word. A document
     /// that a host applies through the store's own entry passes no door,
     /// and no word is stated for it.
+    ///
+    /// `fence` is the fence of a replica under a shared lease, and none
+    /// for a replica alone over its lease. Under it the source writes
+    /// while the fence shows the term its bytes were read under, and at
+    /// no other time ([`Generations::apply_under`]). A replica that has
+    /// not led yet, one that follows a leader, and one whose lead ended
+    /// apply nothing of their own, whatever their file's watch read ahead
+    /// of a look. The door's hook reads the replica's lead by the same
+    /// fence, so the door takes it with a spec source or with none. It is
+    /// handed here and nowhere later: a door never changes the lease it
+    /// stands under, and its file's start asks the door which start it is
+    /// ([`Generations::start_with`]).
     pub(crate) fn stating(
         store: Arc<MemoryStore>,
         catalog: Arc<StageRegistry>,
         holder: Arc<Objects<Members>>,
+        fence: Option<Arc<Fence>>,
     ) -> Self {
-        let fence = Arc::new(OnceLock::new());
         let door = DocumentManager::validating(store, catalog, Vec::new(), one_switch);
-        let entered = states_on(holder, Arc::clone(&fence));
+        let entered = states_on(holder, fence.clone());
         Self::over(door.telling(entered), fence)
     }
 
@@ -299,23 +315,27 @@ impl Generations {
     pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<StageRegistry>) -> Self {
         Self::over(
             DocumentManager::validating(store, catalog, Vec::new(), one_switch),
-            Arc::default(),
+            None,
         )
     }
 
-    /// [`Generations::new`] with the validator as its argument: a case
-    /// hands in one that faults, or one that stalls.
+    /// [`Generations::new`] with the validator as its argument, and with
+    /// the fence its door is built under, as [`Generations::stating`]
+    /// takes it: a case hands in a validator that faults, or one that
+    /// stalls, and the fence of an election of its own where its replica
+    /// stands under a shared lease.
     #[cfg(test)]
     pub(crate) fn validating(
         store: Arc<MemoryStore>,
         catalog: Arc<StageRegistry>,
         validate: Validate,
+        fence: Option<Arc<Fence>>,
     ) -> Self {
         let door = DocumentManager::validating(store, catalog, Vec::new(), validate);
-        Self::over(door, Arc::default())
+        Self::over(door, fence)
     }
 
-    fn over(door: DocumentManager, fence: Arc<OnceLock<Arc<Fence>>>) -> Self {
+    fn over(door: DocumentManager, fence: Option<Arc<Fence>>) -> Self {
         Self {
             door,
             deferred: Mutex::new(None),
@@ -586,6 +606,26 @@ impl Generations {
             .map(|held| wire::generation_event(held.document()))
     }
 
+    /// The start's document of the door's file, as its source wrote it in
+    /// `format`. A replica alone over its lease applies it as the source's
+    /// first ([`Generations::apply`]). One under a shared lease passes it
+    /// and applies none ([`Generations::defer`]). The door knows which of
+    /// the two it is since it was built ([`Generations::stating`]): a
+    /// start asks nobody else, so no start is deferred on a door that
+    /// stands under no fence, and none applies ahead of a lead under one.
+    pub(crate) fn start_with(&self, document: Vec<u8>, format: Format) -> Result<(), SpecRejected> {
+        match self.fence {
+            None => self.apply(document, format).map(drop),
+            Some(_) => self.defer(document, format),
+        }
+    }
+
+    /// Whether the door's file starts by a pass alone: the door was built
+    /// under the fence of a shared lease ([`Generations::start_with`]).
+    pub(crate) fn starts_deferred(&self) -> bool {
+        self.fence.is_some()
+    }
+
     /// The start's document of a replica under a shared lease: passed here
     /// and not applied. A replica that applied it would run a number of
     /// its own, and a number only rises: it could follow no leader whose
@@ -596,7 +636,7 @@ impl Generations {
     /// not run refuses the start, as an applied one does. The bytes are
     /// kept for the replica's first lead ([`Generations::deferred_now`]),
     /// and the door has its source from here on ([`Generations::bound`]).
-    pub(crate) fn defer(&self, document: Vec<u8>, format: Format) -> Result<(), SpecRejected> {
+    fn defer(&self, document: Vec<u8>, format: Format) -> Result<(), SpecRejected> {
         let applying = self.applying.lock();
         if applying.is_some() {
             return Err(SpecRejected::SecondSource);
@@ -619,22 +659,9 @@ impl Generations {
         Ok(())
     }
 
-    /// Puts the source's entry under `fence`, the fence of a replica under
-    /// a shared lease: from here the source writes while the fence shows
-    /// the term its bytes were read under, and at no other time
-    /// ([`Generations::apply_under`]). A replica that has not led yet, one
-    /// that follows a leader, and one whose lead ended apply nothing of
-    /// their own, whatever their file's watch read ahead of a look. The
-    /// door's hook reads the replica's lead by the same fence
-    /// ([`Generations::stating`]), so the bind hands it with a spec source
-    /// or with none. The first fence handed stands.
-    pub(crate) fn under(&self, fence: Arc<Fence>) {
-        let _ = self.fence.set(fence);
-    }
-
     /// Whether the source writes now: always for a replica alone over its
     /// lease, and while the fence shows a term for one under a shared lease
-    /// ([`Generations::under`]). A case's question: the source takes its
+    /// ([`Generations::stating`]). A case's question: the source takes its
     /// lead ahead of a read ([`Generations::lead`]).
     #[cfg(test)]
     pub(crate) fn source_writes(&self) -> bool {
@@ -646,7 +673,7 @@ impl Generations {
     /// ([`Generations::apply_under`]). None where the replica is under a
     /// shared lease and its fence shows no term.
     pub(crate) fn lead(&self) -> Option<Leading> {
-        lead_under(&self.fence)
+        lead_under(self.fence.as_deref())
     }
 
     /// This replica took the lease: the elector calls this at each take,
@@ -709,7 +736,7 @@ impl Generations {
     /// that is still ahead: the document is applied as the lead opens, so
     /// the moment a new leader decides nothing is the document's pass.
     pub(crate) fn nap(&self, most: Duration) -> Duration {
-        let Some(fence) = self.fence.get() else {
+        let Some(fence) = &self.fence else {
             return most;
         };
         if self.deferred.lock().is_none() {
@@ -1090,6 +1117,14 @@ pub(crate) mod tests {
         (Arc::clone(&store), Generations::new(store, stock()))
     }
 
+    /// A store and its door built under `fence`, as the door of a replica
+    /// under a shared lease is.
+    fn generations_under(fence: Arc<Fence>) -> (Arc<MemoryStore>, Generations) {
+        let store = Arc::new(MemoryStore::new());
+        let door = Generations::validating(Arc::clone(&store), stock(), one_switch, Some(fence));
+        (store, door)
+    }
+
     /// `document` applied as YAML.
     fn yaml(
         generations: &Generations,
@@ -1225,7 +1260,7 @@ pub(crate) mod tests {
     /// A door over a store of its own whose validator stands at `G`'s gate.
     pub(crate) fn gated<G: Gated>() -> Arc<Generations> {
         let store = Arc::new(MemoryStore::new());
-        Arc::new(Generations::validating(store, stock(), stalling::<G>))
+        Arc::new(Generations::validating(store, stock(), stalling::<G>, None))
     }
 
     /// One dry run at a time: while a pass stands in the validator a second
@@ -2342,7 +2377,7 @@ pub(crate) mod tests {
         // The older build's door: the stock pass, which takes the document.
         let led = Arc::new(MemoryStore::new());
         let stock_pass = AppliedSpec::validate_digested;
-        let leader = Generations::validating(Arc::clone(&led), stock(), stock_pass);
+        let leader = Generations::validating(Arc::clone(&led), stock(), stock_pass, None);
         yaml(&leader, RANDOM).expect("a valid document");
         yaml(&leader, switched(Some(false), None)).expect("the older build takes it");
         assert_eq!(standing(&led).0, 2);
@@ -2619,9 +2654,8 @@ pub(crate) mod tests {
     /// log writes there all the same.
     #[test]
     fn under_a_shared_lease_the_source_writes_while_its_replica_leads() {
-        let (store, door) = generations();
         let mut elector = election();
-        door.under(elector.fence());
+        let (store, door) = generations_under(elector.fence());
         assert!(!door.source_writes(), "it has not led yet");
         assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Waits(0)));
         assert_eq!(standing(&store), (0, None));
@@ -2671,9 +2705,9 @@ pub(crate) mod tests {
             AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
         }
         let store = Arc::new(MemoryStore::new());
-        let door = Generations::validating(Arc::clone(&store), stock(), ending);
         let mut elector = election();
-        door.under(elector.fence());
+        let fence = Some(elector.fence());
+        let door = Generations::validating(Arc::clone(&store), stock(), ending, fence);
         elector.tick(Instant::now()).expect("a take");
         assert!(door.source_writes());
         LEAD.set(Some(elector));
@@ -2702,7 +2736,7 @@ pub(crate) mod tests {
         let (_, leader) = generations();
         yaml(&leader, RANDOM).expect("a valid document");
         let store = Arc::new(MemoryStore::new());
-        let standby = Generations::validating(Arc::clone(&store), stock(), counting);
+        let standby = Generations::validating(Arc::clone(&store), stock(), counting, None);
         let told = sent(&leader);
         let first = followed(&standby, &told).expect_err("a fault of this build's validator");
         assert_eq!(first.path, "generation.document");
@@ -2759,9 +2793,8 @@ pub(crate) mod tests {
 
         // A take with no holder to wait for opens one renew deadline
         // later, and its first renewal says when.
-        let (store, door) = generations();
         let mut elector = candidate_under(deadline);
-        door.under(elector.fence());
+        let (store, door) = generations_under(elector.fence());
         assert_eq!(door.nap(most), most, "no document waits");
         door.defer(RANDOM.into(), Format::Yaml)
             .expect("a valid document");
@@ -2777,9 +2810,8 @@ pub(crate) mod tests {
 
         // Under an open fence it is no time, and the whole once the
         // document stands.
-        let (store, door) = generations();
         let mut elector = election();
-        door.under(elector.fence());
+        let (store, door) = generations_under(elector.fence());
         door.defer(RANDOM.into(), Format::Yaml)
             .expect("a valid document");
         elector.tick(Instant::now()).expect("a take");
@@ -2808,7 +2840,7 @@ pub(crate) mod tests {
             AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
         }
         let store = Arc::new(MemoryStore::new());
-        let door = Generations::validating(Arc::clone(&store), stock(), faulting_again);
+        let door = Generations::validating(Arc::clone(&store), stock(), faulting_again, None);
         door.defer(RANDOM.into(), Format::Yaml)
             .expect("a valid document");
         door.at_take();
@@ -2834,10 +2866,8 @@ pub(crate) mod tests {
     /// generation stays and no bytes are kept.
     fn a_fence_closes_behind(locked: Locked) {
         let deadline = Duration::from_millis(800);
-        let store = Arc::new(MemoryStore::new());
-        let door = Generations::new(Arc::clone(&store), stock());
         let mut elector = election_under(deadline);
-        door.under(elector.fence());
+        let (store, door) = generations_under(elector.fence());
         elector.tick(Instant::now()).expect("a take");
         assert!(door.source_writes());
         let (held, loads) = match locked {
@@ -2899,9 +2929,9 @@ pub(crate) mod tests {
             AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
         }
         let store = Arc::new(MemoryStore::new());
-        let door = Generations::validating(Arc::clone(&store), stock(), ending);
         let mut elector = election();
-        door.under(elector.fence());
+        let fence = Some(elector.fence());
+        let door = Generations::validating(Arc::clone(&store), stock(), ending, fence);
         elector.tick(Instant::now()).expect("a take");
         LEAD.set(Some(elector));
         assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Generation(1)));
@@ -2935,9 +2965,9 @@ pub(crate) mod tests {
             AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
         }
         let store = Arc::new(MemoryStore::new());
-        let door = Generations::validating(Arc::clone(&store), stock(), retaking);
         let mut elector = election();
-        door.under(elector.fence());
+        let fence = Some(elector.fence());
+        let door = Generations::validating(Arc::clone(&store), stock(), retaking, fence);
         elector.tick(Instant::now()).expect("a take");
         assert_eq!(door.lead(), Some(Leading::Term(1)));
         LEAD.set(Some(elector));
@@ -2977,12 +3007,21 @@ pub(crate) mod tests {
     }
 
     /// A door that states its generations' overload switch on a holder
-    /// handed [`START`]: the store, the holder and the door.
+    /// handed [`START`]: the store, the holder and the door, of a replica
+    /// alone over its lease.
     fn stating() -> (Arc<MemoryStore>, Arc<Objects<Members>>, Generations) {
+        stating_under(None)
+    }
+
+    /// [`stating`] with the door built under `fence`: a replica's under a
+    /// shared lease where one is handed.
+    fn stating_under(
+        fence: Option<Arc<Fence>>,
+    ) -> (Arc<MemoryStore>, Arc<Objects<Members>>, Generations) {
         let store = Arc::new(MemoryStore::new());
         let holder = Objects::new(Arc::new(WorkerRegistry::new())).with_overload_thresholds(START);
         let holder = Arc::new(holder);
-        let door = Generations::stating(Arc::clone(&store), stock(), Arc::clone(&holder));
+        let door = Generations::stating(Arc::clone(&store), stock(), Arc::clone(&holder), fence);
         (store, holder, door)
     }
 
@@ -3077,9 +3116,8 @@ pub(crate) mod tests {
         let holder = Arc::new(holder);
         let stock_pass = AppliedSpec::validate_digested;
         let door = DocumentManager::validating(Arc::clone(&store), stock(), Vec::new(), stock_pass);
-        let fence = Arc::new(OnceLock::new());
-        let entered = states_on(Arc::clone(&holder), Arc::clone(&fence));
-        let door = Generations::over(door.telling(entered), fence);
+        let entered = states_on(Arc::clone(&holder), None);
+        let door = Generations::over(door.telling(entered), None);
         register(&store, &holder, a);
         yaml(&door, switched(Some(false), Some(false))).expect("every binding off");
         assert_eq!(stated(&holder, a), none);
@@ -3134,9 +3172,8 @@ pub(crate) mod tests {
         let none = OverloadThresholds::default();
         let (_, leader) = generations();
         yaml(&leader, switched(Some(false), Some(false))).expect("every binding off");
-        let (store, holder, standby) = stating();
         let elector = election();
-        standby.under(elector.fence());
+        let (store, holder, standby) = stating_under(Some(elector.fence()));
         let row = register(&store, &holder, a);
         let revision = store.get(row).expect("the row").revision;
         holder.connect_row(&store, row, revision);

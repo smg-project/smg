@@ -697,7 +697,10 @@ mod tests {
             &elector,
             unserved(stood),
             followed(journaled_at(&LeasePlace::Process, 0, 2)),
-            Arc::new(crate::stages::StageRegistry::builtin()),
+            (
+                Arc::new(crate::stages::StageRegistry::builtin()),
+                &LeasePlace::Process,
+            ),
             2,
         )
         .expect("the deciders start");
