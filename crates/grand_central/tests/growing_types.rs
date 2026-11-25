@@ -6,16 +6,29 @@
 //! A test target is a program outside the library. The arm for the rest is
 //! what a mark asks of such a program, and the arm holds the mark in turn:
 //! with a mark taken off an enum, its arm can match nothing, and this file
-//! refuses a pattern that can match nothing. A marked record and a marked
-//! case with named fields are held by the examples in their own docs, where
-//! a literal of each must fail to build.
+//! refuses a pattern that can match nothing. A case that makes a marked
+//! record by its call holds the call and no mark: a record's mark is held
+//! where the record is declared, by the crate's lint, by an example in its
+//! own doc where a literal of it must fail to build, or by review alone
+//! where its module still expects the lint.
 
 #![deny(unreachable_patterns)]
 
+#[cfg(feature = "in-process")]
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "in-process")]
+use smg_grand_central::engine::{TextKey, TokenKey};
 use smg_grand_central::{
     document::Needs,
-    engine::{DrawUnit, Health, LoadRow, ScoreFront, ScoreSpread, Shortlist, WorkerId},
+    engine::{
+        DrawUnit, EncodeMember, Health, LoadRow, Phase, Plain, PoolWord, Profile, ScoreFront,
+        ScoreSpread, Shortlist, WeightedScorer, WireModes, WorkerId,
+    },
     policies::prefix_hash::HeadRule,
+    stages::{Best, LeastRequests},
+    store::EncodeOffer,
     tracking::{EventKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
 };
 
@@ -224,4 +237,85 @@ fn an_outcome_is_made_by_its_calls_and_read_by_a_pattern_that_ends_open() {
             12
         )
     );
+}
+
+/// A plain request's facts are made by their call, which takes every field
+/// the record has today, and read by a pattern that ends open.
+#[test]
+fn a_plain_request_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let Plain {
+        phase,
+        wires,
+        prompt_tokens,
+        ..
+    } = Plain::of(Phase::Decode, WireModes::GRPC, 7);
+    assert_eq!(
+        (phase, wires, prompt_tokens),
+        (Phase::Decode, WireModes::GRPC, 7)
+    );
+}
+
+/// A member of the encode derivation is made by its call and read by a
+/// pattern that ends open.
+#[test]
+fn an_encode_member_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let offer = EncodeOffer::default();
+    let EncodeMember {
+        runtime,
+        offer: read,
+        ..
+    } = EncodeMember::of("a runtime", &offer);
+    assert_eq!(runtime, "a runtime");
+    assert!(std::ptr::eq(read, &offer));
+}
+
+/// A pool's word is made by its call, as a program that implements a
+/// picker makes one to call it, and read by a pattern that ends open.
+#[test]
+fn a_pools_word_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let word = AtomicU64::new(3);
+    let PoolWord {
+        rows, word: read, ..
+    } = PoolWord::of(8, &word);
+    assert_eq!((rows, read.load(Ordering::Relaxed)), (8, 3));
+}
+
+/// A prompt's entry in a host's token tree is made by its call and read by
+/// a pattern that ends open.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_token_key_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let TokenKey { tokens, marker, .. } = TokenKey::of(Cow::Borrowed(&[5, 6, 7]), 1);
+    assert_eq!((&tokens[..], marker), (&[5, 6, 7][..], 1));
+}
+
+/// A prompt's entry in a host's string tree is made by its call and read
+/// by a pattern that ends open.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_text_key_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let TextKey { text, marker, .. } = TextKey::of(Cow::Borrowed("a prompt"), 2);
+    assert_eq!((&*text, marker), ("a prompt", 2));
+}
+
+/// A weighted scorer is made by its call with the weight it is given, and
+/// read by a pattern that ends open.
+#[test]
+fn a_weighted_scorer_reads_back_the_weight_it_was_started_with() {
+    let WeightedScorer { weight, .. } = WeightedScorer::of(Box::new(LeastRequests), 2.5);
+    assert_eq!(weight.to_bits(), 2.5_f32.to_bits());
+}
+
+/// A profile is made by its call under the name it is given, with no filter
+/// and no scorer, and read by a pattern that ends open.
+#[test]
+fn a_profile_reads_back_the_name_it_was_started_with() {
+    let Profile {
+        name,
+        filters,
+        scorers,
+        ..
+    } = Profile::of("a profile".into(), Box::new(Best));
+    assert_eq!(name, "a profile");
+    assert!(filters.is_empty() && scorers.is_empty());
 }

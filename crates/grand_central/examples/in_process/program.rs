@@ -232,10 +232,7 @@ impl Lists {
                 handoff: EncodeHandoff::Rendezvous,
                 ..EncodeOffer::default()
             };
-            let member = EncodeMember {
-                runtime: RUNTIME,
-                offer: &offer,
-            };
+            let member = EncodeMember::of(RUNTIME, &offer);
             let ends = EncodeClasses::derive(
                 encoders.iter().map(|_| member),
                 prefills.iter().map(|_| member),
