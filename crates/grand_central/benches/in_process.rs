@@ -360,6 +360,16 @@ const CELLS: &[Cell] = &[
         request: on_runtime,
         ..Cell::PLAIN
     },
+    // The cache-aware preset on both sides of a pair: each side is handed
+    // its own list's column. Asked by the one call (`--entry place`), a
+    // turn's prompt is hashed, each side's column is filled from the
+    // engine's record of sent prefixes, and its pick is written there.
+    Cell {
+        name: "pair_cache_aware",
+        document: || pair::of("cache_aware"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "pair_least_load",
         document: || pair::of("least_load"),

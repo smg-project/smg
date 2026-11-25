@@ -65,9 +65,11 @@
 //! its report and where it hears a word.
 //!
 //! **Who holds the prompt.** A side whose phase reads affinity is handed
-//! its own list's column for the decision ([`overlap::column`]): what each
-//! worker of the side holds of the request, by the host's index of cache
-//! events and by the record of sent prefixes, read at the side's phase.
+//! its own list's column for the decision ([`overlap::side_column`]): what
+//! each worker of the side holds of the request, by the host's index of
+//! cache events and by the record of sent prefixes, read at the side's
+//! phase. The record is read by the side's own profile's word of it: for
+//! every worker where that profile reads sent prefixes alone.
 //! Behind a pick its profile is told of, each side's record keeps where
 //! the prompt went ([`overlap::record_by_column`]). A pair's first pick
 //! states what its prefill holds of the request, by the prefills' column
@@ -701,13 +703,17 @@ impl<'a> PairLists<'a> {
 /// A pair's two columns of who holds the prompt, the prefills' first, and
 /// what each fill read of the record of sent prefixes. A side whose phase
 /// reads affinity is handed its own list's column, read at the side's
-/// phase ([`overlap::column`]). A side whose phase reads none pays one
-/// test and keeps an empty column. `prefill` is `None` for the decode
+/// phase and by the side's own profile's word of the record
+/// ([`overlap::side_column`], [`Engine::side_reads_sent_alone`]): one
+/// lookup of the pair's binding a side. A side whose phase reads none pays
+/// one test and keeps an empty column. `prefill` is `None` for the decode
 /// asked again, which fills no column of the prefills.
 ///
 /// A pair's decision and an encode request's fill their columns here, so
 /// the two read one way.
-#[inline]
+// In line at its two callers: as a call it costs a pair's decision whose
+// sides read no affinity 25 instructions, counted with Callgrind.
+#[inline(always)]
 pub(super) fn side_columns(
     engine: Loaded<'_, '_>,
     facts: &RequestFacts<'_>,
@@ -724,13 +730,17 @@ pub(super) fn side_columns(
             return None;
         }
         let (workers, ids) = (side.workers(), records.ids());
-        overlap::column(
+        // The side's own profile's word, whichever profile its pool's
+        // table read its word of the record from.
+        let alone = spec.engine().side_reads_sent_alone(facts.model, phase);
+        overlap::side_column(
             kept,
             side.affinity(),
             spec,
             workers,
             ids,
             phase,
+            alone,
             facts,
             column,
         )
@@ -1634,6 +1644,7 @@ pub(super) fn issued(
 mod tests {
     use std::{cell::RefCell, collections::BTreeSet, sync::Arc, time::Duration};
 
+    use kv_index::{request_prefix_hashes, ChainBlockMap, ChainIndex, ContentHash, StoredBlock};
     use parking_lot::Mutex;
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -5752,6 +5763,98 @@ mod tests {
         let turns = turns.expect("the preset's profile");
         document.profiles.insert("ahead".into(), turns);
         the_decode_stays_and_the_prefills_turn(&host_of(document, 4, 4));
+    }
+
+    /// A host's indexes of cache events: one chain index for every model,
+    /// of blocks of the sixteen tokens [`prompt`] hashes by.
+    struct Indexes(Arc<ChainIndex>);
+
+    impl overlap::CacheIndexes for Indexes {
+        fn index(&self, _: &str) -> Option<Arc<dyn overlap::CacheIndex>> {
+            Some(Arc::clone(&self.0) as Arc<dyn overlap::CacheIndex>)
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            Some(16)
+        }
+    }
+
+    /// A host of four prefills that take turns and four decodes under
+    /// `cache_aware`, behind a binding of the decode phase alone listed
+    /// ahead of the pair's, `cache_aware` too. The host's index of cache
+    /// events holds a block of another prompt for every decode. Where
+    /// `pair_alone`, the pair's decode profile reads sent prefixes alone
+    /// (`source: predictor`) and the binding ahead reads cache events too:
+    /// the decodes' pool keeps the word of the binding ahead. Where not,
+    /// the two stand the other way round.
+    fn decodes_with_blocks(pair_alone: bool) -> Host {
+        use crate::document::spec::{AffinitySource, ScoreSpec, ScoreStage};
+
+        let pair = PolicySpec::pair_presets("round_robin", "cache_aware");
+        let mut document = pair.expect("the pair presets");
+        let stock = PolicySpec::preset("cache_aware").expect("a preset");
+        let mut ahead = stock.bindings[0].clone();
+        ahead.matcher.phase = vec![Phase::Decode];
+        ahead.profile = Some("ahead".into());
+        document.bindings.insert(0, ahead);
+        let aware = stock.profiles.into_values().next();
+        let aware = aware.expect("the preset's profile");
+        document.profiles.insert("ahead".into(), aware);
+        let alone = if pair_alone { "decode" } else { "ahead" };
+        let profile = document.profiles.get_mut(alone).expect("the profile");
+        for stage in &mut profile.score {
+            if let ScoreSpec::Params(ScoreStage::PrefixAffinity(prefix)) = stage {
+                prefix.source = Some(AffinitySource::Predictor);
+            }
+        }
+        let host = host_of(document, 4, 4);
+        let spec = host.engine.spec();
+        let engine = spec.engine();
+        assert_eq!(
+            engine.side_reads_sent_alone(MODEL, Phase::Decode),
+            pair_alone
+        );
+        let pools_word = engine.pool_record_for(MODEL, Phase::Decode);
+        assert_eq!(pools_word, Some(!pair_alone), "the binding ahead's");
+        let index = Arc::new(ChainIndex::new());
+        for (at, decode) in host.decodes.iter().enumerate() {
+            let number = index.intern_worker(decode.url()).expect("a number");
+            let content_hash = ContentHash(at as u64 + 1);
+            let blocks: Vec<StoredBlock> = request_prefix_hashes(&[content_hash])
+                .into_iter()
+                .map(|seq_hash| StoredBlock {
+                    seq_hash,
+                    content_hash,
+                })
+                .collect();
+            let stored = index.apply_stored(number, &blocks, None, &mut ChainBlockMap::new());
+            stored.expect("the block is stored");
+        }
+        host.engine.affinity().set_indexes(Arc::new(Indexes(index)));
+        host
+    }
+
+    /// A pair's decode side reads the record of sent prefixes by its own
+    /// profile's word, whichever profile its pool keeps the record for.
+    /// The index of cache events holds a block for every decode, and a
+    /// binding of the decode phase alone is listed ahead of the pair's.
+    /// Where the pair's decode profile reads sent prefixes alone, a
+    /// prompt's decode stays, at the pair's first decision and at the
+    /// decode asked again: that side is handed what it sent to a worker
+    /// with a block, and its pick is written there. Where the binding
+    /// ahead reads alone and the pair's decode profile reads cache events
+    /// too, that side reads the index for those workers, as before: a
+    /// prompt the index holds for none of them takes its draws.
+    #[test]
+    fn a_pairs_decode_side_reads_the_record_by_its_own_profiles_word() {
+        the_decode_stays_and_the_prefills_turn(&decodes_with_blocks(true));
+
+        let host = decodes_with_blocks(false);
+        let sent = prompt(&host, 1_000);
+        let decodes: BTreeSet<usize> = (1..33)
+            .map(|seed| host.picked(&decide_prompt(&host, &sent, seed, None)).1)
+            .collect();
+        assert!(decodes.len() > 1, "{decodes:?}");
     }
 
     /// Each side's column is its own list's, whatever the lists' sizes:

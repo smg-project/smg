@@ -680,10 +680,14 @@ For what it sent itself it keeps a record of its own: a hash table behind one lo
    were lost when many requests arrived at once. The deciding thread now keeps what such a write
    has left and writes it on behind a later pick of its own. Until that stands no other thread
    reads it, and a thread keeps eight: what newer ones push out is lost.
-3. For a request that has token ids it is neither read nor written for a worker the index holds
-   a block for. Under a document whose prefix stage reads the record alone (`source: predictor`),
-   such a request is never named such a worker. A request given as text asks no index: for it
-   the record is read and written for every worker of its list.
+3. For a request that has token ids, a profile that reads cache events neither reads nor writes
+   it for a worker the index holds a block for. A profile that reads the record alone
+   (`source: predictor`) reads and writes it for every worker of its list. So does any profile
+   for a request given as text, which asks no index. One limit follows: a profile that reads
+   the record alone knows its own sends to a worker with a block, and none that a profile
+   reading cache events placed there over the same pool. A pair's decode side and a decode
+   request asked alone can be two such profiles. Classic keeps one policy for a model and one
+   for each side of a pair, so it has no twin for this limit.
 
 One more limit is in its reading of record A: it asks the index by at most the first 256 blocks of
 a prompt, where classic asks by every block. Two conversations alike in their first 4,096 tokens
@@ -730,14 +734,18 @@ request goes to.
   of a model with an index of cache events reads the index, and the hash table for the
   workers the index holds no block for, as today. A request given as text asks no index: it
   reads the hash table for every worker of its list, and its pick is written there for the
-  worker it goes to, whatever the index holds for that worker.
+  worker it goes to, whatever the index holds for that worker. So does a request with token
+  ids under a profile that reads the hash table alone (`source: predictor`).
 - **[built]** A prefill-decode pair decided over worker lists reads the host's index of cache
   events and the hash table for each side, by the side's own list: the index, where the request
   has token ids, for the workers it holds a block for, and the hash table for the others. A
-  request given as text reads the hash table for every worker of each side's list. Behind
+  request given as text reads the hash table for every worker of each side's list. So does a
+  side whose own profile reads the hash table alone, whichever profile a request of its phase
+  asked alone resolves to. Behind
   its pick it writes
   the first target its caller sends to into the hash table, a side at a time, where the index
-  does not speak for that side's worker: it speaks for none on a request given as text. An encode
+  does not speak for that side's worker: it speaks for none on a request given as text, and for
+  none to a side whose profile reads the hash table alone. An encode
   request's first decision does the same for its pair. It writes neither side where its caller
   cannot send to an encoder the decision placed (`RequestMaker::sends_to_encoder`). Classic keeps
   trees for each side. **[planned]** The engine reads the host's trees for each side.
@@ -755,7 +763,8 @@ holds where its model has no index of cache events and its profile reads sent pr
 the holders' rows. A request given as text names no entry and still reads the hash table, for
 every worker of its list whatever the index holds. A
 request with token ids of a model that has an index still reads the index,
-and the hash table for the workers the index holds no block for.
+and the hash table for the workers the index holds no block for:
+for every worker under a profile that reads the hash table alone.
 A prefill-decode pair is lent no tree: each of its sides
 reads the hash table, and the index where its model has one, by the side's own list, worker by
 worker as a single request does. An encode
@@ -2875,7 +2884,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint and mixed protocols; of the recorded lines only the three hard-demand sheets, `sticky_rank`, `encode_pair` and `pair_named` (109), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
-| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for: a request whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index. No gateway lends its string tree yet |
+| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for, unless its profile reads the record alone: a request whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index. No gateway lends its string tree yet |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |

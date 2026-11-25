@@ -3480,7 +3480,9 @@ fn side_shadows(binding: &Binding, live: &[bool], marks: &[Marks]) -> [Option<u1
 /// [`Engine::pool_record_for`]). That profile is the pair's side profile
 /// unless a binding of that phase is listed ahead of the pair's. Even
 /// then a decode pool keeps the record the pair's decode profile reads,
-/// where that binding's profile reads none. A shadow profile of another
+/// where that binding's profile reads none. A side reads the record its
+/// pool keeps by its own profile's word of it
+/// ([`Engine::side_reads_sent_alone`]). A shadow profile of another
 /// ruling than its side's, or of another reading of the record, would
 /// be handed another column live. One that reads no column is handed
 /// none either way.
@@ -6107,7 +6109,10 @@ impl Engine {
     /// sent prefixes alone: a scorer of it reads the record, as the prefix
     /// stage does under the source that reads the record alone, and no
     /// prefix stage reads the index. A host names the record's holders
-    /// ahead of the index's then. One prefix stage that reads cache events
+    /// ahead of the index's then, and the engine over worker lists reads
+    /// and writes its record for every worker of that profile's list,
+    /// whatever the index holds for the worker. One prefix stage that
+    /// reads cache events
     /// keeps the index's holders first, whatever another reads: under a
     /// cap it would lose them. A stage that reads cache events for a row's
     /// warm-up reads no holder and turns nothing here.
@@ -6118,9 +6123,28 @@ impl Engine {
             .is_some_and(|(_, index, _)| self.named_by[usize::from(index)].sent_alone)
     }
 
+    /// [`Self::reads_sent_alone_for`] of the profile that decides `side` of
+    /// `model`'s pair: the side's profile of the model's pair binding
+    /// ([`Self::pair_binding`]). That is the profile a request of the
+    /// side's phase asked alone resolves to, unless a binding of that
+    /// phase is listed ahead of the pair's. The side's column is filled by
+    /// this word, whichever profile its pool keeps the record for
+    /// ([`Self::pool_record_for`]). `false` where the model has no pair
+    /// binding, and for a phase its plan has no side for.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn side_reads_sent_alone(&self, model: &str, side: Phase) -> bool {
+        self.pair_binding(model)
+            .and_then(|binding| profile_index(binding, side))
+            .and_then(|index| self.named_by.get(usize::from(index)))
+            .is_some_and(|by| by.sent_alone)
+    }
+
     /// The record of sent prefixes a host keeps for a pool, for the
     /// decisions of `phase` for `model`: `None` where it keeps none, and
-    /// whether the record's holders are named ahead of the index's. It
+    /// whether the reader of a single decision over the pool reads sent
+    /// prefixes alone. The record's holders are named ahead of the
+    /// index's then, and the record speaks to that decision for every
+    /// worker of the pool. It
     /// is the live profile's word ([`Self::reads_sent_for`],
     /// [`Self::reads_sent_alone_for`]) and, where that profile is named
     /// no row and its binding's shadow is named rows of its own, the
@@ -6136,23 +6160,33 @@ impl Engine {
     /// whatever binding a decode request asked alone resolves to. Where
     /// that request's profile reads no record, the pool keeps the one
     /// the pair's decode profile reads: that side is a live reader of
-    /// the model's record. So a decode pool's word is, in this order,
-    /// that request's profile's where it reads the record, the pair's
-    /// decode profile's, and the shadow's as above.
+    /// the model's record. So a decode pool keeps a record, in this
+    /// order, for that request's profile where it reads one, for the
+    /// pair's decode profile, and for the shadow as above.
+    ///
+    /// The word is the word of the single decision's reader over the
+    /// pool, and never a pair's side's: a side reads the record by its
+    /// own profile's word ([`Self::side_reads_sent_alone`]). So for the
+    /// pair's decode profile the pool keeps the record and the word is
+    /// `false`: a decode request asked alone is decided there by a
+    /// profile that reads no record, and no single reader reads alone.
+    /// That decision keeps the index's holders first, and reads and
+    /// writes the record as a profile that reads cache events does.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn pool_record_for(&self, model: &str, phase: Phase) -> Option<bool> {
         if self.reads_sent_for(model, phase) {
             return Some(self.reads_sent_alone_for(model, phase));
         }
         // A pair's decode side reads the decode pool, whichever binding
-        // the phase resolves to.
+        // the phase resolves to. Its word is its own: the single decision
+        // over the pool is no reader of the record.
         let side = (phase == Phase::Decode)
             .then(|| self.pair_binding(model))
             .flatten()
             .and_then(|binding| profile_index(binding, Phase::Decode))
             .and_then(|index| self.named_by.get(usize::from(index)));
-        if let Some(by) = side.filter(|by| by.sent) {
-            return Some(by.sent_alone);
+        if side.is_some_and(|by| by.sent) {
+            return Some(false);
         }
         // The shadow's rows are its own with another record than the
         // live profile's only where that profile is named no row
@@ -10909,7 +10943,9 @@ mod tests {
     /// under the pair's binding. So the pool keeps the record that side's
     /// profile reads where a binding of the decode phase listed ahead
     /// reads none, and a shadow of that binding is not asked beside the
-    /// side. The first binding's word stands where its own profile reads
+    /// side. Its word there is never the side's: the first binding's
+    /// decisions read no record, alone or not. The first binding's word
+    /// stands where its own profile reads
     /// the record, a pair whose decode side reads none adds nothing, and
     /// a decode binding listed behind the pair's changes nothing.
     #[test]
@@ -10958,6 +10994,18 @@ mod tests {
         assert_eq!(engine.pool_record_for("m", Phase::Prefill), None);
         assert_eq!(word(&pairs), (None, Some(false)));
         assert_eq!(word(&behind("round_robin")), (None, None));
+        // The word is never the side's: a side that reads the record
+        // alone states its own, and the first binding's decisions are no
+        // reader of the record the pool keeps for it.
+        let mut sides = behind("cache_aware");
+        let decode = sides.profiles.get_mut("decode");
+        decode.expect("the pair's decode profile").score[1] = by_record.score[1].clone();
+        #[cfg(feature = "in-process")]
+        {
+            let engine = sides.validate().expect("two bindings");
+            assert!(engine.side_reads_sent_alone("m", Phase::Decode));
+        }
+        assert_eq!(word(&sides), (None, Some(false)));
 
         // The first binding's own word stands where its profile reads
         // the record.
