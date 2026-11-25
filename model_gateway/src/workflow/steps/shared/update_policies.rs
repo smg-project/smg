@@ -609,6 +609,25 @@ mod tests {
         monitor.stop().await;
     }
 
+    /// A bucket policy that stands on the prefill side before a prefill
+    /// worker registers, as a pair router made at start-up sets it, is handed
+    /// that worker by the registration.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_bucket_prefill_policy_set_before_a_registration_is_handed_its_workers() {
+        let (app_context, monitor) = context_over(PolicyConfig::RoundRobin);
+        let registry = &app_context.policy_registry;
+        registry.set_prefill_policy(Arc::new(BucketPolicy::new()));
+        registry.set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+
+        register(&app_context, grpc_worker(WorkerType::Prefill), &[]).await;
+
+        assert!(logs_contain(
+            "Initializing prefill bucket policy with 1 workers"
+        ));
+        monitor.stop().await;
+    }
+
     #[traced_test]
     #[test]
     fn cache_aware_over_zmq_warns_that_kv_events_are_missing() {
