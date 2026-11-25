@@ -6,7 +6,6 @@ use serde::de::{self, DeserializeSeed, Deserializer, EnumAccess, MapAccess, SeqA
 use serde_json::{map::Entry, Map, Number, Value};
 use serde_path_to_error::Segment;
 
-use super::SpecRejected;
 use crate::document::spec::PolicySpec;
 
 /// The largest document a source hands over, in bytes: 128 KiB. What sets
@@ -96,24 +95,6 @@ impl Format {
             .find(|format| format.as_str() == name)
     }
 
-    /// The document a source's bytes read as in this form: the size bound
-    /// first ([`MAX_DOCUMENT_BYTES`]), then this form's reader. Every
-    /// source's document is read here: the file a host starts from, an
-    /// apply and a controller's file. A document past the bound is refused
-    /// by its size, unread. One the reader refuses is refused under its
-    /// form's name, by the path of the field where the refusal is about one.
-    pub fn read(self, document: &[u8]) -> Result<PolicySpec, SpecRejected> {
-        if let Some(len) = over_bound(document) {
-            return Err(SpecRejected::TooLarge(len));
-        }
-        self.parse(document)
-            .map_err(|Refused { path, message, .. }| SpecRejected::Unparsed {
-                format: self.as_str(),
-                path,
-                message,
-            })
-    }
-
     /// The document these bytes read as. A document of either form is read
     /// once, into the values it reads as ([`read_yaml`], [`read_json`]),
     /// and the document is built from those values alone: one typed read
@@ -134,7 +115,10 @@ impl Format {
     /// out of range in JSON and text in YAML, which a number's field
     /// refuses. And a YAML whole number may be written in hex, octal or
     /// binary.
-    fn parse(self, document: &[u8]) -> Result<PolicySpec, Refused> {
+    ///
+    /// The size bound is not checked here: a source's bytes are read by
+    /// [`Format::read`], which checks it first.
+    pub(super) fn parse(self, document: &[u8]) -> Result<PolicySpec, Refused> {
         match self {
             Self::Yaml => {
                 placed(read_yaml(document).map_err(Refused::whole)?).map_err(|refused| Refused {
@@ -223,9 +207,9 @@ fn wanted(mut path: String, message: &str) -> String {
 /// Why a reader refused a document: the path of the field, where the
 /// refusal is about one, the reader's message, and whether the place is a
 /// list's item, which has no key.
-struct Refused {
-    path: String,
-    message: String,
+pub(super) struct Refused {
+    pub(super) path: String,
+    pub(super) message: String,
     item: bool,
 }
 
