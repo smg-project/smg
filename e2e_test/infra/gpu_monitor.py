@@ -1,7 +1,7 @@
 """GPU utilization monitoring for benchmarks.
 
 This module provides a low-impact GPU monitor that runs in a separate process
-and collects utilization samples using NVML.
+and collects utilization samples using NVML or AMD SMI.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from multiprocessing import Process
 from pathlib import Path
@@ -140,6 +141,135 @@ def _monitor_loop(pid: int, output_path: str, interval: float) -> None:
         _shutdown_nvml()
 
 
+def _bdf(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\.[0-7]", value
+    ):
+        raise ValueError(f"Invalid full PCI BDF: {value!r}")
+    return value.lower()
+
+
+def _amd_worker_bdfs(torch, gpu_ids: list[int]) -> dict[int, str]:
+    # Worker._build_env overrides CUDA per worker. An inherited parent mask
+    # would make its logical indices ambiguous here; do not guess through it.
+    if any(
+        os.environ.get(key, "").strip()
+        for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+    ):
+        raise ValueError("Worker GPU mapping requires an unmasked parent HIP view")
+    if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("Missing or duplicate worker GPU IDs")
+    if not torch.version.hip:
+        raise ValueError("AMD monitoring requires the workers' HIP runtime")
+    count = torch.cuda.device_count()
+    selected = {}
+    for gpu in gpu_ids:
+        if type(gpu) is not int or not 0 <= gpu < count:
+            raise ValueError("Worker GPU ID outside the actual HIP view")
+        props = torch.cuda.get_device_properties(gpu)
+        for field, limit in (
+            ("pci_domain_id", 0xFFFF),
+            ("pci_bus_id", 0xFF),
+            ("pci_device_id", 0x1F),
+        ):
+            value = getattr(props, field)
+            if type(value) is not int or not 0 <= value <= limit:
+                raise ValueError("Incomplete HIP PCI identity")
+        # These exact HIP properties are also used by the device identity
+        # preflight. GPU PCI functions are zero; SMI roundtrip must agree.
+        selected[gpu] = _bdf(
+            f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+        )
+    if len(set(selected.values())) != len(selected):
+        raise ValueError("Duplicate worker physical PCI identities")
+    return selected
+
+
+def _amd_handles(smi, selected: dict[int, str]) -> dict[int, object]:
+    if not selected or len(set(selected.values())) != len(selected):
+        raise ValueError("Missing or duplicate selected physical GPUs")
+    by_bdf = {}
+    for handle in smi.amdsmi_get_processor_handles():
+        bdf = _bdf(smi.amdsmi_get_gpu_device_bdf(handle))
+        if bdf in by_bdf:
+            raise ValueError("Duplicate AMD SMI PCI identity")
+        by_bdf[bdf] = handle
+    result = {}
+    for gpu, bdf in selected.items():
+        handle = by_bdf[bdf]  # Missing selected devices must not become zeroes.
+        if smi.amdsmi_get_processor_type(handle) != {"processor_type": "AMD_GPU"}:
+            raise ValueError("Selected SMI processor is not an AMD GPU")
+        if (
+            _bdf(smi.amdsmi_get_gpu_device_bdf(smi.amdsmi_get_processor_handle_from_bdf(bdf)))
+            != bdf
+        ):
+            raise ValueError("AMD SMI PCI identity roundtrip mismatch")
+        result[gpu] = handle
+    return result
+
+
+def _amd_sample(smi, handles: dict[int, object]) -> dict[str, float]:
+    values = {}
+    for gpu, handle in handles.items():
+        value = smi.amdsmi_get_gpu_busy_percent(handle)
+        # 27.0's UINT32_MAX sentinel is the string "N/A". Do not accept bool,
+        # missing data, an unsupported API, or out-of-range values as idle.
+        if type(value) is not int or not 0 <= value <= 100:
+            raise ValueError(f"GPU {gpu} busy percent unavailable: {value!r}")
+        values[str(gpu)] = float(value)
+    if not values:
+        raise ValueError("No selected AMD GPUs")
+    return values
+
+
+def _amd_monitor_loop(pid: int, output_path: str, interval: float, gpu_ids: list[int]) -> None:
+    initialized = False
+    samples: list[float] = []
+    per_gpu: dict[str, list[float]] = {}
+    metadata: dict[str, Any] = {
+        "backend": "amdsmi",
+        "status": "unavailable",
+        "sample_times_monotonic": [],
+    }
+    try:
+        # Only the sampler child imports the runtime. CPU tests inject fakes.
+        import amdsmi
+        import torch
+
+        selected = _amd_worker_bdfs(torch, gpu_ids)
+        amdsmi.amdsmi_init()
+        initialized = True
+        handles = _amd_handles(amdsmi, selected)
+        metadata.update(
+            package_version=amdsmi.__version__,
+            module_origin=amdsmi.__file__,
+            library_version=amdsmi.amdsmi_get_lib_version(),
+            selected_bdfs={str(gpu): bdf for gpu, bdf in selected.items()},
+        )
+        per_gpu = {str(gpu): [] for gpu in handles}
+        while _process_alive(pid):
+            values = _amd_sample(amdsmi, handles)
+            # A tick contributes only when every selected worker GPU is valid.
+            for gpu, value in values.items():
+                per_gpu[gpu].append(value)
+            samples.append(sum(values.values()) / len(values))
+            metadata["sample_times_monotonic"].append(time.monotonic())
+            time.sleep(interval)
+        if not samples:
+            raise ValueError("AMD SMI produced no complete selected-GPU samples")
+        metadata["status"] = "available"
+    except Exception as exc:
+        metadata.update(status="unavailable", reason=f"{type(exc).__name__}: {exc}")
+        logger.warning("AMD GPU utilization unavailable: %s", exc)
+    finally:
+        if initialized:
+            try:
+                amdsmi.amdsmi_shut_down()
+            except Exception as exc:
+                metadata.update(status="unavailable", reason=f"SMI shutdown failed: {exc}")
+        _write_result(output_path, pid, interval, samples, per_gpu, metadata=metadata)
+
+
 def _process_alive(pid: int) -> bool:
     """Check if process is still running."""
     try:
@@ -173,25 +303,27 @@ def _write_result(
     interval: float,
     overall_samples: list[float],
     per_gpu_samples: dict[str, list[float]],
+    *,
+    metadata: dict | None = None,
 ) -> None:
     """Write monitoring results to JSON file."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
-            json.dump(
-                {
-                    "bench_pid": pid,
-                    "interval_sec": interval,
-                    "count": len(overall_samples),
-                    "overall": _compute_stats(overall_samples),
-                    "per_gpu": {k: _compute_stats(v) for k, v in per_gpu_samples.items()},
-                    "raw": {
-                        "overall": overall_samples,
-                        "per_gpu": per_gpu_samples,
-                    },
-                },
-                f,
-            )
+            result = {
+                "bench_pid": pid,
+                "interval_sec": interval,
+                "count": len(overall_samples),
+                "overall": _compute_stats(overall_samples),
+                "per_gpu": {k: _compute_stats(v) for k, v in per_gpu_samples.items()},
+                "raw": {"overall": overall_samples, "per_gpu": per_gpu_samples},
+            }
+            if metadata:
+                result.update(metadata)
+                if metadata["status"] != "available":
+                    result["overall"] = None
+                    result["per_gpu"] = {}
+            json.dump(result, f)
     except Exception as e:
         logger.warning("Failed to write GPU monitor results: %s", e)
 
@@ -223,7 +355,16 @@ class GPUMonitor:
         interval: float = 2.0,
         trim_start: int = 3,
         trim_end: int = 2,
+        *,
+        backend: str = "nvml",
+        gpu_ids: list[int] | None = None,
     ):
+        if backend not in ("nvml", "amdsmi"):
+            raise ValueError(f"Unknown GPU monitor backend: {backend}")
+        if interval <= 0 or not interval < float("inf"):
+            raise ValueError("GPU sample interval must be positive and finite")
+        self.backend = backend
+        self.gpu_ids = list(gpu_ids or [])
         self.output_dir = Path(output_dir)
         self.interval = interval
         self.trim_start = trim_start
@@ -243,8 +384,10 @@ class GPUMonitor:
         self._result = None
 
         self._process = Process(
-            target=_monitor_loop,
-            args=(target_pid, self._output_path, self.interval),
+            target=_amd_monitor_loop if self.backend == "amdsmi" else _monitor_loop,
+            args=(target_pid, self._output_path, self.interval, self.gpu_ids)
+            if self.backend == "amdsmi"
+            else (target_pid, self._output_path, self.interval),
             daemon=True,
         )
         self._process.start()
@@ -263,8 +406,14 @@ class GPUMonitor:
         if self._process.is_alive():
             try:
                 self._process.terminate()
-            except Exception:
+                self._process.join(timeout=timeout)
+                if self._process.is_alive():
+                    self._process.kill()
+                    self._process.join(timeout=timeout)
+            except ProcessLookupError:
                 pass
+        if self._process.is_alive():
+            raise RuntimeError("Owned GPU sampler did not exit")
 
         self._process = None
         self._result = self._read_result()
@@ -281,6 +430,9 @@ class GPUMonitor:
         try:
             with open(self._output_path) as f:
                 result = json.load(f)
+
+            if result.get("status") == "unavailable":
+                return result
 
             # Apply trimming to raw samples and recompute stats
             raw_samples = result.get("raw", {}).get("overall", [])
@@ -312,8 +464,11 @@ class GPUMonitor:
     def log_summary(self) -> None:
         """Log a summary of GPU utilization."""
         result = self._result or self._read_result()
-        if not result or result.get("count", 0) <= 0:
-            logger.warning("GPU utilization monitor produced no samples")
+        if not result or result.get("status") == "unavailable" or result.get("count", 0) <= 0:
+            logger.warning(
+                "GPU utilization monitor unavailable: %s",
+                (result or {}).get("reason", "no samples"),
+            )
             return
 
         overall = result.get("overall", {})
@@ -335,6 +490,13 @@ class GPUMonitor:
             return []
 
         result = self._result or self._read_result()
+        if self.backend == "amdsmi" and (
+            not result or result.get("status") != "available" or result.get("count", 0) <= 0
+        ):
+            return [
+                "GPU utilization unavailable: "
+                + str((result or {}).get("reason", "no complete samples"))
+            ]
         if not result or result.get("count", 0) <= 0:
             logger.warning("GPU utilization monitor produced no samples")
             return []

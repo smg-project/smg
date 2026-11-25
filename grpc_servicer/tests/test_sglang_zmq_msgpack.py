@@ -1112,3 +1112,46 @@ def test_sender_cpu_hash_preserves_engine_identity_padding_and_features(
     assert actual.feature.dtype == expected.feature.dtype
     assert torch.equal(actual.feature, expected.feature)
     assert actual.offsets == expected.offsets
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("order", [(0, 1, 2), (1, 0, 2)])
+def test_rust_multi_image_frames_arrive_as_canonical_per_image_items(dtype, order):
+    """Actual request decode normalizes bundled frames before scheduler hash/pad."""
+    import torch
+    from smg_grpc_servicer.sglang.compat import get_multimodal_types
+
+    Modality, _, _ = get_multimodal_types()
+    grids = [[1, 14, 20], [1, 20, 14], [1, 20, 14]]
+    pieces = [
+        torch.full((280, 1536), 17 if i == 0 else 29, dtype=getattr(torch, dtype)) for i in order
+    ]
+    features = torch.cat(pieces)
+    grid = torch.tensor([grids[i] for i in order], dtype=torch.int64)
+    payload = msgspec.msgpack.decode(bytes.fromhex(RUST_MM_FRAMED_REQUEST))
+    payload[4] = [42] * 220
+    payload[6][3] = 1001
+    item = payload[6][0][0]
+    item[1] = 0x123456789ABCDEF0  # Sender identity of the whole synthetic batch.
+    item[3] = [[2, 71], [75, 144], [148, 217]]
+    item[5] = msgspec.msgpack.Ext(100, msgspec.msgpack.encode([[840, 1536], dtype, 1]))
+    item[8] = {
+        "image_grid_thw": msgspec.msgpack.Ext(100, msgspec.msgpack.encode([[3, 3], "int64", 2]))
+    }
+    (request,) = wire.decode_request_frames(
+        [
+            wire.REQ_TYPE_ADD,
+            msgspec.msgpack.encode(payload),
+            bytearray(features.view(torch.uint8).numpy().tobytes()),
+            bytearray(grid.view(torch.uint8).numpy().tobytes()),
+            b"\x80",
+        ]
+    )
+    assert list(request.input_ids) == [42] * 220
+    assert len(request.mm_inputs.mm_items) == 3
+    for index, actual in enumerate(request.mm_inputs.mm_items):
+        assert actual.modality is Modality.IMAGE
+        assert actual.offsets == [tuple(item[3][index])]
+        assert torch.equal(actual.feature, pieces[index])
+        assert torch.equal(actual.model_specific_data["image_grid_thw"], grid[index : index + 1])
+        assert actual.hash is None and actual.pad_value is None

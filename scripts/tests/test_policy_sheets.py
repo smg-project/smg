@@ -125,8 +125,10 @@ def test_a_row_states_its_sheets_commit_row_counts_and_sha256():
         assert sheet["recorded_from"] == row["commit"], name
         if demands:
             for recorded in sheet["rows"]:
-                # A row that lists no request holds the answer to the one request its sheet asks.
-                asked = len(recorded["requests"]) if "requests" in recorded else 1
+                # The HTTP transcription recorder issues one request per row; the gRPC
+                # recorder writes the exact request list next to its ordered answers.
+                requests = [{}] if name == "rank_pin.json" else recorded["requests"]
+                asked = len(requests)
                 answers = recorded["answers"]
                 assert len(answers) == asked, (
                     f"{name}: {recorded['name']}: {len(answers)} answers to {asked} requests"

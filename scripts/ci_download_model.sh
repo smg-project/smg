@@ -53,6 +53,12 @@ download_model() {
     local model_id="$1"
     local model_dir="${HF_HOME}/hub/models--${model_id//\//--}"
     local lock_file="${LOCK_DIR}/${model_id//\//_}.lock"
+    local -a revision_args=()
+    # Only the opted-in AMD SGLang consumer requests its original fixed snapshot.
+    # Other models and callers retain their existing floating-revision behavior.
+    if [ "$model_id" = "openai/gpt-oss-20b" ] && [ -n "${CI_SGLANG_GPTOSS_REVISION:-}" ]; then
+        revision_args=(--revision "$CI_SGLANG_GPTOSS_REVISION")
+    fi
 
     echo "Acquiring lock for ${model_id}..."
     (
@@ -71,7 +77,7 @@ download_model() {
         local attempt=0
         while [ $attempt -lt $MAX_RETRIES ]; do
             attempt=$((attempt + 1))
-            if hf download "$model_id" --quiet 2>&1; then
+            if hf download "$model_id" "${revision_args[@]}" --quiet 2>&1; then
                 if [ "$cached" = true ]; then
                     echo "Model ${model_id} already cached, verified OK."
                 else

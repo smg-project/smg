@@ -228,6 +228,8 @@ def genai_bench_runner():
         server_engine: str | None = None,
         gpu_type: str | None = None,
         gpu_count: int | None = None,
+        gpu_monitor_backend: str = "nvml",
+        worker_gpu_ids: list[int] | None = None,
         kill_procs: list | None = None,
         drain_delay_sec: int = 6,
     ) -> None:
@@ -259,6 +261,17 @@ def genai_bench_runner():
 
         logger.info("Running genai-bench command: %s", " ".join(cmd))
 
+        # Validate monitor configuration before starting the benchmark
+        gpu_monitor: GPUMonitor | None = None
+        if should_monitor_gpu(thresholds):
+            interval = float(os.environ.get("GPU_UTIL_SAMPLE_INTERVAL", "2.0"))
+            gpu_monitor = GPUMonitor(
+                output_dir=exp_dir,
+                interval=interval,
+                backend=gpu_monitor_backend,
+                gpu_ids=worker_gpu_ids,
+            )
+
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -271,29 +284,21 @@ def genai_bench_runner():
         except OSError as e:
             pytest.fail(f"Failed to start genai-bench: {e}")
 
-        # Start GPU monitor if needed
-        gpu_monitor: GPUMonitor | None = None
-        if should_monitor_gpu(thresholds):
-            interval = float(os.environ.get("GPU_UTIL_SAMPLE_INTERVAL", "2.0"))
-            gpu_monitor = GPUMonitor(output_dir=exp_dir, interval=interval)
-            gpu_monitor.start(target_pid=proc.pid)
-
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            logger.error("genai-bench timed out after %ds", timeout)
-
-        # Fail immediately if genai-bench failed
-        if proc.returncode != 0:
-            pytest.fail(
-                f"genai-bench failed with exit code {proc.returncode}. "
-                f"Check CI logs above for details."
-            )
-
         misses: list[str] = []
         try:
+            if gpu_monitor:
+                gpu_monitor.start(target_pid=proc.pid)
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                logger.error("genai-bench timed out after %ds", timeout)
+            if proc.returncode != 0:
+                pytest.fail(
+                    f"genai-bench failed with exit code {proc.returncode}. "
+                    f"Check CI logs above for details."
+                )
             # Parse results; a run without results is broken and still fails
             for path in _find_results(experiment_folder):
                 result = BenchmarkResult.from_json(path)
@@ -309,6 +314,9 @@ def genai_bench_runner():
                 misses.extend(gpu_monitor.threshold_misses(thresholds))
 
         finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
             _cleanup_procs(kill_procs or [], drain_delay_sec)
             if gpu_monitor:
                 gpu_monitor.stop(timeout=2)

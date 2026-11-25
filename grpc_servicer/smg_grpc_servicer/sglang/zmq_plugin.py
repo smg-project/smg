@@ -34,10 +34,17 @@ servicer's scheduler ranks.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import hashlib
+import json
 import logging
 import os
 import pkgutil
+import re
+import stat
+import sys
+from array import array
 from typing import Any
 
 from smg_grpc_servicer.sglang import (
@@ -109,11 +116,488 @@ def attributes_grammar_aborts() -> bool:
     return active() or os.environ.get(GRAMMAR_ATTRIBUTION_ENV, "").strip() not in ("", "0")
 
 
+# Diagnostic only: existing opt-in public Qwen traces. Numerical observations may
+# perform bounded GPU readback; they never issue model requests or measure performance.
+_QWENVL_TRACE_SLOTS = iter(range(64))
+_QWENVL_OUTPUTS = {}
+
+
+_QWENVL_MODEL_METADATA_ONCE = iter((True,))
+
+
+def _trace_qwenvl_model_once(scheduler, trace_id):
+    """Bounded loaded-object provenance only; no imports, model calls or tensor reads."""
+    if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") != "1":
+        return
+    if not next(_QWENVL_MODEL_METADATA_ONCE, False):
+        return
+    slot = next(_QWENVL_TRACE_SLOTS, None)
+    if slot is None:
+        return
+    try:
+        sources, remaining = {}, 4 * 1024 * 1024
+
+        def field(value, name):
+            # nn.Module children live in _modules; bypass property/model hooks.
+            if type(value) is dict:
+                return value.get(name)
+            if type(value) in (list, tuple) and name == "0":
+                return value[0] if value else None
+            try:
+                values = object.__getattribute__(value, "__dict__")
+                modules = values.get("_modules", {})
+                return values.get(name, modules.get(name) if type(modules) is dict else None)
+            except Exception:
+                return None
+
+        def identity(value):
+            nonlocal remaining
+            if value is None:
+                return {"status": "unavailable"}
+            cls = type(value)
+            module = cls.__module__
+            if not isinstance(module, str) or len(module) > 128:
+                return {"status": "unavailable"}
+            result = {"class": (module + "." + cls.__qualname__)[:160]}
+            if module in sources or len(sources) >= 6:
+                return result
+            loaded = sys.modules.get(module)
+            path = vars(loaded).get("__file__") if loaded is not None else None
+            if not module.startswith(("sglang.", "transformers.", "sgl_kernel.")):
+                return result
+            info = sources[module] = {"status": "unavailable"}
+            if not isinstance(path, str) or not os.path.isabs(path) or not path.endswith(".py"):
+                return result
+            package = sys.modules.get(module.split(".", 1)[0])
+            package_file = vars(package).get("__file__") if package is not None else None
+            if not isinstance(package_file, str) or not os.path.isabs(package_file):
+                return result
+            root, real = os.path.dirname(os.path.realpath(package_file)), os.path.realpath(path)
+            if os.path.commonpath((root, real)) != root:
+                info["status"] = "outside_loaded_package"
+                return result
+            info["path"] = path[:256]
+            fd = None
+            try:
+                limit = min(1024 * 1024, remaining)
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                before = os.fstat(fd)
+                if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+                    info["status"] = "over_limit_or_not_regular"
+                    return result
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    data = stream.read(limit)
+                remaining -= len(data)
+                after = os.fstat(fd)
+                stable = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                if len(data) == before.st_size and stable == (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                ):
+                    info.update(
+                        status="captured", bytes=len(data), sha256=hashlib.sha256(data).hexdigest()
+                    )
+            except (OSError, ValueError):
+                pass
+            finally:
+                if fd is not None:
+                    os.close(fd)
+            return result
+
+        def scalars(value, names):
+            result = {}
+            for name in names:
+                item = field(value, name)
+                if type(item) in (bool, int) and (type(item) is bool or item.bit_length() <= 63):
+                    result[name] = item
+                elif type(item) is str and len(item) <= 128:
+                    result[name] = item
+                else:
+                    result[name] = "unavailable"
+            return result
+
+        worker = field(scheduler, "tp_worker")
+        # SGLang exposes model_runner as a property over _model_runner.
+        # Read either stored name without invoking SDK properties.
+        runner, runner_path = None, "tp_worker.model_runner"
+        for owner, path in (
+            (worker, "tp_worker"),
+            (field(worker, "worker"), "tp_worker.worker"),
+        ):
+            for name in ("model_runner", "_model_runner"):
+                runner = field(owner, name)
+                if runner is not None:
+                    runner_path = f"{path}.{name}"
+                    break
+            if runner is not None:
+                break
+        model = field(runner, "model")
+        vision = field(model, "visual")
+        vision_path = "model.visual"
+        if vision is None:
+            vision = field(field(model, "model"), "visual")
+            vision_path = "model.model.visual"
+        config = field(field(runner, "model_config"), "hf_config")
+        if config is None:
+            config = field(model, "config")
+        attention = field(field(field(vision, "blocks"), "0"), "attn")
+        attention_backend = field(attention, "attn_backend")
+        if attention_backend is None:
+            attention_backend = field(attention, "qkv_backend")
+        objects = {
+            "scheduler": scheduler,
+            "tp_worker": worker,
+            "model_runner": runner,
+            "model": model,
+            "vision": vision,
+            "resolved_attention_backend": field(runner, "attn_backend"),
+            "resolved_prefill_backend": field(runner, "prefill_attn_backend"),
+            "resolved_decode_backend": field(runner, "decode_attn_backend"),
+            "first_vision_attention": attention,
+            "first_vision_attention_backend": attention_backend,
+        }
+        facts = {name: identity(value) for name, value in objects.items()}
+        facts.update(
+            runner_lookup={
+                "path": runner_path,
+                "status": "found" if runner is not None else "unavailable",
+            },
+            vision_lookup={
+                "path": vision_path,
+                "status": "found" if vision is not None else "unavailable",
+            },
+            hf_config=scalars(config, ("model_type", "_commit_hash")),
+            hf_vision_config=scalars(
+                field(config, "vision_config"),
+                (
+                    "patch_size",
+                    "temporal_patch_size",
+                    "spatial_merge_size",
+                    "hidden_size",
+                    "out_hidden_size",
+                    "num_heads",
+                    "depth",
+                    "_attn_implementation_internal",
+                ),
+            ),
+            source_files=sources,
+            source_bytes_read=4 * 1024 * 1024 - remaining,
+            scope=(
+                "Loaded fields only; unavailable is unknown. Config is not resolved backend; "
+                "vision attention is first block only."
+            ),
+        )
+        record = json.dumps(
+            {
+                "event": "model_consumer_metadata",
+                "slot": slot,
+                "client_trace_id": trace_id,
+                "metadata": facts,
+            },
+            sort_keys=True,
+        )
+        if len(record) <= 8192:
+            logger.warning("SMG_QWENVL_REQUEST_DIAGNOSTIC %s", record)
+    except Exception:
+        # A diagnostic failure must not change the original request or its trace.
+        return
+
+
+def _trace_qwenvl(event, scheduler=None, req=None, **facts):
+    if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") != "1":
+        return
+    try:
+        if req is not None:
+            rid = getattr(req, "rid", None)
+            match = (
+                re.match(r"^(smg-qwenvl-[0-9a-f]{32})(?:-|$)", rid)
+                if isinstance(rid, str) and len(rid) <= 512
+                else None
+            )
+            if match is None:
+                return
+            facts["client_trace_id"] = match.group(1)
+            model = getattr(getattr(scheduler, "server_args", None), "model_path", None)
+            mm = getattr(req, "multimodal_inputs", None)
+            canonical = "Qwen/Qwen3-VL-8B-Instruct"
+            local_root = os.environ.get("ROUTER_LOCAL_MODEL_PATH", "")
+            local_alias = os.path.join(local_root, canonical) if local_root else None
+            if model not in (canonical, local_alias) or model is None or mm is None:
+                return
+        # Reserve before IDs, item/grid metadata, hashing or tensor property reads.
+        slot = next(_QWENVL_TRACE_SLOTS, None)
+        if slot is None:
+            return
+        if req is not None:
+            _trace_qwenvl_model_once(scheduler, facts["client_trace_id"])
+        if req is not None:
+
+            def ids(value):
+                if not isinstance(value, (list, array)):
+                    return {"available": False}
+                result = {"length": len(value), "sha256": None}
+                if len(value) <= 32768:
+                    digest = hashlib.sha256()
+                    for token in value:
+                        if type(token) is not int or not -(2**63) <= token < 2**63:
+                            return {**result, "integer_domain_valid": False}
+                        digest.update(token.to_bytes(8, "little", signed=True))
+                    result["sha256"] = digest.hexdigest()
+                else:
+                    result["hash_omitted_over_32768"] = True
+                return result
+
+            def bounded_integer(value):
+                return value if type(value) is int and value.bit_length() <= 128 else None
+
+            def sdk_settings():
+                loaded = sys.modules.get("sglang.srt.environ")
+                sdk_envs = vars(loaded).get("envs") if loaded is not None else None
+                result = {}
+                for name, expected in (
+                    ("SGLANG_MM_BUFFER_SIZE_MB", int),
+                    ("SGLANG_MM_SKIP_COMPUTE_HASH", bool),
+                ):
+                    result[name] = {"status": "UNKNOWN", "value": None}
+                    try:
+                        value = getattr(sdk_envs, name).get()
+                        if type(value) is expected and (
+                            expected is bool or value.bit_length() <= 63
+                        ):
+                            result[name] = {"status": "CAPTURED", "value": value}
+                    except Exception:
+                        pass
+                return result
+
+            def tensor_metadata(value, *, integer_values=False):
+                if value is None:
+                    return None
+                if type(value) is int:
+                    return (
+                        {"scalar": value}
+                        if -(2**63) <= value < 2**63
+                        else {"scalar_over_cap": True}
+                    )
+                dims = getattr(value, "shape", None)
+                device = getattr(getattr(value, "device", None), "type", None)
+                result = {
+                    "shape": [dim if type(dim) is int else None for dim in dims]
+                    if isinstance(dims, (list, tuple)) and len(dims) <= 8
+                    else None,
+                    "device_type": device if device in ("cpu", "cuda", "meta") else None,
+                    "dtype": str(getattr(value, "dtype", ""))[:32],
+                }
+                # Tensor layout is metadata only: no feature reads, copies or device transfers.
+                for name in ("stride", "storage_offset"):
+                    result[name] = None
+                    try:
+                        metadata = getattr(value, name)()
+                        if name == "stride":
+                            if type(metadata) in (list, tuple) and len(metadata) <= 8:
+                                result[name] = [bounded_integer(v) for v in metadata]
+                        else:
+                            result[name] = bounded_integer(metadata)
+                    except Exception:
+                        pass
+                # Only small CPU integer metadata; never .cpu(), numpy or feature copies.
+                if integer_values:
+                    result["values_status"] = "OMITTED_NOT_SMALL_CPU_INTEGER"
+                    if (
+                        device == "cpu"
+                        and result["dtype"] in ("torch.int32", "torch.int64")
+                        and value.numel() <= 4096
+                    ):
+                        values = value.reshape(-1).tolist()
+                        summary = ids(values)
+                        result.update(values_status="CAPTURED", values=summary, first12=values[:12])
+                return result
+
+            observed_origin_ids = getattr(req, "origin_input_ids", None)
+            span_budget = 32768
+
+            def observed_span_matches_pad(pair, pad):
+                nonlocal span_budget
+                if (
+                    type(observed_origin_ids) not in (list, array)
+                    or len(observed_origin_ids) > 32768
+                    or pad is None
+                    or type(pair) not in (list, tuple)
+                    or len(pair) != 2
+                    or any(type(v) is not int for v in pair)
+                ):
+                    return None
+                start, end = pair
+                if not 0 <= start <= end < len(observed_origin_ids):
+                    return None
+                count = end - start + 1
+                if count > span_budget:
+                    return None
+                span_budget -= count
+                matches = True
+                for index in range(start, end + 1):
+                    token = observed_origin_ids[index]
+                    if type(token) is not int:
+                        return None
+                    matches = matches and token == pad
+                return matches
+
+            def item_metadata(item):
+                modality = getattr(getattr(item, "modality", None), "name", None)
+                data = getattr(item, "model_specific_data", None)
+                offsets = getattr(item, "offsets", None)
+                offsets = offsets if type(offsets) in (list, tuple) else None
+                pad = bounded_integer(getattr(item, "pad_value", None))
+                return {
+                    "hash": bounded_integer(getattr(item, "hash", None)),
+                    "pad_value": pad,
+                    "offsets": [
+                        [bounded_integer(v) for v in pair]
+                        if type(pair) in (list, tuple) and len(pair) == 2
+                        else None
+                        for pair in offsets[:4]
+                    ]
+                    if offsets is not None
+                    else None,
+                    "observed_origin_span_matches_pad": [
+                        observed_span_matches_pad(pair, pad) for pair in offsets[:4]
+                    ]
+                    if offsets is not None
+                    else None,
+                    "offsets_count": len(offsets) if offsets is not None else None,
+                    "offsets_truncated": len(offsets) > 4 if offsets is not None else None,
+                    "modality": modality if modality in ("IMAGE", "VIDEO", "AUDIO") else None,
+                    "model_specific_data_is_dict": isinstance(data, dict),
+                    "image_grid_thw_present": isinstance(data, dict) and "image_grid_thw" in data,
+                    "image_grid_thw": tensor_metadata(
+                        data.get("image_grid_thw"), integer_values=True
+                    )
+                    if isinstance(data, dict)
+                    else None,
+                    "feature": tensor_metadata(getattr(item, "feature", None)),
+                }
+
+            original = ids(observed_origin_ids)
+            unpadded = ids(getattr(req, "origin_input_ids_unpadded", None))
+            items = getattr(mm, "mm_items", None)
+            rid = getattr(req, "rid", None)
+            processor = getattr(scheduler, "_mm_processor", None)
+            config = getattr(processor, "config", None)
+            revision = getattr(config, "_commit_hash", None)
+            facts.update(
+                mrope_processor_class=(
+                    type(processor).__module__ + "." + type(processor).__qualname__
+                )[:192]
+                if processor is not None
+                else None,
+                mrope_processor_config_commit=revision[:128] if isinstance(revision, str) else None,
+                sdk_effective_settings=sdk_settings(),
+                observed_origin_span_scope=(
+                    "Current event origin_input_ids only; an unpadded MRoPE view need not match pad."
+                ),
+                processor_revision_scope=(
+                    "Direct live mrope processor config only; "
+                    "None means unavailable, not cached-snapshot proof"
+                ),
+                request_id_sha256=hashlib.sha256(rid.encode()).hexdigest()
+                if isinstance(rid, str) and len(rid) <= 512
+                else None,
+                model=model,
+                original_ids=original,
+                unpadded_ids=unpadded,
+                original_unpadded_hash_equal=(original["sha256"] == unpadded["sha256"])
+                if original.get("sha256") is not None and unpadded.get("sha256") is not None
+                else None,
+                mm_items_count=len(items) if isinstance(items, (list, tuple)) else None,
+                mm_items=[item_metadata(item) for item in items[:4]]
+                if isinstance(items, (list, tuple))
+                else None,
+                mm_items_summary_truncated=isinstance(items, (list, tuple)) and len(items) > 4,
+                mrope_positions=tensor_metadata(
+                    getattr(mm, "mrope_positions", None), integer_values=True
+                ),
+                mrope_position_delta=tensor_metadata(
+                    getattr(mm, "mrope_position_delta", None), integer_values=True
+                ),
+            )
+        record = json.dumps({"event": event, "slot": slot, **facts}, sort_keys=True)
+        if len(record) <= 8192:
+            logger.warning("SMG_QWENVL_REQUEST_DIAGNOSTIC %s", record)
+    except Exception:
+        # Diagnostic metadata must not change engine success/failure semantics.
+        return
+
+
+def trace_qwenvl_output(output):
+    """Observe the existing emitted token rows; bounded12 requests/512 IDs each."""
+    if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") != "1":
+        return
+    try:
+        for index in range(min(len(output.rids), 16)):
+            rid = output.rids[index]
+            match = (
+                re.match(r"^(smg-qwenvl-[0-9a-f]{32})(?:-|$)", rid)
+                if isinstance(rid, str) and len(rid) <= 512
+                else None
+            )
+            if match is None:
+                continue
+            if rid not in _QWENVL_OUTPUTS and len(_QWENVL_OUTPUTS) >= 12:
+                continue
+            row = output.output_ids[index]
+            if not isinstance(row, list) or not all(
+                type(v) is int and 0 <= v < 2**63 for v in row[:513]
+            ):
+                continue
+            tokens, truncated = _QWENVL_OUTPUTS.get(rid, ([], False))
+            room = 512 - len(tokens)
+            truncated = truncated or len(row) > room
+            tokens.extend(row[:room])
+            _QWENVL_OUTPUTS[rid] = (tokens, truncated)
+            reason = output.finished_reasons[index]
+            if reason:
+                del _QWENVL_OUTPUTS[rid]
+                _qwenvl_numerical("finish", rid)
+                _trace_qwenvl(
+                    "output",
+                    client_trace_id=match.group(1),
+                    request_id_sha256=hashlib.sha256(rid.encode()).hexdigest(),
+                    emitted_token_ids=tokens,
+                    truncated=truncated,
+                    finish_reason=reason if reason in ("stop", "length", "abort") else "other",
+                )
+    except Exception:
+        return
+
+
+def _qwenvl_numerical(action, *args):
+    if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") != "1":
+        return
+    try:
+        from smg_grpc_servicer.sglang import qwenvl_numerical_diagnostic
+
+        getattr(qwenvl_numerical_diagnostic, action)(*args)
+    except Exception:
+        # Diagnostics never change an original request/return/exception.
+        return
+
+
+def _trace_mrope_call(original, scheduler, req, branch, *args, **kwargs):
+    _qwenvl_numerical("bind_scheduler", req)
+    _trace_qwenvl("mrope_before", scheduler, req, branch=branch)
+    try:
+        return original(scheduler, req, *args, **kwargs)
+    finally:
+        _trace_qwenvl("mrope_after", scheduler, req, branch=branch)
+
+
 def register() -> None:
     """The ``sglang.srt.plugins`` entry point."""
     if attributes_grammar_aborts():
         register_grammar_attribution()
     if not active():
+        _trace_qwenvl("registration", handshake_active=False, registered=False)
         return
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -122,6 +606,11 @@ def register() -> None:
     HookRegistry.register(f"{_SCHEDULER}.maybe_init_rust_server", after_rust_server, HookType.AFTER)
     HookRegistry.register(f"{_RECEIVER}._pull_raw_reqs", pull_raw_reqs, HookType.AROUND)
     HookRegistry.register(f"{_SCHEDULER}.run_event_loop", run_event_loop, HookType.AROUND)
+    target = f"{_SCHEDULER}._maybe_compute_mrope_positions"
+    mrope_available = _resolves(target)
+    if mrope_available:
+        HookRegistry.register(target, mrope_from_unpadded, HookType.AROUND)
+    _trace_qwenvl("registration", handshake_active=True, registered=mrope_available)
     from smg_grpc_servicer.sglang import mm_broadcast
 
     if mm_broadcast.enabled():
@@ -132,6 +621,30 @@ def register() -> None:
             logger.info("SMG plugin: %s is unavailable; using inline media broadcast", target)
 
     logger.info("SMG ZMQ plugin: scheduler will dial %s", handshake_address())
+
+
+def mrope_from_unpadded(original, scheduler, req, *args, **kwargs):
+    """Let the SDK compute positions from image anchors, keeping hash tokens for KV identity."""
+    mm = getattr(req, "multimodal_inputs", None)
+    unpadded = getattr(req, "origin_input_ids_unpadded", None)
+    padded = getattr(req, "origin_input_ids", None)
+    if (
+        mm is not None
+        and getattr(mm, "mrope_positions", None) is None
+        and getattr(scheduler, "_mm_processor", None) is not None
+        and (isinstance(unpadded, array) and unpadded.typecode == "q" or isinstance(unpadded, list))
+        and len(unpadded) > 0
+        and isinstance(padded, (array, list))
+        and len(unpadded) == len(padded)
+        and all(type(token) is int and 0 <= token < 2**63 for token in unpadded)
+    ):
+        # The scheduler pads first; its saved buffer still has the expanded image anchors.
+        # A shallow view shares multimodal results without rewriting the caller's cache tokens.
+        req_view = copy.copy(req)
+        req_view.origin_input_ids = unpadded
+        _trace_qwenvl("mrope_selected_unpadded", scheduler, req, branch="unpadded")
+        return _trace_mrope_call(original, scheduler, req_view, "unpadded", *args, **kwargs)
+    return _trace_mrope_call(original, scheduler, req, "fallback", *args, **kwargs)
 
 
 def create_channels(original, cls, *args, **kwargs):
@@ -170,6 +683,7 @@ def after_rust_server(result, scheduler, *args, **kwargs):
         scheduler, _state.context, _state.sender, handshake_address(), engine_index()
     )
     scheduler.recv_from_tokenizer = recv
+    _qwenvl_numerical("install", scheduler)
     if scheduler.server_args.sleep_on_idle:
         from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 

@@ -1250,6 +1250,7 @@ pub(crate) mod tests {
         fs::write(&bed.path, RANDOM).expect("the transient replacement");
         let mut looks = 0;
         let unexpected_reads = AtomicUsize::new(0);
+        let mut read_attempts = 0;
 
         let started = SpecFile::start_reading(
             bed.path.clone(),
@@ -1265,7 +1266,17 @@ pub(crate) mod tests {
                     _ => look(path),
                 }
             },
-            |identity| read_counting_unexpected(identity, &unexpected_reads),
+            |identity| {
+                read_attempts += 1;
+                let document = read_counting_unexpected(identity, &unexpected_reads);
+                if read_attempts == 1 {
+                    assert!(
+                        document.is_none(),
+                        "the transient descriptor is not accepted"
+                    );
+                }
+                document
+            },
         );
 
         assert!(started.is_ok(), "the standing file starts after the retry");
@@ -1273,6 +1284,7 @@ pub(crate) mod tests {
         // read of the restored file. Where the stamp of the renames shows,
         // that read is made once more.
         assert!(looks >= 3, "the transient read is retried");
+        assert!(read_attempts >= 2, "the transient read is retried");
         assert_eq!(unexpected_reads.load(Ordering::Relaxed), 0);
         assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
     }

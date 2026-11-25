@@ -3,8 +3,10 @@
 from itertools import count
 
 import pytest
+from infra import constants as constants_module
 from infra import worker as worker_module
-from infra.constants import ENV_STARTUP_TIMEOUT, WorkerType
+from infra.constants import ENV_STARTUP_TIMEOUT, ConnectionMode, WorkerType
+from infra.startup_profile_test_support import set_profile_lane
 
 
 @pytest.fixture
@@ -13,6 +15,9 @@ def launch(monkeypatch):
     clock = [100.0]
     ports = count(20000)
     monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    monkeypatch.delenv("E2E_STARTUP_PROFILE", raising=False)
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_SELECTION", None)
     monkeypatch.setattr(worker_module, "get_gpu_offset", lambda: 0)
     monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 1})
     monkeypatch.setattr(worker_module, "detect_ib_device", lambda: None)
@@ -175,3 +180,163 @@ def test_model_timeout_and_environment_floor_apply_to_whole_fleet(launch, monkey
     worker_module.start_workers("model", engine="vllm", count=2, timeout=10)
     assert [event[2] for event in events[:2]] == [30, 30]
     assert [event[2] for event in events[2:]] == [30, 26]
+
+
+@pytest.mark.parametrize(
+    "profile,model,tp,bound,mode",
+    [
+        ("vllm-zmq-dp2-chat", "meta-llama/Llama-3.1-8B-Instruct", 1, 300, ConnectionMode.ZMQ),
+        (
+            "vllm-4gpu-chat",
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            4,
+            1200,
+            ConnectionMode.GRPC,
+        ),
+        ("vllm-4gpu-chat", "openai/gpt-oss-120b", 4, 600, ConnectionMode.GRPC),
+        (
+            "original1-vllm-chat-legacy",
+            "meta-llama/Llama-3.2-1B-Instruct",
+            1,
+            300,
+            ConnectionMode.GRPC,
+        ),
+    ],
+)
+def test_profile_value_reaches_worker_spawn_and_wait_arguments(
+    launch,
+    monkeypatch,
+    profile,
+    model,
+    tp,
+    bound,
+    mode,
+):
+    events, _ = launch
+    set_profile_lane(monkeypatch, profile)
+    monkeypatch.setattr(
+        worker_module, "get_model_spec", lambda _: {"tp": tp, "startup_timeout": 9999}
+    )
+    workers = worker_module.start_workers(model, engine="vllm", mode=mode)
+    assert [event[0] for event in events] == ["start", "ready"]
+    assert [event[2] for event in events] == [bound, bound]
+    assert workers[0].gpu_ids == list(range(tp * (2 if mode == ConnectionMode.ZMQ else 1)))
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"engine": "sglang"},
+        {"mode": ConnectionMode.HTTP},
+        {"tp": 2},
+        {"gpus": 1},
+        {"count": 2},
+        {"count": True},
+        {"count": 1.0},
+        {"count": 0},
+        {"worker_type": WorkerType.PREFILL},
+        {"extra_engine_args": ["--tensor-parallel-size", "2"]},
+        {"extra_engine_args": ["--tensor-parallel-size=2"]},
+        {"extra_engine_args": ["-tp2"]},
+        {"extra_engine_args": ["--data-parallel-size=1"]},
+        {"extra_engine_args": ["--tensor_parallel_size=2"]},
+        {"extra_engine_args": ["--data_parallel_size=1"]},
+        {"extra_engine_args": ["--model", "different-model"]},
+        {"extra_engine_args": ["--config=override.yaml"]},
+        {"extra_env": {"SMG_VLLM_SERVICER_WARMUP": "off"}},
+    ],
+)
+def test_profile_conflict_fails_before_any_fake_spawn(launch, monkeypatch, options):
+    events, _ = launch
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    kwargs = {"engine": "vllm", "mode": ConnectionMode.ZMQ, **options}
+    with pytest.raises(ValueError):
+        worker_module.start_workers("meta-llama/Llama-3.1-8B-Instruct", **kwargs)
+    assert events == []
+
+
+def test_profile_readiness_failure_still_cleans_up(launch, monkeypatch):
+    events, _ = launch
+    set_profile_lane(monkeypatch, "vllm-4gpu-chat")
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 4})
+
+    def fail(worker, timeout):
+        assert timeout == 600
+        raise TimeoutError("profile readiness failed")
+
+    monkeypatch.setattr(worker_module.Worker, "wait_ready", fail)
+    with pytest.raises(TimeoutError, match="profile readiness failed"):
+        worker_module.start_workers("openai/gpt-oss-120b", engine="vllm", mode=ConnectionMode.GRPC)
+    assert [event[0] for event in events] == ["start", "stop"]
+
+
+def test_original1_exact_full_warmup_call_spawns_without_health_wait(launch, monkeypatch):
+    events, _ = launch
+    set_profile_lane(monkeypatch, "original1-vllm-chat-legacy")
+    workers = worker_module.start_workers(
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "vllm",
+        mode=ConnectionMode.GRPC,
+        count=1,
+        wait_ready=False,
+        extra_engine_args=[],
+        extra_env={"SMG_VLLM_SERVICER_WARMUP": "full"},
+    )
+    assert [event[0] for event in events] == ["start"]
+    assert events[0][2:] == (300, False)
+    assert workers[0].extra_env == {"SMG_VLLM_SERVICER_WARMUP": "full"}
+    assert workers[0].gpu_ids == [0]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"model_id": "meta-llama/Llama-3.1-8B-Instruct"},
+        {"mode": ConnectionMode.HTTP},
+        {"mode": ConnectionMode.ZMQ},
+        {"engine": "sglang"},
+        {"worker_type": WorkerType.PREFILL},
+        {"count": 2},
+        {"tp": 2},
+        {"gpus": 2},
+        {"kv_backend": "nixl"},
+        {"wait_ready": True},
+        {"extra_engine_args": ["--log-level", "info"]},
+        {"extra_env": {"SMG_VLLM_SERVICER_WARMUP": "fast"}},
+        {"extra_env": {"SMG_VLLM_SERVICER_WARMUP": "off"}},
+        {"extra_env": {"SMG_VLLM_SERVICER_WARMUP": "full", "E2E_PARSER": "legacy"}},
+        {"extra_env": {"SMG_VLLM_SERVICER_WARMUP": "full", "UNRELATED": "value"}},
+    ],
+)
+def test_original1_full_warmup_exception_rejects_changed_shape(launch, monkeypatch, change):
+    events, _ = launch
+    set_profile_lane(monkeypatch, "original1-vllm-chat-legacy")
+    options = {
+        "model_id": "meta-llama/Llama-3.2-1B-Instruct",
+        "engine": "vllm",
+        "mode": ConnectionMode.GRPC,
+        "count": 1,
+        "wait_ready": False,
+        "extra_engine_args": [],
+        "extra_env": {"SMG_VLLM_SERVICER_WARMUP": "full"},
+    }
+    options.update(change)
+    with pytest.raises(ValueError):
+        worker_module.start_workers(**options)
+    assert events == []
+
+
+def test_other_startup_profile_still_rejects_full_warmup_override(launch, monkeypatch):
+    events, _ = launch
+    set_profile_lane(monkeypatch, "vllm-mooncake-pd2")
+    with pytest.raises(ValueError, match="worker environment override"):
+        worker_module.start_workers(
+            "meta-llama/Llama-3.2-1B-Instruct",
+            "vllm",
+            mode=ConnectionMode.GRPC,
+            count=1,
+            wait_ready=False,
+            extra_engine_args=[],
+            extra_env={"SMG_VLLM_SERVICER_WARMUP": "full"},
+        )
+    assert events == []

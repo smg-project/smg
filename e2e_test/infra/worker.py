@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import IO, Any
 
 import yaml
@@ -21,6 +22,7 @@ from .constants import (
     DEFAULT_STARTUP_TIMEOUT,
     ENV_MOCK_WIRE,
     ENV_SHOW_WORKER_LOGS,
+    ENV_STARTUP_PROFILE,
     ENV_VLLM_SERVICER_IMPL,
     ENV_WORKER_RUST_LOG,
     HEALTH_CHECK_INTERVAL,
@@ -36,11 +38,14 @@ from .constants import (
     get_runtime,
     get_servicer_impl,
     get_servicer_impl_setting,
+    get_startup_profile,
     get_vllm_mm_processor,
     get_zmq_engine_count,
     host_port,
     moriio_host,
+    profile_startup_timeout,
     sglang_transfer_backend,
+    startup_profile_definition,
     trtllm_runs_engines_own_servicer,
     vllm_kv_backend,
     vllm_moriio_backend,
@@ -462,6 +467,62 @@ class Worker:
         features = spec.get("features", [])
 
         if self.engine == "sglang":
+            if self._sglang_mxfp4_fallback():
+                configured = list(spec.get("sglang_args", [])) + list(self.extra_engine_args or [])
+                if any(
+                    arg.split("=", 1)[0]
+                    in (
+                        "--moe-runner-backend",
+                        "--moe-a2a-backend",
+                        "--model-path",
+                        "--model",
+                        "--revision",
+                    )
+                    for arg in configured
+                ):
+                    raise ValueError(
+                        "The fixed GPT-OSS fallback owns its checkpoint and generic Triton/none MoE flags"
+                    )
+                served_model_args = []
+                if model_path == "openai/gpt-oss-20b":
+                    # The numeric preflight uses this same original revision.
+                    # A local copy/alias remains the selected model unchanged.
+                    cache = Path(
+                        os.environ.get("HF_HUB_CACHE")
+                        or Path(os.environ.get("HF_HOME") or "/models") / "hub"
+                    )
+                    model_path = str(
+                        cache
+                        / "models--openai--gpt-oss-20b/snapshots"
+                        / "6cee5e81ee83917806bbde320786a8fb61efebee"
+                    )
+                    # The checkpoint is local, but the suite and gateway still
+                    # address the original HF model ID. SGLang otherwise uses
+                    # the snapshot path as its advertised served model name.
+                    named = False
+                    for index, arg in enumerate(configured):
+                        flag, equals, value = arg.partition("=")
+                        if flag == "--served-model-name":
+                            if not equals:
+                                value = configured[index + 1] if index + 1 < len(configured) else ""
+                            if value != self.model_id:
+                                raise ValueError(
+                                    "The fixed GPT-OSS fallback owns its served model name"
+                                )
+                            named = True
+                    if not named:
+                        served_model_args = ["--served-model-name", self.model_id]
+                spec = {
+                    **spec,
+                    "sglang_args": [
+                        *spec.get("sglang_args", []),
+                        *served_model_args,
+                        "--moe-runner-backend",
+                        "triton",
+                        "--moe-a2a-backend",
+                        "none",
+                    ],
+                }
             if self.mode == ConnectionMode.ZMQ:
                 # The launcher validates the complete engine argument list
                 # (it refuses a DP launch this wire does not carry yet), so
@@ -499,6 +560,13 @@ class Worker:
         if self.extra_engine_args:
             cmd.extend(self.extra_engine_args)
         return cmd
+
+    def _sglang_mxfp4_fallback(self) -> bool:
+        return (
+            self.engine == "sglang"
+            and self.model_id == "openai/gpt-oss-20b"
+            and os.environ.get("E2E_SGLANG_GPTOSS_MXFP4_BF16") == "1"
+        )
 
     def _build_sglang_cmd(
         self, model_path: str, tp_size: int, features: list[str], spec: dict
@@ -1094,6 +1162,16 @@ class Worker:
 
         if self.extra_env:
             env.update(self.extra_env)
+        if self._sglang_mxfp4_fallback():
+            required = {"SGLANG_USE_AITER": "0", "SGLANG_GPTOSS_MXFP4_BF16_FALLBACK": "1"}
+            if self.extra_env and any(
+                key in self.extra_env and self.extra_env[key] != value
+                for key, value in required.items()
+            ):
+                raise ValueError(
+                    "The fixed GPT-OSS fallback requires AITER disabled and its explicit opt-in"
+                )
+            env.update(required)
         return env
 
     def read_log(self) -> str:
@@ -1309,11 +1387,129 @@ def _require_rust_servicer_hook() -> None:
 def worker_startup_timeout(model_id: str, timeout: int = DEFAULT_STARTUP_TIMEOUT) -> int:
     """The bound the harness gives a worker of ``model_id`` to start: its spec's
     ``startup_timeout`` (else ``timeout``), raised to the ``E2E_STARTUP_TIMEOUT``
-    floor. ``start_workers`` waits this long for the worker's health; a gateway
+    floor, unless a declared startup profile selects its frozen value.
+    ``start_workers`` waits this long for the worker's health; a gateway
     that registers the same worker needs the same bound for its own wait, so
     both read it here and a term added to one reaches the other.
     """
-    return effective_startup_timeout(get_model_spec(model_id).get("startup_timeout", timeout))
+    # Prove an opt-in selection before even resolving its model spec.
+    if os.environ.get(ENV_STARTUP_PROFILE, "").strip():
+        get_startup_profile()
+    spec = get_model_spec(model_id)
+    profile_bound = profile_startup_timeout(model_id, spec.get("tp", 1))
+    if profile_bound is not None:
+        return profile_bound
+    return effective_startup_timeout(spec.get("startup_timeout", timeout))
+
+
+def validate_startup_profile_worker(
+    model_id: str,
+    engine: str | None = None,
+    mode: ConnectionMode = ConnectionMode.HTTP,
+    worker_type: WorkerType = WorkerType.REGULAR,
+    count: int = 1,
+    gpus: int | None = None,
+    tp: int | None = None,
+    extra_engine_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+    wait_ready: bool = True,
+    **_kwargs,
+) -> None:
+    """Validate the opt-in profile before start_workers prepares any worker."""
+    profile = get_startup_profile()
+    if profile is None:
+        return
+    if type(count) is not int or count != 1:
+        raise ValueError(f"{profile} requires exactly one worker group")
+    definition = startup_profile_definition()
+    if definition is None:
+        raise ValueError(f"{profile} has no startup profile definition")
+    if profile == "vllm-mooncake-pd2":
+        if (
+            (engine or get_runtime()) != "vllm"
+            or mode not in definition.modes
+            or worker_type not in (WorkerType.REGULAR, WorkerType.PREFILL, WorkerType.DECODE)
+        ):
+            raise ValueError(f"{profile} requires its original gRPC worker roles")
+        spec = get_model_spec(model_id)
+        actual_tp = spec.get("tp", 1) if tp is None else tp
+        profile_startup_timeout(model_id, actual_tp)
+        profile_startup_timeout(model_id, spec.get("tp", 1))
+        # The rank-pinning case uses TP1 and DP2 on two devices, not two prefills.
+        original_dp2 = (
+            model_id == "meta-llama/Llama-3.2-1B-Instruct"
+            and worker_type == WorkerType.REGULAR
+            and type(gpus) is int
+            and gpus == 2
+            and extra_engine_args == ["--data-parallel-size", "2"]
+        )
+        expected_gpus = 2 if original_dp2 else actual_tp
+        if gpus is not None and (type(gpus) is not int or gpus != expected_gpus):
+            raise ValueError(f"{profile} requires its original per-worker GPU count")
+        if _kwargs.get("kv_backend") not in (None, "mooncake"):
+            raise ValueError(f"{profile} forbids a per-worker KV backend override")
+        for arg in () if original_dp2 else extra_engine_args or ():
+            option = arg.split("=", 1)[0].replace("_", "-")
+            if option in (
+                "--tensor-parallel-size",
+                "--data-parallel-size",
+                "--data-parallel-size-local",
+                "--model",
+                "--tokenizer",
+                "--config",
+                "--kv-transfer-config",
+            ) or option.startswith(("-tp", "-dp")):
+                raise ValueError(f"{profile} forbids an appended model/TP/DP/KV override")
+        if extra_env and any(
+            key.startswith("E2E_") or key in ("SMG_VLLM_SERVICER_WARMUP", "SMG_VLLM_MM_PROCESSOR")
+            for key in extra_env
+        ):
+            raise ValueError(f"{profile} forbids a worker environment override")
+        return
+    expected_mode = mode in definition.modes
+    if (
+        (engine or get_runtime()) != "vllm"
+        or not expected_mode
+        or worker_type != WorkerType.REGULAR
+    ):
+        raise ValueError(f"{profile} does not match the effective worker engine/wire/type")
+    spec = get_model_spec(model_id)
+    actual_tp = spec.get("tp", 1) if tp is None else tp
+    profile_startup_timeout(model_id, actual_tp)
+    # _build_cmd uses the spec unless an explicit tp was supplied; a process
+    # override in get_model_spec must match the frozen TP as well.
+    profile_startup_timeout(model_id, spec.get("tp", 1))
+    expected_gpus = actual_tp * definition.gpu_multiplier
+    if gpus is not None and (type(gpus) is not int or gpus != expected_gpus):
+        raise ValueError(f"{profile} requires {expected_gpus} GPUs per worker")
+    for arg in extra_engine_args or ():
+        option = arg.split("=", 1)[0].replace("_", "-")
+        if option in (
+            "--tensor-parallel-size",
+            "--data-parallel-size",
+            "--data-parallel-size-local",
+            "--model",
+            "--tokenizer",
+            "--config",
+        ) or option.startswith(("-tp", "-dp")):
+            raise ValueError(f"{profile} forbids appended TP/DP/model override arguments")
+    # Only the unchanged full-warmup case's exact vLLM call shape may override
+    # the job's fast level. Its existing watch owns its independent time bounds.
+    original1_full_warmup = (
+        profile == "original1-vllm-chat-legacy"
+        and model_id == "meta-llama/Llama-3.2-1B-Instruct"
+        and mode == ConnectionMode.GRPC
+        and wait_ready is False
+        and extra_engine_args == []
+        and extra_env == {"SMG_VLLM_SERVICER_WARMUP": "full"}
+        and _kwargs.get("kv_backend") is None
+    )
+    if (
+        extra_env
+        and any(key.startswith("E2E_") or key == "SMG_VLLM_SERVICER_WARMUP" for key in extra_env)
+        and not original1_full_warmup
+    ):
+        raise ValueError(f"{profile} forbids a worker environment override of its lane/warm-up")
 
 
 def start_workers(
@@ -1356,6 +1552,19 @@ def start_workers(
     Returns:
         List of started Worker instances.
     """
+    validate_startup_profile_worker(
+        model_id=model_id,
+        engine=engine,
+        mode=mode,
+        worker_type=worker_type,
+        count=count,
+        gpus=gpus,
+        tp=tp,
+        extra_engine_args=extra_engine_args,
+        extra_env=extra_env,
+        wait_ready=wait_ready,
+        kv_backend=kv_backend,
+    )
     # The lane's GPU slice: every worker shifts by E2E_GPU_OFFSET.
     gpu_offset += get_gpu_offset()
     if log_dir is None:

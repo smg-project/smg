@@ -45,6 +45,7 @@ from smg_grpc_servicer.sglang.compat import (
     get_disaggregation_types,
     get_multimodal_types,
     get_tokenizer,
+    normalize_multimodal_processor_output,
 )
 from smg_grpc_servicer.sglang.config_view import EngineConfigView, v41_vision
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
@@ -1239,10 +1240,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     offsets=offsets or None,
                 )
             )
-        return MultimodalProcessorOutput(
-            mm_items=mm_items,
-            im_token_id=im_token_id if Modality.IMAGE in seen else video_token_id,
-            video_token_id=video_token_id,
+        return normalize_multimodal_processor_output(
+            MultimodalProcessorOutput(
+                mm_items=mm_items,
+                im_token_id=im_token_id if Modality.IMAGE in seen else video_token_id,
+                video_token_id=video_token_id,
+            )
         )
 
     def _convert_embed_request(
