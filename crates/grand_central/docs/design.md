@@ -390,7 +390,9 @@ one of them.
 
 A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). Either form is read into values first, and the document is built from those values by one typed read.
 
-So a YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map must stand, a list item with nothing in it is refused in a list of the spec's own, and a tag is refused. A key with nothing under it reads as a key left out where the field may be null, as a binding's `overload`, `routing_key`, `sessions`, `shadow`, `canary` and `admission` may.
+So a YAML document reads as JSON does. Text that looks like a number, a boolean or a null is written in quotes. A key with nothing under it is refused where a list or a map must stand. A list item with nothing in it is refused in a list of the spec's own. A local tag, such as `!mine`, is refused on a value, and on a key it is read as if it were not written.
+
+A key with nothing under it reads as a key left out where the field may be null. A binding's `profile`, `plan`, `overload`, `routing_key`, `sessions`, `shadow`, `canary` and `admission` may be.
 
 A number reads one way in both forms and in every build: a whole number of 64 bits as itself, and any other as the nearest double. The crate's manifest asks the JSON library for its exact reading (`float_roundtrip`). A field of single precision takes the number by a cast, so one that rounds past the largest single reads as infinite there and the spec's check refuses it by its field.
 
@@ -857,22 +859,37 @@ host keeps one session table for its engine's life, so a lease's word reaches th
 was made in. On a controller the document in force at a word is the one its store's standing world
 holds, and a lease of a generation above it tells no stage (section 10.2).
 
-An entry of the engine reads the document through a reference its own thread keeps, but for the
-entries that issue no lease: those run under the document their caller hands, a controller's
-world's (section 10.2), and their thread keeps none. The engine
-holds the number of the document in force in one atomic word, written behind the document at an
-apply. A thread keeps one counted reference of the document it read last, and an entry compares
-that document's number with the engine's. Where they are one, the entry takes a plain count on the
-thread's reference: no atomic exchange, and nothing allocated. Otherwise it reads the engine's cell
-and the thread keeps what it read: at a thread's first entry, at its first entry behind a new
-document, and at each entry of a thread that asks two engines by turns. So a replaced document
-lives until its last decision ends, its last handle is let go, and each thread that read it last
-asks an engine again or ends: at most one replaced document for each thread. The stages that the
-document in force did not keep are dropped on the thread that lets the last reference go: as a
-rule at that thread's next entry of an engine (a decision, a lease's word or a read of the
-document), or at its end. A drop that panics there unwinds out of the entry. The process aborts
-where the entry is made while the thread already unwinds, as a request's guard dropped with a
-report owed speaks for its lease, and at a thread's end.
+A request's entry of the engine (a decision, a lease's word, a borrowed read of the document) reads
+the document through a reference its own thread keeps. The entries that are handed their document
+are one exception. A controller's deciding thread calls such entries under its world's document
+(section 10.2), among them `decide_without_lease`, `decide_decode_without_lease`,
+`decide_encode_without_lease` and `count_shadow`. An entry that is handed its document keeps
+nothing for its thread.
+
+`InProcess::spec`, which answers a handle of the document in force, keeps nothing for its thread
+either. Nor does the telling of a change of membership: each reads the engine's cell. The engine's
+own task reads that cell for its load reports, and asks a list's value through the thread's
+reference, as a request's entry does.
+
+The engine holds the number of the document in force in one atomic word, written behind the
+document at an apply. A thread keeps one counted reference of the document it read last, and an
+entry compares that document's number with the engine's.
+
+Where the two numbers are one, the entry takes a plain count on the thread's reference: no atomic
+exchange, and nothing allocated. Otherwise it reads the engine's cell and the thread keeps what it
+read: at a thread's first entry, at its first entry behind a new document, and at each entry of a
+thread that asks two engines by turns. On a thread that is ending and has let its reference go, an
+entry reads the cell each time and the thread keeps nothing.
+
+So a replaced document lives until its last decision ends, its last handle is let go, and each
+thread that read it last asks an engine again or ends: at most one replaced document for each
+thread.
+
+The stages that the document in force did not keep are dropped on the thread that lets the last
+reference go. As a rule that is at the thread's next entry of an engine (a decision, a lease's word
+or a borrowed read of the document), or at its end. A drop that panics there unwinds out of the
+entry. The process aborts where the entry is made while the thread already unwinds, as a request's
+guard dropped with a report owed speaks for its lease, and at a thread's end.
 
 ```rust
 // engine/in_process.rs
@@ -1250,8 +1267,9 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    such a pick states no sessions rule, so the table is told nothing of it.
 
    Under a document that keeps a sample (decision 7) the engine asks the maker the request's id
-   behind the pick, which a maker that holds the id answers with no request made, and reads the
-   clock for a place it keeps.
+   behind the pick, and reads the clock for a place it keeps. A maker that answers the id itself
+   builds no request for it, as the maker inside `InProcess::place` and a request stated ahead do.
+   Under any other maker the request is made for its id.
 
 **The full path**, in logical order (the code interleaves some steps to save work):
 
@@ -2375,10 +2393,10 @@ request ──> route (HTTP or gRPC, any family)
   they already take. A route names the answer's type and makes its load guard from the answer, in the places it made one before.
 
   The gateway observes classic's match ratio series from a placement that states what share of the
-  request's blocks its worker holds (`Placement::overlap`): once for a single request, and once for
-  a pair, of its prefill. A pick states that share only where its own profile reads who holds the
-  prompt, whatever the profile's name. Classic observes a `cache_aware` selection that it decides by
-  events or in a tree, so both sides of a pair where both run that policy.
+  request's blocks its worker holds (`Placement::overlap`). It observes once for a single request,
+  and once for a pair, of its prefill. A pick states that share only where its own profile reads who
+  holds the prompt, whatever the profile's name. Classic observes a `cache_aware` selection that it
+  decides by events or in a tree, so both sides of a pair where both make such a selection.
 
   Where the engine places no worker for a request, the gateway names the client's answer itself,
   by classic's own judgement of the pool. The engine's word for the refusal goes to a log line
