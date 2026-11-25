@@ -42,8 +42,8 @@ use super::{
 };
 use crate::routers::common::snapshot::WorkerRegistry;
 
-/// The settle window of a worker that states none: how long behind its
-/// purge a worker that left with no drain is purged once more.
+/// The settle window of a worker whose own window is zero: how long behind
+/// its removal its address is owed a purge.
 const SETTLE_WHERE_NONE_IS_STATED: Duration = Duration::from_secs(5);
 
 /// The owner of the token trees Grand Central is lent, one a model.
@@ -143,8 +143,9 @@ impl LentTrees {
     /// too, of every address. A registration, a replacement and a status
     /// change purge nothing. A purge walks a tree for each worker that
     /// left, so it runs off the runtime's own threads, and the task reads
-    /// no event until it ends. A worker that left with no drain is purged
-    /// once more a settle window later ([`follow_removals`]).
+    /// no event until it ends. A worker that took requests up to its
+    /// removal is purged once more a settle window later
+    /// ([`follow_removals`]).
     ///
     /// The task holds the trees weakly, and of the registry its events
     /// alone. It ends with the registry, at the first wake after the
@@ -225,13 +226,15 @@ impl LentTrees {
 /// `forget` ends.
 ///
 /// A decision that read a worker ahead of its removal may write a prompt
-/// under the worker's address behind the purge. A worker that was being
+/// under the worker's address behind the removal. A worker that was being
 /// drained when it left took no new request for its settle window, so no
-/// such decision is under way.
-/// Any other worker's address is purged once more one settle window behind
-/// its purge, the worker's own window or five seconds where it states none,
-/// at an event or with none. An address a worker was registered under
-/// meanwhile is left alone: what stands under it is that worker's own.
+/// such decision is under way where that window is not zero. Any other
+/// worker's address is owed a purge one settle window behind its removal,
+/// the worker's own window or five seconds where that is zero, at an event
+/// or with none. An address a worker was registered under meanwhile is
+/// owed none: what stands under it is that worker's own. Behind events
+/// that went unheard no address is owed one, as a registration may be
+/// among them.
 ///
 /// The task holds `stores` weakly, and of the registry its events alone. It
 /// ends with the registry, at the first wake after `stores` are gone, or
@@ -239,15 +242,16 @@ impl LentTrees {
 pub(super) fn follow_removals<S: Send + Sync + 'static>(
     stores: &Arc<S>,
     what: &'static str,
-    forget: fn(&S, &Left),
+    forget: impl Fn(&S, &Left) + Send + Sync + 'static,
     registry: &WorkerRegistry,
     runtime: &Handle,
 ) {
     let mut events = registry.subscribe_events();
     let stores = Arc::downgrade(stores);
+    let forget = Arc::new(forget);
     runtime.spawn(async move {
-        // The addresses owed a second purge, each with the instant it is
-        // due.
+        // The addresses owed a purge behind a settle window, each with the
+        // instant it is due.
         let mut owed: Vec<(Instant, String)> = Vec::new();
         loop {
             let mut left = Left::default();
@@ -259,7 +263,7 @@ pub(super) fn follow_removals<S: Send + Sync + 'static>(
                 Some(Ok(event)) => left.note(&event),
                 Some(Err(RecvError::Lagged(lost))) => left.unheard += lost,
                 Some(Err(RecvError::Closed)) => return,
-                // A second purge is due.
+                // A purge behind a settle window is due.
                 None => {}
             }
             loop {
@@ -270,6 +274,12 @@ pub(super) fn follow_removals<S: Send + Sync + 'static>(
                 }
             }
             let now = Instant::now();
+            if left.unheard > 0 {
+                // A registration may be among the unheard: no address is
+                // known to stand empty a window from now.
+                owed.clear();
+                left.settles.clear();
+            }
             owed.retain(|(due, address)| {
                 if left.listed.contains(address) {
                     return false;
@@ -292,6 +302,7 @@ pub(super) fn follow_removals<S: Send + Sync + 'static>(
             if !left.asks_for_a_purge() {
                 continue;
             }
+            let forget = Arc::clone(&forget);
             let purge = tokio::task::spawn_blocking(move || forget(&stores, &left));
             // A purge that panicked is this task's last: nothing but a
             // store's own size pass bounds it from here on.
@@ -310,37 +321,47 @@ pub(super) fn follow_removals<S: Send + Sync + 'static>(
 pub(super) struct Left {
     /// The addresses of the workers a removal took away.
     addresses: Vec<String>,
-    /// Of those, the ones whose worker was not being drained when it left,
-    /// each with its settle window: purged once more behind it.
+    /// Of those, the ones whose worker was being drained when it left, but
+    /// those a worker was registered under behind the removal.
+    drained: Vec<String>,
+    /// Of those, the ones whose worker took requests up to its removal,
+    /// each with its settle window: owed a purge behind it.
     settles: Vec<(String, Duration)>,
     /// The addresses a worker was registered under.
     listed: Vec<String>,
-    /// The addresses whose second purge is due.
+    /// The addresses whose purge behind a settle window is due.
     again: Vec<String>,
     /// How many events went unheard: a removal may be among them.
     unheard: u64,
 }
 
 impl Left {
-    /// Notes `event`: a removal names the address that left, and its
-    /// settle window where the worker was not being drained. A
-    /// registration and a replacement take no worker away: they name an
-    /// address a worker stands under again, which is owed no second purge.
-    /// A status change says nothing.
+    /// Notes `event`: a removal names the address that left, whether its
+    /// worker was being drained, and its settle window where the worker
+    /// took requests up to its removal: one that was not being drained, or
+    /// was at a window of zero. A registration and a replacement take no
+    /// worker away: they name an address a worker stands under again,
+    /// which is owed no purge. A status change says nothing.
     fn note(&mut self, event: &WorkerEvent) {
         match event {
             WorkerEvent::Removed { worker, .. } => {
                 let address = worker.url().to_owned();
-                if worker.status() != WorkerStatus::Draining {
-                    let settle = match worker.metadata().health_config.drain_settle_secs {
+                let drained = worker.status() == WorkerStatus::Draining;
+                let window = worker.metadata().health_config.drain_settle_secs;
+                if !drained || window == 0 {
+                    let settle = match window {
                         0 => SETTLE_WHERE_NONE_IS_STATED,
                         secs => Duration::from_secs(secs),
                     };
                     self.settles.push((address.clone(), settle));
                 }
+                if drained {
+                    self.drained.push(address.clone());
+                }
                 self.addresses.push(address);
             }
             WorkerEvent::Registered { worker, .. } | WorkerEvent::Replaced { new: worker, .. } => {
+                self.drained.retain(|address| address != worker.url());
                 self.settles.retain(|(address, _)| address != worker.url());
                 self.listed.push(worker.url().to_owned());
             }
@@ -348,14 +369,29 @@ impl Left {
         }
     }
 
-    /// The addresses to purge at this wake: those a removal named, then
-    /// those whose second purge is due.
+    /// The addresses to purge at this wake in a store where a worker that
+    /// rejoins under its address starts with no prompt: those a removal
+    /// named, then those whose purge behind a settle window is due.
     pub(super) fn purged(&self) -> impl Iterator<Item = &str> {
         self.addresses.iter().chain(&self.again).map(String::as_str)
     }
 
-    /// Whether the events ask for a purge: a removal was heard, a second
-    /// purge is due, or events went unheard.
+    /// The addresses to purge at this wake in a store where an address a
+    /// worker is registered under again keeps its prompts: those whose
+    /// worker was being drained when it left and that no worker was
+    /// registered under behind the removal, then those whose purge behind
+    /// a settle window is due.
+    pub(super) fn settled(&self) -> impl Iterator<Item = &str> {
+        self.drained.iter().chain(&self.again).map(String::as_str)
+    }
+
+    /// How many events went unheard.
+    pub(super) fn unheard(&self) -> u64 {
+        self.unheard
+    }
+
+    /// Whether the events ask for a purge: a removal was heard, a purge
+    /// behind a settle window is due, or events went unheard.
     fn asks_for_a_purge(&self) -> bool {
         self.unheard > 0 || !self.addresses.is_empty() || !self.again.is_empty()
     }
@@ -676,6 +712,30 @@ mod tests {
         })
         .await;
         assert!(registry.get_by_url("http://b:1").is_some(), "it rejoined");
+    }
+
+    /// A worker that left with no drain is purged once more a settle window
+    /// behind its removal: a prompt a decision under way wrote under its
+    /// address behind the first purge leaves too.
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_written_behind_the_purge_leaves_a_settle_window_later() {
+        let trees = Arc::new(owner(document(1_000, 0)));
+        let registry = WorkerRegistry::new();
+        worker_at(&registry, "http://a:1");
+        worker_at(&registry, "http://b:1");
+        sent(&trees, MODEL, &["http://a:1", "http://b:1"]);
+        trees.follow_removals(&registry, &Handle::current());
+
+        registry.remove_by_url("http://b:1").expect("the removal");
+        until("the purge behind the removal", || {
+            held(&trees, MODEL) == ["http://a:1"]
+        })
+        .await;
+        sent(&trees, MODEL, &["http://b:1"]);
+        until("the purge a settle window later", || {
+            held(&trees, MODEL) == ["http://a:1"]
+        })
+        .await;
     }
 
     /// Events the task did not hear empty every tree. More events than the

@@ -738,6 +738,64 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Remove several workers by URL, from every model. Each leaves the load
+    /// scorer and every model's string and token tree by a walk of its own.
+    /// A model's hash placements are scanned once for the batch. A batch
+    /// that names no worker scans nothing.
+    pub(crate) fn remove_workers_by_url(&self, urls: &HashSet<String>) {
+        if urls.is_empty() {
+            return;
+        }
+        for url in urls {
+            self.load_scorer.remove_worker(url);
+            self.trees.remove_tenant(&TenantId::from(url.as_str()));
+        }
+        let placement_maps: Vec<Arc<PlacementMap>> = self
+            .placement_index
+            .iter()
+            .map(|model| Arc::clone(model.value()))
+            .collect();
+        for placements in placement_maps {
+            placements.retain(|_, holders| {
+                holders.retain(|holder| !urls.contains(&holder.worker_url));
+                !holders.is_empty()
+            });
+        }
+    }
+
+    /// Keeps the workers `listed` names and removes every other one, from
+    /// every model. A tenant of a string or token tree that `listed` does
+    /// not name leaves the load scorer and the trees by a walk of its own.
+    /// A model's hash placements are scanned once for the holders `listed`
+    /// does not name.
+    pub(crate) fn keep_workers_by_url(&self, listed: &HashSet<String>) {
+        let mut gone: HashSet<String> = HashSet::new();
+        // The size pass's own call at a size no tree is over: it visits
+        // each string tree and evicts nothing.
+        self.trees.evict_string_trees(usize::MAX, |_, tree| {
+            gone.extend(tree.get_tenant_char_count().into_keys());
+        });
+        for tree in self.trees.token_trees() {
+            gone.extend(tree.get_tenant_token_counts().into_keys());
+        }
+        gone.retain(|tenant| !listed.contains(tenant));
+        for url in &gone {
+            self.load_scorer.remove_worker(url);
+            self.trees.remove_tenant(&TenantId::from(url.as_str()));
+        }
+        let placement_maps: Vec<Arc<PlacementMap>> = self
+            .placement_index
+            .iter()
+            .map(|model| Arc::clone(model.value()))
+            .collect();
+        for placements in placement_maps {
+            placements.retain(|_, holders| {
+                holders.retain(|holder| listed.contains(&holder.worker_url));
+                !holders.is_empty()
+            });
+        }
+    }
+
     /// `model_id`'s string tree, for tests that seed and read its tenants.
     #[cfg(test)]
     pub(crate) fn string_tree(&self, model_id: &str) -> Option<Arc<Tree>> {

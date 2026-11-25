@@ -948,33 +948,69 @@ impl PolicyRegistry {
 
     /// Starts the task that takes a worker `workers` lost out of what the
     /// classic `cache_aware` policies remember of it, on `runtime`
-    /// ([`lent_trees::follow_removals`]). The registry sends an event for
-    /// every removal, so a worker a mesh peer's word took away, which runs
-    /// no step of a removal here, leaves them as one this process removed
-    /// does. A worker leaves by its address, whichever models it lists.
+    /// ([`lent_trees::follow_removals`]): its prompts in each model's
+    /// string tree, token tree and hash placements, and its entry of the
+    /// policy's load scorer. The registry sends an event for every removal,
+    /// so a worker a mesh peer's word took away, which runs no step of a
+    /// removal here, leaves these too. A worker leaves by its address,
+    /// whichever models it lists. Nothing else the removal workflow's own
+    /// step does for a worker this process removed is done here, each
+    /// policy's `remove_worker` hook among it. The task holds `workers`
+    /// weakly, for the addresses it lists behind events that went unheard.
     pub(crate) fn follow_removals(
         self: &Arc<Self>,
-        workers: &WorkerRegistry,
+        workers: &Arc<WorkerRegistry>,
         runtime: &tokio::runtime::Handle,
     ) {
+        let listed = Arc::downgrade(workers);
         lent_trees::follow_removals(
             self,
             "the cache_aware policies' stores",
-            Self::forget_the_removed,
+            move |policies: &Self, left: &Left| policies.forget_the_removed(left, &listed),
             workers,
             runtime,
         );
     }
 
-    /// Takes the addresses `left` names out of every `cache_aware` policy
-    /// the registry holds, each policy once: every model's string tree,
-    /// token tree and hash placements of it.
-    fn forget_the_removed(&self, left: &Left) {
+    /// Takes the addresses `left` says are settled out of every
+    /// `cache_aware` policy the registry holds, each policy once: every
+    /// model's string tree, token tree and hash placements of it. A worker
+    /// that was being drained when it left leaves at its removal. One that
+    /// was not leaves a settle window later. Either stays where a worker is
+    /// registered under its address by then: a mesh peer's endpoint passes
+    /// from one publisher to another by a removal and a registration, and
+    /// the worker behind it keeps its cache.
+    ///
+    /// The addresses of one wake leave a policy together: the task hears no
+    /// event while a purge runs, and a model's hash placements are scanned
+    /// once for all of them, not once for each.
+    ///
+    /// Where events went unheard, a removal may be among them, and no
+    /// event that was heard names its address: every address `workers`
+    /// does not list leaves every policy, and a line at warn says so. The
+    /// list is read once, ahead of the first store's scan. What stands
+    /// under a listed address stays. A worker registered behind that read
+    /// loses what was written under its address ahead of the scan, and the
+    /// requests that follow write it again.
+    fn forget_the_removed(&self, left: &Left, workers: &Weak<WorkerRegistry>) {
+        let unheard = left.unheard();
+        // Read under no lock of a store.
+        let listed: Option<HashSet<String>> = match workers.upgrade() {
+            Some(workers) if unheard > 0 => Some(workers.get_all_urls().into_iter().collect()),
+            _ => None,
+        };
+        if listed.is_some() {
+            warn!(
+                "{unheard} events of the worker registry went unheard: the cache_aware policies keep what stands under the addresses the registry lists and let go of the rest"
+            );
+        }
+        let settled: HashSet<String> = left.settled().map(str::to_owned).collect();
         self.each_policy(|policy| {
             if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
-                for address in left.purged() {
-                    cache_aware.remove_worker_by_url(address);
+                if let Some(listed) = &listed {
+                    cache_aware.keep_workers_by_url(listed);
                 }
+                cache_aware.remove_workers_by_url(&settled);
             }
         });
     }
@@ -3750,41 +3786,179 @@ mod tests {
         assert!(tree_of(&policy, "llama-3").is_empty());
     }
 
-    /// A worker the worker registry lost leaves every cache-aware policy by
-    /// its address, whichever way it left: here by a removal that runs no
-    /// step of a workflow. A prompt a decision under way writes behind that
-    /// purge leaves one settle window later, the worker having left with no
-    /// drain.
-    #[tokio::test(start_paused = true)]
-    async fn a_worker_the_registry_lost_leaves_the_cache_aware_policies() {
+    /// [`cache_aware_model`], its registry following a worker registry that
+    /// lists the two workers.
+    fn followed_cache_aware_model() -> (
+        Arc<PolicyRegistry>,
+        Arc<dyn LoadBalancingPolicy>,
+        Vec<Arc<dyn Worker>>,
+        Arc<WorkerRegistry>,
+    ) {
         let (registry, policy, workers) = cache_aware_model();
         let registry = Arc::new(registry);
-        let listed = WorkerRegistry::new();
+        let listed = Arc::new(WorkerRegistry::new());
         for worker in &workers {
             listed.register(Arc::clone(worker)).expect("a worker");
         }
         registry.follow_removals(&listed, &tokio::runtime::Handle::current());
-        let gone = || async {
-            let left = async {
-                while tree_of(&policy, "llama-3") != ["http://w2:8000"] {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            };
-            tokio::time::timeout(Duration::from_secs(60), left).await
-        };
+        (registry, policy, workers, listed)
+    }
+
+    /// Waits for the task that follows the worker registry to get to
+    /// `holds`.
+    async fn until(what: &str, mut holds: impl FnMut() -> bool) {
+        let bound = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !holds() {
+            assert!(
+                tokio::time::Instant::now() < bound,
+                "the task never got to: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A worker the worker registry lost with no drain, here by a removal
+    /// that runs no step of a workflow, keeps its prompts inside its settle
+    /// window and leaves every cache-aware policy behind it.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_the_registry_lost_leaves_the_cache_aware_policies() {
+        let (_registry, policy, _workers, listed) = followed_cache_aware_model();
 
         listed.remove_by_url("http://w1:8000").expect("the removal");
-        gone().await.expect("the purge behind the removal");
-
-        let cache_aware = as_cache_aware(policy.as_ref()).expect("a cache-aware policy");
-        cache_aware.add_worker(workers[0].as_ref());
+        tokio::time::sleep(Duration::from_secs(4)).await;
         assert_eq!(
             tree_of(&policy, "llama-3"),
             ["http://w1:8000", "http://w2:8000"],
-            "written behind the purge"
+            "kept inside its settle window"
         );
-        gone().await.expect("the purge one settle window later");
-        drop(registry);
+        until("the purge behind the settle window", || {
+            tree_of(&policy, "llama-3") == ["http://w2:8000"]
+        })
+        .await;
+    }
+
+    /// An address a worker is registered under again inside the settle
+    /// window keeps its prompts, whether the task hears the removal and the
+    /// registration in one wake or in two, and whether or not the worker
+    /// was being drained when it left. So an endpoint a mesh peer passes
+    /// from one publisher to another, by a removal and a registration,
+    /// keeps what is remembered of the worker behind it.
+    #[tokio::test(start_paused = true)]
+    async fn an_address_registered_again_keeps_its_prompts() {
+        let (_registry, policy, workers, listed) = followed_cache_aware_model();
+
+        listed.remove_by_url("http://w1:8000").expect("the removal");
+        listed.register(Arc::clone(&workers[0])).expect("a worker");
+        listed.remove_by_url("http://w2:8000").expect("the removal");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        listed.register(Arc::clone(&workers[1])).expect("a worker");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            tree_of(&policy, "llama-3"),
+            ["http://w1:8000", "http://w2:8000"],
+            "no purge of an address a worker stands under again"
+        );
+
+        workers[0].set_status(openai_protocol::worker::WorkerStatus::Draining);
+        listed.remove_by_url("http://w1:8000").expect("the removal");
+        listed.register(Arc::clone(&workers[0])).expect("a worker");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            tree_of(&policy, "llama-3"),
+            ["http://w1:8000", "http://w2:8000"],
+            "nor behind a drain"
+        );
+    }
+
+    /// A worker that was being drained when it left leaves every
+    /// cache-aware policy at its removal. Drained over a settle window, it
+    /// took no request for it and is owed no later purge. Drained at a
+    /// window of zero, it took requests up to its removal, and a prompt
+    /// written behind the removal leaves five seconds later.
+    #[tokio::test(start_paused = true)]
+    async fn a_drained_worker_leaves_the_cache_aware_policies_at_its_removal() {
+        use openai_protocol::worker::WorkerStatus;
+        use smg_worker::{
+            model_card::ModelCard,
+            test_support::{no_health_check, BasicWorkerBuilder},
+        };
+
+        let (_registry, policy, workers, listed) = followed_cache_aware_model();
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("a cache-aware policy");
+        let mut no_window = no_health_check();
+        no_window.drain_settle_secs = 0;
+        let third: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w3:8000")
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("llama-3"))
+                .health_config(no_window)
+                .build(),
+        );
+        cache_aware.add_worker(third.as_ref());
+        listed.register(Arc::clone(&third)).expect("a worker");
+        let removed_at = tokio::time::Instant::now();
+
+        for worker in [&workers[0], &third] {
+            worker.set_status(WorkerStatus::Draining);
+            listed.remove_by_url(worker.url()).expect("the removal");
+        }
+        until("the purge at the removals", || {
+            tree_of(&policy, "llama-3") == ["http://w2:8000"]
+        })
+        .await;
+        assert!(
+            removed_at.elapsed() < Duration::from_secs(1),
+            "inside no settle window"
+        );
+
+        cache_aware.add_worker(workers[0].as_ref());
+        cache_aware.add_worker(third.as_ref());
+        until("the purge behind the window of zero", || {
+            tree_of(&policy, "llama-3") == ["http://w1:8000", "http://w2:8000"]
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            tree_of(&policy, "llama-3"),
+            ["http://w1:8000", "http://w2:8000"],
+            "no later purge of a worker drained over its window"
+        );
+    }
+
+    /// Behind events the task did not hear, an address the worker registry
+    /// does not list leaves every cache-aware policy, as its removal may be
+    /// among them, and what stands under a listed address stays. More
+    /// events than the worker registry's channel holds, the task never run
+    /// between them, lose the first of them to every listener: here the
+    /// removal of the first worker.
+    #[tokio::test(start_paused = true)]
+    async fn events_that_went_unheard_keep_the_listed_workers_prompts() {
+        let (_registry, policy, workers, listed) = followed_cache_aware_model();
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("a cache-aware policy");
+        let tree = cache_aware.string_tree("llama-3").expect("the tree");
+        tree.insert_text("a prompt sent to the first worker", "http://w1:8000");
+        tree.insert_text("a prompt sent to the second worker", "http://w2:8000");
+        let remembered = |url: &str| tree.get_tenant_char_count().get(url).copied();
+        let second = remembered("http://w2:8000");
+        assert!(
+            second.is_some_and(|chars| chars > 0),
+            "a prompt is remembered"
+        );
+
+        listed.remove_by_url("http://w1:8000").expect("the removal");
+        for _ in 0..1_024 {
+            listed.remove_by_url("http://w2:8000").expect("the removal");
+            listed.register(Arc::clone(&workers[1])).expect("a worker");
+        }
+        until("the unlisted worker gone behind unheard events", || {
+            remembered("http://w1:8000").is_none()
+        })
+        .await;
+        assert_eq!(
+            remembered("http://w2:8000"),
+            second,
+            "the listed worker's prompt"
+        );
     }
 
     /// A registry made for Grand Central keeps the token trees the
