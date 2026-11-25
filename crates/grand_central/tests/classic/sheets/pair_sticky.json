@@ -1,0 +1,2806 @@
+{
+  "recorded_from": "25e87bde4e0f01a5a02587fa1575bbc60da5ea89",
+  "policy": "pair-sticky",
+  "rows": [
+    {
+      "name": "sticky-pair-delegate-a-key-keeps-its-pair-past-the-loads",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              5,
+              2
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              0,
+              5,
+              1
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-a-request-with-no-key-is-each-policys-own",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "model": "m"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              5,
+              2
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              0,
+              5,
+              1
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-one-key-pins-apart-under-two-models",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m1"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              5,
+              2
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              0,
+              5,
+              1
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m2"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              9,
+              9,
+              0
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              9,
+              9,
+              0
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m1"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m2"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-a-key-from-the-requests-id-pins-as-a-headers-does-and-behind-it",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              5,
+              2
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              0,
+              5,
+              1
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "id": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              9,
+              9,
+              0
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              9,
+              9,
+              0
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "id": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "id": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k3",
+            "id": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              2,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-a-keys-turns-and-retries-share-its-pair-and-its-cap",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "conv_t1",
+            "model": "m"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              5,
+              2
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              0,
+              5,
+              1
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "conv_t2_r1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "conv",
+            "side": "prefill",
+            "on": [
+              0,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "conv_t3",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-min-load-a-new-key-takes-each-sides-least-load-and-keeps-it",
+      "prefill_policy": "random",
+      "decode_policy": "random",
+      "assignment": "min_load",
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              5,
+              2
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              0,
+              5,
+              1
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-min-group-a-new-key-takes-each-sides-fewest-keys",
+      "prefill_policy": "random",
+      "decode_policy": "random",
+      "assignment": "min_group",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "held": {
+            "key": "x1",
+            "side": "prefill",
+            "on": [
+              1,
+              0,
+              1
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "x2",
+            "side": "prefill",
+            "on": [
+              1,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "x1",
+            "side": "decode",
+            "on": [
+              1,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "x2",
+            "side": "decode",
+            "on": [
+              0,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "prefill",
+            "on": [
+              0,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "x3",
+            "side": "prefill",
+            "on": [
+              0,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "x4",
+            "side": "prefill",
+            "on": [
+              0,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "decode",
+            "on": [
+              0,
+              0,
+              1
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "x3",
+            "side": "decode",
+            "on": [
+              0,
+              0,
+              1
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "x4",
+            "side": "decode",
+            "on": [
+              0,
+              0,
+              1
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              2
+            ]
+          },
+          {
+            "pair": [
+              2,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-random-a-new-key-is-drawn-on-each-side",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "random",
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              0,
+              0,
+              656
+            ],
+            [
+              0,
+              1,
+              629
+            ],
+            [
+              0,
+              2,
+              733
+            ],
+            [
+              1,
+              0,
+              655
+            ],
+            [
+              1,
+              1,
+              653
+            ],
+            [
+              1,
+              2,
+              643
+            ],
+            [
+              2,
+              0,
+              649
+            ],
+            [
+              2,
+              1,
+              656
+            ],
+            [
+              2,
+              2,
+              726
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "sticky-pair-the-prefills-cap-moves-the-prefill-alone",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "prefill",
+            "on": [
+              0,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              3,
+              2
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "prefill",
+            "on": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              9,
+              0,
+              9
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-the-decodes-cap-moves-the-decode-alone",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "decode",
+            "on": [
+              0,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              0,
+              3,
+              2
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "decode",
+            "on": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              9,
+              0,
+              9
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-at-the-cap-a-pinned-prefill-picked-again-keeps-its-pin",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "prefill",
+            "on": [
+              0,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "prefill",
+            "on": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              5,
+              9
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-at-the-cap-a-pick-at-the-cap-too-moves-no-pin",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "prefill",
+            "on": [
+              2,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              3,
+              2
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "side": "prefill",
+            "on": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-delegate-a-prefill-down-moves-its-pin-for-good",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": [
+            "prefill",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "prefill",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-delegate-a-decode-down-moves-its-pin-for-good",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": [
+            "decode",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "decode",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-delegate-a-prefill-down-again-goes-back-to-the-one-before",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": [
+            "prefill",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "prefill",
+            1
+          ]
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              1,
+              5,
+              0
+            ]
+          ]
+        },
+        {
+          "down": [
+            "prefill",
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "prefill",
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-delegate-a-decode-down-again-goes-back-to-the-one-before",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": [
+            "decode",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "decode",
+            1
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              1,
+              5,
+              0
+            ]
+          ]
+        },
+        {
+          "down": [
+            "decode",
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "decode",
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-min-load-a-prefill-down-lends-the-key-another-until-it-is-back",
+      "prefill_policy": "random",
+      "decode_policy": "random",
+      "assignment": "min_load",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": [
+            "prefill",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "prefill",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-min-load-a-decode-down-lends-the-key-another-until-it-is-back",
+      "prefill_policy": "random",
+      "decode_policy": "random",
+      "assignment": "min_load",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": [
+            "decode",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "decode",
+            1
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-a-pinned-decode-no-partner-of-the-new-prefill-is-placed-again",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": [
+            "prefill",
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "prefill",
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-a-pinned-decode-that-pairs-with-both-prefills-stays",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": [
+            "prefill",
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "prefill",
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              0,
+              2
+            ]
+          },
+          {
+            "pair": [
+              1,
+              2
+            ]
+          },
+          {
+            "pair": [
+              1,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-a-pinned-prefill-with-no-open-partner-is-placed-again",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 9,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": [
+            "decode",
+            0
+          ]
+        },
+        {
+          "down": [
+            "decode",
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": [
+            "decode",
+            0
+          ]
+        },
+        {
+          "up": [
+            "decode",
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-delegate-a-retry-steps-off-its-pair-and-moves-both-pins",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m",
+            "tried": [
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-min-load-a-retry-steps-off-its-pair-for-that-request",
+      "prefill_policy": "random",
+      "decode_policy": "random",
+      "assignment": "min_load",
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m",
+            "tried": [
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-a-hash-prefill-is-the-rings-beside-a-pinned-decode",
+      "prefill_policy": "consistent_hashing",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              5,
+              2
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              0,
+              5,
+              1
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              2,
+              1
+            ]
+          },
+          {
+            "pair": [
+              2,
+              1
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              2,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sticky-pair-a-hash-decode-is-the-rings-beside-a-pinned-prefill",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "consistent_hashing",
+      "assignment": "delegate",
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "loads": [
+            "prefill",
+            [
+              0,
+              5,
+              2
+            ]
+          ]
+        },
+        {
+          "loads": [
+            "decode",
+            [
+              0,
+              5,
+              1
+            ]
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              1,
+              0
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

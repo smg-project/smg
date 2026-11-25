@@ -32,14 +32,17 @@
 //!   cargo test -p smg --lib routers::common::classic_pair_select_rows -- --ignored --nocapture
 //! ```
 //!
-//! That filter also runs this module's three child recorders
+//! That filter also runs this module's four child recorders
 //! ([`classic_pair_bound_rows`], [`classic_pair_runtime_rows`],
-//! [`classic_pair_named_rows`]), each of which writes a sheet of its own
-//! beside this one: their rows draw nothing. A row of the second is placed
+//! [`classic_pair_named_rows`], [`classic_pair_sticky_rows`]), each of
+//! which writes a sheet of its own beside this one: the rows of the first
+//! three draw nothing. A row of the second is placed
 //! on the wire that carries one runtime's request, and names the runtime of
 //! a worker that is not on the sheet's own. A row of the third states the
 //! text its requests carry under `x-smg-target-worker`, and the pair a
-//! failed attempt was sent to where its requests are retries.
+//! failed attempt was sent to where its requests are retries. A row of the
+//! fourth is a list of steps under the sticky routing-key override, in a
+//! shape of its own.
 //!
 //! A sequence row is recorded twenty times from fresh pools and fresh
 //! policies and must come out the same each time; a drawn row records how
@@ -193,10 +196,10 @@ struct Row {
 }
 
 #[derive(Serialize)]
-struct Sheet {
+struct Sheet<R> {
     recorded_from: String,
     policy: &'static str,
-    rows: Vec<Row>,
+    rows: Vec<R>,
 }
 
 /// The policy's configuration, as the gateway's own configuration file
@@ -1004,8 +1007,9 @@ fn rows() -> Vec<Row> {
 }
 
 /// Writes `rows` as the sheet `file` of `policy` under `CLASSIC_ROWS_OUT`,
-/// naming `CLASSIC_ROWS_COMMIT` as the commit they were recorded from.
-fn write(file: &str, policy: &'static str, rows: Vec<Row>) {
+/// naming `CLASSIC_ROWS_COMMIT` as the commit they were recorded from. A
+/// child recorder's rows may be of a shape of its own.
+fn write<R: Serialize>(file: &str, policy: &'static str, rows: Vec<R>) {
     let out = PathBuf::from(
         std::env::var_os("CLASSIC_ROWS_OUT").expect("CLASSIC_ROWS_OUT names the output directory"),
     );
@@ -1041,3 +1045,7 @@ mod classic_pair_runtime_rows;
 /// The rows of a pair whose request names its worker, on a sheet of their
 /// own.
 mod classic_pair_named_rows;
+
+/// The rows of a pair under the sticky routing-key override, request after
+/// request, on a sheet of their own.
+mod classic_pair_sticky_rows;

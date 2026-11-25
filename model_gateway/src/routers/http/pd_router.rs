@@ -10207,6 +10207,134 @@ mod tests {
         );
     }
 
+    /// A pair goes through the engine under the sticky override's rule.
+    /// Under the document the settings make of round-robin sides with the
+    /// override on, every turn of a conversation reaches the prefill engine
+    /// and the decode engine its first turn reached. A conversation is keyed
+    /// by its routing key header where it carries one, ahead of its body's
+    /// id, and by that id where it carries none. The requests are sent a
+    /// turn at a time, ten conversations to a turn: under round robin alone
+    /// a conversation's three turns would reach three engines of a side.
+    #[tokio::test]
+    async fn a_pairs_conversation_keeps_its_two_engines_under_the_overrides_rule() {
+        use smg_grand_central::document::AppliedSpec;
+
+        use crate::config::types::{RouterConfig, RoutingKeyOverrideConfig, RoutingMode};
+
+        // Ten conversations of three turns. The first five carry their key
+        // in the header beside an id of the turn's own, and the others in
+        // the lineage of their id alone.
+        const CONVERSATIONS: usize = 10;
+
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::RoundRobin),
+            },
+            policy: PolicyConfig::RoundRobin,
+            routing_key_override: RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policies = PolicyRegistry::for_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        engine_on(
+            &policies,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let router = PDRouter {
+            policy_registry: Arc::new(policies),
+            ..create_test_pd_router()
+        };
+        // Three engines a side, each with what arrived at it. A decode
+        // names no transport, so every prefill pairs with every decode.
+        let (mut prefills, mut decodes) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            let prefill = healthy_answer(Shape::Sequential, PdSide::Prefill);
+            let decode = healthy_answer(Shape::Sequential, PdSide::Decode);
+            let prefill = spawn_recording_stub(prefill).await;
+            let decode = spawn_recording_stub(decode).await;
+            for worker in sequential_pair(prefill.0.clone(), decode.0.clone()) {
+                router.worker_registry.register_or_replace(worker);
+            }
+            prefills.push(prefill);
+            decodes.push(decode);
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        // The engines of a side a request arrived at, by their places.
+        let reached = |side: &[(String, Seen)]| -> Vec<usize> {
+            side.iter()
+                .enumerate()
+                .filter(|(_, (_, seen))| !std::mem::take(&mut *seen.lock().unwrap()).is_empty())
+                .map(|(at, _)| at)
+                .collect()
+        };
+
+        // What each conversation's turns reached: the prefill engines and
+        // the decode engines of a turn.
+        let mut turns_of: Vec<Vec<(Vec<usize>, Vec<usize>)>> = vec![Vec::new(); CONVERSATIONS];
+        for turn in 1..=3 {
+            for (conversation, turns) in turns_of.iter_mut().enumerate() {
+                let by_header = conversation < CONVERSATIONS / 2;
+                let rid = if by_header {
+                    format!("request-{conversation}-{turn}")
+                } else {
+                    format!("conv-{conversation}_t{turn}")
+                };
+                let mut headers = HeaderMap::new();
+                if by_header {
+                    let key = format!("conv-{conversation}");
+                    let key = HeaderValue::from_str(&key).expect("the key's text");
+                    headers.insert("x-smg-routing-key", key);
+                }
+                let request = serde_json::from_value(json!({
+                    "model": "m",
+                    "rid": rid,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .expect("valid chat request");
+                let response = router
+                    .route_chat(Some(&headers), &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                turns.push((reached(&prefills), reached(&decodes)));
+            }
+        }
+
+        // Each conversation's one prefill and its one decode.
+        let mut kept = Vec::new();
+        for turns in &turns_of {
+            let first = turns.first().expect("a conversation's first turn");
+            assert!(
+                turns.iter().all(|turn| turn == first),
+                "the turns of a conversation went apart: {turns:?}"
+            );
+            assert_eq!(
+                (first.0.len(), first.1.len()),
+                (1, 1),
+                "a turn reaches one engine a side: {first:?}"
+            );
+            kept.push((first.0[0], first.1[0]));
+        }
+        let engines = |side: fn(&(usize, usize)) -> usize| {
+            let mut engines: Vec<usize> = kept.iter().map(side).collect();
+            engines.sort_unstable();
+            engines.dedup();
+            engines.len()
+        };
+        assert!(
+            engines(|pair| pair.0) > 1 && engines(|pair| pair.1) > 1,
+            "ten conversations went to one engine of a side: {kept:?}"
+        );
+    }
+
     /// A decode worker's own 500, answered before the side's first byte, is
     /// its answer for the payload: a replay on it costs the same work for
     /// the same answer. With no other decode worker available the request

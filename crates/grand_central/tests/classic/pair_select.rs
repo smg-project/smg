@@ -116,7 +116,7 @@ impl Worker {
 /// then the decode's, or no pair.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Answer {
+pub(super) enum Answer {
     Pair([usize; 2]),
     None { why: String },
 }
@@ -125,7 +125,7 @@ enum Answer {
 /// pair took a drawn row's one request.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Outcome {
+pub(super) enum Outcome {
     Sequence(Vec<Answer>),
     Counts {
         draws: u32,
@@ -342,7 +342,7 @@ fn pairing(row: &Row) -> Pairing {
 /// Why the gateway answers no pair, read from a shed: an overload shed,
 /// the prefill admission's bound, a role with no worker at all, and
 /// `unavailable` for every other.
-fn why(reason: ShedReason, stage: &str) -> &'static str {
+pub(super) fn why(reason: ShedReason, stage: &str) -> &'static str {
     match (reason, stage) {
         (ShedReason::Saturated, _) => "overloaded",
         (_, "has-capacity") => "at_capacity",
@@ -354,7 +354,7 @@ fn why(reason: ShedReason, stage: &str) -> &'static str {
 /// What this crate answers one request of a row: the pair, or why none and
 /// the stage its shed names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Here {
+pub(super) enum Here {
     Pair([usize; 2]),
     None(&'static str, &'static str),
 }
@@ -424,7 +424,7 @@ fn run(row: &Row, engine: &Engine, draw: u64, classes: &Classes<'_>) -> Result<V
 /// What this crate answers a row: each request's answer in order, or how
 /// often each answer was given to a drawn row's one request.
 #[derive(Debug)]
-enum Replayed {
+pub(super) enum Replayed {
     Sequence(Vec<Here>),
     Counts(Vec<(Here, u32)>),
 }
@@ -476,7 +476,7 @@ fn same(recorded: &Answer, here: &Here) -> bool {
 
 /// What separates this crate's answers from the recorded ones: a sequence
 /// answer for answer, a drawn row pair for pair and share for share.
-fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
+pub(super) fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
     match (recorded, here) {
         (Outcome::Sequence(recorded), Replayed::Sequence(here)) if recorded.len() == here.len() => {
             (recorded.iter().zip(here).enumerate())
