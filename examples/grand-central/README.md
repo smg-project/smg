@@ -4,7 +4,7 @@ A controller of your own: the stock controller with one scorer added
 in Rust. The command line, the listeners, the election, the store and the
 policy documents are the crate's (`crates/grand_central`). The scorer is
 this package's. This page is the guide: write a stage, register it, run.
-The crate's [README](../../crates/grand_central/README.md) explains the policy document.
+The crate's [policy spec page](../../crates/grand_central/docs/policy-spec.md) explains the policy document.
 
 Write a stage in code when a routing rule cannot be written as a policy
 document over the built-in stages and you want it compiled into the
