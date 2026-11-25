@@ -267,10 +267,12 @@ impl Sticky {
         self.row(Outcome::Sequence(first))
     }
 
-    /// The row drawn 6,000 times: how often each pair took its last
-    /// request.
+    /// The row drawn 600,000 times: how often each pair took its last
+    /// request. A replay draws a hundredth of that, so one deviation of
+    /// the recording is a tenth of a replay's. A recording that falls far
+    /// from its mean then fails no replay by chance.
     fn drawn(self) -> Row {
-        const DRAWS: u32 = 6_000;
+        const DRAWS: u32 = 600_000;
         let mut counts = vec![vec![0u32; self.cell.decodes.len()]; self.cell.prefills.len()];
         for _ in 0..DRAWS {
             match self.run().pop() {

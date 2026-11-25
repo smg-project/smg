@@ -65,6 +65,10 @@ const MODEL: &str = "m";
 /// The header a request's routing key travels in.
 const HEADER: &str = "x-smg-routing-key";
 
+/// The draws a replay makes of a drawn row: not the sheet's `draws`, which
+/// counts the recording's and is a hundred times this ([`replayed`]).
+const REPLAY_DRAWS: u32 = 6_000;
+
 /// The policy that takes the fewest requests in flight, with no draw and no
 /// state, in the gateway's spelling.
 const FEWEST: &str = "power_of_two:least_requests";
@@ -408,14 +412,29 @@ fn run(row: &Row, engine: &'static InProcess, run: &str) -> Result<Vec<Here>, &'
 /// its session table for its life, so every draw runs under the row's one
 /// engine with keys of its own, the row's with the draw's number behind
 /// them: no draw meets a pin of another.
+///
+/// A drawn row is recorded over a hundred times the draws its replay
+/// makes, so one deviation of the recording is a tenth of a replay's. A
+/// row recorded over fewer is refused. The replay's shares are held within
+/// four deviations of the difference of two samples of the replay's size.
+/// At a ninth that is 137 counts of 6,000, about 5.7 deviations of the
+/// replay's own share.
+///
+/// Each draw goes through the host's one call, whose seed is the calling
+/// thread's own. So a replay draws anew at every run.
 fn replayed(row: &Row, spec: &PolicySpec) -> Result<Replayed, String> {
     let applied = AppliedSpec::validate(spec).map_err(|err| err.to_string())?;
     let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(applied)));
     let Outcome::Counts { draws, .. } = &row.outcome else {
         return Ok(Replayed::Sequence(run(row, engine, "")?));
     };
+    if *draws / 100 < REPLAY_DRAWS {
+        return Err(format!(
+            "a drawn row recorded over {draws} draws, fewer than 100 replays of {REPLAY_DRAWS}"
+        ));
+    }
     let mut counts: Vec<(Here, u32)> = Vec::new();
-    for draw in 0..*draws {
+    for draw in 0..REPLAY_DRAWS {
         let answers = run(row, engine, &format!("-{draw}"))?;
         let here = *answers.last().ok_or("a drawn row places a request")?;
         match counts.iter_mut().find(|(answer, _)| *answer == here) {
@@ -515,9 +534,38 @@ fn the_sticky_pair_rows_replay_answer_for_answer() {
     assert_eq!(found, Vec::<String>::new());
 }
 
+/// A drawn row's replay makes [`REPLAY_DRAWS`] draws, whatever the sheet
+/// recorded, and a row recorded over fewer than a hundred times as many is
+/// a defect. A recording of the replay's own size is one sample too: one
+/// such stood far enough from its mean that a replay in 461 left the bound
+/// by chance.
+#[test]
+fn a_drawn_row_is_replayed_over_a_hundredth_of_its_recorded_draws() {
+    let sheet: Sheet = serde_json::from_str(INLINE).expect("the inline rows");
+    let drawn = sheet.rows.iter().find_map(|row| match &row.outcome {
+        Outcome::Counts { draws, .. } => Some((row, *draws)),
+        Outcome::Sequence(_) => None,
+    });
+    let (row, recorded) = drawn.expect("a drawn row");
+    assert_eq!(recorded, 100 * REPLAY_DRAWS);
+    let spec = spec(row).expect("the row's document");
+    let made: Option<u32> = match replayed(row, &spec) {
+        Ok(Replayed::Counts(counts)) => Some(counts.iter().map(|&(_, count)| count).sum()),
+        _ => None,
+    };
+    assert_eq!(made, Some(REPLAY_DRAWS));
+    // The same row under a recording one draw short of a hundred replays.
+    let stated = format!("\"draws\": {recorded}");
+    let thin = INLINE.replace(&stated, &format!("\"draws\": {}", recorded - 1));
+    assert_ne!(thin, INLINE);
+    let (_, found) = replay_rows(&thin, "inline");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("recorded over 599999 draws"), "{found:?}");
+}
+
 /// Rows copied from the recorded sheet, whole.
 pub const INLINE: &str = r#"{
-  "recorded_from": "25e87bde4e0f01a5a02587fa1575bbc60da5ea89",
+  "recorded_from": "0a3b3bfdf5b4a5789fc5b4b7e4ee216f84996318",
   "policy": "pair-sticky",
   "rows": [
     {
@@ -676,7 +724,7 @@ pub const INLINE: &str = r#"{
         {"pick": {"key": "k1", "model": "m"}},
         {"pick": {"key": "k1", "model": "m"}}
       ],
-      "outcome": {"counts": {"draws": 6000, "pairs": [[0, 0, 656], [0, 1, 629], [0, 2, 733], [1, 0, 655], [1, 1, 653], [1, 2, 643], [2, 0, 649], [2, 1, 656], [2, 2, 726]]}}
+      "outcome": {"counts": {"draws": 600000, "pairs": [[0, 0, 66498], [0, 1, 66709], [0, 2, 66506], [1, 0, 66589], [1, 1, 66669], [1, 2, 66933], [2, 0, 66891], [2, 1, 67053], [2, 2, 66152]]}}
     },
     {
       "name": "sticky-pair-the-prefills-cap-moves-the-prefill-alone",

@@ -475,7 +475,9 @@ fn same(recorded: &Answer, here: &Here) -> bool {
 }
 
 /// What separates this crate's answers from the recorded ones: a sequence
-/// answer for answer, a drawn row pair for pair and share for share.
+/// answer for answer, a drawn row pair for pair and share for share. Each
+/// side's shares are of its own draws: the sheet's `draws` counts the
+/// recording's, and a replay's are the sum of its counts.
 pub(super) fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
     match (recorded, here) {
         (Outcome::Sequence(recorded), Replayed::Sequence(here)) if recorded.len() == here.len() => {
@@ -487,6 +489,10 @@ pub(super) fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
                 .collect()
         }
         (Outcome::Counts { draws, pairs }, Replayed::Counts(here)) => {
+            // A sheet may record a row over more draws than its replay
+            // makes. The bound is then the one of two samples of the
+            // replay's size.
+            let made: u32 = here.iter().map(|&(_, count)| count).sum();
             let listed = |answer: &Here| {
                 pairs
                     .iter()
@@ -495,7 +501,7 @@ pub(super) fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
             let mut found: Vec<String> = (here.iter())
                 .filter(|(answer, _)| !listed(answer))
                 .map(|(answer, count)| {
-                    format!("{count} of {draws} draws replayed {answer:?}, which no draw recorded")
+                    format!("{count} of {made} draws replayed {answer:?}, which no draw recorded")
                 })
                 .collect();
             let count_of = |prefill, decode| {
@@ -507,9 +513,9 @@ pub(super) fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
                 .iter()
                 .map(|&(prefill, decode, count)| (count, count_of(prefill, decode)))
                 .unzip();
-            if !same_shares(&shares(&ours, *draws), &shares(&recorded, *draws), *draws) {
+            if !same_shares(&shares(&ours, made), &shares(&recorded, *draws), made) {
                 found.push(format!(
-                    "recorded {pairs:?} of {draws} draws, replayed those pairs {ours:?} times"
+                    "recorded {pairs:?} of {draws} draws, replayed those pairs {ours:?} of {made}"
                 ));
             }
             found
