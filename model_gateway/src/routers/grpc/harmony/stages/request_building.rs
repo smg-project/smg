@@ -176,6 +176,13 @@ impl BuildStage for HarmonyRequestBuildingStage {
             }
         }
 
+        let (tool_constraints, vllm_first_token_tag) =
+            tool_constraints.map_or((None, None), |constraint| {
+                (
+                    Some(("structural_tag".to_string(), constraint.tag)),
+                    constraint.vllm_first_token_tag,
+                )
+            });
         let mut proto_request = build_harmony_proto(
             builder_client,
             body,
@@ -191,6 +198,11 @@ impl BuildStage for HarmonyRequestBuildingStage {
                 format!("Invalid request parameters: {e}"),
             )
         })?;
+
+        if let (ProtoGenerateRequest::Vllm(_), Some(tag)) = (&proto_request, vllm_first_token_tag) {
+            proto_request.set_structural_tag(tag);
+            proto_request.set_grammar_from_first_token(true);
+        }
 
         // Inject the Harmony stop ids (<|return|> and <|call|>) so the model
         // cannot generate past a channel boundary.
