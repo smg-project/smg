@@ -269,41 +269,60 @@ fn number(spec: &AppliedSpec, request: &PlaceRequest<'_>) -> Option<Option<u32>>
 /// the lists' host masks. Both ascending.
 pub(crate) type SidePlaces<'a> = (Option<&'a [u32]>, &'a [u32]);
 
-/// The places of `list` whose worker a request can be sent to at this
-/// read, ascending. They are looked for among the places the count reads
-/// on the side (`among`, and every place for `None`): those the list's
-/// host states, or those of them whose worker meets the request's hard
-/// demands. A place a standing veto of that host masks (`masked`,
-/// ascending) is none of them. The workers of the rest that pass `state`
-/// and that the route's rule takes are (`admits`, and every worker for
-/// `None`). The rule is asked of a worker that passes at a place no veto
-/// masks, and of no other.
-fn taking(
+/// Whether `found` takes one of the places of `list` whose worker a
+/// request can be sent to at this read: the one walk of a pair's count.
+/// The places are handed to `found` ascending, as far as the first it
+/// takes. No worker behind that place is read, and the route's rule is
+/// asked of none there.
+///
+/// The places are looked for among those the count reads on the side
+/// (`among`, and every place for `None`): those the list's host states, or
+/// those of them whose worker meets the request's hard demands. A place a
+/// standing veto of that host masks (`masked`, ascending) is none of them.
+/// The workers of the rest that pass `state` and that the route's rule
+/// takes are (`admits`, and every worker for `None`). The rule is asked of
+/// a worker that passes at a place no veto masks, and of no other.
+fn any_taking(
     admits: Option<WorkerRule<'_>>,
     list: LentList<'_>,
     (among, masked): SidePlaces<'_>,
     state: impl Fn(&dyn Worker) -> bool,
-) -> Vec<u32> {
-    let takes = |place: u32, worker: &Arc<dyn Worker>| {
+    mut found: impl FnMut(u32) -> bool,
+) -> bool {
+    let mut ends = |place: u32, worker: &Arc<dyn Worker>| {
         let worker = worker.as_ref();
         let admitted = || admits.is_none_or(|admits| admits(worker));
-        masked.binary_search(&place).is_err() && state(worker) && admitted()
+        let takes = masked.binary_search(&place).is_err() && state(worker) && admitted();
+        takes && found(place)
     };
     match among {
         None => (0..)
             .zip(&list.workers[..])
-            .filter_map(|(place, worker)| takes(place, worker).then_some(place))
-            .collect(),
+            .any(|(place, worker)| ends(place, worker)),
         // A place past the list's end names no worker.
-        Some(among) => among
-            .iter()
-            .copied()
-            .filter(|&place| {
-                let worker = list.workers.get(place as usize);
-                worker.is_some_and(|worker| takes(place, worker))
-            })
-            .collect(),
+        Some(among) => among.iter().any(|&place| {
+            let worker = list.workers.get(place as usize);
+            worker.is_some_and(|worker| ends(place, worker))
+        }),
     }
+}
+
+/// The places of `list` whose worker a request can be sent to at this
+/// read, ascending: every place of the count's walk ([`any_taking`]),
+/// which ends at none of them. They are kept in a list made once for the
+/// places the count reads on the side, so that no place grows it.
+fn taking(
+    admits: Option<WorkerRule<'_>>,
+    list: LentList<'_>,
+    counted: SidePlaces<'_>,
+    state: impl Fn(&dyn Worker) -> bool,
+) -> Vec<u32> {
+    let mut places = Vec::with_capacity(counted.0.map_or(list.workers.len(), <[u32]>::len));
+    any_taking(admits, list, counted, state, |place| {
+        places.push(place);
+        false
+    });
+    places
 }
 
 /// One call for a pair over `lists`, under a document one of whose
@@ -602,9 +621,10 @@ fn held_pair<'a>(
 /// ([`super::pair::asks`]), and each of its asks is lent the same places.
 /// Each decision books the decode with its prefill under every document:
 /// a decode asked again behind the prefill would count no number.
-/// So a rule the request states is asked of both lists here, of the
-/// decodes and the prefills as they are counted and of the prefills ready
-/// or not ([`hold_to_rule`]), and of no list behind that: a decode the
+/// So a rule the request states is asked of both lists here, and of no
+/// list behind that: of each decode as it is counted, of the prefills as
+/// far as the first that opens the pair, and then of every prefill at the
+/// places the caller states, ready or not ([`hold_to_rule`]). A decode the
 /// rule refuses as a pick is counted by the call's next ask as it was by
 /// its first.
 ///
@@ -696,6 +716,11 @@ fn decode_alone<'a>(
 /// thresholds alone opens it too where its profile places among such
 /// prefills: `lifts` says so, and is asked where no available prefill
 /// opens the pair and of no other pair.
+///
+/// The prefills are read in their list's order as far as the first that
+/// opens the pair ([`any_taking`]): no prefill behind it is read, and the
+/// route's rule is asked of none there. Where none opens the pair, the
+/// walk goes on to the last of the prefills' places.
 pub(crate) fn opened(
     lists: &PairLists<'_>,
     [prefill_counted, decode_counted]: [SidePlaces<'_>; 2],
@@ -704,11 +729,11 @@ pub(crate) fn opened(
 ) -> Option<Vec<u32>> {
     let available = |worker: &dyn Worker| worker.is_available();
     let decodes = taking(admits, lists.decode, decode_counted, available);
+    let classes = lists.classes;
     let opens = |state: &dyn Fn(&dyn Worker) -> bool| {
-        let pairs = |prefill: usize, &decode: &u32| lists.classes.pairs(prefill, decode as usize);
-        let prefills = taking(admits, lists.prefill, prefill_counted, state);
-        let mut prefills = prefills.iter().map(|&prefill| prefill as usize);
-        prefills.any(|prefill| decodes.iter().any(|decode| pairs(prefill, decode)))
+        let pairs = |prefill: u32, &decode: &u32| classes.pairs(prefill as usize, decode as usize);
+        let partnered = |prefill| decodes.iter().any(|decode| pairs(prefill, decode));
+        any_taking(admits, lists.prefill, prefill_counted, state, partnered)
     };
     let lifted = |worker: &dyn Worker| worker.routing_state().eligible_ignoring_overload();
     let opened = opens(&available) || (lifts() && opens(&lifted));

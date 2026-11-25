@@ -402,10 +402,21 @@ pub struct PlaceRequest<'a> {
     /// the list its caller hands. For a single request that names its
     /// worker ([`InProcess::place`]) it is asked ahead of the call's
     /// decision too, of each available worker the request's number counts.
-    /// For a pair that names its worker it is asked there of each available
-    /// worker of the two lists its number counts, at the places the caller
-    /// states for each and does not mask: of the decodes alone where the
-    /// decode's side alone reads the name.
+    /// For a pair that names its worker it is asked there too, in each
+    /// list's order, of workers that meet the request's hard demands at
+    /// places the caller states for the list and does not mask. Where the
+    /// prefill's side reads the name, they are the available workers of
+    /// the two lists and, where the rule takes no available decode under
+    /// a binding that steers a pool all over its thresholds, the decodes
+    /// that pass every veto but the overload one. Where the decode's side
+    /// alone reads the name, they are the available decodes, and the
+    /// available prefills as far as the first that opens the pair: the
+    /// rule is asked of no prefill behind that one. Where none of them
+    /// opens it, under a profile that places among prefills over their
+    /// thresholds, the prefills that pass every veto but the overload one
+    /// are asked so too, an available one a second time. Where a prefill
+    /// opens the pair, the rule is then asked of every prefill at the
+    /// places the caller states, ready or not.
     ///
     /// Where a pair's decode is decided again on its decode side
     /// ([`PlacementSide::decode_again`](crate::tracking::PlacementSide::decode_again)),
@@ -415,6 +426,13 @@ pub struct PlaceRequest<'a> {
     /// that lock and never returns. That decision asks the request's
     /// headers, its ring, its lists' admission and their workers' own calls
     /// under the same lock, and each is held to the same.
+    ///
+    /// A rule that takes something of a worker on a yes is sound only
+    /// where a pair's decode is decided again, which asks it of picks
+    /// alone, best first, and of none behind the first it admits: at a
+    /// first placement a rule answers by reading alone, because a request
+    /// that names its worker asks it of workers the request is never sent
+    /// to.
     ///
     /// For an encode request the rule is its pair's: it is asked of the
     /// pair's two workers and of the pair's two lists, and of no encoder.
