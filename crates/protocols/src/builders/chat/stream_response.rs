@@ -244,6 +244,7 @@ impl ChatCompletionStreamResponseBuilder {
             created: self.created.unwrap_or_else(now_unix_seconds),
             model: self.model,
             system_fingerprint: self.system_fingerprint,
+            prompt_text: None,
             choices: self.choices,
             usage: self.usage,
         }

@@ -1,0 +1,1877 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PolicySpec",
+  "description": "The policy specification, version `smg.policy/v1`: what the host builds\ninto the view, the per-model index settings, the signals its stages\nread, the profiles with their stages, the plans' rules and the ordered\nbindings. An unknown field at any level is refused by name.",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "description": "`smg.policy/v1`.",
+      "type": "string"
+    },
+    "generation": {
+      "description": "The document's generation: written by the operator, or by the apply\nthat persisted it.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 0
+    },
+    "view": {
+      "description": "What the host builds into every decision's view.",
+      "$ref": "#/$defs/ViewSpec"
+    },
+    "index": {
+      "description": "The prefix-index settings per model glob. Where two keys match one\nmodel the most specific wins: an exact id, then the longer of a\n`prefix*` and a `*suffix`, then `*`; a `prefix*` and a `*suffix` of\none length are refused as a pair.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/IndexSpec"
+      }
+    },
+    "signals": {
+      "description": "The signals the document's stages read, by name: a lower-case\nletter, then lower-case letters, digits and underscores, at most 63\nbytes. At most 64. A signal's column is its place among the names,\nin name order.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/SignalSpec"
+      },
+      "maxProperties": 64,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,62}$"
+      }
+    },
+    "profiles": {
+      "description": "The profiles by name, each of at least one character.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ProfileSpec"
+      },
+      "propertyNames": {
+        "minLength": 1
+      }
+    },
+    "plans": {
+      "description": "The plans' rules.",
+      "$ref": "#/$defs/PlansSpec"
+    },
+    "bindings": {
+      "description": "The bindings in order; the first match wins. Empty binds the first\nprofile to everything.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/BindingSpec"
+      },
+      "default": []
+    },
+    "explain": {
+      "description": "The sampling rate for explain.",
+      "$ref": "#/$defs/ExplainSpec"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "profiles"
+  ],
+  "$defs": {
+    "ViewSpec": {
+      "description": "What the host builds into every decision's view beyond the facts it\nderives itself: the request headers a stage may read, the hashing\ninputs a host keeps until it learns them from its engines, and the\nlists a worker's row names its labels, its zone and its engine family\nby.",
+      "type": "object",
+      "properties": {
+        "headers": {
+          "description": "The request headers a stage may read, lowercase, in the order their\npositions take on the wire. A name on the deny-list (`authorization`,\n`proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key`,\n`x-goog-api-key`, the host's tenant header) is refused. Every header a\nbinding's `sessions`, `canary` or `match.header` names must be listed\nhere. At most 256: a view names a header by its position in one byte.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "default": []
+        },
+        "block_size": {
+          "description": "The token block size the host hashes prefixes by when no engine has\npublished one; absent, the host's own default. The block size of\nrecord learned from an engine's events wins at run time.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "boundaries": {
+          "description": "Ascending token positions the hash index and the prefix-hash ring\nkey on; empty for none. A hash index needs at least one.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "default": []
+        },
+        "max_block_hashes": {
+          "description": "How many prefix block hashes a request carries into the view, 8,190\nat most: one frame of the Decide call carries no more.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 8190,
+          "default": 256
+        },
+        "max_report_age_ms": {
+          "description": "With this limit in milliseconds set, `least-load`, `resident-work`,\n`least-cost` and the KV-pressure gates of `prefix-affinity` and\n`warmup-slice` treat older reports as missing. A report exactly at\nthe limit still counts. A host-registered stage reads a report\nunder the limit through its build context's `load_report_reader()`,\nand one that reads the row's report itself sees it at any age.\nOverload verdicts can still reflect older reports, and plugins\ninterpret report age themselves. Omit it to use reports of any age.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "maximum": 3599999
+        },
+        "labels": {
+          "description": "The worker labels a stage may read, each a selector of one label\nkey: `key` (the worker carries the label, whatever its value) or\n`key=value` (it carries the label with that value), split at the\nfirst `=`. A worker's row holds one bit for each selector it meets,\nin this order. At most 64; empty for none.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        },
+        "zones": {
+          "description": "The zones a stage may tell apart. A worker's row names its zone by\nits position in this list, from 1; a worker with no zone reads 0,\nand so does one whose zone this list does not name. At most 256;\nempty for none, where every row reads 0.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256
+        },
+        "engines": {
+          "description": "The engine families a stage may tell apart, spelled as a worker's\nregistration spells its own. A worker's row names its family by its\nposition in this list, from 1; a worker whose family this list does\nnot name reads 0. At most 64; empty for none, where every row reads\n0.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        }
+      },
+      "additionalProperties": false
+    },
+    "IndexSpec": {
+      "description": "A model's prefix-index settings. They are per model, never per profile,\nso two profiles bound to one model never carry two settings.\nTwo keys matching one model resolve by specificity, see\n[`PolicySpec::index_for`].",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/IndexKind",
+          "default": "tree"
+        },
+        "ttl_s": {
+          "description": "How long a hash-index placement stays routable, in seconds.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 180
+        },
+        "max_size": {
+          "description": "The size bound of a tree index: on a text host its characters plus\n1024 for each node a worker stands on, tokens otherwise.\nThe crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "default": 67108864
+        },
+        "sweep_s": {
+          "description": "The index's sweep cadence, in seconds.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 120
+        }
+      },
+      "additionalProperties": false
+    },
+    "IndexKind": {
+      "description": "The under-layer of a model's prefix index.",
+      "oneOf": [
+        {
+          "description": "Radix trees over the prefixes seen.",
+          "type": "string",
+          "const": "tree"
+        },
+        {
+          "description": "A placement map keyed by the request's head at `view.boundaries`,\neach placement living `ttl_s`.",
+          "type": "string",
+          "const": "hash"
+        }
+      ]
+    },
+    "SignalSpec": {
+      "description": "One declared signal: a named value of a worker's report that the\ndocument's stages read beside the rows.",
+      "type": "object",
+      "properties": {
+        "unit": {
+          "description": "The unit a source states for its value to be taken: 1 to 31 ASCII\ncharacters with no space. It is compared byte for byte with the\nunit a report states.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 31,
+          "pattern": "^[!-~]*$"
+        },
+        "max_age_ms": {
+          "description": "A value older than this reads as no value: 1 to 3,599,999, the\nbound of the view's `max_report_age_ms`. A store's clock keeps one\nhour, and a sample older than that stands at the clock's origin:\nunder a longer limit it would read as fresh. Absent: a value does\nnot end by its age.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 3599999
+        },
+        "across_ranks": {
+          "description": "How one row's value is made where its report holds several ranks.\nAbsent: the sum.",
+          "$ref": "#/$defs/AcrossRanks"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "unit"
+      ]
+    },
+    "AcrossRanks": {
+      "description": "How one row's value is made where its report holds several ranks: a\nworker of several data-parallel ranks that stands as one row. Where\neach rank is a row of its own, nothing is reduced.",
+      "oneOf": [
+        {
+          "description": "The ranks' values added: an amount each rank holds a part of.",
+          "type": "string",
+          "const": "sum"
+        },
+        {
+          "description": "The largest of the ranks' values.",
+          "type": "string",
+          "const": "max"
+        },
+        {
+          "description": "The smallest of the ranks' values.",
+          "type": "string",
+          "const": "min"
+        },
+        {
+          "description": "The mean of the ranks' values.",
+          "type": "string",
+          "const": "mean"
+        }
+      ]
+    },
+    "ProfileSpec": {
+      "description": "One profile: an ordered set of filters, weighted scorers and exactly one\npicker.",
+      "type": "object",
+      "properties": {
+        "filter": {
+          "description": "The hard filters, in order: each a name, or the name of a filter the\ncatalog adds mapped to its parameters. Which workers the hard\nfilters keep does not turn on their order; a shed's reason does: a\nshed names the first filter, in this order, that left nobody.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FilterSpec"
+          },
+          "default": []
+        },
+        "score": {
+          "description": "The scorers, each a name or a name with its weight and parameters.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ScoreSpec"
+          },
+          "default": []
+        },
+        "pick": {
+          "description": "The picker: a name, a built-in mapped to its parameters, or the name\nof a picker the catalog adds mapped to its parameters.",
+          "$ref": "#/$defs/PickSpec"
+        },
+        "sent_ttl_ms": {
+          "description": "The number of milliseconds a send counts for. An unset limit keeps\nsends from expiring by age. A profile whose stages do not read its\ncount of sends is refused if it sets a limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "sent_report_delay_ms": {
+          "description": "The least number of milliseconds between a send and the sample of a\nload report that ends it: a report sampled less than that long after\na send leaves the send counted. Unset, a report sampled at or after\na send ends it. A written zero is refused, as a zero limit is. A\nprofile whose stages do not read its count of sends is refused if it\nsets a delay. The limit ends a send whatever the delay. The\nprofiles of a document that set the same limit and the same delay\nread one count, under the name of the first of them that reads it,\nin the order of their names. A new document's count takes over the\nsends of the standing count under the same limit and delay,\nwhichever profiles read that one. Where none stands under them, it\ntakes over those of the standing count under the same name, unless\na count of the new document took that one by its settings, or else\nof a standing count that no count of the new document took. The\ntwo counts share the sends: a read under the shorter of two delays\nends such a send for both. A count that finds none starts empty.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pick"
+      ]
+    },
+    "FilterSpec": {
+      "description": "A filter: its bare name, a built-in mapped to its parameters, or the name of a filter the host adds mapped to its parameters.",
+      "anyOf": [
+        {
+          "type": "string",
+          "examples": [
+            "healthy",
+            "not-overloaded",
+            "has-capacity",
+            "has-room",
+            "not-tried"
+          ]
+        },
+        {
+          "$ref": "#/$defs/FilterStage"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "propertyNames": {
+            "not": {
+              "const": "has-room"
+            }
+          },
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "FilterStage": {
+      "description": "A built-in filter with its parameters, keyed by the filter's name:\n`{ has-room: { used, capacity } }`. One key per entry.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "has-room": {
+              "$ref": "#/$defs/HasRoomParams"
+            }
+          },
+          "required": [
+            "has-room"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "HasRoomParams": {
+      "description": "`has-room` by a rule: a worker has room where what it holds is at most\nits capacity less the headroom, `used <= (1 - headroom) * capacity`.\nThe filter stays soft: where no worker has room, every worker stands.\nWritten bare, `has-room` reads the bit its host sets. A null under the\nname, the slip of a bare name written with a colon, is refused with\nboth forms named, whichever reader takes the document.",
+      "type": "object",
+      "properties": {
+        "used": {
+          "description": "What a worker holds: field names and their coefficients, summed. At\nleast one is required. A name written `signal.<name>` reads a signal\nthe document declares. `request.max_output_tokens` reads the most\ntokens the request's answer may hold, so a coefficient above zero\nreserves room for the answer: a request that states no limit\nreserves none. Under a capacity that is a number, a field or a\nsignal of the worker is required: the request's own values alone\nread nothing of a worker there. A worker that lacks a named value\nhas no room.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double",
+            "minimum": -1000000000000000.0,
+            "maximum": 1000000000000000.0,
+            "not": {
+              "const": 0
+            }
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "anyOf": [
+              {
+                "enum": [
+                  "candidate.in_flight",
+                  "load.active_kv_permille",
+                  "load.kv_usage_permille",
+                  "load.queued",
+                  "load.resident_tokens",
+                  "load.running",
+                  "load.waiting_uncached_tokens",
+                  "request.max_output_tokens",
+                  "request.prompt_tokens",
+                  "sent.requests",
+                  "sent.tokens"
+                ]
+              },
+              {
+                "pattern": "^signal\\.[a-z][a-z0-9_]{0,62}$"
+              }
+            ]
+          }
+        },
+        "capacity": {
+          "description": "What a worker can hold, in the units of `used`: a number, or a\nsignal the document declares. A worker whose capacity reads zero or\nless has no room.",
+          "$ref": "#/$defs/Capacity"
+        },
+        "headroom": {
+          "description": "The share of the capacity kept free: from 0 to under 1.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0,
+          "minimum": 0,
+          "exclusiveMaximum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "used",
+        "capacity"
+      ]
+    },
+    "Capacity": {
+      "description": "What a worker can hold: a number above zero in the units of `used`, or a signal the document declares, written `signal.<name>`.",
+      "anyOf": [
+        {
+          "type": "number",
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^signal\\.[a-z][a-z0-9_]{0,62}$"
+        }
+      ]
+    },
+    "ScoreSpec": {
+      "description": "A scorer: its bare name (a stock scorer at its defaults, or a scorer the host adds at weight one), a stock scorer mapped to its weight and parameters, or the name of a scorer the host adds mapped to its weight and parameters. The stock scorers a document names bare: least-load, least-requests, fewest-sessions, session-affinity, prefix-affinity, kv-pressure, warmup-slice, bucket, consistent-hash.",
+      "anyOf": [
+        {
+          "type": "string",
+          "examples": [
+            "least-load",
+            "least-requests",
+            "fewest-sessions",
+            "session-affinity",
+            "prefix-affinity",
+            "kv-pressure",
+            "warmup-slice",
+            "bucket",
+            "consistent-hash"
+          ]
+        },
+        {
+          "$ref": "#/$defs/ScoreStage"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "least-load",
+                "least-requests",
+                "fewest-sessions",
+                "session-affinity",
+                "prefix-affinity",
+                "kv-pressure",
+                "warmup-slice",
+                "bucket",
+                "consistent-hash",
+                "resident-work",
+                "least-cost"
+              ]
+            }
+          },
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "ScoreStage": {
+      "description": "A scorer with its parameters, keyed by the scorer's name: `{ least-load:\n{ weight: 0.3 } }`. One key per entry; a second key or an unknown\nparameter is refused by name.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "least-load": {
+              "$ref": "#/$defs/LeastLoadParams"
+            }
+          },
+          "required": [
+            "least-load"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "least-requests": {
+              "$ref": "#/$defs/Weight"
+            }
+          },
+          "required": [
+            "least-requests"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "fewest-sessions": {
+              "$ref": "#/$defs/Weight"
+            }
+          },
+          "required": [
+            "fewest-sessions"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session-affinity": {
+              "$ref": "#/$defs/Weight"
+            }
+          },
+          "required": [
+            "session-affinity"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "prefix-affinity": {
+              "$ref": "#/$defs/PrefixAffinityParams"
+            }
+          },
+          "required": [
+            "prefix-affinity"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kv-pressure": {
+              "$ref": "#/$defs/KvPressureParams"
+            }
+          },
+          "required": [
+            "kv-pressure"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "warmup-slice": {
+              "$ref": "#/$defs/WarmupSliceParams"
+            }
+          },
+          "required": [
+            "warmup-slice"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bucket": {
+              "$ref": "#/$defs/BucketParams"
+            }
+          },
+          "required": [
+            "bucket"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "consistent-hash": {
+              "$ref": "#/$defs/ConsistentHashParams"
+            }
+          },
+          "required": [
+            "consistent-hash"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "resident-work": {
+              "$ref": "#/$defs/ResidentWorkParams"
+            }
+          },
+          "required": [
+            "resident-work"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "least-cost": {
+              "$ref": "#/$defs/LeastCostParams"
+            }
+          },
+          "required": [
+            "least-cost"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "LeastLoadParams": {
+      "description": "The least-load scorer: the expected wait from token work over the drain\nrate, with a convex KV-pressure barrier.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "kv_pressure_weight": {
+          "description": "The weight of the KV-pressure barrier in the expected wait; at or\nabove zero (default 0.15).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "mean_prefill_tokens": {
+          "description": "The token-work estimate for a request whose count is unknown; above\nzero (default 1024).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "default_throughput": {
+          "description": "The drain rate assumed when no candidate reports a live one, in\ntokens per second; above zero (default 2000).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Weight": {
+      "description": "A scorer with no parameters of its own: its weight alone.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PrefixAffinityParams": {
+      "description": "The prefix-affinity scorer: the matched prefix share per candidate, with\nthe match threshold, the spill gate and the placement source.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "threshold": {
+          "description": "The matched share under which a request is balanced instead of\npinned; between 0 and 1 (default 0.3).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "decay": {
+          "description": "The decay of the overlap by the candidate's waiting backlog; at or\nabove zero (default 0, off).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "source": {
+          "description": "Where placements come from (default `merged`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AffinitySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "accounting_ttl_ms": {
+          "description": "How long an optimistic dispatch booking lives before the engine\nreports it, in milliseconds (default 0, off).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "spill": {
+          "description": "The spill gate.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpillParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AffinitySource": {
+      "description": "Where prefix affinity reads placements from.",
+      "oneOf": [
+        {
+          "description": "The index of cache events alone.",
+          "type": "string",
+          "const": "index"
+        },
+        {
+          "description": "The record of the prefixes sent alone.",
+          "type": "string",
+          "const": "predictor"
+        },
+        {
+          "description": "Each worker by what it has: its cache events where it publishes\nthem, and the prefixes sent to it where it does not. A request\nhashed by its text reads the prefixes sent to every worker: cache\nevents are token blocks.",
+          "type": "string",
+          "const": "merged"
+        }
+      ]
+    },
+    "SpillParams": {
+      "description": "The spill gate of prefix affinity: when the affine worker is loaded this\nfar past the least-loaded one, the request spills to the latter.",
+      "type": "object",
+      "properties": {
+        "abs": {
+          "description": "The absolute part of the gate, in requests (default 64).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "rel": {
+          "description": "The relative part of the gate; at least 1 (default 1.5).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 1.0
+        },
+        "prefix_margin_tokens": {
+          "description": "The gate's floor from the held prefix, in tokens (default 0).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "uncached_credit": {
+          "description": "Credit a hit with its uncached remainder only (default false).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "KvPressureParams": {
+      "description": "The KV-pressure gate: the fleet's KV-usage spread, or the usage the\nhottest candidate crosses, past which the profile's affinity stages\nyield to load. The stage orders nothing itself. A profile has one gate:\nits `kv-pressure` entries write the same limits. Limits that are off (1\nand above) count as the same.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "spread": {
+          "description": "The usage spread above which load wins; above zero, 1 and above\nswitches the rule off (default 1).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "exclusiveMinimum": 0
+        },
+        "ceiling": {
+          "description": "The usage the hottest candidate crosses for affinity to yield to\nload; above zero, 1 and above switches the rule off (default 1).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "WarmupSliceParams": {
+      "description": "The warm-up slice: the share of misses offered to workers whose index is\nstill thin.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "secs": {
+          "description": "How long after admission a worker counts as warming, in seconds; 0\nswitches the age rule off (default 60).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "share": {
+          "description": "The share of misses offered to warming workers; between 0 and 1\n(default 0.25).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "blocks": {
+          "description": "The index growth after which a worker is warm, in blocks (default\n1024).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "thin_ratio": {
+          "description": "The share of the fleet's median index under which a worker is thin;\nbetween 0 and 1, 0 keeps the age rule alone (default 0.5).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "divert_every": {
+          "description": "One hit in this many is diverted to a thin worker; 0 switches the\ndiversion off (default 8).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "miss_share": {
+          "description": "The index overlap share at or under which a hit counts as a miss\nfor the slice; between 0 and 1 (default 0.3, the affinity\nthreshold's).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0,
+          "maximum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "BucketParams": {
+      "description": "The bucket scorer: prefill placement by request size, over ranges of\nsizes. A cut of the ranges falls due each interval and is made, from the\ntokens booked on the workers, where a worker's share of them moved by\nmore than a factor of two since the last cut or the listing changed.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "abs_threshold": {
+          "description": "The absolute part of the balance rule, in booked tokens (default 64).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "rel_threshold": {
+          "description": "The relative part of the balance rule; at least 1 (default 1.5).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 1.0
+        },
+        "adjust_interval_s": {
+          "description": "The bookings' window and the cut's cadence, in seconds; above zero\n(default 5).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConsistentHashParams": {
+      "description": "The consistent-hash scorer: a per-model ring keyed by the routing key\nand, under `prefix_tokens`, by the prefix of a request that carries none,\nwith a bounded-load rule.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "prefix_tokens": {
+          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix through the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A host that hashes a text request by windows of the\nblock size times four bytes gives it the checked depth in windows,\nas a token request has it in blocks. Under a block size\nan engine published above the depth a request has no key. Where\nthe request's caller lends its ring no block is read: the request\nis keyed at the token, at each boundary it reaches or else at the\ndepth, a shorter request whole, and a text at four characters a\ntoken. A routing key the request's own id handed (a `rid` source)\nleads no prompt under this form: it names the session alone, and\nthe request is keyed by its prefix as one with no routing key. A\ngateway's frame states to a controller where the key came from.\nThe frame of a host older than that field states nothing, and\nunder it the id's key places as any other. Absent, a request with\nno routing key has none.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "bounded_load": {
+          "description": "The bounded-load rule.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BoundedLoadParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "BoundedLoadParams": {
+      "description": "The bounded-load rule of the consistent-hash scorer: a ring owner whose\nrequests in flight are past both parts of the rule over the candidates'\nmean, the request being placed counted in the mean, is passed over. A\nprefix keyed at a boundary is then tried at the next boundary down. A\nrequest no owner keeps is scored as one with no key: the profile's next\nstage places it, and in a profile with no stage after the ring the picker\ndraws among every candidate, the passed owner among them.",
+      "type": "object",
+      "properties": {
+        "factor": {
+          "description": "The relative part of the rule; at least 1 (default 1.25).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 1.0
+        },
+        "abs_margin": {
+          "description": "The absolute part of the rule, in requests (default 10).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResidentWorkParams": {
+      "description": "The resident-work scorer: the context tokens resident on a candidate,\nand a price in tokens for every request it holds.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0
+        },
+        "request_tokens": {
+          "description": "What one request a candidate holds adds to its resident tokens, in\ncontext tokens; zero compares the tokens alone.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "request_tokens"
+      ]
+    },
+    "LeastCostParams": {
+      "description": "The least-cost scorer: a sum of a row's fields times their coefficients,\nin the document's units. Lower cost scores higher.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "maximum": 1000000000000000.0
+        },
+        "terms": {
+          "description": "Field names and their coefficients. At least one field is required.\nA name written `signal.<name>` reads a signal the document declares.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double",
+            "minimum": -1000000000000000.0,
+            "maximum": 1000000000000000.0,
+            "not": {
+              "const": 0
+            }
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "anyOf": [
+              {
+                "enum": [
+                  "candidate.in_flight",
+                  "load.active_kv_permille",
+                  "load.kv_usage_permille",
+                  "load.queued",
+                  "load.resident_tokens",
+                  "load.running",
+                  "load.waiting_uncached_tokens",
+                  "sent.requests",
+                  "sent.tokens"
+                ]
+              },
+              {
+                "pattern": "^signal\\.[a-z][a-z0-9_]{0,62}$"
+              }
+            ]
+          }
+        },
+        "margin": {
+          "description": "How far above the least cost a row still ties for the top score: the\nmap of its two parts, or a bare number, the absolute margin.",
+          "anyOf": [
+            {
+              "description": "The absolute margin, in cost units.",
+              "type": "number",
+              "format": "double",
+              "minimum": 0,
+              "maximum": 1000000000000000.0
+            },
+            {
+              "$ref": "#/$defs/CostMargin"
+            }
+          ],
+          "default": {
+            "absolute": 0.0,
+            "relative": 0.0
+          }
+        },
+        "unreported": {
+          "description": "What a row costs when a named value is missing. Required for terms\nthat read a report or a signal.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Unreported"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "terms"
+      ]
+    },
+    "CostMargin": {
+      "description": "The sum of the absolute and relative margins. Both default to zero.",
+      "type": "object",
+      "properties": {
+        "absolute": {
+          "description": "In cost units.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0,
+          "minimum": 0,
+          "maximum": 1000000000000000.0
+        },
+        "relative": {
+          "description": "A share of the magnitude of the least cost.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0,
+          "minimum": 0,
+          "maximum": 1000000.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Unreported": {
+      "description": "How to cost a row that lacks a value a term reads.",
+      "oneOf": [
+        {
+          "description": "Start at the least cost among the reported rows handed to the scorer,\nor zero if none report, and add `request_cost` for each request in flight.",
+          "type": "object",
+          "properties": {
+            "over-least": {
+              "type": "object",
+              "properties": {
+                "request_cost": {
+                  "type": "number",
+                  "format": "double",
+                  "minimum": 0,
+                  "maximum": 1000000000000000.0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "request_cost"
+              ]
+            }
+          },
+          "required": [
+            "over-least"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Sum the row's available values. A missing value adds nothing.",
+          "type": "string",
+          "const": "missing-as-zero"
+        }
+      ]
+    },
+    "PickSpec": {
+      "description": "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool. The stock pickers a document names bare: best, round-robin, random, power-of-two, count-first, power-of-two-count-first, passthrough, manual.",
+      "anyOf": [
+        {
+          "type": "string",
+          "examples": [
+            "best",
+            "round-robin",
+            "random",
+            "power-of-two",
+            "count-first",
+            "power-of-two-count-first",
+            "passthrough",
+            "manual"
+          ]
+        },
+        {
+          "$ref": "#/$defs/PickStage"
+        },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "best",
+                "best-with-temperature"
+              ]
+            }
+          },
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "PickStage": {
+      "description": "A picker with its parameters, keyed by the picker's name.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "best": {
+              "$ref": "#/$defs/BestParams"
+            }
+          },
+          "required": [
+            "best"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "best-with-temperature": {
+              "$ref": "#/$defs/BestWithTemperatureParams"
+            }
+          },
+          "required": [
+            "best-with-temperature"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "BestParams": {
+      "description": "The `best` picker's parameters.",
+      "type": "object",
+      "properties": {
+        "sample": {
+          "description": "How many rows the picker draws where the host names the request's\nholders and the pool's warming rows: a pool of more than twice this\nmany rows, and of at least 16, is decided by that sample and the\nnamed rows, any other by the whole pool. From 1 to 64.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 64
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sample"
+      ]
+    },
+    "BestWithTemperatureParams": {
+      "description": "The `best-with-temperature` picker's parameters.",
+      "type": "object",
+      "properties": {
+        "temperature": {
+          "description": "The softmax temperature over the combined scores; at or above zero,\n0 picks the best.",
+          "type": "number",
+          "format": "float",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "temperature"
+      ]
+    },
+    "PlansSpec": {
+      "description": "The plans' rules, by plan name.",
+      "type": "object",
+      "properties": {
+        "pd-pair": {
+          "$ref": "#/$defs/PdPairPlanSpec",
+          "default": {
+            "pairing": "lenient",
+            "decode": "with-prefill"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "PdPairPlanSpec": {
+      "description": "The `pd-pair` plan's rules.",
+      "type": "object",
+      "properties": {
+        "pairing": {
+          "$ref": "#/$defs/Pairing",
+          "default": "lenient"
+        },
+        "decode": {
+          "description": "When a pair's decode side is picked: `with-prefill` (the default)\nor `after-prefill`.",
+          "$ref": "#/$defs/DecodePick",
+          "default": "with-prefill"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Pairing": {
+      "description": "How strictly a prefill pairs with a decode on their KV-transfer\ndescriptor. A descriptor component an engine does not report is unknown.",
+      "oneOf": [
+        {
+          "description": "Pair on nothing, as if no descriptor existed.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "A known difference in runtime, transport or KV layout refuses the\npair; unknown components pair with anything.",
+          "type": "string",
+          "const": "lenient"
+        },
+        {
+          "description": "Runtime, transport and KV layout are known on both sides and agree,\nand reported engine versions match.",
+          "type": "string",
+          "const": "strict"
+        }
+      ]
+    },
+    "DecodePick": {
+      "description": "When a pair's decode side is picked.",
+      "oneOf": [
+        {
+          "description": "With the prefill, in the pair's one decision.",
+          "type": "string",
+          "const": "with-prefill"
+        },
+        {
+          "description": "After the prefill has run, on a route that sends the decode then.\nThe pair's first decision books the prefill alone and names the\ndecode's targets. The host asks the decode again when the prefill\nhas answered, and that decision reads the rows of its own instant.\nA route that sends both sides at once keeps the first decision's\ndecode.",
+          "type": "string",
+          "const": "after-prefill"
+        }
+      ]
+    },
+    "BindingSpec": {
+      "description": "A binding: the requests it matches, the profile or plan they resolve to,\nand the rules around the decision.",
+      "type": "object",
+      "properties": {
+        "match": {
+          "$ref": "#/$defs/Match",
+          "default": {
+            "model": "*",
+            "phase": []
+          }
+        },
+        "profile": {
+          "description": "The profile of a single decision.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "description": "`single` (the default), `pd-pair` or `epd`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "profiles": {
+          "description": "The profiles per side: `single`, or every side of the plan\n(`prefill` and `decode`; `encode` too under `epd`), each named.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "overload": {
+          "description": "What the binding says of the overload veto for the workers of the\npools decided under it: the pools whose model and phase it is the first\nto match. A decode pool of a model whose prefill lookup resolves to\na pair binding (`pd-pair` or `epd`) is decided under that binding,\nso its block judges the pool: a decode-phase binding's block is not\nread for it, and a pair binding with its block switched off leaves\nthe pool unjudged. Where a binding of another plan takes the\nmodel's prefill lookup first, no pair decision runs for the model\nand its decode pool is the decode phase's own.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OverloadSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "routing_key": {
+          "description": "Where the binding's requests take their routing key from. Absent, a\nsessions rule's own headers are the sources, and a binding with no\nrule names none.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoutingKeySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessions": {
+          "description": "Sticky sessions.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionsSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shadow": {
+          "description": "A second profile for comparison on the same view. Only the live\nprofile's decision serves the request.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShadowSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "canary": {
+          "description": "A second profile deciding a share of the requests.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanarySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "override": {
+          "description": "Whether a request may name its profile (default `locked`).",
+          "$ref": "#/$defs/Override"
+        },
+        "admission": {
+          "description": "Fairness admission; reserved in v1.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdmissionSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Match": {
+      "description": "What a binding matches on. Bindings are ordered; the first match wins.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "description": "The model id after aliasing: an exact id, `prefix*`, `*suffix` or\n`*`.",
+          "type": "string",
+          "default": "*"
+        },
+        "phase": {
+          "description": "The phases the binding covers; empty covers every phase. A plan with\nseveral sides names every side's phase or none.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Phase"
+          },
+          "default": []
+        },
+        "tenant": {
+          "description": "The tenant the request resolved to.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "description": "The priority band the request carries, as a closed range.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Bounds_for_int32"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "header": {
+          "description": "A request header, present or holding one of the values.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeaderMatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prompt_tokens": {
+          "description": "The request's prompt token count, as a closed range.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Bounds_for_uint32"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "labels": {
+          "description": "Registration labels the binding is restricted to.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Phase": {
+      "description": "Which phase of a request a decision is for.",
+      "type": "string",
+      "enum": [
+        "single",
+        "prefill",
+        "decode",
+        "encode"
+      ]
+    },
+    "Bounds_for_int32": {
+      "description": "A closed range with one or both bounds.",
+      "type": "object",
+      "properties": {
+        "min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "max": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        }
+      },
+      "additionalProperties": false
+    },
+    "HeaderMatch": {
+      "description": "A request header among `view.headers`: present, or holding one of the\nvalues.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "The header's name, lowercase, listed in `view.headers`.",
+          "type": "string"
+        },
+        "values": {
+          "description": "The values that match; empty matches the header's presence.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "Bounds_for_uint32": {
+      "description": "A closed range with one or both bounds.",
+      "type": "object",
+      "properties": {
+        "min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PlanName": {
+      "description": "The plan a binding runs.",
+      "oneOf": [
+        {
+          "description": "One profile over one pool.",
+          "type": "string",
+          "const": "single"
+        },
+        {
+          "description": "The prefill profile, then the decode profile over the chosen\nprefill's partners; both sides named.",
+          "type": "string",
+          "const": "pd-pair"
+        },
+        {
+          "description": "The encode profile once per encode item, then the pair; all three\nsides named.",
+          "type": "string",
+          "const": "epd"
+        }
+      ]
+    },
+    "OverloadSpec": {
+      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. A gateway that runs a supplied document in its own\nprocess reads the switch where it builds its workers' default\nthresholds, and its routes read one shed word, both from that document:\nit refuses one whose bindings differ on either word. With no document\nsupplied it reads its own two settings. A controller that judges on its\nworker objects reads the switch there too, at each document that takes\nforce: its default is off where every binding switches it off. It\nrefuses a document whose bindings differ on the switch, as a gateway\ndoes.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether the host's thresholds veto at all (a worker's own block still\ndoes).",
+          "type": "boolean",
+          "default": true
+        },
+        "waiting_requests": {
+          "description": "A number here is refused: a binding names no count of queued\nrequests. A worker's registration states the count at or above which\nit is vetoed, or its program's default does. The field stands so\nthat a document which names a number is refused by its path. Its\nschema is `null` alone, as a writer that spells an absent field\nwrites it: an editor refuses the number on shape.",
+          "type": "null"
+        },
+        "token_usage": {
+          "description": "A number here is refused: a binding names no KV usage. A worker's\nregistration states the usage at or above which it is vetoed, or its\nprogram's default does. The field stands so that a document which\nnames a number is refused by its path, and its schema is `null`\nalone.",
+          "type": "null"
+        },
+        "shed_when_all_vetoed": {
+          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one. The same word decides what a\nsession key does while its own worker is vetoed, where the ring\nalone places the request: under the single plan, in a profile whose\nonly scorer is `consistent-hash` with no `prefix_tokens` and no\n`bounded_load`, picked by `best` with no parameters, under no\nsessions rule or one that delegates. A rule with an in-flight cap\nkeeps the key only under a host that counts the key's requests, as\nthe controller's own service does. A rule with\n`inflight_cap: 65535` has no cap. Set, the key moves on: under a\nsessions rule to its next routable pin, and to the ring's next\nworker where no pin stands or no rule does. Unset, the key stays\non its worker over the veto. Everywhere else a keyed request\nkeeps the veto. The word is the overload veto's alone: a worker\nthe liveness check doubts still takes a request no other worker\ncan, unless it is over its thresholds too.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "RoutingKeySpec": {
+      "description": "Where a binding's requests take their routing key from: the sources a\nhost reads in order, and the first that holds a value is the key. A ring\nplaces by the key and a sessions rule pins it. In a gateway's own\nprocess a ring's prefix form places by a header's key alone. No value\nenters a view, so the list is not held to `view.headers`.",
+      "type": "object",
+      "properties": {
+        "sources": {
+          "description": "The sources, read in order: one to eight, each named once, with up\nto four client sources and one target source beside them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KeySourceSpec"
+          },
+          "minItems": 1,
+          "maxItems": 13
+        },
+        "strip_lineage": {
+          "description": "Take the turn and retry suffixes off a key, so every turn of a\nconversation shares one (`conv_t2_r1` keys as `conv`); default\nfalse.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sources"
+      ]
+    },
+    "KeySourceSpec": {
+      "description": "One source of a routing key: exactly one of `header` and `rid`.",
+      "type": "object",
+      "properties": {
+        "header": {
+          "description": "A request header, lowercase. A credential header is refused, as on\n`view.headers`; `cookie` is not. A key from a header `view.headers`\ndoes not list leaves as its fingerprint alone.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rid": {
+          "description": "The request's own id, the `rid` of its body: `true` names it. Under\na ring's prefix form (`prefix_tokens`) its key names the session\nalone: a sessions rule pins it, and the ring places the request by\nits prompt. The plain ring places by it, and so does a controller's\nprefix ring where its host's frame does not say the id handed it.",
+          "type": "boolean"
+        },
+        "max_bytes": {
+          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read. A\nheader is measured as sent, and the request's own id after the\nblock's `strip_lineage` took its suffixes off.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 8192
+        },
+        "client": {
+          "description": "A source that tells one client from another, not one session: a\nheader a proxy or a browser sets. Its key places a request that\ncarries no session key on a ring. It lifts no overload veto, pins\nno session and is counted under no key. Of a binding's client\nsources, the first whose header a request carries is the one read,\nand a value it cannot hand ends the read. The value is read whole\nand leaves as its fingerprint alone, so `rid` and `max_bytes` are\nrefused beside it. A header may be named both ways: capped as a\nsession's source, and whole as a client's where that read handed no\nkey. Default false.",
+          "type": "boolean"
+        },
+        "target": {
+          "description": "A source that names the one worker the request goes to, and hands\nno key. The header's value is a number that counts, from 0 and in\nthe order of the request's list of workers, the workers that can\ntake the request when it arrives: so a number names another worker\nwhile one ahead of it is down. A request that carries it goes to\nthat worker and to no other. Where the value is no number, or\nfewer workers can take the request, it is shed under\n`target-worker`. Where no worker at all can take it, it is placed\nas a request that names none and carries no key. A header that is\nabsent, empty or not text names no worker. One entry a block,\nbeside the eight and never without one of them: a header alone,\nso `rid`, `max_bytes` and `client` are refused beside it. It is\nread for a request a program places in process: a single request,\nand a pair under the `pd-pair` plan, on each side whose profile\nscores by `consistent-hash` with no `prefix_tokens`. A pair's\nprefill is counted among the prefills that have a decode to pair\nwith. Its decode is counted among the partners of its prefill: the\none the request names, or the one the prefill's own profile picks.\nA request under the `epd` plan is not read for it. Default false.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SessionsSpec": {
+      "description": "Sticky sessions on the binding: a keyed request stays on the worker its\nkey was first placed on.",
+      "type": "object",
+      "properties": {
+        "sticky_header": {
+          "description": "The header whose value is the session key; listed in `view.headers`.\nLeft out where the binding names its key's sources under\n`routing_key`: a binding names them once.",
+          "type": "string"
+        },
+        "headers": {
+          "description": "The headers looked up in order for the key, the sticky header among\nthem; empty means the sticky header alone. Each listed in\n`view.headers`. Left out under `routing_key` too.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ttl_s": {
+          "description": "How long an idle key stays pinned, in seconds, before the rule's\nnext sweep forgets it; above zero (default 14400), `4294967295` for\never.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 14400
+        },
+        "sweep_s": {
+          "description": "The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`\nis forgotten at the next sweep, and one used again ahead of it stays\npinned. Above zero (default 120), `4294967295` for never, allowed\nunder a `ttl_s` for ever alone.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 120
+        },
+        "assignment": {
+          "description": "How a first-seen key picks its worker (default `delegate`); under\nthe `manual` picker, a request with no key as well.",
+          "$ref": "#/$defs/Assignment",
+          "default": "delegate"
+        },
+        "inflight_cap": {
+          "description": "How many requests of one key a worker carries before the next is\nplaced again; above zero (default 2), `65535` for no cap. At the cap\nthe stages place the request over every usable worker, and the pin\nmoves only to another worker under the cap.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 2
+        },
+        "issue_session_id": {
+          "description": "Issue a session id to a request that carries none (default false;\nnot in this build: set, it is refused by name).",
+          "type": "boolean",
+          "default": false
+        },
+        "recovery": {
+          "description": "Which pin leads once both of a key's pins are routable (default\n`original`).",
+          "$ref": "#/$defs/Recovery",
+          "default": "original"
+        },
+        "rule_placed": {
+          "description": "Whether a request this rule placed alone is the profile's own\n(default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. Under the `pd-pair`\nplan each side of a pair follows the word on its own: a side the\nrule placed alone is kept from that side's profile, beside a side\nthe stages placed, which is told. A controller keeps the word on\nthe lease it files for a single request, and tells such a request\noff its file by it all the same. Its file keeps no word of a pair's\nside: a controller takes `told` alone under the `pd-pair` plan.",
+          "$ref": "#/$defs/RulePlaced"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Assignment": {
+      "description": "How a session key seen for the first time picks its worker. Under the\n`manual` picker the same assignment places a request with no key, which\nis not pinned, and a `manual` profile bound with no sessions rule places\nevery request by `min_load`.",
+      "oneOf": [
+        {
+          "description": "A random worker.",
+          "type": "string",
+          "const": "random"
+        },
+        {
+          "description": "The worker with the fewest running requests.",
+          "type": "string",
+          "const": "min_load"
+        },
+        {
+          "description": "The worker with the fewest active keys.",
+          "type": "string",
+          "const": "min_group"
+        },
+        {
+          "description": "The profile's own pick, then pinned. The `manual` picker, having no\nprofile to delegate to, takes `min_load`.",
+          "type": "string",
+          "const": "delegate"
+        }
+      ]
+    },
+    "Recovery": {
+      "description": "Which of a key's two pins leads once both are routable again: the first\nworker the key was placed on (the manual policy's order) or the latest\none it was dispatched to (the sticky override's under `delegate`).",
+      "type": "string",
+      "enum": [
+        "original",
+        "latest"
+      ]
+    },
+    "RulePlaced": {
+      "description": "Whether a request a sessions rule placed alone is the profile's own: a\npin of the request's key followed, or the rule's own assignment. No\nstage of the profile placed such a request. A single request is such a\nrequest, and so is a side of a pair, each side by its own decision.",
+      "oneOf": [
+        {
+          "description": "The profile's own: its stages hear the request's issue and its\ndispatch, it counts among the profile's sends, and its prompt is\nrecorded as behind any pick.",
+          "type": "string",
+          "const": "told"
+        },
+        {
+          "description": "Kept from the profile, as a gateway's sticky map keeps a request it\nplaces from the gateway's policy.",
+          "type": "string",
+          "const": "untold"
+        }
+      ]
+    },
+    "ShadowSpec": {
+      "description": "A second profile for a binding of one profile, or a profile per side.",
+      "anyOf": [
+        {
+          "description": "The shadow of a binding that names one live profile.",
+          "type": "string"
+        },
+        {
+          "description": "A pair's shadow profiles by side: `prefill`, `decode` or both.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "CanarySpec": {
+      "description": "A second profile deciding a share of the binding's requests, the\ndeciding profile recorded on the lease. Exactly one of `percent`,\n`tenants` and `header` chooses the share.",
+      "type": "object",
+      "properties": {
+        "profile": {
+          "description": "The profile deciding the canary's share.",
+          "type": "string"
+        },
+        "percent": {
+          "description": "A share of requests, 0 to 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "tenants": {
+          "description": "The tenants whose requests the canary decides.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "header": {
+          "description": "A request header that selects the canary.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeaderMatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile"
+      ]
+    },
+    "Override": {
+      "description": "Whether a request may name its profile through the override header.",
+      "oneOf": [
+        {
+          "description": "The override header is honoured.",
+          "type": "string",
+          "const": "allowed"
+        },
+        {
+          "description": "The override header is ignored.",
+          "type": "string",
+          "const": "locked"
+        }
+      ]
+    },
+    "AdmissionSpec": {
+      "description": "Fairness admission on the binding; reserved in v1 and off.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExplainSpec": {
+      "description": "Which decisions a decider keeps for explain.",
+      "type": "object",
+      "properties": {
+        "sample": {
+          "description": "Keep every Nth pick or shed per decider under this generation. Zero\nturns sampling off and one keeps every pick and shed.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

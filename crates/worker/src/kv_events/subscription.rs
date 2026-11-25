@@ -39,10 +39,16 @@ pub enum SubscriptionKind {
 /// sink, and the worker's id in it.
 pub type KvEventFeed<S> = (Arc<S>, <S as KvEventSink>::Id);
 
-/// Where a load record pushed on a worker's event stream goes: the load
-/// monitor, as the collector's streams hold it. Held by this name,
-/// the sink brings nothing of the registry the load monitor is built over.
-pub(super) trait PushedLoadSink: Send + Sync {
+/// Where a load record pushed on a worker's event stream goes, as the
+/// collector's streams hold it: the load monitor, or a sink of the host's
+/// own. Such a sink takes the record as the monitor takes a poll, or drops
+/// it. Held by this name, the sink brings nothing of the registry the load
+/// monitor is built over.
+///
+/// The collector holds a sink weakly: its caller keeps the sink alive for
+/// as long as records should reach it. A record that finds the sink gone
+/// is dropped, and nothing counts it.
+pub trait PushedLoadSink: Send + Sync {
     /// Take the record of `dp_rank` received at `received_at`
     /// ([`WorkerMonitor::apply_pushed_load`]).
     fn push_load(

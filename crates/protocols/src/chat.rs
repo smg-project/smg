@@ -1,4 +1,9 @@
-use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt::{self, Write as _},
+    sync::Arc,
+};
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -27,11 +32,12 @@ use crate::{
 // Chat Messages
 // ============================================================================
 
+crate::kind_read::by_kind! {
 /// One message of a chat conversation, tagged by its `role` (system, user,
 /// assistant, tool, function, developer or root), carrying the content and
 /// fields that role has.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(tag = "role")]
 pub enum ChatMessage {
     #[serde(rename = "system")]
@@ -106,6 +112,7 @@ pub enum ChatMessage {
         content: MessageContent,
         name: Option<String>,
     },
+}
 }
 
 /// The audio answer of an earlier assistant turn, referred to by its id: the
@@ -374,7 +381,7 @@ impl MessageContent {
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
     #[validate(custom(function = "validate_messages"))]
-    #[serde(deserialize_with = "crate::message_read::read")]
+    #[serde(deserialize_with = "crate::kind_read::list")]
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
@@ -603,6 +610,25 @@ pub struct ChatCompletionRequest {
         skip_serializing_if = "is_false"
     )]
     pub return_hidden_states: bool,
+
+    /// Return the prompt as rendered for the model. With `true` the answer
+    /// carries `prompt_text` ([`ChatCompletionResponse::prompt_text`]; on a
+    /// stream, [`ChatCompletionStreamResponse::prompt_text`]) where the path
+    /// that serves the request returns it (that field says which): the chat
+    /// template's output for this request, with the special tokens and the
+    /// generation prefix the template wrote. Encoding that string anew need
+    /// not give the token ids the model received: where the text of a
+    /// message is encoded as plain text in the prompt, text that spells a
+    /// special token becomes that token when the whole string is encoded
+    /// again.
+    /// This type serializes the key only when `true`; a path that forwards
+    /// the client's own bytes forwards the key as the client wrote it.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
+    pub return_prompt_text: bool,
 
     /// Random seed for sampling for deterministic outputs
     pub sampling_seed: Option<u64>,
@@ -1267,62 +1293,232 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Extract text from messages for routing decisions
-        // Use a single buffer to avoid intermediate Vec<String> allocations
-        let mut buffer = String::new();
-        let mut has_content = false;
+        self.joined_text(|_, _| {})
+    }
 
+    fn routing_text(&self) -> String {
+        let mut markers = 0;
+        self.joined_text(|buffer, part| {
+            if markers < PART_MARKERS_A_REQUEST {
+                markers += 1;
+                push_part_marker(buffer, part);
+            }
+        })
+    }
+}
+
+impl ChatCompletionRequest {
+    /// The request's text in message and part order, each piece that is not
+    /// empty joined to the text before it by one space; `other` is handed
+    /// each part that is no text, at its place.
+    fn joined_text(&self, mut other: impl FnMut(&mut String, &ContentPart)) -> String {
+        fn join(buffer: &mut String, text: &str) {
+            if !text.is_empty() {
+                if !buffer.is_empty() {
+                    buffer.push(' ');
+                }
+                buffer.push_str(text);
+            }
+        }
+        let mut buffer = String::new();
+        let mut join_content = |buffer: &mut String, content: &MessageContent| match content {
+            MessageContent::Text(text) => join(buffer, text),
+            MessageContent::Parts(parts) => {
+                for part in parts {
+                    match part.text() {
+                        Some(text) => join(buffer, text),
+                        None => other(buffer, part),
+                    }
+                }
+            }
+        };
         for msg in &self.messages {
             match msg {
                 ChatMessage::System { content, .. }
                 | ChatMessage::User { content, .. }
                 | ChatMessage::Tool { content, .. }
                 | ChatMessage::Developer { content, .. }
-                | ChatMessage::Root { content, .. } => {
-                    if has_content && content.has_text() {
-                        buffer.push(' ');
-                    }
-                    if content.append_text_to(&mut buffer) {
-                        has_content = true;
-                    }
-                }
+                | ChatMessage::Root { content, .. } => join_content(&mut buffer, content),
                 ChatMessage::Assistant {
                     content, reasoning, ..
                 } => {
-                    // Append main content
-                    if let Some(c) = content {
-                        if has_content && c.has_text() {
-                            buffer.push(' ');
-                        }
-                        if c.append_text_to(&mut buffer) {
-                            has_content = true;
-                        }
+                    if let Some(content) = content {
+                        join_content(&mut buffer, content);
                     }
-                    // Append reasoning content
                     if let Some(text) = &reasoning.text {
-                        if !text.is_empty() {
-                            if has_content {
-                                buffer.push(' ');
-                            }
-                            buffer.push_str(text);
-                            has_content = true;
-                        }
+                        join(&mut buffer, text);
                     }
                 }
                 ChatMessage::Function { content, .. } => {
-                    if let Some(content) = content.as_deref().filter(|c| !c.is_empty()) {
-                        if has_content {
-                            buffer.push(' ');
-                        }
-                        buffer.push_str(content);
-                        has_content = true;
+                    if let Some(content) = content {
+                        join(&mut buffer, content);
                     }
                 }
             }
         }
-
         buffer
     }
+}
+
+/// The width in characters of the marker the routing text carries at the
+/// place of a part that is no text: the part's digest in hex, repeated. A
+/// marker of a few characters would leave two requests that differ in such a
+/// part alone alike under a policy that weighs how much of a key matched.
+const PART_MARKER_WIDTH: usize = 256;
+
+/// The markers the routing text of one request carries at most. A part
+/// behind them is left out of the key, as every part that is no text was:
+/// the key of a conversation stays a prefix of the key of its next turn,
+/// and later parts no longer tell two such conversations apart.
+const PART_MARKERS_A_REQUEST: usize = 32;
+
+/// The bytes a part's digest reads at most, whatever the part's size.
+const PART_DIGEST_BYTES: usize = 1024;
+
+/// The state an FNV-1a digest starts from.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Joins the marker of a part that is no text to the routing text. Out of
+/// line: a request of text alone never comes here, and its walk stays the
+/// walk of `extract_text_for_routing`.
+#[cold]
+fn push_part_marker(buffer: &mut String, part: &ContentPart) {
+    if !buffer.is_empty() {
+        buffer.push(' ');
+    }
+    let start = buffer.len();
+    let _ = write!(buffer, "{:016x}", part_digest(part));
+    for _ in 1..PART_MARKER_WIDTH / 16 {
+        buffer.extend_from_within(start..start + 16);
+    }
+}
+
+/// FNV-1a over `bytes`, from `state`: the same in every build and on every
+/// host, which a key that later processes and other gateways meet again
+/// needs, with no dependency of this crate.
+fn fnv1a(state: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(state, |state, &byte| {
+        (state ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Folds a string of a part into its digest and takes what it read from
+/// `budget`: the length and every byte or, of a string longer than the
+/// budget, windows of 64 bytes spread evenly from its first byte to its
+/// last, as many as the budget holds, or its first bytes where the budget
+/// holds no window. An inline image of megabytes is never read whole and
+/// never copied.
+fn fold_sampled(state: u64, text: &str, budget: &mut usize) -> u64 {
+    let bytes = text.as_bytes();
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let state = fnv1a(state, &length.to_le_bytes());
+    if bytes.len() <= *budget {
+        *budget -= bytes.len();
+        return fnv1a(state, bytes);
+    }
+    let windows = *budget / 64;
+    if windows == 0 {
+        let head = bytes.get(..*budget).unwrap_or_default();
+        *budget = 0;
+        return fnv1a(state, head);
+    }
+    *budget -= windows * 64;
+    let (last, steps) = (bytes.len().saturating_sub(64), windows.max(2) - 1);
+    (0..windows).fold(state, |state, window| {
+        let start = last / steps * window + last % steps * window / steps;
+        fnv1a(state, bytes.get(start..start + 64).unwrap_or_default())
+    })
+}
+
+/// Folds a JSON value of a part of an unknown kind into its digest, its
+/// strings by [`fold_sampled`]. Each node the budget reaches folds a byte
+/// of its kind ahead of what it holds, and a list its length too, so two
+/// values that part in the kind or the shape of such a node do not fold
+/// alike; a whole number folds exactly.
+/// A node costs eight bytes of the budget. No further entry of a list is
+/// visited once it is spent; an object's members share what is left
+/// equally, by [`fold_members`].
+fn fold_value(state: u64, value: &Value, budget: &mut usize) -> u64 {
+    if *budget < 8 {
+        return state;
+    }
+    *budget -= 8;
+    match value {
+        Value::Null => fnv1a(state, &[0]),
+        Value::Bool(flag) => fnv1a(state, &[1 + u8::from(*flag)]),
+        Value::Number(number) => {
+            let (kind, bytes) = match (number.as_u64(), number.as_i64()) {
+                (Some(whole), _) => (3, whole.to_le_bytes()),
+                (None, Some(whole)) => (4, whole.to_le_bytes()),
+                (None, None) => (5, number.as_f64().map_or(0, f64::to_bits).to_le_bytes()),
+            };
+            fnv1a(fnv1a(state, &[kind]), &bytes)
+        }
+        Value::String(text) => fold_sampled(fnv1a(state, &[6]), text, budget),
+        Value::Array(items) => {
+            let length = u64::try_from(items.len()).unwrap_or(u64::MAX);
+            let mut state = fnv1a(fnv1a(state, &[7]), &length.to_le_bytes());
+            for item in items {
+                if *budget < 8 {
+                    break;
+                }
+                state = fold_value(state, item, budget);
+            }
+            state
+        }
+        Value::Object(fields) => fold_members(fnv1a(state, &[8]), fields, budget),
+    }
+}
+
+/// Folds the members of an object into the digest whatever their order: a
+/// client that replays a part with its members in another order keeps the
+/// part's marker. Each member reads an equal share of the budget, so what
+/// is read of one member does not depend on the members in front of it, and
+/// the members' digests are folded in their sorted order: no two of them
+/// cancel as they would in a sum. An object of more members than the budget
+/// has shares for folds their count alone.
+fn fold_members(state: u64, fields: &Map<String, Value>, budget: &mut usize) -> u64 {
+    let share = budget.checked_div(fields.len()).unwrap_or(0);
+    let mut members = [0u64; PART_DIGEST_BYTES / 8];
+    let mut read = 0;
+    if share >= 8 {
+        let mut left = 0;
+        for ((name, field), member) in fields.iter().zip(&mut members) {
+            let mut own = share;
+            *member = fold_value(fold_sampled(FNV_OFFSET, name, &mut own), field, &mut own);
+            left += own;
+        }
+        *budget = left;
+        read = fields.len();
+    }
+    let members = members.get_mut(..read).unwrap_or_default();
+    members.sort_unstable();
+    let count = u64::try_from(fields.len()).unwrap_or(u64::MAX);
+    members
+        .iter()
+        .fold(fnv1a(state, &count.to_le_bytes()), |state, member| {
+            fnv1a(state, &member.to_le_bytes())
+        })
+}
+
+/// The digest of a part that is no text, for its marker in the routing text:
+/// the part's kind and what it names (the URL or the inline data as the
+/// request carries it; the members of a part of an unknown kind), reading
+/// [`PART_DIGEST_BYTES`] at most. It reads the reference, never the media:
+/// one image under two URLs has two digests.
+fn part_digest(part: &ContentPart) -> u64 {
+    let mut budget = PART_DIGEST_BYTES;
+    let (kind, reference) = match part {
+        ContentPart::ImageUrl { image_url } => ("image_url", image_url.url.as_str()),
+        ContentPart::AudioUrl { audio_url } => ("audio_url", audio_url.url.as_str()),
+        ContentPart::InputAudio { input_audio } => ("input_audio", input_audio.data.as_str()),
+        ContentPart::VideoUrl { video_url } => ("video_url", video_url.url.as_str()),
+        ContentPart::Text { text } | ContentPart::Refusal { refusal: text } => {
+            ("text", text.as_str())
+        }
+        ContentPart::Unknown(fields) => return fold_members(FNV_OFFSET, fields, &mut budget),
+    };
+    fold_sampled(fnv1a(FNV_OFFSET, kind.as_bytes()), reference, &mut budget)
 }
 
 // ============================================================================
@@ -1345,6 +1541,17 @@ pub struct ChatCompletionResponse {
     /// OpenAI API sends it; the gateway has one tier, `default`.
     #[serde(default = "default_service_tier")]
     pub service_tier: String,
+    /// The prompt as rendered for the model, on the answer of a request that
+    /// set `return_prompt_text`: the chat template's output, with the
+    /// special tokens and the generation prefix the template wrote. The
+    /// gateway's gRPC path returns it for a request that sends the worker no
+    /// media; where media
+    /// travels to the worker with the prompt, and for a model served through
+    /// the Harmony pipeline, the answer carries none. The rule follows what
+    /// was sent: an image that a text-only model's template turned into a
+    /// note in the prompt sent no media, and the answer carries the prompt,
+    /// note included. Absent otherwise.
+    pub prompt_text: Option<String>,
 }
 
 /// The one service tier the gateway serves.
@@ -1416,6 +1623,11 @@ pub struct ChatCompletionStreamResponse {
     pub created: u64,
     pub model: String,
     pub system_fingerprint: Option<String>,
+    /// The prompt as rendered for the model
+    /// ([`ChatCompletionResponse::prompt_text`]). The gateway's gRPC path
+    /// writes it on the first chunk that opens a choice and on no other, so
+    /// a stream of several choices carries it once.
+    pub prompt_text: Option<String>,
     pub choices: Vec<ChatStreamChoice>,
     pub usage: Option<Usage>,
 }
@@ -2298,6 +2510,193 @@ mod tests {
             "a chat message is {} bytes",
             size_of::<ChatMessage>()
         );
+    }
+
+    /// The routing text of a chat request carries, at the place of each part
+    /// that is no text, a marker of 256 characters made from the part's
+    /// digest, 32 markers a request at most. The pairs below are parts the
+    /// digest tells apart within the bytes it reads; a part whose members
+    /// come in another order keeps its marker.
+    #[test]
+    fn the_routing_text_carries_a_marker_of_each_part_that_is_no_text() {
+        let routed = |parts: Value| -> String {
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m", "messages": [{"role": "user", "content": parts}]
+            }))
+            .unwrap();
+            chat.routing_text()
+        };
+        let text = json!({"type": "text", "text": "what does it show"});
+        let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+        let around = |part: Value| json!([text, part, text]);
+
+        let first = routed(around(image("https://example.com/a.png")));
+        assert!(first.starts_with("what does it show ") && first.ends_with(" what does it show"));
+        // The marker is the digest's 16 digits sixteen times: 256 characters.
+        assert_eq!(first.len(), 18 + 256 + 18);
+        assert_eq!(first[18..274], first[18..34].repeat(16));
+
+        // An inline image far over the bytes its digest reads: its last
+        // byte still parts two keys.
+        let inline = |last: char| {
+            image(&format!(
+                "data:image/png;base64,{}{last}",
+                "A".repeat(1 << 20)
+            ))
+        };
+        assert_ne!(routed(around(inline('B'))), routed(around(inline('C'))));
+
+        for (one, two) in [
+            (
+                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}}),
+                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/b.wav"}}),
+            ),
+            (
+                json!({"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}}),
+                json!({"type": "input_audio", "input_audio": {"data": "QUJE", "format": "wav"}}),
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}),
+                json!({"type": "video_url", "video_url": {"url": "https://example.com/b.mp4"}}),
+            ),
+            (
+                json!({"type": "file", "file": {"file_id": "file-1", "filename": "a.pdf"}}),
+                json!({"type": "file", "file": {"file_id": "file-2", "filename": "a.pdf"}}),
+            ),
+            // Two kinds of value, two shapes of a list and two whole numbers
+            // that one float holds are each two parts; so are two members
+            // that change together, a string longer than its share and a
+            // list with an entry more behind what its share reads.
+            (
+                json!({"type": "file", "file": {"file_id": 0}}),
+                json!({"type": "file", "file": {"file_id": ""}}),
+            ),
+            (
+                json!({"type": "file", "file": {"pages": [[1, 2], [3]]}}),
+                json!({"type": "file", "file": {"pages": [[1], [2, 3]]}}),
+            ),
+            (
+                json!({"type": "file", "file": {"file_id": 9_007_199_254_740_993_u64}}),
+                json!({"type": "file", "file": {"file_id": 9_007_199_254_740_992_u64}}),
+            ),
+            (
+                json!({"type": "file", "a": null, "b": null}),
+                json!({"type": "file", "a": false, "b": false}),
+            ),
+            (
+                json!({"type": "file", "file": {
+                    "file_data": "A".repeat(64),
+                    "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null
+                }}),
+                json!({"type": "file", "file": {
+                    "file_data": format!("B{}", "A".repeat(63)),
+                    "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null
+                }}),
+            ),
+            (
+                json!({"type": "file", "file": {"pages": ["x".repeat(479)]}}),
+                json!({"type": "file", "file": {"pages": ["x".repeat(479), null]}}),
+            ),
+        ] {
+            let (one, two) = (routed(around(one)), routed(around(two)));
+            assert_eq!(one[..18], two[..18]);
+            assert_ne!(one[18..34], two[18..34], "{one} / {two}");
+        }
+
+        // A part replayed with its members in another order keeps its marker.
+        assert_eq!(
+            routed(around(
+                json!({"type": "file", "file": {"file_id": "file-1", "filename": "a.pdf"}})
+            )),
+            routed(around(
+                json!({"file": {"filename": "a.pdf", "file_id": "file-1"}, "type": "file"})
+            )),
+        );
+        // So does a part whose inline data is longer than its digest reads:
+        // each member reads its own share, whatever stands in front of it.
+        let (data, other) = ("QUJD".repeat(1024), "QUJE".repeat(1024));
+        assert_eq!(
+            routed(around(
+                json!({"type": "file", "file": {"file_data": data, "filename": "a.pdf"}})
+            )),
+            routed(around(
+                json!({"file": {"filename": "a.pdf", "file_data": data}, "type": "file"})
+            )),
+        );
+        assert_ne!(
+            routed(around(
+                json!({"type": "file", "file": {"file_data": data, "filename": "a.pdf"}})
+            )),
+            routed(around(
+                json!({"type": "file", "file": {"file_data": other, "filename": "a.pdf"}})
+            )),
+        );
+
+        // One request carries 32 markers at most: the 32nd image still parts
+        // two keys, the 33rd no longer does, and the key stays a prefix of
+        // the key of the same parts with a turn behind them.
+        let images = |changed: usize| -> Vec<Value> {
+            (0..40)
+                .map(|at| image(&format!("https://example.com/{at}-{}.png", at == changed)))
+                .collect()
+        };
+        assert_ne!(routed(json!(images(31))), routed(json!(images(40))));
+        assert_eq!(routed(json!(images(32))), routed(json!(images(40))));
+        let mut longer = images(40);
+        longer.extend([text.clone(), image("https://example.com/next.png")]);
+        assert!(routed(json!(longer)).starts_with(&routed(json!(images(40)))));
+    }
+
+    /// The text for routing of a mixed request, piece by piece: an empty
+    /// text part joins nothing, a part that is no text gives nothing between
+    /// two texts, an assistant's reasoning follows its content and a function
+    /// message gives its content. The routing text is another text exactly
+    /// where a part of the request is no text.
+    #[test]
+    fn the_text_for_routing_joins_the_texts_of_a_mixed_request() {
+        let chat = |messages: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({"model": "m", "messages": messages})).unwrap()
+        };
+        let image = json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}});
+        let history = |part: Value| {
+            chat(json!([
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "what does"},
+                    part,
+                    {"type": "text", "text": "it show"},
+                ]},
+                {"role": "assistant", "content": "a cat", "reasoning_content": "four legs"},
+                {"role": "function", "name": "lookup", "content": "tabby"},
+            ]))
+        };
+        let mixed = history(image.clone());
+        assert_eq!(
+            mixed.extract_text_for_routing(),
+            "be brief what does it show a cat four legs tabby"
+        );
+        // A refusal part is text: it joins its text and has no marker.
+        let refused = history(json!({"type": "refusal", "refusal": "no"}));
+        assert_eq!(
+            refused.extract_text_for_routing(),
+            "be brief what does no it show a cat four legs tabby"
+        );
+        let replayed = chat(json!([
+            {"role": "user", "content": "what does it show"},
+            {"role": "assistant", "content": [{"type": "text", "text": "a cat"}, image]},
+        ]));
+        assert_eq!(
+            replayed.extract_text_for_routing(),
+            "what does it show a cat"
+        );
+
+        for (request, marked) in [(mixed, true), (refused, false), (replayed, true)] {
+            assert_eq!(
+                request.routing_text() != request.extract_text_for_routing(),
+                marked
+            );
+        }
     }
 }
 

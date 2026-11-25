@@ -20,7 +20,7 @@ use axum::{
     response::Response,
 };
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatMessage},
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     classify::ClassifyRequest,
     common::{GenerationRequest, InputIds},
     completion::{CompletionPrompt, CompletionRequest},
@@ -93,6 +93,32 @@ pub(crate) trait TenantCharge: GenerationRequest {
 /// deprecated function call, by the words of their JSON. A call's name is not
 /// counted.
 impl TenantCharge for ChatCompletionRequest {
+    /// The routing text of a request with a part that is no text carries
+    /// that part's marker, which is no word of the prompt: such a request
+    /// is counted from its body.
+    fn estimated_input_tokens(&self, routing_text: Option<&str>) -> u32 {
+        let unmarked = routing_text.filter(|_| {
+            self.messages.iter().all(|message| {
+                let content = match message {
+                    ChatMessage::System { content, .. }
+                    | ChatMessage::User { content, .. }
+                    | ChatMessage::Tool { content, .. }
+                    | ChatMessage::Developer { content, .. }
+                    | ChatMessage::Root { content, .. } => Some(content),
+                    ChatMessage::Assistant { content, .. } => content.as_ref(),
+                    ChatMessage::Function { .. } => None,
+                };
+                match content {
+                    Some(MessageContent::Parts(parts)) => {
+                        parts.iter().all(|part| part.text().is_some())
+                    }
+                    _ => true,
+                }
+            })
+        });
+        tokens_for_words(routed_words(self, unmarked) + self.unrouted_words())
+    }
+
     fn unrouted_words(&self) -> usize {
         self.messages
             .iter()
@@ -1151,5 +1177,59 @@ mod tests {
             "messages": [{"role": "user", "content": "one two three four five six seven"}],
         }));
         assert_eq!(chat.estimated_input_tokens(None), 10);
+    }
+
+    /// The estimate of a chat request counts the words of its prompt alone,
+    /// whichever text routing hands it. The routing text carries a marker at
+    /// the place of a part that is no text, and counted as it stands it
+    /// would charge the marker as a word: no kind of such a part does, in a
+    /// user's content or in an assistant's.
+    #[test]
+    fn a_chat_estimate_charges_no_marker_of_a_part_that_is_no_text() {
+        let text = json!({"type": "text", "text": "what does it show"});
+        for (part, marked) in [
+            (
+                json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}),
+                true,
+            ),
+            (
+                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}}),
+                true,
+            ),
+            (
+                json!({"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}}),
+                true,
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}),
+                true,
+            ),
+            (json!({"type": "file", "file": {"file_id": "file-1"}}), true),
+            (json!({"type": "refusal", "refusal": "no"}), false),
+        ] {
+            for messages in [
+                json!([{"role": "user", "content": [text, part, text]}]),
+                json!([
+                    {"role": "user", "content": "what does it show"},
+                    {"role": "assistant", "content": [text, part]},
+                ]),
+            ] {
+                let chat: ChatCompletionRequest =
+                    request(json!({"model": "m", "messages": messages}));
+                let routed = chat.routing_text();
+                let own = chat.estimated_input_tokens(None);
+                assert_eq!(
+                    routed != chat.extract_text_for_routing(),
+                    marked,
+                    "{routed}"
+                );
+                assert_eq!(
+                    tokens_for_words(word_count(&routed)) != own,
+                    marked,
+                    "{routed}"
+                );
+                assert_eq!(chat.estimated_input_tokens(Some(&routed)), own, "{routed}");
+            }
+        }
     }
 }

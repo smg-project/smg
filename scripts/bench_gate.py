@@ -76,8 +76,8 @@ branch that stops predicting: where the function moved too, or for an id that ti
 pass on any level count, such a row reads as a placement up to twice its threshold, by name,
 in the summary. A placement is still a row to read.
 
-An id that times a whole pass, many functions over many pages as a decision of the policy
-engine is, is marked in its gate entry: `whole_pass = true`. Its time follows which of the
+An id that times a whole pass, many functions over many pages as a decision of Grand
+Central is, is marked in its gate entry: `whole_pass = true`. Its time follows which of the
 pass's code lines share a set of the processor's op cache, and every change to the executable
 draws that again. A change to the pass itself moves its count by a few instructions, so the
 same count is not there to read: a pull request read two decide ids 11.9 and 15.2 % slower on

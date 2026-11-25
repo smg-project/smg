@@ -2,10 +2,11 @@
 
 use openai_protocol::{
     common::{
-        to_value_exact, ContextManagementType, Detail, PromptCacheRetention,
+        to_value_exact, ContextManagementType, Detail, GenerationRequest, PromptCacheRetention,
         ToolChoice as ChatToolChoice, ToolChoiceValue as ChatToolChoiceValue, ToolReference,
     },
     responses::*,
+    validated::Normalizable,
 };
 use serde_json::json;
 use validator::Validate;
@@ -73,7 +74,7 @@ fn tool_continuation_keeps_other_input_and_cross_field_validation() {
     assert!(request.validate().is_err());
     assert!(serde_json::from_value::<ResponsesRequest>(json!({
         "model": "test-model", "previous_response_id": "resp_previous",
-        "input": [{"type": "function_call_output", "output": "sunny"}]
+        "input": [{"type": "function_call_output", "call_id": "call_weather"}]
     }))
     .is_err());
 }
@@ -1809,7 +1810,7 @@ fn image_generation_call_input_item_round_trips_spec_shape() {
             status,
             ..
         } => {
-            assert_eq!(id, "ig_2");
+            assert_eq!(id.as_deref(), Some("ig_2"));
             assert_eq!(result.as_deref(), Some("d29ybGQ="));
             assert!(revised_prompt.is_none());
             assert_eq!(*status, Some(ImageGenerationCallStatus::Completed));
@@ -1841,7 +1842,7 @@ fn image_generation_call_input_item_accepts_id_only_reference() {
             status,
             ..
         } => {
-            assert_eq!(id, "ig_3");
+            assert_eq!(id.as_deref(), Some("ig_3"));
             assert!(result.is_none());
             assert!(revised_prompt.is_none());
             assert!(status.is_none());
@@ -1876,7 +1877,7 @@ fn image_generation_call_input_item_round_trips_with_revised_prompt() {
             status,
             ..
         } => {
-            assert_eq!(id, "ig_2");
+            assert_eq!(id.as_deref(), Some("ig_2"));
             assert_eq!(result.as_deref(), Some("d29ybGQ="));
             assert_eq!(
                 revised_prompt.as_deref(),
@@ -2017,8 +2018,9 @@ fn image_generation_call_input_item_round_trips_with_full_metadata() {
             revised_prompt,
             size,
             status,
+            ..
         } => {
-            assert_eq!(id, "ig_prod_2");
+            assert_eq!(id.as_deref(), Some("ig_prod_2"));
             assert_eq!(action.as_deref(), Some("edit"));
             assert_eq!(background.as_deref(), Some("transparent"));
             assert_eq!(output_format.as_deref(), Some("webp"));
@@ -2058,8 +2060,9 @@ fn image_generation_call_input_item_round_trips_minimal_without_metadata() {
             revised_prompt,
             size,
             status,
+            ..
         } => {
-            assert_eq!(id, "ig_min_2");
+            assert_eq!(id.as_deref(), Some("ig_min_2"));
             assert!(action.is_none());
             assert!(background.is_none());
             assert!(output_format.is_none());
@@ -2689,6 +2692,7 @@ fn test_custom_tool_call_input_item_round_trip() {
             name,
             id,
             namespace,
+            ..
         } => {
             assert_eq!(call_id, "call_abc123");
             assert_eq!(input, "SELECT count(*) FROM events");
@@ -2723,6 +2727,7 @@ fn test_custom_tool_call_output_string_round_trip() {
             call_id,
             output,
             id,
+            ..
         } => {
             assert_eq!(call_id, "call_abc123");
             assert_eq!(id.as_deref(), Some("ctco_01"));
@@ -3087,6 +3092,7 @@ fn shell_call_input_item_round_trips_spec_shape() {
             environment,
             status,
             created_by,
+            ..
         } => {
             assert_eq!(call_id, "call_shell_1");
             assert_eq!(id.as_deref(), Some("sc_01"));
@@ -3147,6 +3153,7 @@ fn shell_call_minimal_shape_round_trips() {
             environment,
             status,
             created_by,
+            ..
         } => {
             assert_eq!(call_id, "call_shell_2");
             assert!(id.is_none());
@@ -3221,6 +3228,7 @@ fn shell_call_output_input_item_round_trips_spec_shape() {
             max_output_length,
             status,
             created_by,
+            ..
         } => {
             assert_eq!(call_id, "call_shell_1");
             assert_eq!(id.as_deref(), Some("sco_01"));
@@ -3325,8 +3333,8 @@ fn local_shell_call_input_item_round_trips_spec_shape() {
             action,
             status,
         } => {
-            assert_eq!(id, "ls_1");
-            assert_eq!(call_id, "call_ls_1");
+            assert_eq!(id.as_deref(), Some("ls_1"));
+            assert_eq!(call_id.as_deref(), Some("call_ls_1"));
             assert_eq!(*status, LocalShellCallStatus::InProgress);
             match action {
                 LocalShellExec::Exec {
@@ -3717,7 +3725,7 @@ fn test_apply_patch_tool_round_trip() {
 
     let tool: ResponseTool =
         serde_json::from_value(payload.clone()).expect("apply_patch tool should deserialize");
-    assert!(matches!(tool, ResponseTool::ApplyPatch));
+    assert!(matches!(tool, ResponseTool::ApplyPatch(_)));
 
     let serialized = serde_json::to_value(&tool).expect("apply_patch tool should serialize");
     assert_eq!(serialized, payload);
@@ -3849,6 +3857,7 @@ fn test_apply_patch_call_input_item_round_trip() {
             operation,
             status,
             id,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_001");
             assert_eq!(*status, ApplyPatchCallStatus::Completed);
@@ -3888,6 +3897,7 @@ fn test_apply_patch_call_input_item_in_progress_status_and_omitted_id() {
             operation,
             status,
             id,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_002");
             assert_eq!(*status, ApplyPatchCallStatus::InProgress);
@@ -3926,6 +3936,7 @@ fn test_apply_patch_call_output_input_item_completed_round_trip() {
             status,
             id,
             output,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_001");
             assert_eq!(*status, ApplyPatchCallOutputStatus::Completed);
@@ -3957,6 +3968,7 @@ fn test_apply_patch_call_output_input_item_failed_without_output() {
             status,
             id,
             output,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_003");
             assert_eq!(*status, ApplyPatchCallOutputStatus::Failed);
@@ -5537,4 +5549,381 @@ fn function_tool_round_trips_a_missing_schema_as_null() {
         serde_json::to_value(tool).unwrap(),
         json!({"type":"function", "name":"absent", "parameters":null})
     );
+}
+
+#[test]
+fn codex_additional_tools_and_agent_message_round_trip_and_validate() {
+    let body = json!({
+        "model": "test-model",
+        "stream": true,
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "store": false,
+        "input": [
+            {
+                "type": "additional_tools",
+                "id": "at_123",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "exec_command",
+                                "description": "Run a shell command",
+                                "parameters": {"type": "object", "properties": {}},
+                                "strict": false
+                            },
+                            {
+                                "type": "custom",
+                                "name": "apply_patch",
+                                "description": "Apply a patch",
+                                "format": {"type": "text"}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "clock",
+                        "description": "Tools in the clock namespace.",
+                        "defer_loading": true,
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "now",
+                                "description": "Current time",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "collaboration",
+                        "description": "Tools in the collaboration namespace.",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "send_message",
+                                "description": "Message another agent",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "tool_search",
+                        "execution": "client",
+                        "description": "Load deferred tools",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "web_search",
+                        "external_web_access": true,
+                        "indexed_web_access": false,
+                        "search_content_types": ["text", "image"]
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "Base instructions"}]
+            },
+            {
+                "type": "agent_message",
+                "id": "am_1",
+                "author": "/root",
+                "recipient": "/root/worker_1",
+                "content": [{"type": "input_text", "text": "Reply with OK-SUBAGENT."}]
+            }
+        ]
+    });
+
+    let request: ResponsesRequest =
+        serde_json::from_value(body.clone()).expect("Codex subagent request should parse");
+    request
+        .validate()
+        .expect("Codex subagent request should validate");
+    assert_eq!(
+        request.extract_text_for_routing(),
+        "Base instructions Reply with OK-SUBAGENT."
+    );
+
+    let wire = to_value_exact(&request).expect("serialize request");
+    assert_eq!(wire["input"], body["input"]);
+}
+
+#[test]
+fn additional_tools_normalizes_tool_choice_and_reports_input_item_error_path() {
+    let input = json!([
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "",
+                    "tools": [{
+                        "type": "function",
+                        "name": "exec_command",
+                        "parameters": {"type": "object"}
+                    }]
+                },
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "description": "Collab",
+                    "tools": [{
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {"type": "object"}
+                    }]
+                }
+            ]
+        },
+        {"role": "user", "content": "hi"}
+    ]);
+
+    // Empty top-level `tools: []` with inline `additional_tools` defaults to
+    // `"auto"`, while an explicit `"none"` is preserved.
+    let mut implicit_choice: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "tools": [],
+        "input": input
+    }))
+    .unwrap();
+    implicit_choice.normalize();
+    assert!(matches!(
+        implicit_choice.tool_choice,
+        Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto))
+    ));
+    implicit_choice.validate().unwrap();
+
+    let mut explicit_none: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "tools": [],
+        "tool_choice": "none",
+        "input": input
+    }))
+    .unwrap();
+    explicit_none.normalize();
+    assert!(matches!(
+        explicit_none.tool_choice,
+        Some(ResponsesToolChoice::Options(ToolChoiceOptions::None))
+    ));
+
+    for choice in [
+        json!("required"),
+        json!({"type": "function", "name": "exec_command"}),
+        json!({"type": "function", "name": "spawn_agent", "namespace": "collaboration"}),
+        json!({"type": "function", "name": "exec_command", "namespace": "functions"}),
+        json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "exec_command"}]}),
+    ] {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": input,
+            "tool_choice": choice
+        }))
+        .unwrap();
+        req.validate()
+            .unwrap_or_else(|e| panic!("choice {choice} should validate: {e}"));
+    }
+
+    // Validation errors inside inline additional_tools point at `input[i].tools[j]`.
+    let bad_inline_tool: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [
+            {"role": "developer", "content": "instructions"},
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "function",
+                    "name": "bad_schema",
+                    "parameters": "not-an-object"
+                }]
+            }
+        ]
+    }))
+    .unwrap();
+    let err = bad_inline_tool.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("input[1].tools[0].parameters"),
+        "expected input-scoped error path, got: {err}"
+    );
+}
+
+#[test]
+fn empty_agent_message_is_rejected_at_validation() {
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [{"type":"agent_message","author":"/root","recipient":"/root/worker","content":[]}]
+    }))
+    .unwrap();
+    assert!(req
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("Agent message content cannot be empty"));
+}
+
+#[test]
+fn agent_message_rejects_unknown_content_part() {
+    let err = serde_json::from_value::<ResponsesRequest>(json!({
+        "model": "test-model",
+        "input": [{
+            "type": "agent_message",
+            "author": "/root",
+            "recipient": "/root/worker",
+            "content": [{"type": "mystery_part", "payload": "x"}]
+        }]
+    }))
+    .expect_err("unknown agent_message content part must fail deserialization");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("content[0].type") && msg.contains("mystery_part"),
+        "expected part-scoped refusal, got: {msg}"
+    );
+}
+
+#[test]
+fn reasoning_input_accepts_null_content_and_optional_id() {
+    // Matches cross-model continuation history (reasoning with explicit
+    // `content: null`, omitted `content`, empty `[]`, and non-empty content)
+    // and Codex tool-output follow-ups where `reasoning.id` is omitted or null.
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "reasoning",
+                "id": "rs_omitted_content",
+                "summary": [{"type": "summary_text", "text": "s0"}]
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_empty_content",
+                "summary": [],
+                "content": []
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_null_content",
+                "summary": [{"type": "summary_text", "text": "s1"}],
+                "content": null,
+                "encrypted_content": "gAAAAB-opaque"
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_with_content",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "step 1"}]
+            },
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "no id"}]
+            },
+            {
+                "type": "reasoning",
+                "id": null,
+                "summary": [],
+                "content": null
+            }
+        ]
+    }))
+    .expect("reasoning items with null content and optional id should deserialize");
+
+    req.validate().expect("reasoning items should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    let items = wire["input"].as_array().unwrap();
+    assert_eq!(items[0]["id"], "rs_omitted_content");
+    assert!(items[0].get("content").is_none());
+    assert_eq!(items[1]["id"], "rs_empty_content");
+    assert!(items[1].get("content").is_none());
+    assert_eq!(items[2]["id"], "rs_null_content");
+    assert!(items[2].get("content").is_none());
+    assert_eq!(items[2]["summary"][0]["text"], "s1");
+    assert_eq!(items[2]["encrypted_content"], "gAAAAB-opaque");
+    assert_eq!(items[3]["content"][0]["text"], "step 1");
+    assert!(items[4].get("id").is_none());
+    assert!(items[5].get("id").is_none());
+    assert!(items[5].get("content").is_none());
+}
+
+#[test]
+fn function_call_output_accepts_optional_call_id_name_namespace_and_caller() {
+    // Real Codex payload: function_call_output without call_id, identified by
+    // namespace + name, alongside programmatic-tool-calling caller metadata.
+    let payload = json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "function_call_output",
+                "name": "codex_apps_open_page",
+                "namespace": "agent",
+                "output": "{\"page_id\":null}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_ptc",
+                "caller": {"type": "program", "caller_id": "prog_1"},
+                "name": "query_db",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_ptc",
+                "caller": {"type": "direct"},
+                "output": "[]"
+            }
+        ]
+    });
+
+    let req: ResponsesRequest = serde_json::from_value(payload.clone())
+        .expect("call_id-less and caller-tagged items should deserialize");
+    req.validate().expect("items should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    assert_eq!(wire["input"], payload["input"]);
+}
+
+#[test]
+fn responses_schema_passthrough_for_ptc_tool_search_web_search_and_optional_ids() {
+    let payload = json!({
+        "model": "test-model",
+        "prompt_cache_options": {"retention": "24h"},
+        "tools": [
+            {"type": "programmatic_tool_calling"},
+            {"type": "apply_patch", "allowed_callers": ["direct", "programmatic"]},
+            {"type": "shell", "allowed_callers": ["programmatic"]},
+            {"type": "mcp", "server_label": "docs", "server_url": "https://example.com/mcp", "allowed_callers": ["direct"], "tunnel_id": "tun_1"}
+        ],
+        "tool_choice": {"type": "programmatic_tool_calling"},
+        "input": [
+            {"type": "tool_search_call", "call_id": "ts_1", "arguments": {"query": "weather"}, "execution": "client"},
+            {"type": "tool_search_output", "call_id": "ts_1", "execution": "client", "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}]},
+            {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "rust"}, "results": [{"url": "https://rust-lang.org/", "title": "Rust"}]},
+            {"type": "program", "id": "prg_1", "call_id": "call_p1", "code": "return 1;", "fingerprint": "fp_1"},
+            {"type": "program_output", "id": "prgo_1", "call_id": "call_p1", "result": "1", "status": "completed"},
+            {"type": "local_shell_call", "action": {"type": "exec", "command": ["ls"], "env": {}}, "status": "completed"},
+            {"type": "image_generation_call", "status": "failed", "error": {"code": "moderation_blocked"}}
+        ]
+    });
+
+    let req: ResponsesRequest = serde_json::from_value(payload.clone())
+        .expect("PTC, tool_search, web_search_call, and optional-id items should deserialize");
+    req.validate().expect("request should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        wire["prompt_cache_options"],
+        payload["prompt_cache_options"]
+    );
+    assert_eq!(wire["tools"], payload["tools"]);
+    assert_eq!(wire["tool_choice"], payload["tool_choice"]);
+    assert_eq!(wire["input"], payload["input"]);
 }

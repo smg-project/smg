@@ -1,13 +1,13 @@
 //! The recorder of the classic power-of-two outcomes: each row is a pool of
 //! workers, the reports the policy has of them, one request shape and what
-//! the classic policy picked for it. The policy controller crate replays the
-//! rows through its own decision (`crates/policy_controller/tests/classic_rows.rs`).
+//! the classic policy picked for it. The Grand Central crate replays the
+//! rows through its own decision (`crates/grand_central/tests/classic_rows.rs`).
 //!
 //! This file is an ignored test of the gateway crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \

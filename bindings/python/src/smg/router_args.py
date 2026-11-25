@@ -462,6 +462,7 @@ class RouterArgs:
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
     eviction_interval_secs: int = 120
+    grand_central: str = "off"
     # Pin a routing key's requests to one engine of a grouped data-parallel
     # worker: off (the default) or hash
     grouped_dp_sticky: str = "off"
@@ -523,7 +524,9 @@ class RouterArgs:
     # the foreground)
     max_background_responses: int = 1024
     # Most bytes the router may buffer for a request it holds only to keep
-    # it retryable; larger eligible requests stream and forfeit router retries
+    # it retryable; larger eligible requests stream and forfeit router retries.
+    # Also bounds transcription audio held for one pre-response resend; 0
+    # disables both kinds of buffering
     max_buffered_request_bytes: int = 1048576
     # Standing-concurrency cap (-1 to disable); permits span the full response
     max_concurrent_requests: int = -1
@@ -604,7 +607,6 @@ class RouterArgs:
     # protocol: off, lenient or strict
     pd_pairing_mode: str = "lenient"
     policy: str | None = None
-    policy_controller: str = "off"
     policy_spec: str | None = None
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
@@ -1023,11 +1025,11 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
-            f"--{prefix}policy-controller",
+            f"--{prefix}grand-central",
             choices=["on", "off"],
-            default=RouterArgs.policy_controller,
+            default=RouterArgs.grand_central,
             help=(
-                "Choose off for the classic routing policies or on for the policy controller."
+                "Choose off for the classic routing policies or on for Grand Central."
                 " With on, the routing options keep their meaning through a policy document."
             ),
         )
@@ -1036,10 +1038,11 @@ class RouterArgs:
             metavar="FILE",
             default=RouterArgs.policy_spec,
             help=(
-                "Run a policy document with the policy controller."
+                "Run a policy document with Grand Central."
                 " The document replaces the routing options: one that is not at its"
                 " default is refused beside it by name. The two overload thresholds"
-                " stand beside it: the gateway builds its workers with them."
+                " stand beside it: the gateway builds its workers with them, unless"
+                " the document switches its overload block off."
             ),
         )
         routing_group.add_argument(
@@ -1470,8 +1473,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum total size of each model's approximation tree for "
-            "cache-aware routing (chars for HTTP, tokens for gRPC), shared "
-            "across all workers; eviction keeps every tree at or under this "
+            "cache-aware routing, shared across all workers: for HTTP the "
+            "chars of its texts plus 1024 for each node a worker stands on, "
+            "for gRPC tokens; eviction keeps every tree at or under this "
             "bound",
         )
         routing_group.add_argument(
@@ -1552,7 +1556,9 @@ class RouterArgs:
                 " forfeiting router-level retries; a streamed request reaches"
                 " the worker as the client sent it: JSON validation defers to"
                 " the worker, and the provider profile's request normalization"
-                " is skipped. 0 never buffers for retries"
+                " is skipped. This also bounds the transcription audio held"
+                " for one resend after a pre-response connection failure; 0"
+                " disables both kinds of buffering"
             ),
         )
         routing_group.add_argument(

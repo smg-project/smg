@@ -83,6 +83,12 @@ pub(crate) const MAX_FRAME_BYTES: usize = 1 << 20;
 /// Delta fields whose text is buffered, in the order they are emitted.
 const PAYLOAD_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "content"];
 
+/// The top-level key of the rendered prompt a request asked back
+/// (`return_prompt_text`). It is the payload of the event that brings it, not
+/// part of the envelope the synthesized events repeat: it goes out once, with
+/// that event written whole or with the opening half of that event split.
+const PROMPT_TEXT: &str = "prompt_text";
+
 /// Re-slices the deltas of one SSE stream: feed it the body chunks in order
 /// and forward what it returns.
 pub struct SseRechunker<O = NoopObserver> {
@@ -92,9 +98,11 @@ pub struct SseRechunker<O = NoopObserver> {
     partial: Vec<u8>,
     /// Bytes of `partial` already searched for a delimiter.
     scanned: usize,
-    /// Top-level fields of the latest event except `choices` and `usage`,
-    /// serialized as the start of an object (`{"id":"x",`), so synthesized
-    /// events look like the upstream ones.
+    /// Top-level fields of the latest event except `choices`, `usage` and
+    /// `prompt_text` (the rendered prompt a request asked back, which the
+    /// event that brought it carries alone), serialized as the start of an
+    /// object (`{"id":"x",`), so synthesized events look like the upstream
+    /// ones.
     envelope: Vec<u8>,
     /// The latest text-bearing event carried the `usage: null` placeholder
     /// (a usage object, which closes the stream, leaves the flag as it was):
@@ -441,9 +449,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
         if let Some(delta) = &delta {
             self.inspect_delta(delta, &mut shape);
         }
-        if choices.len() == 1 {
-            self.update_envelope(event);
-        }
+        let brings_prompt = choices.len() == 1 && self.update_envelope(event);
 
         let structural = Structural {
             event,
@@ -454,7 +460,11 @@ impl<O: DeltaObserver> SseRechunker<O> {
         // Text already buffered goes out before an event that opens
         // something; an event that closes something goes out after its own
         // text, so nothing is split.
-        match (shape.opens, shape.closes) {
+        // An event that brings the rendered prompt and would leave as
+        // synthesized text alone goes out as an opening one: an event of
+        // its own carries the key, ahead of the event's text.
+        let opens = shape.opens || (brings_prompt && !shape.closes);
+        match (opens, shape.closes) {
             (true, true) => {
                 self.flush(out);
                 self.write_structural(&structural, Variant::Opening, out);
@@ -515,13 +525,19 @@ impl<O: DeltaObserver> SseRechunker<O> {
     /// Keeps the envelope, and the placeholder flag, in step with the latest
     /// event. A usage object leaves the flag as it was: that event closes the
     /// stream and goes out whole after the flush, so the flag keeps describing
-    /// the text buffered before it.
-    fn update_envelope(&mut self, event: &RawObject<'_>) {
+    /// the text buffered before it. Returns whether the event brought the
+    /// rendered prompt (`prompt_text`), which stays out of the envelope.
+    fn update_envelope(&mut self, event: &RawObject<'_>) -> bool {
         self.scratch.clear();
         self.scratch.push(b'{');
         let mut usage_null = Some(false);
+        let mut brings_prompt = false;
         for (key, value) in &event.entries {
             if key == "choices" {
+                continue;
+            }
+            if key == PROMPT_TEXT {
+                brings_prompt = true;
                 continue;
             }
             if key == "usage" {
@@ -539,6 +555,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
         if let Some(usage_null) = usage_null {
             self.usage_null = usage_null;
         }
+        brings_prompt
     }
 
     fn push_text(&mut self, shape: &Shape<'_>, out: &mut Vec<u8>) {
@@ -800,7 +817,8 @@ enum Variant {
     /// The event minus what ends the stream: `finish_reason` becomes null
     /// and a usage object is left out (the `usage: null` placeholder stays).
     Opening,
-    /// The event with an empty delta.
+    /// The event with an empty delta, and without the rendered prompt
+    /// (`prompt_text`): the opening half carried it.
     Closing,
 }
 
@@ -816,6 +834,7 @@ fn write_event(structural: &Structural<'_, '_>, variant: Variant, out: &mut Vec<
                 out.push(b']');
             }
             ("usage", _) if variant == Variant::Opening && !is_null(value) => {}
+            (PROMPT_TEXT, _) if variant == Variant::Closing => {}
             _ => comma.raw(out, key, value),
         }
     }
@@ -1671,6 +1690,44 @@ mod tests {
             .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
             .collect();
         assert_eq!(text, "Hi there");
+    }
+
+    #[test]
+    fn prompt_text_goes_out_once_with_its_events_own_keys() {
+        // The first event carries the rendered prompt the request asked
+        // back, a role, text and a usage object: it leaves as an opening
+        // event, its text under the envelope, and a closing event, and the
+        // prompt rides the opening alone.
+        let first = "data: {\"id\":\"x\",\"prompt_text\":\"user: hi\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi there\"}}],\"usage\":{\"total_tokens\":5}}\n\n";
+        let evs = events(&run(&[first]));
+        assert_eq!(evs.len(), 3, "{evs:?}");
+        assert_eq!(evs[0]["prompt_text"], Value::from("user: hi"));
+        assert!(
+            evs[1..].iter().all(|e| e.get("prompt_text").is_none()),
+            "{evs:?}"
+        );
+
+        // A content event that brings the prompt behind the role, with no
+        // finish and no usage, would leave as synthesized text alone: an
+        // event of its own carries the key once, and the text is whole.
+        let role = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+        let content = "data: {\"id\":\"x\",\"prompt_text\":\"user: hi\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n";
+        let evs = events(&run(&[role, content]));
+        let prompts: Vec<&Value> = evs.iter().filter_map(|e| e.get("prompt_text")).collect();
+        assert_eq!(prompts, [&Value::from("user: hi")], "{evs:?}");
+        // The key's event leaves ahead of the event's text.
+        let key_at = evs.iter().position(|e| e.get("prompt_text").is_some());
+        let text_at = evs.iter().position(|e| {
+            e["choices"][0]["delta"]["content"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        });
+        assert!(key_at < text_at, "{evs:?}");
+        let text: String = evs
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(text, "hello");
     }
 
     #[test]

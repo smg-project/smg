@@ -14,7 +14,7 @@ use crate::metrics::recorder;
 #[tokio::test]
 async fn kv_event_lag_renders_histogram_buckets() {
     let handle = recorder();
-    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
 

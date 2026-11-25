@@ -82,8 +82,9 @@
                              prompt (default off; decode picks keep the whole prompt)
     balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
-    max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
-                             shared across all workers; enforced by eviction
+    max_tree_size:           Max total size of each model's approximate tree (chars plus
+                             1024 for each node a worker stands on, or tokens), shared
+                             across all workers; enforced by eviction
     block_size:              Backend KV cache block size for event-driven routing
     cache_index:             Under-layer: tree (radix trees) or hash (placement map)
     cache_ttl_secs:          Seconds a hash-index placement stays routable
@@ -117,6 +118,8 @@ use smg_worker::{
 };
 use tracing::{debug, error, warn};
 
+#[cfg(test)]
+use super::TEXT_MARKER_LEN;
 use super::{
     cost::{
         self, CandidateInputs, OptimisticAccounting, Pick, RequestInputs, WorkerSelectionPolicy,
@@ -125,7 +128,7 @@ use super::{
     prefix_hash::CHARS_PER_TOKEN,
     utils::PeriodicTask,
     CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, NamedList,
-    SelectWorkerInfo, WorkerRole, TEXT_MARKER_LEN,
+    SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::CacheIndexKind,
@@ -317,8 +320,9 @@ fn hash_token_head(namespace: Option<CacheNamespace>, head: &[u32]) -> u64 {
     }
 }
 
-/// Total cached characters across tenants and the tenant count for one
-/// model's string tree. O(tenants): sums the tree's maintained counters.
+/// Total size across tenants (cached characters plus 1024 for each node)
+/// and the tenant count for one model's string tree. O(tenants): sums the
+/// tree's maintained counters.
 fn string_tree_totals(tree: &Tree) -> (usize, usize) {
     let counts = tree.get_tenant_char_count();
     (counts.values().sum(), counts.len())
@@ -334,7 +338,7 @@ fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
 /// One eviction pass over every tree of `trees` at `max_tree_size`, with the
 /// per-model gauges and the log line of the tree sizes: what the eviction
 /// task runs on its interval.
-fn evict_trees(trees: &ModelTrees, max_tree_size: usize) {
+pub(super) fn evict_trees(trees: &ModelTrees, max_tree_size: usize) {
     // Evict string trees (HTTP)
     let mut total_chars: usize = 0;
     let mut string_hashed: usize = 0;
@@ -484,13 +488,8 @@ impl CacheAwarePolicy {
     // the event-driven index through `event_content_hashes`.
 
     /// The token tree's key for `tokens` and the length of the marker at its
-    /// head. A partitioned request keys under its namespace marker: another
-    /// namespace diverges at position 0 and can never match, and the marker
-    /// never counts toward the match ratio, so a match count read from the
-    /// tree has the marker length subtracted. The marker fills whole pages,
-    /// so the prompt's page grid is the unpartitioned one. An unpartitioned
-    /// request keys under its tokens stripped of marker material, marker
-    /// length 0.
+    /// head: the one rule ([`CacheNamespace::keyed_tokens`]) at this
+    /// policy's page.
     #[inline]
     fn keyed_tokens<'a>(
         &self,
@@ -498,26 +497,15 @@ impl CacheAwarePolicy {
         tokens: &'a [u32],
     ) -> (Cow<'a, [u32]>, usize) {
         let page_size = self.config.block_size.max(1);
-        match info.cache_namespace {
-            Some(namespace) => (
-                Cow::Owned(namespace.prefixed_tokens(tokens, page_size)),
-                CacheNamespace::token_marker_len(page_size),
-            ),
-            None => (
-                Cow::Borrowed(CacheNamespace::unpartitioned_tokens(tokens)),
-                0,
-            ),
-        }
+        CacheNamespace::keyed_tokens(info.cache_namespace, tokens, page_size)
     }
 
     /// The string tree's key for `text` and the length of the marker at its
-    /// head: the rule of [`Self::keyed_tokens`], in chars.
+    /// head: the one rule ([`CacheNamespace::keyed_text`]), which the
+    /// placement inputs name a request's entry in a lent string tree by.
     #[inline]
-    fn keyed_text<'a>(info: &SelectWorkerInfo, text: &'a str) -> (Cow<'a, str>, usize) {
-        match info.cache_namespace {
-            Some(namespace) => (Cow::Owned(namespace.prefixed_text(text)), TEXT_MARKER_LEN),
-            None => (Cow::Borrowed(CacheNamespace::unpartitioned_text(text)), 0),
-        }
+    pub(crate) fn keyed_text<'a>(info: &SelectWorkerInfo, text: &'a str) -> (Cow<'a, str>, usize) {
+        CacheNamespace::keyed_text(info.cache_namespace, text)
     }
 
     /// Hash mode's key material: a namespaced request's tokens as sent (its

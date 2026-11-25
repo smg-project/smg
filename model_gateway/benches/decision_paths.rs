@@ -1,13 +1,28 @@
-//! One request's routing under the classic policies, over one fleet of
-//! workers a model, every one ready unless the cell says otherwise.
+//! One request's routing under the classic policies or under Grand
+//! Central, over one fleet of workers a model, every one ready unless the
+//! cell says otherwise.
 //!
-//! `--path classic`, the default, is the one path: the classic policies
-//! over the worker registry. The paths `object`, `records` and `engine`
-//! are refused by name: they are no longer part of this bench.
+//! `--path classic`, the default, routes by the classic policies over the
+//! worker registry. `--path engine` routes the same cell by Grand
+//! Central, over what a gateway builds with Grand Central on: a
+//! registry that makes no classic policy object, workers with no
+//! completion sink, and the engine of the document the cell's routing
+//! settings mean, started by the gateway's own start over the cell's
+//! registry and, where the cell publishes reports, its load feed. The
+//! same routing calls then place by it. The engine's task is spawned and
+//! not waited for, as at a gateway's start: a cell's first decisions,
+//! which are untimed, may run ahead of its first step. The bench keeps no
+//! cache-event monitor, so the engine is handed no index of cache events.
+//! Where the document reads the prefixes sent to each worker, as
+//! `cache_aware`'s does, the start lends the engine the gateway's token
+//! trees and string trees.
+//! The paths `object` and `records` are refused by name: they are no
+//! longer part of this bench.
 //!
 //! A cell is one route, one policy, one fleet size and one count of
 //! callers. Each caller routes requests back to back: the placement, the
-//! worker's load guard and what its drop tells the model's policy.
+//! worker's load guard, and what the request's end tells the model's
+//! policy or the engine.
 //! The cell prints its decisions a second over every caller and one caller's
 //! time a decision. The callers are threads that stand for the whole cell,
 //! and each makes its first decisions untimed. The gateway's metrics
@@ -27,9 +42,17 @@
 //!
 //! `--pair true` makes the cell a pair gateway's: the fleet is the cell's
 //! size of prefill workers and as many decode workers, on the gRPC wire,
-//! and a request is placed as a pair by the classic pair placement over
-//! its two side policies. `--not-ready` and `--ready` then hold for each
-//! side.
+//! and a request is placed as a pair: by the classic pair placement over
+//! its two side policies, or by the engine, whose document plans the pair
+//! alone. `--not-ready` and `--ready` then hold for each side.
+//!
+//! `--encode-side true` makes a pair cell's gateway a three-sided one: its
+//! settings name the encode mode, so the engine's document plans an encode
+//! side beside the pair's two, under that side's default policy, which
+//! places by the model's ring. The cell's requests carry no item: each is
+//! placed as a pair, and the encode side places nothing. The cell counts
+//! what a pair pays for a side it does not use. Only a pair cell on the
+//! engine's path takes it.
 //!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
 //! header `x-smg-routing-key`: a policy that places by a key places by it.
@@ -52,6 +75,16 @@
 //! the cell publishes them: a cell read for this column also runs with
 //! `--reports false`.
 //!
+//! `--text true` makes each request hold its prompt as text and no token
+//! ids, as a request the HTTP router did not tokenize does: the same
+//! prompts and conversations, each token written as four letters. A policy
+//! that keeps its prompts by text then places by it, as `cache_aware` does
+//! by its string tree. The cell's line is as it was, and a line
+//! `prompt=text` stands ahead of it. `false`, the default, sends token ids
+//! on either route. A pair cell sends token ids alone, and a cell of text
+//! takes no `--end`: the bench has no route that tells the end of a
+//! request of text.
+//!
 //! `--publish-ms N` publishes the fleet's reports again, as a new load
 //! snapshot, every `N` milliseconds while the callers run: the load monitor
 //! publishes pushed reports at most once in 20 milliseconds. `0`, the
@@ -66,6 +99,38 @@
 //! cell's size: a caller's requests name the models in turn, as the
 //! requests of a gateway that serves many models do, so no two requests in
 //! a row are for one model.
+//!
+//! `--end FORM` runs the cell on a route that tells Grand Central the
+//! request's end, and names what that route does behind the making of its
+//! load guard. Without it the route drops its guard at once and reports no
+//! outcome. `streamed` is a streamed answer: the route asks the guard a
+//! handle on the request's end, and the stream's reader reports the outcome
+//! through it while the guard stands. It is counted against `passed`, which
+//! shows the guard to an opaque reader and reports nothing. `answer` is an
+//! answer read whole: the route reports through the answer it keeps past
+//! its guard. It is counted against `kept`, which keeps that answer and
+//! reports nothing. A pair route tells no end yet: under `streamed` its
+//! decode's reader tests the empty handle it is handed, and a pair cell
+//! takes no other form but `passed`.
+//!
+//! `told` is a single request of the gRPC execution stage, behind a
+//! dispatch that answered: the stage asks its selection whether the request
+//! tells its end, the answer's word, and behind a yes asks its guards the
+//! handle and hands it to the request's stream. It is counted against
+//! `dispatched`, which makes the same selection, guards and stream and asks
+//! nothing. `walked` asks the guards whatever the answer's word says: what
+//! a request Grand Central placed pays there, counted on a classic
+//! guard against `dispatched`. `read` reads the stream once, to its end,
+//! counted against `dispatched` too. `watched` watches the stream for a
+//! client as a streaming reader does, and `stopped` lets that stream go as
+//! a reader lets it go at its own stop, counted against `watched`. A
+//! classic request's stream holds no layer of Grand Central's, so a
+//! read walks the layers it walked before and a stop finds nothing to tell.
+//!
+//! `layered` puts on the stream the layer that tells its end under a policy
+//! document one of whose stages takes an end, with an empty handle in it.
+//! `layered-read` reads that stream once through the layer. They count what
+//! the layer costs a request and a read, the report itself apart.
 //!
 //! No Criterion harness: a cell runs a fixed count of decisions, so the same
 //! binary counts instructions under callgrind (two counts, one difference).
@@ -82,6 +147,7 @@
 )]
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     hint::black_box,
     sync::{
@@ -98,6 +164,7 @@ use openai_protocol::{
     worker::{HealthCheckConfig, WorkerLoadResponse, WorkerStatus},
 };
 use smg::{
+    app_context::AppContextBuilder,
     config::{
         types::{PolicyConfig, RoutingMode},
         RouterConfig,
@@ -107,8 +174,8 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, route_classic, route_pair, set_pair_sides, thread_allocated_bytes,
-                Route,
+                attach_loads, route_classic, route_classic_ended, route_pair, route_pair_ended,
+                set_pair_sides, thread_allocated_bytes, Ended, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -160,10 +227,15 @@ struct Cell {
     /// A pair gateway: `workers` prefill workers and as many decode
     /// workers a model, and a request placed as a pair.
     pair: bool,
+    /// A pair cell's settings name the encode mode: the engine's document
+    /// plans an encode side beside the pair's two.
+    encode_side: bool,
     /// The routing keys the requests carry in turn; `0` for none.
     keys: usize,
     /// The prompts the requests carry in turn.
     prompts: usize,
+    /// The requests hold their prompt as text and no token ids.
+    text: bool,
     /// Milliseconds between two publications of the fleet's reports while
     /// the callers run; `0` for the one publication before the first
     /// request.
@@ -171,6 +243,9 @@ struct Cell {
     /// The tokens a request adds to its caller's conversation; `0` for the
     /// prompts in turn.
     grow: usize,
+    /// What a route that tells the request's end does with it; `None` for
+    /// the route that drops its guard at once.
+    end: Option<Ended>,
 }
 
 fn cell() -> Cell {
@@ -187,10 +262,13 @@ fn cell() -> Cell {
         overloaded: false,
         models: 1,
         pair: false,
+        encode_side: false,
         keys: 0,
         prompts: 1,
+        text: false,
         publish_ms: 0,
         grow: 0,
+        end: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -220,10 +298,29 @@ fn cell() -> Cell {
             "--overloaded" => cell.overloaded = value.parse().unwrap(),
             "--models" => cell.models = value.parse().unwrap(),
             "--pair" => cell.pair = value.parse().unwrap(),
+            "--encode-side" => cell.encode_side = value.parse().unwrap(),
             "--keys" => cell.keys = value.parse().unwrap(),
             "--prompts" => cell.prompts = value.parse().unwrap(),
+            "--text" => cell.text = value.parse().unwrap(),
             "--publish-ms" => cell.publish_ms = value.parse().unwrap(),
             "--grow" => cell.grow = value.parse().unwrap(),
+            "--end" => {
+                cell.end = Some(match value.as_str() {
+                    "passed" => Ended::Passed,
+                    "streamed" => Ended::Streamed,
+                    "kept" => Ended::Kept,
+                    "answer" => Ended::Answer,
+                    "dispatched" => Ended::Dispatched,
+                    "told" => Ended::Told,
+                    "walked" => Ended::Walked,
+                    "read" => Ended::Read,
+                    "watched" => Ended::Watched,
+                    "stopped" => Ended::Stopped,
+                    "layered" => Ended::Layered,
+                    "layered-read" => Ended::LayeredRead,
+                    other => panic!("no end {other}"),
+                });
+            }
             other => panic!("no flag {other}"),
         }
     }
@@ -462,37 +559,130 @@ impl Conversation {
     }
 }
 
+/// The letters a token is written as under `--text`: the engine reads a
+/// text's size in tokens as its bytes over four.
+const TOKEN_BYTES: usize = 4;
+
+/// A caller's requests as text, under `--text`: the tokens of its last
+/// request and their text. A request that carries the last one on has the
+/// tokens it adds written behind that text, as a conversation's next turn
+/// is its last one and more. Any other request is written whole.
+struct AsText {
+    tokens: Vec<u32>,
+    text: String,
+}
+
+impl AsText {
+    /// The text of `tokens`: each token as four letters of its mix (`mix`),
+    /// so two prompts' texts part where their tokens do, but for one pair
+    /// of tokens in some 450,000.
+    fn of(&mut self, tokens: &[u32]) -> &str {
+        if !tokens.starts_with(&self.tokens) {
+            self.tokens.clear();
+            self.text.clear();
+        }
+        let kept = self.tokens.len();
+        for &token in &tokens[kept..] {
+            let mut bits = mix(u64::from(token));
+            for _ in 0..TOKEN_BYTES {
+                self.text.push(char::from(b'a' + (bits % 26) as u8));
+                bits /= 26;
+            }
+        }
+        self.tokens.extend_from_slice(&tokens[kept..]);
+        &self.text
+    }
+}
+
+thread_local! {
+    /// The calling thread's requests as text: each caller is a thread.
+    static AS_TEXT: RefCell<AsText> = const {
+        RefCell::new(AsText {
+            tokens: Vec::new(),
+            text: String::new(),
+        })
+    };
+}
+
+/// A text cell's routing call: the same call for a request that holds its
+/// prompt as text. A closure of its own over a route of its own: a cell
+/// without `--text` runs the code it ran before this flag.
+fn text_routing(
+    registry: Arc<WorkerRegistry>,
+    policies: Arc<PolicyRegistry>,
+    models: Vec<String>,
+    keys: Vec<HeaderMap>,
+    route: Route,
+) -> Routing {
+    use smg::routers::common::bench_support::route_text;
+    Box::new(move |tokens, turn| {
+        let model = &models[(turn % models.len() as u64) as usize];
+        let headers = match keys.len() {
+            0 => None,
+            count => keys.get((turn % count as u64) as usize),
+        };
+        AS_TEXT.with_borrow_mut(|as_text| {
+            let text = as_text.of(tokens);
+            route_text(&registry, &policies, model, route, text, headers)
+        })
+    })
+}
+
 /// The load feed of a cell and the reports it publishes: one a worker.
 struct Feed {
     feed: TestFeed,
     loads: HashMap<String, WorkerLoadResponse>,
 }
 
-/// A cell's path as `build` leaves it: the routing call, and the load feed
-/// where the cell publishes reports.
+/// A cell's path as `build` leaves it: the routing call, the load feed
+/// where the cell publishes reports, and the engine's runtime on its path.
 struct Built {
     routing: Routing,
     feed: Option<Feed>,
+    /// The runtime Grand Central's task runs on, kept for the cell's
+    /// life: `None` on the classic path, which starts no engine.
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
-/// A cell's path, built: a registry with the fleet, the policies a
-/// registration leaves (the model's policy and each worker's completion
-/// sink), and the load feed the monitor would publish. A pair cell's
-/// registry holds the two side policies a pair gateway's start sets, and
-/// each model's fleet is its two sides.
+/// A cell's path, built: a registry with the fleet, what a registration
+/// leaves (under the classic policies the model's policy and each worker's
+/// completion sink, under the engine neither), and the load feed the
+/// monitor would publish. A classic pair cell's registry holds the two
+/// side policies a pair gateway's start sets, and each model's fleet is
+/// its two sides. On the engine's path the engine is started last.
 fn build(cell: &Cell) -> Built {
     let registry = Arc::new(WorkerRegistry::new());
     let mut config = RouterConfig {
         policy: policy_config(&cell.policy),
         ..RouterConfig::default()
     };
+    assert!(
+        !cell.encode_side || (cell.pair && cell.path == "engine"),
+        "an encode side is planned for a pair cell on the engine's path"
+    );
     if cell.pair {
-        config.mode = RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
+        config.mode = if cell.encode_side {
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            }
+        } else {
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            }
         };
+        // The cell's workers are on the gRPC wire, and its settings say so:
+        // a pair gateway of one router over gRPC plans the pair alone, where
+        // one over HTTP plans single requests beside it. Only the engine's
+        // document reads this.
+        config.connection_mode = ConnectionMode::Grpc;
     }
     let policies = match cell.path.as_str() {
         "classic" => {
@@ -502,8 +692,15 @@ fn build(cell: &Cell) -> Built {
             }
             Arc::new(policies)
         }
-        gone @ ("object" | "records" | "engine") => {
-            panic!("the path {gone} was removed from this bench: it runs the classic path only")
+        "engine" => {
+            // The registry a gateway builds with Grand Central on:
+            // it makes no classic policy object, and a pair's two side
+            // policies are not set on it.
+            config.grand_central = true;
+            Arc::new(PolicyRegistry::of_config(&config))
+        }
+        gone @ ("object" | "records") => {
+            panic!("the path {gone} was removed from this bench: it runs the classic and the engine path")
         }
         other => panic!("no path {other}"),
     };
@@ -522,7 +719,9 @@ fn build(cell: &Cell) -> Built {
             for worker in &fleet {
                 registry.register(Arc::clone(worker)).unwrap();
                 policies.on_worker_added(model, None);
-                worker.set_completion_sink(Some(policies.completion_sink()));
+                // The sink a registration gives a worker: the registry's own
+                // under the classic policies, none where the engine places.
+                worker.set_completion_sink(policies.worker_completion_sink());
             }
             leave_not_ready(&fleet, cell.not_ready);
             leave_ready(&fleet, cell.ready);
@@ -532,7 +731,8 @@ fn build(cell: &Cell) -> Built {
             every.extend(fleet);
         }
     }
-    // The feed's receiver goes to the registry's policies.
+    // The feed's receiver goes to the registry's policies, and to the engine
+    // on its path.
     let mut receiver = None;
     let feed = cell.reports.then(|| {
         let feed = TestFeed::attached_to(|rx| receiver = rx);
@@ -543,32 +743,95 @@ fn build(cell: &Cell) -> Built {
         feed.publish(&loads);
         Feed { feed, loads }
     });
+    let engine_loads = receiver.clone();
     if cell.reports {
         attach_loads(&policies, receiver);
     }
-    let (route, pair) = (cell.route, cell.pair);
+    // The engine path: the gateway's own start, with Grand Central
+    // on in the cell's settings, behind the fleet's registration and, where
+    // the cell publishes reports, the feed's first publication. The engine's
+    // task runs on a runtime of its own thread, kept for the cell's life,
+    // and its first step is not waited for.
+    let runtime = (cell.path == "engine").then(|| {
+        config.grand_central = true;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _entered = runtime.enter();
+            AppContextBuilder::start_engine_for_bench(&config, &policies, &registry, engine_loads)
+                .unwrap();
+        }
+        runtime
+    });
+    let (route, pair, end) = (cell.route, cell.pair, cell.end);
     assert!(
         !(pair && cell.keys != 0),
         "a pair cell sends no routing key"
     );
     assert!(
+        !pair || matches!(end, None | Some(Ended::Passed | Ended::Streamed)),
+        "a pair cell reports through no answer and runs no single request's stage"
+    );
+    assert!(
         !(cell.grow > 0 && cell.models > 1),
         "a growing conversation is one model's"
     );
-    let keys = keyed_headers(cell.keys);
-    let routing: Routing = Box::new(move |tokens, turn| {
-        let model = &models[(turn % models.len() as u64) as usize];
-        let headers = match keys.len() {
-            0 => None,
-            count => keys.get((turn % count as u64) as usize),
+    if cell.text {
+        assert!(!pair, "a pair cell sends token ids");
+        assert!(end.is_none(), "a cell of text takes no --end");
+        let keys = keyed_headers(cell.keys);
+        return Built {
+            routing: text_routing(registry, policies, models, keys, route),
+            feed,
+            runtime,
         };
-        if pair {
-            route_pair(&registry, &policies, model, Some(tokens))
-        } else {
-            route_classic(&registry, &policies, model, route, Some(tokens), headers)
-        }
-    });
-    Built { routing, feed }
+    }
+    let keys = keyed_headers(cell.keys);
+    let routing: Routing = match end {
+        None => Box::new(move |tokens, turn| {
+            let model = &models[(turn % models.len() as u64) as usize];
+            let headers = match keys.len() {
+                0 => None,
+                count => keys.get((turn % count as u64) as usize),
+            };
+            if pair {
+                route_pair(&registry, &policies, model, Some(tokens))
+            } else {
+                route_classic(&registry, &policies, model, route, Some(tokens), headers)
+            }
+        }),
+        // The same routing on a route that tells the request's end, as a
+        // closure of its own: a cell without `--end` runs the code it ran
+        // before this flag, instruction for instruction.
+        Some(end) => Box::new(move |tokens, turn| {
+            let model = &models[(turn % models.len() as u64) as usize];
+            let headers = match keys.len() {
+                0 => None,
+                count => keys.get((turn % count as u64) as usize),
+            };
+            if pair {
+                route_pair_ended(&registry, &policies, model, Some(tokens), end)
+            } else {
+                route_classic_ended(
+                    &registry,
+                    &policies,
+                    model,
+                    route,
+                    Some(tokens),
+                    headers,
+                    end,
+                )
+            }
+        }),
+    };
+    Built {
+        routing,
+        feed,
+        runtime,
+    }
 }
 
 fn main() {
@@ -576,7 +839,11 @@ fn main() {
     let recorder = start_prometheus(PrometheusConfig::default());
     let prompts = prompts(cell.prompts);
     let tokens_at = |turn: u64| &prompts[(turn % prompts.len() as u64) as usize][..];
-    let Built { routing, feed } = build(&cell);
+    let Built {
+        routing,
+        feed,
+        runtime: _engine_runtime,
+    } = build(&cell);
     // The path's first sight of the pool, untimed: what a registration and
     // the first request after it build once.
     let warm = (cell.workers as u64 * 8).max(4_096) * cell.models.max(1) as u64;
@@ -698,8 +965,13 @@ fn main() {
     } else {
         returned as f64 / turns as f64
     };
+    if cell.text {
+        // A line of its own, ahead of the cell's: the cell's line stands as
+        // it was before this flag.
+        println!("prompt=text");
+    }
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} encode_side={} end={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -711,6 +983,10 @@ fn main() {
         cell.overloaded,
         cell.models,
         cell.pair,
+        cell.encode_side,
+        cell
+            .end
+            .map_or_else(|| "dropped".to_owned(), |end| format!("{end:?}").to_lowercase()),
         cell.keys,
         cell.prompts,
         cell.grow,

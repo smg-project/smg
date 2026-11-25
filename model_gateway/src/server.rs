@@ -44,11 +44,11 @@ use openai_protocol::{
     },
 };
 use serde::Deserialize;
+use smg_grand_central::stages::StageRegistry;
 use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
-use smg_policy_controller::stages::StageRegistry;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -56,6 +56,7 @@ use wfaas::LoggingSubscriber;
 pub mod connection_limit;
 pub mod connection_timeouts;
 pub mod health;
+mod policy_explain;
 pub mod posture;
 mod rate_limit_document;
 pub(crate) mod tls;
@@ -1190,7 +1191,7 @@ impl Extensions {
     }
 
     /// Set the table of stages a policy document of this gateway may name,
-    /// where the gateway runs the policy controller (`policy_controller`
+    /// where the gateway runs Grand Central (`grand_central`
     /// on). Start from the stock table ([`StageRegistry::builtin`]) and add
     /// each stage of your own under a new name, with
     /// [`StageRegistry::filter`], [`StageRegistry::scorer`] or
@@ -1203,7 +1204,7 @@ impl Extensions {
     /// does not hold ends the start by the stage's name. Without this call
     /// the document is validated against the stock table.
     ///
-    /// With the policy controller off the table is not read.
+    /// With Grand Central off the table is not read.
     #[must_use]
     pub fn policy_stages(mut self, stages: StageRegistry) -> Self {
         self.policy_stages = Some(stages);
@@ -1554,6 +1555,7 @@ pub fn build_apps(
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
+        .route("/policy/explain/{request_id}", get(policy_explain::get))
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))
@@ -1810,6 +1812,7 @@ async fn start_observability(
             handle,
             prometheus_config.host.clone(),
             prometheus_config.port,
+            app_context.policy_registry.engine(),
         )
         .await?;
         runtime_metrics::spawn_observer();
@@ -2323,7 +2326,7 @@ async fn build_app_context(
 }
 
 /// What the start line says places this process's requests: the policy
-/// document the policy controller runs in place of the one the routing
+/// document Grand Central runs in place of the one the routing
 /// settings mean, by its path where it was read from one, and the routing
 /// settings' policy everywhere else.
 fn start_line_policy(config: &RouterConfig) -> String {
@@ -3780,6 +3783,55 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// The gateway's start hands its metrics endpoint the Grand Central it
+    /// started. A scrape of a gateway whose policy document names a shadow
+    /// holds that binding's shadow series, at zero before any request.
+    #[tokio::test]
+    async fn the_started_metrics_endpoint_publishes_the_engines_shadow_counts() {
+        use crate::observability::metrics::test_support::{shadow_kinds, shadowing_document};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = ::metrics::set_default_local_recorder(&recorder);
+        let router_config = RouterConfig {
+            grand_central: true,
+            policy_spec: Some(shadowing_document()),
+            ..RouterConfig::default()
+        };
+        // The start binds the port its configuration names. A port read as
+        // free is held by nobody until then, so another case may take it: a
+        // start that fails is tried again on another port.
+        let mut tries = 0;
+        let (port, _probes) = loop {
+            let free = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+            let port = free.local_addr().expect("the port's address").port();
+            drop(free);
+            let prometheus = PrometheusConfig {
+                port,
+                host: "127.0.0.1".to_string(),
+                duration_buckets: None,
+            };
+            let config = ServerConfig {
+                prometheus_config: Some(prometheus),
+                ..ServerConfig::minimal(router_config.clone())
+            };
+            let app = build_app_context(&config, Extensions::new())
+                .await
+                .expect("the gateway starts");
+            match start_observability(&config, &app, Some(recorder.handle())).await {
+                Ok(probes) => break (port, probes),
+                Err(error) => {
+                    tries += 1;
+                    assert!(tries < 8, "the metrics endpoint starts: {error}");
+                }
+            }
+        };
+
+        let url = format!("http://127.0.0.1:{port}/metrics");
+        let scrape = http_client().get(url).send().await.expect("a scrape");
+        let body = scrape.text().await.expect("the scrape's text");
+        assert_eq!(shadow_kinds(&body), [Some(0); 4], "{body}");
+    }
 
     /// A gRPC worker imported from a mesh peer runs no registration workflow
     /// here; without its model's tokenizer, readiness answers 503.
@@ -5452,7 +5504,7 @@ mod tests {
     }
 
     /// The start line names what places requests. Under the classic
-    /// policies, and where the policy controller runs the document the
+    /// policies, and where Grand Central runs the document the
     /// settings mean, it is the settings' policy in its debug form. A
     /// supplied document is named in its place: by its path where it was
     /// read from one, and without one where the caller set it.
@@ -5462,7 +5514,7 @@ mod tests {
         assert_eq!(start_line_policy(&classic), format!("{:?}", classic.policy));
 
         let the_settings_own = RouterConfig {
-            policy_controller: true,
+            grand_central: true,
             ..RouterConfig::default()
         };
         assert_eq!(
@@ -5474,7 +5526,7 @@ mod tests {
             .policy_document()
             .expect("the default settings mean a document");
         let read_from_a_path = RouterConfig {
-            policy_controller: true,
+            grand_central: true,
             policy_spec_path: Some("routing.yaml".to_owned()),
             policy_spec: Some(document.clone()),
             ..RouterConfig::default()
@@ -5485,7 +5537,7 @@ mod tests {
         );
 
         let set_by_the_caller = RouterConfig {
-            policy_controller: true,
+            grand_central: true,
             policy_spec: Some(document),
             ..RouterConfig::default()
         };

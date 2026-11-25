@@ -130,6 +130,7 @@ pub(crate) async fn prepare_rendered_prompt(
                     model_id,
                     &media_plan,
                     true,
+                    mm_components.pixels_go_to,
                 )?;
             }
             // The dtype every worker the selection can pick reads image
@@ -629,7 +630,8 @@ mod tests {
         ] {
             let registry = registry_with(workers);
             assert!(
-                ensure_model_accepts_media(&registry, "m", &plan, false).is_ok(),
+                ensure_model_accepts_media(&registry, "m", &plan, false, WorkerType::Regular)
+                    .is_ok(),
                 "{name}: preparation's check passes"
             );
             let (mut ctx, tokenizer) = context_over(registry).await;

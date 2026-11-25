@@ -419,6 +419,7 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/get_loads"),
     ("POST", "/parse/function_call"),
     ("POST", "/parse/reasoning"),
+    ("GET", "/policy/explain/{request_id}"),
     ("POST", "/wasm"),
     ("GET", "/wasm"),
     ("DELETE", "/wasm/{module_uuid}"),
@@ -1545,6 +1546,31 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         },
     );
 
+    // ---- A kept routing decision ----
+    paths.insert(
+        "/policy/explain/{request_id}".to_string(),
+        PathItem {
+            get: Some(operation(
+                "explainRoutingDecision",
+                "The newest routing decision Grand Central kept of one request, where the policy spec sets explain.sample",
+                Some(vec![path_param("request_id")]),
+                None,
+                refused_with(
+                    inline_response(
+                        "The kept decision, each worker with its address",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {"decision": {"type": "object"}},
+                            "required": ["decision"]
+                        }),
+                    ),
+                    &worker_error_name,
+                ),
+            )),
+            ..PathItem::default()
+        },
+    );
+
     // ---- Models ----
     use openai_protocol::models::ListModelsResponse as OpenAIListModelsResponse;
     let resp_name = collect_schema(schema_for!(OpenAIListModelsResponse), &mut schemas)?;
@@ -1733,6 +1759,27 @@ mod tests {
                 "{method} {path} {status}"
             );
         }
+    }
+
+    /// The route that answers a kept routing decision takes the request's id
+    /// as its one path parameter, answers an object that holds the decision,
+    /// and refuses in the control plane's envelope.
+    #[test]
+    fn the_kept_decision_route_names_its_parameter_and_refuses_in_the_worker_envelope() {
+        let doc = document_value();
+        let get = &doc["paths"]["/policy/explain/{request_id}"]["get"];
+        assert_eq!(
+            get["parameters"],
+            json!([{"name": "request_id", "in": "path", "required": true, "schema": {"type": "string"}}]),
+            "{get}"
+        );
+        let answer = &get["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(answer["required"], json!(["decision"]), "{get}");
+        assert_eq!(
+            get["responses"]["4XX"]["content"]["application/json"]["schema"]["$ref"],
+            json!("#/components/schemas/WorkerErrorResponse"),
+            "{get}"
+        );
     }
 
     /// The WASM load's explicit 400 carries two bodies, the per-module results

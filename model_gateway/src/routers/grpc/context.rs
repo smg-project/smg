@@ -61,8 +61,12 @@ use crate::{
     policies::CacheNamespace,
     routers::{
         common::{
-            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, placement::Placed,
-            prefill_admission::PrefillLoadGuard, snapshot::WorkerRegistry, sse::SseSender,
+            attempt_ledger::AttemptLedger,
+            pd_admission::PdAdmissionGuard,
+            placement::{Placed, RequestEnd, SharedEnd},
+            prefill_admission::{PrefillAhead, PrefillLoadGuard},
+            snapshot::WorkerRegistry,
+            sse::SseSender,
         },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
@@ -360,8 +364,9 @@ pub(crate) struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     /// Prefill admission slot, taken during PD/EPD worker selection and
-    /// handed to the dispatch that runs the Prefill side.
-    pub pd_prefill_guard: Option<PrefillLoadGuard>,
+    /// handed to the dispatch that runs the Prefill side, which says the
+    /// prefill's send.
+    pub pd_prefill_guard: Option<PrefillAhead>,
 
     // Response processing state seeded during ingress (stop decoder, router
     // stop obligations, derived skip_special_tokens).
@@ -485,9 +490,9 @@ pub(crate) struct DispatchContext {
     /// its last reader and takes it.
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
-    /// Prefill admission slot for the next PD/EPD dispatch; a retry's
-    /// reselection refills it.
-    pub pd_prefill_guard: Option<PrefillLoadGuard>,
+    /// Prefill admission slot for the next PD/EPD dispatch, held ahead of
+    /// the prefill's send; a retry's reselection refills it.
+    pub pd_prefill_guard: Option<PrefillAhead>,
     pub response: ResponseState,
 }
 
@@ -1012,8 +1017,10 @@ pub(crate) enum WorkerSelection {
     ///
     /// The decode is kept as its placement answered it: its load guard is
     /// made from the answer ([`LoadGuards::new`],
-    /// [`LoadGuards::behind_prefill`]). The prefill's guard was made from
-    /// its answer where the Prefill admission took its slot.
+    /// [`LoadGuards::behind_prefill`]). The prefill's load is a plain guard
+    /// of its worker, held where the Prefill admission took its slot. What
+    /// its answer owes its send goes with that load ([`PrefillAhead`]), and
+    /// the dispatch says the send where the prefill goes out.
     Disaggregated {
         encode_assignments: Option<Vec<EncodeWorkerAssignment>>,
         prefill: Arc<dyn Worker>,
@@ -1092,7 +1099,9 @@ impl Drop for StreamSpan {
 impl LoadGuards {
     /// The guards of an attempt whose every side goes out with the dispatch
     /// that follows: each is made from its placement's answer, which says
-    /// the dispatch where the policy engine placed the request.
+    /// the dispatch where Grand Central placed the request.
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
@@ -1106,7 +1115,7 @@ impl LoadGuards {
 
     /// [`Self::new`] for a pair whose decode is owed its ask and its send
     /// behind its prefill ([`Placed::owed_behind_prefill`]): one request of
-    /// a sequential dispatch that the policy engine placed. A classic
+    /// a sequential dispatch that Grand Central placed. A classic
     /// pair's takes [`Self::new`]. The decode's guard is made
     /// ahead of its send ([`Placed::ahead`]): the decode is counted from
     /// here, and the dispatch says its send where the decode goes out
@@ -1176,6 +1185,8 @@ impl LoadGuards {
     /// Bind an admission claim to the dispatch's guards, so the rooms it
     /// reserved outlive nothing else. `None` (the engine reports no window)
     /// returns the guards untouched.
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     pub fn admitted(admission: Option<PdAdmissionGuard>, guards: Self) -> Self {
         match admission {
             Some(admission) => Self::Admitted {
@@ -1204,6 +1215,20 @@ impl LoadGuards {
                     .map(|_| Self::new(selection, routing_key))
                     .collect(),
             }
+        }
+    }
+
+    /// The handle on the end of the single request these guards count
+    /// ([`RequestEnd::of`]), asked of its guard under whatever rides with
+    /// it. A batch's sub-requests are one placement: the first guard made
+    /// from its answer keeps Grand Central's side of it, and that guard
+    /// is asked. A pair's guards hand the empty handle.
+    pub(crate) fn end(&self) -> RequestEnd {
+        match self {
+            Self::Single { _guard } => RequestEnd::of(_guard),
+            Self::Batch { _guards } => _guards.first().map_or_else(RequestEnd::default, Self::end),
+            Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => _guards.end(),
+            Self::Disaggregated { .. } => RequestEnd::default(),
         }
     }
 }
@@ -1240,6 +1265,14 @@ pub(crate) struct ResponseState {
     /// `None` for the shapes whose response carries the engine's counters
     /// unchanged (completion, generate, decisions, embeddings, classify).
     pub engine_counts: Option<TokenCounts>,
+
+    /// The rendered prompt of a chat request that asked for it
+    /// (`return_prompt_text`), kept by request building where the wire lets
+    /// the text go, which is where no media travels with the prompt
+    /// (`backed_plan::build`), and taken by the answer. Here and
+    /// not on the response spec: every attempt but the last dispatches a
+    /// clone of the spec, and the text is moved to the answer, never copied.
+    pub prompt_text: Option<String>,
 
     /// Responses API iteration result (Harmony only, for tool loop
     /// orchestration). Behind a pointer: the field is empty on every other
@@ -1651,6 +1684,36 @@ impl WorkerSelection {
         std::iter::once(first).chain(second)
     }
 
+    /// The handle a single request tells Grand Central its end through
+    /// ([`RequestEnd`]), asked of `guards`, the attempt's
+    /// ([`LoadGuards::end`]). The answer's one word is tested first
+    /// ([`Placed::end_of`]): a request the classic policies placed walks no
+    /// guards and takes the empty handle. Every sub-request of a batch
+    /// takes the handle of the batch's one placement. A pair takes the
+    /// empty handle: nobody tells the engine a pair's end yet.
+    #[inline]
+    pub(crate) fn end(&self, guards: Option<&LoadGuards>) -> RequestEnd {
+        match self {
+            Self::Single { worker } => {
+                worker.end_of(|| guards.map_or_else(RequestEnd::default, LoadGuards::end))
+            }
+            Self::Disaggregated { .. } => RequestEnd::default(),
+        }
+    }
+
+    /// Whether this selection's request tells Grand Central its end:
+    /// the test [`Self::end`] makes ahead of its guards, for a place that
+    /// holds no guards or would make something for the report alone. True
+    /// for a single request whose answer says so ([`Placed::tells_end`]). A
+    /// request the classic policies placed and a pair tell none.
+    #[inline]
+    pub(crate) fn tells_end(&self) -> bool {
+        match self {
+            Self::Single { worker } => worker.tells_end(),
+            Self::Disaggregated { .. } => false,
+        }
+    }
+
     /// The engines (base URLs) this selection dispatches to: the one worker,
     /// or the prefill and decode sides.
     pub fn engines(&self) -> impl Iterator<Item = &str> {
@@ -1953,6 +2016,47 @@ impl ExecutionResult {
             }
         }
     }
+
+    /// From here on the result tells Grand Central its request's end
+    /// through `end`, the handle the execution plan asked of the attempt's
+    /// guards ([`WorkerSelection::end`]). The one worker's stream tells its
+    /// own end ([`ProtoStream::report_through`]). The streams of a batch
+    /// share its one placement's end ([`SharedEnd`]): the first failure one
+    /// of them meets stands, and the worker's 200 is told once every stream
+    /// ended well. An embedding is its answers, in hand
+    /// and all good: the worker's 200 is told here, the status the circuit
+    /// breaker sampled for them, and nothing for an embedding of no answer,
+    /// which the breaker took no sample of.
+    pub(crate) fn report_through(&mut self, end: RequestEnd) {
+        match self {
+            Self::Single { stream, .. } => stream.report_through(end),
+            // Nobody tells the engine a pair's end yet. The change that
+            // makes a pair's two sides tell theirs turns this arm on.
+            Self::PrefillDecode { .. } => {}
+            Self::Embedding { responses } => {
+                if !responses.is_empty() {
+                    end.report(200, || true);
+                }
+            }
+            Self::Batch { results } if !end.is_empty() => {
+                let shared = SharedEnd::among(end);
+                for result in results {
+                    match result {
+                        Self::Single { stream, .. } => {
+                            stream.put_report_layer(RequestEnd::default(), Some(shared.reader()));
+                        }
+                        // A single request's batch holds its streams alone.
+                        // A result of another kind takes no share of the
+                        // end: the batch's good end does not wait on it.
+                        Self::PrefillDecode { .. }
+                        | Self::Embedding { .. }
+                        | Self::Batch { .. } => {}
+                    }
+                }
+            }
+            Self::Batch { .. } => {}
+        }
+    }
 }
 
 /// A request's wait ahead of the dispatch its answer's clocks start at, as
@@ -1970,18 +2074,24 @@ pub(crate) type DispatchWait = Option<std::time::Duration>;
 /// run inside it, so they read the wait there, against the dispatch instant
 /// their stream's clocks start at, and hand it to the reading they build:
 /// the response body drives that reading once the request's future has
-/// returned, outside the scope.
+/// returned, outside the scope. A collected answer is built inside the
+/// request's future, so its processor reads the wait where it makes the
+/// answer's records, against the dispatch its generation clock starts at.
 ///
-/// A streamed Responses tool loop dispatches its generations from a task of
-/// its own and puts each of them under a stamp there: the first turn's under
-/// the request's own, a later turn's under one taken where that turn starts.
-/// A later turn's wait is therefore the gateway's time from the turn's start
-/// to its dispatch, with none of the generations and tool calls before it.
+/// A Responses tool loop puts each of its generations under a stamp: the
+/// first turn's under the request's own, a later turn's under one taken
+/// where that turn starts (the streamed loop dispatches from a task of its
+/// own and carries the request's stamp there; the collected loop runs in the
+/// request's future). A later turn's wait is therefore the gateway's time
+/// from the turn's start to its dispatch, with none of the generations and
+/// tool calls before it.
 ///
-/// `None` when no stamp is in scope. Behind the edge every entry point that
-/// reads the wait runs under one. A pipeline a test runs bare has none, on
-/// any turn of a tool loop either, and its stream records its time to first
-/// token alone.
+/// `None` when no stamp is in scope. Behind the edge every streaming entry
+/// point that reads the wait runs under one, and so does every collected
+/// answer but a background Responses request's: its generations run in a
+/// task of its own, outside the request's scope, and record no wait. A
+/// pipeline a test runs bare has none, on any turn of a tool loop either,
+/// and its answer records its other families alone.
 pub(crate) fn dispatch_wait(dispatched: Instant) -> DispatchWait {
     let entered = RequestStarted::current()?;
     Some(dispatched.saturating_duration_since(entered))
@@ -2673,6 +2783,65 @@ mod tests {
             3,
         ));
         assert_eq!(spy.0.lock().unwrap().len(), before + 3);
+    }
+
+    /// The handle on a request's end is asked of its guard under whatever
+    /// rides with the guards: the dispatch's upstream span, an admission
+    /// claim. A request told through that handle hears its outcome.
+    #[test]
+    fn the_guards_hand_a_requests_end_under_what_rides_with_them() {
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::{
+            common::{
+                pd_admission::{try_admit_decode, Tried},
+                placement::tests::heard_request,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
+        };
+
+        // A ride takes the guards and hands them back under itself.
+        type Ride = Box<dyn FnOnce(LoadGuards) -> LoadGuards>;
+
+        let window = [("max_running_requests".to_string(), "1".to_string())];
+        let windowed: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://windowed")
+                .worker_type(WorkerType::Decode)
+                .labels(window.into_iter().collect())
+                .build(),
+        );
+        let Tried::Claimed(claim) = try_admit_decode(&windowed, 1) else {
+            panic!("a free room is claimed");
+        };
+        let rides: [(&str, Ride); 2] = [
+            (
+                "the upstream span",
+                Box::new(|guards| LoadGuards::traced(tracing::Span::none(), guards)),
+            ),
+            (
+                "an admission claim",
+                Box::new(move |guards| LoadGuards::admitted(Some(claim), guards)),
+            ),
+        ];
+        for (ride, under) in rides {
+            let (heard, guard, end) = heard_request();
+            drop(end);
+            let guards = under(LoadGuards::Single { _guard: guard });
+            assert!(
+                matches!(
+                    guards,
+                    LoadGuards::Traced { .. } | LoadGuards::Admitted { .. }
+                ),
+                "{ride}"
+            );
+            guards.end().report(200, || true);
+            drop(guards);
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                ["issued", "dispatched Single", "completed Ok 200"],
+                "{ride}"
+            );
+        }
     }
 
     /// The client-shape mismatch answers an executor takes from the

@@ -239,6 +239,8 @@ pub(super) fn response_tool_to_value(tool: &ResponseTool) -> Option<Value> {
             // or the deferred-loading hint.
             insert_optional_value(&mut m, "connector_id", mcp.connector_id.as_ref());
             insert_optional_value(&mut m, "defer_loading", mcp.defer_loading.as_ref());
+            insert_optional_value(&mut m, "allowed_callers", mcp.allowed_callers.as_ref());
+            insert_optional_value(&mut m, "tunnel_id", mcp.tunnel_id.as_ref());
             Some(Value::Object(m))
         }
         ResponseTool::WebSearchPreview(_) => serde_json::to_value(tool).ok(),
@@ -255,10 +257,12 @@ pub(super) fn response_tool_to_value(tool: &ResponseTool) -> Option<Value> {
         // to the client unchanged (T9).
         ResponseTool::Namespace(_) => serde_json::to_value(tool).ok(),
         ResponseTool::Shell(_) => serde_json::to_value(tool).ok(),
-        ResponseTool::ApplyPatch => serde_json::to_value(tool).ok(),
+        ResponseTool::ApplyPatch(_) => serde_json::to_value(tool).ok(),
         ResponseTool::Function(_) => None,
         // T5 schema-only: forced-cascade arm, no behavior.
         ResponseTool::LocalShell => serde_json::to_value(tool).ok(),
+        ResponseTool::ToolSearch(_) => serde_json::to_value(tool).ok(),
+        ResponseTool::ProgrammaticToolCalling => serde_json::to_value(tool).ok(),
     }
 }
 
@@ -805,6 +809,8 @@ mod tests {
                     ])),
                     connector_id: None,
                     defer_loading: None,
+                    allowed_callers: None,
+                    tunnel_id: None,
                 }),
             ]),
             ..hello_request()

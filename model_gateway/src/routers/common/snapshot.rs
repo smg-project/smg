@@ -10,7 +10,7 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
-use smg_policy_controller::engine::{LentList, ListCell};
+use smg_grand_central::engine::{LentList, PublishedList};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -22,7 +22,10 @@ use symphony::grammar::GrammarStart;
 use crate::{
     policies::hash_ring::HashRing,
     routers::{
-        common::pair_index::{PdPairIndex, PdWire},
+        common::{
+            pair_index::{PdPairIndex, PdWire},
+            place_request::stated_facts,
+        },
         grpc::multimodal::MediaFacts,
     },
 };
@@ -175,10 +178,12 @@ pub(crate) struct ModelLabels {
 pub struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
-    /// The cell beside each pool's list, empty until the policy engine is
-    /// asked over that list (see [`Self::lent`]). A gateway that starts no
-    /// engine leaves every cell empty.
-    cells: [ListCell; RoutingPool::COUNT],
+    /// Each pool's list as Grand Central is lent it: the list, the cell
+    /// the engine keeps its value of the list in, and what this gateway
+    /// states of each worker beside its object. Made where the engine is
+    /// first asked over that list (see [`Self::lent`]). A gateway that
+    /// starts no engine makes none.
+    lent: [OnceLock<PublishedList>; RoutingPool::COUNT],
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
     pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
@@ -205,7 +210,7 @@ impl ModelWorkerSnapshot {
         Self {
             all,
             pools: std::array::from_fn(|_| OnceLock::new()),
-            cells: std::array::from_fn(|_| ListCell::default()),
+            lent: std::array::from_fn(|_| OnceLock::new()),
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
             harmony: OnceLock::new(),
             window_floors: std::array::from_fn(|_| OnceLock::new()),
@@ -393,18 +398,24 @@ impl ModelWorkerSnapshot {
         })
     }
 
-    /// The list of `pool` as the policy engine is lent it: the pool's own
-    /// list ([`Self::pool`]) with the cell that stands beside it. The engine
+    /// The list of `pool` as Grand Central is lent it: the pool's own
+    /// list ([`Self::pool`]) with the cell that stands beside it and what
+    /// the gateway states of each worker ([`stated_facts`]). The engine
     /// keeps its value of the list in that cell from the list's first
     /// request on, and the value falls with this snapshot, as the list
-    /// does: a membership change publishes the next one with empty cells.
-    /// The gateway states no fact of a worker beside its object.
+    /// does: a membership change publishes the next one with none.
+    ///
+    /// The three are one [`PublishedList`], made at the list's first
+    /// lending and read from one place at every later one: a lending reads
+    /// no more than it did while the gateway stated no fact.
     pub(crate) fn lent(&self, pool: RoutingPool) -> LentList<'_> {
-        LentList {
-            workers: self.pool(pool),
-            cell: &self.cells[pool.index()],
-            facts: None,
-        }
+        self.lent[pool.index()]
+            .get_or_init(|| {
+                let workers = Arc::clone(self.pool(pool));
+                let facts = stated_facts(&workers);
+                PublishedList::stating(workers, facts)
+            })
+            .lent()
     }
 }
 

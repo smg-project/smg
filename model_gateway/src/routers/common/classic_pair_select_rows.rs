@@ -4,8 +4,8 @@
 //! overload thresholds or doubted by the liveness tracker), the KV transport
 //! each worker names, the policy each pool runs under, whether shedding is
 //! on, and what the gateway's pair placement answered at each request. The
-//! policy controller crate replays the rows through its own pair decision
-//! (`crates/policy_controller/tests/classic_rows.rs`).
+//! Grand Central crate replays the rows through its own pair decision
+//! (`crates/grand_central/tests/classic_rows.rs`).
 //!
 //! A request's answer is the pair it was placed on, each worker by its place
 //! in its pool's list, or no pair with the role the placement named and why.
@@ -24,13 +24,22 @@
 //! This file is an ignored test of the gateway crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
 //!   cargo test -p smg --lib routers::common::classic_pair_select_rows -- --ignored --nocapture
 //! ```
+//!
+//! That filter also runs this module's three child recorders
+//! ([`classic_pair_bound_rows`], [`classic_pair_runtime_rows`],
+//! [`classic_pair_named_rows`]), each of which writes a sheet of its own
+//! beside this one: their rows draw nothing. A row of the second is placed
+//! on the wire that carries one runtime's request, and names the runtime of
+//! a worker that is not on the sheet's own. A row of the third states the
+//! text its requests carry under `x-smg-target-worker`, and the pair a
+//! failed attempt was sent to where its requests are retries.
 //!
 //! A sequence row is recorded twenty times from fresh pools and fresh
 //! policies and must come out the same each time; a drawn row records how
@@ -39,6 +48,7 @@
 
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 
+use axum::http::HeaderMap;
 use openai_protocol::{
     model_card::ModelCard,
     worker::{WorkerSpec, WorkerStatus},
@@ -96,7 +106,9 @@ struct Rooms {
 
 /// One worker of a row: the requests the router holds on it, its state, the
 /// transport its registration names (`a`, `b` or none) and, for a decode
-/// that reports a running window, its rooms.
+/// that reports a running window, its rooms. A worker that is not on the
+/// sheet's one runtime names its own: `other`, a second known runtime, or
+/// `unknown`, none.
 #[derive(Clone, Copy, Serialize)]
 struct Member {
     in_flight: u32,
@@ -104,6 +116,8 @@ struct Member {
     transport: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rooms: Option<Rooms>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<&'static str>,
 }
 
 const fn member(in_flight: u32, state: State, transport: Option<&'static str>) -> Member {
@@ -112,6 +126,15 @@ const fn member(in_flight: u32, state: State, transport: Option<&'static str>) -
         state,
         transport,
         rooms: None,
+        runtime: None,
+    }
+}
+
+impl Member {
+    /// The member on `runtime`: `other` or `unknown`.
+    const fn on(mut self, runtime: &'static str) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 }
 
@@ -150,6 +173,18 @@ struct Row {
     /// the row runs behind it; a prefill holding that many has no capacity.
     #[serde(skip_serializing_if = "Option::is_none")]
     prefill_bound: Option<u32>,
+    /// The wire the row's pair is placed for, where it is not the plain
+    /// one: `grpc`, which carries one runtime's request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wire: Option<&'static str>,
+    /// The text the row's requests carry under `x-smg-target-worker`: the
+    /// worker they name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'static str>,
+    /// The pair a failed attempt of each request was sent to, where the
+    /// row's requests are retries: the prefill's place, then the decode's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tried: Option<(usize, usize)>,
     prefills: Vec<Member>,
     decodes: Vec<Member>,
     /// How many requests the row places, one after another.
@@ -177,9 +212,24 @@ fn config_of(policy: &str) -> PolicyConfig {
     serde_json::from_str(&text).expect("the policy's configuration")
 }
 
-fn worker(side: &str, place: usize, role: WorkerType, member: Member) -> Arc<dyn Worker> {
-    let mut spec = WorkerSpec::new(format!("http://{side}{place}:8000"));
-    spec.runtime_type = RuntimeType::Vllm;
+fn worker(
+    side: &str,
+    place: usize,
+    role: WorkerType,
+    member: Member,
+    wire: PdWire,
+) -> Arc<dyn Worker> {
+    let (scheme, mode) = match wire {
+        PdWire::Http => ("http", ConnectionMode::Http),
+        PdWire::Grpc => ("grpc", ConnectionMode::Grpc),
+    };
+    let mut spec = WorkerSpec::new(format!("{scheme}://{side}{place}:8000"));
+    spec.runtime_type = match member.runtime {
+        None => RuntimeType::Vllm,
+        Some("other") => RuntimeType::Sglang,
+        Some("unknown") => RuntimeType::Unspecified,
+        Some(runtime) => panic!("a row names no runtime {runtime}"),
+    };
     spec.kv_connector = member.transport.map(|transport| {
         if transport == "a" {
             TX_A.to_string()
@@ -194,7 +244,7 @@ fn worker(side: &str, place: usize, role: WorkerType, member: Member) -> Arc<dyn
     let worker = BasicWorkerBuilder::from_spec(spec)
         .model(ModelCard::new(MODEL))
         .worker_type(role)
-        .connection_mode(ConnectionMode::Http)
+        .connection_mode(mode)
         .labels(labels)
         .health_config(no_health_check())
         .build();
@@ -218,12 +268,17 @@ struct Bed {
 impl Bed {
     fn new(cell: &Cell) -> Self {
         let registry = WorkerRegistry::new();
+        let wire = match cell.wire {
+            None => PdWire::Http,
+            Some("grpc") => PdWire::Grpc,
+            Some(wire) => panic!("{}: a row names no wire {wire}", cell.name),
+        };
         let pool = |side: &str, role: WorkerType, members: &[Member]| -> Vec<Arc<dyn Worker>> {
             members
                 .iter()
                 .enumerate()
                 .map(|(place, &member)| {
-                    let worker = worker(side, place, role, member);
+                    let worker = worker(side, place, role, member, wire);
                     registry
                         .register(Arc::clone(&worker))
                         .expect("the worker registers");
@@ -245,7 +300,7 @@ impl Bed {
         let pairs = PdPairIndex::build(
             Arc::from(prefill_pool.clone()),
             Arc::from(decode_pool.clone()),
-            PdWire::Http,
+            wire,
             PdPairingMode::Lenient,
         );
         for (workers, members) in [
@@ -313,6 +368,17 @@ impl Bed {
     /// One request through the gateway's pair placement, behind the prefill
     /// admission when the row names its bound.
     fn pick(&self) -> Answer {
+        self.pick_with(None, &[])
+    }
+
+    /// [`Self::pick`] for a request that carries `headers` and that a failed
+    /// attempt already sent to the engines `tried`, each by its base URL.
+    fn pick_with(&self, headers: Option<&HeaderMap>, tried: &[String]) -> Answer {
+        let inputs = PlacementInputs {
+            headers,
+            tried,
+            ..PlacementInputs::default()
+        };
         let Some(admission) = &self.admission else {
             return self.answer(&select_pair(
                 &self.registry,
@@ -321,7 +387,7 @@ impl Bed {
                 &self.pairs,
                 None,
                 None,
-                PlacementInputs::default(),
+                inputs,
                 Stated::nothing,
             ));
         };
@@ -340,7 +406,7 @@ impl Bed {
                     &self.pairs,
                     None,
                     Some(capacity),
-                    PlacementInputs::default(),
+                    inputs,
                     Stated::nothing,
                 );
                 answer = Some(self.answer(&placed));
@@ -369,6 +435,7 @@ struct Cell {
     decode_policy: &'static str,
     shed: bool,
     prefill_bound: Option<u32>,
+    wire: Option<&'static str>,
     prefills: Vec<Member>,
     decodes: Vec<Member>,
 }
@@ -404,6 +471,9 @@ impl Cell {
             decode_policy: self.decode_policy,
             shed: self.shed,
             prefill_bound: self.prefill_bound,
+            wire: self.wire,
+            target: None,
+            tried: None,
             prefills: self.prefills,
             decodes: self.decodes,
             requests,
@@ -473,6 +543,7 @@ fn fleet(
         decode_policy: policies.1,
         shed,
         prefill_bound: None,
+        wire: None,
         prefills: vec![member(p0, s0, Some("a")), member(p1, s1, Some("b"))],
         decodes: vec![
             member(d0, t0, Some("a")),
@@ -922,6 +993,7 @@ fn rows() -> Vec<Row> {
         decode_policy: BY_COUNT,
         shed: false,
         prefill_bound: None,
+        wire: None,
         prefills,
         decodes,
     };
@@ -931,9 +1003,9 @@ fn rows() -> Vec<Row> {
     rows
 }
 
-#[test]
-#[ignore = "records the classic rows into CLASSIC_ROWS_OUT"]
-fn record_the_classic_pair_select_rows() {
+/// Writes `rows` as the sheet `file` of `policy` under `CLASSIC_ROWS_OUT`,
+/// naming `CLASSIC_ROWS_COMMIT` as the commit they were recorded from.
+fn write(file: &str, policy: &'static str, rows: Vec<Row>) {
     let out = PathBuf::from(
         std::env::var_os("CLASSIC_ROWS_OUT").expect("CLASSIC_ROWS_OUT names the output directory"),
     );
@@ -941,12 +1013,31 @@ fn record_the_classic_pair_select_rows() {
         std::env::var("CLASSIC_ROWS_COMMIT").expect("CLASSIC_ROWS_COMMIT names the commit");
     let sheet = Sheet {
         recorded_from: commit,
-        policy: "pair-select",
-        rows: rows(),
+        policy,
+        rows,
     };
     fs::create_dir_all(&out).expect("the output directory");
-    let path = out.join("pair_select.json");
+    let path = out.join(file);
     let text = serde_json::to_string_pretty(&sheet).expect("the sheet serializes");
     fs::write(&path, text + "\n").expect("the sheet is written");
     println!("{} rows -> {}", sheet.rows.len(), path.display());
 }
+
+#[test]
+#[ignore = "records the classic rows into CLASSIC_ROWS_OUT"]
+fn record_the_classic_pair_select_rows() {
+    write("pair_select.json", "pair-select", rows());
+}
+
+/// The rows behind the prefill admission's bound where a prefill that holds
+/// it has an open partner or none, on a sheet of their own.
+mod classic_pair_bound_rows;
+
+/// The rows of a pair on one known runtime beside workers of another or of
+/// none, on the wire that carries one runtime's request and on a sheet of
+/// their own.
+mod classic_pair_runtime_rows;
+
+/// The rows of a pair whose request names its worker, on a sheet of their
+/// own.
+mod classic_pair_named_rows;

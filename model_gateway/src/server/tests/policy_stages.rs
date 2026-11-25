@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
-use smg_policy_controller::{
+use smg_grand_central::{
     document::PolicySpec,
     engine::{Candidate, Constraints, Filter, RequestFacts, WorkerId},
     stages::StageRegistry,
@@ -59,7 +59,7 @@ fn host_stages() -> StageRegistry {
     stages
 }
 
-/// A gateway that runs the policy controller under a supplied document. Its
+/// A gateway that runs Grand Central under a supplied document. Its
 /// one profile filters by the host's stage and picks at random among the
 /// workers the stage kept.
 fn configuration() -> RouterConfig {
@@ -70,7 +70,7 @@ fn configuration() -> RouterConfig {
     }))
     .expect("a policy document");
     RouterConfig {
-        policy_controller: true,
+        grand_central: true,
         policy_spec: Some(document),
         ..RouterConfig::default()
     }
@@ -139,7 +139,7 @@ async fn the_stock_table_refuses_a_document_that_names_a_hosts_stage() {
         .hosted_policy(&document, &StageRegistry::builtin())
         .expect_err("the stock table holds no such stage");
     let ended = refusal(config, Extensions::new()).await;
-    assert_eq!(ended, format!("policy controller: {refused}"));
+    assert_eq!(ended, format!("Grand Central: {refused}"));
     assert!(ended.contains(&format!("{STAGE:?}")), "{ended}");
 }
 
@@ -154,7 +154,7 @@ async fn the_rank_option_beside_a_supplied_document_is_refused_by_name() {
     let host = Extensions::new().policy_stages(host_stages());
     let ended = refusal(config, host).await;
     assert!(
-        ended.starts_with("policy controller: dp_minimum_tokens_scheduler = true: "),
+        ended.starts_with("Grand Central: dp_minimum_tokens_scheduler = true: "),
         "{ended}"
     );
 }
@@ -178,5 +178,5 @@ async fn a_refused_document_ends_the_start_ahead_of_the_stores() {
         "{at_the_hook}"
     );
     let ended = refusal(config, Extensions::new()).await;
-    assert!(ended.starts_with("policy controller: "), "{ended}");
+    assert!(ended.starts_with("Grand Central: "), "{ended}");
 }

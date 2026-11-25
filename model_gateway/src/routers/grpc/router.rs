@@ -118,15 +118,15 @@ impl GrpcRouter {
         // What can fail here is the operator's own setting, so the router
         // stops rather than coming up with media handling quietly switched
         // off and every media request failing later for no stated reason.
-        let multimodal = Some(Arc::new(
-            MultimodalComponents::new(
-                ctx.multimodal_config_registry.clone(),
-                ctx.router_config.mm_per_request_image_limit,
-                ctx.router_config.multimodal_max_inflight_bytes,
-                mm_settings(),
-            )
-            .map_err(|e| format!("multimodal components: {e:#}"))?,
-        ));
+        let mut multimodal = MultimodalComponents::new(
+            ctx.multimodal_config_registry.clone(),
+            ctx.router_config.mm_per_request_image_limit,
+            ctx.router_config.multimodal_max_inflight_bytes,
+            mm_settings(),
+        )
+        .map_err(|e| format!("multimodal components: {e:#}"))?;
+        multimodal.pixels_go_to = mode.pixels_go_to();
+        let multimodal = Some(Arc::new(multimodal));
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {

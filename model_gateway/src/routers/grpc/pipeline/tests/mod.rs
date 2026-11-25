@@ -5,6 +5,7 @@ mod embeddings;
 mod generate_body;
 mod glm53;
 mod model_label;
+mod outcome;
 mod pretokenized;
 mod rate_limit_reserve;
 mod refusal_lines;
@@ -140,6 +141,14 @@ struct GatedScheduler {
     fail_always: bool,
     fail_internal: bool,
     fail_mid_stream: bool,
+    /// The call of this place, counted from zero, ends its stream with the
+    /// engine's own error a pace behind its first frame: the calls beside
+    /// it have ended by then.
+    fail_late: Option<usize>,
+    /// The call of this place, counted from zero, is refused as
+    /// `fail_first` refuses the first: UNAVAILABLE, and no stream.
+    fail_call: Option<usize>,
+    started: Arc<AtomicUsize>,
     fail_constraint: bool,
     fail_engine_report: bool,
     /// Send the first frame, then hold the stream open with nothing on
@@ -285,7 +294,11 @@ impl TokenSpeedScheduler for GatedScheduler {
                     })
                     .unwrap_or_default(),
             );
-        if self.fail_always || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0) {
+        let place = self.started.fetch_add(1, Ordering::SeqCst);
+        if self.fail_always
+            || self.fail_call == Some(place)
+            || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0)
+        {
             return Err(Status::unavailable("release-test induced failure"));
         }
         if self.fail_internal {
@@ -321,7 +334,8 @@ impl TokenSpeedScheduler for GatedScheduler {
         let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
         let released = Arc::clone(&self.released);
         let frame_gap = self.frame_gap;
-        let fail_mid_stream = self.fail_mid_stream;
+        let fail_late = self.fail_late == Some(place);
+        let fail_mid_stream = self.fail_mid_stream || fail_late;
         let hold_after_first = self.hold_after_first;
         let gate_after_first = self.gate_after_first.clone();
         tokio::spawn(async move {
@@ -334,6 +348,9 @@ impl TokenSpeedScheduler for GatedScheduler {
             {
                 if let Some(gap) = frame_gap {
                     tokio::time::sleep(gap).await;
+                }
+                if fail_late && index == 1 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
                 }
                 let frame = if fail_mid_stream && index == 1 {
                     Err(Status::internal(ENGINE_ERROR_MESSAGE))
@@ -4035,6 +4052,37 @@ async fn a_call_the_worker_never_answers_is_the_504_at_the_request_timeout() {
     let elapsed = started.elapsed();
     assert_timeout_response(response, elapsed).await;
     assert_eq!(worker.load(), 0, "the slot goes with the answer");
+}
+
+/// A worker that takes every call and answers nothing is taken out at its
+/// breaker's threshold when the requests come one after another: the call
+/// it took is no success for it, so the cut requests are failures in a row.
+#[tokio::test]
+async fn streamed_requests_one_after_another_to_a_silent_worker_open_its_breaker() {
+    let (pipeline, worker, _scheduler, components) =
+        silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+    for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+        let response = pipeline
+            .execute_completion(
+                completion(true),
+                None,
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                None,
+            )
+            .await;
+        // A streamed answer fails inside its body: it is read to its end.
+        tokio::time::timeout(
+            CASE_CAP,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the request timeout ends the body")
+        .expect("drain body");
+    }
+    assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
 }
 
 /// A worker that answers within the timeout is not touched by it: the

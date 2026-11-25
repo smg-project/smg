@@ -35,8 +35,8 @@ What it holds:
   `proto/common.proto`: the messages every engine's gRPC service shares.
 
 What it does not hold: **routing**. No routing policy lives here. Choosing a
-worker for a request is the job of the gateway and of the policy controller
-(`crates/policy_controller`).
+worker for a request is the job of the gateway and of Grand Central
+(`crates/grand_central`).
 
 On this page:
 

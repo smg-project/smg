@@ -95,6 +95,25 @@ impl ModelTrees {
         self.token_trees.len()
     }
 
+    /// Every model's token tree, copied out: a pass of the owner's over the
+    /// trees holds no lock of this store, so a model's first tree is not
+    /// kept waiting behind it.
+    pub fn token_trees(&self) -> Vec<Arc<TokenTree>> {
+        self.token_trees
+            .iter()
+            .map(|tree| Arc::clone(tree.value()))
+            .collect()
+    }
+
+    /// Every model's string tree, copied out as [`Self::token_trees`]
+    /// copies the token trees.
+    pub fn string_trees(&self) -> Vec<Arc<Tree>> {
+        self.string_trees
+            .iter()
+            .map(|tree| Arc::clone(tree.value()))
+            .collect()
+    }
+
     /// Inserts the empty prompt for `tenant` in the two trees of `model_id`,
     /// making them where the model is new. The string tree then holds the
     /// tenant at its root and routes to it before it has served a request.
@@ -109,11 +128,18 @@ impl ModelTrees {
     /// worker's tenant count never grows again, so size-based eviction alone
     /// would retain its subtree forever.
     pub fn remove_tenant(&self, tenant: &TenantId) {
-        for tree_ref in &self.string_trees {
-            tree_ref.value().remove_tenant_all(tenant);
+        // Copied out, as `token_trees` copies: a purge can make three passes
+        // over a tree, and it runs under no lock of this store.
+        let string_trees: Vec<Arc<Tree>> = self
+            .string_trees
+            .iter()
+            .map(|tree| Arc::clone(tree.value()))
+            .collect();
+        for tree in string_trees {
+            tree.remove_tenant_all(tenant);
         }
-        for tree_ref in &self.token_trees {
-            tree_ref.value().remove_tenant_all(tenant);
+        for tree in self.token_trees() {
+            tree.remove_tenant_all(tenant);
         }
     }
 
@@ -132,7 +158,7 @@ impl ModelTrees {
         }
     }
 
-    /// Evicts every model's string tree down to `max_size` characters
+    /// Evicts every model's string tree down to the size `max_size`
     /// ([`Tree::evict_tenant_by_size`]) and hands each tree to `each` once
     /// its own eviction is done. `each` runs under the read guard of the
     /// model's map entry: it must not make a tree of this store.
@@ -158,6 +184,7 @@ impl ModelTrees {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::string_tree::NODE_WEIGHT;
 
     fn tenant(name: &str) -> TenantId {
         TenantId::from(name)
@@ -189,6 +216,34 @@ mod tests {
         assert_eq!(token.page_size(), 4);
         // A page of no tokens is a page of one.
         assert_eq!(ModelTrees::new(0).token_tree_or_new("a").page_size(), 1);
+    }
+
+    #[test]
+    fn every_models_token_tree_is_handed_out_and_no_string_tree() {
+        let trees = ModelTrees::new(4);
+        assert!(trees.token_trees().is_empty());
+        trees.string_tree_or_new("c");
+        let made = [trees.token_tree_or_new("a"), trees.token_tree_or_new("b")];
+
+        let handed = trees.token_trees();
+        assert_eq!(handed.len(), 2);
+        for tree in &made {
+            assert!(handed.iter().any(|other| Arc::ptr_eq(other, tree)));
+        }
+    }
+
+    #[test]
+    fn every_models_string_tree_is_handed_out_and_no_token_tree() {
+        let trees = ModelTrees::new(4);
+        assert!(trees.string_trees().is_empty());
+        trees.token_tree_or_new("c");
+        let made = [trees.string_tree_or_new("a"), trees.string_tree_or_new("b")];
+
+        let handed = trees.string_trees();
+        assert_eq!(handed.len(), 2);
+        for tree in &made {
+            assert!(handed.iter().any(|other| Arc::ptr_eq(other, tree)));
+        }
     }
 
     #[test]
@@ -245,7 +300,7 @@ mod tests {
                     .map(|worker| (worker.to_string(), size))
                     .collect()
             };
-            assert_eq!(chars, sized(6), "model {model}");
+            assert_eq!(chars, sized(6 + NODE_WEIGHT), "model {model}");
             assert_eq!(tokens, sized(2), "model {model}");
         }
     }
@@ -264,14 +319,15 @@ mod tests {
         trees.string_tree_or_new("c").insert_text("short", "w1");
 
         let mut strings = Vec::new();
-        trees.evict_string_trees(13, |model, tree| {
+        trees.evict_string_trees(13 + NODE_WEIGHT, |model, tree| {
             strings.push((model.to_string(), tree.total_char_size()));
         });
         strings.sort();
-        // 25 characters a model before: the older prompt leaves, and a tree
-        // under the bound keeps what it holds.
-        let named =
-            |sizes: [(&str, usize); 3]| sizes.map(|(model, size)| (model.to_string(), size));
+        // Two prompts of 25 characters a model before, one node each: the
+        // older prompt leaves, and a tree under the bound keeps what it holds.
+        let named = |sizes: [(&str, usize); 3]| {
+            sizes.map(|(model, chars)| (model.to_string(), chars + NODE_WEIGHT))
+        };
         assert_eq!(strings, named([("a", 13), ("b", 13), ("c", 5)]));
 
         let mut tokens = Vec::new();
@@ -281,6 +337,9 @@ mod tests {
         tokens.sort();
         assert_eq!(tokens, [("a".to_string(), 4), ("b".to_string(), 4)]);
         // The token trees' pass left the string trees alone.
-        assert_eq!(trees.string_tree("a").unwrap().total_char_size(), 13);
+        assert_eq!(
+            trees.string_tree("a").unwrap().total_char_size(),
+            13 + NODE_WEIGHT
+        );
     }
 }

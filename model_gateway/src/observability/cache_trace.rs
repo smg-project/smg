@@ -396,6 +396,74 @@ pub(crate) fn selection(
     });
 }
 
+/// The rows a request's capture keeps at most. A row past them is dropped
+/// and marks the record truncated. [`selection`] states the same bound in
+/// place.
+const MAX_SELECTIONS: usize = 16;
+
+/// What a selection observed of its candidates, held by its caller until
+/// the selection's row is written ([`selection_of`]): the candidates,
+/// whether they are all of the list, and the reading's two instants.
+pub(crate) struct Observed {
+    candidates: Vec<Candidate>,
+    candidates_complete: bool,
+    started_ns: u64,
+    finished_ns: u64,
+}
+
+/// A list's candidates as a selection observes them where its pick is about
+/// to run ([`begin_selection`]), handed to the caller and not kept in the
+/// request's capture. It is for a call that may pick from two lists and
+/// answers workers, not places in a list: its caller reads each list ahead
+/// of the call and writes a row for each pick behind it
+/// ([`selection_of`]). `None` where nothing is captured for the request,
+/// which is one lookup.
+pub(crate) fn observe(workers: &[Arc<dyn Worker>]) -> Option<Observed> {
+    CAPTURE
+        .try_with(|_| {
+            let mut read = Capture::default();
+            read.observe_candidates(workers);
+            Observed {
+                candidates: read.candidates,
+                candidates_complete: read.candidates_complete,
+                started_ns: read.observation_started_ns,
+                finished_ns: read.observation_finished_ns,
+            }
+        })
+        .ok()
+}
+
+/// The row of the selection whose candidates `observed` holds: `policy` and
+/// `origin` as [`selection`] takes them, and `worker` the worker picked,
+/// `None` where the call picked nobody. The row holds no prediction, score
+/// or gate: the call that picked wrote none.
+pub(crate) fn selection_of(
+    policy: &'static str,
+    origin: &'static str,
+    observed: Observed,
+    worker: Option<&Arc<dyn Worker>>,
+) {
+    let _ = CAPTURE.try_with(|capture| {
+        let mut capture = capture.borrow_mut();
+        if capture.selections.len() >= MAX_SELECTIONS {
+            capture.truncated = true;
+            return;
+        }
+        capture.selections.push(Selection {
+            policy,
+            origin,
+            worker: worker.map(Arc::clone),
+            prediction: Value::Null,
+            candidates: observed.candidates,
+            candidates_complete: observed.candidates_complete,
+            observation_started_ns: observed.started_ns,
+            observation_finished_ns: observed.finished_ns,
+            scores: Vec::new(),
+            gates: Vec::new(),
+        });
+    });
+}
+
 pub(crate) fn dispatch(
     root_id: Option<&str>,
     attempt: u32,
@@ -661,6 +729,89 @@ mod tests {
             assert_eq!(rows[1]["candidates_complete"], false);
             assert_eq!(rows[1]["candidates"][31]["worker"], "grpc://w31:50051");
             assert_eq!(rows[1]["worker"], "grpc://w32:50051");
+        })
+        .await;
+    }
+
+    /// A caller whose one call picks from two lists reads both ahead of the
+    /// call and writes a row for each behind it. Each row lists its own
+    /// list as it stood at the reading, whatever the call credited since,
+    /// under the caller's policy and origin, with the worker handed or
+    /// none, and with no prediction, score or gate. A list read and never
+    /// written leaves no row. Nothing is read where no capture is in scope.
+    /// A row past the bound ([`MAX_SELECTIONS`]) is dropped and marks the
+    /// record truncated, and the classic writer's own bound is the same.
+    #[tokio::test]
+    async fn a_row_of_a_list_read_ahead_is_the_list_as_it_was_read() {
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+        let worker = |url: &str| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>;
+        let prefills = vec![worker("grpc://p1:50051"), worker("grpc://p2:50051")];
+        let decodes = vec![worker("grpc://d1:50051")];
+        assert!(observe(&prefills).is_none(), "no capture is in scope");
+        // A list as a row lists it, read from its workers as they stand.
+        let listed = |list: &[Arc<dyn Worker>]| -> Vec<Value> {
+            let candidate = |worker: &Arc<dyn Worker>| {
+                json!({
+                    "worker": worker.redacted_url(), "load": worker.load(), "healthy": worker.is_healthy(),
+                    "overloaded": worker.is_overloaded(), "registry_revision": worker.revision(),
+                    "backend_cache_epoch": null,
+                    "backend_cache_epochs": [],
+                    "backend_cache_epoch_source": "registration_metadata",
+                })
+            };
+            list.iter().map(candidate).collect()
+        };
+        scope(true, async {
+            let read = |list: &[Arc<dyn Worker>]| observe(list).expect("a capture is in scope");
+            let (first, second, unwritten) = (read(&prefills), read(&decodes), read(&decodes));
+            let as_read = (listed(&prefills), listed(&decodes));
+            // Behind the reading: the call's own credit.
+            prefills[1].increment_load();
+            decodes[0].increment_load();
+            assert_ne!(listed(&prefills), as_read.0, "the credit moved the list");
+            selection_of("bucket", "engine", first, Some(&prefills[1]));
+            selection_of("round_robin", "engine", second, None);
+            drop(unwritten);
+            let rows = captured_selections();
+            let expected = |policy: &str, worker: Value, candidates: &[Value], row: &Value| {
+                json!({
+                    "policy": policy, "origin": "engine", "worker": worker,
+                    "prediction": null,
+                    "candidates": candidates,
+                    "candidates_complete": true,
+                    "observation_started_ns": row["observation_started_ns"],
+                    "observation_finished_ns": row["observation_finished_ns"],
+                    "snapshot_atomic": false,
+                    "scores": [],
+                    "load_source": "router_inflight", "eligibility_scope": "policy_candidates",
+                    "load_observation_phase": "before_selection",
+                    "gates": [],
+                })
+            };
+            assert_eq!(
+                rows,
+                [
+                    expected("bucket", json!("grpc://p2:50051"), &as_read.0, &rows[0]),
+                    expected("round_robin", Value::Null, &as_read.1, &rows[1]),
+                ]
+            );
+            // One short of the bound: the classic writer, which states the
+            // same bound in place, writes the last row the bound admits.
+            for _ in 2..MAX_SELECTIONS - 1 {
+                selection_of("round_robin", "engine", read(&decodes), None);
+            }
+            begin_selection(&decodes);
+            selection("round_robin", "policy", &decodes, None);
+            let truncated = || CAPTURE.with(|capture| capture.borrow().truncated);
+            assert_eq!(captured_selections().len(), MAX_SELECTIONS);
+            assert!(!truncated(), "the bound's rows are the record's whole");
+            // Neither writer adds a row past it.
+            selection_of("round_robin", "engine", read(&decodes), None);
+            assert_eq!(captured_selections().len(), MAX_SELECTIONS);
+            assert!(truncated(), "a row past the bound is not kept");
+            begin_selection(&decodes);
+            selection("round_robin", "policy", &decodes, None);
+            assert_eq!(captured_selections().len(), MAX_SELECTIONS);
         })
         .await;
     }

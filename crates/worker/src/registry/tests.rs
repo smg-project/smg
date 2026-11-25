@@ -1566,7 +1566,7 @@ fn the_model_index_keeps_a_fixed_shard_count() {
 }
 
 /// The per-model retry overrides are scanned on a request path, as the model
-/// index is counted on one, so their map keeps the same fixed shard count.
+/// index is listed on one, so their map keeps the same fixed shard count.
 #[test]
 fn the_retry_override_map_keeps_a_fixed_shard_count() {
     use dashmap::Map as _;
@@ -2146,6 +2146,64 @@ fn test_model_alias_resolves_to_canonical_model() {
     assert!(registry.get_by_model("glm-5.2-coding").is_empty());
     assert_eq!(registry.get_models(), vec!["GLM-5.2"]);
     assert_eq!(registry.stats().total_models, 1);
+}
+
+/// The count of served models goes up where a model takes its first worker
+/// and down where it loses its last: behind each of those writes it reads
+/// what a walk of the index reads, and it is read beside a writer of the
+/// index.
+#[test]
+fn the_model_count_is_kept_where_a_model_enters_and_leaves_the_index() {
+    use std::sync::mpsc;
+
+    let registry = WorkerRegistry::new();
+    let regular =
+        |url: &str, model: &str| worker_with_model_aliases(url, model, &[], WorkerType::Regular);
+    let counts = || (registry.model_count(), registry.get_models().len());
+
+    // A model enters with its first worker, not with its second.
+    let first = registry
+        .register(regular("http://llama-1:8080", "llama"))
+        .unwrap();
+    let second = registry
+        .register(regular("http://llama-2:8080", "llama"))
+        .unwrap();
+    assert_eq!(counts(), (1, 1));
+    let third = registry
+        .register(regular("http://qwen:8080", "qwen"))
+        .unwrap();
+    assert_eq!(counts(), (2, 2));
+
+    // It leaves with its last worker, not with its first.
+    registry.remove(&first).unwrap();
+    assert_eq!(counts(), (2, 2));
+    registry.remove(&second).unwrap();
+    assert_eq!(counts(), (1, 1));
+
+    // An entry that a removal emptied and has not evicted yet takes a
+    // worker again.
+    registry
+        .model_index
+        .insert("llama".to_string(), Arc::clone(&registry.empty_generation));
+    assert_eq!(counts(), (1, 1));
+    registry
+        .register(regular("http://llama-3:8080", "llama"))
+        .unwrap();
+    assert_eq!(counts(), (2, 2));
+    assert_eq!(registry.stats().total_models, 2);
+
+    // A writer holds a shard of the index: the count is read beside it.
+    let writing = registry.model_index.get_mut("qwen").unwrap();
+    let (said, heard) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| said.send(registry.model_count()));
+        let read = heard.recv_timeout(std::time::Duration::from_secs(5));
+        drop(writing);
+        assert_eq!(read, Ok(2), "the count waits for no writer of the index");
+    });
+
+    registry.remove(&third).unwrap();
+    assert_eq!(counts(), (1, 1));
 }
 
 #[test]
@@ -2956,6 +3014,50 @@ fn clear_all_overload_flags_resets_every_model() {
     assert!(!b.is_overloaded());
     assert_eq!(registry.overloaded_worker_count("m1"), 0);
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
+}
+
+/// The registry counts its overload edges for a host's read: one a veto
+/// that changed, either way, a clear of every flag among them. A verdict
+/// said again counts nothing, and a worker the registry does not hold
+/// counts nothing. The replacement and the removal of an overloaded worker
+/// lower its flag, an edge each, and those of a worker with no flag count
+/// nothing.
+#[test]
+fn an_overload_edge_is_counted_once_and_a_verdict_said_again_is_not() {
+    let registry = WorkerRegistry::new();
+    let a = overload_worker("http://127.0.0.1:9711", "m");
+    let b = overload_worker("http://127.0.0.1:9712", "m");
+    let a_id = registry.register(Arc::clone(&a)).unwrap();
+    let b_id = registry.register(Arc::clone(&b)).unwrap();
+    assert_eq!(registry.overload_edges(), 0);
+
+    assert!(registry.set_worker_overloaded(&a, true));
+    assert!(!registry.set_worker_overloaded(&a, true));
+    assert_eq!(registry.overload_edges(), 1, "said again: no edge");
+    assert!(registry.set_worker_overloaded(&b, true));
+    assert!(registry.set_worker_overloaded(&a, false));
+    assert_eq!(registry.overload_edges(), 3, "either way is an edge");
+
+    assert_eq!(registry.clear_all_overload_flags(), 1);
+    assert_eq!(registry.overload_edges(), 4, "a clear is an edge a flag");
+
+    let stranger = overload_worker("http://127.0.0.1:9713", "m");
+    assert!(!registry.set_worker_overloaded(&stranger, true));
+    assert_eq!(registry.overload_edges(), 4, "no worker of the registry's");
+
+    assert!(registry.set_worker_overloaded(&a, true));
+    assert!(registry.set_worker_overloaded(&b, true));
+    let again = overload_worker("http://127.0.0.1:9711", "m");
+    assert!(registry.replace(&a_id, again));
+    assert_eq!(
+        registry.overload_edges(),
+        7,
+        "a replacement lowers the flag"
+    );
+    assert!(registry.remove(&b_id).is_some());
+    assert_eq!(registry.overload_edges(), 8, "a removal lowers the flag");
+    assert!(registry.remove(&a_id).is_some());
+    assert_eq!(registry.overload_edges(), 8, "no flag to lower: no edge");
 }
 
 /// A removed worker's address stays retired in the series store while a

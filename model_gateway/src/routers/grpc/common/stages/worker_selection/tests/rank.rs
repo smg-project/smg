@@ -1,7 +1,7 @@
 //! A pair's decode side over an engine of several ranks, each rank a worker
-//! object of its own, where the policy engine places the pair.
+//! object of its own, where Grand Central places the pair.
 
-use smg_policy_controller::{
+use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{Candidate, RequestFacts, Scorer, TieBand},
     stages::{Lifecycle, StageRegistry},
