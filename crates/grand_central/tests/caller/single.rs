@@ -34,7 +34,7 @@ use smg_worker::{
 use tokio::{task::JoinHandle, time::sleep};
 
 use crate::{
-    program::{settings, Answer, Asked, Program, ATTEMPTS},
+    program::{settings, Answer, Asked, InFlight, Program, Stated, ATTEMPTS},
     served, started, under, url, worker, workers, MODEL,
 };
 
@@ -44,6 +44,13 @@ const PLAIN: Asked<'static> = Asked {
     headers: None,
     items: &[],
 };
+
+/// A first attempt of [`PLAIN`], placed for a case that keeps the attempt
+/// itself.
+fn placed(program: &Program) -> InFlight {
+    let placed = program.place(&PLAIN, Stated::default());
+    placed.expect("a placement")
+}
 
 /// How often each worker was sent to over `answers`, by its address.
 fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeMap<&'a str, u32> {
@@ -446,11 +453,11 @@ async fn the_engine_hears_each_requests_end() {
     ];
     assert_eq!(taken(&heard), [failed, served].concat());
 
-    let unsent = program.place(&PLAIN, 0, &[]).expect("a placement");
+    let unsent = placed(&program);
     drop(unsent);
     assert_eq!(taken(&heard), ["issued", "released Abandoned"]);
 
-    let mut cut = program.place(&PLAIN, 0, &[]).expect("a placement");
+    let mut cut = placed(&program);
     cut.sent();
     drop(cut);
     let cancelled = taken(&heard);
@@ -458,14 +465,14 @@ async fn the_engine_hears_each_requests_end() {
     assert!(cancelled[2].ends_with("Cancelled"), "{cancelled:?}");
     assert_eq!(cancelled.len(), 3);
 
-    let mut streamed = program.place(&PLAIN, 0, &[]).expect("a placement");
+    let mut streamed = placed(&program);
     streamed.sent();
     let ended = thread::spawn(move || streamed.ended(Side::Single, 200));
     ended.join().expect("the stream's thread ends");
     assert_eq!(taken(&heard), ["issued", "dispatched", "completed 200 Ok"]);
 
     for (status, class) in [(404, "ClientError"), (408, "Timeout"), (504, "Timeout")] {
-        let mut ended = program.place(&PLAIN, 0, &[]).expect("a placement");
+        let mut ended = placed(&program);
         ended.sent();
         ended.ended(Side::Single, status);
         let completed = format!("completed {status} {class}");
@@ -579,7 +586,7 @@ fn a_request_is_placed_over_the_generation_that_stands() {
     // A request is under way on the worker that leaves.
     let leaving = url(1);
     let mut under_way = loop {
-        let attempt = program.place(&PLAIN, 0, &[]).expect("a placement");
+        let attempt = placed(&program);
         if attempt.placement.worker.url() == leaving {
             break attempt;
         }

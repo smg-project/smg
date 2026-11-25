@@ -358,7 +358,11 @@ fn a_pair_is_placed_over_the_generation_that_stands() {
 /// under `prefill` and its decode side under `decode`, with the decode
 /// picked `when`. The settings hold no word for when a pair's decode is
 /// picked: it is the document's own (`plans.pd-pair.decode`).
-fn picked(when: DecodePick, prefill: PolicySettings, decode: PolicySettings) -> PolicySpec {
+pub(crate) fn picked(
+    when: DecodePick,
+    prefill: PolicySettings,
+    decode: PolicySettings,
+) -> PolicySpec {
     let settings = RoutingSettings {
         mode: ModeSettings::PrefillDecode {
             prefill_policy: None,
@@ -374,7 +378,7 @@ fn picked(when: DecodePick, prefill: PolicySettings, decode: PolicySettings) -> 
 
 /// The program under `document` over `fleet`, with a route that sends a
 /// pair's decode behind its prefill's answer.
-fn in_turn(
+pub(crate) fn in_turn(
     document: &PolicySpec,
     fleet: &[Arc<dyn Worker>],
     sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
