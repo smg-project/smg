@@ -608,15 +608,16 @@ pub struct ChatCompletionRequest {
 
     /// Return the prompt as rendered for the model. With `true` the answer
     /// carries `prompt_text` ([`ChatCompletionResponse::prompt_text`]; on a
-    /// stream, [`ChatCompletionStreamResponse::prompt_text`]): the chat
+    /// stream, [`ChatCompletionStreamResponse::prompt_text`]) where the path
+    /// that serves the request returns it (that field says which): the chat
     /// template's output for this request, with the special tokens and the
     /// generation prefix the template wrote. Encoding that string anew need
-    /// not give the token
-    /// ids the model received: text of a message that spells a special token
-    /// is encoded as plain text in the prompt, and as that token when the
-    /// whole string is encoded again.
-    /// Serialized only when `true`, so a worker that is sent the request
-    /// reads the key only where the client asked.
+    /// not give the token ids the model received: where the text of a
+    /// message is encoded as plain text in the prompt, text that spells a
+    /// special token becomes that token when the whole string is encoded
+    /// again.
+    /// This type serializes the key only when `true`; a path that forwards
+    /// the client's own bytes forwards the key as the client wrote it.
     #[serde(
         default,
         deserialize_with = "deserialize_null_as_false",

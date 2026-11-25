@@ -1585,6 +1585,16 @@ async fn the_rendered_prompt_rides_the_first_opening_chunk_alone() {
             .all(|event| event.get("prompt_text").is_none()),
         "{events:?}"
     );
+    // The chunk with the prompt opens its choice with the whole opening
+    // delta, as the chunk that opens the other choice does.
+    let plain_opener = events[1..]
+        .iter()
+        .find(|event| event["choices"][0]["index"] == 0)
+        .expect("the other choice opens");
+    assert_eq!(
+        events[0]["choices"][0]["delta"], plain_opener["choices"][0]["delta"],
+        "{events:?}"
+    );
 }
 
 /// The rendered prompt's chunk is a frame of its own, the body's first, and
@@ -1593,92 +1603,98 @@ async fn the_rendered_prompt_rides_the_first_opening_chunk_alone() {
 /// so the reading yields twice at the first token's hand-off and the
 /// connection's next pull is pending. With one yield that pull would run the
 /// reading on through the engine messages ready behind the first token and
-/// return the burst's frame instead.
+/// return the burst's frame instead. A first token's frame that reaches the
+/// flush bound leaves from inside its turn, and is handed off as the small
+/// one is. Behind a first output that writes no byte the prompt's frame has
+/// left where it was sent, so it does not pass for the first token's frame.
 #[tokio::test]
 async fn the_first_tokens_frame_behind_the_prompts_is_pending_before_the_burst_is_read() {
-    // Four chunks ready at once: the first token, then a burst behind it.
-    let (stream, server) = scripted_stream(
-        vec![
-            chunk(0, "a"),
+    for mut script in [
+        vec![chunk(0, "a")],
+        vec![chunk(0, &"a".repeat(CHUNK_FLUSH_BYTES))],
+        vec![chunk_of_ids(0, Vec::new()), chunk(0, "a")],
+    ] {
+        // The chunks are ready at once: the first token, then a burst
+        // behind it.
+        script.extend([
             chunk(0, "b"),
             chunk(0, "c"),
             chunk(0, "d"),
             complete(0, "stop"),
-        ],
-        "0",
-    )
-    .await;
-    let (tx, rx) = driven_channel();
-    let processor = processor(false);
-    let mut spec = chat_spec(false);
-    spec.prompt_text = Some("user: hi\nassistant: ".to_string());
-    let reading = async move {
-        let result = processor
-            .process_streaming_chunks(
-                stream,
-                dispatch(),
-                Arc::new(CharacterTokenizer::default()),
-                (None, None, false, false, false),
-                spec,
-                &tx,
-                None,
-            )
-            .await;
-        assert!(result.is_ok(), "{result:?}");
-        ReadingEnd::Complete
-    };
-    let mut body = DrivenBody::new(Box::pin(reading), rx);
-    // The prompt's chunk (the body's own yield follows it), then the first
-    // token's frame.
-    let mut frames = Vec::new();
-    loop {
-        let frame = body
-            .next()
-            .await
-            .expect("the body ends only after the first token")
-            .expect("a write");
-        let text = String::from_utf8(frame.to_vec()).expect("text");
-        let first_token = text.contains(r#""content":"a""#);
-        frames.push(text);
-        if first_token {
-            break;
+        ]);
+        let (stream, server) = scripted_stream(script, "0").await;
+        let (tx, rx) = driven_channel();
+        let processor = processor(false);
+        let mut spec = chat_spec(false);
+        spec.prompt_text = Some("user: hi\nassistant: ".to_string());
+        let reading = async move {
+            let result = processor
+                .process_streaming_chunks(
+                    stream,
+                    dispatch(),
+                    Arc::new(CharacterTokenizer::default()),
+                    (None, None, false, false, false),
+                    spec,
+                    &tx,
+                    None,
+                )
+                .await;
+            assert!(result.is_ok(), "{result:?}");
+            ReadingEnd::Complete
+        };
+        let mut body = DrivenBody::new(Box::pin(reading), rx);
+        // The prompt's chunk (the body's own yield follows it), then the first
+        // token's frame.
+        let mut frames = Vec::new();
+        loop {
+            let frame = body
+                .next()
+                .await
+                .expect("the body ends only after the first token")
+                .expect("a write");
+            let text = String::from_utf8(frame.to_vec()).expect("text");
+            let first_token = text.contains(r#""content":"a"#);
+            frames.push(text);
+            if first_token {
+                break;
+            }
         }
+        assert_eq!(
+            frames.len(),
+            2,
+            "the prompt's chunk, then the first token's frame: {frames:?}"
+        );
+        assert!(
+            frames[0].contains(r#""prompt_text":"user: hi\nassistant: ""#)
+                && frames[0].contains(r#""role":"assistant""#),
+            "the body's first frame opens the choice with the prompt: {frames:?}"
+        );
+        assert!(
+            !frames[1].contains("prompt_text"),
+            "the first token's frame carries no prompt: {frames:?}"
+        );
+        // The pull after it: pending, so the connection writes the first
+        // token's frame before the reading runs on. With one yield at the
+        // hand-off it is the burst's frame.
+        let next = pull(&mut body).await;
+        assert!(
+            next.is_pending(),
+            "the pull after the first token's frame must be pending, not a frame: {next:?}"
+        );
+        let rest: Vec<String> = body
+            .map(|frame| String::from_utf8(frame.expect("a write").to_vec()).expect("text"))
+            .collect()
+            .await;
+        server.abort();
+        assert!(
+            rest.iter().any(|frame| frame.contains(r#""content":"b""#)),
+            "the burst follows: {rest:?}"
+        );
+        assert!(
+            rest.iter().all(|frame| !frame.contains("prompt_text")),
+            "no later frame carries the prompt: {rest:?}"
+        );
     }
-    assert_eq!(
-        frames.len(),
-        2,
-        "the prompt's chunk, then the first token's frame: {frames:?}"
-    );
-    assert!(
-        frames[0].contains(r#""prompt_text":"user: hi\nassistant: ""#)
-            && frames[0].contains(r#""role":"assistant""#),
-        "the body's first frame opens the choice with the prompt: {frames:?}"
-    );
-    assert!(
-        !frames[1].contains("prompt_text"),
-        "the first token's frame carries no prompt: {frames:?}"
-    );
-    // The pull after it: pending, so the connection writes the first
-    // token's frame before the reading runs on. With one yield at the
-    // hand-off it is the burst's frame.
-    let next = pull(&mut body).await;
-    assert!(
-        next.is_pending(),
-        "the pull after the first token's frame must be pending, not a frame: {next:?}"
-    );
-    let rest: Vec<String> = body
-        .map(|frame| String::from_utf8(frame.expect("a write").to_vec()).expect("text"))
-        .collect()
-        .await;
-    server.abort();
-    assert!(
-        rest.iter().any(|frame| frame.contains(r#""content":"b""#)),
-        "the burst follows: {rest:?}"
-    );
-    assert!(
-        rest.iter().all(|frame| !frame.contains("prompt_text")),
-        "no later frame carries the prompt: {rest:?}"
-    );
 }
 
 #[tokio::test]

@@ -3810,7 +3810,13 @@ impl<'a> ChatStream<'a> {
         self.tx
             .send(Ok(own.freeze()))
             .await
-            .map_err(|_| "Failed to send first chunk".to_string())
+            .map_err(|_| "Failed to send first chunk".to_string())?;
+        // The body driving this reading hands the prompt's frame out on this
+        // yield (see `DrivenBody`), so the channel is empty behind it: a
+        // frame that sits there at the top of the reading's loop before the
+        // first token's hand-off is a data frame ([`Self::read_engine`]).
+        tokio::task::yield_now().await;
+        Ok(())
     }
 
     /// Whether the choice's opening chunk went out. The check sits before
@@ -3956,7 +3962,13 @@ impl<'a> ChatStream<'a> {
                     } else {
                         let frame_out = !self.sse_buffer.is_empty();
                         StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
-                        if frame_out && self.first_token_time.is_some() {
+                        // Behind the prompt's chunk a first data frame
+                        // that reached the flush bound left from inside
+                        // its turn and sits in the channel: it is handed
+                        // off as a frame that leaves here is.
+                        if self.first_token_time.is_some()
+                            && (frame_out || (self.prompt_frame_out && self.tx.capacity() == 0))
+                        {
                             self.first_token_out = true;
                             // The first token's frame reaches the
                             // connection before the engine is read

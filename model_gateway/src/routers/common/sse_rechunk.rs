@@ -449,9 +449,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
         if let Some(delta) = &delta {
             self.inspect_delta(delta, &mut shape);
         }
-        if choices.len() == 1 {
-            self.update_envelope(event);
-        }
+        let brings_prompt = choices.len() == 1 && self.update_envelope(event);
 
         let structural = Structural {
             event,
@@ -465,7 +463,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
         // An event that brings the rendered prompt and would leave as
         // synthesized text alone goes out as an opening one: an event of
         // its own carries the key, ahead of the event's text.
-        let opens = shape.opens || (!shape.closes && event.get(PROMPT_TEXT).is_some());
+        let opens = shape.opens || (brings_prompt && !shape.closes);
         match (opens, shape.closes) {
             (true, true) => {
                 self.flush(out);
@@ -527,13 +525,19 @@ impl<O: DeltaObserver> SseRechunker<O> {
     /// Keeps the envelope, and the placeholder flag, in step with the latest
     /// event. A usage object leaves the flag as it was: that event closes the
     /// stream and goes out whole after the flush, so the flag keeps describing
-    /// the text buffered before it.
-    fn update_envelope(&mut self, event: &RawObject<'_>) {
+    /// the text buffered before it. Returns whether the event brought the
+    /// rendered prompt (`prompt_text`), which stays out of the envelope.
+    fn update_envelope(&mut self, event: &RawObject<'_>) -> bool {
         self.scratch.clear();
         self.scratch.push(b'{');
         let mut usage_null = Some(false);
+        let mut brings_prompt = false;
         for (key, value) in &event.entries {
-            if key == "choices" || key == PROMPT_TEXT {
+            if key == "choices" {
+                continue;
+            }
+            if key == PROMPT_TEXT {
+                brings_prompt = true;
                 continue;
             }
             if key == "usage" {
@@ -551,6 +555,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
         if let Some(usage_null) = usage_null {
             self.usage_null = usage_null;
         }
+        brings_prompt
     }
 
     fn push_text(&mut self, shape: &Shape<'_>, out: &mut Vec<u8>) {
@@ -1710,6 +1715,14 @@ mod tests {
         let evs = events(&run(&[role, content]));
         let prompts: Vec<&Value> = evs.iter().filter_map(|e| e.get("prompt_text")).collect();
         assert_eq!(prompts, [&Value::from("user: hi")], "{evs:?}");
+        // The key's event leaves ahead of the event's text.
+        let key_at = evs.iter().position(|e| e.get("prompt_text").is_some());
+        let text_at = evs.iter().position(|e| {
+            e["choices"][0]["delta"]["content"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        });
+        assert!(key_at < text_at, "{evs:?}");
         let text: String = evs
             .iter()
             .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
