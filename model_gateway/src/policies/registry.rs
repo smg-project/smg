@@ -299,7 +299,7 @@ pub struct PolicyRegistry {
     /// every request.
     engine: Arc<OnceLock<&'static InProcess>>,
 
-    /// The token trees Grand Central is lent, where its start asked
+    /// The trees Grand Central is lent, where its start asked
     /// for them ([`Self::lend_trees`]). A worker the registry lost is
     /// taken out of them by their own task
     /// ([`LentTrees::follow_removals`]).
@@ -945,7 +945,7 @@ impl PolicyRegistry {
         Arc::clone(self.lent_trees.get_or_init(made))
     }
 
-    /// The token trees Grand Central is lent, where its start asked
+    /// The trees Grand Central is lent, where its start asked
     /// for them: for a case that reads what the start made.
     #[cfg(test)]
     pub(crate) fn lent_trees(&self) -> Option<Arc<LentTrees>> {
