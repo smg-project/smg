@@ -1141,7 +1141,8 @@ impl PolicyRegistry {
     /// router's live in-flight count there (see
     /// [`LoadBalancingPolicy::reconcile_in_flight`]). The worker monitor
     /// calls this at every batch of a group's load answers, for every
-    /// worker of the group.
+    /// worker of the group but a handle that left an address another worker
+    /// holds now.
     pub fn reconcile_in_flight(&self, worker: &dyn Worker) {
         if !self.classic {
             return;

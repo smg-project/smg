@@ -374,8 +374,20 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         // booked on a worker to the requests the router still holds there,
         // the safety net behind the load guard's completion report. It runs
         // for every worker, polled or served by its stream, whether or not a
-        // fetch succeeded; the live count is the router's.
+        // fetch succeeded; the live count is the router's. A handle that
+        // left a URL another worker holds now is the one it skips.
         for worker in tick.workers {
+            // What is booked is kept by URL. Where the registry holds
+            // another worker at this URL, the count of the handle that left
+            // says nothing of it: the worker that came is trimmed at its own
+            // tick.
+            if self
+                .worker_registry
+                .get_by_url(worker.url())
+                .is_some_and(|held| !Arc::ptr_eq(&held, worker))
+            {
+                continue;
+            }
             self.load_consumer.reconcile_in_flight(worker.as_ref());
         }
         // The DP cache deliberately keeps last-known-good entries so routing
