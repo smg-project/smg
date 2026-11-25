@@ -1,10 +1,14 @@
-//! What a host reads of a generation and of a document's pass.
+//! What a host reads of a generation and of a document's pass, and the
+//! read every source's document passes ([`Format::read`]).
 
 use std::{fmt, time::SystemTime};
 
-use super::{Format, MAX_DOCUMENT_BYTES};
+use super::{
+    reader::{over_bound, Refused},
+    Format, MAX_DOCUMENT_BYTES,
+};
 use crate::{
-    document::spec::{Digest, Needs, SpecError},
+    document::spec::{Digest, Needs, PolicySpec, SpecError},
     engine::view::Phase,
     store::StaleGeneration,
 };
@@ -190,6 +194,26 @@ impl SpecRejected {
                 "generation".to_owned()
             }
         }
+    }
+}
+
+impl Format {
+    /// The document a source's bytes read as in this form: the size bound
+    /// first ([`MAX_DOCUMENT_BYTES`]), then this form's reader. Every
+    /// source's document is read here: the file a host starts from, an
+    /// apply and a controller's file. A document past the bound is refused
+    /// by its size, unread. One the reader refuses is refused under its
+    /// form's name, by the path of the field where the refusal is about one.
+    pub fn read(self, document: &[u8]) -> Result<PolicySpec, SpecRejected> {
+        if let Some(len) = over_bound(document) {
+            return Err(SpecRejected::TooLarge(len));
+        }
+        self.parse(document)
+            .map_err(|Refused { path, message, .. }| SpecRejected::Unparsed {
+                format: self.as_str(),
+                path,
+                message,
+            })
     }
 }
 
