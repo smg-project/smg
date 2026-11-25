@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use smg_grand_central::{
     engine::WireModes,
-    store::{MemoryStore, Overload, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{MemoryStore, Overload, Registrant, WorkerFacts, WorkersStore},
     worker_host::{load_monitor, Members, Objects},
 };
 use smg_worker::{
@@ -214,7 +214,7 @@ impl Bed {
             Laid::Whole | Laid::Ranks => vec![(ENGINE.to_string(), 0)],
         };
         for (key, rank) in &keys {
-            let written = store.upsert(WorkerFacts {
+            let facts = WorkerFacts {
                 key: key.clone(),
                 engine: ENGINE.to_string(),
                 incarnation: 1,
@@ -224,15 +224,13 @@ impl Bed {
                 wire_modes: WireModes::GRPC,
                 overload: own,
                 ..WorkerFacts::default()
-            });
-            let id = written.id();
+            };
+            let written = objects.upsert(&store, facts, Registrant::Control);
+            let id = written.ok_or("a write the store did not take")?.id();
             let stored = WorkersStore::get(&store, id).ok_or("no row behind its write")?;
-            store
-                .set_status(id, WorkerStatus::Ready, stored.revision)
-                .ok_or("a status the store did not take")?;
+            objects.connect_row(&store, id, stored.revision);
         }
         store.publish_now();
-        objects.follow(&store);
         let mut workers = Vec::with_capacity(keys.len());
         for (key, _) in &keys {
             let object = objects.registry().get_by_url(key);
