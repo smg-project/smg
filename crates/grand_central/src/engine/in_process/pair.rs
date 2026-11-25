@@ -1207,7 +1207,7 @@ fn later_shadow(
     let first = first_decode(held);
     let ran = own.caught(|| {
         let cx = &decode_cx;
-        Ok(engine.shadow_decode_later(at, facts, pool, pools, held.id, first, pick, cx, scratch))
+        Ok(engine.shadow_decode_later(at, facts, pool, pools, held.id, first, cx, scratch))
     });
     match ran {
         Ok(Some(shadow)) => {

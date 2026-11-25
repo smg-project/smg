@@ -1158,6 +1158,16 @@ pub struct Scratch {
     /// ([`FirstPartners`]). Where the pair is made among them they stand in
     /// `classes`, and this holds every class with a partner.
     firsts: Vec<u32>,
+    /// Whether the last pair decision's decode side read first partners
+    /// ([`FirstPartners`]): a pair made among them at its first decision,
+    /// or a decode decided again among its held prefill's. The entry that
+    /// chooses the partners writes it ([`Engine::decide_pair`],
+    /// [`Engine::decide_decode`]), and the decode's shadow reads the same
+    /// partners by it ([`Engine::shadow_side`],
+    /// [`Engine::shadow_decode_later`]). It is what the decision chose and
+    /// is never worked out of its pick: a pick the all-vetoed rule made
+    /// past a doubt can name a first partner where every partner was read.
+    among_first: bool,
     /// The encode side of an encode-pair decision, boxed: the entry moves
     /// one pointer out of the scratch while the pair entry holds the rest.
     encode: Option<Box<encode::EncodeScratch>>,
@@ -1235,8 +1245,9 @@ struct Buffers {
     /// tier on both sides' buffers ([`vetoed::paired`]). No other pass
     /// clears it, so a decision that reads it clears it first: a keyed
     /// request's ([`Engine::keep`]), and a pair's for the prefill's buffer
-    /// ([`Engine::decide_pair`]). There the default alone writes it again,
-    /// and the prefill's shadow reads it to know the default made the pair
+    /// ([`Engine::decide_pair`]). There the pair's default writes it again,
+    /// and so does a pick the weighing lift alone made possible. Each
+    /// side's shadow reads it there, and none is made beside such a pair
     /// ([`Engine::shadow_side`]).
     lifted: LiftedVeto,
     /// The pool size every buffer holds room for ([`Buffers::reserve`]).
@@ -4776,15 +4787,6 @@ impl<'a> PairPools<'a> {
         }
     }
 
-    /// Whether the pair `live` names was made among first partners: its
-    /// decode is a first partner of its prefill's class `class`. A side's
-    /// shadow is shown the partners its live side was shown.
-    fn made_first(&self, class: u32, live: &Pick) -> bool {
-        let decode = live.targets.first().and_then(|target| target.pair);
-        let decode = decode.and_then(|pair| self.decodes.get(pair.decode_position as usize));
-        decode.is_some_and(|decode| classed(self.first.of(class), decode.pair_class))
-    }
-
     /// One side of the pair as its stages read it: the side's pool, and the
     /// request's facts with the side's phase, its draw sequence and its own
     /// pool's affinity column and signal cells, and with no rows named:
@@ -8153,6 +8155,10 @@ impl Engine {
                 };
             }
         }
+        // Whether the pair is made among first partners, left for the
+        // decode's shadow: it reads the partners this decision's decode
+        // side reads ([`Self::shadow_side`]).
+        scratch.among_first = firsts;
         // The prefill's pick is read where its decision stands: a pick is
         // 256 bytes, and taking it out copies them.
         let Decision::Pick(prefill_pick) = &prefill else {
@@ -8460,7 +8466,9 @@ impl Engine {
     /// those with a partner: their classes stand in `scratch` as the
     /// pair's decision left them, so a caller hands the scratch that
     /// decision wrote. The decode's shadow reads the partners of the
-    /// live pair's prefill, never of a prefill of its own. `at` is
+    /// live pair's prefill, never of a prefill of its own: its first
+    /// partners where the pair was made among them, by the word that
+    /// decision left in the scratch ([`Scratch::among_first`]). `at` is
     /// the pair binding's position ([`Self::shadow_for`]) and `live` the
     /// pair's pick, made over the same `pools`. The run writes the
     /// scratch and the shadow profile's stages, and nothing a commit
@@ -8522,7 +8530,9 @@ impl Engine {
         let index = self.shadow_sides.get(at as usize)?[side.index()]?;
         // A pair the default made, or one the weighing lift alone placed:
         // the mark the pair's decision left on the prefill's buffer
-        // ([`Self::decide_pair`]).
+        // ([`Self::decide_pair`]). The prefill's shadow runs over that
+        // buffer ahead of the decode's and leaves the mark as it stands:
+        // its set is put to no rule, so none of its passes writes it.
         if self.side_apart(at, side) || scratch.single.lifted != LiftedVeto::None {
             return None;
         }
@@ -8562,10 +8572,12 @@ impl Engine {
             }
             PairSide::Decode => {
                 // The partners of the live pair's prefill, put to the
-                // binding's all-vetoed rule as the live decode side's are.
+                // binding's all-vetoed rule as the live decode side's are:
+                // its first partners where the pair's decision read those,
+                // by the word it left ([`Scratch::among_first`]).
                 let prefill = live.targets.first()?;
                 let class = prefills.get(prefill.position as usize)?.pair_class;
-                let firsts = pools.made_first(class, live);
+                let firsts = scratch.among_first;
                 let partners = Set::side(decodes, Some(pools.partners(&class, firsts)), None);
                 run_profile(
                     profile,
@@ -8605,9 +8617,12 @@ impl Engine {
     /// is free to run ([`side_shadows`]), where that shadow would be handed
     /// another column ([`Self::side_apart`]), and where the held prefill
     /// left the rows. The same beside a decode its sessions rule or its
-    /// picker's assignment placed ([`Self::places_side`]). `live` is that
-    /// call's pick: it says whether the call read the held prefill's first
-    /// partners ([`PairPools::made_first`]).
+    /// picker's assignment placed ([`Self::places_side`]).
+    ///
+    /// The run follows that call over the same `scratch`: the call left
+    /// there whether it read the held prefill's first partners
+    /// ([`Scratch::among_first`]), and the shadow reads the same partners
+    /// by that word.
     #[expect(
         clippy::too_many_arguments,
         reason = "the decode entry and its inputs, beside the binding"
@@ -8627,7 +8642,6 @@ impl Engine {
         pools: PairPools<'_>,
         prefill: WorkerId,
         first_decode: Option<(WorkerId, u16)>,
-        live: &Pick,
         decode_cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Option<Decision> {
@@ -8651,8 +8665,10 @@ impl Engine {
         let prefill = pools.prefills.iter().find(|row| row.id == prefill)?;
         // The call's own draw sequence, as its live decode's.
         decode_facts.seed = facts.seed;
+        // The partners the live call read: the held prefill's first
+        // partners where it read those, by the word it left.
         let class = prefill.pair_class;
-        let firsts = pools.made_first(class, live);
+        let firsts = scratch.among_first;
         let partners = Set::side(decodes, Some(pools.partners(&class, firsts)), None);
         Some(run_side(
             profile,
@@ -8799,6 +8815,9 @@ impl Engine {
                 || (!open(pools.table.of(&class), &decode_facts, decode_cx)
                     && open(first, &all, &pass))
         };
+        // Left for the decode's shadow, which reads the same partners
+        // ([`Self::shadow_decode_later`]).
+        scratch.among_first = firsts;
         let partners = pools.partners(&class, firsts);
         let partners = Set::side(decodes, Some(partners), None).ruled(entry.vetoed);
         let mut decision = if self.places_side(entry, index, &decode_facts) {
@@ -14776,17 +14795,8 @@ mod tests {
             ..facts
         };
         let mut later = |engine: &Engine, held: WorkerId| {
-            let shadow = engine.shadow_decode_later(
-                0,
-                &call,
-                &pool,
-                pools,
-                held,
-                None,
-                pick,
-                &cx,
-                &mut scratch,
-            );
+            let shadow =
+                engine.shadow_decode_later(0, &call, &pool, pools, held, None, &cx, &mut scratch);
             shadow.map(|shadow| lead(&shadow))
         };
         assert_eq!(later(&both, prefills[0].id), Some(Some(1)));
@@ -17654,17 +17664,8 @@ mod tests {
                     engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
                 shadow.is_some()
             });
-            let later = engine.shadow_decode_later(
-                0,
-                &facts,
-                &pool,
-                pools,
-                held,
-                None,
-                pick,
-                &cx,
-                &mut scratch,
-            );
+            let later =
+                engine.shadow_decode_later(0, &facts, &pool, pools, held, None, &cx, &mut scratch);
             (sides, later.is_some())
         };
         let rule = SessionRule {

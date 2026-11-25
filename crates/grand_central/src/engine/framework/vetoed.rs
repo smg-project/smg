@@ -2118,11 +2118,54 @@ mod tests {
             let scratch = &mut Scratch::new();
             let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
             assert_eq!(pair_of(&again), (1, first));
-            let live = again.pick().expect("a decode");
-            let later =
-                engine.shadow_decode_later(0, &req, &pool, pools, held, None, live, &cx, scratch);
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
             assert_eq!(later.map(|shadow| order(&shadow)[0]), Some(first));
         }
+    }
+
+    /// The shadow of a decode asked again reads the partners its call read
+    /// by the word that call left in the scratch, never by its pick. Where
+    /// every partner is doubted the call reads them all, and the rule's
+    /// liveness tier draws among equals: a draw that lands on a first
+    /// partner says nothing of the partners read. A twin of the live
+    /// profile names the live decode under every seed, behind a pair's
+    /// first decision that was made among first partners and left its own
+    /// word in the same scratch.
+    #[test]
+    fn a_later_decode_shadow_reads_every_partner_its_call_read_past_a_doubt() {
+        let engine = pair_engine(false);
+        let prefills = [classed(free(0, 0), 2), classed(free(1, 0), 1)];
+        let open = [classed(free(0, 0), 2), classed(free(1, 0), 1)];
+        // Two first partners of the held prefill and one partner that is
+        // none, equally loaded and all doubted.
+        let decodes = [
+            classed(doubted(0, 0), 1),
+            classed(doubted(1, 0), 1),
+            classed(doubted(2, 0), 2),
+        ];
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let held = prefills[1].id;
+        let mut among_first = 0;
+        for seed in 0..16 {
+            let (req, scratch) = (facts(seed), &mut Scratch::new());
+            let first_pair = first_pools(&prefills, &open);
+            let first = engine.decide_pair(&req, &pool, first_pair, &cx, &cx, scratch);
+            assert_eq!(pair_of(&first), (1, 1), "seed {seed}");
+            let pools = first_pools(&prefills, &decodes);
+            let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
+            assert_eq!(again.trace().lifted, LiftedVeto::Liveness, "seed {seed}");
+            let live = pair_of(&again).1;
+            among_first += u32::from(live != 2);
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
+            assert_eq!(
+                later.map(|shadow| order(&shadow)[0]),
+                Some(live),
+                "seed {seed}"
+            );
+        }
+        // The draws landed on a first partner, and on the partner that is
+        // none: the call read every partner.
+        assert!((1..16).contains(&among_first), "{among_first} of 16");
     }
 
     /// The pools of a first list that is no partner list of the table: the
@@ -2959,9 +3002,7 @@ mod tests {
             let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
             let twin = beside(&first, twin);
             let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
-            let live = again.pick().expect("a decode");
-            let later =
-                engine.shadow_decode_later(0, &req, &pool, pools, held, None, live, &cx, scratch);
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
             (twin, beside(&again, later))
         };
         let none = Some((0, LiftedVeto::None));
@@ -2999,9 +3040,8 @@ mod tests {
             assert_eq!(live.trace.lifted, LiftedVeto::None);
             let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, live, scratch);
             let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
-            let live = again.pick().expect("a decode");
-            let later =
-                engine.shadow_decode_later(0, &req, &pool, pools, held, None, live, &cx, scratch);
+            assert!(again.pick().is_some(), "a decode: {again:?}");
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
             [twin, later].map(|shadow| shadow.expect("the decode's shadow"))
         };
         for steered in said(false) {
