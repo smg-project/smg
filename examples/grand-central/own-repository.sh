@@ -111,8 +111,8 @@ tikv-jemallocator = ${jemallocator}
 [dev-dependencies]
 mock-worker = { git = "${url}" }
 serde_yaml = "${serde_yaml}"
-smg-grpc-client = { git = "${url}" }
 smg-grand-central = { git = "${url}", features = ["client"] }
+smg-grpc-client = { git = "${url}" }
 smg-worker = { git = "${url}", features = ["runtime", "test-util"] }
 tokio = { version = "${tokio}", features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tonic = ${tonic}

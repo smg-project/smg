@@ -793,8 +793,8 @@ class TestPolicyDocument:
 
 
 class TestKeywordOnlyParametersOfTheCliFlags:
-    """The parameters behind the CLI's --engine-metrics, --grouped-dp-sticky,
-    --pd-pairing-mode, --grand-central, --policy-spec, --runtime-worker-threads, --webrtc-bind-addr and
+    """The parameters behind the CLI's --engine-metrics, --grand-central,
+    --grouped-dp-sticky, --pd-pairing-mode, --policy-spec, --runtime-worker-threads, --webrtc-bind-addr and
     --webrtc-stun-server are keyword-only (no positional slot to keep) with the
     CLI's defaults, and a value the CLI refuses is refused before anything starts."""
 
@@ -804,9 +804,9 @@ class TestKeywordOnlyParametersOfTheCliFlags:
         params = inspect.signature(_Router).parameters
         for name in (
             "engine_metrics",
+            "grand_central",
             "grouped_dp_sticky",
             "pd_pairing_mode",
-            "grand_central",
             "policy_spec",
             "runtime_worker_threads",
             "webrtc_bind_addr",
