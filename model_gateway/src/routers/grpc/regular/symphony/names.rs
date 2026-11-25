@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(named_table(&pair(None, Some("hy_v4"))), Some(Table::Hy4));
         assert_eq!(
             named_table(&pair(None, Some("minimax"))),
-            Some(Table::MinimaxM2)
+            Some(Table::MinimaxM3)
         );
         assert_eq!(named_table(&pair(None, Some("deepseek_r1"))), None);
         // A launcher's name for a family whose table has no older parser reads with the table:
@@ -758,7 +758,7 @@ mod tests {
             ("inkling", "inkling"),
             ("cohere", "command"),
             ("cohere_cmd", "command"),
-            ("minimax", "minimax_m2"),
+            ("minimax", "minimax_m3"),
             ("minimax_m2", "minimax_m2"),
             ("minimax_m3", "minimax_m3"),
             ("deepseek", "deepseek_v3"),
@@ -1282,6 +1282,40 @@ mod tests {
         assert_eq!(
             read(&ModelNames::flagged(&pair(None, Some("qwen3"))), unknown),
             table("qwen3")
+        );
+
+        // A family's name reads with the table of the family's current line: `minimax` on the
+        // labels of a model the registry reads with that table, and as the flag for a model the
+        // registry does not know. The M2 line names its own table, and its legacy pair keeps
+        // it: the tool-call name decides.
+        let family = pair(None, Some("minimax"));
+        assert_eq!(
+            read(&labeled(family.clone(), &no_flags), "MiniMaxAI/MiniMax-M3"),
+            table("minimax_m3")
+        );
+        assert_eq!(
+            read(&ModelNames::flagged(&family), unknown),
+            table("minimax_m3")
+        );
+        assert_eq!(
+            read(
+                &labeled(pair(Some("minimax_m2"), Some("minimax")), &no_flags),
+                "MiniMaxAI/MiniMax-M2.7"
+            ),
+            table("minimax_m2")
+        );
+        // Alone, the name gives way: the registry reads a model of the M2 line it lists, behind
+        // the label as behind the flag.
+        assert_eq!(
+            read(
+                &labeled(family.clone(), &no_flags),
+                "MiniMaxAI/MiniMax-M2.7"
+            ),
+            table("minimax_m2")
+        );
+        assert_eq!(
+            read(&ModelNames::flagged(&family), "MiniMaxAI/MiniMax-M2.7"),
+            table("minimax_m2")
         );
 
         // Labels that select nothing (a reasoning name alone that no table answers to) leave the
