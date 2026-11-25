@@ -35,7 +35,7 @@ use crate::{
     engine::{decision_slot::DecisionSlot, view::WorkerId},
     plugins::shared::{
         breaker::{Breaker, Latency, Recorded},
-        intern, own_bound, Counters, OpenDecisions, Part,
+        intern, own_bound, Budget, Counters, OpenDecisions, Part,
     },
     tracking::lease::Membership,
     Draw,
@@ -625,9 +625,10 @@ struct Instance {
 /// sequence (`None` leaves the instance's own).
 struct Frame<'a> {
     cap: u64,
-    /// The decision's remaining budget, in microseconds; a grant draws it
-    /// down by the call's fuel at the plugin's calibration.
-    remaining_micros: &'a mut u64,
+    /// The decision's budget, or a call's own outside every decision
+    /// ([`Budget::alone`]); a grant draws it down by the call's fuel at the
+    /// plugin's calibration.
+    budget: &'a mut Budget,
     fuel_per_micro: u64,
     frame_micros: u32,
     now: Option<u64>,
@@ -638,8 +639,6 @@ struct Frame<'a> {
     /// The decision's number on this thread, zero outside one: the plugin's
     /// own spend in the decision is kept by it.
     decision: u64,
-    /// The decision's budget as seeded (zero outside one).
-    seed_micros: u64,
 }
 
 /// What became of one guest call.
@@ -1631,9 +1630,7 @@ impl Plugin {
             return Call::Failed;
         };
         let fuel_per_micro = frame.fuel_per_micro.max(1);
-        let grant = frame
-            .cap
-            .min(frame.remaining_micros.saturating_mul(fuel_per_micro));
+        let grant = frame.cap.min(frame.budget.fuel(fuel_per_micro));
         if grant == 0 {
             // The decision's earlier calls spent its remainder: no call is
             // made, the stage falls back, the instance stands; nothing counts
@@ -1650,9 +1647,7 @@ impl Plugin {
         // whose ring is armed, the reading the call's end is judged on;
         // otherwise the first tick the call meets. Elsewhere the call ends at
         // its deadline on the wall clock.
-        let bound = frame
-            .frame_micros
-            .min(u32::try_from(*frame.remaining_micros).unwrap_or(u32::MAX));
+        let bound = frame.frame_micros.min(frame.budget.remaining_micros_u32());
         let watched = self.runtime.thread_clock;
         let start = if watched && self.armed() {
             thread_cpu_micros()
@@ -1685,7 +1680,7 @@ impl Plugin {
         // its host calls and a call the host held all draw it down.
         let fuel_micros = used.div_ceil(fuel_per_micro);
         let charged = fuel_micros.max(u64::from(elapsed));
-        *frame.remaining_micros = frame.remaining_micros.saturating_sub(charged);
+        frame.budget.draw(charged);
         let state = inst.store.data_mut();
         state.decision_micros = None;
         let watch = std::mem::take(&mut state.watch);
@@ -1766,14 +1761,15 @@ impl Plugin {
                 // clock has no low end: there the spend is the time they took.
                 let granted = grant.div_ceil(fuel_per_micro);
                 let whole = grant == frame.cap;
-                let under_its_own = own_bound(whole, before.spend, granted, frame.seed_micros);
+                let seed_micros = frame.budget.seed_micros();
+                let under_its_own = own_bound(whole, before.spend, granted, seed_micros);
                 if frame_ran_out && frame.decision != 0 && !under_its_own {
                     tracing::debug!(
                         plugin = self.name,
                         "a call ran out under the decision's remainder"
                     );
                     bump(&self.tally.budget_spent);
-                    if own_bound(whole, before.sample, granted, frame.seed_micros) {
+                    if own_bound(whole, before.sample, granted, seed_micros) {
                         // The two ends part: the time the plugin's unread
                         // calls took reaches the budget, their fuel does
                         // not, and nothing says whether a hold or their own
@@ -2166,17 +2162,16 @@ impl Plugin {
         let fuel = self.frame.fuel_of(frame);
         bump(&self.tally.observed);
         // Outside a decision: the live clock, the instance's own draw.
-        let mut remaining_micros = u64::from(frame);
+        let mut alone = Budget::alone(frame);
         let lifecycle = Frame {
             cap: fuel,
-            remaining_micros: &mut remaining_micros,
+            budget: &mut alone,
             fuel_per_micro: self.frame.fuel_per_micro,
             frame_micros: frame,
             now: None,
             draw: None,
             quiet: false,
             decision: 0,
-            seed_micros: 0,
         };
         let _ = self.call(slot, lifecycle, |inst| {
             let result = match &inst.exports {
