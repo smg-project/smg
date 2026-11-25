@@ -436,15 +436,26 @@ impl PlacedPair {
     /// that names no decode, which the engine answers no pair's lists with.
     fn by_engine(placement: Placement<'_>, stated: Stated) -> Option<Self> {
         let routing_key = placement.routing_key;
-        let placement = placement.kept();
         let prefill = Arc::clone(&placement.worker);
         let decode = placement.decode.clone()?;
         let runtime = prefill.metadata().spec.runtime_type;
-        let (prefill_side, decode_side) = placement.sides();
+        // Each side goes into its box out of the pair as the engine hands
+        // it. Bound by itself first, or asked through `?`, a side is
+        // copied whole once more on the way.
+        let sides = placement.kept().sides();
+        let prefill_side = Box::new(sides.0);
+        #[expect(
+            clippy::question_mark,
+            reason = "asked through `?`, a side is copied whole once more on the way"
+        )]
+        let decode_side = match sides.1 {
+            Some(side) => Box::new(side),
+            None => return None,
+        };
         Some(Self {
             // A prefill's answer is asked nothing again.
             prefill: Placed::by_side(prefill, prefill_side, routing_key, Stated::nothing()),
-            decode: Placed::by_side(decode, decode_side?, routing_key, stated),
+            decode: Placed::by_side(decode, decode_side, routing_key, stated),
             runtime,
         })
     }
@@ -759,17 +770,19 @@ impl Placed {
     /// The answer for one worker of a pair Grand Central placed: the
     /// worker with its own side of the pair's placement, counted under the
     /// routing value the engine names for the pair. `stated` is what the
-    /// request stated for the engine alone at that decision.
+    /// request stated for the engine alone at that decision. The side comes
+    /// in the box the answer keeps it in: a decode that moved hands on the
+    /// box its first answer held.
     fn by_side(
         worker: Arc<dyn Worker>,
-        side: PlacementSide,
+        side: Box<PlacementSide>,
         routing_key: Option<&str>,
         stated: Stated,
     ) -> Self {
         Self {
             worker,
             engine: Some(Box::new(ByEngine {
-                side: Mutex::new(Some(Box::new(side))),
+                side: Mutex::new(Some(side)),
                 end: Mutex::default(),
                 routing_key: routing_key.map(Box::from),
                 stated,
@@ -1135,7 +1148,7 @@ impl ByEngine {
         // the request stated all the same, for a retry that states it
         // again off the answer of the attempt before ([`Placed::stated`]).
         let routing_key = self.routing_key.as_deref();
-        let moved = Placed::by_side(worker, *side, routing_key, self.stated);
+        let moved = Placed::by_side(worker, side, routing_key, self.stated);
         (Some(moved), guard)
     }
 }
