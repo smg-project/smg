@@ -242,15 +242,6 @@ fn process_messages_prompt(
     } else {
         None
     };
-    // The thought prefix of a template without a thinking switch, as for Chat.
-    let assistant_prefix = match chat_utils::thinking_prefix(request.provider, thinking, tokenizer)
-        .filter(|_| !native_continuation)
-    {
-        Some(marker) => Some(
-            assistant_prefix.map_or_else(|| marker.to_owned(), |text| format!("{marker}{text}")),
-        ),
-        None => assistant_prefix,
-    };
     let params = ChatTemplateParams {
         add_generation_prompt: !native_continuation,
         continue_final_message: native_continuation,
@@ -261,13 +252,16 @@ fn process_messages_prompt(
         ..Default::default()
     };
 
-    let rendered = tokenizer
-        .apply_chat_template_with_encoding_owned(
-            transformed_messages,
-            params,
-            assistant_prefix.as_deref(),
-        )
-        .map_err(|e| PromptError::of_render(&e))?;
+    // The render writes the thought prefix of a template without a thinking
+    // switch, as for Chat.
+    let rendered = chat_utils::apply_chat_template_with_thinking_prefix(
+        tokenizer,
+        request.provider,
+        transformed_messages,
+        params,
+        assistant_prefix,
+    )
+    .map_err(|e| PromptError::of_render(&e))?;
 
     // Step 7: Build ProcessedMessages
     let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);

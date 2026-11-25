@@ -582,7 +582,11 @@ pub fn reasoning_starts_in_prefill(
     let thinking = resolve_user_thinking(kwargs, reasoning_effort, thinking, tokenizer, provider);
     // Behind a thought prefix the gateway wrote for a template without a
     // switch, the completion starts where the prefix leaves it: inside the
-    // thought behind the opening marker alone.
+    // thought behind the opening marker alone. The render writes the prefix
+    // behind every generation prompt, the one a continuation falls back to
+    // as well (`chat_utils::apply_chat_template_with_thinking_prefix`), and
+    // a prompt without one, or one that continues its final message, never
+    // reaches this line.
     if chat_utils::thinking_prefix(provider, thinking, tokenizer).is_some() {
         return thinking == Some(true);
     }

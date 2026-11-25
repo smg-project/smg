@@ -15,7 +15,8 @@ use serde_json::json;
 
 use super::*;
 use crate::routers::grpc::utils::{
-    chat_reasoning_starts_in_prefill, process_messages_with_encoding,
+    chat_reasoning_starts_in_prefill, chat_reasoning_starts_in_rendered_prefill,
+    messages_reasoning_starts_in_prefill, process_messages_with_encoding,
 };
 
 /// The error frame is `data: {"error":{"message":..,"type":..}}` with
@@ -1670,17 +1671,53 @@ fn minimax_template_without_a_thinking_switch_gets_the_thought_prefix() {
         "[user]ai\n",
         "a tokenizer without the marker tokens"
     );
-    // The Messages route renders through the same rule.
-    let messages = serde_json::from_value(json!({
-        "model": "MiniMax-M3",
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "hello"}],
-        "thinking": {"type": "disabled"},
-    }))
-    .expect("messages request");
-    let (rendered, _) =
-        process_messages_with_encoding(&messages, &no_switch, None).expect("render");
-    assert_eq!(rendered.text, "[user]ai\n</mm:think>", "the Messages route");
+    // The Messages route renders through the same rule, by its own reading
+    // of the `thinking` block: `adaptive` counts as on and `between_tools`
+    // as off, as for a template with the switch.
+    for (thinking, prompt, in_thought, name) in [
+        (disabled(), "[user]ai\n</mm:think>", false, "disabled"),
+        (
+            Some(json!({"type": "between_tools"})),
+            "[user]ai\n</mm:think>",
+            false,
+            "between_tools",
+        ),
+        (
+            Some(json!({"type": "enabled", "budget_tokens": 1024})),
+            "[user]ai\n<mm:think>",
+            true,
+            "enabled",
+        ),
+        (
+            Some(json!({"type": "adaptive"})),
+            "[user]ai\n<mm:think>",
+            true,
+            "adaptive",
+        ),
+        (None, "[user]ai\n", false, "no thinking block"),
+    ] {
+        let mut body = json!({
+            "model": "MiniMax-M3",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        if let Some(thinking) = thinking {
+            body["thinking"] = thinking;
+        }
+        let messages = serde_json::from_value(body).expect("messages request");
+        let (rendered, _) =
+            process_messages_with_encoding(&messages, &no_switch, None).expect("render");
+        assert_eq!(rendered.text, prompt, "the Messages route, {name}");
+        assert_eq!(
+            messages_reasoning_starts_in_prefill(
+                &messages,
+                rendered.continued_final_message,
+                &no_switch
+            ),
+            in_thought,
+            "the Messages route, {name}: where the reasoning parser starts"
+        );
+    }
     // A template that reads the switch writes its own prefix, once.
     let own_switch = template(OWN_SWITCH)
         .with_tokens(&MARKERS)
@@ -1699,6 +1736,180 @@ fn minimax_template_without_a_thinking_switch_gets_the_thought_prefix() {
             render(&own_switch, &request),
             prompt,
             "the template's own switch"
+        );
+    }
+}
+
+/// A continued final message keeps the rule of the thought prefix. Where the
+/// renderer continues the message in place, the prompt ends past the thought
+/// and takes no prefix. Where it cannot (here: the template renders no
+/// message text, so the text never reaches the prompt), it writes a
+/// generation prompt and the message's text behind it, and the prefix stands
+/// between the two. The reasoning parser starts from the rendered prompt
+/// either way: inside the thought behind the opening marker alone.
+#[test]
+fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
+    const FALLS_BACK: &str = "{% for message in messages %}[{{ message.role }}]{% endfor %}\
+         {% if add_generation_prompt %}ai\n{% endif %}";
+    const CONTINUES: &str =
+        "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}\
+         {% if add_generation_prompt %}ai\n{% endif %}";
+    // A real tokenizer: its Jinja renderer says whether it continued the
+    // final message, which the mock does not.
+    let tokenizer = |template: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            json!({
+                "version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": [
+                    {"id": 1, "content": "<mm:think>", "single_word": false, "lstrip": false,
+                     "rstrip": false, "normalized": false, "special": true},
+                    {"id": 2, "content": "</mm:think>", "single_word": false, "lstrip": false,
+                     "rstrip": false, "normalized": false, "special": true}
+                ],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"},
+                "post_processor": null, "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {"[UNK]": 0, "<mm:think>": 1, "</mm:think>": 2},
+                    "unk_token": "[UNK]"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            json!({"chat_template": template}).to_string(),
+        )
+        .unwrap();
+        llm_tokenizer::create_tokenizer(dir.path().to_str().unwrap()).unwrap()
+    };
+    let falls_back = tokenizer(FALLS_BACK);
+    let continues = tokenizer(CONTINUES);
+    let chat = |thinking: Option<&str>, text: &str| -> ChatCompletionRequest {
+        let mut body = json!({
+            "model": "MiniMax-M3",
+            "continue_final_message": true,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": text}
+            ]
+        });
+        if let Some(mode) = thinking {
+            body["thinking"] = json!({"type": mode});
+        }
+        serde_json::from_value(body).expect("chat request")
+    };
+    for (tokenizer, thinking, text, prompt, continued, in_thought, name) in [
+        (
+            &falls_back,
+            Some("enabled"),
+            "Sure",
+            "[user]ai\n<mm:think>Sure",
+            false,
+            true,
+            "fell back, enabled",
+        ),
+        (
+            &falls_back,
+            Some("disabled"),
+            "Sure",
+            "[user]ai\n</mm:think>Sure",
+            false,
+            false,
+            "fell back, disabled",
+        ),
+        (
+            &falls_back,
+            Some("enabled"),
+            "",
+            "[user]ai\n<mm:think>",
+            false,
+            true,
+            "fell back on an empty message, enabled",
+        ),
+        (
+            &falls_back,
+            None,
+            "Sure",
+            "[user]ai\nSure",
+            false,
+            false,
+            "fell back, no switch",
+        ),
+        (
+            &continues,
+            Some("enabled"),
+            "Sure",
+            "[user]hello[assistant]Sure",
+            true,
+            false,
+            "continued in place, enabled",
+        ),
+        (
+            &continues,
+            Some("disabled"),
+            "Sure",
+            "[user]hello[assistant]Sure",
+            true,
+            false,
+            "continued in place, disabled",
+        ),
+    ] {
+        let request = chat(thinking, text);
+        let rendered = process_chat_messages(&request, tokenizer.as_ref(), None).expect("render");
+        assert_eq!(rendered.text, prompt, "{name}");
+        assert_eq!(rendered.continued_final_message, continued, "{name}");
+        assert_eq!(
+            chat_reasoning_starts_in_rendered_prefill(
+                &request,
+                rendered.generation_prompt,
+                rendered.continued_final_message,
+                tokenizer.as_ref()
+            ),
+            in_thought,
+            "{name}: where the reasoning parser starts"
+        );
+    }
+    // The Messages route: a trailing assistant message with text is the
+    // continued one.
+    for (thinking, prompt, in_thought, name) in [
+        (
+            json!({"type": "enabled", "budget_tokens": 1024}),
+            "[user]ai\n<mm:think>Sure",
+            true,
+            "enabled",
+        ),
+        (
+            json!({"type": "disabled"}),
+            "[user]ai\n</mm:think>Sure",
+            false,
+            "disabled",
+        ),
+    ] {
+        let messages = serde_json::from_value(json!({
+            "model": "MiniMax-M3",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "Sure"}
+            ],
+            "thinking": thinking,
+        }))
+        .expect("messages request");
+        let (rendered, _) =
+            process_messages_with_encoding(&messages, falls_back.as_ref(), None).expect("render");
+        assert_eq!(rendered.text, prompt, "the Messages route, {name}");
+        assert_eq!(
+            messages_reasoning_starts_in_prefill(
+                &messages,
+                rendered.continued_final_message,
+                falls_back.as_ref()
+            ),
+            in_thought,
+            "the Messages route, {name}: where the reasoning parser starts"
         );
     }
 }
