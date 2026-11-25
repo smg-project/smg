@@ -1517,6 +1517,12 @@ mod tests {
             NemotronGeometry::from_model_config(&fourfold),
             Err(NemotronConfigError::Invalid("/downsample_ratio"))
         );
+        let mut tiled = config("v2");
+        tiled["downsample_ratio"] = json!(0.25);
+        assert_eq!(
+            NemotronGeometry::from_model_config(&tiled).map(|g| g.shuffle()),
+            Ok(4)
+        );
         let mut unset = config("omni");
         unset["vision_config"]["args"]["min_num_patches"] = Value::Null;
         assert_eq!(
@@ -1634,7 +1640,8 @@ mod tests {
                 data,
             })
             .collect();
-        let clip = VideoClipOptions::sampled_at(30.0);
+        // The frame duration is the source's, not the sampled rate's.
+        let clip = VideoClipOptions::sampled_at(2.0);
         let sampling = VideoSamplingInfo {
             source_fps: 30.0,
             frame_indices: vec![0, 15, 29],
