@@ -387,6 +387,13 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut dp_evict: Vec<String> = Vec::new();
         for polled in tick.reports {
+            // The rank counts are laid by URL. A worker the registry no
+            // longer holds at its URL lays none there: its eviction cleared
+            // them, and the next worker registered at the URL would read
+            // what is laid behind it.
+            if !self.worker_registry.is_current_handle(polled.worker) {
+                continue;
+            }
             let url = polled.worker.url().to_string();
             // Only feed the DP-rank cache from responses that carry real
             // absolute per-rank token counts. Ratio-only snapshots,

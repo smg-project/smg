@@ -5674,6 +5674,76 @@ mod native_loads_tests {
         }
     }
 
+    /// An engine can answer after its worker left with no worker at its URL.
+    /// The eviction cleared what the worker had there and the late answer
+    /// lays nothing behind it: a worker registered at the URL afterwards is
+    /// given no rank until its own poll.
+    #[tokio::test]
+    async fn an_answer_for_a_worker_that_left_lays_nothing_at_its_url() {
+        const LEFT: &str = r#"{"dp_rank_count":2,"loads":[
+            {"dp_rank":0,"num_used_tokens":900,"max_total_num_tokens":1000},
+            {"dp_rank":1,"num_used_tokens":100,"max_total_num_tokens":1000}]}"#;
+        // The engine holds its answer until it is let go.
+        let let_go = Arc::new(Notify::new());
+        let asked = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/v1/loads",
+            axum::routing::get({
+                let (let_go, asked) = (Arc::clone(&let_go), Arc::clone(&asked));
+                move || {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    let let_go = Arc::clone(&let_go);
+                    async move {
+                        let_go.notified().await;
+                        (StatusCode::OK, LEFT)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        let worker = gauge_worker(&url);
+        worker.set_status(WorkerStatus::Ready);
+        let left = registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let tick = poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now());
+        tokio::pin!(tick);
+        tokio::select! {
+            () = &mut tick => panic!("the tick ended ahead of its engine's answer"),
+            () = wait_until("the tick's fetch", || asked.load(Ordering::SeqCst) == 1) => {}
+        }
+
+        // The worker leaves and its eviction is said, as at any removal.
+        assert!(registry.remove(&left).is_some());
+        monitor.evict_worker_loads(&worker);
+        let_go.notify_one();
+        tick.await;
+
+        let came = gauge_worker(&url);
+        came.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&came)).unwrap();
+        assert_eq!(
+            monitor
+                .worker_load_manager
+                .select_and_increment_lowest_dp_load(came.as_ref(), 0),
+            None,
+            "the worker that came is given a rank by the counts of the worker that left"
+        );
+    }
+
     /// Empty polls retract old ranks without discarding concurrent stream records.
     #[tokio::test]
     async fn empty_poll_does_not_resurrect_stale_pushed_ranks() {
