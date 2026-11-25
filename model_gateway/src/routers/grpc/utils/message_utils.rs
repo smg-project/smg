@@ -52,6 +52,9 @@ pub(crate) struct MessagesPrompt<'a> {
     /// tells it; a renderer that declares the tools under `none` writes its
     /// instruction not to call them from it.
     pub tool_choice: Option<&'a messages::ToolChoice>,
+    /// The model's provider profile, whose thought prefix a template without
+    /// a thinking switch takes (`chat_utils::thinking_prefix`).
+    pub provider: ProviderProfile,
 }
 
 impl<'a> MessagesPrompt<'a> {
@@ -68,6 +71,7 @@ impl<'a> MessagesPrompt<'a> {
             thinking: request.template_thinking_for(provider),
             reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
+            provider,
         }
     }
 }
@@ -87,6 +91,7 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
             thinking: request.template_thinking_for(provider),
             reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
+            provider,
         }
     }
 }
@@ -236,6 +241,15 @@ fn process_messages_prompt(
         })
     } else {
         None
+    };
+    // The thought prefix of a template without a thinking switch, as for Chat.
+    let assistant_prefix = match chat_utils::thinking_prefix(request.provider, thinking, tokenizer)
+        .filter(|_| !native_continuation)
+    {
+        Some(marker) => Some(
+            assistant_prefix.map_or_else(|| marker.to_owned(), |text| format!("{marker}{text}")),
+        ),
+        None => assistant_prefix,
     };
     let params = ChatTemplateParams {
         add_generation_prompt: !native_continuation,

@@ -23,6 +23,7 @@ use tool_parser::{
 };
 use tracing::warn;
 
+use super::chat_utils;
 use crate::routers::{common::snapshot::WorkerRegistry, grpc::context::WorkerSelection};
 
 /// Per-request parser-name resolution.
@@ -404,7 +405,9 @@ impl ModelNames<'_> {
 /// A template without a switch cannot turn thinking off, whatever the request
 /// asks: when its generation prompt opens the think block (GLM-5.3), the
 /// completion starts inside it and the parser must start there too, or the
-/// reasoning streams as content.
+/// reasoning streams as content. Where the gateway applies the preference
+/// itself by a prefix (`chat_utils::thinking_prefix`),
+/// [`reasoning_starts_in_prefill`] decides before this is asked.
 pub fn should_mark_reasoning_started(
     user_thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
@@ -576,10 +579,14 @@ pub fn reasoning_starts_in_prefill(
     {
         return false;
     }
-    should_mark_reasoning_started(
-        resolve_user_thinking(kwargs, reasoning_effort, thinking, tokenizer, provider),
-        tokenizer,
-    )
+    let thinking = resolve_user_thinking(kwargs, reasoning_effort, thinking, tokenizer, provider);
+    // Behind a thought prefix the gateway wrote for a template without a
+    // switch, the completion starts where the prefix leaves it: inside the
+    // thought behind the opening marker alone.
+    if chat_utils::thinking_prefix(provider, thinking, tokenizer).is_some() {
+        return thinking == Some(true);
+    }
+    should_mark_reasoning_started(thinking, tokenizer)
 }
 
 /// `reasoning_starts_in_prefill` for a chat request, without its rendered

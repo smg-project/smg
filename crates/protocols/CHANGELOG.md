@@ -27,6 +27,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `ProviderProfile::thinking_prefix`: the prefix that applies a thinking preference behind the
+  generation prompt of a template with no thinking switch of its own. Under MiniMax the closing
+  thought marker while thinking is off and the opening one while it is on, the prefix a template
+  that reads `thinking_mode` writes itself; nothing without a preference and under every other
+  profile. The gateway writes it where the template has no switch and the tokenizer has the
+  marker as a token, and starts its reasoning parser where the prefix leaves the completion.
 - `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
   map of its pairs), `responses::validate_metadata_pair_count` (its 16-pair bound alone, for a
   count read on its own), `responses::validate_input_message_role` (an input message's role in

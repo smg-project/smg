@@ -21,6 +21,12 @@ pub(super) const EFFORT_MINIMAL: &str = "minimal";
 pub(super) const THINKING_MODE_KEY: &str = "thinking_mode";
 pub(super) const THINKING_MODE_ENABLED: &str = "enabled";
 pub(super) const THINKING_MODE_DISABLED: &str = "disabled";
+/// The thought markers a template with that switch writes behind its
+/// generation prompt: the opening one while the mode is `enabled`, the
+/// closing one while it is `disabled`
+/// ([`super::ProviderProfile::thinking_prefix`]).
+pub(super) const THOUGHT_OPEN: &str = "<mm:think>";
+pub(super) const THOUGHT_CLOSE: &str = "</mm:think>";
 
 /// Tool-protocol strictness for conversation history (MPV tests 16_08, 16_09,
 /// 16_12): tool messages must answer a pending tool_call id, every tool_call

@@ -17,7 +17,7 @@ use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{
         ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, TemplateFailure,
-        TemplateRefusal, ThinkingKeyName,
+        TemplateRefusal, ThinkingKeyName, ThinkingToggle,
     },
     traits::{Encoding, PromptEncoding, Tokenizer},
     StopRules, StopSequenceConfig, StopSequenceDecoder,
@@ -789,6 +789,24 @@ fn resolve_template_thinking(
     request.template_thinking_for(provider)
 }
 
+/// The thought prefix the gateway writes behind the generation prompt for a
+/// thinking preference the template cannot apply: the profile's
+/// ([`ProviderProfile::thinking_prefix`]) where the template has no thinking
+/// switch and the tokenizer has the marker as a token (an earlier model of
+/// the family has no such token and renders as before). A template with a
+/// switch writes its own prefix and gets none. The reasoning parser starts
+/// from the same answer (`parsers::reasoning_starts_in_prefill`).
+pub(crate) fn thinking_prefix(
+    provider: ProviderProfile,
+    thinking: Option<bool>,
+    tokenizer: &dyn Tokenizer,
+) -> Option<&'static str> {
+    provider.thinking_prefix(thinking).filter(|marker| {
+        tokenizer.thinking_toggle() == ThinkingToggle::None
+            && tokenizer.token_to_id(marker).is_some()
+    })
+}
+
 /// Validate content sent to a model template, using the tool declarations
 /// that the template will receive.
 pub(crate) fn validate_chat_template_content_parts(
@@ -1527,6 +1545,18 @@ pub(crate) fn process_chat_messages_with_placeholders(
                 .and_then(prefill_text)
         } else {
             None
+        };
+        // A template without a thinking switch takes the profile's thought
+        // prefix where a template with one writes its own: right behind the
+        // generation prompt, ahead of a continued message's text.
+        let assistant_prefix = match thinking_prefix(provider, params.thinking, tokenizer)
+            .filter(|_| params.add_generation_prompt)
+        {
+            Some(marker) => Some(
+                assistant_prefix
+                    .map_or_else(|| marker.to_owned(), |text| format!("{marker}{text}")),
+            ),
+            None => assistant_prefix,
         };
 
         // Apply chat template with the (now possibly shorter) list of messages.

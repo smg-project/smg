@@ -14,6 +14,9 @@ use openai_protocol::{
 use serde_json::json;
 
 use super::*;
+use crate::routers::grpc::utils::{
+    chat_reasoning_starts_in_prefill, process_messages_with_encoding,
+};
 
 /// The error frame is `data: {"error":{"message":..,"type":..}}` with
 /// the message escaped as JSON, whatever it carries.
@@ -1566,6 +1569,138 @@ fn minimax_effort_none_switches_thinking_off_and_renders_no_effort() {
         kwargs_for_switch(&request).get(REASONING_EFFORT_KEY),
         Some(&json!("low"))
     );
+}
+
+/// A MiniMax template with no `thinking_mode` switch renders one prompt
+/// whatever the request asks, so the gateway applies the preference itself:
+/// the closing thought marker behind the generation prompt while thinking is
+/// off, the opening one while it is on, nothing for the template's default,
+/// and the reasoning parser starts where the prefix leaves the completion. A
+/// template with the switch writes its own prefix; a tokenizer without the
+/// marker tokens, another profile and a prompt without a generation prompt
+/// get none.
+#[test]
+fn minimax_template_without_a_thinking_switch_gets_the_thought_prefix() {
+    const NO_SWITCH: &str = "{% for message in messages %}[{{ message.role }}]{% endfor %}\
+         {% if add_generation_prompt %}ai\n{% endif %}";
+    const OWN_SWITCH: &str = "{% for message in messages %}[{{ message.role }}]{% endfor %}\
+         {% if add_generation_prompt %}ai\n\
+         {% if thinking_mode is defined and thinking_mode == \"disabled\" %}</mm:think>{% endif %}\
+         {% if thinking_mode is defined and thinking_mode == \"enabled\" %}<mm:think>{% endif %}\
+         {% endif %}";
+    const MARKERS: [(&str, u32); 2] = [("<mm:think>", 200059), ("</mm:think>", 200060)];
+    let request = |model: &str, thinking: Option<Value>, reasoning_effort: Option<&str>| {
+        let mut request = effort_request(reasoning_effort);
+        request.model = model.to_string();
+        request.thinking = thinking.map(|value| serde_json::from_value(value).unwrap());
+        request
+    };
+    let render = |tokenizer: &llm_tokenizer::MockTokenizer, request: &ChatCompletionRequest| {
+        process_chat_messages(request, tokenizer, None)
+            .expect("render")
+            .text
+    };
+    let template = |source: &str| {
+        llm_tokenizer::MockTokenizer::new()
+            .with_chat_template(source)
+            .expect("chat template")
+    };
+    let no_switch = template(NO_SWITCH).with_tokens(&MARKERS);
+    let disabled = || Some(json!({"type": "disabled"}));
+    let enabled = || Some(json!({"type": "enabled"}));
+    for (thinking, effort, prompt, in_thought, name) in [
+        (disabled(), None, "[user]ai\n</mm:think>", false, "disabled"),
+        (
+            None,
+            Some("none"),
+            "[user]ai\n</mm:think>",
+            false,
+            "effort none",
+        ),
+        (
+            disabled(),
+            Some("high"),
+            "[user]ai\n</mm:think>",
+            false,
+            "an effort beside disabled",
+        ),
+        (enabled(), None, "[user]ai\n<mm:think>", true, "enabled"),
+        (None, None, "[user]ai\n", false, "no switch"),
+        (
+            Some(json!({"type": "adaptive"})),
+            None,
+            "[user]ai\n",
+            false,
+            "adaptive",
+        ),
+        (None, Some("high"), "[user]ai\n", false, "an effort level"),
+        (
+            None,
+            Some("ultra"),
+            "[user]ai\n",
+            false,
+            "a value outside the levels",
+        ),
+    ] {
+        let request = request("MiniMax-M3", thinking, effort);
+        assert_eq!(render(&no_switch, &request), prompt, "{name}");
+        assert_eq!(
+            chat_reasoning_starts_in_prefill(&request, &no_switch),
+            in_thought,
+            "{name}: where the reasoning parser starts"
+        );
+    }
+    let mut headless = request("MiniMax-M3", disabled(), None);
+    headless.add_generation_prompt = Some(false);
+    assert_eq!(
+        render(&no_switch, &headless),
+        "[user]",
+        "no generation prompt"
+    );
+    assert_eq!(
+        render(&no_switch, &request("inkling-chat", disabled(), None)),
+        "[user]ai\n",
+        "another profile"
+    );
+    assert_eq!(
+        render(
+            &template(NO_SWITCH),
+            &request("MiniMax-M3", disabled(), None)
+        ),
+        "[user]ai\n",
+        "a tokenizer without the marker tokens"
+    );
+    // The Messages route renders through the same rule.
+    let messages = serde_json::from_value(json!({
+        "model": "MiniMax-M3",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hello"}],
+        "thinking": {"type": "disabled"},
+    }))
+    .expect("messages request");
+    let (rendered, _) =
+        process_messages_with_encoding(&messages, &no_switch, None).expect("render");
+    assert_eq!(rendered.text, "[user]ai\n</mm:think>", "the Messages route");
+    // A template that reads the switch writes its own prefix, once.
+    let own_switch = template(OWN_SWITCH)
+        .with_tokens(&MARKERS)
+        .with_thinking_key_name(ThinkingKeyName::ThinkingMode)
+        .with_thinking_toggle(ThinkingToggle::DefaultOff);
+    for (thinking, mode, prompt) in [
+        (disabled(), "disabled", "[user]ai\n</mm:think>"),
+        (enabled(), "enabled", "[user]ai\n<mm:think>"),
+    ] {
+        let mut request = request("MiniMax-M3", thinking, None);
+        // The mock renders the template as it stands, so the request hands
+        // it the switch under its key.
+        request.chat_template_kwargs =
+            Some(HashMap::from([("thinking_mode".to_string(), json!(mode))]));
+        assert_eq!(
+            render(&own_switch, &request),
+            prompt,
+            "the template's own switch"
+        );
+    }
 }
 
 #[test]

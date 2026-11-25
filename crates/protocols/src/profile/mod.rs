@@ -262,6 +262,29 @@ impl ProviderProfile {
         }
     }
 
+    /// The prefix that applies a thinking preference behind the generation
+    /// prompt of a template with no thinking switch of its own: under MiniMax
+    /// the closing thought marker while thinking is off and the opening one
+    /// while it is on, the prefix the templates that read `thinking_mode`
+    /// write themselves and the one the instructions of a template without
+    /// the switch name ("When thinking is disabled, begin your response
+    /// directly after the `</mm:think>` prefix"). Such a template renders one
+    /// prompt whatever the request asks, so the gateway writes the prefix
+    /// where the tokenizer has the marker. `None` without a preference (the
+    /// template's default, the model decides) and under every other profile.
+    pub fn thinking_prefix(self, thinking: Option<bool>) -> Option<&'static str> {
+        match self {
+            ProviderProfile::Minimax => thinking.map(|on| {
+                if on {
+                    minimax::THOUGHT_OPEN
+                } else {
+                    minimax::THOUGHT_CLOSE
+                }
+            }),
+            _ => None,
+        }
+    }
+
     /// Record the configured model aliases (`alias -> served model id`).
     ///
     /// A served model id whose own name selects no vendor contract takes the
