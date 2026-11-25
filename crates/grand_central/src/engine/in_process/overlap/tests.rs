@@ -1877,7 +1877,7 @@ fn a_thread_keeps_eight_writes_and_a_conversations_turns_are_one() {
 /// behind the thread's next column stands, the kept write is written on
 /// behind it, and nothing waits.
 #[test]
-fn a_column_reads_the_write_its_thread_keeps_and_the_next_turn_continues_it() {
+fn a_column_reads_the_write_its_thread_keeps_and_the_next_turn_is_kept() {
     let (affinity, _, _) = hosted(false);
     let prefills = Bed::new(affinity, paired(), 4);
     let asked = prompt(1_000, 4);
