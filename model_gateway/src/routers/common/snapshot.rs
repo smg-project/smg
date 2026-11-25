@@ -10,7 +10,10 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
-use smg_grand_central::engine::{LentList, PublishedList};
+use smg_grand_central::{
+    engine::{EncodeClasses, EncodeMember, EncoderFacts, LentList, PublishedList},
+    store::{EncodeHandoff, EncodeOffer},
+};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -160,6 +163,22 @@ pub(crate) struct ModelLabels {
     pub(crate) vocabulary: TagVocabulary,
 }
 
+/// What an encode request's decision reads of a generation's encoders and
+/// prefills beside their lists, as Grand Central's class rule derives it
+/// ([`EncodeClasses`]): which encoders hand an item to which prefills. A
+/// snapshot keeps one ([`ModelWorkerSnapshot::encode_columns`]).
+#[derive(Debug)]
+pub(crate) struct EncodeColumns {
+    /// One entry an encoder of the gRPC encode pool, in the pool's order.
+    pub(crate) facts: Box<[EncoderFacts]>,
+    /// The encode class of each prefill of the gRPC prefill pool, in the
+    /// pool's order.
+    pub(crate) prefill_classes: Box<[u32]>,
+    /// Whether an encoder's registration states the pushing form: only
+    /// such a fleet places a request's items as one.
+    pub(crate) pushes: bool,
+}
+
 /// Immutable membership snapshot. Route-specific projections are populated
 /// lazily once and then shared by every request until membership changes
 /// publish a replacement snapshot.
@@ -200,6 +219,9 @@ pub struct ModelWorkerSnapshot {
     /// together (see [`Self::media`]). `MediaFacts` stays with the gates in
     /// `routers::grpc::multimodal`, so this module depends on that one.
     media: OnceLock<MediaFacts>,
+    /// What an encode request's decision reads of the encoders and the
+    /// prefills beside their lists (see [`Self::encode_columns`]).
+    encode_columns: OnceLock<EncodeColumns>,
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
@@ -216,6 +238,7 @@ impl ModelWorkerSnapshot {
             window_floors: std::array::from_fn(|_| OnceLock::new()),
             labels: OnceLock::new(),
             media: OnceLock::new(),
+            encode_columns: OnceLock::new(),
             hash_ring: OnceLock::new(),
         }
     }
@@ -300,6 +323,44 @@ impl ModelWorkerSnapshot {
     /// the media gates.
     pub(crate) fn media(&self, read: impl FnOnce(&[Arc<dyn Worker>]) -> MediaFacts) -> &MediaFacts {
         self.media.get_or_init(|| read(&self.all))
+    }
+
+    /// What an encode request's decision reads of the gRPC encode pool and
+    /// the gRPC prefill pool beside their lists ([`EncodeColumns`]): `offer`
+    /// reads each worker's end of the encode handoff on the first encode
+    /// request Grand Central places after the membership change, and
+    /// every such request after it reads the kept columns. A worker states
+    /// its end by its runtime, its labels and its role, which it holds from
+    /// its construction (see [`Self::labels`]). The rule that reads an end
+    /// stays with the encode stage, and the rule that reads ends into
+    /// classes is the engine's. A gateway that starts no engine derives
+    /// none.
+    pub(crate) fn encode_columns(
+        &self,
+        offer: impl Fn(&dyn Worker) -> EncodeOffer,
+    ) -> &EncodeColumns {
+        self.encode_columns.get_or_init(|| {
+            let encoders = self.pool(RoutingPool::GrpcEncode);
+            let prefills = self.pool(RoutingPool::GrpcPrefill);
+            let offers = |pool: &WorkerSnapshot| -> Vec<EncodeOffer> {
+                pool.iter().map(|worker| offer(worker.as_ref())).collect()
+            };
+            let (of_encoders, of_prefills) = (offers(encoders), offers(prefills));
+            let classes = EncodeClasses::derive(
+                members(encoders, &of_encoders),
+                members(prefills, &of_prefills),
+            );
+            EncodeColumns {
+                facts: classes.encoder_facts(&of_encoders),
+                // One entry a prefill, whether or not a class stands.
+                prefill_classes: (0..prefills.len())
+                    .map(|at| classes.prefill_class(at))
+                    .collect(),
+                pushes: of_encoders
+                    .iter()
+                    .any(|offer| offer.handoff == EncodeHandoff::Push),
+            }
+        })
     }
 
     /// The consistent-hash ring over the URLs of this generation's members,
@@ -417,6 +478,17 @@ impl ModelWorkerSnapshot {
             })
             .lent()
     }
+}
+
+/// Each worker of `pool` as the encode class rule reads it: its runtime by
+/// name, and its end of the handoff at its place in `offers`.
+fn members<'a>(
+    pool: &'a [Arc<dyn Worker>],
+    offers: &'a [EncodeOffer],
+) -> impl Iterator<Item = EncodeMember<'a>> {
+    pool.iter().zip(offers).map(|(worker, offer)| {
+        EncodeMember::of(worker.metadata().spec.runtime_type.as_str(), offer)
+    })
 }
 
 impl Deref for ModelWorkerSnapshot {

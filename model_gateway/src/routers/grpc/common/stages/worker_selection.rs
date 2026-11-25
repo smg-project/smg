@@ -13,6 +13,10 @@ use axum::{
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
 use parking_lot::Mutex;
+use smg_grand_central::{
+    engine::{EncodeItems, Identity, InProcess, MediaCounts, References, ShedReason, Unplaced},
+    store,
+};
 use smg_worker::identity::{
     basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
     sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
@@ -33,7 +37,7 @@ use crate::{
     },
     policies::{
         hash_ring::HashRing, policy_reads_hash_ring, CacheNamespace, LoadBalancingPolicy,
-        PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        PolicyRegistry, SelectWorkerInfo, Side, WorkerRole,
     },
     routers::{
         common::{
@@ -88,9 +92,9 @@ type AdmittedPdPair = (Arc<dyn Worker>, Placed, RuntimeType);
 const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
 /// Why an EPD selection produced nothing: a full Prefill pool, unsupported
-/// media references, an encode item where Grand Central places the
-/// gateway's requests, or a failure judged per role afterwards by
-/// [`WorkerSelectionStage::selection_failure`].
+/// media references, an encode item where Grand Central's policy spec
+/// plans the model no encode side, or a failure judged per role afterwards
+/// by [`WorkerSelectionStage::selection_failure`].
 enum EpdSelectionFailure {
     Unavailable,
     Placement(Box<PairFailure>),
@@ -98,8 +102,9 @@ enum EpdSelectionFailure {
     DecodeVisionUnsupported,
     EncodeNotSupported,
     EncodeVisionUnsupported,
-    /// Grand Central places the gateway's requests, and it places no
-    /// encoder: a request that carries an encode item is not served.
+    /// Grand Central places the gateway's requests, and its policy spec
+    /// binds the model no plan with an encode side: the engine declined a
+    /// request that carries an encode item.
     EncodeUnderGrandCentral,
 }
 
@@ -132,7 +137,7 @@ impl PrefillCandidateError for PdSelectionFailure {
 }
 
 /// Result type for EPD worker selection: (encode assignments, prefill, decode, runtime_type).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 type EncodePrefillDecodeWorkerSelection = (
     Vec<EncodeWorkerAssignment>,
     Arc<dyn Worker>,
@@ -158,10 +163,10 @@ type AdmittedEpdSelection = (
 /// inside the gateway.
 pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_timeout";
 
-/// Client-visible, gateway-owned code for a request refused ahead of its
-/// prefill/decode pair because it carries media for the model's encode
-/// workers and the gateway places its requests by Grand Central
-/// (`--grand-central on`), which places no encoder.
+/// Client-visible, gateway-owned code for a request refused because it
+/// carries media for the model's encode workers and the gateway places its
+/// requests by Grand Central (`--grand-central on`) under a policy spec
+/// that binds the model no plan with an encode side.
 pub(crate) const ENCODE_UNDER_GRAND_CENTRAL_CODE: &str = "encode_under_grand_central";
 
 /// The lines of that refusal, a model at a time under the refusal lines'
@@ -172,6 +177,15 @@ static ENCODE_UNDER_GRAND_CENTRAL_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
     Duration::from_secs(1),
     placement::REFUSAL_LOG_MODELS,
 );
+
+/// What an encode request states for Grand Central alone: what its
+/// pair states ([`placement::Stated`]), and the media it carries, by count.
+/// The stage's call makes it where the engine decides, and nowhere else.
+#[derive(Clone, Copy, Default)]
+struct EncodeStated {
+    stated: placement::Stated,
+    media: MediaCounts,
+}
 
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub(crate) struct WorkerSelectionStage {
@@ -681,6 +695,7 @@ impl WorkerSelectionStage {
                         ));
                     }
                 };
+                let request: &RequestContext = ctx;
                 let ((encode_assignments, prefill, decode, runtime_type), guard) = self
                     .admit_selection_within_budget(
                         ctx,
@@ -697,10 +712,20 @@ impl WorkerSelectionStage {
                                 image_fanout: ctx.state.image_anchor.is_some(),
                             },
                             // This mode captures no context requirements, so
-                            // this call reads the budget off the body. The
-                            // placement makes it only where Grand
-                            // Central decides.
-                            || placement::Stated::of_limit(output_budget(&ctx.input.request_type)),
+                            // this call reads the budget off the body, and
+                            // the media's counts off what the stage holds of
+                            // them. The placement makes it only where Grand
+                            // Central decides. The call takes its one
+                            // reference by value.
+                            move || EncodeStated {
+                                stated: placement::Stated::of_limit(output_budget(
+                                    &request.input.request_type,
+                                )),
+                                media: multimodal::media_counts(
+                                    request.state.multimodal_intermediate.as_ref(),
+                                    request.state.multimodal_refs.as_ref(),
+                                ),
+                            },
                         ),
                     )
                     .await?;
@@ -1123,7 +1148,7 @@ impl WorkerSelectionStage {
     }
 
     /// EPD counterpart of [`Self::admit_pd_pair`]. `stated` states the
-    /// request to Grand Central ([`placement::Stated`]): the placement
+    /// request to Grand Central ([`EncodeStated`]): the placement
     /// makes that call where the engine decides, once a pass of the
     /// admission, and a classic selection never makes it.
     async fn admit_encode_prefill_decode_workers(
@@ -1133,7 +1158,7 @@ impl WorkerSelectionStage {
         sticky_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
         demand: EpdDemands,
-        stated: impl Fn() -> placement::Stated + Sync,
+        stated: impl Fn() -> EncodeStated + Sync,
     ) -> Result<(AdmittedEpdSelection, PrefillAhead), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
@@ -2027,12 +2052,13 @@ impl WorkerSelectionStage {
     }
 
     /// The gateway places its requests by Grand Central
-    /// (`--grand-central on`), which places a prefill/decode pair and no
-    /// encoder: a request that carries media for the model's encode workers
-    /// is not served, whatever the pools hold. A 501, as the gateway answers
-    /// a kind of request that one of its routes does not serve. A 501 is
-    /// terminal for the retry layer by status, and no retry changes this
-    /// answer. Its line is written under the refusal lines' allowance.
+    /// (`--grand-central on`), and the policy spec in force binds the model
+    /// no plan with an encode side: the engine declines a request that
+    /// carries media for the model's encode workers, whatever the pools
+    /// hold. A 501, as the gateway answers a kind of request that one of its
+    /// routes does not serve. A 501 is terminal for the retry layer by
+    /// status, and no retry changes this answer, so it carries no retry
+    /// hint. Its line is written under the refusal lines' allowance.
     fn encode_under_grand_central(&self, model_id: &str) -> Response {
         if let Some(admitted) = ENCODE_UNDER_GRAND_CENTRAL_LOG.admit(model_id) {
             warn!(
@@ -2041,16 +2067,16 @@ impl WorkerSelectionStage {
                 model_id = %model_id,
                 code = ENCODE_UNDER_GRAND_CENTRAL_CODE,
                 suppressed = admitted.suppressed,
-                "Refused a request that carries media for the encode workers: Grand Central places no encoder"
+                "Refused a request that carries media for the encode workers: the policy spec in force binds the model no plan with an encode side"
             );
         }
         error::not_implemented(
             ENCODE_UNDER_GRAND_CENTRAL_CODE,
             format!(
                 "model '{model_id}' takes a request's media on encode workers, and this gateway \
-                 runs with --grand-central on, which places no request on encode workers \
-                 yet: send the request without media, or to a gateway that runs with \
-                 --grand-central off"
+                 runs with --grand-central on under a policy spec that binds the model no plan \
+                 with an encode side: send the request without media, or to a gateway that \
+                 runs with --grand-central off"
             ),
         )
     }
@@ -2543,14 +2569,17 @@ impl WorkerSelectionStage {
     ///
     /// This is the encode stage's own selection, the fifth of the functions
     /// that choose a worker, and it holds that function's arm for Grand
-    /// Central. The engine places the pair, through
-    /// [`placement::select_pair`], and no encoder. Where the gateway started
-    /// the engine, a request that carries an encode item is refused by name
-    /// ahead of the pair ([`Self::encode_under_grand_central`]). A request
-    /// with no item is placed on the engine's pair, and the lines below
-    /// assign it no encoder and ask no policy. `stated` states that
-    /// request to the engine ([`placement::Stated`]): the pair's placement
-    /// makes the call where the engine decides, and nowhere else.
+    /// Central. Where the gateway started the engine, a request that
+    /// carries an encode item is placed by it, the pair and each item's
+    /// encoder in one call ([`Self::encode_by_engine`]). A request with no
+    /// item is placed on the engine's pair through
+    /// [`placement::select_pair`], and the classic lines assign it no
+    /// encoder and ask no policy. `stated` states the request to the engine
+    /// ([`EncodeStated`]): the call is made where the engine decides, and
+    /// nowhere else.
+    ///
+    /// The generation is read here, once, and the selection runs over it
+    /// ([`Self::encode_selection_over`]).
     fn placed_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -2558,14 +2587,209 @@ impl WorkerSelectionStage {
         encode_item_hashes: &[Vec<u8>],
         demand: EpdDemands,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-        stated: impl FnOnce() -> placement::Stated,
+        stated: impl FnOnce() -> EncodeStated,
     ) -> Result<PlacedEpdSelection, EpdSelectionFailure> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        self.encode_selection_over(
+            snapshot,
+            model_id,
+            inputs,
+            encode_item_hashes,
+            demand,
+            prefill_capacity,
+            stated,
+            false,
+        )
+    }
+
+    /// The engine's arm of the encode stage's selection, out of line: a
+    /// request that carries items, placed by one call of Grand Central
+    /// over its three lists ([`placement::pair_and_encoders_by_engine`]).
+    ///
+    /// The engine is handed what the classic lines read. Each worker's end
+    /// of the encode handoff is read once a generation ([`encode_offer`]).
+    /// Each item is stated its key as the text the classic encode policy
+    /// is handed in its header, so a ring the engine is lent places the
+    /// item where that policy's walk does. The one key of a fleet that
+    /// pushes is stated the same way for a request that is no fan-out
+    /// ([`one_key`]): the engine reads it for a pair whose encoders push,
+    /// and for no other. The request states no rule of its route: the
+    /// engine's encode pass holds the pair to what the classic rule holds
+    /// it to. `inputs` are the request's without its filter: the engine is
+    /// asked with none.
+    ///
+    /// An item's encoder is counted as a classic encode selection counts
+    /// it: once a placed key, under the name the settings give the encode
+    /// side ([`PolicyRegistry::side_policy_name`]).
+    ///
+    /// Prefills all at the admission limit answer as a pair's do, and the
+    /// route waits. One miss is the engine's own word and no state of the
+    /// fleet: the policy spec in force binds the model no plan with an
+    /// encode side, and the engine declines the request under `binding`.
+    /// The stage refuses that request by name
+    /// ([`Self::encode_under_grand_central`]): no classic line answers it.
+    /// Any other miss is answered by the classic lines themselves, which
+    /// name the gap as they name it for a classic request
+    /// ([`Self::encode_selection_over`]).
+    #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the encode selection's own arguments, and the engine it asks"
+    )]
+    fn encode_by_engine(
+        &self,
+        engine: &'static InProcess,
+        snapshot: Arc<ModelWorkerSnapshot>,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        encode_item_hashes: &[Vec<u8>],
+        demand: EpdDemands,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        stated: EncodeStated,
+    ) -> Result<PlacedEpdSelection, EpdSelectionFailure> {
+        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        let columns = snapshot.encode_columns(encode_offer);
+        let texts: Vec<String> = encode_item_hashes
+            .iter()
+            .map(|hash| hex_encode(hash))
+            .collect();
+        let keys: Vec<Identity<'_>> = texts
+            .iter()
+            .map(|text| Identity::plain(text.as_str()))
+            .collect();
+        let one = (columns.pushes && !demand.image_fanout)
+            .then(|| hex_encode(&one_key(encode_item_hashes)));
+        let mut items = EncodeItems::default();
+        items.keys = &keys;
+        items.one = one.as_deref().map(Identity::plain);
+        items.references = demand.encode.media_refs;
+        items.decode_images = demand.decode_vision;
+        let encode = placement::EncodeAsk {
+            generation: &snapshot,
+            columns,
+            items,
+            media: stated.media,
+            references: match demand.encode.pipeline {
+                PipelinePin::Any => References::None,
+                PipelinePin::Only => References::Caller,
+                PipelinePin::Never => References::Worker,
+            },
+        };
+        let mut encoders = Vec::new();
+        // The engine's word for a model its policy spec binds no plan with
+        // an encode side: no state of the fleet, and no retry changes it.
+        let mut unbound = false;
+        let placed = placement::pair_and_encoders_by_engine(
+            engine,
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &pairs,
+            demand.wire,
+            prefill_capacity,
+            inputs,
+            || stated.stated,
+            Some(encode),
+            |answer| match answer {
+                Ok(placement) => encoders.extend_from_slice(placement.encoders.workers()),
+                Err(unplaced) => {
+                    unbound = matches!(
+                        unplaced,
+                        Unplaced::Shed {
+                            reason: ShedReason::PolicyDeclined,
+                            emptied_by: "binding",
+                            ..
+                        }
+                    );
+                }
+            },
+        );
+        match placed {
+            Ok(pair) => {
+                let counted_under = self.policy_registry.side_policy_name(Side::Encode);
+                let assigned = |(item_index, worker)| {
+                    Metrics::record_worker_selection(
+                        metrics_labels::WORKER_ENCODE,
+                        metrics_labels::CONNECTION_GRPC,
+                        model_id,
+                        counted_under,
+                    );
+                    EncodeWorkerAssignment { item_index, worker }
+                };
+                let assignments = encoders.into_iter().enumerate().map(assigned).collect();
+                Ok((assignments, pair.prefill, pair.decode, pair.runtime))
+            }
+            Err(failure) if failure.is_at_capacity() => {
+                Err(EpdSelectionFailure::Placement(failure))
+            }
+            Err(_) if unbound => Err(EpdSelectionFailure::EncodeUnderGrandCentral),
+            Err(_) => self.encode_selection_over(
+                snapshot,
+                model_id,
+                inputs,
+                encode_item_hashes,
+                demand,
+                prefill_capacity,
+                || stated,
+                true,
+            ),
+        }
+    }
+
+    /// The lines of [`Self::placed_encode_prefill_decode_workers`] over
+    /// `snapshot`, the generation its caller read. A request that carries
+    /// an item is handed to Grand Central first, where the gateway started
+    /// it ([`Self::encode_by_engine`]). The classic lines follow: the gaps
+    /// membership proves, the pair, and each item's encoder by the encode
+    /// policy.
+    ///
+    /// `missed` says Grand Central was asked and placed nobody for the
+    /// request: its arm calls these lines with it. They ask the engine no
+    /// second time, run as far as their pair and assign no encoder. They
+    /// name the gap as they name it for a classic request. Where they name
+    /// none they ask for the pair alone, as they ask for a classic
+    /// request's ahead of its encoders, and the pair's own failure is the
+    /// answer. A pair that is placed is let go, and the answer is no role's
+    /// own: the stage judges each role.
+    ///
+    /// Inlined by force into its two callers, where `missed` is a constant:
+    /// a classic request's lines hold no test of it.
+    #[inline(always)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the encode selection's own arguments, and its caller's word"
+    )]
+    fn encode_selection_over(
+        &self,
+        snapshot: Arc<ModelWorkerSnapshot>,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        encode_item_hashes: &[Vec<u8>],
+        demand: EpdDemands,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        stated: impl FnOnce() -> EncodeStated,
+        missed: bool,
+    ) -> Result<PlacedEpdSelection, EpdSelectionFailure> {
         let needs_encode = !encode_item_hashes.is_empty();
-        // The engine's arm. An item is refused ahead of the pair, so the
-        // engine is told of no request that it would then have to give up.
-        if needs_encode && self.policy_registry.engine().is_some() {
-            return Err(EpdSelectionFailure::EncodeUnderGrandCentral);
+        if needs_encode && !missed {
+            if let Some(engine) = self.policy_registry.engine() {
+                // The arm takes inputs made here, without the request's
+                // filter: the lines below put their own in its place. Made
+                // in this branch, they cost a classic request nothing.
+                return self.encode_by_engine(
+                    engine,
+                    snapshot,
+                    model_id,
+                    PlacementInputs {
+                        candidate_filter: None,
+                        ..inputs
+                    },
+                    encode_item_hashes,
+                    demand,
+                    prefill_capacity,
+                    stated(),
+                );
+            }
         }
         let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
         // An encoder serves the request by its runtime's encode handoff: a
@@ -2664,11 +2888,17 @@ impl WorkerSelectionStage {
                 ..inputs
             },
             // The request as its caller states it, for Grand Central
-            // alone: under the engine this mode places a request that
-            // carries no item, and refuses one that does (above).
-            stated,
+            // alone: under the engine these lines place the pair of a
+            // request that carries no item, and of one the engine placed
+            // nobody for.
+            || stated().stated,
         )
         .map_err(EpdSelectionFailure::Placement)?;
+        if missed {
+            // The engine placed nobody for the items, and no policy of
+            // these lines places them: the pair is let go.
+            return Err(EpdSelectionFailure::Unavailable);
+        }
         let handoff = PdProtocol::encode_handoff(pair.runtime);
         // The encoders that pair with the chosen prefill side: its runtime
         // and, under a push handoff, its EC roles and connector.
@@ -2681,12 +2911,7 @@ impl WorkerSelectionStage {
         let prompt_hash;
         let hashes = if handoff == Some(EncodeHandoff::Push) && needs_encode && !demand.image_fanout
         {
-            let mut hash = blake3::Hasher::new();
-            for item in encode_item_hashes {
-                hash.update(&(item.len() as u64).to_le_bytes());
-                hash.update(item);
-            }
-            prompt_hash = [hash.finalize().as_bytes().to_vec()];
+            prompt_hash = [one_key(encode_item_hashes)];
             &prompt_hash[..]
         } else {
             encode_item_hashes
@@ -2709,9 +2934,10 @@ impl WorkerSelectionStage {
     }
 
     /// [`Self::placed_encode_prefill_decode_workers`] with the pair's two
-    /// workers alone, for a case, which sends them no request and states
-    /// none.
-    #[cfg(test)]
+    /// workers alone, for a caller that sends them no request and states
+    /// none: a bench's placement, a case. An engine's side of the request
+    /// is let go here, which the engine hears as a release.
+    #[cfg(any(test, feature = "test-util"))]
     fn select_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -2720,13 +2946,22 @@ impl WorkerSelectionStage {
         demand: EpdDemands,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
+        // The request states an image where its demand asks vision of an
+        // encoder, as a route's own request does. The call holds that count
+        // itself, and nothing of the demand.
+        let images = u16::from(demand.encode.vision);
+        let stated = move || {
+            let mut stated = EncodeStated::default();
+            stated.media.images = images;
+            stated
+        };
         self.placed_encode_prefill_decode_workers(
             model_id,
             inputs,
             encode_item_hashes,
             demand,
             prefill_capacity,
-            placement::Stated::nothing,
+            stated,
         )
         .map(|(assignments, prefill, decode, runtime)| {
             (
@@ -2820,6 +3055,41 @@ fn assign_encode_workers(
         .collect()
 }
 
+/// The one key of a request whose encoders push and that is no fan-out:
+/// the digest over each item's length and the item, in the items' order.
+/// The classic lines and the engine's arm place the items as one by it.
+/// Inlined by force: the classic lines hold it as they held it written out.
+#[inline(always)]
+fn one_key(item_hashes: &[Vec<u8>]) -> Vec<u8> {
+    let mut hash = blake3::Hasher::new();
+    for item in item_hashes {
+        hash.update(&(item.len() as u64).to_le_bytes());
+        hash.update(item);
+    }
+    hash.finalize().as_bytes().to_vec()
+}
+
+/// A worker's end of the encode handoff as Grand Central's class rule
+/// reads one, made of what the classic lines read of its registration: the
+/// form its runtime hands an item on in, the role it states on a connector,
+/// and whether it takes an item's references. A rendezvous encoder takes
+/// none, whatever it processes itself.
+fn encode_offer(worker: &dyn Worker) -> store::EncodeOffer {
+    let handoff = match PdProtocol::encode_handoff(worker.metadata().spec.runtime_type) {
+        Some(EncodeHandoff::Push) => store::EncodeHandoff::Push,
+        Some(EncodeHandoff::Rendezvous) => store::EncodeHandoff::Rendezvous,
+        None => store::EncodeHandoff::None,
+    };
+    let connector = worker.metadata().spec.labels.get("ec_connector");
+    store::EncodeOffer {
+        handoff,
+        producer: ec_role(worker, "ec_producer"),
+        consumer: ec_role(worker, "ec_consumer"),
+        connector: connector.filter(|name| !name.is_empty()).cloned(),
+        references: handoff == store::EncodeHandoff::Push && accepts_media_refs(worker),
+    }
+}
+
 fn encode_routing_headers(content_hash: &[u8]) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let key = hex_encode(content_hash);
@@ -2829,6 +3099,11 @@ fn encode_routing_headers(content_hash: &[u8]) -> HeaderMap {
     headers
 }
 
+/// A hash as lowercase hex text: the key a classic encode policy is handed
+/// in its header, and the key the engine's arm states for an item. Inlined
+/// by force: the classic lines hold it where they call it, whoever else
+/// calls it.
+#[inline(always)]
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -2842,9 +3117,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// The stage's own selections under a benchmark: one regular placement and
 /// one pair placement as a request's first attempt runs them, under the
 /// context demand of a request's input tokens and completion budget and no
-/// media demand. The gRPC router module re-exports it, the face
-/// `benches/policy_selection.rs` sees; compiled for the crate's test targets
-/// only.
+/// media demand, and one encode selection of a request that carries images.
+/// The gRPC router module re-exports it, the face the benches see; compiled
+/// for the crate's test targets only.
 #[cfg(any(test, feature = "test-util"))]
 pub struct SelectionBench {
     stage: WorkerSelectionStage,
@@ -2888,6 +3163,20 @@ impl SelectionBench {
             model,
             ContextRequirements::of_counts(input_tokens, budget),
         )
+    }
+
+    /// The encode stage over `registry` and `policies`, with no admission
+    /// window, for requests that carry images.
+    pub fn encode(
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        model: &str,
+    ) -> Self {
+        let (mode, context) = (
+            WorkerSelectionMode::EncodePrefillDecode,
+            ContextRequirements::default(),
+        );
+        Self::of(mode, registry, policies, model, context)
     }
 
     fn of(
@@ -2937,6 +3226,31 @@ impl SelectionBench {
             .select_pd_pair(&self.model, inputs, None, None, demand)
             .ok()
             .map(|(prefill, decode, _)| (prefill, decode))
+    }
+
+    /// One encode selection of a request that carries `items`, the hash of
+    /// one image each, as the stage runs a first attempt's: the prefill of
+    /// the pair, and how many encoders the items were placed on.
+    pub fn place_encode(&self, items: &[Vec<u8>]) -> Option<(Arc<dyn Worker>, usize)> {
+        let demand = EpdDemands {
+            wire: None,
+            encode: MediaDemands {
+                vision: true,
+                ..MediaDemands::NONE
+            },
+            decode_vision: false,
+            image_fanout: true,
+        };
+        self.stage
+            .select_encode_prefill_decode_workers(
+                &self.model,
+                PlacementInputs::default(),
+                items,
+                demand,
+                None,
+            )
+            .ok()
+            .map(|(encoders, prefill, ..)| (prefill, encoders.len()))
     }
 }
 
@@ -5341,13 +5655,74 @@ mod tests {
         registry
     }
 
+    /// The policies of an encode gateway whose prefill and decode sides run
+    /// under round robin, and whose encode side runs `encode`, or its own
+    /// default where none is given. They are the classic ones, or under
+    /// `engine` the registry Grand Central places for, with the engine
+    /// started over the document those settings mean. `shed` is the
+    /// gateway's `--worker-overload-shed`, which that document reads.
+    fn epd_policies(encode: Option<PolicyConfig>, engine: bool, shed: bool) -> PolicyRegistry {
+        use smg_grand_central::document::AppliedSpec;
+
+        use crate::{
+            config::{
+                types::{RoutingKeyOverrideConfig, RoutingMode},
+                RouterConfig,
+            },
+            routers::common::placement::tests::engine_on,
+        };
+
+        if !engine {
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            if let Some(encode) = &encode {
+                policies.set_encode_policy(PolicyFactory::create_from_config(encode));
+            }
+            return policies;
+        }
+        let config = RouterConfig {
+            mode: RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: encode,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            policy: PolicyConfig::RoundRobin,
+            connection_mode: ConnectionMode::Grpc,
+            worker_overload_shed: shed,
+            ..RouterConfig::default()
+        };
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        let document = config.policy_document().expect("the settings' document");
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        engine_on(&policies, spec);
+        policies
+    }
+
+    /// What a request of `images` images states for the engine alone.
+    fn pictured(images: u16) -> EncodeStated {
+        let mut stated = EncodeStated::default();
+        stated.media.images = images;
+        stated
+    }
+
     /// Two capable encoders of the pair's runtime, one on the prefill's EC
     /// connector and one on another: under a rotating encode policy both
     /// items of a request land on the pairing encoder (the pool is narrowed
     /// before the policy); without the narrowing the rotation would hand the
-    /// second item to the other encoder.
+    /// second item to the other encoder. Grand Central narrows alike.
     #[test]
     fn the_encode_assignment_is_narrowed_to_encoders_that_pair_with_the_prefill() {
+        for engine in [false, true] {
+            narrowed_to_the_prefills_encoders(engine);
+        }
+    }
+
+    fn narrowed_to_the_prefills_encoders(engine: bool) {
         let model = "epd-pairing";
         let registry = ec_registry(
             model,
@@ -5358,8 +5733,7 @@ mod tests {
                 (8913, WorkerType::Decode, "ECCPUConnector"),
             ],
         );
-        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        policies.set_encode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        let policies = epd_policies(Some(PolicyConfig::RoundRobin), engine, false);
         let stage = WorkerSelectionStage::new(
             registry,
             Arc::new(policies),
@@ -5399,20 +5773,13 @@ mod tests {
 
     /// Where the gateway started Grand Central, the encode stage's
     /// selection asks no classic policy. A request that carries an item is
-    /// refused by name ahead of its pair: a 501 under the stage's own code,
-    /// which the retry layer does not repeat, and the engine hears of no
-    /// request, neither a lease nor its release. A request with no item is
-    /// placed on the engine's pair and on no encoder. The registry made for
-    /// the engine counts no classic policy made or asked behind either.
-    /// With no engine the stage places the item by its encode policy, as it
-    /// did.
+    /// placed by the engine's one call, through the stage's admission: its
+    /// pair, and the item's encoder. A request with no item is placed on
+    /// the engine's pair and on no encoder. The registry made for the
+    /// engine counts no classic policy made or asked behind either. With no
+    /// engine the stage places the item by its encode policy, as it did.
     #[tokio::test]
-    async fn the_engine_places_an_encode_requests_pair_and_refuses_an_item_by_name() {
-        use crate::{
-            config::types::RoutingKeyOverrideConfig,
-            routers::common::placement::tests::hearing_pairs_on,
-        };
-
+    async fn the_engine_places_an_encode_requests_pair_and_each_items_encoder() {
         /// The encode policy behind a count of the items it is asked to
         /// place.
         #[derive(Debug)]
@@ -5469,33 +5836,26 @@ mod tests {
         };
         let item = [vec![1]];
 
-        // The engine places: an item is refused, and the engine hears nothing.
-        let policies = PolicyRegistry::for_engine(
-            PolicyConfig::RoundRobin,
-            RoutingKeyOverrideConfig::default(),
-        );
-        let heard = hearing_pairs_on(&policies, false);
-        let said = || heard.lock().expect("the stage heard").clone();
-        let stage = stage_over(policies);
-        let refusal = stage
+        // The engine places: the pair, and the item's encoder.
+        let stage = stage_over(epd_policies(Some(PolicyConfig::RoundRobin), true, false));
+        let ((encoders, prefill, decode, _), _ahead) = stage
             .admit_encode_prefill_decode_workers(
                 model,
                 PlacementInputs::default(),
                 None,
                 &item,
                 demand(true),
-                placement::Stated::nothing,
+                || pictured(1),
             )
             .await
-            .err()
-            .expect("an item is refused");
-        assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
+            .unwrap_or_else(|_| panic!("the engine places the item"));
+        assert_eq!(encoders.len(), 1);
+        assert_eq!(encoders[0].item_index, 0);
+        assert_eq!(encoders[0].worker.url(), "grpc://127.0.0.1:8930");
         assert_eq!(
-            error::extract_error_code_from_response(&refusal),
-            ENCODE_UNDER_GRAND_CENTRAL_CODE
+            (prefill.url(), decode.url()),
+            ("grpc://127.0.0.1:8931", "grpc://127.0.0.1:8932")
         );
-        assert!(!is_retryable_response(&refusal));
-        assert!(said().is_empty(), "the engine heard {:?}", said());
         assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
 
         // The engine places: no item is the engine's pair and no encoder.
@@ -5513,7 +5873,6 @@ mod tests {
             (prefill.url(), decode.url()),
             ("grpc://127.0.0.1:8931", "grpc://127.0.0.1:8932")
         );
-        assert_eq!(said()[..2], ["issued", "issued"]);
         assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
 
         // No engine: the item is placed by the stage's encode policy.
@@ -5536,6 +5895,194 @@ mod tests {
         assert_eq!(encoders.len(), 1);
         assert_eq!(encoders[0].worker.url(), "grpc://127.0.0.1:8930");
         assert_eq!(counted.asked.load(Ordering::Relaxed), 1);
+    }
+
+    /// A policy spec written by hand may bind a model to a pair plan while
+    /// an encode pool registers for it. The engine declines that model's
+    /// request with media under `binding`, and the stage refuses it by name,
+    /// whatever the pools hold: a 501 under its own code, which the retry
+    /// layer does not repeat and which carries no retry hint. Its line is
+    /// written once, at WARN. The engine issued no lease, and no classic
+    /// policy was made or asked.
+    #[tokio::test]
+    async fn a_spec_that_plans_no_encode_side_refuses_an_item_by_name() {
+        use crate::{
+            config::types::RoutingKeyOverrideConfig,
+            routers::common::placement::tests::hearing_pairs_on,
+        };
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
+        let model = "epd-unbound";
+        let registry = ec_registry(
+            model,
+            &[
+                (8950, WorkerType::Encode, "ECCPUConnector"),
+                (8951, WorkerType::Prefill, "ECCPUConnector"),
+                (8952, WorkerType::Decode, "ECCPUConnector"),
+            ],
+        );
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        let heard = hearing_pairs_on(&policies, false);
+        let stage = WorkerSelectionStage::new(
+            registry,
+            Arc::new(policies),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        let demand = EpdDemands {
+            wire: None,
+            encode: MediaDemands {
+                media_refs: false,
+                vision: true,
+                pipeline: PipelinePin::Any,
+            },
+            decode_vision: false,
+            image_fanout: true,
+        };
+        let refusal = stage
+            .admit_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                None,
+                &[vec![1]],
+                demand,
+                || pictured(1),
+            )
+            .await
+            .err()
+            .expect("the item is refused");
+        assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            ENCODE_UNDER_GRAND_CENTRAL_CODE
+        );
+        assert!(!is_retryable_response(&refusal));
+        assert_eq!(retry_after(&refusal), None);
+        assert_eq!(refusal_lines.load(Ordering::Relaxed), 1);
+        assert_eq!(errors.load(Ordering::Relaxed), 0);
+        let heard = heard.lock().expect("the stage heard").clone();
+        assert!(heard.is_empty(), "the engine heard {heard:?}");
+        assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
+    }
+
+    /// A request the engine places nobody for is placed by nobody. Under a
+    /// policy spec whose encode side keeps no encoder, over a fleet whose
+    /// every worker is ready, the engine sheds a request with media. The
+    /// stage's classic lines then name no gap, as the fleet has none, and
+    /// assign no encoder: the request is refused as one no worker is
+    /// available for, with the classic retry hint, and no classic policy is
+    /// made or asked. A request with no media is placed on the engine's
+    /// pair all the same.
+    #[tokio::test]
+    async fn a_request_the_engine_places_nobody_for_is_placed_by_no_classic_policy() {
+        use smg_grand_central::{
+            document::{AppliedSpec, PolicySpec},
+            engine::{Candidate, Constraints, Filter, RequestFacts},
+            stages::StageRegistry,
+        };
+
+        use crate::{
+            config::types::RoutingKeyOverrideConfig, routers::common::placement::tests::engine_on,
+        };
+
+        /// A filter of a host's own build: it keeps no worker.
+        #[derive(Debug)]
+        struct KeepsNone;
+
+        impl Filter for KeepsNone {
+            fn name(&self) -> &'static str {
+                "keeps-none"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                false
+            }
+        }
+
+        let mut stages = StageRegistry::builtin();
+        let added = stages.filter("keeps-none", || Box::new(KeepsNone));
+        assert!(added.is_ok(), "the name is free");
+        let document = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin");
+        let mut document = document.expect("the three sides' presets");
+        document.generation = 1;
+        let encode = document.profiles.get_mut("encode");
+        let encode = encode.expect("the encode side's profile");
+        encode.filter.push("keeps-none".into());
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        engine_on(&policies, spec.expect("the stages hold the filter"));
+
+        let model = "epd-shed";
+        let registry = ec_registry(
+            model,
+            &[
+                (8924, WorkerType::Encode, "ECCPUConnector"),
+                (8925, WorkerType::Prefill, "ECCPUConnector"),
+                (8926, WorkerType::Decode, "ECCPUConnector"),
+            ],
+        );
+        let stage = WorkerSelectionStage::new(
+            registry,
+            Arc::new(policies),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        let demand = |items: bool| EpdDemands {
+            wire: None,
+            encode: MediaDemands {
+                media_refs: false,
+                vision: items,
+                pipeline: PipelinePin::Any,
+            },
+            decode_vision: false,
+            image_fanout: items,
+        };
+        let refusal = stage
+            .admit_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                None,
+                &[vec![1]],
+                demand(true),
+                || pictured(1),
+            )
+            .await
+            .err()
+            .expect("nobody is placed");
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        assert!(retry_after(&refusal).is_some());
+        assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
+
+        let (encoders, prefill, decode, _) = stage
+            .select_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                &[],
+                demand(false),
+                None,
+            )
+            .unwrap_or_else(|_| panic!("the engine places the pair"));
+        assert!(encoders.is_empty());
+        assert_eq!(
+            (prefill.url(), decode.url()),
+            ("grpc://127.0.0.1:8925", "grpc://127.0.0.1:8926")
+        );
+        assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
     }
 
     /// The encode mode states the body's completion budget to Grand
@@ -5649,9 +6196,16 @@ mod tests {
 
     /// The encode stage reads the hash ring off the generation it holds for
     /// an encode policy that walks it, and for no other: whether a request
-    /// of two media items filled the ring of the model's generation.
+    /// of two media items filled the ring of the model's generation. Grand
+    /// Central is lent that ring for the same policies alone.
     #[test]
     fn the_encode_stage_reads_the_hash_ring_for_a_policy_that_walks_it_alone() {
+        for engine in [false, true] {
+            reads_the_ring_for_a_policy_that_walks_it(engine);
+        }
+    }
+
+    fn reads_the_ring_for_a_policy_that_walks_it(engine: bool) {
         let fills_the_ring = |encode: &PolicyConfig| {
             let model = "epd-ring";
             let registry = ec_registry(
@@ -5663,8 +6217,7 @@ mod tests {
                     (8923, WorkerType::Decode, "ECCPUConnector"),
                 ],
             );
-            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-            policies.set_encode_policy(PolicyFactory::create_from_config(encode));
+            let policies = epd_policies(Some(encode.clone()), engine, false);
             let stage = WorkerSelectionStage::new(
                 Arc::clone(&registry),
                 Arc::new(policies),
@@ -5703,9 +6256,551 @@ mod tests {
         );
     }
 
-    /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.
+    /// What Grand Central reads of a generation's encoders and
+    /// prefills beside their lists follows each worker's end of the encode
+    /// handoff as the classic lines read it. A pushing encoder that states
+    /// the producer role on a connector is of one class with the prefills
+    /// that state the consumer role on it. A rendezvous runtime's encoders
+    /// and prefills are one class, and such an encoder takes no reference.
+    /// A worker that states no end is of class `0`. The columns are derived
+    /// once a generation: the rule is asked of no worker again.
+    #[test]
+    fn a_generations_encode_columns_follow_each_workers_end_of_the_handoff() {
+        let model = "epd-columns";
+        let registry = WorkerRegistry::new();
+        for (port, role, runtime, ec_role, connector) in [
+            (
+                8980,
+                WorkerType::Encode,
+                RuntimeType::Vllm,
+                "ec_producer",
+                "c1",
+            ),
+            (
+                8981,
+                WorkerType::Encode,
+                RuntimeType::Vllm,
+                "ec_producer",
+                "c2",
+            ),
+            (
+                8982,
+                WorkerType::Encode,
+                RuntimeType::Vllm,
+                "ec_consumer",
+                "c1",
+            ),
+            (8983, WorkerType::Encode, RuntimeType::TokenSpeed, "", ""),
+            (8984, WorkerType::Encode, RuntimeType::Sglang, "", ""),
+            (
+                8985,
+                WorkerType::Prefill,
+                RuntimeType::Vllm,
+                "ec_consumer",
+                "c2",
+            ),
+            (
+                8986,
+                WorkerType::Prefill,
+                RuntimeType::Vllm,
+                "ec_both",
+                "c1",
+            ),
+            (
+                8987,
+                WorkerType::Prefill,
+                RuntimeType::Vllm,
+                "ec_consumer",
+                "",
+            ),
+            (8988, WorkerType::Prefill, RuntimeType::TokenSpeed, "", ""),
+            (8989, WorkerType::Prefill, RuntimeType::Sglang, "", ""),
+        ] {
+            let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                .model(ModelCard::new(model))
+                .worker_type(role)
+                .runtime_type(runtime)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .label("supports_ec_transfer", "true")
+                .label("ec_role", ec_role)
+                .label("ec_connector", connector)
+                .label("mm_processor", "inprocess")
+                .build();
+            registry.register(Arc::new(worker)).unwrap();
+        }
+        let snapshot = registry.get_routing_snapshot(model);
+        let columns = snapshot.encode_columns(encode_offer);
+        let at = |pool: RoutingPool, port: u16| {
+            let url = format!("grpc://127.0.0.1:{port}");
+            let mut listed = snapshot.pool(pool).iter();
+            listed
+                .position(|worker| worker.url() == url)
+                .expect("a worker of the pool")
+        };
+        let encoder = |port: u16| columns.facts[at(RoutingPool::GrpcEncode, port)];
+        let prefill = |port: u16| columns.prefill_classes[at(RoutingPool::GrpcPrefill, port)];
+        assert_eq!(columns.facts.len(), 5);
+        assert_eq!(columns.prefill_classes.len(), 5);
+        assert!(columns.pushes);
+
+        // The pushing encoders, each by its connector.
+        let (first, second) = (encoder(8980), encoder(8981));
+        assert!(first.class != 0 && second.class != 0 && first.class != second.class);
+        assert_eq!((prefill(8986), prefill(8985)), (first.class, second.class));
+        assert!(first.pushes && first.references && second.pushes);
+        // A pushing encoder with no producer role, and a prefill with no
+        // connector, state no end.
+        let no_role = encoder(8982);
+        assert_eq!((no_role.class, no_role.pushes, prefill(8987)), (0, true, 0));
+        // The rendezvous runtime: one class, and no reference.
+        let meets = encoder(8983);
+        assert!(meets.class != 0 && meets.class != first.class && meets.class != second.class);
+        assert_eq!(prefill(8988), meets.class);
+        assert!(!meets.pushes && !meets.references);
+        // A runtime with no encode handoff states no end.
+        assert_eq!((encoder(8984).class, prefill(8989)), (0, 0));
+
+        let again = snapshot.encode_columns(|_| panic!("the rule is asked once a generation"));
+        assert!(std::ptr::eq(columns, again));
+    }
+
+    /// The encoder each of `items` is placed on over `fleet`, by the classic
+    /// encode policy `encode` or by Grand Central under the document
+    /// that policy means, each from a registry of its own: one URL an item
+    /// under a fan-out, and one alone where the items are placed as one.
+    /// `ready` says of each worker's port whether it is ready, and `load`
+    /// how many requests it holds.
+    fn encoders_of(
+        fleet: &[(u16, WorkerType, &str)],
+        encode: &PolicyConfig,
+        engine: bool,
+        items: &[Vec<u8>],
+        image_fanout: bool,
+        state: &dyn Fn(u16) -> (bool, usize),
+    ) -> Vec<String> {
+        let model = "epd-held";
+        let registry = ec_registry(model, fleet);
+        for &(port, ..) in fleet {
+            let worker = registry
+                .get_by_url(&format!("grpc://127.0.0.1:{port}"))
+                .expect("registered");
+            let (ready, load) = state(port);
+            if !ready {
+                worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            }
+            for _ in 0..load {
+                worker.increment_load();
+            }
+        }
+        let stage = WorkerSelectionStage::new(
+            registry,
+            Arc::new(epd_policies(Some(encode.clone()), engine, false)),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        let demand = EpdDemands {
+            wire: None,
+            encode: MediaDemands {
+                vision: true,
+                ..MediaDemands::NONE
+            },
+            decode_vision: false,
+            image_fanout,
+        };
+        let (encoders, ..) = stage
+            .select_encode_prefill_decode_workers(
+                model,
+                PlacementInputs::default(),
+                items,
+                demand,
+                None,
+            )
+            .unwrap_or_else(|_| panic!("the EPD set is selected"));
+        for (at, assignment) in encoders.iter().enumerate() {
+            assert_eq!(assignment.item_index, at, "the items' order");
+        }
+        let url = |assignment: &EncodeWorkerAssignment| assignment.worker.url().to_owned();
+        encoders.iter().map(url).collect()
+    }
+
+    /// Under consistent hashing, the encode side's own default, an item
+    /// keeps its encoder whichever places it: Grand Central is lent the
+    /// gateway's ring and puts each item where the classic policy's walk
+    /// puts it, by the key the classic policy reads in its header. So with
+    /// every encoder ready, with the owner of some keys not ready, and for
+    /// the one key a pushing fleet places a request's items by.
+    #[test]
+    fn an_item_keeps_its_encoder_under_consistent_hashing_and_the_engine() {
+        let fleet = [
+            (8950, WorkerType::Encode, "ECCPUConnector"),
+            (8951, WorkerType::Encode, "ECCPUConnector"),
+            (8952, WorkerType::Encode, "ECCPUConnector"),
+            (8953, WorkerType::Encode, "ECCPUConnector"),
+            (8954, WorkerType::Prefill, "ECCPUConnector"),
+            (8955, WorkerType::Decode, "ECCPUConnector"),
+        ];
+        let items: Vec<Vec<u8>> = (0u8..24)
+            .map(|item| blake3::hash(&[item]).as_bytes().to_vec())
+            .collect();
+        let ring = PolicyConfig::ConsistentHashing;
+        for image_fanout in [true, false] {
+            let mut owners = Vec::new();
+            for down in [None, Some(8950), Some(8952)] {
+                let state = |port: u16| (Some(port) != down, 0);
+                let placed =
+                    |engine: bool| encoders_of(&fleet, &ring, engine, &items, image_fanout, &state);
+                let (classic, engine) = (placed(false), placed(true));
+                assert_eq!(classic, engine, "fan-out {image_fanout}, down {down:?}");
+                let keys = if image_fanout { items.len() } else { 1 };
+                assert_eq!(classic.len(), keys);
+                owners.extend(classic);
+            }
+            // The case holds something: the keys spread over the encoders.
+            owners.sort();
+            owners.dedup();
+            assert!(!image_fanout || owners.len() > 2, "{owners:?}");
+        }
+    }
+
+    /// Under a policy that places by load an item goes to the encoder that
+    /// holds fewer requests, by the classic policy and by Grand Central
+    /// alike: under `power_of_two`, of the two a fleet of two leaves to
+    /// draw, under `least_load`, and under `cache_aware`, which is handed no
+    /// prompt to place an item by. Under `passthrough` an item goes to the
+    /// first ready encoder of the list under both.
+    ///
+    /// No gateway starts with one of these four on its encode side: its
+    /// configuration takes consistent hashing, round robin and random
+    /// alone (`config::validate_encode_policy`). The case holds what the
+    /// engine reads of each to the classic policy's own answer, where a
+    /// caller sets one by hand, as this one does.
+    #[tokio::test]
+    async fn an_item_takes_the_less_loaded_encoder_and_the_first_under_both() {
+        let fleet = [
+            (8956, WorkerType::Encode, "ECCPUConnector"),
+            (8957, WorkerType::Encode, "ECCPUConnector"),
+            (8958, WorkerType::Prefill, "ECCPUConnector"),
+            (8959, WorkerType::Decode, "ECCPUConnector"),
+        ];
+        let of = |text: &str| -> PolicyConfig {
+            serde_json::from_str(text).expect("the policy's configuration")
+        };
+        let url = |port: u16| format!("grpc://127.0.0.1:{port}");
+        let items = [vec![1], vec![2], vec![3]];
+        let by_load = [
+            of(r#"{"type":"power_of_two","load_metric":"least_requests"}"#),
+            of(r#"{"type":"least_load"}"#),
+            PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864),
+        ];
+        for policy in &by_load {
+            for busy in [8956, 8957] {
+                let state = |port: u16| (true, if port == busy { 3 } else { 0 });
+                for engine in [false, true] {
+                    let placed = encoders_of(&fleet, policy, engine, &items, true, &state);
+                    let idle = url(8956 + 8957 - busy);
+                    let name = policy.name();
+                    assert_eq!(
+                        placed,
+                        vec![idle; 3],
+                        "{name}, engine {engine}, busy {busy}"
+                    );
+                }
+            }
+        }
+        let first = of(r#"{"type":"passthrough"}"#);
+        for (down, port) in [(None, 8956), (Some(8956), 8957)] {
+            let state = |port: u16| (Some(port) != down, 0);
+            for engine in [false, true] {
+                let placed = encoders_of(&fleet, &first, engine, &items, true, &state);
+                assert_eq!(placed, vec![url(port); 3], "engine {engine}, down {down:?}");
+            }
+        }
+    }
+
+    /// Under round robin and under random, the two policies a gateway's
+    /// encode side takes beside consistent hashing, the picks are another
+    /// sequence of one shape under both: every item of a request goes to
+    /// a ready encoder, the items spread over the ready encoders, and
+    /// with one encoder not ready every item goes to the other.
+    #[test]
+    fn an_items_encoder_is_a_ready_one_under_round_robin_and_random_under_both() {
+        let fleet = [
+            (8964, WorkerType::Encode, "ECCPUConnector"),
+            (8965, WorkerType::Encode, "ECCPUConnector"),
+            (8966, WorkerType::Prefill, "ECCPUConnector"),
+            (8967, WorkerType::Decode, "ECCPUConnector"),
+        ];
+        let url = |port: u16| format!("grpc://127.0.0.1:{port}");
+        let items: Vec<Vec<u8>> = (0u8..32).map(|item| vec![item]).collect();
+        for policy in [PolicyConfig::RoundRobin, PolicyConfig::Random] {
+            for engine in [false, true] {
+                let name = policy.name();
+                let placed = encoders_of(&fleet, &policy, engine, &items, true, &|_| (true, 0));
+                assert_eq!(placed.len(), items.len(), "{name}, engine {engine}");
+                for port in [8964, 8965] {
+                    let taken = placed.iter().filter(|placed| **placed == url(port)).count();
+                    assert!(taken > 0, "{name}, engine {engine}: {port} takes an item");
+                    if matches!(policy, PolicyConfig::RoundRobin) {
+                        assert_eq!(taken, items.len() / 2, "{name}, engine {engine}");
+                    }
+                }
+                let state = |port: u16| (port != 8964, 0);
+                let placed = encoders_of(&fleet, &policy, engine, &items, true, &state);
+                assert_eq!(placed, vec![url(8965); 32], "{name}, engine {engine}");
+            }
+        }
+    }
+
+    /// Every capable encoder over its overload thresholds, for a request
+    /// that carries an item: a client reads one answer whichever places the
+    /// request, by its status, its code and its retry hint. Under
+    /// `--worker-overload-shed` it is the 503 of a shed, and without it the
+    /// 503 of no available worker. Grand Central places nobody there,
+    /// and the stage's classic lines answer, which ask no classic policy
+    /// behind the engine's miss.
+    #[tokio::test]
+    async fn encoders_all_over_their_thresholds_answer_alike_under_both() {
+        let model = "epd-saturated";
+        let demand = EpdDemands {
+            wire: None,
+            encode: MediaDemands {
+                vision: true,
+                ..MediaDemands::NONE
+            },
+            decode_vision: false,
+            image_fanout: true,
+        };
+        for (shed, code) in [
+            (true, "worker_overload_protection_shed"),
+            (false, "no_available_workers"),
+        ] {
+            let mut answers = Vec::new();
+            for engine in [false, true] {
+                let registry = ec_registry(
+                    model,
+                    &[
+                        (8960, WorkerType::Encode, "ECCPUConnector"),
+                        (8961, WorkerType::Encode, "ECCPUConnector"),
+                        (8962, WorkerType::Prefill, "ECCPUConnector"),
+                        (8963, WorkerType::Decode, "ECCPUConnector"),
+                    ],
+                );
+                registry.set_overload_shed(shed);
+                for port in [8960, 8961] {
+                    let encoder = registry
+                        .get_by_url(&format!("grpc://127.0.0.1:{port}"))
+                        .expect("registered");
+                    registry.set_worker_overloaded(&encoder, true);
+                }
+                let stage = WorkerSelectionStage::new(
+                    registry,
+                    Arc::new(epd_policies(None, engine, shed)),
+                    WorkerSelectionMode::EncodePrefillDecode,
+                    None,
+                );
+                let refusal = stage
+                    .admit_encode_prefill_decode_workers(
+                        model,
+                        PlacementInputs::default(),
+                        None,
+                        &[vec![1]],
+                        demand,
+                        || pictured(1),
+                    )
+                    .await
+                    .err()
+                    .expect("no encoder takes the item");
+                // Behind the engine's miss the classic lines name the
+                // answer and place nobody: no classic policy is asked.
+                if engine {
+                    assert_eq!(stage.policy_registry.classic_made_or_asked(), 0);
+                }
+                answers.push((
+                    refusal.status(),
+                    error::extract_error_code_from_response(&refusal).to_string(),
+                    retry_after(&refusal).map(str::to_owned),
+                ));
+            }
+            let (status, named, hint) = &answers[0];
+            assert_eq!(*status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(named, code);
+            assert!(hint.is_some(), "a retry hint under shed={shed}");
+            assert_eq!(answers[0], answers[1], "one answer under shed={shed}");
+        }
+    }
+
+    /// A side of the pair with nobody, for a request that carries an item:
+    /// a client reads one answer whichever places the request, by its
+    /// status, its code and its retry hint. Grand Central places nobody
+    /// there, the stage's classic lines name no gap of the encoders, and
+    /// the pair's own failure answers: for a prefill side that is not
+    /// ready, for a decode side that is not ready, and for a model with no
+    /// decode at all.
+    #[tokio::test]
+    async fn a_side_of_the_pair_with_nobody_answers_alike_under_both() {
+        let model = "epd-no-pair";
+        let demand = EpdDemands {
+            wire: None,
+            encode: MediaDemands {
+                vision: true,
+                ..MediaDemands::NONE
+            },
+            decode_vision: false,
+            image_fanout: true,
+        };
+        let whole = [
+            (8990, WorkerType::Encode, "ECCPUConnector"),
+            (8991, WorkerType::Prefill, "ECCPUConnector"),
+            (8992, WorkerType::Decode, "ECCPUConnector"),
+        ];
+        // Each case: its name, how many of the three workers are registered,
+        // and the one that is not ready.
+        for (name, registered, down) in [
+            ("a prefill side not ready", 3, Some(8991)),
+            ("a decode side not ready", 3, Some(8992)),
+            ("no decode", 2, None),
+        ] {
+            let fleet = &whole[..registered];
+            let mut answers = Vec::new();
+            for engine in [false, true] {
+                let registry = ec_registry(model, fleet);
+                if let Some(port) = down {
+                    registry
+                        .get_by_url(&format!("grpc://127.0.0.1:{port}"))
+                        .expect("registered")
+                        .set_status(openai_protocol::worker::WorkerStatus::NotReady);
+                }
+                let stage = WorkerSelectionStage::new(
+                    registry,
+                    Arc::new(epd_policies(None, engine, false)),
+                    WorkerSelectionMode::EncodePrefillDecode,
+                    None,
+                );
+                let refusal = stage
+                    .admit_encode_prefill_decode_workers(
+                        model,
+                        PlacementInputs::default(),
+                        None,
+                        &[vec![1]],
+                        demand,
+                        || pictured(1),
+                    )
+                    .await
+                    .err()
+                    .expect("nobody takes the request");
+                if engine {
+                    assert_eq!(stage.policy_registry.classic_made_or_asked(), 0, "{name}");
+                }
+                answers.push((
+                    refusal.status(),
+                    error::extract_error_code_from_response(&refusal).to_string(),
+                    retry_after(&refusal).map(str::to_owned),
+                ));
+            }
+            assert_eq!(answers[0].0, StatusCode::SERVICE_UNAVAILABLE, "{name}");
+            assert_eq!(answers[0], answers[1], "one answer for {name}");
+        }
+    }
+
+    /// A request whose references are pinned to a pipeline takes an encoder
+    /// on the pin's side, whichever places it: the one that runs the
+    /// gateway's own pipeline under the pin to it, and the one that runs its
+    /// own under the pin away from it. With no encoder on the pin's side
+    /// both refuse it by one name.
+    #[test]
+    fn a_pinned_references_request_takes_an_encoder_of_its_pipeline_under_both() {
+        let model = "epd-pinned";
+        let fleet = |processors: &[&str]| {
+            let registry = Arc::new(WorkerRegistry::new());
+            let roles = [WorkerType::Prefill, WorkerType::Decode];
+            let encoders = processors.iter().map(|name| (WorkerType::Encode, *name));
+            let pair = roles.into_iter().map(|role| (role, "inprocess"));
+            for (at, (role, processor)) in encoders.chain(pair).enumerate() {
+                let ec_role = if role == WorkerType::Encode {
+                    "ec_producer"
+                } else {
+                    "ec_consumer"
+                };
+                let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", 8970 + at))
+                    .model(ModelCard::new(model))
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::Vllm)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .label("supports_ec_transfer", "true")
+                    .label("ec_connector", "ECCPUConnector")
+                    .label("ec_role", ec_role)
+                    .label("kv_connector", "NixlConnector")
+                    .label("mm_processor", processor)
+                    .label("mm_media_ref_schemes", "http,https,data")
+                    .build();
+                registry.register(Arc::new(worker)).unwrap();
+            }
+            registry
+        };
+        let own = multimodal::GATEWAY_PIPELINE_PROCESSOR;
+        let pick = |processors: &[&str], pin: PipelinePin, engine: bool| {
+            let stage = WorkerSelectionStage::new(
+                fleet(processors),
+                Arc::new(epd_policies(None, engine, false)),
+                WorkerSelectionMode::EncodePrefillDecode,
+                None,
+            );
+            let demand = EpdDemands {
+                wire: None,
+                encode: MediaDemands {
+                    media_refs: true,
+                    vision: true,
+                    pipeline: pin,
+                },
+                decode_vision: false,
+                image_fanout: false,
+            };
+            stage
+                .select_encode_prefill_decode_workers(
+                    model,
+                    PlacementInputs::default(),
+                    &[vec![1], vec![2]],
+                    demand,
+                    None,
+                )
+                .map(|(encoders, ..)| {
+                    assert_eq!(encoders.len(), 1, "a pushing fleet places the items as one");
+                    encoders[0].worker.url().to_owned()
+                })
+        };
+        for engine in [false, true] {
+            for (pin, port) in [(PipelinePin::Only, 8970), (PipelinePin::Never, 8971)] {
+                let placed = pick(&[own, "inprocess"], pin, engine);
+                let placed = placed.unwrap_or_else(|_| panic!("an encoder on the pin's side"));
+                assert_eq!(
+                    placed,
+                    format!("grpc://127.0.0.1:{port}"),
+                    "engine {engine}"
+                );
+            }
+            assert!(matches!(
+                pick(&["inprocess"], PipelinePin::Only, engine),
+                Err(EpdSelectionFailure::EncodeNotSupported)
+            ));
+            assert!(matches!(
+                pick(&[own], PipelinePin::Never, engine),
+                Err(EpdSelectionFailure::EncodeNotSupported)
+            ));
+        }
+    }
+
+    /// EPD selects a compatible EC consumer even with mixed runtimes and
+    /// connectors, by the classic policies and by Grand Central alike.
     #[test]
     fn epd_filters_capabilities_and_pairs_before_encoding() {
+        for engine in [false, true] {
+            filters_capabilities_and_pairs_before_encoding(engine);
+        }
+    }
+
+    fn filters_capabilities_and_pairs_before_encoding(engine: bool) {
         for media_refs in [true, false] {
             let registry = Arc::new(WorkerRegistry::new());
             let model = "epd-model";
@@ -5783,7 +6878,7 @@ mod tests {
             }
             let stage = WorkerSelectionStage::new(
                 registry,
-                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                Arc::new(epd_policies(None, engine, false)),
                 WorkerSelectionMode::EncodePrefillDecode,
                 None,
             );
@@ -5879,9 +6974,16 @@ mod tests {
         }
     }
 
-    /// EC roles/connectors and E/D vision demands are independent constraints.
+    /// EC roles/connectors and E/D vision demands are independent
+    /// constraints, by the classic policies and by Grand Central alike.
     #[test]
     fn epd_enforces_ec_roles_connectors_and_media_demands() {
+        for engine in [false, true] {
+            enforces_ec_roles_connectors_and_media_demands(engine);
+        }
+    }
+
+    fn enforces_ec_roles_connectors_and_media_demands(engine: bool) {
         for runtime in [RuntimeType::Vllm, RuntimeType::TokenSpeed] {
             for (
                 e_connector,
@@ -6033,7 +7135,7 @@ mod tests {
                 }
                 let stage = WorkerSelectionStage::new(
                     registry,
-                    Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                    Arc::new(epd_policies(None, engine, false)),
                     WorkerSelectionMode::EncodePrefillDecode,
                     None,
                 );
@@ -9001,7 +10103,7 @@ mod tests {
     }
 
     /// One attempt's dispatch future (`execute_plan`'s) stays within the
-    /// 2,048-byte bound the selection stage's future is held to: 1,152 bytes
+    /// 2,048-byte bound the selection stage's future is held to: 1,376 bytes
     /// on 64-bit targets. The pipeline awaits it by value, so it sizes every
     /// attempt's future: that one read 7,280 bytes while the two
     /// disaggregated dispatches were awaited by value, and reads 1,528 with

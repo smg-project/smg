@@ -54,6 +54,17 @@
 //! what a pair pays for a side it does not use. Only a pair cell on the
 //! engine's path takes it.
 //!
+//! `--encode true` makes the cell an encode gateway's: the fleet is the
+//! cell's size of prefill workers and as many decode workers, and an eighth
+//! as many encoders, on the gRPC wire, each stating its end of the encode
+//! handoff. A request carries four images and is placed whole by the encode
+//! stage's own selection: the pair, and each image's encoder. On the classic
+//! path the pair is placed by its two side policies and each image by the
+//! encode side's policy: `--encode-policy`, and consistent hashing where the
+//! cell names none. On the engine's path one call places all of it. The
+//! cell sends no request: the answers are let go, which the engine hears as
+//! a release.
+//!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
 //! header `x-smg-routing-key`: a policy that places by a key places by it.
 //! `0`, the default, sends no key.
@@ -170,7 +181,7 @@ use smg::{
         RouterConfig,
     },
     observability::metrics::{start_prometheus, PrometheusConfig},
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, Side},
     routers::{
         common::{
             bench_support::{
@@ -179,7 +190,7 @@ use smg::{
             },
             snapshot::WorkerRegistry,
         },
-        grpc::backend_client::BasicWorkerBuilder,
+        grpc::{backend_client::BasicWorkerBuilder, SelectionBench},
     },
 };
 use smg_worker::{
@@ -230,6 +241,12 @@ struct Cell {
     /// A pair cell's settings name the encode mode: the engine's document
     /// plans an encode side beside the pair's two.
     encode_side: bool,
+    /// An encode gateway: `workers` prefill workers, as many decode workers
+    /// and an eighth as many encoders a model, and a request of four images
+    /// placed whole.
+    encode: bool,
+    /// The encode side's policy; `None` for the side's own default.
+    encode_policy: Option<String>,
     /// The routing keys the requests carry in turn; `0` for none.
     keys: usize,
     /// The prompts the requests carry in turn.
@@ -263,6 +280,8 @@ fn cell() -> Cell {
         models: 1,
         pair: false,
         encode_side: false,
+        encode: false,
+        encode_policy: None,
         keys: 0,
         prompts: 1,
         text: false,
@@ -299,6 +318,8 @@ fn cell() -> Cell {
             "--models" => cell.models = value.parse().unwrap(),
             "--pair" => cell.pair = value.parse().unwrap(),
             "--encode-side" => cell.encode_side = value.parse().unwrap(),
+            "--encode" => cell.encode = value.parse().unwrap(),
+            "--encode-policy" => cell.encode_policy = Some(value),
             "--keys" => cell.keys = value.parse().unwrap(),
             "--prompts" => cell.prompts = value.parse().unwrap(),
             "--text" => cell.text = value.parse().unwrap(),
@@ -404,6 +425,51 @@ fn side(model: &str, role: WorkerType, count: usize) -> Vec<Arc<dyn Worker>> {
                     .build(),
             ) as Arc<dyn Worker>
         })
+        .collect()
+}
+
+/// One role of an encode fleet of `model`: `count` ready workers of `role`
+/// on the gRPC wire, with no health checker behind them. Each states its end
+/// of the encode handoff on one connector: an encoder the producer's, a
+/// prefill worker the consumer's.
+fn encode_role(model: &str, role: WorkerType, count: usize) -> Vec<Arc<dyn Worker>> {
+    let (name, end) = match role {
+        WorkerType::Encode => ("encode", "ec_producer"),
+        WorkerType::Prefill => ("prefill", "ec_consumer"),
+        _ => ("decode", "ec_consumer"),
+    };
+    (0..count)
+        .map(|i| {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://{model}-{name}-{i:04}:9000"))
+                    .model(ModelCard::new(model))
+                    .worker_type(role)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Vllm)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .label("supports_ec_transfer", "true")
+                    .label("ec_connector", "ECCPUConnector")
+                    .label("ec_role", end)
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect()
+}
+
+/// The images of an encode cell's requests in turn, four a request: each
+/// image by a hash of its own, of the 32 bytes the gateway hashes an image
+/// to.
+fn encode_requests() -> Vec<Vec<Vec<u8>>> {
+    let image = |request: u64, item: u64| -> Vec<u8> {
+        (0..4u64)
+            .flat_map(|word| mix(request * 64 + item * 8 + word).to_le_bytes())
+            .collect()
+    };
+    (0..256u64)
+        .map(|request| (0..4u64).map(|item| image(request, item)).collect())
         .collect()
 }
 
@@ -684,11 +750,28 @@ fn build(cell: &Cell) -> Built {
         // document reads this.
         config.connection_mode = ConnectionMode::Grpc;
     }
+    if cell.encode {
+        config.mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: cell.encode_policy.as_deref().map(policy_config),
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        config.connection_mode = ConnectionMode::Grpc;
+    }
     let policies = match cell.path.as_str() {
         "classic" => {
             let policies = PolicyRegistry::new(policy_config(&cell.policy));
-            if cell.pair {
+            if cell.pair || cell.encode {
                 set_pair_sides(&policies, &config);
+            }
+            if cell.encode {
+                // The encode side as an encode gateway's start sets it: its
+                // own policy, or consistent hashing.
+                let ring = PolicyConfig::ConsistentHashing;
+                policies.set_side_policy(Side::Encode, config.mode.get_encode_policy(&ring));
             }
             Arc::new(policies)
         }
@@ -707,7 +790,13 @@ fn build(cell: &Cell) -> Built {
     let models = model_ids(cell.models);
     let mut every = Vec::with_capacity(models.len() * cell.workers);
     for model in &models {
-        let fleets = if cell.pair {
+        let fleets = if cell.encode {
+            vec![
+                encode_role(model, WorkerType::Encode, (cell.workers / 8).max(1)),
+                encode_role(model, WorkerType::Prefill, cell.workers),
+                encode_role(model, WorkerType::Decode, cell.workers),
+            ]
+        } else if cell.pair {
             vec![
                 side(model, WorkerType::Prefill, cell.workers),
                 side(model, WorkerType::Decode, cell.workers),
@@ -779,6 +868,29 @@ fn build(cell: &Cell) -> Built {
         !(cell.grow > 0 && cell.models > 1),
         "a growing conversation is one model's"
     );
+    if cell.encode {
+        assert!(
+            !pair && cell.keys == 0 && end.is_none() && cell.grow == 0 && !cell.text,
+            "an encode cell is no pair's, and takes no key, no end, no conversation and no text"
+        );
+        let stage_of = |model: &String| {
+            SelectionBench::encode(Arc::clone(&registry), Arc::clone(&policies), model)
+        };
+        let stages: Vec<SelectionBench> = models.iter().map(stage_of).collect();
+        let requests = encode_requests();
+        let routing: Routing = Box::new(move |_tokens, turn| {
+            let stage = &stages[(turn % stages.len() as u64) as usize];
+            let images = &requests[(turn % requests.len() as u64) as usize];
+            let (prefill, encoders) = stage.place_encode(images)?;
+            assert_eq!(encoders, images.len(), "each image has its encoder");
+            Some(Arc::as_ptr(&prefill).addr())
+        });
+        return Built {
+            routing,
+            feed,
+            runtime,
+        };
+    }
     if cell.text {
         assert!(!pair, "a pair cell sends token ids");
         assert!(end.is_none(), "a cell of text takes no --end");
@@ -971,7 +1083,7 @@ fn main() {
         println!("prompt=text");
     }
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} encode_side={} end={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} encode_side={} encode={} end={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -984,6 +1096,7 @@ fn main() {
         cell.models,
         cell.pair,
         cell.encode_side,
+        cell.encode,
         cell
             .end
             .map_or_else(|| "dropped".to_owned(), |end| format!("{end:?}").to_lowercase()),

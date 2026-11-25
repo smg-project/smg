@@ -17,6 +17,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
 use axum::response::Response;
 use llm_multimodal::{EncoderInputFormat, Modality};
+use smg_grand_central::engine::MediaCounts;
 use smg_worker::{
     identity::basic::{RuntimeType, Worker, WorkerType},
     labels::SUPPORTS_VISION_LABEL,
@@ -406,6 +407,37 @@ pub(crate) fn request_needs_vision(
     decoded.chain(referenced).any(is_pixel_modality)
 }
 
+/// The media a request carries, by count, as Grand Central reads a
+/// request's: the items of its decoded batches and of its media-reference
+/// plan, each under its kind. An image handed as embeddings is no pixel
+/// ([`is_pixel_modality`]) and is counted under none. So the counts hold an
+/// image or a video exactly where the request needs a vision encoder
+/// ([`request_needs_vision`]).
+pub(crate) fn media_counts(
+    intermediate: Option<&MultimodalIntermediate>,
+    refs: Option<&MediaPlan>,
+) -> MediaCounts {
+    let decoded = intermediate
+        .into_iter()
+        .flat_map(MultimodalIntermediate::batches)
+        .map(|batch| (batch.media.modality(), batch.media.len()));
+    let referenced = refs.into_iter().flat_map(|plan| {
+        let counted = |kind: &Modality| (*kind, plan.count(*kind));
+        plan.modalities().iter().map(counted)
+    });
+    let mut counts = MediaCounts::NONE;
+    for (kind, items) in decoded.chain(referenced) {
+        let count = match kind {
+            Modality::Image => &mut counts.images,
+            Modality::Audio => &mut counts.audio,
+            Modality::Video => &mut counts.video,
+            Modality::ImageEmbeds => continue,
+        };
+        *count = count.saturating_add(u16::try_from(items).unwrap_or(u16::MAX));
+    }
+    counts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +530,53 @@ mod tests {
         }]);
         assert!(request_needs_vision(None, Some(&image)));
         assert!(!request_needs_vision(None, Some(&MediaPlan::default())));
+    }
+
+    /// A request's media is counted by kind, over its decoded batches and
+    /// its reference plan, and an image handed as embeddings under none. So
+    /// the counts hold pixels exactly where the request needs vision.
+    #[test]
+    fn a_requests_media_is_counted_by_kind() {
+        use llm_multimodal::MediaContentPart;
+
+        let image = || MediaContentPart::ImageUrl {
+            url: "data:image/png;base64,AAAA".to_string().into(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        };
+        let audio = || MediaContentPart::AudioUrl {
+            url: "data:audio/wav;base64,AAAA".to_string().into(),
+            uuid: None,
+        };
+        let video = MediaContentPart::VideoUrl {
+            url: "data:video/mp4;base64,AAAA".to_string().into(),
+            uuid: None,
+            fps: None,
+            max_long_side_pixel: None,
+        };
+        let counted = |decoded: Option<&MultimodalIntermediate>, refs: Option<&MediaPlan>| {
+            let counts = media_counts(decoded, refs);
+            assert_eq!(
+                counts.holds_pixels(),
+                request_needs_vision(decoded, refs),
+                "{counts:?}"
+            );
+            (counts.images, counts.audio, counts.video)
+        };
+
+        assert_eq!(media_counts(None, None), MediaCounts::NONE);
+        let decoded = single_image_intermediate();
+        assert_eq!(counted(Some(&decoded), None), (1, 0, 0));
+        let mixed = MediaPlan::new([image(), audio(), image(), video, audio(), audio()]);
+        assert_eq!(counted(None, Some(&mixed)), (2, 3, 1));
+        assert_eq!(counted(None, Some(&MediaPlan::new([audio()]))), (0, 1, 0));
+        // An image stated as embeddings is no pixel.
+        let embeds = MediaPlan::new([MediaContentPart::ImageEmbeds {
+            payload: serde_json::Value::Null,
+            uuid: None,
+        }]);
+        assert_eq!(counted(None, Some(&embeds)), (0, 0, 0));
     }
 
     fn single_image_intermediate() -> MultimodalIntermediate {

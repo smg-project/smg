@@ -23,8 +23,8 @@ use rand::RngExt;
 use smg_grand_central::{
     document::DecodePick,
     engine::{
-        DecisionEngine, InProcess, LentList, PairAdmission, PairLists, Phase, PlaceRequest,
-        Unplaced, WorkerLists,
+        DecisionEngine, EncodeItems, EncodeLists, InProcess, LentList, MediaCounts, PairAdmission,
+        PairLists, Phase, PlaceRequest, References, Unplaced, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     tracking::{Outcome, Placement, PlacementSide, SideEnd, TransportClass},
@@ -60,7 +60,9 @@ use crate::{
             place_request::{place_request, tried_ids, TriedIds},
             prefill_admission::{PrefillCandidateError, PrefillSelectionContext},
             retry::mark_non_retryable,
-            snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            snapshot::{
+                EncodeColumns, ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt,
+            },
         },
         error,
     },
@@ -1118,6 +1120,7 @@ impl ByEngine {
             None,
             inputs,
             self.stated,
+            None::<NoEncode>,
             |request| {
                 // `ahead` counts the request on its first decode across
                 // this decision: the engine reads that decode without it.
@@ -2596,6 +2599,44 @@ impl PairAdmission for PairGates<'_> {
     }
 }
 
+/// What an encode request with items adds to its pair's request for
+/// Grand Central ([`with_pair_request`]): the encoders' list of the
+/// generation its pair index is read from, what the encode side reads of
+/// the encoders and the prefills beside their lists, and the request's own
+/// facts of its media. The request then hands the engine three lists, and
+/// one call places its pair and each item's encoder.
+#[derive(Clone, Copy)]
+pub(crate) struct EncodeAsk<'a> {
+    /// The generation the request's lists are read from. Its encode pool
+    /// is lent, and its hash ring: the ring a classic encode policy walks.
+    pub generation: &'a ModelWorkerSnapshot,
+    /// Each encoder's facts and each prefill's encode class, of that
+    /// generation.
+    pub columns: &'a EncodeColumns,
+    /// Each item's key, the one key for a fleet that pushes, and what the
+    /// request asks for its items.
+    pub items: EncodeItems<'a>,
+    /// The media the request carries, by count.
+    pub media: MediaCounts,
+    /// The pipeline the request's references are pinned to, as a demand:
+    /// none for a request that pins none, whose items say the rest.
+    pub references: References,
+}
+
+/// What a pair's own request adds for the encode side: nothing. The type
+/// has no value, so `None` of it is known where a function is compiled for
+/// it, and that function holds no line of the encode side's. A pair's own
+/// request then pays nothing for the functions it shares with an encode
+/// request ([`with_pair_request`], [`pair_and_encoders_by_engine`]).
+#[derive(Clone, Copy)]
+pub(crate) enum NoEncode {}
+
+impl From<NoEncode> for EncodeAsk<'_> {
+    fn from(none: NoEncode) -> Self {
+        match none {}
+    }
+}
+
 /// Grand Central's request for a pair over the two pools of `pairs`,
 /// handed to `ask`: each pool's list with its cell and the index's pair
 /// classes ([`PdPairIndex::lent`]), and this gateway's two admission reads
@@ -2621,11 +2662,19 @@ impl PairAdmission for PairGates<'_> {
 /// - The request states that its decode may be asked again behind its
 ///   prefill's answer. A route that sends both sides at once sends the
 ///   decode the first decision named, which the engine books at that send.
+///
+/// `encode` is what an encode request with items adds ([`EncodeAsk`]), and
+/// `None` of the type with no value ([`NoEncode`]) for a pair's own
+/// request, whose maker is so compiled with the pair's lines alone. An
+/// encode request hands the pair's lists with the encoders' as one
+/// request's three, states its items, its media and its references' pin,
+/// and reads its ring off the generation it holds. It states no place and
+/// no standing veto of an encoder.
 #[expect(
     clippy::too_many_arguments,
     reason = "the pair placement's own arguments, and the engine it asks"
 )]
-fn with_pair_request<R>(
+fn with_pair_request<'e, R>(
     engine: &'static InProcess,
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -2635,6 +2684,7 @@ fn with_pair_request<R>(
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
     stated: Stated,
+    encode: Option<impl Into<EncodeAsk<'e>> + Copy>,
     ask: impl FnOnce(&mut PlaceRequest<'_>) -> R,
 ) -> R {
     let ([prefill, decode], classes) = pairs.lent();
@@ -2665,16 +2715,45 @@ fn with_pair_request<R>(
     tried_ids(prefill.workers, inputs.tried, &mut tried);
     tried_ids(decode.workers, inputs.tried, &mut decodes_tried);
     tried.append(&mut decodes_tried);
-    let sides = [Phase::Prefill, Phase::Decode];
-    let ring = ModelRing::read(engine, policies, registry, model_id, &sides);
-    let mut request = place_request(
-        model_id,
-        WorkerLists::Pair(lists),
-        &inputs,
-        &tried,
-        wire,
-        stated,
-    );
+    let ring;
+    let mut request = match encode {
+        None => {
+            // A pair alone is decided in its prefill and decode phases.
+            let sides = [Phase::Prefill, Phase::Decode];
+            ring = ModelRing::read(engine, policies, registry, model_id, &sides);
+            place_request(
+                model_id,
+                WorkerLists::Pair(lists),
+                &inputs,
+                &tried,
+                wire,
+                stated,
+            )
+        }
+        Some(encode) => {
+            let encode: EncodeAsk<'_> = encode.into();
+            // An encode request is decided in the encode phase too. Its
+            // items are lent this ring, which the encode side's profile may
+            // walk where neither side of the pair does.
+            let sides = [Phase::Encode, Phase::Prefill, Phase::Decode];
+            ring = ModelRing::of(engine, policies, model_id, encode.generation, &sides);
+            let lists = EncodeLists {
+                pair: lists,
+                encoders: encode.generation.lent(RoutingPool::GrpcEncode),
+                encoders_places: None,
+                encoders_stalled: &[],
+                encoders_held: &[],
+                facts: &encode.columns.facts,
+                prefill_classes: &encode.columns.prefill_classes,
+            };
+            let lists = WorkerLists::Encode(lists);
+            let mut request = place_request(model_id, lists, &inputs, &tried, wire, stated);
+            request.encode = Some(encode.items);
+            request.media = encode.media;
+            request.demands.references = encode.references;
+            request
+        }
+    };
     request.ring = ring.lent();
     request.attempt = u8::try_from(inputs.tried.len().div_ceil(2)).unwrap_or(u8::MAX);
     request.decode_again = true;
@@ -2739,12 +2818,73 @@ fn pair_by_engine(
     inputs: PlacementInputs<'_>,
     stated: impl FnOnce() -> Stated,
 ) -> Result<PlacedPair, Box<PairFailure>> {
+    pair_and_encoders_by_engine(
+        engine,
+        registry,
+        policies,
+        model_id,
+        pairs,
+        wire,
+        prefill_capacity,
+        inputs,
+        stated,
+        None::<NoEncode>,
+        |_| {},
+    )
+}
+
+/// The one body of the engine's two arms, inlined by force into each: a
+/// pair's own placement ([`pair_by_engine`]), and the encode stage's arm
+/// for a request with items, where `encode` holds what such a request adds
+/// ([`EncodeAsk`]). For a pair's own, `encode` is `None` of the type with
+/// no value ([`NoEncode`]): its placement is compiled with no line of the
+/// encode side's and answers the pair alone.
+///
+/// An encode request is placed by one call over its three lists: its pair
+/// as the engine places a pair's own, and each item's encoder. `answered`
+/// reads the engine's answer for such a request, and is called for no
+/// other. It reads a placement ahead of its split, whose encoders stand in
+/// the items' order, one alone where the items were placed as one, or a
+/// miss as the engine named it, the prefills' limit apart. The route's rule
+/// is the pair's: the engine asks it of no encoder.
+///
+/// Prefills all at the admission limit answer as a pair's do, and the route
+/// waits. Any other miss of an encode request is judged by nobody here, and
+/// its failure names no side to read: the encode stage answers the request
+/// by what `answered` read and by its classic lines, which ask this
+/// placement for the pair alone.
+///
+/// No row of a traced request's record is an encoder's, as none is under
+/// the classic policies. The encode stage's arm counts each encoder.
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pair placement's own arguments, and the encode side's"
+)]
+pub(crate) fn pair_and_encoders_by_engine<'e>(
+    engine: &'static InProcess,
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    inputs: PlacementInputs<'_>,
+    stated: impl FnOnce() -> Stated,
+    encode: Option<impl Into<EncodeAsk<'e>> + Copy>,
+    mut answered: impl FnMut(Result<&Placement<'_>, &Unplaced>),
+) -> Result<PlacedPair, Box<PairFailure>> {
+    let fail =
+        |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
+    // No refusal of an encode request is named here: its stage's classic
+    // lines name it, behind the gaps of its encoders.
+    if encode.is_some() && !pairs.can_pair() {
+        return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
+    }
     if let Some(failure) = unpairable(policies, model_id, pairs) {
         return Err(failure);
     }
     let stated = stated();
-    let fail =
-        |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
     let side_row = |side: RowSide, label| row_name(policies, Some(side), label);
     let prefill_seen = cache_trace::observe(&pairs.prefill_pool);
     let decode_seen = prefill_seen
@@ -2760,6 +2900,7 @@ fn pair_by_engine(
         prefill_capacity,
         inputs,
         stated,
+        encode,
         |request| {
             engine.place(request).map(|placement| {
                 let labels = (
@@ -2767,6 +2908,11 @@ fn pair_by_engine(
                     placement.decode_profile.unwrap_or(placement.profile),
                 );
                 let share = (placement.overlap.blocks, placement.overlap.of);
+                // An encode request's encoders are read ahead of the split:
+                // a side names none of them.
+                if encode.is_some() {
+                    answered(Ok(&placement));
+                }
                 (labels, share, PlacedPair::by_engine(placement, stated))
             })
         },
@@ -2778,6 +2924,11 @@ fn pair_by_engine(
                 WorkerRole::Prefill,
                 PlacementFailure::PrefillAtCapacity,
             ));
+        }
+        Err(refused) if encode.is_some() => {
+            answered(Err(&refused));
+            report_unplaced(model_id, &refused, "Grand Central placed no encode request");
+            return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
         }
         Err(unplaced) => {
             report_unplaced(model_id, &unplaced, "Grand Central placed no pair");
@@ -8772,6 +8923,65 @@ pub(crate) mod tests {
         assert!(sides.len() > 8, "the pairs spread: {sides:?}");
         assert!(registry.get_routing_snapshot(MODEL).hash_ring_is_filled());
         assert_eq!(engine.classic_made_or_asked(), 0);
+    }
+
+    /// An encode request's ring is its generation's own. The request holds
+    /// the generation its lists are read from, and its maker lends the
+    /// engine that generation's ring, the same object, though the registry
+    /// holds another generation by now: the maker reads the registry no
+    /// second time.
+    #[test]
+    fn an_encode_requests_ring_is_the_one_of_the_generation_it_holds() {
+        let registry = one_pair();
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        // The encode side places by the ring, so the document reads one.
+        let document = PolicySpec::epd_presets("consistent_hashing", "round_robin", "round_robin");
+        let mut document = document.expect("the three sides' presets");
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document);
+        engine_on(&policies, spec.expect("a valid document"));
+        let engine = policies.engine().expect("the engine is on");
+
+        let held = registry.get_routing_snapshot(MODEL);
+        let pairs = pairs_of(&registry, &policies);
+        // The registry moves on: a second prefill registers.
+        let second = pd_worker("grpc://p:2", WorkerType::Prefill, Some("NixlConnector"));
+        let registered = registry.register(Arc::new(second));
+        registered.expect("worker registers");
+        let now = registry.get_routing_snapshot(MODEL);
+
+        let encode = EncodeAsk {
+            generation: &held,
+            columns: held.encode_columns(|_| Default::default()),
+            items: EncodeItems::default(),
+            media: MediaCounts::default(),
+            references: References::None,
+        };
+        let lent = with_pair_request(
+            engine,
+            &registry,
+            &policies,
+            MODEL,
+            &pairs,
+            None,
+            None,
+            PlacementInputs::default(),
+            Stated::nothing(),
+            Some(encode),
+            |request| {
+                let ring = request.ring.expect("a ring is lent");
+                std::ptr::from_ref(ring).cast::<()>()
+            },
+        );
+        let own = |generation: &ModelWorkerSnapshot| {
+            let ring = policies.hash_ring_of(MODEL, generation);
+            Arc::as_ptr(&ring.expect("the generation's ring")).cast::<()>()
+        };
+        assert_eq!(lent, own(&held), "the ring of the generation held");
+        assert_ne!(own(&held), own(&now), "two generations, two rings");
     }
 
     /// A pair whose two sides read the model's ring by two words is placed
