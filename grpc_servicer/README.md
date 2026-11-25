@@ -666,9 +666,10 @@ bound for the pass. Each admitted request keeps the fixed finite ceiling
 `D = min(R, max(initial B, F))`, where `R` is the caller's request timeout and
 `F` is the timeout floor (one second by default), rather than the shrinking
 budget remainder. For wires that honor their deadlines, Generate can take
-roughly `B + D`, plus fanout and scheduling overhead. Each of the two gRPC
-cache-flush calls has its own separate 60-second deadline; generic in-process
-async flushes gain no new bound here. With the default caller timeout and
+roughly `B + D`, plus fanout and scheduling overhead. A pass with recorded
+results attempts one final cache flush, with a separate 60-second deadline on
+the gRPC wires; generic in-process async flushes gain no new bound here. With the
+default caller timeout and
 floor, `fast:30` gives an admitted request a 30-second ceiling, so even a
 healthy 40-second cold JIT or kernel compile can time out. Its engine-side
 completion is then unconfirmed: the Rust worker stays NOT_SERVING and exits
