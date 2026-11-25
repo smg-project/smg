@@ -643,3 +643,39 @@ fn the_encoders_a_gateways_wires_take_are_counted_for_a_request_with_a_key() {
     assert_eq!(counted(2, 0), (Vec::new(), 1), "no key reads no encoder");
     assert_eq!(counted(3, 1), (vec![other_wire], 2));
 }
+
+/// An encode request's frame is read for no number its request names its
+/// worker by. Under an encode plan whose pair's two sides are plain hash
+/// rings, so that its binding names a target source, a frame that states a
+/// number is answered the pair the same frame is answered with none,
+/// whatever the number: the widest one sheds nothing.
+#[test]
+fn an_encode_requests_frame_is_read_for_no_number() {
+    let ring = "consistent_hashing";
+    let document = PolicySpec::epd_presets("random", ring, ring);
+    let mut document = document.expect("presets of this build");
+    document.generation = 1;
+    let store = Arc::new(MemoryStore::new());
+    store
+        .apply(staged(&document, &StageRegistry::builtin()))
+        .expect("above the unbound start");
+    for name in ["p0", "p1", "p2"] {
+        member(&store, name, Role::Prefill, PUSHING);
+    }
+    for name in ["d0", "d1", "d2"] {
+        member(&store, name, Role::Decode, PUSHING);
+    }
+    member(&store, "e0", Role::Encode, PUSHING);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let asked = |number: Option<u32>| {
+        let mut frame = encode_frame(1, 1);
+        frame.named_worker = number;
+        pairs_of(&served_encode(&store, &objects, frame, GATEWAY, now).0)
+    };
+    let unnamed = asked(None);
+    assert!(!unnamed.is_empty(), "a pick");
+    for number in [0, 1, 2, u32::MAX] {
+        assert_eq!(asked(Some(number)), unnamed, "{number}");
+    }
+}

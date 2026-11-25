@@ -2,7 +2,8 @@
 //! (`DecideRequest.named_worker`): its ask [`decide`](super::decide) as a
 //! deciding thread asks it, under the stock hash ring document, whose
 //! binding names a target source, and
-//! [`decide_alone`](super::decide_alone) for a frame that stands alone.
+//! [`decide_alone`](super::decide_alone) for a frame that stands alone. A
+//! pair's frame has its cases in a file of their own.
 
 use std::{
     collections::BTreeSet,
@@ -28,6 +29,8 @@ use crate::{
     store::{GatewayId, HealthSink, LeasesStore, MemoryStore},
     worker_host::{Members, Objects},
 };
+
+mod pair;
 
 /// The shed of a request whose named worker cannot take it.
 const MISSED: Option<(ShedReason, &str)> = Some((ShedReason::NoEndpoints, "target-worker"));

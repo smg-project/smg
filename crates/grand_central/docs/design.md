@@ -1880,8 +1880,8 @@ engine, whose default pairs over the caller's own places. A prefill over its thr
 opens the pair too where its profile weighs load itself and its binding steers, as classic
 lifts the veto for such a policy with its shedding off. A decision that states a number beside
 no places of its decode side is declined under `target-worker`, and so is an encode request's
-that states one. **[planned]** A controller reads a pair's frame for no number (section 10.1):
-its served decision states none.
+that states one. A controller's served decision is lent the same decodes and stated the number
+its pair's frame carries (section 10.1).
 
 One thing differs from classic there, by rule. **[planned]** The engine reads no encode
 request's header for a target yet. One limit is a supplied policy spec's own: a pair's target
@@ -2281,22 +2281,48 @@ controller's prefix ring places that request by its prompt, as a gateway's own p
 (section 8.1). The frame of a host older than that field says nothing, and under it the id's key
 places as any other.
 
-A frame that is decided over one list may state the number its request names its worker by
-(`DecideRequest.named_worker`): a single request's frame, and one that stands alone at a side's
-phase. Its host reads the number under the target source of its binding (section 8.2) and states
-it. A text that is no number crosses as the widest number, which reaches no worker. Under a
-document whose binding for the frame names that source, the controller counts as the one call
-does, by the same function: from 0 and in the order of its own list, over the workers the asking
-gateway can be sent to. Those are the places the gateway may take by its reach and its wires, that
-none of its standing vetoes holds back, and whose worker object is available by its own test. The
-frame's one decision is held to the worker the number reaches. The request goes to that worker or
-is shed with no endpoint, under `target-worker`: where the number reaches no worker, or that
-worker cannot take the request after all. Where the gateway can be sent to no worker of the list,
-the request is decided as one that names none, and carries neither its session key nor its
-client's key. A frame that states no number is decided as it was, and the frame of a host older
-than the field states none. No pair's frame and no encode request's is read for the number.
+A frame may state the number its request names its worker by (`DecideRequest.named_worker`): a
+single request's frame, one that stands alone at a side's phase, and a pair's. Its host reads the
+number under the target source of its binding (section 8.2) and states it. A text that is no
+number crosses as the widest number, which reaches no worker. Under a document whose binding for
+the frame names that source, the controller counts as the one call does, by the same function.
+For a frame decided over one list it counts from 0 and in the order of its own list, over the
+workers the asking gateway can be sent to. Those are the places the gateway may take by its reach
+and its wires, that none of its standing vetoes holds back, and whose worker object is available
+by its own test. The frame's one decision is held to the worker the number reaches. The request
+goes to that worker or is shed with no endpoint, under `target-worker`: where the number reaches
+no worker, or that worker cannot take the request after all. Where the gateway can be sent to no
+worker of the list, the request is decided as one that names none, and carries neither its
+session key nor its client's key. A frame that states no number is decided as it was, and the
+frame of a host older than the field states none. No encode request's frame is read for the
+number.
 
-Four things differ there from a gateway's own process (section 8.2). Each is open under rule 6.
+A pair's frame states one number for its two sides, as one header gives a gateway's own process
+one (section 8.2). The controller counts it as the one call counts a pair's, by the same
+functions, over the two lists as the asking gateway may take them: each side's places by its
+reach and its wires, the places its standing vetoes hold back as that side's mask, and each
+worker object's own test. The frame's one decision is held to the places the count reaches: the
+prefill's and the decode's where both sides' profiles are the plain hash ring, and the prefill's
+alone where the decode's is not. Where the decode's side alone is the ring's, the decision is
+lent the decodes the gateway can be sent to and counts the number itself, behind the prefill it
+picks (`Constraints::target_worker`). A number that reaches no worker on a side sheds the pair
+with no endpoint, under `target-worker`, and so does a named worker that cannot take the request
+after all. Where no prefill is counted, or none opens the pair, the frame is decided as one that
+names none, and keeps its keys. Where every decode is over its thresholds and the binding steers
+such a pool, the decode goes by load and its number is not read. A pair's frame that states no
+number pays one test of it.
+
+A frame that states its later decode keeps that word (`DecideRequest.decode_later`). Its decode
+side is filed chosen, with the one decode the held decision named: it books nothing and waits
+under no dispatch deadline. A decode call behind it (`DecideRequest.decode_of`) is refused as
+one whose decode never stood chosen where the call's frame names its worker and the decode side
+of the binding reads the number, and the gateway sends the decode the first decision named. The
+call is judged by the policy spec in force at the call, whatever spec decided the first frame. A
+call whose frame leaves the number out is decided again as any pair's decode.
+
+Six things differ there from a gateway's own process (section 8.2). The first four are open
+under rule 6. The last two stand only behind a frame that states its later decode, which the
+crate's own client states for no request.
 
 - **The route's rule is not asked.** It is the gateway's own code and no frame states it yet, so
   the number counts a worker that rule refuses. It ends when the rule crosses as section 11 plans
@@ -2308,10 +2334,18 @@ Four things differ there from a gateway's own process (section 8.2). Each is ope
 - **No hard demand crosses.** A frame states none in this protocol version, and a host decides a
   request that states one by itself. So the controller's count leaves no worker out for a demand.
   It ends when a frame states a request's demands **[planned]**.
-- **A pair's frame is read for no number.** A gateway's own process holds a pair to the workers
-  its request names, a side at a time (section 8.2), and a controller decides a pair's frame as
-  one that names none. It ends when a controller counts a pair's two sides as the one call does
-  **[planned]**.
+- **A named prefill at its admission limit is not waited for.** A gateway's own process waits for
+  the prefill a pair names where it stands at that gateway's admission limit (section 8.2). A
+  controller keeps no gate: its count takes the prefill, and the gateway finds the limit. It ends
+  when a controller keeps a pair's admission **[planned]**.
+- **A later decode is booked at its dispatch.** A gateway's own process books the decode a pair
+  names with its prefill. A controller files it chosen, as the contract has a later decode, and
+  books it where a dispatch names it.
+- **A decode call is refused whatever the first decision counted.** Where the first decision
+  held no decode to the number (no prefill was counted or opened the pair, or every decode stood
+  over its thresholds), a gateway's own process asks the decode again as any pair's. A controller
+  refuses the call, and the gateway sends the first decision's decode. This is a named limit and
+  no cure is planned: the lease on file keeps no word of what its first decision counted.
 
 A gateway that decides by itself for lack of an answer (decision 6) counts over its own list by
 its own rule, so it can reach another worker than the controller's count reaches.
