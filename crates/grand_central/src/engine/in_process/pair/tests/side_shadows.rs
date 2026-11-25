@@ -651,12 +651,13 @@ fn a_sides_shadow_of_another_column_is_skipped_and_counted() {
     assert_eq!((again_kinds(&host), seen.asks()), ([0, 0, 0, 1], [2, 0]));
 }
 
-/// Beside a pair the binding's all-vetoed rule placed, the decode's shadow
-/// is not asked: its run is put to no rule, and would shed the partners
-/// its live side was steered among. It is counted as skipped, and the
+/// Beside a pair whose decode side the binding's all-vetoed rule steered,
+/// the decode's shadow is put to that rule as its live side is: it takes
+/// the decode the rule took for the live side and is counted as agreed.
+/// The rule's pick is no stage's, so the shadow's picker is not asked. The
 /// prefill's shadow is asked and compared.
 #[test]
-fn a_pair_a_lifted_veto_placed_counts_its_decode_shadow_as_skipped() {
+fn a_decode_shadow_beside_a_decode_the_rule_steered_is_put_to_the_rule() {
     let next = [Some(Rule::Place(1)); 2];
     let (host, seen) = shadowing((2, 2), [Rule::Place(0); 2], next, |document| {
         let stock = PolicySpec::pair_presets("least_load", "least_load");
@@ -676,7 +677,7 @@ fn a_pair_a_lifted_veto_placed_counts_its_decode_shadow_as_skipped() {
     let decided = paired(&host);
     let live = decided.decision.pick().expect("a pair");
     assert_eq!(live.trace.lifted, LiftedVeto::Overload);
-    assert_eq!(side_kinds(&host), [[0, 1, 0, 0], [0, 0, 0, 1]]);
+    assert_eq!(side_kinds(&host), [[0, 1, 0, 0], [1, 0, 0, 0]]);
     assert_eq!(seen.asks(), [1, 0]);
 }
 

@@ -78,8 +78,8 @@ pub(super) enum AllVetoed {
     /// No rule is asked: a pool a veto empties is shed at the stage that
     /// emptied it. A set's word, never a binding's. The rule's own passes
     /// carry it ([`Set::shedding`]), and so does a pass of a pair that says
-    /// no binding's word ([`Set::side`]): a prefill side's, one that only
-    /// names a shed's stage, a shadow's run, an encode item's.
+    /// no binding's word ([`Set::side`]): a prefill side's and its shadow's,
+    /// one that only names a shed's stage, an encode item's.
     Unasked,
 }
 
@@ -2926,13 +2926,16 @@ mod tests {
         }
     }
 
-    /// A pair the rule placed gets no decode shadow, at its first decision
-    /// and where its decode is asked again, under either lift: a shadow's
-    /// run says no binding's word, and a twin would shed the partners its
-    /// live side was steered among. Beside a pair no rule placed the twin
-    /// names the live decode.
+    /// A pair's decode shadow is put to its binding's rule as its live side
+    /// is, at the pair's first decision and where the decode is asked
+    /// again. Beside a decode the rule steered among partners over their
+    /// thresholds, the twin names that decode and the veto the rule lifted
+    /// for it. Where the decode is asked again past a doubt, the twin
+    /// follows it there too. A first decision's pair past a doubt is the
+    /// default's, and no shadow is said beside it. Beside a pair no rule
+    /// placed the twin names the live decode, and no veto.
     #[test]
-    fn a_pair_the_rule_placed_gets_no_decode_shadow() {
+    fn a_pairs_decode_shadow_is_put_to_its_bindings_rule() {
         let (engine, prefills) = (pair_engine(false), [classed(free(0, 0), 1)]);
         let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
         let shadows = |made: [fn(u32, u32) -> Candidate; 2]| {
@@ -2943,31 +2946,80 @@ mod tests {
                 ..PairPools::default()
             };
             let (held, side, scratch) = (prefills[0].id, PairSide::Decode, &mut Scratch::new());
+            // What a twin said beside `live`: its first decode and the veto
+            // its trace names. A twin that speaks names the live decode.
+            let beside = |live: &Decision, twin: Option<Decision>| {
+                twin.map(|twin| {
+                    assert_eq!(order(&twin)[0], pair_of(live).1);
+                    (order(&twin)[0], twin.trace().lifted)
+                })
+            };
             let first = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
-            // A first decision's pair past a doubt is the default's, and no
-            // shadow is said beside it either.
-            let twin = first.pick().map(|live| {
-                let said = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, live, scratch);
-                said.map(|shadow| order(&shadow)[0])
-            });
+            let pick = first.pick().expect("a pair");
+            let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
+            let twin = beside(&first, twin);
             let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
             let live = again.pick().expect("a decode");
             let later =
                 engine.shadow_decode_later(0, &req, &pool, pools, held, None, live, &cx, scratch);
-            let later = later.map(|shadow| order(&shadow)[0]);
-            (twin, later, live.trace.lifted == LiftedVeto::Liveness)
+            (twin, beside(&again, later))
         };
-        assert_eq!(shadows([free, over]), (Some(Some(0)), Some(0), false));
-        assert_eq!(shadows([over, over]), (Some(None), None, false));
-        assert_eq!(shadows([doubted, doubted]), (Some(None), None, true));
+        let none = Some((0, LiftedVeto::None));
+        assert_eq!(shadows([free, over]), (none, none));
+        let steered = Some((1, LiftedVeto::Overload));
+        assert_eq!(shadows([over, over]), (steered, steered));
+        // Past a doubt the first pair is the default's: its twin is silent.
+        let doubt = Some((1, LiftedVeto::Liveness));
+        assert_eq!(shadows([doubted, doubted]), (None, doubt));
+    }
+
+    /// The binding's word stands for a decode's shadow as for its live
+    /// side. A live decode side that reads no overload veto takes a busy
+    /// partner by its own stages. Its twin reads the veto, which leaves
+    /// the live prefill's partners nobody. Under a binding that steers
+    /// the rule takes the partner with the fewest requests for the twin,
+    /// and under one that sheds the twin is shed as saturated: at the
+    /// pair's first decision and where the decode is asked again.
+    #[test]
+    fn a_pairs_decode_shadow_reads_its_bindings_word() {
+        let prefills = [classed(free(0, 0), 1)];
+        let decodes = [over(0, 2), over(1, 1)].map(|worker| classed(worker, 1));
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+        let said = |shed: bool| {
+            let healthy: Vec<Box<dyn Filter>> = vec![Box::new(Healthy)];
+            let engine = pair_engine_of(shed, [vetoes(), healthy]);
+            let (held, side, scratch) = (prefills[0].id, PairSide::Decode, &mut Scratch::new());
+            let first = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
+            let live = first.pick().expect("a pair");
+            assert_eq!(live.trace.lifted, LiftedVeto::None);
+            let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, live, scratch);
+            let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
+            let live = again.pick().expect("a decode");
+            let later =
+                engine.shadow_decode_later(0, &req, &pool, pools, held, None, live, &cx, scratch);
+            [twin, later].map(|shadow| shadow.expect("the decode's shadow"))
+        };
+        for steered in said(false) {
+            let taken = (order(&steered)[0], steered.trace().lifted);
+            assert_eq!(taken, (1, LiftedVeto::Overload));
+        }
+        for shed in said(true) {
+            assert_eq!(shed_of(&shed), (ShedReason::Saturated, "not-overloaded"));
+        }
     }
 
     /// A pair the default made gets no shadow on either side: a twin
     /// decides by its profile where the live side was taken by load, and
     /// its stages shed a pool the vetoes refuse.
-    /// Beside a pair whose decode side alone the rule steered, the prefill's
-    /// shadow speaks: its live side was put to no rule. One scratch serves
-    /// both pairs, the default's first.
+    /// Beside a pair whose decode side alone the rule steered, both shadows
+    /// speak: the prefill's live side was put to no rule, and the decode's
+    /// shadow is put to its live side's. One scratch serves both pairs, the
+    /// default's first.
     #[test]
     fn a_pair_the_default_made_gets_no_shadow() {
         let (engine, scratch) = (pair_engine(false), &mut Scratch::new());
@@ -2991,7 +3043,7 @@ mod tests {
         // The default's pair: every prefill is over its thresholds.
         assert_eq!(said(over(0, 1), free(0, 0)), [None, None]);
         // The rule's pair: every decode is over, and the prefill side open.
-        assert_eq!(said(free(0, 0), over(0, 1)), [Some(0), None]);
+        assert_eq!(said(free(0, 0), over(0, 1)), [Some(0), Some(0)]);
     }
 
     /// An engine of one profile: `veto` and a filter that refuses every row,

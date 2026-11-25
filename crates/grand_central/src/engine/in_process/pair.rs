@@ -1036,8 +1036,11 @@ fn decide_shadowed(
 /// [`SHADOW_FLOOR`] of the request's stated budget, and where the engine's
 /// run says none. That run says none where the side's shadow profile would
 /// be handed another column than the side's pool carries
-/// ([`Engine::side_apart`]), beside a pair a lifted veto placed, and beside
-/// a side its binding's sessions rule or its picker's assignment placed.
+/// ([`Engine::side_apart`]), beside a pair the pair's default made or a
+/// weighing prefill profile's lift alone placed, and beside a side its
+/// binding's sessions rule or its picker's assignment placed. Beside a
+/// pair whose decode side the binding's all-vetoed rule steered, the
+/// decode's shadow is put to that rule and compared.
 /// So the kinds a side counts add up to the decisions its pair's profiles
 /// made.
 ///
@@ -1089,8 +1092,9 @@ fn side_shadows(
                 said(kind, first)
             }
             // The engine's run says none for a profile of another column,
-            // beside a pair a lifted veto placed, and beside a side its
-            // rule or its picker's assignment placed.
+            // beside a pair the default made or the weighing lift alone
+            // placed, and beside a side its rule or its picker's
+            // assignment placed.
             Ok(None) => said(ShadowKind::Skipped, None),
             // The shadow panicked: counted where it was caught.
             Err(_) => None,
