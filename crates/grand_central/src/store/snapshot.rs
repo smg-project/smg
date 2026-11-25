@@ -22,25 +22,15 @@
 //! What a membership build derives (where each pool stands, each pool's
 //! shape) is built once and shared by every world until the next membership
 //! build. A world's epoch is the membership's at its build: a world's
-//! identity moves with every publication. The pair classes are derived
-//! with the shapes where a write moved a member or an offer, and once more
-//! where a generation moves the pairing mode: a new world of the same
-//! epoch.
+//! identity moves with every publication.
 //! Between two membership builds a publication derives nothing: it is one
 //! small object, a pointer per pool, and new rows for each pool a write was
 //! folded into.
 //!
-//! **A pair class is a fact of the rows.** A model's pair classes come from
-//! what its prefills and decodes report ([`PairClasses`]), and a membership
-//! build holds them before any row is built: a worker's row carries its one
-//! class, and the model's table says which classes pair. The table names
-//! classes, never rows, so a pool with another gateway's host-local rows
-//! left out reads the same table. A build that pays one worker's writes
-//! derives the classes for that worker alone, in the models it left and
-//! joined, from what the writer keeps of each model's derivation. A build
-//! of writes that moved no member and no member's offer carries the last
-//! build's classes and reads no member's facts for them. Two workers'
-//! writes are one whole derivation.
+//! **The store derives no pair class.** A model's pair classes are derived
+//! by whoever holds its worker objects, from what its prefills and decodes
+//! report ([`PairClasses::derive`](crate::store::pairing::PairClasses::derive)).
+//! A row of a world reads class `0`.
 //!
 //! A row in a pool is the candidate row itself. Its fixed fields are
 //! written when the membership's first world is built. Its two status bits
@@ -89,11 +79,10 @@ use rustc_hash::FxHashMap;
 #[cfg(feature = "in-process")]
 use crate::engine::in_process::InProcess;
 use crate::{
-    document::spec::{AppliedSpec, Pairing, ViewListPositions},
+    document::spec::{AppliedSpec, ViewListPositions},
     engine::view::{fingerprint, Candidate, Health, Role, WorkerId},
     store::{
         applied::{Applied, EngineCounts},
-        pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
@@ -121,12 +110,6 @@ struct PoolShape {
     /// file ([`InFlightCounts`]): the slot its member keeps across membership
     /// builds.
     booked: Box<[WorkerSlot]>,
-    /// The pair classes of the pool's model, on its prefill pool where the
-    /// model has a decode too. Counted: a membership build hands them to
-    /// the shape it derives where they stand, one of writes that moved no offer
-    /// ([`Classes::Carry`]) and a written worker's derive that leaves them
-    /// as they were ([`Classes::Written`]).
-    pairs: Option<Arc<PairClasses>>,
 }
 
 /// The roles a model's pools are derived for: one slot each.
@@ -146,9 +129,8 @@ const fn role_slot(role: Role) -> usize {
 }
 
 /// What one membership build derives: where each pool stands in a world's
-/// rows, and each pool's shape. Built once per membership build, and once
-/// more where a generation moves the pairing mode, and shared by every
-/// world published until the next.
+/// rows, and each pool's shape. Built once per membership build and shared
+/// by every world published until the next.
 #[derive(Default)]
 struct Derived {
     /// The pools by model, then by role: each an index into a world's rows.
@@ -163,22 +145,6 @@ struct Derived {
 }
 
 impl Derived {
-    /// The shape of `model`'s pool of `role`.
-    fn shape(&self, model: &str, role: Role) -> Option<&PoolShape> {
-        let pool = self.by_model.get(model)?[role_slot(role)]?;
-        self.pools.get(pool as usize)
-    }
-
-    /// The shape of `model`'s prefill pool: the model's classes stand on it.
-    fn prefill(&self, model: &str) -> Option<&PoolShape> {
-        self.shape(model, Role::Prefill)
-    }
-
-    /// The pair classes of `model`, where it has a prefill and a decode.
-    fn pairs(&self, model: &str) -> Option<&Arc<PairClasses>> {
-        self.prefill(model)?.pairs.as_ref()
-    }
-
     /// How many members `pool` holds: none where there is no pool.
     fn members(&self, pool: Option<u32>) -> usize {
         pool.and_then(|pool| self.pools.get(pool as usize))
@@ -639,15 +605,6 @@ impl StoreSnapshot {
         self.pool(model, role).map(|(rows, _)| rows.len())
     }
 
-    /// The pair classes of `model` as this world's pools were derived, with
-    /// the table a pair decision reads beside the two pools
-    /// ([`PairClasses::table`]); `None` when the model has no prefill or no
-    /// decode. A membership write derives them, and so does a generation of
-    /// another pairing mode at the same epoch.
-    pub fn pairs(&self, model: &str) -> Option<&PairClasses> {
-        self.derived.pairs(model).map(|classes| &**classes)
-    }
-
     fn pool(&self, model: &str, role: Role) -> Option<(&[Candidate], &PoolShape)> {
         let index = self.index(model, role)?;
         Some((self.rows.get(index)?, self.derived.pools.get(index)?))
@@ -726,8 +683,8 @@ struct Held {
 
 /// The candidate row of one member: its fixed fields from its registration,
 /// its status bits, and its engine family, zone and labels as `listed`
-/// reads them under the standing generation's lists. Its pair class is the
-/// membership's to derive ([`pair_up`]).
+/// reads them under the standing generation's lists. Its pair class reads
+/// `0`: the store derives none.
 fn row_of(member: &WorkerRow, listed: ViewListPositions) -> Candidate {
     let facts = &member.facts;
     Candidate {
@@ -762,12 +719,11 @@ fn health_of(status: WorkerStatus) -> Health {
     }
 }
 
-/// One member on its way into a pool: its row, what it registered with, and
-/// its slot in the store's counts.
+/// One member on its way into a pool: its row and its slot in the store's
+/// counts.
 #[derive(Clone, Copy)]
-struct Entry<'a> {
+struct Entry {
     row: Candidate,
-    facts: &'a WorkerFacts,
     /// Its member's slot in the store's counts.
     booked: WorkerSlot,
 }
@@ -798,99 +754,6 @@ fn side_of<T: Copy>(entries: &mut Vec<T>, places: &[u32], last: bool) -> Vec<T> 
     }
 }
 
-/// What the pairing rule reads of one side's entries, in place: each
-/// worker's id, wires, runtime and descriptor.
-impl<'a> Pool<'a> for [Entry<'a>] {
-    fn count(&self) -> usize {
-        self.len()
-    }
-
-    fn id(&self, at: usize) -> WorkerId {
-        self[at].row.id
-    }
-
-    fn member(&self, at: usize) -> Member<'a> {
-        let entry = &self[at];
-        let facts = entry.facts;
-        Member::new(
-            entry.row.id,
-            facts.wire_modes,
-            &facts.engine_kind,
-            facts.pairing.as_deref(),
-        )
-    }
-}
-
-/// What a membership write asks of a model's pair classes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Classes {
-    /// Every model's classes are derived whole: a generation of another
-    /// pairing mode, which moves every verdict.
-    Derive,
-    /// One worker's write moved a member or a member's offer: `left` is
-    /// the worker the last write held and `joined` the worker as it stands
-    /// now, each where there is one, and one id where a registration moved
-    /// its own offer. The classes are derived for that worker alone in the
-    /// models it left and joined ([`Derivation::written`]) and carried in
-    /// every other.
-    Written {
-        left: Option<WorkerId>,
-        joined: Option<WorkerId>,
-    },
-    /// No member joined or left and no member's offer moved
-    /// ([`same_offer`]): the classes are the last write's, carried, and no
-    /// member's facts are read for them. Every pool holds the rows it
-    /// held, each admitted when it was and stating the wires it stated.
-    Carry,
-}
-
-impl Classes {
-    /// What one write asks that stands for a write asking `self` and a
-    /// later one asking `next`: the build that pays both derives once.
-    fn then(self, next: Self) -> Self {
-        match (self, next) {
-            (Self::Carry, asked) | (asked, Self::Carry) => asked,
-            // One worker written twice: the worker the last build held and
-            // the worker as it stands now. A worker that came and went
-            // between two builds moved nothing.
-            (
-                Self::Written {
-                    left,
-                    joined: Some(between),
-                },
-                Self::Written {
-                    left: Some(again),
-                    joined,
-                },
-            ) if between == again => {
-                if left.is_none() && joined.is_none() {
-                    Self::Carry
-                } else {
-                    Self::Written { left, joined }
-                }
-            }
-            // Two workers' writes, or a whole derivation owed already.
-            _ => Self::Derive,
-        }
-    }
-}
-
-/// Whether two versions of one worker's facts stand in the same pools with
-/// the same offer: the role and the models place a worker in its pools, and
-/// the wires, the runtime and the descriptor are what the pairing rule reads of
-/// it, the runtime as an offer holds it ([`known`]). A write from one such
-/// version to the other moves no pair class. The models are read as they
-/// are listed: a refresh that only reorders them is answered as a moved
-/// offer, for that worker alone, where [`WorkerFacts::same_models`] reads
-/// the reorder as the same worker for the status a new incarnation takes.
-pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
-    old.role == new.role
-        && old.models == new.models
-        && old.wire_modes == new.wire_modes
-        && known(&old.engine_kind) == known(&new.engine_kind)
-        && old.pairing == new.pairing
-}
-
 /// The models `old` stands in a pool of and `new` does not, where both are
 /// one worker's facts under one registration: every model of the old list
 /// where the role moved, and the old list less the new where it did not.
@@ -904,60 +767,6 @@ pub(super) fn left_models(old: WorkerFacts, new: &WorkerFacts) -> Vec<String> {
     models
         .extract_if(.., |model| moved || !new.models.contains(model))
         .collect()
-}
-
-/// One model's pair classes under `mode`, each prefill's and each decode's
-/// class written on its row. `carried` is the last write's and `kept` holds
-/// the model's derivation as that write left it: the classes are carried
-/// where this write moved no member and no offer, derived for the written
-/// worker alone where it moved one, and derived whole for a model's first
-/// pair and for a generation of another mode (`classes`). `None` when a
-/// side has no member: one side alone is no pair, and its rows keep class
-/// 0.
-fn pair_up(
-    sides: &mut [Vec<Entry<'_>>; ROLES],
-    mode: Pairing,
-    classes: Classes,
-    carried: Option<&Arc<PairClasses>>,
-    kept: &mut FxHashMap<Box<str>, Derivation>,
-    model: &str,
-) -> Option<Arc<PairClasses>> {
-    let (prefill, decode) = (role_slot(Role::Prefill), role_slot(Role::Decode));
-    if sides[prefill].is_empty() || sides[decode].is_empty() {
-        return None;
-    }
-    let (prefills, decodes) = (sides[prefill].as_slice(), sides[decode].as_slice());
-    let classes = match (classes, carried) {
-        // No member and no offer moved: the last write's classes stand, and
-        // what is kept of their derivation is not looked up.
-        (Classes::Carry, Some(carried)) => Arc::clone(carried),
-        (classes, carried) => match kept.get_mut(model) {
-            Some(derivation) => match (classes, carried) {
-                (Classes::Written { left, joined }, Some(carried)) => derivation
-                    .written(carried, prefills, decodes, mode, (left, joined))
-                    .map_or_else(|| Arc::clone(carried), Arc::new),
-                _ => Arc::new(derivation.whole(prefills, decodes, mode)),
-            },
-            // The model's first pair.
-            None => {
-                let mut derivation = Derivation::default();
-                let classes = Arc::new(derivation.whole(prefills, decodes, mode));
-                kept.insert(model.into(), derivation);
-                classes
-            }
-        },
-    };
-    for (side, classed) in [(prefill, classes.prefills()), (decode, classes.decodes())] {
-        let ids = sides[side].iter().map(|entry| entry.row.id);
-        debug_assert!(
-            classed.iter().map(|&(id, _)| id).eq(ids),
-            "the classes are these members'"
-        );
-        for (entry, &(_, class)) in sides[side].iter_mut().zip(classed) {
-            entry.row.pair_class = class;
-        }
-    }
-    Some(classes)
 }
 
 /// One member's row in one pool of the writer's working copy.
@@ -976,16 +785,6 @@ struct Working {
     dirty: bool,
 }
 
-/// The build the membership writes since the last one left owed.
-#[derive(Clone, Copy)]
-struct Owed {
-    /// What those writes ask of the pair classes, as one write would.
-    classes: Classes,
-    /// When the first of them was written: the build is due from then, or
-    /// from the window's end where that is later.
-    since: Instant,
-}
-
 /// The write side of the world, behind one lock of the store: the working
 /// copy of every pool, where each member's rows stand in them, what the
 /// last publication held, and the publication window. Every write that
@@ -997,10 +796,6 @@ pub(super) struct Writer {
     /// The store's epoch at the last membership build.
     epoch: u64,
     derived: Arc<Derived>,
-    /// Each model's derivation of its pair classes as the last membership
-    /// build left it, for the models that hold a prefill and a decode: the
-    /// next build of one worker's writes derives for that worker alone.
-    derivations: FxHashMap<Box<str>, Derivation>,
     /// Each pool's rows as the last publication left them.
     published: Vec<Arc<[Candidate]>>,
     /// Each pool's spare: the rows it published before its last, kept for
@@ -1062,9 +857,11 @@ pub(super) struct Writer {
     listed_spare: Vec<Held>,
     /// The last publication the window counts from: a window's end.
     last_window: Option<Instant>,
-    /// The build the membership writes since the last one left owed; `None`
-    /// while the working rows are the membership's.
-    owed: Option<Owed>,
+    /// The build the membership writes since the last one left owed, by the
+    /// instant the first of them was written: the build is due from then,
+    /// or from the window's end where that is later. `None` while the
+    /// working rows are the membership's.
+    owed: Option<Instant>,
 }
 
 impl Writer {
@@ -1077,7 +874,6 @@ impl Writer {
             origin,
             epoch: 0,
             derived: Arc::default(),
-            derivations: FxHashMap::default(),
             published: Vec::new(),
             spares: Vec::new(),
             working: Vec::new(),
@@ -1142,17 +938,9 @@ impl Writer {
     /// membership, read again under them, so the first world of a
     /// generation holds rows of its own lists.
     ///
-    /// The pair classes are derived under the generation's pairing mode.
-    /// A generation of the standing mode keeps the rows' classes; one
-    /// of another mode derives `members`, the membership as it stands at
-    /// the store's `epoch`, again by the build's own door
-    /// ([`Writer::rebuild`]) and publishes once, under the new generation:
-    /// the epoch is the membership's and the generation the document's,
-    /// and what is derived from both is published under both. That build
-    /// takes in every membership write since the last, so none stays owed.
-    /// It reads every member where the generation's lists differ from the
-    /// standing one's and carries each member's fields where they are the
-    /// same.
+    /// No pool is built again, whatever the generation's pairing mode: the
+    /// store derives no pair class, and a build the membership writes left
+    /// owed stays owed.
     ///
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
@@ -1163,7 +951,6 @@ impl Writer {
     pub(super) fn apply<'a>(
         &mut self,
         spec: Arc<Applied>,
-        epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
     ) -> Result<(Arc<StoreSnapshot>, Option<Arc<Applied>>), StaleGeneration> {
         let standing = self.spec.generation();
@@ -1174,21 +961,11 @@ impl Writer {
             });
         }
         let relisted = spec.lists() != self.spec.lists();
-        let derive = spec.pairing() != self.spec.pairing();
         let before = self.retired.replace(mem::replace(&mut self.spec, spec));
-        let world = if derive {
-            if relisted {
-                // No member's fields are carried into other lists.
-                self.listed.clear();
-            }
-            self.rebuild(epoch, members, Classes::Derive)
-        } else {
-            if relisted {
-                self.list(members);
-            }
-            self.publish()
-        };
-        Ok((world, before))
+        if relisted {
+            self.list(members);
+        }
+        Ok((self.publish(), before))
     }
 
     /// Read every member under the standing generation's lists: its engine
@@ -1254,24 +1031,18 @@ impl Writer {
     /// Derive the pools of the membership `members` at the store's `epoch`,
     /// make them the working copy and publish them through the one door:
     /// every pool is new, so the door copies none, every earlier fold is in
-    /// the world this returns and nothing waits. The pair classes are
-    /// derived for the written worker alone, derived whole or carried from
-    /// the last write, as the caller says (`classes`). A member's engine
-    /// family, zone and labels under the standing generation's lists are
-    /// read where its row's revision moved since they were last read, and
-    /// carried where it stands.
+    /// the world this returns and nothing waits. A member's engine family,
+    /// zone and labels under the standing generation's lists are read where
+    /// its row's revision moved since they were last read, and carried
+    /// where it stands.
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
-        classes: Classes,
     ) -> Arc<StoreSnapshot> {
         // A build takes in every membership write: none stays owed.
         self.owed = None;
         self.builds += 1;
-        // The last write's classes: carried, or what the written worker's
-        // derive starts from.
-        let last = (classes != Classes::Derive).then(|| Arc::clone(&self.derived));
         // Each model's members a side, by their place in `entries`: a
         // member's entry is written once, whatever it offers.
         let mut groups: FxHashMap<Box<str>, [Vec<u32>; ROLES]> = FxHashMap::default();
@@ -1292,7 +1063,7 @@ impl Writer {
         // entries is made from it below for one model at a time, at its
         // length: a build holds one model's lists and never every
         // model's, and moves none to grow.
-        let mut entries: Vec<Entry<'a>> = Vec::with_capacity(members.len());
+        let mut entries: Vec<Entry> = Vec::with_capacity(members.len());
         // Each member's three fields under the standing generation's lists:
         // carried from the last read where the member's row stands at the
         // revision it was read at, read again where it moved or is new. A
@@ -1333,7 +1104,6 @@ impl Writer {
             };
             let entry = Entry {
                 row: row_of(member, listed),
-                facts,
                 // The slot the member's first write gave it: a build gives
                 // none and moves none.
                 booked: slot,
@@ -1387,19 +1157,13 @@ impl Writer {
             // build holds one model's lists at a time. No model behind the
             // last reads `entries`.
             let last_model = nth + 1 == models;
-            let mut sides: [Vec<Entry<'a>>; ROLES] =
+            let sides: [Vec<Entry>; ROLES] =
                 sides_at.map(|side| side_of(&mut entries, &side, last_model));
-            // Every side stands in id order, as the walk above pushed it,
-            // before a class is derived: the classes are numbered in it, and
-            // each row is built with its class.
+            // Every side stands in id order, as the walk above pushed it:
+            // a pool's rows are searched by id.
             debug_assert!(sides
                 .iter()
                 .all(|entries| entries.is_sorted_by(|a, b| a.row.id < b.row.id)));
-            // The model's classes go on its prefill pool's shape: a model
-            // that has classes has that pool.
-            let carried = last.as_deref().and_then(|last| last.pairs(&model));
-            let (mode, kept) = (self.spec.pairing(), &mut self.derivations);
-            let mut pairs = pair_up(&mut sides, mode, classes, carried, kept, &model);
             let mut indexes = [None; ROLES];
             for (side, entries) in sides.into_iter().enumerate() {
                 if entries.is_empty() {
@@ -1423,25 +1187,12 @@ impl Writer {
                     }));
                 pools.push(PoolShape {
                     booked: entries.iter().map(|entry| entry.booked).collect(),
-                    pairs: if side == role_slot(Role::Prefill) {
-                        pairs.take()
-                    } else {
-                        None
-                    },
                 });
                 self.spares.push(None);
                 self.working.push(Working { rows, dirty: false });
                 indexes[side] = Some(index);
             }
             by_model.insert(model, indexes);
-        }
-        if classes != Classes::Carry {
-            // A model that lost a side keeps no derivation.
-            let (prefill, decode) = (role_slot(Role::Prefill), role_slot(Role::Decode));
-            let paired =
-                |pools: &[Option<u32>; ROLES]| pools[prefill].is_some() && pools[decode].is_some();
-            self.derivations
-                .retain(|model, _| by_model.get(model).is_some_and(paired));
         }
         self.places
             .sort_unstable_by_key(|place| (place.id, place.pool));
@@ -1646,26 +1397,22 @@ impl Writer {
     pub(super) fn due(&self) -> Option<Instant> {
         let end = self.last_window.map(|last| self.window_end(last));
         match (self.owed, end) {
-            (Some(owed), None) => Some(owed.since),
-            (Some(owed), Some(end)) => end.map(|end| end.max(owed.since)),
+            (Some(since), None) => Some(since),
+            (Some(since), Some(end)) => end.map(|end| end.max(since)),
             (None, _) => None,
         }
     }
 
     /// A membership write moved the rows of record: the pools are built
     /// again once, when the window ends ([`Writer::due`]), for every write
-    /// since the last build. `classes` is what this write asks of the pair
-    /// classes and `at` when it was written. `true` where no build was
-    /// owed before: the write named an instant the host has not read.
-    pub(super) fn owe(&mut self, classes: Classes, at: Instant) -> bool {
+    /// since the last build. `at` is when this write was written. `true`
+    /// where no build was owed before: the write named an instant the host
+    /// has not read.
+    pub(super) fn owe(&mut self, at: Instant) -> bool {
         let first = self.owed.is_none();
-        self.owed = Some(match self.owed {
-            Some(owed) => Owed {
-                classes: owed.classes.then(classes),
-                since: owed.since,
-            },
-            None => Owed { classes, since: at },
-        });
+        if first {
+            self.owed = Some(at);
+        }
         first
     }
 
@@ -1673,12 +1420,6 @@ impl Writer {
     /// membership in hand ([`Writer::build_owed`]).
     pub(super) fn build_due(&self, now: Instant) -> bool {
         self.owed.is_some() && self.due().is_some_and(|due| now >= due)
-    }
-
-    /// Whether a membership write left a build owed that none has paid:
-    /// the standing pools then list no member written since their build.
-    pub(super) fn owes(&self) -> bool {
-        self.owed.is_some()
     }
 
     /// Pay the build the membership writes left owed: the pools of
@@ -1694,7 +1435,7 @@ impl Writer {
         epoch: u64,
         members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
     ) -> Option<Arc<StoreSnapshot>> {
-        let owed = self.owed.take()?;
+        self.owed.take()?;
         if let Some(at) = at {
             self.last_window = Some(at);
             // A veto that ended at or before the window's instant leaves the
@@ -1704,7 +1445,7 @@ impl Writer {
                 self.vetoes = Arc::new(vetoes);
             }
         }
-        Some(self.rebuild(epoch, members, owed.classes))
+        Some(self.rebuild(epoch, members))
     }
 
     /// The end of the window `last` opened; `None` for a window so long

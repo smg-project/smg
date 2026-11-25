@@ -1096,7 +1096,7 @@ fn bootstrap_port(pairing: &proto::PairingDescriptor) -> Result<Option<u16>, Ref
     if *pair_class != 0 {
         return Err(refused(
             "spec.pairing.pair_class",
-            "the store derives a pairing class: a registration states none",
+            "a pairing class is derived, never stated: a registration states none",
         ));
     }
     match u16::try_from(*bootstrap_port) {
