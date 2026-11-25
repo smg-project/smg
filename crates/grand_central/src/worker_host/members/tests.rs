@@ -20,7 +20,7 @@ use crate::{
         Constraints, InProcess, LentList, Request, RequestFacts, RequestMaker, WorkerId,
         WorkerLists,
     },
-    store::{MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{MemoryStore, WorkerFacts, WorkersStore},
     worker_host::Objects,
 };
 
@@ -160,21 +160,18 @@ fn each_role_is_lent_in_the_registrys_order_with_its_rows_facts() {
 /// is zero, which would state none.
 #[test]
 fn a_decision_over_a_lent_list_names_its_targets_by_their_rows_ids() {
-    let mut replica = Replica::new();
-    replica.objects = replica.objects.with_status_followed();
+    let replica = Replica::new();
     // A worker with no row stands first among the members and in no list.
     replica.register_stray();
     let first = replica.write(SINGLE_0, Role::Single, false);
     let second = replica.write(SINGLE_1, Role::Single, false);
     assert!(first != WorkerId(0) && second != WorkerId(0));
-    // A decision takes a worker whose row is ready.
+    // A decision takes a worker that is ready: its connect signal.
     for url in [SINGLE_0, SINGLE_1] {
         let row = replica.store.by_key(url).expect("a row");
-        let ready = WorkerStatus::Ready;
-        assert!(replica
-            .store
-            .set_status(row.id, ready, row.revision)
-            .is_some());
+        replica
+            .objects
+            .connect_row(&replica.store, row.id, row.revision);
     }
     replica.objects.follow(&replica.store);
     let generation = replica.generation();

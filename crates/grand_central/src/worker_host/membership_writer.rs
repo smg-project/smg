@@ -2925,10 +2925,10 @@ pub(super) mod tests {
             }
         }
 
-        /// A holder with a registry of its own, whose objects take their
-        /// rows' status. It reads `store` where a case has it follow.
+        /// A holder with a registry of its own. It reads `store` where a
+        /// case has it follow, and builds each object in its row's status.
         fn holder() -> Objects<Members> {
-            Objects::new(Arc::new(WorkerRegistry::new())).with_status_followed()
+            Objects::new(Arc::new(WorkerRegistry::new()))
         }
 
         /// What `engine` decides for `asked` over `lists`: a whole decision.

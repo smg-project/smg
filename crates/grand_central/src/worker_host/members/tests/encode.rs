@@ -272,8 +272,7 @@ fn a_row_whose_encode_end_moves_gets_a_new_object_and_a_new_generation() {
 /// each named by its place in its list and by its row's id.
 #[test]
 fn the_lent_lists_and_the_holders_columns_place_an_item_of_one_fleet() {
-    let mut replica = Replica::new();
-    replica.objects = replica.objects.with_status_followed();
+    let replica = Replica::new();
     let sides = [
         (PREFILL, Role::Prefill, push(Role::Prefill, "a")),
         (PREFILL_1, Role::Prefill, push(Role::Prefill, "b")),
