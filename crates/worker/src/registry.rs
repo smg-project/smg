@@ -157,10 +157,10 @@ type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
 /// lock ([`WorkerRegistry::remove_if`]).
 type RemovalCondition<'a> = &'a dyn Fn(&Arc<dyn Worker>) -> bool;
 
-/// Pauses the next status transition after whatever its caller did outside
-/// the worker's mutation lock and before the lock is taken: the transition
-/// reports in, then waits to be let go. The interleaving proofs place
-/// another writer's transition in that window.
+/// Pauses the next status transition or registration after whatever its
+/// caller did outside the worker's mutation lock and before the lock is
+/// taken: the call reports in, then waits to be let go. The interleaving
+/// proofs place another writer's transition in that window.
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Debug, Default)]
 struct TransitionTestHooks {
@@ -1700,19 +1700,7 @@ impl<G: Generation> WorkerRegistry<G> {
             .clone();
 
         #[cfg(any(test, feature = "test-util"))]
-        #[expect(
-            clippy::expect_used,
-            reason = "test support: a hook nobody observes must fail the test that set it"
-        )]
-        {
-            let pause = self.transition_test_hooks.lock().before_lock.take();
-            if let Some((reached, resume)) = pause {
-                reached.send(()).expect("transition observer is listening");
-                resume
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .expect("test releases the paused transition");
-            }
-        }
+        self.pause_before_the_lock();
 
         let _guard = lock.lock();
 
@@ -2246,7 +2234,25 @@ impl<G: Generation> WorkerRegistry<G> {
             .entry(worker_id.clone())
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
+        #[cfg(any(test, feature = "test-util"))]
+        self.pause_before_the_lock();
         let _guard = lock.lock();
+
+        // The id was read before its lock was held. A removal that held the
+        // lock in between took the URL's mapping and the lock's entry with
+        // its worker, and a worker entered then would be one no read by URL
+        // finds, under a lock no later call takes: where either is gone it
+        // is laid again for this id. One another call laid meanwhile stays.
+        if !self.worker_mutation_locks.contains_key(&worker_id) {
+            self.worker_mutation_locks
+                .entry(worker_id.clone())
+                .or_insert_with(|| Arc::clone(&lock));
+        }
+        if !self.url_to_id.contains_key(worker.url()) {
+            self.url_to_id
+                .entry(worker.url().to_string())
+                .or_insert_with(|| worker_id.clone());
+        }
 
         // Under the lock, reject if the URL already has an active
         // worker. A pre-reserved ID (from `reserve_id_for_url`) or a
@@ -2662,10 +2668,29 @@ impl<G: Generation> WorkerRegistry<G> {
 
 #[cfg(any(test, feature = "test-util"))]
 impl<G: Generation> WorkerRegistry<G> {
+    /// The seam of [`Self::with_another_write_before_the_lock`]: a status
+    /// transition or a registration that holds its worker's mutation lock
+    /// by reference and has not taken it yet reports in and waits to be
+    /// let go, once for a hook set.
+    #[expect(
+        clippy::expect_used,
+        reason = "test support: a hook nobody observes must fail the test that set it"
+    )]
+    fn pause_before_the_lock(&self) {
+        let pause = self.transition_test_hooks.lock().before_lock.take();
+        if let Some((reached, resume)) = pause {
+            reached.send(()).expect("transition observer is listening");
+            resume
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("test releases the paused transition");
+        }
+    }
+
     /// Test support for the interleaving proofs. Runs `transition` on its
     /// own thread and pauses it at the next status transition's seam: after
     /// whatever the caller did outside the worker's mutation lock, before
-    /// the lock is taken. `other_write` then runs on this thread (another
+    /// the lock is taken. A registration pauses at the same seam, the id of
+    /// its URL read. `other_write` then runs on this thread (another
     /// writer's transition, through the registry, so it lands under the
     /// lock), after which `transition` is let go and its result returned.
     /// No sleep determines the ordering.
