@@ -8,7 +8,7 @@
 //! ([`InProcess::place`]): it keeps the placement to the request's end
 //! and says when the request went out and how it ended.
 //!
-//! `program.rs` is the program. This file runs it six times, over workers
+//! `program.rs` is the program. This file runs it seven times, over workers
 //! that serve nothing: a send is a line on the output. The first run is over
 //! three single workers, one of which answers every send with a server
 //! error, so a request that meets it is asked again past it. The second is
@@ -22,7 +22,9 @@
 //! that places a routing key by a ring: the program lends its own
 //! (`ring.rs`), and a key goes to the worker that ring puts it on. The
 //! sixth is over workers on two wires: a retry stays on the wire of the
-//! worker its request went to first.
+//! worker its request went to first. The seventh is over a worker that
+//! answers each request itself: the program states a rule of its own with
+//! the retry, and that worker takes no further attempt of the request.
 //!
 //! `engine_load.rs` is a stage of the program's own, a scorer added in
 //! code. This file shows it once over records made by hand, as a program
@@ -43,7 +45,7 @@ use std::{error::Error, sync::Arc};
 
 use engine_load::{decided_by_engine_load, stages};
 use http::{HeaderMap, HeaderValue};
-use program::{encode_settings, pair_settings, settings, Asked, Plan, Program};
+use program::{encode_settings, pair_settings, settings, Asked, Plan, Program, OWN_ANSWER};
 use smg_grand_central::{
     document::{AppliedSpec, DecodePick, PolicySettings, PolicySpec},
     engine::{
@@ -65,6 +67,10 @@ const MODEL: &str = "model-a";
 
 /// The worker that answers every send with a server error.
 const FAILING: &str = "http://worker-1:8000";
+
+/// The worker that takes every request, runs it and fails on it: its
+/// answer is its own ([`OWN_ANSWER`]).
+const ANSWERING: &str = "http://worker-6:8000";
 
 /// A ready worker of `kind` at `address` that serves [`MODEL`], dialed over
 /// `transport`, with no health checker behind it.
@@ -90,7 +96,11 @@ fn worker(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
 
 /// The example's network: a send is a line on the output.
 fn send(worker: &dyn Worker) -> u16 {
-    let status = if worker.url() == FAILING { 502 } else { 200 };
+    let status = match worker.url() {
+        FAILING => 502,
+        ANSWERING => OWN_ANSWER,
+        _ => 200,
+    };
     println!("  sent to {}, answered {status}", worker.url());
     status
 }
@@ -185,6 +195,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     in_turn(&asked).await?;
     by_ring().await?;
     on_one_wire(&asked).await?;
+    by_rule(&asked).await?;
     own_stage()
 }
 
@@ -372,6 +383,43 @@ async fn on_one_wire(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
         println!("request {request}, over two wires:");
         let answer = program.serve(asked);
         println!("  the client reads {}", answer.status);
+    }
+    Ok(())
+}
+
+/// The program over a worker that answers each request itself, first beside
+/// a worker that is not serving and then alone. A worker that answered a
+/// request itself takes no further attempt of it: the program states that
+/// rule of its own with each later attempt. Beside the other worker, the
+/// request's other attempts go there, and the client reads that worker's
+/// status. Alone, its answer is the client's after one send: the rule
+/// leaves the next attempt no worker, and the engine says so.
+async fn by_rule(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let fleets = [
+        (&[ANSWERING, FAILING][..], "beside one that is not serving"),
+        (&[ANSWERING][..], "alone"),
+    ];
+    for (addresses, how) in fleets {
+        let settings = settings(PolicySettings::RoundRobin);
+        let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+        let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+        let (program, task) = Program::start(plan, spec, None, send);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the engine's task runs for the life of the process"
+        )]
+        let _task = tokio::spawn(task);
+        for address in addresses {
+            let single = worker(address, WorkerType::Regular);
+            assert!(program.join(single), "a free address joins");
+        }
+        tokio::task::yield_now().await;
+        println!("a request over a worker that answers it itself, {how}:");
+        let answer = program.serve(asked);
+        match answer.unplaced {
+            Some(unplaced) => println!("  the client reads {}: {unplaced:?}", answer.status),
+            None => println!("  the client reads {}", answer.status),
+        }
     }
     Ok(())
 }
