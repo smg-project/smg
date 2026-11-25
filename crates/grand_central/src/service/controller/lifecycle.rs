@@ -1412,7 +1412,7 @@ pub(crate) mod tests {
 
     /// A dispatch on a worker whose object stands is counted while the
     /// store's world lists the worker not yet: a registration's object
-    /// stands from its write, and the world lists its row at the build
+    /// stands from its write, and the world lists the worker at the build
     /// its publication window ends with. The decision that sent the
     /// request read the worker objects, and so does its count.
     #[test]

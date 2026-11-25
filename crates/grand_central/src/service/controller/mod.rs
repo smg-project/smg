@@ -152,6 +152,14 @@ pub struct Controller {
     elector: Elector,
     /// The election's sight of the lease, written by its thread.
     standing: watch::Sender<ElectionObservation>,
+    /// The listeners' close: one word, said once by the serve's drain.
+    /// Every task of the serve hears it, and an open decide stream through
+    /// [`Shared::stop`].
+    stop: watch::Sender<bool>,
+    /// The term this replica leads, told by the serve's one task
+    /// ([`tell_role`]), which takes this sender whole: [`Shared::role`] is
+    /// its receiver.
+    role: watch::Sender<Option<u64>>,
     /// What every listener's instance of the service reads; the store is
     /// its field, the run loop's tasks read the same one.
     shared: Arc<Shared>,
@@ -479,11 +487,18 @@ impl Controller {
         // not indexed streams its load records alone. Every replica opens
         // that stream: a take finds it open.
         kv_feed.set_loads_wanted(monitor.wanted());
-        let mut shared = Shared::new(
+        // The serve's two words, each said by one task of it: `Shared` holds
+        // their receivers, as every listener's instance hears them.
+        let (stop, stopped) = watch::channel(false);
+        let (role, led) = watch::channel(None);
+        // The standby's lag, made once from the configured interval: the
+        // readiness reads the one `Shared` holds.
+        let lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
+        let shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
-            stood,
+            (stood, stopped, led, lag),
             (journal.0, journal.1, workers.holder(), monitor.loads()),
             Arc::clone(&catalog),
             config.decide_shards,
@@ -496,7 +511,6 @@ impl Controller {
         if config.election.lease.is_shared() {
             shared.generations.under(Arc::clone(&shared.fence));
         }
-        shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
         let shared = Arc::new(shared);
@@ -531,6 +545,8 @@ impl Controller {
             metrics: Arc::new(metrics::Metrics::new()),
             elector,
             standing,
+            stop,
+            role,
             shared,
             spec_file: None,
             listeners,
@@ -878,6 +894,8 @@ impl Controller {
             metrics,
             elector,
             standing,
+            stop,
+            role,
             shared,
             spec_file,
             listeners,
@@ -890,9 +908,6 @@ impl Controller {
             ..
         } = self;
         let store = Arc::clone(&shared.store);
-        // The listeners' close is one word, and an open decide stream hears
-        // it too: the word is `Shared`'s.
-        let stop = shared.stop.clone();
         // A replica under a shared lease follows its leader where it can,
         // and says once why it cannot: it then behaves as before a standby
         // existed.
@@ -942,12 +957,7 @@ impl Controller {
             });
             reporters.push(reporter);
         }
-        let teller = tell_role(
-            readiness.clone(),
-            stop.subscribe(),
-            doors,
-            shared.role.clone(),
-        );
+        let teller = tell_role(readiness.clone(), stop.subscribe(), doors, role);
         tasks.spawn(async move {
             teller.await;
             Ok(())
@@ -988,7 +998,7 @@ impl Controller {
             // The probes run under the role's word on every replica: one
             // that leads alone hears it from its own election, and one
             // that does not lead dials no engine for its health.
-            let (probes_stop, led) = (stop.subscribe(), shared.role.subscribe());
+            let (probes_stop, led) = (stop.subscribe(), shared.role.clone());
             tasks.spawn(async move {
                 prober.run(probes_stop, led).await;
                 Ok(())
@@ -997,7 +1007,7 @@ impl Controller {
             // does not lead polls no engine for its load either. Its stop
             // publishes the snapshot empty for the deciding threads, but
             // for the one loop `LoadMonitor::run` names.
-            let (loads_stop, led) = (stop.subscribe(), shared.role.subscribe());
+            let (loads_stop, led) = (stop.subscribe(), shared.role.clone());
             tasks.spawn(async move {
                 monitor.run(loads_stop, led).await;
                 Ok(())
@@ -1223,6 +1233,10 @@ impl Controller {
 /// take behind it can both fall between two reads of this loop: the replica
 /// leads at each read, under another term at the second. That term is
 /// another word, so a task that runs for one term hears where it ended.
+///
+/// `told` is the word's one sender and goes with this task. At the task's
+/// end, a serve's leave by an error included, the word ends: a watch that
+/// waits is woken once more, and ends.
 async fn tell_role(
     mut role: Readiness,
     mut stop: watch::Receiver<bool>,
@@ -1404,16 +1418,19 @@ mod tests {
         decision_slots::{tests as bed, TERM_MARK},
         election::{self, ElectionObservation},
         following,
-        principal::Layer,
+        principal::{tests::told, Layer},
         readiness::{self, tests::fenced, Phase},
         standby::Lag,
         tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, Error, NoFollow,
-        Scope,
+        Scope, Service,
     };
     use crate::{
-        service::elector::{
-            ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
-            LeaseRecord, MemoryLease, TickOutcome,
+        service::{
+            elector::{
+                ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
+                LeaseRecord, MemoryLease, TickOutcome,
+            },
+            proto::{self, grand_central_server::GrandCentral as _},
         },
         store::{HealthPolicy, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
     };
@@ -1887,6 +1904,63 @@ mod tests {
             record.holder.is_empty(),
             "the lease is released when the serve has returned: {record:?}"
         );
+    }
+
+    /// The role's word ends with the task that tells it. A serve that
+    /// leaves by a listener's error ends that task with its listeners and
+    /// says no stop: a watch that waits for its next event is woken at the
+    /// word's end and ends as at a lost lead, with no wait for its
+    /// connection.
+    #[tokio::test]
+    async fn a_serve_that_leaves_by_an_error_ends_a_watch_that_waits() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let gateways = Service::new(vec![Scope::Gateway], Arc::clone(&controller.shared));
+        let (fail, failed) = oneshot::channel::<()>();
+        let serve = controller.serve_until(pending(), async move {
+            let _ = failed.await;
+            Error::Task("a listener failed".to_owned())
+        });
+        let case = async {
+            let (wait, begun) = (Duration::from_secs(20), Instant::now());
+            while gateways.leading(Instant::now()).is_err() {
+                assert!(begun.elapsed() < wait, "no first take");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mut watch = tonic::Request::new(proto::WatchWorkersRequest::default());
+            watch.extensions_mut().insert(told("gateway-a"));
+            let mut watching = gateways
+                .watch_workers(watch)
+                .await
+                .expect("opened")
+                .into_inner();
+            // A task of its own polls the watch, as a connection's does:
+            // at the word of the stream's waker alone.
+            let (words, mut heard) = mpsc::channel(2);
+            let mut watcher = JoinSet::new();
+            watcher.spawn(async move {
+                while let Some(word) = watching.next().await {
+                    if words.send(word).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let mut next = async || {
+                timeout(Duration::from_secs(5), heard.recv())
+                    .await
+                    .expect("a word within five seconds")
+                    .expect("the stream is open")
+            };
+            next().await.expect("the rows, none yet");
+            // Nothing is written from here: the watch waits. The listener
+            // fails.
+            fail.send(()).expect("the serve waits for its fault");
+            let ended = next().await.expect_err("the word's end");
+            assert_eq!(ended.code(), tonic::Code::Aborted);
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends within its grace period");
+        assert!(matches!(served, Err(Error::Task(_))), "{served:?}");
     }
 
     /// The largest grace period a caller can set is one the clock cannot

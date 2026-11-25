@@ -204,8 +204,8 @@ impl<G: Generation> Objects<G> {
     /// tells the store its object's status behind the put
     /// ([`Self::tell_row`]). A told row's put and a cut are followed by
     /// the table's status ([`mod@super::standby`]). The holder's own
-    /// follow, which lays a row written around the holder, settles it
-    /// only where it follows statuses ([`Self::with_status_followed`]).
+    /// follow, which lays a row written around the holder, settles no
+    /// status.
     fn status_under(
         &self,
         store: &MemoryStore,
@@ -361,7 +361,6 @@ pub(crate) mod tests {
     /// probe's verdict leaves the two: a case's own hand on a worker's
     /// health where it runs no probe. The holder reads the store to its
     /// end first.
-    #[cfg(feature = "controller")]
     pub(crate) fn stand<G: Generation>(
         objects: &Objects<G>,
         store: &MemoryStore,

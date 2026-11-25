@@ -1987,24 +1987,51 @@ impl TokenTree {
         node: &NodeRef,
         result: &mut Vec<(NodeRef, TenantId, u64)>,
     ) {
-        for child_entry in &node.children {
-            self.collect_all_tenant_leaves(child_entry.value(), result);
+        // The children are named under the guards of the child map and walked
+        // behind them: the walk below a child holds no shard of its parent.
+        let children: Vec<NodeRef> = node
+            .children
+            .iter()
+            .map(|child| Arc::clone(child.value()))
+            .collect();
+        for child in &children {
+            self.collect_all_tenant_leaves(child, result);
         }
 
         // Root is never eligible for eviction
         if Arc::ptr_eq(node, &self.root) {
             return;
         }
-        for entry in &node.tenant_last_access_time {
-            let tenant = entry.key();
-            let any_child_has_tenant = node.children.iter().any(|child| {
-                child
-                    .value()
-                    .tenant_last_access_time
-                    .contains_key(tenant.as_ref())
-            });
-            if !any_child_has_tenant {
-                result.push((Arc::clone(node), Arc::clone(tenant), *entry.value()));
+        // No child was listed: each of the node's tenants is queued straight
+        // from the stamp map, as no child is asked under its guard. A child
+        // attached since is met by the leaf check where the entry is popped.
+        if children.is_empty() {
+            for entry in &node.tenant_last_access_time {
+                result.push((Arc::clone(node), Arc::clone(entry.key()), *entry.value()));
+            }
+            return;
+        }
+        // The tenants are named first, and the guard of the stamp map ends
+        // with the list: no child is probed under it, so a match that stamps
+        // this node does not wait behind a probe.
+        let tenants: Vec<TenantId> = node
+            .tenant_last_access_time
+            .iter()
+            .map(|entry| Arc::clone(entry.key()))
+            .collect();
+        for tenant in tenants {
+            let any_child_has_tenant = children
+                .iter()
+                .any(|child| child.tenant_last_access_time.contains_key(tenant.as_ref()));
+            if any_child_has_tenant {
+                continue;
+            }
+            let stamp = node
+                .tenant_last_access_time
+                .get(tenant.as_ref())
+                .map(|ts| *ts);
+            if let Some(ts) = stamp {
+                result.push((Arc::clone(node), tenant, ts));
             }
         }
     }

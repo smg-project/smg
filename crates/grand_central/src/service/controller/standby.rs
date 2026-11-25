@@ -1017,7 +1017,7 @@ mod tests {
         engine::view::{Role, WireModes, WorkerId},
         service::{
             controller::{
-                decision_slots::tests::{followed, frame_for, holder, lent_pick, preset},
+                decision_slots::tests::{followed, frame_for, holder, lent_pick, preset, unserved},
                 election::LeasePlace,
                 replication::{journaled, journaled_from, parts, Replication},
                 worker_objects::WorkerObjects,
@@ -2065,7 +2065,7 @@ mod tests {
         let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
         let catalog = Arc::new(crate::stages::StageRegistry::builtin());
         let journal = followed(journal);
-        let shared = Shared::new(id, address, &elector, stood, journal, catalog, 1)
+        let shared = Shared::new(id, address, &elector, unserved(stood), journal, catalog, 1)
             .expect("the deciders start");
         let mut standby = Standby::new(Arc::new(shared), bed.addr.port());
         // The bound a replica runs with: three of its leader's heartbeats,

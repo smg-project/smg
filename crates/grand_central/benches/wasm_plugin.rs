@@ -90,47 +90,35 @@ fn row(name: &str, component: Vec<u8>, config: Vec<u8>) -> PluginSpec {
 /// One profile whose three stages are the plugin's.
 fn plugin_engine(plugin: &Arc<Plugin>) -> Engine {
     let bound = plugin.bind();
-    let profile = Profile {
-        name: "plugin".into(),
-        filters: vec![Box::new(WasmFilter::new(Arc::clone(&bound), None))],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(Arc::clone(&bound), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(WasmPicker::new(bound, None)),
-    };
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+        vec![Box::new(WasmFilter::new(Arc::clone(&bound), None))];
+    let scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(Arc::clone(&bound), None)),
+        1.0,
+    )];
+    let mut profile = Profile::of("plugin".into(), Box::new(WasmPicker::new(bound, None)));
+    profile.filters = filters;
+    profile.scorers = scorers;
     engine_of(profile)
 }
 
 /// The same shape out of built-in stages.
 fn native_engine() -> Engine {
-    engine_of(Profile {
-        name: "native".into(),
-        filters: vec![Box::new(Healthy)],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    })
+    let mut profile = Profile::of("native".into(), Box::new(Best));
+    profile.filters = vec![Box::new(Healthy)];
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    engine_of(profile)
 }
 
 fn engine_of(profile: Profile) -> Engine {
-    Engine::new(
-        vec![profile],
-        vec![Binding {
-            model: "*".into(),
-            phases: vec![],
-            plan: Plan::Single,
-            profile: 0,
-            decode_profile: None,
-            shadow: None,
-            decode_shadow: None,
-            sessions: None,
-        }],
-        1,
-        Needs::default(),
-    )
+    let mut binding = Binding::of("*".into(), 0);
+    binding.phases = vec![];
+    binding.plan = Plan::Single;
+    binding.decode_profile = None;
+    binding.shadow = None;
+    binding.decode_shadow = None;
+    binding.sessions = None;
+    Engine::new(vec![profile], vec![binding], 1, Needs::default())
 }
 
 fn facts(seed: u64) -> RequestFacts<'static> {
@@ -402,11 +390,9 @@ fn observe(c: &mut Criterion) {
             vec![guest::mode::LEAST_IN_FLIGHT],
         );
         let engine = plugin_engine(&plugin);
-        let lease = Lease {
-            issued_micros: 1_000_000,
-            tokens: 512,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = 1_000_000;
+        lease.tokens = 512;
         let target = Target::default();
         group.bench_function(world, |b| {
             b.iter(|| engine.on_dispatched(black_box(&lease), &target, Side::Single, 0));
@@ -425,11 +411,9 @@ fn unheard(c: &mut Criterion) {
         row.observes = EventSet::NONE;
         let plugin = Plugin::load(&runtime, row).expect("the guest loads");
         let engine = plugin_engine(&plugin);
-        let lease = Lease {
-            issued_micros: 1_000_000,
-            tokens: 512,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = 1_000_000;
+        lease.tokens = 512;
         let target = Target::default();
         group.bench_function(world, |b| {
             b.iter(|| engine.on_dispatched(black_box(&lease), &target, Side::Single, 0));

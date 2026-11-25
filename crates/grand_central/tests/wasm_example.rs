@@ -85,30 +85,23 @@ fn engine_under(spec: PluginSpec) -> (Arc<Plugin>, Engine) {
     let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
     let plugin = Plugin::load(&runtime, spec).expect("the example loads");
     let bound = plugin.bind();
-    let profile = Profile {
-        name: "example".into(),
-        filters: vec![Box::new(WasmFilter::new(Arc::clone(&bound), None))],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(Arc::clone(&bound), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(WasmPicker::new(bound, None)),
-    };
-    let engine = Engine::new(
-        vec![profile],
-        vec![Binding {
-            model: "*".into(),
-            phases: vec![],
-            plan: Plan::Single,
-            profile: 0,
-            decode_profile: None,
-            shadow: None,
-            decode_shadow: None,
-            sessions: None,
-        }],
-        1,
-        Needs::default(),
-    );
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+        vec![Box::new(WasmFilter::new(Arc::clone(&bound), None))];
+    let scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(Arc::clone(&bound), None)),
+        1.0,
+    )];
+    let mut profile = Profile::of("example".into(), Box::new(WasmPicker::new(bound, None)));
+    profile.filters = filters;
+    profile.scorers = scorers;
+    let mut binding = Binding::of("*".into(), 0);
+    binding.phases = vec![];
+    binding.plan = Plan::Single;
+    binding.decode_profile = None;
+    binding.shadow = None;
+    binding.decode_shadow = None;
+    binding.sessions = None;
+    let engine = Engine::new(vec![profile], vec![binding], 1, Needs::default());
     (plugin, engine)
 }
 

@@ -17,7 +17,9 @@
 //! deciding document reads of them. The budget is what is left of the
 //! frame's at the decision. The places of its list the asking gateway may
 //! take, and the positions its standing vetoes hold back, are stated by
-//! position ([`FrameRequest::held_to`]). A keyed frame's request says that
+//! position ([`FrameRequest::held_to`]). A pair's frame whose decision
+//! counts the number its request names its decode by states that number
+//! ([`FrameRequest::naming_decode`]). A keyed frame's request says that
 //! its key's requests are counted on each worker, and the maker says under
 //! what name ([`RequestMaker::session_counted_under`]): the session's
 //! number, by the decisions the controller holds on file.
@@ -67,10 +69,12 @@ use crate::{
 ///
 /// `UNKEYED` says whether the request is made with no routing value and no
 /// client's value, whatever its frame states ([`FrameRequest::unkeyed`]).
-/// The word is the type's and no field: the maker of every other request
-/// is compiled with no test of it.
+/// `NAMES_DECODE` says whether it states the number its frame names its
+/// worker by ([`FrameRequest::naming_decode`]). Each word is the type's
+/// and no field: the maker of every other request is compiled with no
+/// test of it.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct FrameRequest<'a, const UNKEYED: bool = false> {
+pub(crate) struct FrameRequest<'a, const UNKEYED: bool = false, const NAMES_DECODE: bool = false> {
     frame: &'a Checked,
     lists: &'a FrameLists<'a>,
     /// What is left of the frame's budget at the decision, in microseconds.
@@ -164,6 +168,33 @@ impl<'a> FrameRequest<'a> {
     /// ([`InProcess::place`](crate::engine::in_process::InProcess::place)).
     #[must_use]
     pub(crate) fn unkeyed(self) -> FrameRequest<'a, true> {
+        self.typed()
+    }
+
+    /// The request that states the number its frame names its worker by
+    /// (`DecideRequest.named_worker`), as a pair's decision counts it
+    /// ([`Constraints::target_worker`]): the frame of a pair whose decode
+    /// side alone reads the number, behind the prefill that decision
+    /// picks. The number stands beside the decodes it counts, which the
+    /// maker's caller states as the decode side's places
+    /// ([`Self::over`]). What the one call states of its own pair there,
+    /// in a host's own process
+    /// ([`InProcess::place`](crate::engine::in_process::InProcess::place)).
+    #[must_use]
+    pub(crate) fn naming_decode(self) -> FrameRequest<'a, false, true> {
+        self.typed()
+    }
+
+    /// The request over `workers` in the place of the lists it was made
+    /// over: a pair's two lists with other places beside them, for a frame
+    /// whose decision is held to the workers its request names.
+    #[must_use]
+    pub(crate) fn over(self, workers: WorkerLists<'a>) -> Self {
+        Self { workers, ..self }
+    }
+
+    /// The request as it stands, under other words of its type.
+    fn typed<const KEYLESS: bool, const NAMES: bool>(self) -> FrameRequest<'a, KEYLESS, NAMES> {
         let Self {
             frame,
             lists,
@@ -188,7 +219,9 @@ impl<'a> FrameRequest<'a> {
 }
 
 // `plain` keeps the trait's answer: a controller's request is never plain.
-impl<const UNKEYED: bool> RequestMaker for FrameRequest<'_, UNKEYED> {
+impl<const UNKEYED: bool, const NAMES_DECODE: bool> RequestMaker
+    for FrameRequest<'_, UNKEYED, NAMES_DECODE>
+{
     fn model(&self) -> &str {
         self.frame.model()
     }
@@ -226,6 +259,9 @@ impl<const UNKEYED: bool> RequestMaker for FrameRequest<'_, UNKEYED> {
                 places: self.places,
                 stalled: self.stalled,
                 held: self.held,
+                // A pair's decision counts the number where its maker
+                // states it, and no other frame's request states one.
+                target_worker: frame.named_worker().filter(|_| NAMES_DECODE),
                 ..frame.constraints(self.lists)
             },
         }

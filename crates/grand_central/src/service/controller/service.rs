@@ -63,7 +63,7 @@ use super::{
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
     session, snapshot,
-    standby::{self, Lag},
+    standby::Lag,
     watch_workers::{self, Feed, Source, Watchers, Watching},
     wire, PROTOCOL_VERSION,
 };
@@ -184,14 +184,18 @@ pub(crate) struct Shared {
     pub(crate) streams: Arc<Streams>,
     /// The run loop's word that the listeners close: `true` from the end
     /// of the drain's settle window on. An open decide stream ends at it.
-    pub(crate) stop: watch::Sender<bool>,
+    /// The drain alone says it: a listener holds this receiver.
+    pub(crate) stop: watch::Receiver<bool>,
     /// The log that store journals to and the wake of its watched writes:
     /// what a watch of the rows reads.
     pub(crate) feed: Feed,
     /// The term this replica leads, if it leads one, told at a change alone
     /// by the run loop's one task: how an idle watch learns its replica
     /// stopped leading, and a task of the lead that another term began.
-    pub(crate) role: watch::Sender<Option<u64>>,
+    /// That task alone tells it: a listener holds this receiver, whose
+    /// clone has seen no word, and marks its own seen where it hears from
+    /// its start on.
+    pub(crate) role: watch::Receiver<Option<u64>>,
     /// Who watches this replica: the bounds of a watch's open.
     pub(crate) watchers: Arc<Watchers>,
     /// A gateway's term floor above this replica's term, on its way to the
@@ -199,8 +203,8 @@ pub(crate) struct Shared {
     pub(crate) floors: Floors,
     /// How far behind its leader this replica is while it follows one: the
     /// standby loop writes it. It holds the bound a standby reads synced
-    /// under, the first of the three counts of design 5.4: made again
-    /// where the configuration is known.
+    /// under, the first of the three counts of design 5.4: the bind makes
+    /// it once, where the configuration is known.
     pub(crate) lag: Arc<Lag>,
     /// The turn of the operators' snapshots: one is taken at a time, off
     /// the runtime's workers.
@@ -229,7 +233,11 @@ impl Shared {
     /// the feed of the log it journals to, the one value one place builds
     /// ([`journaled`](super::replication::journaled)), and with the holder
     /// of the replica's worker objects, whose rows stand in that store: the
-    /// deciders decide over their lists.
+    /// deciders decide over their lists. The run loop's side comes as a
+    /// listener holds it: the receivers of the election's sight of the
+    /// lease, of the listeners' close and of the role's word, each word's
+    /// sender with its one writer, and the standby's lag, made once from
+    /// the configured interval.
     ///
     /// # Errors
     ///
@@ -238,7 +246,12 @@ impl Shared {
         controller_id: String,
         address: String,
         elector: &Elector,
-        standing: watch::Receiver<ElectionObservation>,
+        (standing, stop, role, lag): (
+            watch::Receiver<ElectionObservation>,
+            watch::Receiver<bool>,
+            watch::Receiver<Option<u64>>,
+            Arc<Lag>,
+        ),
         (store, feed, objects, loads): (
             Arc<MemoryStore>,
             Feed,
@@ -305,15 +318,15 @@ impl Shared {
                 objects,
             )
             .telling(Arc::clone(&generations)),
-            lag: Arc::new(Lag::new(standby::synced_within(Duration::ZERO))),
+            lag,
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
             deciders,
             streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
-            stop: watch::Sender::new(false),
+            stop,
             feed,
-            role: watch::channel(None).0,
+            role,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
             snapshots: SerialTurn::new(snapshot::SNAPSHOTS_WAITING),
@@ -820,12 +833,16 @@ impl GrandCentral for Service {
         let term = self.watched(Instant::now())?;
         let asked = request.get_ref();
         let start = watch_workers::start(asked)?;
+        // The role's word as it stands at the open is seen: the watch
+        // ends at a word told from here on, whatever the word before it.
+        let mut role = self.shared.role.clone();
+        role.mark_unchanged();
         let source = Source {
             store: Arc::clone(&self.shared.store),
             objects: Arc::clone(&self.shared.objects),
             feed: self.shared.feed.clone(),
             fence: Arc::clone(&self.shared.fence),
-            role: self.shared.role.subscribe(),
+            role,
             term,
         };
         let watchers = &self.shared.watchers;
@@ -1233,7 +1250,7 @@ mod tests {
                 ID.to_owned(),
                 ADDRESS.to_owned(),
                 &elector,
-                stood,
+                bed::unserved(stood),
                 bed::followed(journaled_at(&LeasePlace::Process, 0, 2)),
                 Arc::new(catalog),
                 2,
@@ -1290,7 +1307,7 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             state,
             catalog,
             1,
@@ -1322,7 +1339,7 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             (Arc::clone(&store), feed, Arc::clone(&objects), loads),
             Arc::new(StageRegistry::builtin()),
             1,
@@ -1398,7 +1415,7 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             bed::followed((Arc::clone(&store), feed)),
             Arc::new(StageRegistry::builtin()),
             1,
@@ -1485,7 +1502,7 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             bed::followed((store, feed)),
             Arc::new(StageRegistry::builtin()),
             1,
@@ -1527,7 +1544,7 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             bed::followed((store, feed)),
             Arc::new(StageRegistry::builtin()),
             1,
@@ -1593,7 +1610,7 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             bed::followed((Arc::clone(&store), feed)),
             Arc::new(StageRegistry::builtin()),
             1,
@@ -1721,7 +1738,7 @@ mod tests {
                 ID.to_owned(),
                 ADDRESS.to_owned(),
                 &elector,
-                stood,
+                bed::unserved(stood),
                 bed::followed((Arc::clone(&store), feed)),
                 Arc::new(StageRegistry::builtin()),
                 2,
@@ -2067,6 +2084,54 @@ mod tests {
         );
     }
 
+    /// A watch hears the role's word from its open on. The word that
+    /// nobody leads here, told before a take, stands until the take is
+    /// told: the fence admits a watch under it, and it ends no such watch.
+    /// Told again, it ends the watch whatever the fence reads.
+    #[tokio::test]
+    async fn a_watch_ends_at_a_role_told_after_its_open_and_at_none_before() {
+        let mut elector = Elector::alone(IDENTITY, PATIENT).expect("the settings are in order");
+        let (_standing, stood) = watch::channel(ElectionObservation::default());
+        // The role's word is the case's to tell, as the serve's one task
+        // tells it.
+        let (told, role) = watch::channel(None);
+        let (stood, stop, _untold, lag) = bed::unserved(stood);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            (stood, stop, role, lag),
+            bed::followed(journaled_from(&LeasePlace::Process, 0)),
+            Arc::new(StageRegistry::builtin()),
+            1,
+        )
+        .expect("the decider starts");
+        let service = Service::new(vec![Scope::Gateway], Arc::new(shared));
+        told.send_replace(None);
+        elector.lead_at(Instant::now());
+        service.shared.store.set_term(1);
+        let mut stream = service
+            .watch_workers(from("gateway-a", proto::WatchWorkersRequest::default()))
+            .await
+            .expect("opened")
+            .into_inner();
+        let mut next = async || {
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("a word within five seconds")
+                .expect("the stream is open")
+        };
+        let page = next()
+            .await
+            .expect("a page: the word before the open ends nothing");
+        assert_eq!((page.seq, page.term, page.membership_epoch), (1, 1, 0));
+        // The same word again, while the fence reads this replica's lead.
+        told.send_replace(None);
+        let ended = next().await.expect_err("the word told after the open");
+        assert_eq!(ended.code(), Code::Aborted);
+        assert_eq!(service.shared.fence.leader_term(Instant::now()), Some(1));
+    }
+
     /// The path the transport routes `Decide` by is the contract's: its
     /// service's name, then its method's.
     #[test]
@@ -2307,7 +2372,7 @@ mod tests {
                     ID.to_owned(),
                     ADDRESS.to_owned(),
                     &elector,
-                    stood,
+                    bed::unserved(stood),
                     bed::followed((store, feed)),
                     Arc::new(StageRegistry::builtin()),
                     2,

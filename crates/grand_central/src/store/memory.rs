@@ -117,7 +117,7 @@ pub struct MemoryStore {
     /// The store's counts of the leases on file, for the write that gives
     /// a joining member its slot.
     counts: Arc<InFlightCounts>,
-    /// Where the rows' clock starts.
+    /// Where the store's clock starts.
     origin: Instant,
     /// What every engine the store builds counts its held panics into: the
     /// unbound start's and each applied document's ([`Applied::new`]).
@@ -384,7 +384,7 @@ impl MemoryStore {
                 health.vetoes.clear();
                 // An unpublished build over no row drops the restore's old
                 // vetoes and the state derived from its membership.
-                drop(loads.writer.rebuild(cut.epoch, std::iter::empty()));
+                drop(loads.writer.rebuild(std::iter::empty()));
             }
             workers.by_key.clear();
             workers.log.clear();
@@ -423,10 +423,10 @@ impl MemoryStore {
         }
         previous.retain(|id, _| !workers.rows.contains_key(id));
         // The session pins take the steps of the writes the cut stands
-        // for, ahead of the world that lists its rows: no decision reads
+        // for, ahead of the world that lists its members: no decision reads
         // a new row before its pins stand under its id. Until that world
-        // stands, a row the last one held under its old id reads as in no
-        // pool: a request of its key is placed by the rule, as inside a
+        // stands, a member the last one listed under its old id reads as in
+        // no pool: a request of its key is placed by the rule, as inside a
         // replacement ([`Self::pins_follow`]).
         let left = previous.into_iter().map(|(id, held)| (id, held.row.facts));
         let (follows, ended) = workers.lay_gone(left, Instant::now(), self.pins_absence());
@@ -619,7 +619,9 @@ impl MemoryStore {
             MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. } => {
                 self.tell_leaving(&workers, change, &off, now);
             }
-            MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
+            // A status is on the table's row and in the log: no world
+            // holds one, and none is published.
+            MembershipChange::StatusChanged { .. } => {}
             MembershipChange::Removed { id } => {
                 self.pay_leave(&workers, now);
                 self.tell_membership(change);
@@ -794,20 +796,16 @@ impl MemoryStore {
     /// write one cache line twice a decision. A decision reads the world
     /// through [`deciding`](Self::deciding), which borrows it and writes no
     /// shared count.
-    ///
-    /// A world kept across two publications of a pool keeps the rows it
-    /// lists as they are: the second publication writes over other rows,
-    /// and allocates that pool's rows when the writer holds none alone.
     pub fn snapshot(&self) -> Arc<StoreSnapshot> {
         self.world.load_full()
     }
 
     /// Read the snapshot of this instant under one load, held until `read`
-    /// returns: the rows it reads, the generation and its engine
+    /// returns: the vetoes it reads, the generation and its engine
     /// ([`StoreSnapshot::spec`]) are of one publication. Like
     /// [`deciding`](Self::deciding) it borrows the world and writes no
     /// shared count. The load is held for as long as `read` runs: a reader
-    /// that waits inside keeps the publication's rows from their next use.
+    /// that waits inside keeps that world from being let go.
     pub fn with_snapshot<R>(&self, read: impl FnOnce(&StoreSnapshot) -> R) -> R {
         let world = self.world.load();
         read(&world)
@@ -825,7 +823,7 @@ impl MemoryStore {
         decide(&self.world.load())
     }
 
-    /// `at` in the rows' clock: microseconds since the store's origin.
+    /// `at` in the store's clock: microseconds since the store's origin.
     pub fn micros(&self, at: Instant) -> u64 {
         micros(self.origin, at)
     }
@@ -836,7 +834,7 @@ impl MemoryStore {
         let mut loads = self.loads.lock();
         let writer = &mut loads.writer;
         writer.clear_listed();
-        let world = writer.rebuild(workers.epoch, workers.members());
+        let world = writer.rebuild(workers.members());
         writer.replaced(self.world.swap(world));
         // The build listed every member: none is left for the table.
         self.listed();
@@ -866,9 +864,9 @@ impl MemoryStore {
     /// paid its leave's, and with the load lock let go: the engine hears the
     /// writes in their order, and an apply, which takes the workers lock, moves no
     /// generation in between. A leave is told after the build that takes its
-    /// rows out of their pools: the worker is in no pool when its write
+    /// worker out of its pools: the worker is in no pool when its write
     /// returns, whoever wrote. A join is told when the store takes it, and
-    /// the world that lists its row follows at its window's build. A
+    /// the world that lists its worker follows at its window's build. A
     /// decision takes neither lock and meets the call at a stage's own lock
     /// or at a record of sent prefixes' own, and nowhere else. One that
     /// read its world before a leave's swap may still name the worker: a
@@ -959,7 +957,7 @@ impl MemoryStore {
         let (world, built) = match at {
             Some(now) if !writer.build_due(now) => (None, false),
             _ => {
-                let world = writer.build_owed(at, workers.epoch, workers.members());
+                let world = writer.build_owed(at, workers.members());
                 let built = world.is_some();
                 (world, built)
             }
@@ -1040,14 +1038,6 @@ impl MemoryStore {
         if let Some(world) = world {
             writer.replaced(self.world.swap(world));
         }
-    }
-
-    /// Fold a status change into the world and publish it at once. Called
-    /// under the workers lock, as the status was written.
-    fn show_status(&self, id: WorkerId, status: WorkerStatus) {
-        let mut loads = self.loads.lock();
-        let world = loads.writer.fold_status(id, status);
-        self.show(&mut loads.writer, world);
     }
 
     /// Publish `gateway`'s veto on `id` with its hold's end, or its
@@ -1687,7 +1677,6 @@ impl MemoryStore {
         if workers.set_status(id, status).is_none() {
             return HealthWrite::Stood(from);
         }
-        self.show_status(id, status);
         HealthWrite::Moved { from, to: status }
     }
 }
@@ -1750,9 +1739,7 @@ impl WorkersStore for MemoryStore {
     ) -> Option<MembershipChange> {
         let mut workers = self.writing();
         workers.guarded(id, revision)?;
-        let change = workers.set_status(id, status)?;
-        self.show_status(id, status);
-        Some(change)
+        workers.set_status(id, status)
     }
 
     fn get(&self, id: WorkerId) -> Option<WorkerRow> {
@@ -2135,6 +2122,11 @@ struct FiledDecode {
     /// pick's first, until that dispatch names another target the side's
     /// pick holds.
     taken: u8,
+    /// Whether the side's own dispatch deadline runs: the deadline's door
+    /// started it at its first pass behind the end of the prefill the side
+    /// was issued with ([`Leases::waits_on`]). The door's next pass ends a
+    /// side that still waits.
+    own_deadline: bool,
 }
 
 /// One issue of a chosen decode side, for a caller that may undo it
@@ -2165,6 +2157,7 @@ impl FiledDecode {
             filed_chosen,
             issues: 0,
             taken: 0,
+            own_deadline: false,
         }
     }
 
@@ -2867,7 +2860,9 @@ impl Leases {
     /// since, the deadline's span of them at most. `None` at a first place
     /// whose lease waits inside its deadline, at an empty queue and once
     /// the steps are spent. A lease waits while a side of it does
-    /// ([`Leases::abandon`]).
+    /// ([`Leases::abandon`]). A pair's decode side that waits behind its
+    /// prefill is not ended: its lease is queued again, a step as any
+    /// place stepped over ([`Leases::waits_on`]).
     fn end_due(&mut self, now: Instant, steps: &mut usize) -> Option<Sides> {
         while *steps > 0 {
             let &(due, key) = self.due.front()?;
@@ -2880,11 +2875,55 @@ impl Leases {
             }
             self.due.pop_front();
             *steps -= 1;
-            if waits {
+            if waits && !self.waits_on(&key, now) {
                 return self.abandon(&key);
             }
         }
         None
+    }
+
+    /// Whether the pair's lease under `key`, whose deadline the door found
+    /// due at `now`, waits on for its decode side alone: the lease's
+    /// deadline is then written one span behind `now` and queued again,
+    /// and nothing ends.
+    ///
+    /// A decode side issued with its prefill is sent when that prefill has
+    /// answered, so the time to name its dispatch starts at the prefill's
+    /// end. The side stands while its prefill is dispatched, as it stands
+    /// in a gateway's own process, where no deadline runs. At the door's
+    /// first pass behind that prefill's end it takes one whole deadline of
+    /// its own ([`FiledDecode::own_deadline`]), and the pass behind that
+    /// ends a side that still waits. An end hands the file no instant: the
+    /// door's own pass dates the side's deadline, and no clock is read.
+    ///
+    /// `false` for every other lease, which the deadline ends as it did: a
+    /// single's, a pair whose prefill waits too, and a side a decode call
+    /// issued, whose deadline the call wrote ([`Leases::issue_decode`]).
+    /// Cold, as [`Leases::abandon`] is: a due deadline alone reaches it.
+    #[cold]
+    fn waits_on(&mut self, key: &Key, now: Instant) -> bool {
+        let Some(held) = self.records.get_mut(key) else {
+            return false;
+        };
+        if held.record.decode.is_none() || held.record.state.is_issued() {
+            return false;
+        }
+        let Some(decode) = self.decodes.get_mut(held.decode, key) else {
+            return false;
+        };
+        if decode.filed_chosen || !decode.side.state.is_issued() {
+            return false;
+        }
+        if !matches!(held.record.state, LeaseState::Dispatched { .. }) {
+            if decode.own_deadline {
+                return false;
+            }
+            decode.own_deadline = true;
+        }
+        let deadline = now + DISPATCH_TTL;
+        held.record.dispatch_deadline = deadline;
+        self.queue(deadline, *key);
+        true
     }
 
     /// Ends what waits of the lease under `key` as abandoned: a single's
@@ -3490,7 +3529,7 @@ impl MemoryStore {
     /// where its registration filed one ([`Slots::filed`]). A decision
     /// over worker objects can pick a member inside its registration
     /// window: the objects follow a registration as its write lands, a
-    /// build ahead of the world that lists its row.
+    /// build ahead of the world that lists it.
     #[cfg(feature = "controller")]
     pub(crate) fn filed_slot(&self, target: WorkerId) -> Option<WorkerSlot> {
         self.slots().filed(target)

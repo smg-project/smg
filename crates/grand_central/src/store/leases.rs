@@ -230,7 +230,10 @@ pub struct LeaseRecord {
     /// The term of the leader that issued the lease.
     pub term: u64,
     pub issued_at: Instant,
-    /// Past it, an issued side is released as abandoned.
+    /// Past it, an issued side is released as abandoned. A file writes it
+    /// anew for a pair's decode side that was issued with its prefill:
+    /// at each deadline while that prefill is dispatched, and once behind
+    /// the prefill's end.
     pub dispatch_deadline: Instant,
     /// The state of a single's lease or a pair's prefill side.
     pub state: LeaseState,
@@ -723,7 +726,10 @@ pub trait LeasesStore: Send + Sync {
 
     /// Releases issued sides past their dispatch deadline at `now` as
     /// abandoned and returns both parts of each lease as the call left
-    /// them. A file whose decider is at work is left to its decider, who
+    /// them. A pair's decode side that was issued with its prefill is not
+    /// released while that prefill is dispatched, nor at the first
+    /// deadline behind the prefill's end: it has a whole deadline from
+    /// there. A file whose decider is at work is left to its decider, who
     /// ends due leases at its issues. The store tells the lifecycle of
     /// each end itself.
     fn expire(&self, now: Instant) -> Vec<Sides>;

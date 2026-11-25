@@ -606,13 +606,12 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer], lent: boo
             Some(text) => Some(Identity::plain(text)),
             None => (!request.fanout && !keys.is_empty()).then_some(digest),
         };
-        let items = EncodeItems {
-            keys: &keys,
-            one,
-            references: request.references,
-            decode_images: request.decode_images,
-            ring: of_answer.as_ref().map(|ring| ring as &dyn LentRing),
-        };
+        let mut items = EncodeItems::default();
+        items.keys = &keys;
+        items.one = one;
+        items.references = request.references;
+        items.decode_images = request.decode_images;
+        items.ring = of_answer.as_ref().map(|ring| ring as &dyn LentRing);
         let seed = at as u64 + 1;
         let id = seed.to_le_bytes();
         // The request as its host makes it for the prefill phase: held to

@@ -610,7 +610,8 @@ impl Checked {
             held: &[],
             // No frame holds a request to places.
             places: None,
-            // No pair's frame is read for the number it names its decode by.
+            // The number a pair's decision counts is its maker's to state
+            // ([`FrameRequest::naming_decode`]): this reader states none.
             target_worker: None,
         }
     }

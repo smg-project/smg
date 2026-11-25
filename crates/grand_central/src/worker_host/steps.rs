@@ -215,8 +215,7 @@ fn registration_line<H: WorkflowHost>(
 /// when it follows the store. The drain is the door's write. A door with
 /// a holder marks the worker object draining and tells its row, so a
 /// decision that reads the object's status picks it no more. Where a door
-/// marks the row alone, a holder built with
-/// [`Objects::with_status_followed`] mirrors it onto the held object.
+/// marks the row alone, the held object's status does not move.
 ///
 /// A step drops from the job's lists a worker it leaves standing, as the
 /// registry's steps do: a host step behind reads the workers the removal

@@ -1497,19 +1497,24 @@ fn decode_alone(
 /// A decode call's decision and its side's issue, for the frame that names
 /// the decode side of `lease` (`DecideRequest.decode_of`). The store's own
 /// test of the lease comes first ([`MemoryStore::held_pair`]), so a call it
-/// refuses runs no stage. Then the decode is decided again behind the held
-/// prefill ([`frame_decision::decide_decode`]) and, for a pick, issued
-/// under the lease's id ([`frame_decision::issue_decode`]). The lease
-/// filed is the decode side's, and its issue's count comes beside it. The
-/// issue tests the lease again: one that moved under the decision is
-/// refused there, behind the stages.
+/// refuses runs no stage. A call whose frame names its worker where the
+/// decode's side reads the number is refused next, as one whose decode
+/// never stood chosen ([`frame_decision::names_decode`]): the decode its
+/// request named stands, and no stage runs. Then the decode is decided
+/// again behind the held prefill ([`frame_decision::decide_decode`]) and,
+/// for a pick, issued under the lease's id
+/// ([`frame_decision::issue_decode`]). The lease filed is the decode
+/// side's, and its issue's count comes beside it. The issue tests the
+/// lease again: one that moved under the decision is refused there, behind
+/// the stages.
 ///
 /// Out of line: no other request carries a part of it.
 ///
 /// # Errors
 ///
 /// The reason the call's answer is `Busy` under: one of its own for each
-/// refusal of the store ([`busy_of`]), at either test.
+/// refusal of the store ([`busy_of`]), at either test, and the one of a
+/// decode never chosen for a call that names its decode.
 #[inline(never)]
 fn decode_call(
     store: &MemoryStore,
@@ -1521,6 +1526,9 @@ fn decode_call(
     caught: &mut bool,
 ) -> Result<(Decision, Filed, FiledBeside), Reason> {
     let held = store.held_pair(taken.gateway, lease).map_err(busy_of)?;
+    if frame_decision::names_decode(world.spec(), taken.request) {
+        return Err(busy_of(DecodeRefused::NotChosen));
+    }
     let decided = frame_decision::decide_decode(world, objects, taken, held, frames, loads, own);
     let (decision, booked) = made(decided, caught)?;
     let issued = frame_decision::issue_decode(store, world, taken, lease, &decision, booked);
@@ -1532,7 +1540,10 @@ fn decode_call(
 
 /// The `Busy` a refused decode call leaves under: a reason of its own for
 /// each refusal of the store, never a decision that sheds. No policy spoke:
-/// the lease's own state refused the call, and the reason names which.
+/// the lease's own state refused the call, and the reason names which. A
+/// call that names its decode leaves under the reason of a side never
+/// chosen ([`decode_call`]): behind either its gateway sends the decode
+/// the first pick named.
 const fn busy_of(refused: DecodeRefused) -> Reason {
     match refused {
         DecodeRefused::NoLease => Reason::DecodeNoLease,
@@ -1596,7 +1607,7 @@ pub(crate) mod tests {
         panic::resume_unwind,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            mpsc as std_mpsc, Arc, Weak,
+            mpsc as std_mpsc, Arc, OnceLock, Weak,
         },
         thread,
         time::{Duration, Instant},
@@ -1637,6 +1648,7 @@ pub(crate) mod tests {
                     Gateways, Vetoed,
                 },
                 lifecycle,
+                standby::{self, Lag},
                 watch_workers::Feed,
                 wire::{self, Checked},
                 worker_objects::WorkerObjects,
@@ -1654,6 +1666,7 @@ pub(crate) mod tests {
     };
 
     pub(crate) mod encode;
+    mod named;
 
     /// How long a case waits for a decider before it fails.
     pub(crate) const PATIENCE: Duration = Duration::from_secs(20);
@@ -1753,6 +1766,28 @@ pub(crate) mod tests {
     ) -> (Arc<MemoryStore>, Feed, Arc<Objects<Members>>, LoadReceiver) {
         let objects = holder(&store);
         (store, feed, objects, frame_loads::silent())
+    }
+
+    /// `standing` with the rest of a run loop's side where no serve runs,
+    /// as the service's shared state takes the four: the listeners' close
+    /// nobody says, the role's word nobody tells, and a lag under the bound
+    /// of no load poll interval. The two words' senders stand to the
+    /// process's end, so a stream over the state reads no word and no end
+    /// of its telling.
+    pub(crate) fn unserved(
+        standing: watch::Receiver<ElectionObservation>,
+    ) -> (
+        watch::Receiver<ElectionObservation>,
+        watch::Receiver<bool>,
+        watch::Receiver<Option<u64>>,
+        Arc<Lag>,
+    ) {
+        static UNTOLD: OnceLock<(watch::Sender<bool>, watch::Sender<Option<u64>>)> =
+            OnceLock::new();
+        let (stop, role) =
+            UNTOLD.get_or_init(|| (watch::Sender::new(false), watch::Sender::new(None)));
+        let lag = Arc::new(Lag::new(standby::synced_within(Duration::ZERO)));
+        (standing, stop.subscribe(), role.subscribe(), lag)
     }
 
     /// A store, a candidate of its election and the deciders over both.
@@ -4938,7 +4973,7 @@ pub(crate) mod tests {
 
     /// A decision can pick a worker the store's world does not list yet:
     /// the worker objects follow a registration as its write lands, and
-    /// the store builds the pools that list the row a window later. The
+    /// the store builds the pools that list it a window later. The
     /// lease of such a pick books the worker's count all the same, by the
     /// slot the registration filed: the next decision reads one request in
     /// flight on the worker, on its object and in its record. A lease that
@@ -4955,7 +4990,7 @@ pub(crate) mod tests {
         });
         let mut bed = bed(Some(spec), true, (1, 8), []);
         // One more member, alone under its model, written ready and never
-        // published: the build that lists its row is still owed.
+        // published: the build that lists it is still owed.
         let key = String::from("http://late:8000");
         let facts = WorkerFacts {
             key: key.clone(),
@@ -4976,7 +5011,7 @@ pub(crate) mod tests {
             moved.expect("the row stands");
         }
         let listed = bed.store.snapshot().booked_of(late);
-        assert_eq!(listed, None, "no world lists the row yet");
+        assert_eq!(listed, None, "no world lists the worker yet");
         for request in 1..=2u8 {
             let answer = bed.ask(frame_for(LATE, request, u64::from(request))).await;
             assert_eq!(picked(&answer), late);
@@ -6148,7 +6183,7 @@ pub(crate) mod tests {
         let (mut bed, _, prefill) = later_bed();
         let (id, [chosen, other], _) = held(&mut bed).await;
         // One more decode, written ready and never published: the build
-        // that lists its row is still owed. A lease filed on the other
+        // that lists it is still owed. A lease filed on the other
         // decode leaves the new one alone with nothing in flight.
         let key = String::from("http://late:8000");
         let facts = WorkerFacts {
@@ -6170,7 +6205,7 @@ pub(crate) mod tests {
             moved.expect("the row stands");
         }
         let listed = bed.store.snapshot().booked_of(late);
-        assert_eq!(listed, None, "no world lists the row yet");
+        assert_eq!(listed, None, "no world lists the worker yet");
         file(&bed.store, 1, other, bed.script.taken);
         let answer = bed.ask(call(1, id)).await;
         assert_eq!(pair_of(&answer).0[0], (prefill.0, Some(late.0)));
@@ -7558,6 +7593,32 @@ pub(crate) mod tests {
     /// verdict leaves it, and the store is told.
     fn set_status(bed: &Bed, worker: WorkerId, status: WorkerStatus) {
         stand(&bed.reads.objects, &bed.store, worker, status);
+    }
+
+    /// A worker told not ready, or draining, is passed over by the very
+    /// next decision, and the store publishes no world for its status: a
+    /// decision reads a worker's status on its worker object, so none waits
+    /// a publication for a worker that left rotation. Under `round_robin`
+    /// the three ready workers take requests by turns, so six in a row on
+    /// one worker show the two others passed over.
+    #[tokio::test]
+    async fn a_worker_told_out_of_rotation_is_passed_over_with_no_publication() {
+        for out in [WorkerStatus::NotReady, WorkerStatus::Draining] {
+            let mut bed = bed(Some(preset("round_robin", 1)), true, (1, 8), []);
+            let stays = bed.workers[0];
+            assert_eq!(bed.store.publish_due(), None, "no build waits");
+            let published = bed.store.publications();
+            for other in [bed.workers[1], bed.workers[2]] {
+                set_status(&bed, other, out);
+            }
+            let told = bed.store.publications();
+            assert_eq!(told, published, "{out:?}: a status published a world");
+            for request in 1..=6 {
+                let answer = bed.ask(frame(request, 1_000 + u64::from(request))).await;
+                assert_eq!(picked(&answer), stays, "{out:?}: request {request}");
+            }
+            assert_eq!(bed.store.publications(), published, "{out:?}");
+        }
     }
 
     /// The service counts a keyed single request for its key under any

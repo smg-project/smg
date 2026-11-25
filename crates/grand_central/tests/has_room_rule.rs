@@ -346,15 +346,11 @@ fn a_count_that_holds_no_send_leaves_the_other_terms_of_the_rule() {
     assert_eq!(kept(&policy, 0, &request(0), &rows), [0]);
     // A send behind the first row's sample enters the count, and the pass
     // reads it.
-    let lease = Lease {
-        issued_micros: NOW + 1,
-        tokens: 2,
-        ..Lease::default()
-    };
-    let target = Target {
-        id: rows[0].id,
-        ..Target::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = NOW + 1;
+    lease.tokens = 2;
+    let mut target = Target::default();
+    target.id = rows[0].id;
     policy.on_dispatched(&lease, &target, Side::Single, 0);
     assert_eq!(kept(&policy, 0, &request(0), &rows), [0u32; 0]);
 }
@@ -373,16 +369,12 @@ fn a_send_takes_room_until_a_report_or_the_profiles_limit_ends_it() {
         .validate()
         .expect("the rule reads the sends the limit ages");
     let send = |row: &Candidate| {
-        let lease = Lease {
-            issued_micros: START,
-            tokens: TOKENS,
-            ..Lease::default()
-        };
-        let target = Target {
-            id: row.id,
-            dp_rank: row.dp_rank,
-            ..Target::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = START;
+        lease.tokens = TOKENS;
+        let mut target = Target::default();
+        target.id = row.id;
+        target.dp_rank = row.dp_rank;
         policy.on_dispatched(&lease, &target, Side::Single, DELAY);
     };
     let at = START + u64::from(DELAY);
@@ -424,16 +416,12 @@ fn a_send_takes_room_past_a_report_sampled_sooner_than_the_profiles_delay() {
         .expect("the rule reads the sends the delay holds");
     let mut a = row(0, 0);
     let b = row(1, 0);
-    let lease = Lease {
-        issued_micros: SENT_AT,
-        tokens: 317,
-        ..Lease::default()
-    };
-    let target = Target {
-        id: a.id,
-        dp_rank: a.dp_rank,
-        ..Target::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = SENT_AT;
+    lease.tokens = 317;
+    let mut target = Target::default();
+    target.id = a.id;
+    target.dp_rank = a.dp_rank;
     policy.on_dispatched(&lease, &target, Side::Single, 0);
     let mut facts = RequestFacts::default();
     facts.now_micros = SENT_AT + 9_000;
@@ -451,15 +439,11 @@ fn a_sends_request_and_its_tokens_each_take_room_by_their_own_coefficient() {
         policy(r#"{"has-room":{"used":{"sent.requests":100,"sent.tokens":1},"capacity":250}}"#);
     let rows = [row(0, 0), row(1, 0)];
     let send = || {
-        let lease = Lease {
-            issued_micros: NOW + 1,
-            tokens: 50,
-            ..Lease::default()
-        };
-        let target = Target {
-            id: rows[0].id,
-            ..Target::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = NOW + 1;
+        lease.tokens = 50;
+        let mut target = Target::default();
+        target.id = rows[0].id;
         policy.on_dispatched(&lease, &target, Side::Single, 0);
     };
     // One send of 50 tokens holds 100 and 50 of the 250. Under the
@@ -488,15 +472,11 @@ fn a_send_of_text_alone_takes_room_by_its_bytes_over_four() {
     text.prompt_bytes = 404;
     assert_eq!(kept(&policy, 0, &text, &rows), [0, 1]);
     // The same text is sent to the first row, behind its report's sample.
-    let lease = Lease {
-        issued_micros: NOW + 1,
-        bytes: 404,
-        ..Lease::default()
-    };
-    let target = Target {
-        id: rows[0].id,
-        ..Target::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = NOW + 1;
+    lease.bytes = 404;
+    let mut target = Target::default();
+    target.id = rows[0].id;
     policy.on_dispatched(&lease, &target, Side::Single, 0);
     // 800 resident, the send's 101 and the request's 101 are over it.
     assert_eq!(kept(&policy, 0, &text, &rows), [1]);
@@ -523,15 +503,11 @@ fn a_rule_that_prices_the_sends_by_their_tokens_asks_for_each_requests_size() {
     assert_eq!(kept(&policy, 0, &request(0), &rows), [0, 1]);
     // 404 bytes of text are sent to the first row: 900 resident and the
     // send's 101 are over the thousand.
-    let lease = Lease {
-        issued_micros: NOW + 1,
-        bytes: 404,
-        ..Lease::default()
-    };
-    let target = Target {
-        id: rows[0].id,
-        ..Target::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = NOW + 1;
+    lease.bytes = 404;
+    let mut target = Target::default();
+    target.id = rows[0].id;
     policy.on_dispatched(&lease, &target, Side::Single, 0);
     assert_eq!(kept(&policy, 0, &request(0), &rows), [1]);
 }

@@ -6032,8 +6032,8 @@ impl AppliedSpec {
         self.decode_pick
     }
 
-    /// The lists this generation declares, as a store reads them when it
-    /// writes a worker's row.
+    /// The lists this generation declares: a worker's candidate row is
+    /// written under them, and a store counts the members outside them.
     #[must_use]
     pub fn lists(&self) -> &ViewLists {
         &self.lists
@@ -6048,8 +6048,8 @@ impl AppliedSpec {
     }
 }
 
-/// The lists a generation declares, as a store reads them when it writes a
-/// worker's row ([`Candidate`](crate::engine::view::Candidate)): the row names its
+/// The lists a generation declares, as the writer of a worker's candidate
+/// row ([`Candidate`](crate::engine::view::Candidate)) reads them: the row names its
 /// engine family and its zone by a position from 1, and holds one bit for
 /// each label selector the worker meets. Built once, at validation.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -9192,6 +9192,21 @@ mod tests {
         }
         let alone = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"manual"}}}"#);
         assert!(alone.validate().is_ok());
+    }
+
+    /// The start a binding is built from by hand ([`Binding::of`]) is the
+    /// binding a document gets that states its model and its profile and
+    /// nothing else: the two are held equal here.
+    #[test]
+    fn a_binding_of_a_model_and_a_profile_alone_is_the_start_built_by_hand() {
+        let built = spec_with_binding(r#"{"match":{"model":"m"},"profile":"p"}"#)
+            .validate()
+            .expect("the binding validates");
+        let binding = built.binding("m", Phase::Single).expect("the binding");
+        assert_eq!(
+            format!("{binding:?}"),
+            format!("{:?}", Binding::of("m".into(), 0))
+        );
     }
 
     #[test]

@@ -132,17 +132,13 @@ fn least_cost() -> Engine {
 }
 
 fn fill(engine: &Engine, rows: &[Candidate]) {
-    let lease = Lease {
-        issued_micros: SENT_AT,
-        tokens: 379,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = SENT_AT;
+    lease.tokens = 379;
     for row in rows {
-        let target = Target {
-            id: row.id,
-            dp_rank: row.dp_rank,
-            ..Target::default()
-        };
+        let mut target = Target::default();
+        target.id = row.id;
+        target.dp_rank = row.dp_rank;
         engine.on_dispatched(&lease, &target, Side::Single, 0);
     }
 }
@@ -227,15 +223,14 @@ fn tell_each(engine: &Engine, lease: &Lease, targets: &[Target]) {
 /// enters a rank and each rank holds two sends at the pass's end.
 fn dispatch(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_sent/dispatch");
-    let lease = Lease {
-        issued_micros: SENT_AT,
-        tokens: 379,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = SENT_AT;
+    lease.tokens = 379;
     let targets: Vec<_> = (0..64)
-        .map(|position| Target {
-            id: WorkerId(1003 + position),
-            ..Target::default()
+        .map(|position| {
+            let mut placed = Target::default();
+            placed.id = WorkerId(1003 + position);
+            placed
         })
         .collect();
     for (name, reader) in [("least_load", false), ("least_load_and_reader", true)] {

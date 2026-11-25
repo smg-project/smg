@@ -112,11 +112,12 @@ impl Replayed for Row {
                 wire_modes: wire_of(&worker.transport)?,
                 state: worker.state,
                 vision: worker.vision,
-                facts: DemandFacts {
-                    runtime: runtimes.number(&worker.runtime),
-                    references: worker.processes_references,
-                    host_pipeline: worker.gateway_pipeline,
-                    ..DemandFacts::default()
+                facts: {
+                    let mut demand_facts = DemandFacts::default();
+                    demand_facts.runtime = runtimes.number(&worker.runtime);
+                    demand_facts.references = worker.processes_references;
+                    demand_facts.host_pipeline = worker.gateway_pipeline;
+                    demand_facts
                 },
             });
         }

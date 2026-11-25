@@ -3142,9 +3142,10 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         let now = Instant::now();
         leases
             .issue(LeaseRecord {
-                lease: Lease {
-                    id: LeaseId(1),
-                    ..Lease::default()
+                lease: {
+                    let mut lease = Lease::default();
+                    lease.id = LeaseId(1);
+                    lease
                 },
                 gateway,
                 request: 1,

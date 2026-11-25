@@ -360,16 +360,15 @@ fn each_side_of_a_pair_reads_its_own_pools_cells() {
     facts.now_micros = NOW;
     facts.signal_cells = Some(&request);
     let cx = Constraints::default();
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
+    pools.prefill_signal_cells = Some(&prefill);
+    pools.decode_signal_cells = Some(&decode);
     let decision = engine.decide_pair(
         &facts,
         &PoolFacts::default(),
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            prefill_signal_cells: Some(&prefill),
-            decode_signal_cells: Some(&decode),
-            ..PairPools::default()
-        },
+        pools,
         &cx,
         &cx,
         &mut Scratch::new(),

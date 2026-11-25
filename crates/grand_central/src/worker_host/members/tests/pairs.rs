@@ -323,8 +323,7 @@ fn a_member_derived_with_no_place_given_is_refused_in_a_debug_build() {
 /// holds one pair, and the decision picks it.
 #[test]
 fn the_lent_lists_and_the_holders_classes_pick_the_one_pair_of_one_fleet() {
-    let mut replica = Replica::new();
-    replica.objects = replica.objects.with_status_followed();
+    let replica = Replica::new();
     let sides = [
         (PREFILL, Role::Prefill, "a"),
         (PREFILL_1, Role::Prefill, "b"),

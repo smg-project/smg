@@ -55,13 +55,14 @@
 //! the prefill it picks ([`Constraints::target_worker`]), and books that
 //! decode with its prefill.
 //!
-//! **A controller's served decision** counts a single request's number by
-//! the same function ([`reached`]), over the list its worker objects lend
-//! and by tests of its own: a place the asking gateway may take, that none
-//! of its standing vetoes holds back, whose worker is available by its own
-//! test. Its frame states the number, which the asking host read by the
-//! same source. The route's rule is that gateway's own code, and is not
-//! asked there.
+//! **A controller's served decision** counts by the same functions, over
+//! the lists its worker objects lend: a single request's number by
+//! [`reached`], a pair's by [`reached_pair`], and the decodes a pair's
+//! decision counts its decode's number among by [`opened`]. Its tests are
+//! its own: a place the asking gateway may take, that none of its standing
+//! vetoes holds back, whose worker is available by its own test. Its frame
+//! states the number, which the asking host read by the same source. The
+//! route's rule is that gateway's own code, and is not asked there.
 //!
 //! [`Constraints::places`]: crate::engine::view::Constraints::places
 //! [`Constraints::target_worker`]: crate::engine::view::Constraints::target_worker
@@ -71,7 +72,7 @@ use std::{iter, sync::Arc};
 
 use smg_worker::identity::basic::Worker;
 
-use super::{admitted, hold_to_rule, Call, PlaceRequest, Unplaced, ASKS};
+use super::{admitted, hold_to_rule, Call, PlaceRequest, Unplaced, WorkerRule, ASKS};
 #[cfg(feature = "controller")]
 use crate::engine::decision::{Decision, Shed};
 use crate::{
@@ -263,23 +264,30 @@ fn number(spec: &AppliedSpec, request: &PlaceRequest<'_>) -> Option<Option<u32>>
     sources.and_then(|sources| sources.target(|name| headers.header(name)))
 }
 
-/// The places of `list` whose worker `request` can be sent to at this
+/// What a pair's count reads of one side beside its list: the places it
+/// counts among, every place for `None`, and the places a standing veto of
+/// the lists' host masks. Both ascending.
+pub(crate) type SidePlaces<'a> = (Option<&'a [u32]>, &'a [u32]);
+
+/// The places of `list` whose worker a request can be sent to at this
 /// read, ascending. They are looked for among the places the count reads
 /// on the side (`among`, and every place for `None`): those the list's
 /// host states, or those of them whose worker meets the request's hard
 /// demands. A place a standing veto of that host masks (`masked`,
 /// ascending) is none of them. The workers of the rest that pass `state`
-/// and that the route's rule takes are. The rule is asked of a worker that
-/// passes at a place no veto masks, and of no other.
+/// and that the route's rule takes are (`admits`, and every worker for
+/// `None`). The rule is asked of a worker that passes at a place no veto
+/// masks, and of no other.
 fn taking(
-    request: &PlaceRequest<'_>,
+    admits: Option<WorkerRule<'_>>,
     list: LentList<'_>,
-    (among, masked): (Option<&[u32]>, &[u32]),
+    (among, masked): SidePlaces<'_>,
     state: impl Fn(&dyn Worker) -> bool,
 ) -> Vec<u32> {
     let takes = |place: u32, worker: &Arc<dyn Worker>| {
         let worker = worker.as_ref();
-        masked.binary_search(&place).is_err() && state(worker) && admitted(request, worker)
+        let admitted = || admits.is_none_or(|admits| admits(worker));
+        masked.binary_search(&place).is_err() && state(worker) && admitted()
     };
     match among {
         None => (0..)
@@ -331,6 +339,9 @@ fn taking(
 /// prefill's place, and the call asks again as any pair's does
 /// ([`super::pair::asks`]): a rule the request states is then asked of
 /// that one place, and of the decodes.
+///
+/// The count is one function ([`reached_pair`]), which a controller's
+/// served decision asks too, over its own two lists.
 ///
 /// Where no decode can be sent to, a decode over its overload thresholds
 /// alone counts as a prefill's partner, and the decode's number is not
@@ -421,17 +432,66 @@ pub(super) fn pair<'a>(
     // A place a hold of the host stands on is a place of the mask.
     let prefill_places = (stated[0], lists.prefill_stalled);
     let decode_places = (stated[1], lists.decode_stalled);
+    let counted = [prefill_places, decode_places];
     if !prefill_named {
-        let counted = [prefill_places, decode_places];
         return decode_alone(engine, request, lists, counted, named, call);
     }
+    let steers = || spec.engine().steers_all_vetoed(request.model);
+    let named = (named, decode_named);
+    let reached = reached_pair(lists, counted, named, request.admits, steers);
+    held_pair(engine, request, lists, reached, call)
+}
+
+/// Where the number a pair names its workers by reaches
+/// ([`reached_pair`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReachedPair {
+    /// No prefill is counted: there is nobody to name, and the pair leaves
+    /// its hold.
+    NoneToCount,
+    /// A prefill is counted and the number reaches no worker on a side:
+    /// its text is no number, or fewer workers are counted there.
+    NoWorker,
+    /// The place of the prefill the number reaches, and of the decode it
+    /// reaches among that prefill's partners. No decode where the
+    /// decode's number is not read: its side is no plain ring's, or a
+    /// decode over its thresholds alone counted as a partner.
+    Places(u32, Option<u32>),
+}
+
+/// The count of a pair that names its worker on its prefill's side, the
+/// one count of both doors: the one call in a host's own process
+/// ([`pair`]) and a controller's served decision hand it their own two
+/// lists, and what each states beside them.
+///
+/// `counted` is what the count reads of each side, the prefill's and then
+/// the decode's. `named` is the number, `None` for a text that is no
+/// number, and whether the decode's side reads it too. `admits` is the
+/// route's rule, asked as [`taking`] asks it: `None` for a caller that
+/// has none, as a controller is. `steers` is whether the binding steers a
+/// decode pool that is all over its thresholds, asked where no decode can
+/// be sent to and of no other pair.
+///
+/// The prefill's number counts the prefills that can be sent to and pair
+/// with a decode that can, and those that pair with one first, alone,
+/// where there is one. The decode's number counts the partners so counted
+/// of the prefill reached. Where no decode can be sent to and the binding
+/// steers, a decode over its thresholds alone counts as a partner, and
+/// the decode's number is not read.
+pub(crate) fn reached_pair(
+    lists: &PairLists<'_>,
+    [prefill_places, decode_places]: [SidePlaces<'_>; 2],
+    (named, decode_named): (Option<u32>, bool),
+    admits: Option<WorkerRule<'_>>,
+    steers: impl FnOnce() -> bool,
+) -> ReachedPair {
     let available = |worker: &dyn Worker| worker.is_available();
-    let mut decodes = taking(request, lists.decode, decode_places, available);
-    let lifted = decodes.is_empty() && spec.engine().steers_all_vetoed(request.model);
+    let mut decodes = taking(admits, lists.decode, decode_places, available);
+    let lifted = decodes.is_empty() && steers();
     if lifted {
         let but_overloaded =
             |worker: &dyn Worker| worker.routing_state().eligible_ignoring_overload();
-        decodes = taking(request, lists.decode, decode_places, but_overloaded);
+        decodes = taking(admits, lists.decode, decode_places, but_overloaded);
     }
     let classes = lists.classes;
     let partner = |prefill: u32, decode: u32, first: bool| {
@@ -447,7 +507,7 @@ pub(super) fn pair<'a>(
             .iter()
             .any(|&decode| partner(prefill, decode, first))
     };
-    let prefills = taking(request, lists.prefill, prefill_places, available);
+    let prefills = taking(admits, lists.prefill, prefill_places, available);
     // A first partner is looked for where a prefill's class states one:
     // under classes that state none, no decode is read for it.
     let firsts = classes.first();
@@ -463,22 +523,51 @@ pub(super) fn pair<'a>(
         .copied()
         .filter(|&prefill| partnered(prefill, first));
     let Some(lead) = counted.next() else {
-        return super::pair::place(engine, request, lists, &mut call);
+        return ReachedPair::NoneToCount;
     };
     let mut counted = iter::once(lead).chain(counted);
-    let prefill = named
-        .and_then(|number| counted.nth(number as usize))
-        .ok_or(MISSED)?;
+    let Some(prefill) = named.and_then(|number| counted.nth(number as usize)) else {
+        return ReachedPair::NoWorker;
+    };
     let decode = if decode_named && !lifted {
         let mut partners = decodes
             .iter()
             .filter(|&&decode| partner(prefill, decode, first));
         let reached = named.and_then(|number| partners.nth(number as usize));
-        Some([*reached.ok_or(MISSED)?])
+        let Some(&decode) = reached else {
+            return ReachedPair::NoWorker;
+        };
+        Some(decode)
     } else {
         None
     };
-    let prefill = [prefill];
+    ReachedPair::Places(prefill, decode)
+}
+
+/// The asks of a pair's call behind its count ([`reached_pair`]), held to
+/// the places the count reached: the prefill's, and the decode's where
+/// the count read the decode's number. Where there was no prefill to
+/// count, the pair is placed as one that names no worker
+/// ([`super::pair::place`]).
+///
+/// # Errors
+///
+/// The pair's shed with no endpoint, under [`TARGET_WORKER`], where the
+/// number reached no worker on a side, and where the decision held to the
+/// places named no pair that can be sent to ([`held`]). Any other answer
+/// of [`super::pair::place`] stands as it is.
+fn held_pair<'a>(
+    engine: Loaded<'static, '_>,
+    request: &PlaceRequest<'a>,
+    lists: &PairLists<'_>,
+    reached: ReachedPair,
+    mut call: Call,
+) -> Result<Placement<'a>, Unplaced> {
+    let (prefill, decode) = match reached {
+        ReachedPair::NoneToCount => return super::pair::place(engine, request, lists, &mut call),
+        ReachedPair::NoWorker => return Err(MISSED),
+        ReachedPair::Places(prefill, decode) => ([prefill], decode.map(|decode| [decode])),
+    };
     // The pair's lists as the call's asks read them: the prefill's place,
     // and the decode's where the request names one.
     let held_to = PairLists {
@@ -533,6 +622,9 @@ pub(super) fn pair<'a>(
 /// changes between this read and its own: it then pairs among the lent
 /// decodes.
 ///
+/// The decodes, and whether a prefill opens the pair, are one function's
+/// read ([`opened`]), which a controller's served decision asks too.
+///
 /// The gateway's own pair selection counts the open partners of its
 /// prefill policy's pick so
 /// (`model_gateway/src/routers/common/placement.rs:2884-2887`,
@@ -559,23 +651,14 @@ fn decode_alone<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
     lists: &PairLists<'_>,
-    [prefill_counted, decode_counted]: [(Option<&[u32]>, &[u32]); 2],
+    counted: [SidePlaces<'_>; 2],
     named: Option<u32>,
     mut call: Call,
 ) -> Result<Placement<'a>, Unplaced> {
-    let available = |worker: &dyn Worker| worker.is_available();
-    let decodes = taking(request, lists.decode, decode_counted, available);
-    let opens = |state: &dyn Fn(&dyn Worker) -> bool| {
-        let pairs = |prefill: usize, &decode: &u32| lists.classes.pairs(prefill, decode as usize);
-        let prefills = taking(request, lists.prefill, prefill_counted, state);
-        let mut prefills = prefills.iter().map(|&prefill| prefill as usize);
-        prefills.any(|prefill| decodes.iter().any(|decode| pairs(prefill, decode)))
-    };
-    let lifted = |worker: &dyn Worker| worker.routing_state().eligible_ignoring_overload();
     let lifts = || engine.document.spec.engine().lifts_prefills(request.model);
-    if !(opens(&available) || (lifts() && opens(&lifted))) {
+    let Some(decodes) = opened(lists, counted, request.admits, lifts) else {
         return super::pair::place(engine, request, lists, &mut call);
-    }
+    };
     // The rule's prefills, found ahead of the first ask: the asks behind
     // it find no places again, and two asks are the call's.
     let mut prefills = None;
@@ -598,4 +681,36 @@ fn decode_alone<'a>(
         Unplaced::NoWorkers => MISSED,
         other => other,
     })
+}
+
+/// The decodes a pair's decision counts its decode's number among, where
+/// the decode's side alone reads the name: the one read of both doors, the
+/// one call in a host's own process ([`decode_alone`]) and a controller's
+/// served decision. They are the places of the decodes that can be sent
+/// to, among those `counted` states for the decode's side, the second of
+/// its two. `admits` is the route's rule, as [`reached_pair`] takes it.
+///
+/// `None` where no prefill opens the pair, so the number is not read. A
+/// prefill opens it where it is read as [`reached_pair`] reads its
+/// prefills and one of those decodes partners it. A prefill over its
+/// thresholds alone opens it too where its profile places among such
+/// prefills: `lifts` says so, and is asked where no available prefill
+/// opens the pair and of no other pair.
+pub(crate) fn opened(
+    lists: &PairLists<'_>,
+    [prefill_counted, decode_counted]: [SidePlaces<'_>; 2],
+    admits: Option<WorkerRule<'_>>,
+    lifts: impl FnOnce() -> bool,
+) -> Option<Vec<u32>> {
+    let available = |worker: &dyn Worker| worker.is_available();
+    let decodes = taking(admits, lists.decode, decode_counted, available);
+    let opens = |state: &dyn Fn(&dyn Worker) -> bool| {
+        let pairs = |prefill: usize, &decode: &u32| lists.classes.pairs(prefill, decode as usize);
+        let prefills = taking(admits, lists.prefill, prefill_counted, state);
+        let mut prefills = prefills.iter().map(|&prefill| prefill as usize);
+        prefills.any(|prefill| decodes.iter().any(|decode| pairs(prefill, decode)))
+    };
+    let lifted = |worker: &dyn Worker| worker.routing_state().eligible_ignoring_overload();
+    let opened = opens(&available) || (lifts() && opens(&lifted));
+    opened.then_some(decodes)
 }
