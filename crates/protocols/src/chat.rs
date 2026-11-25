@@ -1412,11 +1412,13 @@ fn fold_sampled(state: u64, text: &str, budget: &mut usize) -> u64 {
 }
 
 /// Folds a JSON value of a part of an unknown kind into its digest, its
-/// strings by [`fold_sampled`]. Each kind folds a byte of its own ahead of
-/// what it holds and a list its length too, so two values of two kinds or
-/// of two shapes do not fold alike; a whole number folds exactly.
-/// A node costs eight bytes of the budget and no further entry of a list or
-/// an object is visited once it is spent.
+/// strings by [`fold_sampled`]. Each node the budget reaches folds a byte
+/// of its kind ahead of what it holds, and a list its length too, so two
+/// values that part in the kind or the shape of such a node do not fold
+/// alike; a whole number folds exactly.
+/// A node costs eight bytes of the budget. No further entry of a list is
+/// visited once it is spent; an object's members share what is left
+/// equally, by [`fold_members`].
 fn fold_value(state: u64, value: &Value, budget: &mut usize) -> u64 {
     if *budget < 8 {
         return state;
@@ -2473,6 +2475,193 @@ mod tests {
             "a chat message is {} bytes",
             size_of::<ChatMessage>()
         );
+    }
+
+    /// The routing text of a chat request carries, at the place of each part
+    /// that is no text, a marker of 256 characters made from the part's
+    /// digest, 32 markers a request at most. The pairs below are parts the
+    /// digest tells apart within the bytes it reads; a part whose members
+    /// come in another order keeps its marker.
+    #[test]
+    fn the_routing_text_carries_a_marker_of_each_part_that_is_no_text() {
+        let routed = |parts: Value| -> String {
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m", "messages": [{"role": "user", "content": parts}]
+            }))
+            .unwrap();
+            chat.routing_text()
+        };
+        let text = json!({"type": "text", "text": "what does it show"});
+        let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+        let around = |part: Value| json!([text, part, text]);
+
+        let first = routed(around(image("https://example.com/a.png")));
+        assert!(first.starts_with("what does it show ") && first.ends_with(" what does it show"));
+        // The marker is the digest's 16 digits sixteen times: 256 characters.
+        assert_eq!(first.len(), 18 + 256 + 18);
+        assert_eq!(first[18..274], first[18..34].repeat(16));
+
+        // An inline image far over the bytes its digest reads: its last
+        // byte still parts two keys.
+        let inline = |last: char| {
+            image(&format!(
+                "data:image/png;base64,{}{last}",
+                "A".repeat(1 << 20)
+            ))
+        };
+        assert_ne!(routed(around(inline('B'))), routed(around(inline('C'))));
+
+        for (one, two) in [
+            (
+                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}}),
+                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/b.wav"}}),
+            ),
+            (
+                json!({"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}}),
+                json!({"type": "input_audio", "input_audio": {"data": "QUJE", "format": "wav"}}),
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}),
+                json!({"type": "video_url", "video_url": {"url": "https://example.com/b.mp4"}}),
+            ),
+            (
+                json!({"type": "file", "file": {"file_id": "file-1", "filename": "a.pdf"}}),
+                json!({"type": "file", "file": {"file_id": "file-2", "filename": "a.pdf"}}),
+            ),
+            // Two kinds of value, two shapes of a list and two whole numbers
+            // that one float holds are each two parts; so are two members
+            // that change together, a string longer than its share and a
+            // list with an entry more behind what its share reads.
+            (
+                json!({"type": "file", "file": {"file_id": 0}}),
+                json!({"type": "file", "file": {"file_id": ""}}),
+            ),
+            (
+                json!({"type": "file", "file": {"pages": [[1, 2], [3]]}}),
+                json!({"type": "file", "file": {"pages": [[1], [2, 3]]}}),
+            ),
+            (
+                json!({"type": "file", "file": {"file_id": 9_007_199_254_740_993_u64}}),
+                json!({"type": "file", "file": {"file_id": 9_007_199_254_740_992_u64}}),
+            ),
+            (
+                json!({"type": "file", "a": null, "b": null}),
+                json!({"type": "file", "a": false, "b": false}),
+            ),
+            (
+                json!({"type": "file", "file": {
+                    "file_data": "A".repeat(64),
+                    "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null
+                }}),
+                json!({"type": "file", "file": {
+                    "file_data": format!("B{}", "A".repeat(63)),
+                    "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null
+                }}),
+            ),
+            (
+                json!({"type": "file", "file": {"pages": ["x".repeat(479)]}}),
+                json!({"type": "file", "file": {"pages": ["x".repeat(479), null]}}),
+            ),
+        ] {
+            let (one, two) = (routed(around(one)), routed(around(two)));
+            assert_eq!(one[..18], two[..18]);
+            assert_ne!(one[18..34], two[18..34], "{one} / {two}");
+        }
+
+        // A part replayed with its members in another order keeps its marker.
+        assert_eq!(
+            routed(around(
+                json!({"type": "file", "file": {"file_id": "file-1", "filename": "a.pdf"}})
+            )),
+            routed(around(
+                json!({"file": {"filename": "a.pdf", "file_id": "file-1"}, "type": "file"})
+            )),
+        );
+        // So does a part whose inline data is longer than its digest reads:
+        // each member reads its own share, whatever stands in front of it.
+        let (data, other) = ("QUJD".repeat(1024), "QUJE".repeat(1024));
+        assert_eq!(
+            routed(around(
+                json!({"type": "file", "file": {"file_data": data, "filename": "a.pdf"}})
+            )),
+            routed(around(
+                json!({"file": {"filename": "a.pdf", "file_data": data}, "type": "file"})
+            )),
+        );
+        assert_ne!(
+            routed(around(
+                json!({"type": "file", "file": {"file_data": data, "filename": "a.pdf"}})
+            )),
+            routed(around(
+                json!({"type": "file", "file": {"file_data": other, "filename": "a.pdf"}})
+            )),
+        );
+
+        // One request carries 32 markers at most: the 32nd image still parts
+        // two keys, the 33rd no longer does, and the key stays a prefix of
+        // the key of the same parts with a turn behind them.
+        let images = |changed: usize| -> Vec<Value> {
+            (0..40)
+                .map(|at| image(&format!("https://example.com/{at}-{}.png", at == changed)))
+                .collect()
+        };
+        assert_ne!(routed(json!(images(31))), routed(json!(images(40))));
+        assert_eq!(routed(json!(images(32))), routed(json!(images(40))));
+        let mut longer = images(40);
+        longer.extend([text.clone(), image("https://example.com/next.png")]);
+        assert!(routed(json!(longer)).starts_with(&routed(json!(images(40)))));
+    }
+
+    /// The text for routing of a mixed request, piece by piece: an empty
+    /// text part joins nothing, a part that is no text gives nothing between
+    /// two texts, an assistant's reasoning follows its content and a function
+    /// message gives its content. The routing text is another text exactly
+    /// where a part of the request is no text.
+    #[test]
+    fn the_text_for_routing_joins_the_texts_of_a_mixed_request() {
+        let chat = |messages: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({"model": "m", "messages": messages})).unwrap()
+        };
+        let image = json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}});
+        let history = |part: Value| {
+            chat(json!([
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "what does"},
+                    part,
+                    {"type": "text", "text": "it show"},
+                ]},
+                {"role": "assistant", "content": "a cat", "reasoning_content": "four legs"},
+                {"role": "function", "name": "lookup", "content": "tabby"},
+            ]))
+        };
+        let mixed = history(image.clone());
+        assert_eq!(
+            mixed.extract_text_for_routing(),
+            "be brief what does it show a cat four legs tabby"
+        );
+        // A refusal part is text: it joins its text and has no marker.
+        let refused = history(json!({"type": "refusal", "refusal": "no"}));
+        assert_eq!(
+            refused.extract_text_for_routing(),
+            "be brief what does no it show a cat four legs tabby"
+        );
+        let replayed = chat(json!([
+            {"role": "user", "content": "what does it show"},
+            {"role": "assistant", "content": [{"type": "text", "text": "a cat"}, image]},
+        ]));
+        assert_eq!(
+            replayed.extract_text_for_routing(),
+            "what does it show a cat"
+        );
+
+        for (request, marked) in [(mixed, true), (refused, false), (replayed, true)] {
+            assert_eq!(
+                request.routing_text() != request.extract_text_for_routing(),
+                marked
+            );
+        }
     }
 }
 

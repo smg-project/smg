@@ -3820,11 +3820,12 @@ mod tests {
         assert!(!message.contains("for url"), "{message}");
     }
 
-    /// Two chat requests of one text and two images part at the image's
-    /// place, as they do in a backend's prefix cache; one image keeps one
-    /// key, every kind of part that is no text has its marker, a request of
-    /// text alone reads the text of before, and the tenant's charge counts
-    /// the words of the prompt alone.
+    /// A route keys a chat request on its routing text: two requests of one
+    /// text and two images part at the image's place, as they do in a
+    /// backend's prefix cache; one image keeps one key, a request of text
+    /// alone reads the text of before, and the tenant's charge counts the
+    /// words of the prompt alone. The marker and its digest have their own
+    /// cases in the protocol crate.
     #[test]
     fn a_chat_request_routes_on_a_marker_at_the_place_of_each_part_that_is_no_text() {
         let chat = |parts: Value| -> ChatCompletionRequest {
@@ -3850,119 +3851,10 @@ mod tests {
         assert_eq!(first[..18], other[..18]);
         assert_ne!(first[18..34], other[18..34]);
         assert!(first.starts_with("what does it show ") && first.ends_with(" what does it show"));
-        // The marker is the digest's 16 digits sixteen times: 256 characters.
+        // The route hands the marker on whole: the digest's 16 digits
+        // sixteen times, 256 characters.
         assert_eq!(first.len(), 18 + 256 + 18);
         assert_eq!(first[18..274], first[18..34].repeat(16));
-
-        // An inline image far over the bytes its digest reads: its last
-        // byte still parts two keys.
-        let inline = |last: char| {
-            image(&format!(
-                "data:image/png;base64,{}{last}",
-                "A".repeat(1 << 20)
-            ))
-        };
-        assert_ne!(routed(around(inline('B'))), routed(around(inline('C'))));
-
-        for (one, two) in [
-            (
-                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}}),
-                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/b.wav"}}),
-            ),
-            (
-                json!({"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}}),
-                json!({"type": "input_audio", "input_audio": {"data": "QUJE", "format": "wav"}}),
-            ),
-            (
-                json!({"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}),
-                json!({"type": "video_url", "video_url": {"url": "https://example.com/b.mp4"}}),
-            ),
-            (
-                json!({"type": "file", "file": {"file_id": "file-1", "filename": "a.pdf"}}),
-                json!({"type": "file", "file": {"file_id": "file-2", "filename": "a.pdf"}}),
-            ),
-            // Two kinds of value, two shapes of a list and two whole numbers
-            // that one float holds are each two parts; so are two members
-            // that change together, a string longer than its share and a
-            // list with an entry more behind what its share reads.
-            (
-                json!({"type": "file", "file": {"file_id": 0}}),
-                json!({"type": "file", "file": {"file_id": ""}}),
-            ),
-            (
-                json!({"type": "file", "file": {"pages": [[1, 2], [3]]}}),
-                json!({"type": "file", "file": {"pages": [[1], [2, 3]]}}),
-            ),
-            (
-                json!({"type": "file", "file": {"file_id": 9_007_199_254_740_993_u64}}),
-                json!({"type": "file", "file": {"file_id": 9_007_199_254_740_992_u64}}),
-            ),
-            (
-                json!({"type": "file", "a": null, "b": null}),
-                json!({"type": "file", "a": false, "b": false}),
-            ),
-            (
-                json!({"type": "file", "file": {
-                    "file_data": "A".repeat(64),
-                    "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null
-                }}),
-                json!({"type": "file", "file": {
-                    "file_data": format!("B{}", "A".repeat(63)),
-                    "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null
-                }}),
-            ),
-            (
-                json!({"type": "file", "file": {"pages": ["x".repeat(479)]}}),
-                json!({"type": "file", "file": {"pages": ["x".repeat(479), null]}}),
-            ),
-        ] {
-            let (one, two) = (routed(around(one)), routed(around(two)));
-            assert_eq!(one[..18], two[..18]);
-            assert_ne!(one[18..34], two[18..34], "{one} / {two}");
-        }
-
-        // A part replayed with its members in another order keeps its marker.
-        assert_eq!(
-            routed(around(
-                json!({"type": "file", "file": {"file_id": "file-1", "filename": "a.pdf"}})
-            )),
-            routed(around(
-                json!({"file": {"filename": "a.pdf", "file_id": "file-1"}, "type": "file"})
-            )),
-        );
-        // So does a part whose inline data is longer than its digest reads:
-        // each member reads its own share, whatever stands in front of it.
-        let (data, other) = ("QUJD".repeat(1024), "QUJE".repeat(1024));
-        assert_eq!(
-            routed(around(
-                json!({"type": "file", "file": {"file_data": data, "filename": "a.pdf"}})
-            )),
-            routed(around(
-                json!({"file": {"filename": "a.pdf", "file_data": data}, "type": "file"})
-            )),
-        );
-        assert_ne!(
-            routed(around(
-                json!({"type": "file", "file": {"file_data": data, "filename": "a.pdf"}})
-            )),
-            routed(around(
-                json!({"type": "file", "file": {"file_data": other, "filename": "a.pdf"}})
-            )),
-        );
-
-        // One request carries 32 markers at most: the 32nd image still parts
-        // two keys, the 33rd no longer does, and the key stays a prefix of
-        // the key of the same parts with a turn behind them.
-        let images = |changed: usize| -> Vec<Value> {
-            (0..40)
-                .map(|at| image(&format!("https://example.com/{at}-{}.png", at == changed)))
-                .collect()
-        };
-        assert_ne!(routed(json!(images(31))), routed(json!(images(40))));
-        assert_eq!(routed(json!(images(32))), routed(json!(images(40))));
-        let mut longer = images(40);
-        longer.extend([text.clone(), image("https://example.com/next.png")]);
-        assert!(routed(json!(longer)).starts_with(&routed(json!(images(40)))));
 
         let with_image = chat(around(image("https://example.com/a.png")));
         let words = chat(json!([text, text])).estimated_input_tokens(None);
