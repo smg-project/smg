@@ -202,7 +202,7 @@ def test_the_command_line_takes_the_marker_and_refuses_an_empty_one(mod, tree, c
 
 
 @pytest.mark.skipif(not os.path.isdir("/proc"), reason="reads the real /proc")
-def test_real_children_carrying_the_marker_are_ended_and_others_are_not(mod):
+def test_real_children_carrying_the_marker_are_ended_and_others_are_not(mod, tmp_path):
     marker = f"e2e-test-{os.getpid()}-{time.time_ns()}"
     marked = [
         subprocess.Popen(["sleep", "300"], env={**os.environ, "E2E_JOB_MARKER": marker})
@@ -210,8 +210,13 @@ def test_real_children_carrying_the_marker_are_ended_and_others_are_not(mod):
     ]
     other = subprocess.Popen(["sleep", "300"], env={**os.environ, "E2E_JOB_MARKER": marker + "-x"})
     try:
+        view = tmp_path / "legacy-owned-proc-view"
+        view.mkdir()
+        pids = {1, *mod.ancestors("/proc", os.getpid()), *(p.pid for p in marked), other.pid}
+        for pid in pids:
+            (view / str(pid)).symlink_to(Path("/proc") / str(pid), target_is_directory=True)
         lines: list[str] = []
-        found = mod.reap(marker, grace=5.0, log=lines.append)
+        found = mod.reap(marker, proc_root=str(view), grace=5.0, log=lines.append)
         assert sorted(process.pid for process in found) == sorted(p.pid for p in marked)
         for process in marked:
             assert process.wait(timeout=5) == -signal.SIGTERM
@@ -344,7 +349,30 @@ def test_strict_rechecks_identity_after_open_before_any_signal(mod, strict_tree,
 
     runtime.on_open = replace
     assert not runtime.run(mod)
-    assert runtime.sent == []
+    # Reject the changed identity while still cleaning independently verified peers.
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_strict_reused_pid_does_not_abort_verified_peers_kill_grace(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    timed = []
+
+    def replace(pid):
+        if pid == 100:
+            _strict_process(strict_tree, 100, birth=9999)
+
+    def on_signal(pid, sig):
+        timed.append((pid, sig, runtime.now))
+        if pid == 101 and sig == signal.SIGKILL:
+            runtime.remove(pid)
+
+    runtime.on_open = replace
+    runtime.on_signal = on_signal
+    assert not runtime.run(mod)
+    assert all(pid != 100 for pid, _, _ in timed)
+    assert any(pid == 101 and sig == signal.SIGKILL and t >= 0.4 for pid, sig, t in timed)
     assert runtime.closed == set(runtime.opened)
 
 
@@ -373,6 +401,91 @@ def test_strict_changed_marker_after_term_is_not_killed_or_reported_clean(mod, s
     assert not runtime.run(mod)
     assert (100, signal.SIGKILL) not in runtime.sent
     assert runtime.closed == set(runtime.opened)
+
+
+def test_strict_bound_exit_during_ownership_read_keeps_cleaning_peers(
+    mod, strict_tree, monkeypatch
+):
+    runtime = _Pidfds(strict_tree)
+    original_owned = mod._strict_owned
+    original_exited = runtime.exited
+    ready = set()
+
+    def exit_during_read(proc_root, pid, *args, **kwargs):
+        if pid == 100 and pid in runtime.opened.values():
+            ready.add(pid)
+            stat = strict_tree / str(pid) / "stat"
+            stat.write_bytes(stat.read_bytes().replace(b") S ", b") Z "))
+            return None
+        return original_owned(proc_root, pid, *args, **kwargs)
+
+    monkeypatch.setattr(mod, "_strict_owned", exit_during_read)
+    assert runtime.run(
+        mod, pidfd_exited=lambda fd: runtime.opened[fd] in ready or original_exited(fd)
+    )
+    assert (strict_tree / "100" / "stat").exists()  # Unreaped Z can remain visible.
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("transition", ["zombie", "empty", "permission"])
+def test_strict_transient_exit_observation_does_not_abort_other_worker(
+    mod, strict_tree, monkeypatch, transition
+):
+    runtime = _Pidfds(strict_tree)
+    original_exited = runtime.exited
+    original_open = open
+    transitioning = set()
+    ready = set()
+    signal_times = []
+
+    def write_state(state):
+        stat = strict_tree / "100" / "stat"
+        text = stat.read_bytes()
+        split = text.rfind(b")") + 2
+        stat.write_bytes(text[:split] + state + text[split + 1 :])
+
+    def proc_open(path, *args, **kwargs):
+        if (
+            transition == "permission"
+            and 100 in transitioning
+            and str(path) == str(strict_tree / "100" / "environ")
+        ):
+            raise PermissionError("exit in progress")
+        return original_open(path, *args, **kwargs)
+
+    def on_signal(pid, sig):
+        signal_times.append((pid, sig, runtime.now))
+        if pid == 100:
+            transitioning.add(pid)
+            write_state(b"Z" if transition == "zombie" else b"D")
+            if transition == "empty":
+                (strict_tree / "100" / "environ").write_bytes(b"")
+        elif sig == signal.SIGKILL:
+            runtime.remove(pid)
+
+    def finish_group():
+        if runtime.now >= 1.0:
+            ready.add(100)
+            write_state(b"Z")
+
+    monkeypatch.setattr("builtins.open", proc_open)
+    runtime.on_signal = on_signal
+    runtime.on_sleep = finish_group
+    assert runtime.run(
+        mod, pidfd_exited=lambda fd: runtime.opened[fd] in ready or original_exited(fd)
+    )
+    assert (100, signal.SIGKILL) not in runtime.sent
+    assert any(pid == 101 and sig == signal.SIGKILL and t >= 0.4 for pid, sig, t in signal_times)
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_strict_live_empty_environment_is_not_a_negative_marker_observation(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    (strict_tree / "100" / "environ").write_bytes(b"")
+    assert not runtime.run(mod)
+    assert runtime.sent == []
 
 
 def test_strict_survivors_are_failure_after_bounded_term_and_kill(mod, strict_tree):
@@ -613,7 +726,11 @@ def test_strict_zombie_main_thread_cannot_hide_live_threads(mod, tmp_path):
                 "threading.Thread(target=lambda:time.sleep(30)).start(); "
                 "print('READY',flush=True); ctypes.CDLL(None).pthread_exit(None)",
             ],
-            env={"PATH": "/usr/bin:/bin", "E2E_JOB_MARKER": marker},
+            env={
+                **{key: os.environ[key] for key in ("LD_LIBRARY_PATH",) if key in os.environ},
+                "PATH": "/usr/bin:/bin",
+                "E2E_JOB_MARKER": marker,
+            },
             stdout=subprocess.PIPE,
         )
         fd = os.pidfd_open(child.pid, 0)
