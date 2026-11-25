@@ -1580,7 +1580,7 @@
           "const": "pd-pair"
         },
         {
-          "description": "The pair, then the encode profile over the encoders of the chosen\nprefill's class, once per encode item or once for the items taken\nas one; all three sides named. A request with items that no encoder\nis open to is refused ahead of the pair.",
+          "description": "The pair, then the encode profile over the encoders of the chosen\nprefill's class, once per encode item or once for the items taken\nas one; all three sides named. A request with items that no encoder\nis open to is refused ahead of the pair. The pair of a request with\nitems is picked among the prefills whose class holds an open encoder\nthat takes its media. A decode without the vision a request asks of\nit is no candidate of the pair either.",
           "type": "string",
           "const": "epd"
         }
@@ -1725,6 +1725,23 @@
         "rule_placed": {
           "description": "Whether a request this rule placed alone is the profile's own\n(default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. Under the `pd-pair`\nplan each side of a pair follows the word on its own: a side the\nrule placed alone is kept from that side's profile, beside a side\nthe stages placed, which is told. A controller keeps the word on\nthe lease it files for a single request, and tells such a request\noff its file by it all the same. Its file keeps no word of a pair's\nside: a controller takes `told` alone under the `pd-pair` plan.",
           "$ref": "#/$defs/RulePlaced"
+        },
+        "sides": {
+          "description": "The sides of a pair the rule covers: `prefill` or `decode`, or both,\neach named once. Left out, the rule covers both sides. Stated under\nthe `pd-pair` plan alone.\n\nA side the rule does not name is its profile's alone. The rule reads,\nclaims and writes no pin of that side's session. A side whose picker\nleaves the placement to the rule is not left out. A gateway leaves a\nrole out of its sticky override where the role's policy keeps a\nrouting key's handling to itself, as its `manual` and its\n`consistent_hashing` do.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "prefill",
+              "decode"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true
         }
       },
       "additionalProperties": false
@@ -1866,7 +1883,7 @@
       "type": "object",
       "properties": {
         "sample": {
-          "description": "Each decider of a controller, and each calling thread in a host's\nown process, keeps every Nth pick or shed it counts. The count\nstarts over under a new generation, and in a controller under a new\nlead. Zero keeps none. In a host's own process a request is counted\nonly where an id names it.",
+          "description": "Each decider of a controller, and each calling thread in a host's\nown process, keeps every Nth pick or shed it counts. The count\nstarts over under a new generation, and in a controller under a new\nlead. In a host's own process it also starts over under another\nengine, by the document's number. Zero keeps none. In a host's own\nprocess a request is counted only where an id names it.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,

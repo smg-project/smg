@@ -1043,6 +1043,7 @@ fn a_decode_calls_verdict_hands_the_table_its_pairs_lease_date() {
         sweep_micros: 100,
         recovery: Recovery::Latest,
         rule_placed: RulePlaced::Told,
+        sides: Default::default(),
     };
     // The call's pick: the held prefill (worker 1) with decode 102.
     let call = |verdict: SessionVerdict| {

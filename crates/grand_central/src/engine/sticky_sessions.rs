@@ -52,6 +52,47 @@ pub struct SessionRule {
     /// pick the rule placed carries the word to the engine that tells the
     /// stages of it.
     pub rule_placed: RulePlaced,
+    /// The sides of a pair the rule covers.
+    pub sides: SessionSides,
+}
+
+/// The sides of a pair a sessions rule covers (`sessions.sides` in a
+/// document). A side the rule does not cover is its profile's alone: the
+/// rule reads, claims and writes no pin of that side's session. A
+/// binding built in code can leave out a side whose picker leaves the
+/// placement to the rule, which no checked document can. A debug build
+/// stops where the engine is built. A release build places that side by
+/// the rule, as it places a side the rule covers. A gateway decides its
+/// sticky override a role at a time, and leaves a role to a policy that
+/// keeps a routing key's handling to itself: its `manual` and its
+/// `consistent_hashing`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionSides {
+    /// Any side the binding's plan has for a rule: what a document that
+    /// names no side states, and one that names both. Under `single` that
+    /// is the request's one side, and under `pd-pair` both sides. Under a
+    /// plan with an encode side it is the prefill and the decode, and
+    /// never the encode side.
+    #[default]
+    Any,
+    /// The prefill side alone.
+    Prefill,
+    /// The decode side alone.
+    Decode,
+}
+
+impl SessionSides {
+    /// Whether the rule covers `decode`, the decode side of a pair, or its
+    /// prefill side.
+    #[inline]
+    pub(crate) const fn covers(self, decode: bool) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Prefill => !decode,
+            Self::Decode => decode,
+        }
+    }
 }
 
 impl SessionRule {
@@ -455,9 +496,9 @@ impl Entry {
 
     /// Whether a word dated `at` comes from an older life of the key: it
     /// is dated before the oldest date a decision read this one under. A
-    /// pair's decode call reads under its lease's date
-    /// ([`SessionTable::told_under`]). A word that states no instant (`0`)
-    /// does not. Neither does any word in an entry no decision has read.
+    /// word that states no instant (`0`) does not. Neither does any word
+    /// in an entry no decision has read. A pair's decode call reads under
+    /// its lease's date ([`SessionTable::told_under`]).
     fn outlived(&self, at: u64) -> bool {
         at != 0 && at < self.oldest_reader_micros
     }
@@ -1062,9 +1103,9 @@ impl SessionTable {
     /// confirmed ([`Self::told_under`]), the move ends what ties the two:
     /// the dispatch of that call's lease then takes back neither pin.
     ///
-    /// `at` is the moving decision's instant. A move dated before every
-    /// decision that read the key's current life writes nothing
-    /// ([`Entry::outlived`]). The key started over since the moving
+    /// `at` is the moving decision's instant. A move dated before the
+    /// oldest date a decision read the key's current life under writes
+    /// nothing ([`Entry::outlived`]). The key started over since the moving
     /// decision read its pin, and the move would front a worker over
     /// pins that decision never read. A caller that states no instant
     /// (`0`) moves the pin in any life.
@@ -1326,10 +1367,9 @@ impl SessionTable {
     /// respill a worker outside the pins joins them by the key's recovery
     /// rule. A dispatch to the claimed worker confirms the claim first; the
     /// claiming decision's commit elsewhere withdraws it. A dispatch on an
-    /// id its worker had before it was
-    /// registered again is one on that worker, under the id that stands
-    /// ([`Self::stands`]). A dispatch on a claim's lease asks by the
-    /// claim of record.
+    /// id its worker had before it was registered again is one on that
+    /// worker, under the id that stands ([`Self::stands`]). A dispatch on a
+    /// claim's lease asks by the claim of record.
     ///
     /// `at` is the instant the dispatched lease is issued under. The
     /// claiming decision is the one whose lease names the claim's id and
@@ -1337,10 +1377,10 @@ impl SessionTable {
     /// older decision that claimed the same worker withdraws nothing. A
     /// lease that states no instant (`0`) is known by its worker alone.
     ///
-    /// A dispatch dated before every decision that read the key's current
-    /// life writes nothing ([`Entry::outlived`]): the key started over
-    /// between that dispatch's decision and its send. One that states no
-    /// instant is written.
+    /// A dispatch dated before the oldest date a decision read the key's
+    /// current life under writes nothing ([`Entry::outlived`]): the key
+    /// started over between that dispatch's decision and its send. One
+    /// that states no instant is written.
     ///
     /// A decode call's claim may stand over the first claim of its own
     /// lease ([`Self::told_under`]). That lease's dispatch on the call's
@@ -1369,10 +1409,10 @@ impl SessionTable {
         let Some(entry) = self.slot(&mut shard, key) else {
             return;
         };
-        // A dispatch dated before every decision that read the key's
-        // current life comes from an older one. The new life keeps its
-        // own pins: a gateway's sticky map pins where it selects, and a
-        // send that comes late writes nothing there.
+        // A dispatch dated before the oldest date a decision read the
+        // key's current life under comes from an older one. The new life
+        // keeps its own pins: a gateway's sticky map pins where it
+        // selects, and a send that comes late writes nothing there.
         if entry.outlived(at) {
             return;
         }

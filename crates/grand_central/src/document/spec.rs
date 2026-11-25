@@ -35,7 +35,7 @@ pub(crate) use crate::document::applied::AppliedSpec;
 use crate::{
     engine::{
         framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, WeightedScorer},
-        sticky_sessions::SessionRule,
+        sticky_sessions::{SessionRule, SessionSides},
         view::{Phase, MAX_LOAD_REPORT_AGE_MS},
     },
     load::{
@@ -2503,6 +2503,23 @@ pub struct SessionsSpec {
     /// side: a controller takes `told` alone under the `pd-pair` plan.
     #[serde(default, skip_serializing_if = "is_default")]
     pub rule_placed: RulePlaced,
+    /// The sides of a pair the rule covers: `prefill` or `decode`, or both,
+    /// each named once. Left out, the rule covers both sides. Stated under
+    /// the `pd-pair` plan alone.
+    ///
+    /// A side the rule does not name is its profile's alone. The rule reads,
+    /// claims and writes no pin of that side's session. A side whose picker
+    /// leaves the placement to the rule is not left out. A gateway leaves a
+    /// role out of its sticky override where the role's policy keeps a
+    /// routing key's handling to itself, as its `manual` and its
+    /// `consistent_hashing` do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1, max = 2),
+        extend("uniqueItems" = true),
+        extend("items" = { "type": "string", "enum": ["prefill", "decode"] })
+    )]
+    pub sides: Option<Vec<String>>,
 }
 
 fn default_ttl_s() -> u32 {
@@ -2668,7 +2685,10 @@ pub enum PlanName {
     /// The pair, then the encode profile over the encoders of the chosen
     /// prefill's class, once per encode item or once for the items taken
     /// as one; all three sides named. A request with items that no encoder
-    /// is open to is refused ahead of the pair.
+    /// is open to is refused ahead of the pair. The pair of a request with
+    /// items is picked among the prefills whose class holds an open encoder
+    /// that takes its media. A decode without the vision a request asks of
+    /// it is no candidate of the pair either.
     Epd,
 }
 
@@ -2805,8 +2825,9 @@ pub struct ExplainSpec {
     /// Each decider of a controller, and each calling thread in a host's
     /// own process, keeps every Nth pick or shed it counts. The count
     /// starts over under a new generation, and in a controller under a new
-    /// lead. Zero keeps none. In a host's own process a request is counted
-    /// only where an id names it.
+    /// lead. In a host's own process it also starts over under another
+    /// engine, by the document's number. Zero keeps none. In a host's own
+    /// process a request is counted only where an id names it.
     #[serde(default)]
     pub sample: u32,
 }
@@ -5235,6 +5256,17 @@ fn check_binding(
     }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
         let rule = session_rule(sessions, cx.index, binding.plan, cx.lifecycle)?;
+        // A picker that leaves the placement to the rule places nothing
+        // itself: on a side the rule's `sides` leaves out no rule would
+        // place its requests. The built picker answers, as under the plan
+        // with an encode side above.
+        for (decode, side) in [(false, "prefill"), (true, "decode")] {
+            let by_rule = (b.profiles.get(side))
+                .is_some_and(|name| cx.by_assignment.contains(&name.as_str()));
+            if by_rule && !rule.sides.covers(decode) {
+                deferred.note(at.sub("profiles").field(side), BY_RULE_ON_A_SIDE_LEFT_OUT);
+            }
+        }
         needs.active_sessions |= rule.assignment == Assignment::MinGroup;
         needs.session_in_flight |= rule.inflight_cap > 0;
         binding.sessions = Some(rule);
@@ -5254,11 +5286,70 @@ const UNTOLD_ON_FILE_EPD: &str =
 const UNTOLD_ON_FILE: &str =
     "`told` under the pd-pair plan in this build: a file of leases keeps no side's word";
 
+/// What the build lacks where a rule's `sides` leaves out a side whose
+/// picker leaves the placement to the rule. The binding holds one rule, and
+/// no second one places that side.
+const BY_RULE_ON_A_SIDE_LEFT_OUT: &str =
+    "a picker that places by the sessions rule on a side the rule's `sessions.sides` leaves out";
+
+/// The sides of a pair a sessions rule covers (`sides`): both where the
+/// document names none. The field is the `pd-pair` plan's: a single request
+/// has one side, and under `epd` a rule covers the pair's two sides in this
+/// build. A list names `prefill`, `decode` or both, each once. The rule
+/// covers no encode side: a gateway's sticky map keeps no pin of one.
+fn session_sides(
+    sessions: &SessionsSpec,
+    index: usize,
+    plan: Plan,
+) -> Result<SessionSides, SpecError> {
+    let Some(named) = &sessions.sides else {
+        return Ok(SessionSides::Any);
+    };
+    let refused = |reason| SpecError::BadSessions {
+        index,
+        name: "sides",
+        reason,
+    };
+    if matches!(plan, Plan::Single) {
+        return Err(refused(
+            "left out under the single plan: a single request has one side",
+        ));
+    }
+    if matches!(plan, Plan::Epd { .. }) {
+        return Err(refused(
+            "left out under the epd plan in this build: a rule covers the pair's two sides there",
+        ));
+    }
+    let mut covered = [false; 2];
+    for side in named {
+        let at = match side.as_str() {
+            "prefill" => 0,
+            "decode" => 1,
+            _ => {
+                return Err(refused(
+                    "`prefill`, `decode` or both: a rule covers no other side",
+                ))
+            }
+        };
+        if std::mem::replace(&mut covered[at], true) {
+            return Err(refused("a list that names each side once"));
+        }
+    }
+    match covered {
+        [true, true] => Ok(SessionSides::Any),
+        [true, false] => Ok(SessionSides::Prefill),
+        [false, true] => Ok(SessionSides::Decode),
+        [false, false] => Err(refused(
+            "a list of one side at least: leave it out for both",
+        )),
+    }
+}
+
 /// The sessions rule as the engine runs it: the schema's largest cap is no
 /// cap, its largest idle time or sweep is for ever (a sweep for ever under a
 /// finite idle time is refused, as nothing would forget the keys; an idle
 /// time for ever sweeps nothing). The rule runs under the `single` plan, and
-/// on the two sides of a `pd-pair` plan: each side of a pair's pick states
+/// on the sides of a `pd-pair` plan it covers: each side of a pair's pick states
 /// its own word for whether its stages hear of it. A rule that keeps what
 /// it places from the profile is in the build of a host that makes the
 /// lifecycle's calls (`lifecycle`), which tells each side by the pick in
@@ -5319,6 +5410,7 @@ fn session_rule(
         },
         recovery: sessions.recovery,
         rule_placed: sessions.rule_placed,
+        sides: session_sides(sessions, index, plan)?,
     })
 }
 

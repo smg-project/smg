@@ -340,7 +340,9 @@ fn label_side<'a>(
     if let Some(sources) = key_sources(policy, config)? {
         shared.bound.keys.push((name, sources));
     }
-    shared.bound.overridden += usize::from(override_places(policy, config));
+    if override_places(policy, config) {
+        shared.bound.overridden.push("single");
+    }
     Ok((std::mem::take(&mut shared.bound), own))
 }
 
@@ -441,9 +443,7 @@ pub(super) fn written_with<'a>(
                     shared.bound.keys.push((policy.name(), sources));
                 }
                 if override_places(policy, config) {
-                    shared.bound.overridden += 1;
-                } else {
-                    shared.bound.keyed_itself = Some(side);
+                    shared.bound.overridden.push(side);
                 }
             }
         }
@@ -914,11 +914,10 @@ struct Bound {
     /// the manual policy's rule places the plan's other sides alone.
     encode_side: bool,
     /// The sides whose keyed requests the sticky override places
-    /// ([`override_places`]).
-    overridden: usize,
-    /// A side the override does not place. With the override on, that
-    /// side's policy reads the routing key itself.
-    keyed_itself: Option<&'static str>,
+    /// ([`override_places`]), by name. With the override on, a side that
+    /// is not among them reads the routing key itself, or is the encode
+    /// side, which reads none.
+    overridden: Vec<&'static str>,
     /// The sources each keyed side reads a request's key from, under the
     /// side's policy.
     keys: Vec<(&'static str, RoutingKeySpec)>,
@@ -1021,17 +1020,47 @@ impl Bound {
             if let Some(key) = &key {
                 within_a_block(key, config)?;
             }
-            if self.overridden > 0 {
-                if let Some(reason) = override_refused(sides, self.keyed_itself) {
-                    return Err(unsupported("routing_key_override.enabled", true, reason));
+            if !self.overridden.is_empty() {
+                // The settings write the override's rule for a single
+                // request and for a pair. Under a plan with an encode side
+                // they write none yet.
+                if sides > 2 {
+                    return Err(unsupported(
+                        "routing_key_override.enabled",
+                        true,
+                        "the sticky sessions' rule places a single request or the two sides of a pair, and this plan has an encode side",
+                    ));
                 }
-                binding.sessions = Some(override_rule(config)?);
+                // The gateway's sticky map places a role at a time. It
+                // asks the role's policy, and leaves the role to one
+                // that keeps the key's handling to itself: `manual` and
+                // `consistent_hashing`
+                // (`model_gateway/src/policies/registry.rs`,
+                // `sticky_for`). No side is `manual` here, and a pair
+                // with one such side is refused below. Beside a side
+                // under `consistent_hashing` the rule names the side
+                // the override places, and covers it alone.
+                let named = (self.overridden.len() < sides).then(|| {
+                    self.overridden
+                        .iter()
+                        .map(|&side| side.to_owned())
+                        .collect()
+                });
+                binding.sessions = Some(SessionsSpec {
+                    sides: named,
+                    ..override_rule(config)?
+                });
                 // The rule's cap counts a key's requests on a worker by
                 // the key's text, which a header hands where the view
-                // lists it.
+                // lists it. The view lists the session's sources alone.
+                // Beside a side left to its own policy the binding's
+                // list holds that side's client sources and its target
+                // source too ([`one_list`]). The rule reads none of
+                // them, and the check refuses `cookie` in the view.
                 *view_headers = key
                     .iter()
                     .flat_map(|key| &key.sources)
+                    .filter(|source| !source.client && !source.target)
                     .filter_map(|source| source.header.clone())
                     .collect();
             }
@@ -1042,7 +1071,7 @@ impl Bound {
             return Err(unsupported(
                 "policy",
                 "manual",
-                "the manual policy places by the binding's one session rule, so both sides of a pair are manual or neither is",
+                "the settings write the manual policy's session rule over both sides of a pair, so both sides are manual or neither is",
             ));
         }
         let key = one_list(self.keys)?.ok_or(RoutingSettingsError::NoPart {
@@ -1359,34 +1388,6 @@ fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
     config.routing_key_override.enabled && placed
 }
 
-/// Why a plan of `sides` sides takes no rule of the sticky override, where
-/// the override places a side of it. `keyed_itself` is a side the override
-/// does not place: its policy reads the routing key itself. `None` for a
-/// single request's plan, and for a pair's whose two sides the override
-/// places.
-///
-/// A binding's rule places every side of its plan, each side by its own
-/// session, as the gateway's sticky map pins each role under its own key
-/// (`model_gateway/src/policies/registry.rs`, `select_sticky`). The map
-/// places a role at a time, so beside a side whose policy reads the key
-/// itself it places the other side alone (`sticky_for`), and no document
-/// holds the rule to one side yet. The check takes no sessions rule under a
-/// plan with an encode side.
-fn override_refused(sides: usize, keyed_itself: Option<&'static str>) -> Option<&'static str> {
-    match (sides, keyed_itself) {
-        (1, _) | (2, None) => None,
-        (2, Some("prefill")) => Some(
-            "the sticky sessions' rule places both sides of a pair, and the prefill side's policy reads the routing key itself",
-        ),
-        (2, Some(_)) => Some(
-            "the sticky sessions' rule places both sides of a pair, and the decode side's policy reads the routing key itself",
-        ),
-        _ => Some(
-            "the sticky sessions' rule places a single request or the two sides of a pair, and this plan has an encode side",
-        ),
-    }
-}
-
 /// The requests of one key a worker carries under the sticky override
 /// before the key's next request is placed again: the number of the
 /// gateway's own sticky map.
@@ -1413,9 +1414,12 @@ const OVERRIDE_INFLIGHT_CAP: u16 = 2;
 ///   these settings write says so.
 ///
 /// The rule names no header: the binding's `routing_key` block lists the
-/// key's sources ([`key_sources`]). It stands on a single request's binding,
-/// and on a pair's where the override places both sides
-/// ([`override_refused`]).
+/// key's sources ([`key_sources`]). It stands on a single request's binding
+/// and on a pair's. A pair may hold one side under `consistent_hashing`,
+/// which keeps the key's handling to itself. The binding's rule then names
+/// the other side and covers it alone (`sessions.sides`, written where the
+/// binding is). A pair with that policy on both sides gets no rule, and
+/// one with one `manual` side is refused.
 fn override_rule(config: &RoutingSettings) -> Result<SessionsSpec, RoutingSettingsError> {
     let sticky = &config.routing_key_override;
     let (ttl_s, sweep_s) = pin_times(
@@ -1438,6 +1442,7 @@ fn override_rule(config: &RoutingSettings) -> Result<SessionsSpec, RoutingSettin
             Assignment::Random | Assignment::MinLoad | Assignment::MinGroup => Recovery::Original,
         },
         rule_placed: RulePlaced::Untold,
+        sides: None,
     })
 }
 
