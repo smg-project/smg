@@ -531,8 +531,9 @@ impl PrefixAffinity {
         kept: &[u32],
         out: &mut [f32],
         feed: Feed<'_>,
-        reads: impl Fn() -> R,
+        reads: impl FnOnce() -> R,
     ) -> (TieBand, u32) {
+        debug_assert_eq!(out.len(), kept.len(), "one score slot a kept row");
         let whole = self.gates.whole(facts);
         let holds = !feed.is_empty();
         // Nobody holding anything, the deepest match is zero without a
@@ -561,7 +562,8 @@ impl PrefixAffinity {
         for (o, &i) in out.iter_mut().zip(kept) {
             let c = &candidates[i as usize];
             let load = facts.in_flight(c) as f32;
-            // A match above zero was read into this slot by the pass above.
+            // Where the deepest match is above zero, the pass above wrote
+            // this row's match into its slot.
             *o = if best > 0 && o.to_bits() == best && !self.gates.over(load, avg, held) {
                 // Counted where it is written: a row under the ceiling
                 // adds nothing to the pass.
