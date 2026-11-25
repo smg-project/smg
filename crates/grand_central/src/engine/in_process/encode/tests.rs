@@ -1335,7 +1335,8 @@ fn a_side_its_demand_leaves_nobody_is_said_behind_the_encoders_answers() {
 /// meet the demand, beside one outside them that meets it and takes the
 /// request, holds the request off every encoder that takes it. Where no
 /// encoder meets the demand, the gap of the membership stands whatever the
-/// places are.
+/// places are. A side the demand leaves nobody is said ahead of the
+/// encoders' places, as a gap of the pair's membership is.
 ///
 /// The classic router states no places of an encoder list, so it has no
 /// line for the first state. The last is its rung 4
@@ -1360,6 +1361,11 @@ fn a_hosts_places_for_the_encoders_stand_beside_a_demand() {
     let mut far = fleet((7, 7), [Enc::on(8), Enc::on(8).seeing()]);
     far.0.encoder_places = Some(vec![0]);
     assert_eq!(answered(&far, image, seven), Err("encode-media"));
+    // The one prefill is on another runtime, and the host holds the request
+    // off the encoder that takes it: the side's stage is said first.
+    let mut both = fleet((8, 7), [Enc::on(8).seeing(), Enc::on(7).seeing()]);
+    both.0.encoder_places = Some(vec![0]);
+    assert_eq!(answered(&both, image, seven), Err("wires"));
 }
 
 /// A demand leaves what a host states beside each list as it stands. The

@@ -587,9 +587,11 @@ fn a_gap_is_named_by_the_encoders_on_the_requests_wires() {
 /// The pass keeps the hard demand its encode side states in its one test
 /// of an encoder, against what each encoder states beside its row
 /// ([`EncodePool::demands`]): the runtime as a wire, and vision with the
-/// request's pixels. An encoder with no entry states nothing and meets no
-/// demand for a runtime, as every encoder does under an empty column. A
-/// window and a way of deciding a constraint are no encoder's to meet.
+/// request's pixels. An encoder that states nothing meets no demand for a
+/// runtime, as every encoder does under an empty column. A column of
+/// another length than the encoders is declined for a request that reads
+/// it, and is not asked of one that reads none of it. A window and a way
+/// of deciding a constraint are no encoder's to meet.
 ///
 /// The classic router holds an encoder to the request's wire in its one
 /// test of an encoder
@@ -612,9 +614,15 @@ fn an_encoder_is_held_to_the_encode_sides_demand_by_what_it_states() {
     // No column: no encoder states a runtime, and a pushing encoder that
     // takes the media stands off the request's.
     assert_eq!(bed.stage(), "ec-compatible");
-    // The first states another runtime, and the second has no entry.
-    bed.stated = vec![on(8)];
+    // The first states another runtime, and the second states nothing.
+    bed.stated = vec![on(8), DemandFacts::default()];
     assert_eq!(bed.stage(), "ec-compatible");
+    // A column of another length than the encoders is its host's mistake,
+    // one entry short or one too many: the request is declined.
+    bed.stated = vec![on(7)];
+    assert_eq!(bed.stage(), "encode-column");
+    bed.stated = vec![on(7); 3];
+    assert_eq!(bed.stage(), "encode-column");
     // The second states the request's: the item goes there, past the idle
     // first.
     bed.stated = vec![on(8), on(7)];
@@ -628,9 +636,9 @@ fn an_encoder_is_held_to_the_encode_sides_demand_by_what_it_states() {
     };
     assert_eq!(bed.placed(), ((0, 0), vec![1], false));
     // A demand for vision is the test of the request's pixels, and reads
-    // no entry. The request holds no image and demands vision, and the
-    // idle encoder takes none.
-    bed.stated = Vec::new();
+    // no entry: a column of another length is not asked of it. The request
+    // holds no image and demands vision, and the idle encoder takes none.
+    bed.stated = vec![on(8)];
     bed.images = 0;
     bed.demands = Demands {
         vision: true,

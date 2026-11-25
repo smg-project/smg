@@ -162,9 +162,11 @@ impl EncodeLists<'_> {
     /// it is no member of its class, and what the encoders lack is named
     /// in the pass's order, a demand's part with the request's own facts
     /// ([`Engine::decide_encode_pair`](crate::engine::Engine::decide_encode_pair)).
-    /// So no encoder is shed under a demand's own stage. Every answer for
-    /// the encoders stands ahead of a side's: the pass says a side's stage
-    /// behind them, and no key is placed.
+    /// So no encoder is shed under a demand's own stage. Three answers for
+    /// the encoders stand ahead of a side's: a gap of their membership,
+    /// none open, a saturated fleet. The pass says a side's stage behind
+    /// them and ahead of the encoders' `places` answer, and no key is
+    /// placed.
     ///
     /// One side of the pair
     /// alone is no pair, and the engine says so behind the encoders: a

@@ -1030,9 +1030,12 @@ its class. So what the encoders lack is named in the pass's own order, as classi
 whether a request states a fact as a demand or as its own: an encoder that would take the
 request but for its images (`encode-vision`), a pushing encoder that takes the media
 (`ec-compatible`), the media (`encode-media`), the encoders (`encoders`). No encoder is shed
-under a demand's own stage, and every answer for the encoders stands ahead of a side's. A
+under a demand's own stage. Three answers for the encoders stand ahead of a side's stage: a gap
+of their membership, encoders none of which is open, and a saturated fleet. A
 host's places for the encoders stand beside a demand as beside none: the pass reads every
-encoder for what the model takes, and the places for what the request may reach.
+encoder for what the model takes, and the places for what the request may reach. The
+encoders' `places` answer waits behind a side's stage, as it waits behind a gap of the pair's
+membership.
 A request with items that demands vision or a way of processing its
 references leaves that part of the demand to its encoders. A decode asked again takes no items
 and would hold the decode to the whole demand, so the decode of such a request is not asked
