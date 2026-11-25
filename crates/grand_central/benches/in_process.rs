@@ -87,6 +87,8 @@ mod conversations;
 mod counting_alloc;
 #[path = "in_process/encode.rs"]
 mod encode;
+#[path = "in_process/indexed.rs"]
+mod indexed;
 #[path = "in_process/pair.rs"]
 mod pair;
 #[path = "in_process/place.rs"]
@@ -161,6 +163,11 @@ pub static MALLOC_CONF: &[u8; 100] =
     b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
 
 const MODEL: &str = "bench-model";
+
+/// The address of the list's worker at `at`.
+fn address(at: usize) -> String {
+    format!("http://worker-{at:04}:8000")
+}
 
 /// Decisions a caller makes untimed first: the buffers a thread keeps.
 const CALLER_WARM: u64 = 256;
@@ -245,6 +252,15 @@ const CELLS: &[Cell] = &[
     Cell {
         name: "cache_aware_one_prompt",
         document: || preset("cache_aware"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "cache_aware_indexed",
+        document: || preset("cache_aware"),
+        behind: indexed::keeps,
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        words: conversations::words,
         ..Cell::PLAIN
     },
     Cell {
@@ -980,7 +996,7 @@ fn main() {
         "--cold-kb: this cell's callers time their own turns"
     );
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
-        .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
+        .map(|at| ready_worker(&address(at), MODEL))
         .collect();
     lend(&workers);
     if run.overloaded {

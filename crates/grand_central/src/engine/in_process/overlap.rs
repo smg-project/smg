@@ -354,7 +354,10 @@ pub trait CacheIndexes: Send + Sync {
     /// The index of `model`, the model id its workers registered under.
     /// `None` where no worker of the model streams cache events, and while
     /// the index holds no block: a request is then decided by the host's
-    /// token tree, where it lends one ([`Self::token_tree`]).
+    /// token tree, where it lends one ([`Self::token_tree`]). An index
+    /// handed decides a single request of token ids alone where a prefix
+    /// stage of its profile reads cache events: no record of sent
+    /// prefixes is read or written for it.
     fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>>;
 
     /// The size of one cache block of `model` in tokens, as its workers'
@@ -940,7 +943,9 @@ struct Table {
     /// ([`Self::recorded`]), and its holders are named ahead of the
     /// index's. A single decision reads by this word. A pair's side reads
     /// by its own profile's, which its fill is handed ([`side_column`]),
-    /// whatever this word is.
+    /// whatever this word is. For a single decision's reader that reads
+    /// cache events too, the index decides a request of token ids alone
+    /// ([`Self::index_alone`]).
     ///
     /// [`Engine::pool_record_for`]: crate::engine::Engine::pool_record_for
     alone: bool,
@@ -1187,13 +1192,37 @@ impl Table {
     /// worker the index holds a block for is read and written as any other.
     /// So it is, on a request of either kind, for a reader that reads sent
     /// prefixes alone: no prefix stage of it reads what the index holds.
+    ///
+    /// To a reader that reads cache events too, the record speaks for no
+    /// worker of the list where the model's index decides a request hashed
+    /// by token blocks alone ([`Self::index_alone`]).
     fn recorded(&self, kind: HashKind, alone: bool, row: Option<u32>) -> bool {
         match (kind, row) {
             (HashKind::Text, _) => true,
             (HashKind::Token, _) if alone => true,
+            (HashKind::Token, _) if self.index_alone() => false,
             (HashKind::Token, Some(row)) => !is_set(&self.heard, row as usize),
             (HashKind::Token, None) => self.unheard_any,
         }
+    }
+
+    /// Whether the model's index of cache events decides a request hashed
+    /// by token blocks by itself, as the classic policy's event path does:
+    /// a single request, under a model whose index holds a block, for a
+    /// reader one of whose prefix stages reads cache events. The rule asks
+    /// it behind its answer to a reader that reads sent prefixes alone
+    /// ([`Self::recorded`]). The record of sent prefixes is then neither
+    /// read nor written, for a row the index speaks for or for any other:
+    /// a worker the index holds nothing for is named nothing. Each side of
+    /// a pair is decided at its own phase and keeps both.
+    ///
+    /// An index the table was handed holds a block: its host hands none
+    /// while the index holds none ([`CacheIndexes::index`]). The table
+    /// stands for a second, so the word is as old as the table.
+    fn index_alone(&self) -> bool {
+        // The index first: the rule asks this at every question, and a
+        // table that was handed none answers at one test.
+        self.index.is_some() && self.phase == Phase::Single
     }
 
     /// The row of the worker `id` where the record of sent prefixes speaks
@@ -1306,7 +1335,9 @@ impl Table {
     /// entries of the index's own. So no row is named twice. The index is
     /// asked for a request hashed by token blocks alone, the record for a
     /// request of either kind: a request hashed by its text is named its
-    /// holders by the record among every row ([`Self::recorded`]).
+    /// holders by the record among every row ([`Self::recorded`]). A single
+    /// request the model's index decides alone is named the index's
+    /// holders and no other ([`Self::index_alone`]).
     ///
     /// The warming rows are the table's whose naming has not ended at the
     /// request's instant: whole within the cap, a draw of the cap past it.
@@ -1607,7 +1638,9 @@ impl Table {
     /// the record for a request of either kind: for the rows the index does
     /// not speak for, and for every row where the request is hashed by its
     /// text or the column's reader reads sent prefixes alone (`alone`,
-    /// [`Self::recorded`]). An entry then holds both counts.
+    /// [`Self::recorded`]). An entry then holds both counts. The record is
+    /// asked for no row of a single request the model's index decides
+    /// alone ([`Self::index_alone`]).
     ///
     /// Returns what was read of the record, where it was read: the pick's
     /// write stands on it.
@@ -2544,9 +2577,10 @@ impl Table {
             return decision;
         };
         // The record takes an entry for the worker it speaks for on this
-        // request, by the word it was read by: on one hashed by token
-        // blocks, not for a worker the index holds a block for, unless the
-        // profile reads sent prefixes alone.
+        // request, by the word it was read by ([`Self::recorded`]). On one
+        // hashed by token blocks that is no worker where the index decides
+        // alone, and else no worker the index holds a block for, unless
+        // the profile reads sent prefixes alone.
         let (kind, alone) = (facts.hash_kind, read.alone);
         let sent = sent_target(&decision, sends_to);
         let Some(target) = sent.filter(|to| self.recorded(kind, alone, Some(to.position))) else {

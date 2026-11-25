@@ -736,7 +736,7 @@
           "const": "predictor"
         },
         {
-          "description": "Each worker by what it has: its cache events where it publishes\nthem, and the prefixes sent to it where it does not. A request\nhashed by its text reads the prefixes sent to every worker: cache\nevents are token blocks.",
+          "description": "Each worker by what it has: its cache events where it publishes\nthem, and the prefixes sent to it where it does not. A request\nhashed by its text reads the prefixes sent to every worker: cache\nevents are token blocks. A single request of token ids under a\nmodel whose index holds a block is read from the index alone.",
           "type": "string",
           "const": "merged"
         }
