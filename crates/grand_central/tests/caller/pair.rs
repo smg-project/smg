@@ -165,8 +165,10 @@ fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
         "nothing else is left: the one pair takes the retries"
     );
 
+    // A status that says the request was not served now: the prefill steps
+    // aside as a tried worker, where its own answer would state the rule.
     let failing = prefill(0);
-    let sends = move |worker: &dyn Worker| if worker.url() == failing { 500 } else { 200 };
+    let sends = move |worker: &dyn Worker| if worker.url() == failing { 502 } else { 200 };
     let (program, _loads, _task) =
         under_pairs(PolicySettings::RoundRobin, &self::fleet(2, 1), sends);
     let answers: Vec<Answer> = (0..2).map(|_| program.serve(&PLAIN)).collect();
@@ -254,72 +256,78 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
 /// keeps: a served pair is issued once, each side is dispatched before a
 /// send goes out, and each side's end is said as its worker answered. An
 /// attempt whose decode answers a server error ends so on that side, and
-/// its retry is a request of its own to the stages.
+/// its retry is a request of its own to the stages. A program that sends
+/// both sides at once says of no request that its decode is asked again,
+/// so the engine books both sides at the one call under either word of the
+/// document on when a pair's decode is picked.
 ///
 /// The classic router's engine arm says each side by that side's guard: its
 /// case `the_engine_hears_each_side_of_a_placed_pair_by_that_sides_guard`
 /// (`model_gateway/src/routers/common/placement.rs:9514-9549`).
 #[tokio::test(start_paused = true)]
 async fn the_engine_hears_both_sides_of_a_pair() {
-    let heard = Heard::default();
-    let kept = Arc::clone(&heard);
-    let mut stages = StageRegistry::builtin();
-    let added = stages.scorer("hears", move || Box::new(Hears(Arc::clone(&kept))));
-    added.expect("a free name");
-    let settings = pair_settings(PolicySettings::RoundRobin);
-    let document = settings.policy_document();
-    let mut document = document.expect("the settings have a document");
-    // One stage of the document hears: the decode side's profile names it.
-    let profile = document.profiles.get_mut("decode");
-    let profile = profile.expect("the decode side's profile");
-    profile.score.push(ScoreSpec::from("hears"));
-    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
-    let spec = spec.expect("the stages hold the scorer");
-    let fails = Arc::new(AtomicBool::new(false));
-    let (next, went) = (Arc::clone(&fails), Arc::clone(&heard));
-    let sends = move |worker: &dyn Worker| {
-        let mut words = went.lock().expect("no case panicked");
-        words.push("went out".to_owned());
-        let decode = *worker.worker_type() == WorkerType::Decode;
-        if decode && next.swap(false, Ordering::Relaxed) {
-            502
-        } else {
-            200
-        }
-    };
-    let (program, _loads, task) = started_as(Plan::Pair, spec, &fleet(2, 2), sends);
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the case holds the task's handle and ends the task"
-    )]
-    let task = tokio::spawn(task);
-    // The task's first step reads the registry whole.
-    sleep(Duration::from_millis(1)).await;
-    let told = taken(&heard);
-    assert_eq!(told.len(), 4, "each worker's join: {told:?}");
+    for when in [DecodePick::WithPrefill, DecodePick::AfterPrefill] {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let mut stages = StageRegistry::builtin();
+        let added = stages.scorer("hears", move || Box::new(Hears(Arc::clone(&kept))));
+        added.expect("a free name");
+        let settings = pair_settings(PolicySettings::RoundRobin);
+        let document = settings.policy_document();
+        let mut document = document.expect("the settings have a document");
+        document.plans.pd_pair.decode = when;
+        // One stage of the document hears: the decode side's profile names it.
+        let profile = document.profiles.get_mut("decode");
+        let profile = profile.expect("the decode side's profile");
+        profile.score.push(ScoreSpec::from("hears"));
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let spec = spec.expect("the stages hold the scorer");
+        let fails = Arc::new(AtomicBool::new(false));
+        let (next, went) = (Arc::clone(&fails), Arc::clone(&heard));
+        let sends = move |worker: &dyn Worker| {
+            let mut words = went.lock().expect("no case panicked");
+            words.push("went out".to_owned());
+            let decode = *worker.worker_type() == WorkerType::Decode;
+            if decode && next.swap(false, Ordering::Relaxed) {
+                502
+            } else {
+                200
+            }
+        };
+        let (program, _loads, task) = started_as(Plan::Pair, spec, &fleet(2, 2), sends);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the case holds the task's handle and ends the task"
+        )]
+        let task = tokio::spawn(task);
+        // The task's first step reads the registry whole.
+        sleep(Duration::from_millis(1)).await;
+        let told = taken(&heard);
+        assert_eq!(told.len(), 4, "each worker's join: {told:?}");
 
-    assert_eq!(program.serve(&PLAIN).status, 200);
-    let said = |decode: &'static str| {
-        [
-            "issued Prefill",
-            "issued Decode",
-            "dispatched Prefill",
-            "dispatched Decode",
-            "went out",
-            "completed Prefill 200 Ok",
-            "went out",
-            decode,
-        ]
-    };
-    let served = said("completed Decode 200 Ok");
-    assert_eq!(taken(&heard), served);
+        assert_eq!(program.serve(&PLAIN).status, 200);
+        let said = |decode: &'static str| {
+            [
+                "issued Prefill",
+                "issued Decode",
+                "dispatched Prefill",
+                "dispatched Decode",
+                "went out",
+                "completed Prefill 200 Ok",
+                "went out",
+                decode,
+            ]
+        };
+        let served = said("completed Decode 200 Ok");
+        assert_eq!(taken(&heard), served, "the decode picked {when:?}");
 
-    fails.store(true, Ordering::Relaxed);
-    let answer = program.serve(&PLAIN);
-    assert_eq!((answer.status, answer.sent.len()), (200, 4));
-    let failed = said("completed Decode 502 ServerError");
-    assert_eq!(taken(&heard), [failed, served].concat());
-    task.abort();
+        fails.store(true, Ordering::Relaxed);
+        let answer = program.serve(&PLAIN);
+        assert_eq!((answer.status, answer.sent.len()), (200, 4));
+        let failed = said("completed Decode 502 ServerError");
+        assert_eq!(taken(&heard), [failed, served].concat());
+        task.abort();
+    }
 }
 
 /// A worker that left takes no later request on its side, and one that
@@ -727,8 +735,10 @@ async fn the_engine_hears_a_decode_asked_again_at_its_ask_its_send_and_its_end()
             if prefill && stalled.swap(false, Ordering::Relaxed) {
                 one.set_status(WorkerStatus::NotReady);
             }
+            // A status that says the request was not served now: the one
+            // prefill takes the retry, where its own answer would end it.
             if prefill && next.swap(false, Ordering::Relaxed) {
-                500
+                502
             } else {
                 200
             }
@@ -803,14 +813,14 @@ async fn the_engine_hears_a_decode_asked_again_at_its_ask_its_send_and_its_end()
                 "issued Prefill",
                 "dispatched Prefill",
                 "went out",
-                "completed Prefill 500 ServerError",
+                "completed Prefill 502 ServerError",
             ],
             _ => &[
                 "issued Prefill",
                 "issued Decode",
                 "dispatched Prefill",
                 "went out",
-                "completed Prefill 500 ServerError",
+                "completed Prefill 502 ServerError",
                 "released Decode Abandoned",
             ],
         };

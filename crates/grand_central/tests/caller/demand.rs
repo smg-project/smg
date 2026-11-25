@@ -6,7 +6,8 @@
 //! since the request a route keeps for a retry was built for that wire, and
 //! the engine holds the retry to the workers that state the same number,
 //! ahead of every stage. A first attempt demands nothing. Each case serves
-//! requests over workers on two wires and reads where a retry was sent.
+//! requests over workers on more than one wire and reads where a retry was
+//! sent.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -32,18 +33,23 @@ use crate::{
 
 /// A wire: a runtime, and the transport a worker that runs it is dialed
 /// over.
-type Wire = (RuntimeType, ConnectionMode);
+pub(crate) type Wire = (RuntimeType, ConnectionMode);
 
 /// The wire of a worker that states no runtime, dialed over gRPC.
-const GRPC: Wire = (RuntimeType::Unspecified, ConnectionMode::Grpc);
+pub(crate) const GRPC: Wire = (RuntimeType::Unspecified, ConnectionMode::Grpc);
 
 /// The wire of a worker that states no runtime, dialed over HTTP: the wire
 /// of the other transport than [`GRPC`].
-const HTTP: Wire = (RuntimeType::Unspecified, ConnectionMode::Http);
+pub(crate) const HTTP: Wire = (RuntimeType::Unspecified, ConnectionMode::Http);
 
 /// The wire of a worker of another runtime than [`GRPC`], dialed over gRPC
 /// too.
 const OTHER: Wire = (RuntimeType::Generic, ConnectionMode::Grpc);
+
+/// The wire of a worker of [`OTHER`]'s runtime, dialed over HTTP. The two
+/// differ by their transport alone, under a runtime whose number, laid over
+/// a transport's, would hide which transport it is.
+const OTHER_HTTP: Wire = (RuntimeType::Generic, ConnectionMode::Http);
 
 /// A ready worker of `kind` that serves [`MODEL`] at `address`, on `wire`.
 fn dialed(address: &str, kind: WorkerType, wire: Wire) -> Arc<dyn Worker> {
@@ -61,7 +67,7 @@ fn dialed(address: &str, kind: WorkerType, wire: Wire) -> Arc<dyn Worker> {
 
 /// Single workers at [`url`]`(0)` and on, each on the wire `wires` names at
 /// its place.
-fn singles(wires: &[Wire]) -> Vec<Arc<dyn Worker>> {
+pub(crate) fn singles(wires: &[Wire]) -> Vec<Arc<dyn Worker>> {
     let at_place = wires.iter().enumerate();
     let single = |(at, wire): (usize, &Wire)| dialed(&url(at), WorkerType::Regular, *wire);
     at_place.map(single).collect()
@@ -81,6 +87,8 @@ fn failing_at(failing: String) -> impl Fn(&dyn Worker) -> u16 + Send + Sync + 's
 /// no failure go to the workers of both wires. It holds for the wire that
 /// stands first in the worker crate's lists too, a worker over HTTP that
 /// states no runtime: its number is not zero, which would state no wire.
+/// And it holds for two transports of one runtime ([`OTHER_HTTP`]): a
+/// wire's number keeps its runtime and its transport in bits of their own.
 ///
 /// The gateway states a wire's number of each worker and of a retry pinned
 /// to its plan's wire (`stated_facts` and the request's demand,
@@ -89,7 +97,12 @@ fn failing_at(failing: String) -> impl Fn(&dyn Worker) -> u16 + Send + Sync + 's
 /// (`model_gateway/src/routers/common/placement.rs:7809-7851`).
 #[test]
 fn a_retry_stays_on_the_wire_of_its_first_worker() {
-    for (wire, another) in [(GRPC, HTTP), (GRPC, OTHER), (HTTP, GRPC)] {
+    for (wire, another) in [
+        (GRPC, HTTP),
+        (GRPC, OTHER),
+        (HTTP, GRPC),
+        (OTHER, OTHER_HTTP),
+    ] {
         let fleet = singles(&[wire, another, wire]);
         let sends = failing_at(url(0));
         let (program, _loads, _task) = under(PolicySettings::RoundRobin, &fleet, sends);
@@ -176,9 +189,11 @@ fn a_wire_with_no_worker_left_leaves_the_retry_no_endpoint() {
 
 /// A pair's retry holds both sides to its wire, the wire of its first
 /// attempt's prefill. Two prefills over gRPC, the first of which fails, and
-/// two decodes: one over gRPC, one over HTTP. A first attempt takes either
-/// decode. Each retry goes to the second prefill and to the decode over
-/// gRPC, and never to the one over HTTP.
+/// two decodes: one over HTTP, one over gRPC. A first attempt takes either
+/// decode, and a request meets the failing prefill beside the decode over
+/// HTTP: the wire it keeps is its prefill's, and not that decode's. Each
+/// retry goes to the second prefill and to the decode over gRPC, and never
+/// to the one over HTTP.
 ///
 /// The gateway holds a pinned pair's two sides to the retained wire: its
 /// case `a_pinned_pair_keeps_the_retained_runtime_and_transport`
@@ -188,8 +203,8 @@ fn a_pairs_retry_holds_both_sides_to_its_wire() {
     let fleet = [
         dialed(&prefill(0), WorkerType::Prefill, GRPC),
         dialed(&prefill(1), WorkerType::Prefill, GRPC),
-        dialed(&decode(0), WorkerType::Decode, GRPC),
-        dialed(&decode(1), WorkerType::Decode, HTTP),
+        dialed(&decode(0), WorkerType::Decode, HTTP),
+        dialed(&decode(1), WorkerType::Decode, GRPC),
     ];
     let sends = failing_at(prefill(0));
     let (program, _loads, _task) = under_pairs(PolicySettings::RoundRobin, &fleet, sends);
@@ -198,15 +213,17 @@ fn a_pairs_retry_holds_both_sides_to_its_wire() {
     let mut met = 0;
     for answer in &answers {
         if answer.sent[0] == prefill(0) {
-            assert_eq!(answer.sent[2..], [prefill(1), decode(0)], "{answers:?}");
+            assert_eq!(answer.sent[2..], [prefill(1), decode(1)], "{answers:?}");
             met += 1;
         } else {
             assert_eq!(answer.sent.len(), 2, "{answers:?}");
         }
     }
     assert!(met > 0, "no request met the failing prefill: {answers:?}");
-    let over_http = |answer: &Answer| answer.sent[1] == decode(1);
-    assert!(answers.iter().any(over_http), "{answers:?}");
+    // The wire kept is the prefill's: a first attempt failed at its prefill
+    // beside the decode over HTTP, and its retry stayed on gRPC.
+    let beside_http = |answer: &Answer| answer.sent[..2] == [prefill(0), decode(0)];
+    assert!(answers.iter().any(beside_http), "{answers:?}");
 }
 
 /// A pair's retry in turn holds its second ask to its wire too. One

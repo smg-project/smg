@@ -4,8 +4,9 @@
 //! ([`Ring`]) and lends it with every request. Under `consistent_hashing` a
 //! request's routing key then goes to the worker that ring's walk reaches
 //! from where the key stands. Each case reads the ring the program holds.
-//! All but one expect the sends its walk says, and that one holds the
-//! ring's two walks to one order.
+//! All but two expect the sends its walk says: one holds the ring's two
+//! walks to one order, and one holds the ring to the order of its workers'
+//! places.
 //!
 //! [`Ring`]: crate::ring::Ring
 
@@ -240,7 +241,7 @@ fn a_pairs_two_sides_are_walked_on_the_one_ring() {
 /// The gateway states a pair's second ask by the request maker of its
 /// first, which lends the model's ring (`with_pair_request`,
 /// `model_gateway/src/routers/common/placement.rs:2507-2560`, the ring at
-/// `:2556`, the second ask at `:1011-1027`).
+/// `:2556`, the second ask at `:1012-1028`).
 #[test]
 fn a_decode_asked_again_is_walked_on_the_ring_its_second_ask_lends() {
     let fleet = pair::fleet(1, 3);
