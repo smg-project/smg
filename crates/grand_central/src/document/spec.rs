@@ -3579,8 +3579,11 @@ fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
 
 /// The gates a profile's affinity stages share: the spill gate of its
 /// `prefix-affinity` entry, the fleet gate of its `kv-pressure` entry and
-/// the view's block size. Of two entries of a kind the last one's stands
-/// here; a `prefix-affinity` scorer spills by its own entry's gate.
+/// the view's block size. Of two entries of a kind that write parameters
+/// the last one's stand here, and the defaults where none does; a
+/// `prefix-affinity` scorer spills by its own entry's gate. A
+/// `warmup-slice` follows this spill gate by its `rel` and `abs`, so beside
+/// one `check_profile` refuses `prefix-affinity` entries that write two.
 fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
     let mut affinity = None;
     let mut kv = None;
@@ -4294,6 +4297,9 @@ fn check_profile(
     let mut complete = true;
     let mut plain_ring = false;
     let mut kv_gate = None;
+    let mut spill_gate = None;
+    let mut other_spill = None;
+    let mut sliced = false;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
         let stage = match scored(entry, name, &entry_at, from, settings, &mut sent)? {
@@ -4324,6 +4330,28 @@ fn check_profile(
                     ));
                 }
             }
+        }
+        // A `prefix-affinity` scorer spills by its own gate; a warm-up slice
+        // asks the shared one with no held tokens: its `rel` and `abs` alone.
+        match &stage {
+            ScoreStage::PrefixAffinity(params) if other_spill.is_none() => {
+                let own = Gates::of(Some(params), None, None);
+                let first = *spill_gate.get_or_insert(own);
+                if own.rel != first.rel || own.abs != first.abs {
+                    other_spill = Some((i, own, first));
+                }
+            }
+            ScoreStage::WarmupSlice(_) => sliced = true,
+            _ => {}
+        }
+        if let Some((entry, own, first)) = other_spill.take_if(|_| sliced) {
+            let spill_at = At::new(format!("{}.score[{entry}].prefix-affinity.spill", at.0));
+            let reason = "the limit the profile's first prefix-affinity entry writes: a warmup-slice follows one spill gate, so beside one the entries write the same rel and abs";
+            return Err(if own.rel == first.rel {
+                spill_at.bad("abs", own.abs, reason)
+            } else {
+                spill_at.bad("rel", own.rel, reason)
+            });
         }
         check_prefix_depth(&stage, gates, view, &stage_at)?;
         let count = || profile_sent(&mut sent, name, settings);
@@ -10396,6 +10424,55 @@ mod tests {
         spec.validate().expect("one profile binds to everything");
         let text = serde_json::to_string(&spec).expect("serializes");
         assert!(!text.contains("kind"), "{text}");
+    }
+
+    /// A warm-up slice follows the profile's one spill gate. Beside a slice
+    /// a `prefix-affinity` entry that writes another `rel` or `abs` than the
+    /// profile's first is refused by that limit, wherever the slice stands,
+    /// and a bare name writes the defaults. Entries of one gate load, and
+    /// so do two gates with no slice: each scorer spills by its own.
+    #[test]
+    fn a_warmup_slice_beside_two_spill_gates_is_refused() {
+        let refused = |score: &str| match spec_with_score(score).validate() {
+            Err(SpecError::BadField { path, .. }) => path,
+            Err(other) => panic!("{score}: {other:?}"),
+            Ok(_) => panic!("{score}: the document loads"),
+        };
+        let (wide, tight) = (
+            r#"{"prefix-affinity":{"spill":{"rel":4.0}}}"#,
+            r#"{"prefix-affinity":{"spill":{"rel":1.0}}}"#,
+        );
+        for (score, path) in [
+            (
+                format!(r#"{wide},{tight},"warmup-slice""#),
+                "profiles.p.score[1].prefix-affinity.spill.rel",
+            ),
+            (
+                format!(r#"{tight},"warmup-slice",{wide}"#),
+                "profiles.p.score[2].prefix-affinity.spill.rel",
+            ),
+            (
+                format!(r#""warmup-slice",{wide},"prefix-affinity""#),
+                "profiles.p.score[2].prefix-affinity.spill.rel",
+            ),
+            (
+                r#"{"prefix-affinity":{"spill":{"abs":8}}},"prefix-affinity","warmup-slice""#
+                    .to_owned(),
+                "profiles.p.score[1].prefix-affinity.spill.abs",
+            ),
+        ] {
+            assert_eq!(refused(&score), path, "{score}");
+        }
+        for loads in [
+            format!("{wide},{tight}"),
+            format!(r#"{wide},{wide},"warmup-slice""#),
+            r#"{"prefix-affinity":{"spill":{"rel":1.5,"abs":64}}},"prefix-affinity","warmup-slice""#
+                .to_owned(),
+            r#"{"prefix-affinity":{"spill":{"prefix_margin_tokens":512}}},"prefix-affinity","warmup-slice""#
+                .to_owned(),
+        ] {
+            assert!(spec_with_score(&loads).validate().is_ok(), "{loads}");
+        }
     }
 
     /// The spill parameters of a prefix-affinity entry reach the gates the
