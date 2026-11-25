@@ -1856,13 +1856,34 @@ a decode once, with its prefill: a decode asked again behind the prefill is refu
 never stood chosen (`DecodeRefused::NotChosen`). Classic's side of every clause is `pair_pass`,
 and the cases name its lines (`place/tests/pair/named.rs`).
 
-Two things differ from classic there, by rule. **[planned]** A pair whose decode side alone is
-the plain hash ring is read for no target yet: its prefill is its profile's pick, known inside
-the decision alone, and classic counts the decode's number behind that pick (its case
+**[built]** Where the decode's side alone is the plain hash ring, the prefill is its own
+profile's pick, known inside a decision alone, and classic counts the decode's number behind
+that pick (`pair_pass`; its case
 `an_explicit_target_under_consistent_hashing_keeps_its_full_decode_partner` in `placement.rs`).
-**[planned]** The engine reads no encode request's header for a target yet. One limit is a
-supplied policy spec's own: a pair's target source holds a side only where that side's profile is
-the plain hash ring, because the spec has no word for a side.
+The call lends the places of the decodes that can be sent to, counted as a pair named on both
+sides counts them (a hard demand a decode is held to, a place its host masks), and states the
+number to each of its decisions (`Constraints::target_worker`). A decision counts it among the
+partners at those places of the prefill it picks, its first partners where the pair is made
+among those, and its decode side keeps that one decode through every pass. It books that decode
+with its prefill under every document, as a pair held on both sides does. A number that reaches
+no partner sheds the pair under `target-worker`, and so does a decode the decision cannot name:
+the partners of no other prefill are asked, as classic refuses there. The pair's default for a
+pool its vetoes refuse reads no number, as classic's reads no header, and a decode pool all over
+its thresholds states none. The call states none either where no prefill opens the pair: none
+that can be sent to, read as a pair named on both sides reads its prefills, has a partner among
+the decodes counted. Classic reads no header there: it answers as for a pair that names no
+worker, and pairs by load a pool whose every worker is vetoed (`relaxed_pair`). So does the
+engine, whose default pairs over the caller's own places. A prefill over its thresholds alone
+opens the pair too where its profile weighs load itself and its binding steers, as classic
+lifts the veto for such a policy with its shedding off. A decision that states a number beside
+no places of its decode side is declined under `target-worker`, and so is an encode request's
+that states one. **[planned]** A controller reads a pair's frame for no number (section 10.1):
+its served decision states none.
+
+One thing differs from classic there, by rule. **[planned]** The engine reads no encode
+request's header for a target yet. One limit is a supplied policy spec's own: a pair's target
+source holds a side only where that side's profile is the plain hash ring, because the spec has
+no word for a side.
 
 An encode request is placed over its three lists as a pair is over its two, each decision given the whole budget. Where it carries items its call makes three decisions at most, and the later ones are held to the workers the rule takes on each of its pair's two lists, as a pair's are: behind the first decision none of whose targets holds or whose encoder cannot be sent to, and behind a first decision that sheds the request as saturated over a list of its pair. The rule is asked of no encoder, and the encoders' list is decided as its caller lent it: a shed made over the encoders stands, by the decision's own word of it, and no rule is asked behind it. One
 decision names its pair and each item's encoder, and the pair's targets are tried as a pair's
@@ -2632,7 +2653,7 @@ classic code gave. A *recorder* is an ignored test beside classic's own code tha
 writes the sheet. The sheets are in `crates/grand_central/tests/classic/sheets/`. A crate
 test replays each line through the crate and compares.
 
-On main: 19 sheets, 489 lines.
+On main: 20 sheets, 512 lines.
 
 | | Sheets | Lines |
 |---|---|---|
@@ -2808,7 +2829,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
-| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded, the 10 also over the classes a controller's pairing rule derives |
+| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded, the 10 also over the classes a controller's pairing rule derives; the 23 lines of a pair that names its worker (`pair_named`) replay through the engine's one call for a host in process |
 | Encode-prefill-decode on that engine | **[partly]** | `InProcess::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images, or where it carries items and demands vision or a way of processing its references: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most, and the later decisions of a single request, of a pair and of an encode request held to the workers the route's rule takes; an encode request's header for a target is not read |

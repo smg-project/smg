@@ -1645,6 +1645,37 @@ pub struct Constraints<'a> {
     /// workers is soft, so the answer is the one a list of those workers
     /// alone gives. In-process only.
     pub places: Option<&'a [u32]>,
+    /// The number a pair's request names its decode by, where the prefill
+    /// is the decision's own pick: the number its header states, counted
+    /// from 0. It counts, in the decode list's order, the rows the decode
+    /// side's set opens with for the prefill a decision chose: the side's
+    /// places ([`Self::places`]) whose class that prefill's class pairs
+    /// with, its first partners alone while one is open
+    /// ([`FirstPartners`](crate::engine::framework::FirstPartners)). The
+    /// decode side keeps the row the number reaches and no other, in every
+    /// pass of its run and of the all-vetoed rule. Where the number reaches
+    /// no row the pair's decision is shed under `target-worker`, and asks
+    /// the partners of no other prefill.
+    ///
+    /// It is the count the gateway's own pair selection makes only where
+    /// the host states, as the decode side's places, the decodes that
+    /// selection counts: the ones the request can be sent to. So a number
+    /// stands beside places: a pair's decision that states one beside none
+    /// is declined under `target-worker`, and so is an encode request's
+    /// that states one at all. And the host states a number only where a
+    /// prefill the request can be sent to pairs with one of those decodes:
+    /// where none does, that selection reads no header and answers as for
+    /// a pair that names no worker.
+    ///
+    /// No other set reads it: a single request's decision, a pair's
+    /// prefill side and the pair's default for a pool its vetoes refuse
+    /// answer as they do with none. That default pairs among the decode
+    /// side's places as they are stated, so under a number it sees the
+    /// lent decodes alone: a host that states a number as above meets it
+    /// only where the fleet changes between its read and the decision's.
+    /// `None`: the request names no decode so. In-process only: a
+    /// controller's served decision reads a pair's frame for no number.
+    pub target_worker: Option<u32>,
 }
 
 impl Constraints<'_> {

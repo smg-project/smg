@@ -57,6 +57,10 @@
 //! runtime's request, where the workers of one known runtime stand beside
 //! workers of another or of none. Its sheet is its own too, and its replay
 //! the pair-select module's, answer for answer.
+//! A pair-named row is a pair-select row whose requests name their worker
+//! under `x-smg-target-worker`. Its sheet is its own, and so is its
+//! replay: through the engine's one call for a host in process, answer
+//! for answer.
 //! No row is decided differently but where its module names it. The prefix
 //! hash module holds a recorded row that a key of whole blocks cannot
 //! decide as recorded to the outcome its entry gives. The sticky rank
@@ -97,6 +101,7 @@ mod classic {
     pub mod overload;
     pub mod pair_bound;
     pub mod pair_index;
+    pub mod pair_named;
     pub mod pair_runtime;
     pub mod pair_select;
     pub mod power_of_two;
@@ -297,7 +302,10 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// A pair-bound row and a pair-runtime row have the pair-select row's
 /// shape: each module names its own sheet and replays it by the pair-select
 /// module's replay, and holds a copied row whole.
-const MODULES: [Module; 18] = [
+/// A pair-named row has that shape and two words more: its module brings
+/// its own replay, through the engine's one call, and holds a copied row
+/// whole.
+const MODULES: [Module; 19] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -343,6 +351,12 @@ const MODULES: [Module; 18] = [
         inline: classic::pair_index::INLINE,
         replay: classic::pair_index::replay_rows,
         copied: classic::pair_index::copied_row_defects,
+    },
+    Module {
+        policy: classic::pair_named::POLICY,
+        inline: classic::pair_named::INLINE,
+        replay: classic::pair_named::replay_rows,
+        copied: whole_row_defects,
     },
     Module {
         policy: classic::pair_runtime::POLICY,
@@ -1301,6 +1315,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "overload.json",
             "pair-bound.json",
             "pair-index.json",
+            "pair-named.json",
             "pair-runtime.json",
             "pair-select.json",
             "power_of_two.json",

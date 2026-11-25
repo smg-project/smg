@@ -20,7 +20,7 @@ use crate::{
     engine::{
         decision::{
             Decision, LiftedVeto, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets,
-            Trace, MAX_TARGETS, TRACE_TOP,
+            Trace, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
         },
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
@@ -1890,7 +1890,11 @@ fn only(classes: &[u32]) -> Option<u32> {
 ///
 /// A set opens with the places the request is held to, where its host holds
 /// it to any, and with no other row ([`places`]): what a class or a filter
-/// then keeps is among them, under any profile.
+/// then keeps is among them, under any profile. A pair's decode side that
+/// states a number beside its places opens with the one row the number
+/// reaches among those its classes keep
+/// ([`Constraints::target_worker`]), here and so in every pass that asks
+/// this half again: `target-worker` where it reaches none.
 ///
 /// A pool a hard filter empties is put to the set's all-vetoed rule before
 /// its stage is returned ([`vetoed::emptied`]). Where the rule steers, the
@@ -1921,6 +1925,14 @@ fn filter(
             kept.retain(|&i| classed(classes, candidates[i as usize].pair_class));
             if kept.is_empty() {
                 return Some("partners");
+            }
+            // The decode a pair's request names: the row its number reaches
+            // among these, and the side's one row. A number past them
+            // leaves no row, and none for the all-vetoed rule to steer to.
+            if let Some(number) = cx.target_worker {
+                if !named_row(kept, number) {
+                    return Some(TARGET_WORKER);
+                }
             }
         }
         Some(classes) => {
@@ -4835,6 +4847,58 @@ fn carries_a_column(facts: &RequestFacts<'_>) -> bool {
     !facts.affinity.is_empty() || facts.named.is_some()
 }
 
+/// The one row `number` reaches among `kept`, left as the set's one row:
+/// `false`, and no row, where it reaches none. Cold and out of line: a
+/// side that states no number runs one test of the word.
+#[cold]
+#[inline(never)]
+fn named_row(kept: &mut Vec<u32>, number: u32) -> bool {
+    let named = kept.get(number as usize).copied();
+    kept.clear();
+    kept.extend(named);
+    named.is_some()
+}
+
+/// Whether a pair's decode side states a number beside no places
+/// ([`Constraints::target_worker`]): the number counts the places a host
+/// states, so such a decision is declined under `target-worker`.
+const fn counts_no_place(decode_cx: &Constraints<'_>) -> bool {
+    decode_cx.target_worker.is_some() && decode_cx.places.is_none()
+}
+
+/// The decline of a decision whose decode side states a number beside no
+/// places ([`counts_no_place`]), under `profile`. The decode's entry
+/// names the profile it resolved. The pair's entry declines ahead of its
+/// binding's lookup and names none: it hands on the profile of its bare
+/// trace ([`Trace::profile`]). Cold and out of line, as
+/// [`rows_not_written`] is: an entry's path past the refusal keeps its
+/// weight.
+#[cold]
+#[inline(never)]
+fn number_not_counted(bare: Trace, profile: u16) -> Decision {
+    let trace = Trace { profile, ..bare };
+    shed(ShedReason::PolicyDeclined, TARGET_WORKER, trace)
+}
+
+/// What a pair answers where its request names its decode by a number
+/// ([`Constraints::target_worker`]) and the decode side's run named no
+/// worker. Its shed for want of that worker, with no endpoint or for a
+/// worker over its thresholds, takes the target's name: the request has
+/// the one decode. Any other answer stands as it is. Cold and out of
+/// line: a decode side that picks runs none of it.
+#[cold]
+#[inline(never)]
+fn target_missed(decision: Decision) -> Decision {
+    match decision {
+        Decision::Shed(Shed {
+            reason: ShedReason::NoEndpoints | ShedReason::Saturated,
+            trace,
+            ..
+        }) => shed(ShedReason::NoEndpoints, TARGET_WORKER, trace),
+        other => other,
+    }
+}
+
 /// The stage a decision names when a profile that shows its rows to a
 /// plugin was handed rows that carry a mask beside them.
 const WRITTEN_ROWS: &str = "written-rows";
@@ -5699,6 +5763,20 @@ impl Engine {
     pub(crate) fn steers_all_vetoed(&self, model: &str) -> bool {
         let entry = self.resolve(model, Phase::Prefill);
         entry.is_some_and(|(entry, _, _)| entry.vetoed == AllVetoed::Steer)
+    }
+
+    /// Whether the prefill profile of `model`'s pair places among the
+    /// prefills over their thresholds too: its binding steers a pool the
+    /// overload veto empties, and the profile weighs load against affinity
+    /// by a gate of its own ([`Self::weighing_lift`]). `false` where the
+    /// model's prefill resolves to no binding. One lookup of the binding,
+    /// asked by the call of a pair that names its decode alone where no
+    /// available prefill has a partner to count.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn lifts_prefills(&self, model: &str) -> bool {
+        let entry = self.resolve(model, Phase::Prefill);
+        entry
+            .is_some_and(|(entry, index, _)| entry.vetoed == AllVetoed::Steer && self.weighs(index))
     }
 
     /// [`Self::states_head_places`] by the two profiles of
@@ -7737,7 +7815,7 @@ impl Engine {
     /// side's verdict, and its first target's pair the decode side's
     /// ([`Pair::decode_verdict`](super::decision::Pair::decode_verdict)).
     /// A claim of the prefill side names the prefill the pair formed on,
-    /// before any dispatch, and a decision that forms no pair leaves none.
+    /// before any dispatch, and a decision that sheds leaves none.
     /// A prefill side's pin at the cap moves to that prefill where the
     /// pair forms, and a decision that forms no pair moves none.
     ///
@@ -7784,6 +7862,20 @@ impl Engine {
     /// (`model_gateway/src/routers/common/placement.rs:2479-2502`,
     /// `:2532-2545`, `:2615-2618`, and its default at `:1804-1813`, on main
     /// `30f636706`).
+    ///
+    /// Where the decode side states a number
+    /// ([`Constraints::target_worker`] of `decode_cx`), the pair's decode
+    /// is the one that number reaches among the partners of the prefill
+    /// chosen, at the decode side's places: its first partners where the
+    /// pair is made among those. Where the number reaches none, or the
+    /// decode it reaches is shed for want of an endpoint or as over its
+    /// thresholds, the pair is shed under `target-worker` and the partners
+    /// of no other prefill are asked. The pair's default reads no number.
+    /// A number beside no places of the decode side is declined under that
+    /// name. The gateway's own pair selection counts the open partners of
+    /// its one pick so, and reads no header for its default
+    /// (`model_gateway/src/routers/common/placement.rs:2884-2887`,
+    /// `:2914-2920`, `:2729-2747`, on main `4b41f39a7`).
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -7803,6 +7895,9 @@ impl Engine {
         // dropped in silence and both sides scored as if nothing were held.
         if carries_a_column(facts) {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
+        }
+        if counts_no_place(decode_cx) {
+            return number_not_counted(bare, bare.profile);
         }
         // Each side's stages read their own pool and its own column.
         let (Some((prefills, prefill_facts)), Some((decodes, decode_facts))) = (
@@ -8245,7 +8340,17 @@ impl Engine {
                     }
                     return decision;
                 }
-                Decision::Shed(shed) => last_shed = Some(*shed),
+                Decision::Shed(shed) => {
+                    last_shed = Some(*shed);
+                    // The decode a request names is counted behind the one
+                    // prefill: where it is shed, no other prefill's
+                    // partners are asked.
+                    if decode_cx.target_worker.is_some() {
+                        break;
+                    }
+                }
+                // A queue returns with the prefill side's claim standing.
+                // No stage issues one today.
                 Decision::Queue(_) => return decision,
             }
         }
@@ -8256,6 +8361,9 @@ impl Engine {
             self.sessions.move_claim(key, claimed, WorkerId(0));
         }
         match last_shed {
+            // The shed of the one decode a request names takes the
+            // target's name.
+            Some(last) if decode_cx.target_worker.is_some() => target_missed(Decision::Shed(last)),
             Some(last) => Decision::Shed(last),
             None => shed(ShedReason::NoEndpoints, "partners", prefill_pick.trace),
         }
@@ -8568,6 +8676,13 @@ impl Engine {
     /// Where a filter refuses that decode, or none of the partners is that
     /// worker, the picker picks among the decodes the filters keep. So it
     /// does under every other profile, and for a caller that hands none.
+    ///
+    /// A number `decode_cx` states ([`Constraints::target_worker`]) is
+    /// counted among those partners at the decode side's places, as a
+    /// pair's first decision counts it ([`Self::decide_pair`]): the call
+    /// answers the decode it reaches, is shed under `target-worker` where
+    /// that decode cannot be named, and is declined under that name where
+    /// the number stands beside no places.
     #[expect(
         clippy::too_many_arguments,
         reason = "the request and the pair's pools, beside the pair the call is held by"
@@ -8614,6 +8729,9 @@ impl Engine {
         let shown = self.marks[usize::from(index)].scoped();
         if shown && !decode_cx.stalled.is_empty() {
             return rows_not_written(bare, index);
+        }
+        if counts_no_place(decode_cx) {
+            return number_not_counted(bare, index);
         }
         // This call has one draw sequence, seeded by its own request.
         decode_facts.seed = facts.seed;
@@ -8692,6 +8810,8 @@ impl Engine {
         if let Decision::Pick(pick) = &mut decision {
             let decode = std::mem::take(&mut pick.session_verdict);
             pick.targets.pair_under(&target_of(prefill), decode);
+        } else if decode_cx.target_worker.is_some() {
+            return target_missed(decision);
         }
         decision
     }
@@ -16707,7 +16827,8 @@ mod tests {
     /// nothing.
     ///
     /// The classic manual policy keeps one key's entry apart under each
-    /// role of a pair (`model_gateway/src/policies/manual.rs:345-352`).
+    /// role of a pair (`select_worker_impl` in
+    /// `model_gateway/src/policies/manual.rs`).
     #[test]
     fn each_side_of_a_pair_follows_its_keys_pin_by_its_own_session() {
         let engine = pair_session_engine(vec![least_requests_profile()], Assignment::Delegate);
@@ -16772,9 +16893,9 @@ mod tests {
     /// a side takes the fewest in flight too.
     ///
     /// The classic manual policy places a request with no key by its
-    /// assignment under any role
-    /// (`model_gateway/src/policies/manual.rs:357-360`), and a new key the
-    /// same way (`:317`).
+    /// assignment under any role (`select_worker_impl` in
+    /// `model_gateway/src/policies/manual.rs`), and a new key the same way
+    /// (`select_by_routing_id`).
     #[test]
     fn a_manual_side_of_a_pair_is_placed_by_the_rules_assignment() {
         let engine = pair_session_engine(vec![manual_profile()], Assignment::MinLoad);
@@ -16887,7 +17008,8 @@ mod tests {
     /// known runtime alone (the candidates of `pair_pass` in
     /// `model_gateway/src/routers/common/placement.rs`), and the classic
     /// manual policy selects anew for a key whose workers are not among
-    /// those it is handed (`model_gateway/src/policies/manual.rs:303-308`).
+    /// those it is handed (`select_by_routing_id` in
+    /// `model_gateway/src/policies/manual.rs`).
     #[test]
     fn a_rule_places_a_pairs_prefill_among_first_partners_then_over_every_partner() {
         let engine = pair_session_engine(vec![least_requests_profile()], Assignment::Delegate);
@@ -17219,6 +17341,41 @@ mod tests {
         }));
         assert!(told.is_err(), "the stage unwound");
         assert_eq!(pins(), [none; 2]);
+    }
+
+    /// A pair whose request names its decode is made behind one prefill
+    /// and no other. Where the decode its number reaches cannot be named,
+    /// the pair is shed under `target-worker` and leaves no claim: the
+    /// claim the prefill side's run made is withdrawn, as for any pair
+    /// that formed none, and the key holds no pin.
+    #[test]
+    fn a_pair_whose_named_decode_is_shed_withdraws_the_claim_too() {
+        let sides = two_sides(&[0, 5], &[0, 0]);
+        let profiles = vec![least_requests_profile(), least_requests_profile()];
+        let engine = pair_session_engine(profiles, Assignment::Delegate);
+        let keyed = pair_request(Some(7));
+        let [prefill_session, _] = side_sessions(&keyed);
+        let pools = PairPools {
+            prefills: &sides[0],
+            decodes: &sides[1],
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        // Two decodes stand at the places, and the number asks a third.
+        let places = [0, 1];
+        let decode_cx = Constraints {
+            places: Some(&places[..]),
+            target_worker: Some(2),
+            ..Constraints::default()
+        };
+        let mut scratch = Scratch::new();
+        let missed = engine.decide_pair(&keyed, &pool, pools, &cx, &decode_cx, &mut scratch);
+        assert!(
+            matches!(&missed, Decision::Shed(shed) if shed.emptied_by == TARGET_WORKER),
+            "{missed:?}"
+        );
+        let none = Some([WorkerId(0); 2]);
+        assert_eq!(engine.sessions.pins(prefill_session), none);
     }
 
     /// [`pair_session_engine`] under the rule's cap of two, where the

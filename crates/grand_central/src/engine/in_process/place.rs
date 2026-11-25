@@ -41,8 +41,9 @@
 //! A single request that names its worker, under a document whose binding
 //! says which header names it, is held to that one worker and goes to no
 //! other ([`target`]). A pair that names its worker is held so on each
-//! side whose profile is the hash ring keyed by no prefix, its prefill's
-//! first.
+//! side whose profile is the hash ring keyed by no prefix. Where its
+//! prefill's is another, each decision counts the decode's number behind
+//! the prefill it picks.
 //!
 //! A request with a pair's two lists is placed a target at a time over both
 //! its workers ([`pair`]). Its later decisions are held to the workers the
@@ -324,8 +325,8 @@ pub struct PlaceRequest<'a> {
     /// that demands vision or a way of processing its references
     /// ([`Self::demands`]): its encoders meet that part of the demand, and
     /// a decode asked again would hold the decode to it. So does a pair
-    /// held to the two workers its request names: a decode asked again
-    /// would be picked by the pair's routing value.
+    /// that names its decode, on both sides or on the decode's alone: a
+    /// decode asked again would be picked by the pair's routing value.
     pub decode_again: bool,
     /// Whether the caller counts this request on the decode its first
     /// decision named while it asks that decode again: one of that
@@ -393,7 +394,8 @@ pub struct PlaceRequest<'a> {
     /// decision too, of each available worker the request's number counts.
     /// For a pair that names its worker it is asked there of each available
     /// worker of the two lists its number counts, at the places the caller
-    /// states for each and does not mask.
+    /// states for each and does not mask: of the decodes alone where the
+    /// decode's side alone reads the name.
     ///
     /// Where a pair's decode is decided again on its decode side
     /// ([`PlacementSide::decode_again`](crate::tracking::PlacementSide::decode_again)),
@@ -529,6 +531,11 @@ pub(super) struct Made<'r, 'a> {
     /// ([`RequestMaker::prompt_chars`]). A call says it ([`Made::asked`]).
     /// False outside one: the decode entry leases no plain pick.
     sized: bool,
+    /// The number a pair's request names its decode by, where the decision
+    /// counts it behind the prefill it picks ([`Call::named_decode`]): the
+    /// request made states it ([`Constraints::target_worker`]). `None` for
+    /// every other request.
+    named_decode: Option<u32>,
 }
 
 /// What a call's maker answered on a decision's targets where the decision
@@ -616,6 +623,7 @@ impl<'r, 'a> Made<'r, 'a> {
             encoders: RefCell::new(Answered(Vec::new())),
             decode_alone: false,
             sized: false,
+            named_decode: None,
         }
     }
 
@@ -905,12 +913,15 @@ impl RequestMaker for Made<'_, '_> {
         // again reads no image fact. Nor does one that leaves a part of
         // its hard demand to its encoders: a decode asked again takes no
         // items and would hold the decode to the whole. A pair held to the
-        // two workers it names states none: a decode asked again would be
-        // picked by the pair's routing value. The holds are read last, so a
-        // request that asks no decode again reads none of them.
+        // two workers it names states none, and neither does one whose
+        // decision counts the number its decode is named by: a decode asked
+        // again would be picked by the pair's routing value. The holds are
+        // read last, so a request that asks no decode again reads none of
+        // them.
         let later = request.asks_decode_again()
             && spec.decode_pick() == DecodePick::AfterPrefill
             && !self.of_call.is_some_and(|call| call.named_pair)
+            && self.named_decode.is_none()
             && !request.encode.is_some_and(|items| {
                 items.holds_decode_to_images(request.media.holds_pixels())
                     || splits(&items, request.demands)
@@ -924,6 +935,7 @@ impl RequestMaker for Made<'_, '_> {
                 decode_later: later,
                 counted_on_decode: request.counted_on_decode,
                 demands: request.demands,
+                target_worker: self.named_decode,
                 ..Constraints::default()
             },
         }
@@ -1419,6 +1431,16 @@ pub(super) struct Call {
     /// follows it ([`pair`]). The worker a request names is that
     /// decision's, so no later one moves it.
     named_pair: bool,
+    /// The number the call's pair names its decode by, where the decode's
+    /// side alone reads the request's target source ([`target`]): the
+    /// prefill is each decision's own pick, so each ask of the call states
+    /// the number beside the decodes' places, and its decision counts it
+    /// behind the prefill it picks ([`Constraints::target_worker`]). A text
+    /// that is no number is stated as one that reaches no decode. `None`
+    /// for every other call. Each of its decisions books the decode with
+    /// its prefill under every document, as a pair held on both sides
+    /// does: a decode asked again would count no number.
+    named_decode: Option<u32>,
     /// Whether the call's last decision shed an encode request as
     /// saturated over its encoders, by that decision's own word
     /// ([`EncodePlaced::shed_over_encoders`]). The route's rule is asked
@@ -1763,13 +1785,28 @@ impl InProcess {
     /// thresholds, one over them alone counts as a partner, and the decode
     /// goes by load. Under a binding that sheds them no decode counts so.
     /// Where no prefill is counted, the pair is placed as one that names
-    /// no worker, with its routing value. A pair whose decode side alone is
-    /// such a ring is not read for a target, and neither is an encode
-    /// request: they are placed by the rest of the document. A pair held
-    /// to the two workers it names books its decode with its prefill
-    /// under every document ([`PlaceRequest::decode_again`]): a decode
-    /// asked again behind its prefill ([`Placement::decode_again`]) is
-    /// refused as one that never stood chosen, and that decode stands.
+    /// no worker, with its routing value. A pair held to the two workers
+    /// it names books its decode with its prefill under every document
+    /// ([`PlaceRequest::decode_again`]): a decode asked again behind its
+    /// prefill ([`Placement::decode_again`]) is refused as one that never
+    /// stood chosen, and that decode stands.
+    ///
+    /// Where the decode's side alone is such a ring, the prefill is its
+    /// own profile's pick, which a decision alone knows. The call lends
+    /// the places of the decodes that can be sent to, and each of its
+    /// decisions counts the decode's number among the partners there of
+    /// the prefill it picks: its first partners where the pair is made
+    /// among those. A number that reaches none sheds the request under
+    /// `target-worker`, and so does a decode the decision cannot name or
+    /// the call cannot send to. Such a pair books its decode with its
+    /// prefill too. Where no prefill opens the pair, the header is not
+    /// read and the pair is placed as one that names no worker. A prefill
+    /// opens it where a decode that can be sent to partners it, and it
+    /// can be sent to itself or, under a profile that weighs load itself
+    /// and a binding that steers, is over its thresholds alone.
+    ///
+    /// An encode request is not read for a target: it is placed by the
+    /// rest of the document.
     ///
     /// Declined by name ([`ShedReason::PolicyDeclined`]): a request that
     /// carries encode items over other lists than an encode request's

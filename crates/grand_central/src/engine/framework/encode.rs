@@ -56,7 +56,7 @@ use super::{
 };
 use crate::{
     engine::{
-        decision::{Decision, ShedReason, Target, Targets, Trace, PLACES},
+        decision::{Decision, ShedReason, Target, Targets, Trace, PLACES, TARGET_WORKER},
         demands::{DemandFacts, Demands, References},
         view::{
             AffinityFacts, Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts,
@@ -789,7 +789,9 @@ impl Engine {
     /// key. A pair column of another length than its pool names
     /// `affinity-column` before a cut, as the pair entry names it. So does
     /// a column on the request, or rows named on it, before a stage of the
-    /// encode side is asked.
+    /// encode side is asked. A number on the decode side
+    /// ([`Constraints::target_worker`]) names `target-worker`: an encode
+    /// request names no worker.
     ///
     /// A list this side hands on in a pool's stead (the prefills or the
     /// decodes it admits, the encoders it offers a key) is numbered anew. A
@@ -961,6 +963,11 @@ impl Engine {
         // of the encode side is asked.
         if carries_a_column(facts) {
             return turned_away(ShedReason::PolicyDeclined, AFFINITY_COLUMN, unbound);
+        }
+        // An encode request names no worker: a number on its decode side
+        // would count rows this side numbers anew.
+        if decode_cx.target_worker.is_some() {
+            return turned_away(ShedReason::PolicyDeclined, TARGET_WORKER, unbound);
         }
         debug_assert_indexed(encode.encoders);
         debug_assert_cells(encode.signal_cells, encode.encoders);
