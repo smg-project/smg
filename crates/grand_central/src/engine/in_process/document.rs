@@ -76,16 +76,22 @@ pub(in crate::engine) struct InForce {
     pub(super) hears: EventSet,
     /// The kinds the document takes of a pick its session table has no
     /// word for: [`Self::hears`] without the table's own, read once, here.
-    /// Under a sessions rule over stages that take no word on a lease,
-    /// such a pick costs its request no lease either
-    /// ([`super::single::issued`]).
+    /// Under a sessions rule beside which no stage and no count of sends
+    /// takes a word on a lease, such a pick of a whole pass costs its
+    /// request no lease either ([`super::single::issued`]), and a place one
+    /// pick decided is its request's whole answer where its worker reads
+    /// ready a second time ([`super::single::still_ready`]). Where it does
+    /// not, the pick is noted and takes its lease.
     pub(super) hears_beside_table: EventSet,
-    /// Whether a place one pick decided is not the whole of what the
-    /// document asks of its request: a stage takes a word on a lease
-    /// ([`Self::hears`]), or the document keeps a sample of its decisions
-    /// ([`Self::samples`]). Read once, here: a place tests this word once,
-    /// and under a document that asks neither it is the whole answer behind
-    /// that test.
+    /// Whether a place one pick decided may not be the whole of what the
+    /// document asks of its request: a stage, a count of sends or the
+    /// session table takes a word on a lease ([`Self::hears`]), or the
+    /// document keeps a sample of its decisions ([`Self::samples`]). Read
+    /// once, here: a place tests this word once, and under a document that
+    /// asks neither it is the whole answer behind that test. Under one whose
+    /// table alone takes a word, a place is the whole answer all the same
+    /// where its worker reads ready a second time
+    /// ([`Self::hears_beside_table`]).
     pub(super) leases_or_samples: bool,
     /// Each profile's name as a label that lives as long as the process,
     /// by the profile's position in the document
