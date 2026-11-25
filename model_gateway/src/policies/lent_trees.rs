@@ -220,7 +220,7 @@ impl LentTrees {
     /// The trees are emptied by the size pass's own call, at no size, of
     /// one name on a token tree and on a string tree
     /// ([`TokenTree::evict_tenant_by_size`]): one pass, where a purge by
-    /// name walks a tree once for each address. The call takes one leaf
+    /// name makes up to three for each address. The call takes one leaf
     /// out at a time and debits it from its worker. A prompt a request
     /// writes meanwhile is never left uncounted. It stays, with the prompt
     /// it extends, as it was sent to the worker that stands. Or it leaves
@@ -236,9 +236,9 @@ impl LentTrees {
             );
         }
         // The stores are copied out and the lock is let go ahead of the
-        // purge: a purge walks a tree once for every worker that left, and
-        // a decision that builds a model's table asks for its tree under
-        // this lock.
+        // purge: a purge makes up to three passes over a tree for every
+        // worker that left, and a decision that builds a model's table asks
+        // for its tree under this lock.
         let stores: Vec<Arc<ModelTrees>> = self
             .stores
             .lock()
