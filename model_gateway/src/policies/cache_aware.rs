@@ -164,7 +164,8 @@ const FLEET_SAMPLE: usize = 16;
 
 /// How long a pool table serves before a decision rebuilds it: a worker the
 /// index interned after the build gains affinity within this, and a worker
-/// that entered the warm-up window is sliced to within this.
+/// that entered the warm-up window is sliced to within this. An index id
+/// that changed hands has the table rebuilt sooner ([`Rows::numbered`]).
 const POOL_TABLE_REFRESH_MS: u64 = 1_000;
 
 /// Pool tables kept at once for the lists no caller named: one per list of
@@ -257,7 +258,8 @@ pub struct CacheAwarePolicy {
     pool_tables: ArcSwap<Vec<Arc<WorkersTable>>>,
     /// The tables of the lists their callers named, ascending by
     /// [`NamedTable::key`]: one a live list and index, built once a refresh
-    /// period whatever part of the list each request may use.
+    /// period, and again once an index id changed hands, whatever part of
+    /// the list each request may use.
     named_tables: ArcSwap<Vec<Arc<NamedTable>>>,
     /// Holders dropped since a named table was last published because a
     /// named list's candidate was not the list's worker at the position its
@@ -1160,7 +1162,10 @@ impl Rows {
 
     /// Whether the ids the rows read are still `indexer`'s: it handed none
     /// out a second time since. The count does not say which id it handed
-    /// on: once it moved, any id of the rows may be another worker's.
+    /// on: once it moved, any id of the rows may be another worker's, and
+    /// every list's rows over that index are read again. The holder lookup
+    /// tests it ([`CacheAwarePolicy::overlap_holders`]). The warm-up's
+    /// reads of a row's block count do not.
     fn numbered(&self, indexer: &KvIndex) -> bool {
         indexer.numbers_reused() == self.reused
     }
@@ -1707,7 +1712,8 @@ impl CacheAwarePolicy {
     }
 
     /// The table of a list nobody named under `indexer`: the one kept when
-    /// it is fresh, a stale one while another decision rebuilds it, else
+    /// it is fresh and its ids are still the index's ([`Rows::numbered`]),
+    /// a stale one while another decision rebuilds it, else
     /// built here and published, the oldest leaving past
     /// [`POOL_TABLES_KEPT`].
     fn workers_table(
@@ -2040,7 +2046,8 @@ impl CacheAwarePolicy {
     /// soaks a worker whose index a publisher-restart resync had emptied never
     /// saw a request again, every prompt holding an overlap elsewhere). The
     /// candidates are the pool table's, chosen at its build (refreshed every
-    /// second): workers thinner than the fleet (see
+    /// second, sooner once an index id changed hands): workers thinner than
+    /// the fleet (see
     /// [`liveness::Warmup::is_thin`]) whatever the fleet's age, else the
     /// workers inside the warm-up window unless every worker is (a young
     /// fleet slices nothing, a miss getting a load-balanced pick anyway); a
@@ -2789,7 +2796,8 @@ impl CacheAwarePolicy {
     /// at temperature zero; a softmax-sampled group otherwise), and
     /// `select_final_from_affinity` uses LeastLoad to choose and credit one
     /// final worker from that group. An empty result means no full-block
-    /// overlap. The tests name the eligible set themselves.
+    /// overlap, or rows read before an index id changed hands. The tests
+    /// name the eligible set themselves.
     #[cfg(test)]
     fn overlap_candidates(
         workers: &[Arc<dyn Worker>],
@@ -2889,13 +2897,14 @@ impl CacheAwarePolicy {
         let started = Instant::now();
         let mut overlap = indexer.find_matches(content_hashes, false);
         Metrics::record_kv_index_lookup(indexer.name(), started.elapsed().as_secs_f64());
-        // An id handed on since the rows were read holds its new worker's
-        // blocks: such a lookup names nobody.
-        if overlap.scores.is_empty() || !table.rows().numbered(indexer) {
+        if overlap.scores.is_empty() {
             return Vec::new();
         }
         let caps = indexer.cap_by_groups(content_hashes, block_size, &mut overlap);
-        if overlap.scores.is_empty() {
+        // An id handed on since the rows were read holds its new worker's
+        // blocks and group view: such a lookup names nobody. The count is
+        // read behind both reads of the index by id.
+        if overlap.scores.is_empty() || !table.rows().numbered(indexer) {
             return Vec::new();
         }
 
