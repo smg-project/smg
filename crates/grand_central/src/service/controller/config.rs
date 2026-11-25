@@ -204,7 +204,7 @@ impl Config {
         waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
         token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
     };
-    /// The most deciding threads a controller starts.
+    /// The most deciding threads a controller starts: 256.
     pub const MAX_DECIDE_SHARDS: usize = DECIDE_SHARDS_CEILING;
 
     /// The deciding threads a controller starts when its operator names no
