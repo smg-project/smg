@@ -1675,8 +1675,9 @@ pub struct Constraints<'a> {
     /// side's places as they are stated, so under a number it sees the
     /// lent decodes alone: a host that states a number as above meets it
     /// only where the fleet changes between its read and the decision's.
-    /// `None`: the request names no decode so. In-process only: a
-    /// controller's served decision reads a pair's frame for no number.
+    /// `None`: the request names no decode so. No frame carries the field:
+    /// a controller states it for a pair's frame whose decode side alone
+    /// reads the number the frame names its worker by.
     pub target_worker: Option<u32>,
 }
 

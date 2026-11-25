@@ -480,7 +480,11 @@ message DecideRequest {
   // the same lease id. A refusal is a Busy with a reason of its own, and a
   // decision that sheds is no refusal of the request, whose prefill runs:
   // behind either the gateway sends the decode the first pick named, and
-  // that Dispatched books the side. An id of 0 is out of range.
+  // that Dispatched books the side. A call whose frame names its worker
+  // (named_worker), under a spec whose binding holds the pair's decode side
+  // to that number, is refused so, as one whose decode side was never
+  // chosen: the decode stays the one the first pick named. An id of 0 is
+  // out of range.
   optional fixed64 decode_of = 6;
   // The items of an encode request. Its presence says that the request is
   // one, with a key or with none. Read on a frame of the encode phase, and
@@ -510,10 +514,28 @@ message DecideRequest {
   // worker, and neither its session key nor its client key is read. A text
   // that is no number is stated as 4294967295: it reaches no worker of any
   // list, as that text does. Absent, the request names no worker, so the
-  // frame of a host older than the field is decided as it was. Read on a
-  // frame that is decided over one list, a single request's and one that
-  // stands alone at a side's phase, under a spec whose binding for the
-  // frame names a target source, and on no other.
+  // frame of a host older than the field is decided as it was. Read under a
+  // spec whose binding for the frame names a target source: on a frame that
+  // is decided over one list, a single request's and one that stands alone
+  // at a side's phase, and on a pair's frame at its prefill. Not read on an
+  // encode request's frame.
+  //
+  // A pair's frame states the one number for its two sides, and each side
+  // whose profile is the plain hash ring reads it. The prefill's side counts
+  // the prefills the gateway can be sent to that pair with a decode it can
+  // be sent to, and those with such a decode among their first partners
+  // alone where there is one. The decode's side counts the partners so
+  // counted of the prefill reached. The decision is held to the two
+  // workers, or to the prefill alone where the decode's side does not read
+  // the number. Where the decode's side alone reads it, the decision counts
+  // it among the partners of the prefill it picks. A number that reaches no
+  // worker on a side sheds the pair with no endpoint, under
+  // `target-worker`, and so does a named worker that cannot take the
+  // request after all. Where no prefill can be counted, or none opens the
+  // pair, the pair is decided as one that names no worker, and its keys are
+  // read. Where every decode is over its thresholds and the spec steers
+  // such a pool, the decode goes by load and its number is not read. The
+  // pair's decode_later stands as it is stated.
   optional uint32 named_worker = 8;
 }
 

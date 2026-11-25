@@ -1497,19 +1497,24 @@ fn decode_alone(
 /// A decode call's decision and its side's issue, for the frame that names
 /// the decode side of `lease` (`DecideRequest.decode_of`). The store's own
 /// test of the lease comes first ([`MemoryStore::held_pair`]), so a call it
-/// refuses runs no stage. Then the decode is decided again behind the held
-/// prefill ([`frame_decision::decide_decode`]) and, for a pick, issued
-/// under the lease's id ([`frame_decision::issue_decode`]). The lease
-/// filed is the decode side's, and its issue's count comes beside it. The
-/// issue tests the lease again: one that moved under the decision is
-/// refused there, behind the stages.
+/// refuses runs no stage. A call whose frame names its worker where the
+/// decode's side reads the number is refused next, as one whose decode
+/// never stood chosen ([`frame_decision::names_decode`]): the decode its
+/// request named stands, and no stage runs. Then the decode is decided
+/// again behind the held prefill ([`frame_decision::decide_decode`]) and,
+/// for a pick, issued under the lease's id
+/// ([`frame_decision::issue_decode`]). The lease filed is the decode
+/// side's, and its issue's count comes beside it. The issue tests the
+/// lease again: one that moved under the decision is refused there, behind
+/// the stages.
 ///
 /// Out of line: no other request carries a part of it.
 ///
 /// # Errors
 ///
 /// The reason the call's answer is `Busy` under: one of its own for each
-/// refusal of the store ([`busy_of`]), at either test.
+/// refusal of the store ([`busy_of`]), at either test, and the one of a
+/// decode never chosen for a call that names its decode.
 #[inline(never)]
 fn decode_call(
     store: &MemoryStore,
@@ -1521,6 +1526,9 @@ fn decode_call(
     caught: &mut bool,
 ) -> Result<(Decision, Filed, FiledBeside), Reason> {
     let held = store.held_pair(taken.gateway, lease).map_err(busy_of)?;
+    if frame_decision::names_decode(world.spec(), taken.request) {
+        return Err(busy_of(DecodeRefused::NotChosen));
+    }
     let decided = frame_decision::decide_decode(world, objects, taken, held, frames, loads, own);
     let (decision, booked) = made(decided, caught)?;
     let issued = frame_decision::issue_decode(store, world, taken, lease, &decision, booked);
@@ -1532,7 +1540,10 @@ fn decode_call(
 
 /// The `Busy` a refused decode call leaves under: a reason of its own for
 /// each refusal of the store, never a decision that sheds. No policy spoke:
-/// the lease's own state refused the call, and the reason names which.
+/// the lease's own state refused the call, and the reason names which. A
+/// call that names its decode leaves under the reason of a side never
+/// chosen ([`decode_call`]): behind either its gateway sends the decode
+/// the first pick named.
 const fn busy_of(refused: DecodeRefused) -> Reason {
     match refused {
         DecodeRefused::NoLease => Reason::DecodeNoLease,
@@ -1654,6 +1665,7 @@ pub(crate) mod tests {
     };
 
     pub(crate) mod encode;
+    mod named;
 
     /// How long a case waits for a decider before it fails.
     pub(crate) const PATIENCE: Duration = Duration::from_secs(20);
