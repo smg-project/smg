@@ -7,32 +7,44 @@
 //! and what the workers saw. Where the classic router has a case of its own
 //! for the answer, the case here names it and its lines.
 //!
+//! A route sends a pair's decode at once, or behind its prefill's answer
+//! ([`Program::in_turn`]). The last cases serve in turn: the program asks
+//! the engine for the decode again behind that answer.
+//!
+//! [`Program::in_turn`]: crate::program::Program::in_turn
+//!
 //! [`Plan::Pair`]: crate::program::Plan::Pair
 //! [`Program::serve`]: crate::program::Program::serve
 
 use std::{
     collections::BTreeMap,
+    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
 
+use http::{HeaderMap, HeaderValue};
 use smg_grand_central::{
-    document::{AppliedSpec, PolicySettings, ScoreSpec},
+    document::{
+        AppliedSpec, Assignment, DecodePick, LoadMetricSetting, ModeSettings, PolicySettings,
+        PolicySpec, RoutingSettings, ScoreSpec,
+    },
     engine::{ShedReason, Unplaced},
     stages::StageRegistry,
 };
 use smg_worker::{
     identity::basic::Worker,
+    load::state::TestFeed,
     test_support::worker_with_model_aliases,
     worker::{WorkerStatus, WorkerType},
 };
 use tokio::time::sleep;
 
 use crate::{
-    program::{pair_settings, Answer, Asked, Plan, ATTEMPTS},
+    program::{pair_settings, settings, Answer, Asked, Plan, Program, ATTEMPTS},
     served,
     single::{taken, Heard, Hears},
     started_as, under_pairs, MODEL,
@@ -87,7 +99,7 @@ pub(crate) fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeM
 ///
 /// The classic router names both sides of a pair with their places: its
 /// case `a_pair_placement_names_both_sides_with_their_positions`
-/// (`model_gateway/src/routers/common/placement.rs:3472-3519`).
+/// (`model_gateway/src/routers/common/placement.rs:3489-3536`).
 #[test]
 fn a_pair_names_a_prefill_and_a_decode_and_each_side_takes_its_turn() {
     let fleet = fleet(2, 3);
@@ -117,7 +129,7 @@ fn a_pair_names_a_prefill_and_a_decode_and_each_side_takes_its_turn() {
 /// time, and goes back to a tried worker that is the only one open: its
 /// cases `a_pairs_retry_steps_aside_from_the_tried_engines_a_side_at_a_time`
 /// and `a_pairs_retry_goes_back_to_a_tried_worker_that_is_the_only_one_open`
-/// (`model_gateway/src/routers/common/placement.rs:3703-3751`, `:3757-3789`).
+/// (`model_gateway/src/routers/common/placement.rs:3720-3768`, `:3774-3806`).
 #[test]
 fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
     let fleet = fleet(2, 2);
@@ -183,7 +195,7 @@ fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
 /// The classic router answers a pair whose only decode is not ready as the
 /// decode role's unavailability: its case
 /// `a_pair_whose_only_decode_is_not_ready_is_the_decode_roles_unavailability`
-/// (`model_gateway/src/routers/common/placement.rs:4512-4524`).
+/// (`model_gateway/src/routers/common/placement.rs:4529-4541`).
 #[test]
 fn a_side_that_cannot_be_sent_to_takes_no_request() {
     let fleet = fleet(2, 3);
@@ -246,7 +258,7 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
 ///
 /// The classic router's engine arm says each side by that side's guard: its
 /// case `the_engine_hears_each_side_of_a_placed_pair_by_that_sides_guard`
-/// (`model_gateway/src/routers/common/placement.rs:9367-9402`).
+/// (`model_gateway/src/routers/common/placement.rs:9514-9549`).
 #[tokio::test(start_paused = true)]
 async fn the_engine_hears_both_sides_of_a_pair() {
     let heard = Heard::default();
@@ -340,4 +352,397 @@ fn a_pair_is_placed_over_the_generation_that_stands() {
     let answers: Vec<Answer> = (0..4).map(|_| program.serve(&PLAIN)).collect();
     let times = sends(&answers);
     assert_eq!(times.get(joined.as_str()), Some(&2), "{times:?}");
+}
+
+/// The document a gateway means that routes to pairs, its prefill side
+/// under `prefill` and its decode side under `decode`, with the decode
+/// picked `when`. The settings hold no word for when a pair's decode is
+/// picked: it is the document's own (`plans.pd-pair.decode`).
+fn picked(when: DecodePick, prefill: PolicySettings, decode: PolicySettings) -> PolicySpec {
+    let settings = RoutingSettings {
+        mode: ModeSettings::PrefillDecode {
+            prefill_policy: None,
+            decode_policy: Some(decode),
+        },
+        ..settings(prefill)
+    };
+    let document = settings.policy_document();
+    let mut document = document.expect("the settings have a document");
+    document.plans.pd_pair.decode = when;
+    document
+}
+
+/// The program under `document` over `fleet`, with a route that sends a
+/// pair's decode behind its prefill's answer.
+fn in_turn(
+    document: &PolicySpec,
+    fleet: &[Arc<dyn Worker>],
+    sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
+) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
+    let spec = AppliedSpec::validate(document).expect("the document validates");
+    let (program, loads, task) = started_as(Plan::Pair, spec, fleet, sends);
+    (program.in_turn(), loads, task)
+}
+
+/// A decode asked again is picked as the decodes stand behind the prefill's
+/// answer, and the request's count follows it. The first decision names the
+/// decode that holds no request, and the program counts the request there
+/// from the placement, under the request's routing key. While the prefill
+/// runs that decode takes three more requests, and the second ask names the
+/// other one: at the decode's send the request is counted on that one,
+/// under its key still, and on the first no more. Under a document that
+/// books both sides at once the decode never stands chosen: the program
+/// makes no second ask, and the first decision's decode is sent, under the
+/// guard it has.
+///
+/// The gateway asks so where the engine placed the pair: its cases
+/// `a_decode_asked_again_moves_the_request_and_its_guard_to_the_decode_the_engine_takes`
+/// and `a_decode_asked_again_that_takes_no_other_worker_leaves_the_first_standing`
+/// (`model_gateway/src/routers/common/placement.rs:10084-10110`, `:10119-10175`).
+/// It makes no ask for a decode booked with its prefill either
+/// (`:1004-1010`): its case
+/// `a_decode_booked_with_its_prefill_answers_the_ask_as_the_first_decode_standing`
+/// (`:10325-10371`).
+/// A pair the classic policies picked is sent the decode its one selection
+/// named, and no decode is picked again (`DecodeBehindPrefill`,
+/// `model_gateway/src/routers/grpc/sequential_pd.rs:595-603`).
+#[test]
+fn a_decode_asked_again_is_picked_as_the_decodes_stand_behind_the_prefills_answer() {
+    const KEY: &str = "session-7";
+    let fewest = PolicySettings::PowerOfTwo {
+        load_metric: LoadMetricSetting::LeastRequests,
+    };
+    // When the document picks the decode, the decode that is sent, and what
+    // the two decodes count at its send: each one's requests in flight, and
+    // those of them under the request's key.
+    let turns = [
+        (DecodePick::AfterPrefill, 1, [(3, 0), (2, 1)]),
+        (DecodePick::WithPrefill, 0, [(4, 1), (1, 0)]),
+    ];
+    for (when, sent_to, at_decode) in turns {
+        let fleet = fleet(1, 2);
+        let (idle, busy) = (Arc::clone(&fleet[1]), Arc::clone(&fleet[2]));
+        busy.increment_load();
+        // What the two decodes count at each send, read ahead of the three
+        // requests the first one takes while the prefill runs.
+        let counted = Arc::new(Mutex::new(Vec::new()));
+        let counts = Arc::clone(&counted);
+        let sends = move |worker: &dyn Worker| {
+            let running = [&idle, &busy].map(|decode| {
+                let under_key = decode.routing_key_inflight(KEY);
+                (decode.load(), under_key)
+            });
+            counts.lock().expect("no case panicked").push(running);
+            if *worker.worker_type() == WorkerType::Prefill {
+                (0..3).for_each(|_| idle.increment_load());
+            }
+            200
+        };
+        // The prefill side is under a policy that reads a routing key, and
+        // the document's view lists the key's header: the placement names
+        // the key, and the program's guards count under it.
+        let hashed = PolicySettings::ConsistentHashing;
+        let mut document = picked(when, hashed, fewest.clone());
+        document.view.headers.push("x-smg-routing-key".to_owned());
+        let (program, _loads, _task) = in_turn(&document, &fleet, sends);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", HeaderValue::from_static(KEY));
+        let asked = Asked {
+            headers: Some(&headers),
+            ..PLAIN
+        };
+        let answer = program.serve(&asked);
+        assert_eq!(
+            answer,
+            Answer {
+                sent: vec![prefill(0), decode(sent_to)],
+                status: 200,
+                unplaced: None,
+            },
+            "the decode picked {when:?}"
+        );
+        let counted = counted.lock().expect("no case panicked");
+        assert_eq!(
+            counted.as_slice(),
+            [[(1, 1), (1, 0)], at_decode],
+            "at the prefill's send and at the decode's, picked {when:?}"
+        );
+    }
+}
+
+/// The request a second ask states says that its first decode counts it,
+/// since the program's guard stands there across the ask: the engine then
+/// reads that decode without the request. Under a rule that lets a worker
+/// hold two requests of one key, one other request of the key on the first
+/// decode leaves the request there. Read with the request's own count, that
+/// decode would stand at the rule's bound and the request would move.
+///
+/// The gateway states the same word behind the guard it makes ahead of the
+/// decode's send (`model_gateway/src/routers/common/placement.rs:1022-1026`,
+/// over `LoadGuards::behind_prefill`,
+/// `model_gateway/src/routers/grpc/context.rs:1116-1130`).
+#[test]
+fn a_decode_asked_again_is_read_without_the_request_its_guard_counts_there() {
+    const KEY: &str = "session-7";
+    let manual = PolicySettings::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: Assignment::MinLoad,
+    };
+    let document = pair_settings(manual).policy_document();
+    let mut document = document.expect("the settings have a document");
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    for binding in &mut document.bindings {
+        if let Some(rule) = &mut binding.sessions {
+            rule.inflight_cap = 2;
+        }
+    }
+    let fleet = fleet(1, 2);
+    let (first, other) = (Arc::clone(&fleet[1]), &fleet[2]);
+    // The key's first request takes the lighter decode.
+    other.increment_load();
+    let sends = move |worker: &dyn Worker| {
+        if *worker.worker_type() == WorkerType::Prefill {
+            // One other request of the key lands on the first decode while
+            // the prefill runs.
+            first.increment_load();
+            first.increment_routing_key_load(KEY);
+        }
+        200
+    };
+    let (program, _loads, _task) = in_turn(&document, &fleet, sends);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-smg-routing-key", HeaderValue::from_static(KEY));
+    let asked = Asked {
+        headers: Some(&headers),
+        ..PLAIN
+    };
+    let answer = program.serve(&asked);
+    assert_eq!(
+        answer,
+        Answer {
+            sent: vec![prefill(0), decode(0)],
+            status: 200,
+            unplaced: None,
+        },
+        "the request stays on its first decode"
+    );
+}
+
+/// A pair served in turn under the document the settings mean, which books
+/// both sides at once, is served as a pair sent at once is: two sends a
+/// request, the prefill's first, and each side takes its turn. Its decode
+/// never stands chosen, so the program asks for none again.
+///
+/// The classic router names both sides of a pair in its one selection: its
+/// case `a_pair_placement_names_both_sides_with_their_positions`
+/// (`model_gateway/src/routers/common/placement.rs:3489-3536`).
+#[test]
+fn a_pair_in_turn_under_a_document_that_books_both_sides_takes_its_turns() {
+    let fleet = fleet(2, 3);
+    let turns = PolicySettings::RoundRobin;
+    let document = picked(DecodePick::WithPrefill, turns.clone(), turns);
+    let (program, _loads, _task) = in_turn(&document, &fleet, served);
+    let answers: Vec<Answer> = (0..6).map(|_| program.serve(&PLAIN)).collect();
+    for answer in &answers {
+        assert_eq!((answer.status, answer.sent.len()), (200, 2), "{answer:?}");
+        assert!(answer.sent[0].contains("prefill"), "{answer:?}");
+        assert!(answer.sent[1].contains("decode"), "{answer:?}");
+    }
+    let (first, second) = (prefill(0), prefill(1));
+    let decodes = [decode(0), decode(1), decode(2)];
+    let mut expected = BTreeMap::from([(first.as_str(), 3), (second.as_str(), 3)]);
+    expected.extend(decodes.iter().map(|decode| (decode.as_str(), 2)));
+    assert_eq!(sends(&answers), expected);
+}
+
+/// A prefill that answered in turn holds the request no more: the program
+/// lets its load guard go where it says the prefill's end, so the prefill
+/// counts the request at its own send and no more at the decode's, whether
+/// the decode was asked again or booked with it. A pair sent at once is
+/// counted on its prefill through both sends.
+///
+/// The gateway's sequential dispatch frees the prefill once it is drained,
+/// ahead of its decode
+/// (`model_gateway/src/routers/grpc/sequential_pd.rs:919-921`).
+#[test]
+fn a_prefill_that_answered_in_turn_holds_the_request_no_more() {
+    let turns = PolicySettings::RoundRobin;
+    // Whether the route sends the pair in turn, when the document picks the
+    // decode, and the prefill's requests in flight at the request's two
+    // sends.
+    let served = [
+        (true, DecodePick::AfterPrefill, [1, 0]),
+        (true, DecodePick::WithPrefill, [1, 0]),
+        (false, DecodePick::WithPrefill, [1, 1]),
+    ];
+    for (by_turn, when, expected) in served {
+        let fleet = fleet(1, 1);
+        let one = Arc::clone(&fleet[0]);
+        let counted = Arc::new(Mutex::new(Vec::new()));
+        let counts = Arc::clone(&counted);
+        let sends = move |_: &dyn Worker| {
+            counts.lock().expect("no case panicked").push(one.load());
+            200
+        };
+        let document = picked(when, turns.clone(), turns.clone());
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let (program, _loads, _task) = started_as(Plan::Pair, spec, &fleet, sends);
+        let program = if by_turn { program.in_turn() } else { program };
+        assert_eq!(program.serve(&PLAIN).sent, [prefill(0), decode(0)]);
+        let counted = counted.lock().expect("no case panicked");
+        assert_eq!(
+            counted.as_slice(),
+            expected,
+            "in turn: {by_turn}, the decode picked {when:?}"
+        );
+    }
+}
+
+/// A prefill that fails in turn sends no decode: its attempt is one send.
+/// The decode is counted from the placement, so it holds the request while
+/// the prefill runs, and no more once the attempt is over. The retry states
+/// both workers of the failed attempt as tried, so the prefill steps aside
+/// and the one decode stays.
+///
+/// The gateway's retry names the engines of both sides of the failed
+/// attempt's selection, whichever side failed and whether or not its
+/// decode was sent: it reads the selection, and not what went out
+/// (`WorkerSelection::engines`,
+/// `model_gateway/src/routers/grpc/context.rs:1665-1669`, read at
+/// `model_gateway/src/routers/grpc/pipeline.rs:849-861`).
+#[test]
+fn a_prefill_that_fails_in_turn_sends_no_decode() {
+    let fleet = fleet(2, 1);
+    let (failing, one) = (prefill(0), Arc::clone(&fleet[2]));
+    // The decode's requests in flight at each send.
+    let counted = Arc::new(Mutex::new(Vec::new()));
+    let counts = Arc::clone(&counted);
+    let sends = move |worker: &dyn Worker| {
+        counts.lock().expect("no case panicked").push(one.load());
+        if worker.url() == failing {
+            500
+        } else {
+            200
+        }
+    };
+    let turns = PolicySettings::RoundRobin;
+    let document = picked(DecodePick::AfterPrefill, turns.clone(), turns);
+    let (program, _loads, _task) = in_turn(&document, &fleet, sends);
+    let answers: Vec<Answer> = (0..2).map(|_| program.serve(&PLAIN)).collect();
+    assert!(answers.iter().all(|answer| answer.status == 200));
+    let asked_again: Vec<&Answer> = answers
+        .iter()
+        .filter(|answer| answer.sent.len() == 3)
+        .collect();
+    let [answer] = asked_again[..] else {
+        panic!("one of the two requests meets the failing prefill: {answers:?}");
+    };
+    assert_eq!(answer.sent, [prefill(0), prefill(1), decode(0)]);
+    // Five sends, and the decode holds one request at each: the attempt's
+    // own, the failed attempt's no more.
+    let counted = counted.lock().expect("no case panicked");
+    assert_eq!(counted.as_slice(), [1; 5]);
+    assert_eq!(fleet[2].load(), 0, "every guard ended with its attempt");
+}
+
+/// The engine hears a decode asked again at its ask, its send and its end:
+/// the prefill is issued alone and dispatched, the decode is issued at the
+/// second ask, ahead of the prefill's end, and dispatched where its send is
+/// said, behind that end. The guard the program made at the placement told
+/// the engine nothing. Under a document that books both sides at once, a
+/// prefill that fails leaves a decode that was never sent: the engine hears
+/// it given up.
+///
+/// The gateway's stages hear a pair sent prefill first in this order: its
+/// case `a_decode_decided_behind_its_prefill_is_heard_behind_the_prefills_answer`
+/// (`model_gateway/src/routers/http/pd_router/tests/grand_central.rs:460-543`).
+#[tokio::test(start_paused = true)]
+async fn the_engine_hears_a_decode_asked_again_at_its_ask_its_send_and_its_end() {
+    for when in [DecodePick::AfterPrefill, DecodePick::WithPrefill] {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let mut stages = StageRegistry::builtin();
+        let added = stages.scorer("hears", move || Box::new(Hears(Arc::clone(&kept))));
+        added.expect("a free name");
+        let turns = PolicySettings::RoundRobin;
+        let mut document = picked(when, turns.clone(), turns);
+        // One stage of the document hears: the decode side's profile names it.
+        let profile = document.profiles.get_mut("decode");
+        let profile = profile.expect("the decode side's profile");
+        profile.score.push(ScoreSpec::from("hears"));
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        let spec = spec.expect("the stages hold the scorer");
+        let fails = Arc::new(AtomicBool::new(false));
+        let (next, went) = (Arc::clone(&fails), Arc::clone(&heard));
+        let sends = move |worker: &dyn Worker| {
+            let mut words = went.lock().expect("no case panicked");
+            words.push("went out".to_owned());
+            let prefill = *worker.worker_type() == WorkerType::Prefill;
+            if prefill && next.swap(false, Ordering::Relaxed) {
+                500
+            } else {
+                200
+            }
+        };
+        let (program, _loads, task) = started_as(Plan::Pair, spec, &fleet(1, 1), sends);
+        let program = program.in_turn();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the case holds the task's handle and ends the task"
+        )]
+        let task = tokio::spawn(task);
+        // The task's first step reads the registry whole.
+        sleep(Duration::from_millis(1)).await;
+        let told = taken(&heard);
+        assert_eq!(told.len(), 2, "each worker's join: {told:?}");
+
+        assert_eq!(program.serve(&PLAIN).status, 200);
+        let served: &[&str] = match when {
+            DecodePick::AfterPrefill => &[
+                "issued Prefill",
+                "dispatched Prefill",
+                "went out",
+                "issued Decode",
+                "completed Prefill 200 Ok",
+                "dispatched Decode",
+                "went out",
+                "completed Decode 200 Ok",
+            ],
+            _ => &[
+                "issued Prefill",
+                "issued Decode",
+                "dispatched Prefill",
+                "went out",
+                "dispatched Decode",
+                "completed Prefill 200 Ok",
+                "went out",
+                "completed Decode 200 Ok",
+            ],
+        };
+        assert_eq!(taken(&heard), served, "picked {when:?}");
+
+        // A prefill that fails: no decode is sent in that attempt.
+        fails.store(true, Ordering::Relaxed);
+        let answer = program.serve(&PLAIN);
+        assert_eq!((answer.status, answer.sent.len()), (200, 3));
+        let failed: &[&str] = match when {
+            DecodePick::AfterPrefill => &[
+                "issued Prefill",
+                "dispatched Prefill",
+                "went out",
+                "completed Prefill 500 ServerError",
+            ],
+            _ => &[
+                "issued Prefill",
+                "issued Decode",
+                "dispatched Prefill",
+                "went out",
+                "completed Prefill 500 ServerError",
+                "released Decode Abandoned",
+            ],
+        };
+        assert_eq!(taken(&heard), [failed, served].concat(), "picked {when:?}");
+        task.abort();
+    }
 }

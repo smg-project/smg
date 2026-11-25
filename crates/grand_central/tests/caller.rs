@@ -14,6 +14,8 @@
 //! What the program asks of the engine stands in one place, the methods of
 //! its `Engine`. Each method beside `place` is a call the host contract
 //! still owes a program, and leaves that list with the change that pays it.
+//! A pair's decode asked again is asked of the placement `place` answered,
+//! where that placement says its decode still stands chosen.
 //!
 //! One module a plan holds the plan's cases: a single request
 //! (`caller/single.rs`), a pair of a prefill worker and a decode worker
