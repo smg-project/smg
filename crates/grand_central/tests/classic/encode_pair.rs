@@ -244,17 +244,11 @@ fn replay(row: &Row) -> Vec<String> {
         row.encoders
             .iter()
             .zip(&of_encoders)
-            .map(|(worker, offer)| EncodeMember {
-                runtime: &worker.runtime,
-                offer,
-            }),
+            .map(|(worker, offer)| EncodeMember::of(&worker.runtime, offer)),
         row.prefills
             .iter()
             .zip(&of_prefills)
-            .map(|(worker, offer)| EncodeMember {
-                runtime: &worker.runtime,
-                offer,
-            }),
+            .map(|(worker, offer)| EncodeMember::of(&worker.runtime, offer)),
     );
     let mut found = Vec::new();
     if row.requests.len() != row.outcome.sequence.len() {

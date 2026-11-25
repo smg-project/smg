@@ -12,10 +12,20 @@
 
 #![deny(unreachable_patterns)]
 
+#[cfg(feature = "in-process")]
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "in-process")]
+use smg_grand_central::engine::{TextKey, TokenKey};
 use smg_grand_central::{
     document::Needs,
-    engine::{DrawUnit, Health, LoadRow, ScoreFront, ScoreSpread, Shortlist, WorkerId},
+    engine::{
+        DrawUnit, EncodeMember, Health, LoadRow, Phase, Plain, PoolWord, ScoreFront, ScoreSpread,
+        Shortlist, WireModes, WorkerId,
+    },
     policies::prefix_hash::HeadRule,
+    store::EncodeOffer,
     tracking::{EventKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
 };
 
@@ -224,4 +234,63 @@ fn an_outcome_is_made_by_its_calls_and_read_by_a_pattern_that_ends_open() {
             12
         )
     );
+}
+
+/// A plain request's facts are made by their call, which takes every field
+/// the record has today, and read by a pattern that ends open.
+#[test]
+fn a_plain_request_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let Plain {
+        phase,
+        wires,
+        prompt_tokens,
+        ..
+    } = Plain::of(Phase::Decode, WireModes::GRPC, 7);
+    assert_eq!(
+        (phase, wires, prompt_tokens),
+        (Phase::Decode, WireModes::GRPC, 7)
+    );
+}
+
+/// A member of the encode derivation is made by its call and read by a
+/// pattern that ends open.
+#[test]
+fn an_encode_member_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let offer = EncodeOffer::default();
+    let EncodeMember {
+        runtime,
+        offer: read,
+        ..
+    } = EncodeMember::of("a runtime", &offer);
+    assert_eq!(runtime, "a runtime");
+    assert!(std::ptr::eq(read, &offer));
+}
+
+/// A pool's word is made by its call, as a program that implements a
+/// picker makes one to call it, and read by a pattern that ends open.
+#[test]
+fn a_pools_word_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let word = AtomicU64::new(3);
+    let PoolWord {
+        rows, word: read, ..
+    } = PoolWord::of(8, &word);
+    assert_eq!((rows, read.load(Ordering::Relaxed)), (8, 3));
+}
+
+/// A prompt's entry in a host's token tree is made by its call and read by
+/// a pattern that ends open.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_token_key_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let TokenKey { tokens, marker, .. } = TokenKey::of(Cow::Borrowed(&[5, 6, 7]), 1);
+    assert_eq!((&tokens[..], marker), (&[5, 6, 7][..], 1));
+}
+
+/// A prompt's entry in a host's string tree is made by its call and read
+/// by a pattern that ends open.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_text_key_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let TextKey { text, marker, .. } = TextKey::of(Cow::Borrowed("a prompt"), 2);
+    assert_eq!((&*text, marker), ("a prompt", 2));
 }

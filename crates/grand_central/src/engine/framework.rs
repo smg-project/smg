@@ -3,11 +3,6 @@
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
     any::Any,
     collections::HashMap,
@@ -842,6 +837,7 @@ pub trait Picker: Lifecycle + Debug {
 /// A pool as a picker that places over its workers by itself is handed it
 /// ([`Picker::pick_alone`]): its size and its own word.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct PoolWord<'a> {
     /// How many workers the pool holds, in an order that stands for as long
     /// as the pool does.
@@ -852,6 +848,19 @@ pub struct PoolWord<'a> {
     /// pool and no table is looked up. It starts at a position the caller
     /// drew.
     pub word: &'a AtomicU64,
+}
+
+impl<'a> PoolWord<'a> {
+    /// A pool's size and its own word. It takes every field whose silence
+    /// would change an answer with no word, and neither of these has a neutral
+    /// value: a later field with a true neutral value joins by assignment. A
+    /// program that implements [`Picker::pick_alone`] builds one to call its
+    /// picker. It checks nothing. Code outside this crate starts here: the
+    /// record gains fields, so no literal of it builds there.
+    #[must_use]
+    pub const fn of(rows: usize, word: &'a AtomicU64) -> Self {
+        Self { rows, word }
+    }
 }
 
 /// Per-decision state a stage set keeps across the stages of one profile

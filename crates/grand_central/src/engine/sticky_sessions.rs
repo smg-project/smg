@@ -13,11 +13,6 @@
 //! follows the move ahead of that dispatch, as a gateway's sticky map moves
 //! a pin where it selects the worker.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
     collections::hash_map,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -31,8 +26,11 @@ use crate::{
     engine::view::{Session, WorkerId},
 };
 
-/// A binding's sessions rule as the engine runs it.
+/// A binding's sessions rule as the engine runs it. A document's validation
+/// makes it, and code outside this crate states a sessions rule by a
+/// document. The record gains fields: a pattern of it there ends with `..`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SessionRule {
     pub assignment: Assignment,
     /// Requests of one key a worker carries before the next is placed
