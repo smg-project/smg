@@ -20,8 +20,8 @@ use crate::{
     },
     service::{controller::wire::Checked, proto},
     store::{
-        snapshot::StandingVeto, GatewayId, HealthSink, MemoryStore, Reachability, VetoWrite,
-        WorkerFacts, WorkersStore,
+        snapshot::StandingVeto, GatewayId, HealthSink, MemoryStore, Reachability, Registrant,
+        VetoWrite, WorkerFacts,
     },
     worker_host::{
         reach::{ListReach, Reach},
@@ -371,13 +371,13 @@ fn a_veto_holds_its_workers_position_back_over_a_lent_list() {
             reachable_from: reach.from,
             ..WorkerFacts::default()
         };
-        store.upsert(stated).id()
+        let written = objects.upsert(&store, stated, Registrant::Control);
+        written.expect("the store takes the write").id()
     };
     let first = row(0, Role::Single, any(HTTP));
     row(1, Role::Prefill, any(HTTP));
     let second = row(2, Role::Single, local(ASKER, HTTP));
     let third = row(3, Role::Single, any(HTTP));
-    objects.follow(&store);
     store.publish_now();
 
     let registry = objects.registry();
