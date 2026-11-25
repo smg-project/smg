@@ -3554,6 +3554,108 @@ mod native_loads_tests {
         }
     }
 
+    /// What the routing side is told by a tick whose engine's answer is under
+    /// way while another handle comes to hold its worker's URL, one request
+    /// under way on the handle that came: the URL, and what that tick's
+    /// reconcile calls were handed. `replaced` says how the handle came: by
+    /// `replace()`, or by a removal, its eviction and a registration.
+    async fn told_by_a_tick_across_a_swap(replaced: bool) -> (String, Vec<(String, usize)>) {
+        // The engine holds its answer until it is let go.
+        let let_go = Arc::new(Notify::new());
+        let asked = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/v1/loads",
+            axum::routing::get({
+                let (let_go, asked) = (Arc::clone(&let_go), Arc::clone(&asked));
+                move || {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    let let_go = Arc::clone(&let_go);
+                    async move {
+                        let_go.notified().await;
+                        (StatusCode::OK, NATIVE_BODY)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let recorder = Arc::new(ReconcileRecorder::default());
+        let monitor = Arc::new(WorkerMonitor::new(
+            registry.clone(),
+            Arc::clone(&recorder),
+            1,
+            false,
+            false,
+        ));
+        let worker = gauge_worker(&url);
+        worker.set_status(WorkerStatus::Ready);
+        let left = registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let tick = poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now());
+        tokio::pin!(tick);
+        tokio::select! {
+            () = &mut tick => panic!("the tick ended ahead of its engine's answer"),
+            () = wait_until("the tick's fetch", || asked.load(Ordering::SeqCst) == 1) => {}
+        }
+
+        // Another handle comes to hold the URL, with one request under way
+        // on it: by `replace()`, or the worker leaves, its eviction is said
+        // and another worker is registered there.
+        let came = gauge_worker(&url);
+        came.set_status(WorkerStatus::Ready);
+        if replaced {
+            assert!(registry.replace(&left, Arc::clone(&came)));
+        } else {
+            assert!(registry.remove(&left).is_some());
+            monitor.evict_worker_loads(&worker);
+            registry.register(Arc::clone(&came)).unwrap();
+        }
+        let held = WorkerLoadGuard::with_key(Arc::clone(&came), None);
+        let_go.notify_one();
+        tick.await;
+
+        let told = recorder.0.lock().clone();
+        drop(held);
+        (url, told)
+    }
+
+    /// A worker can leave, and another be registered at its URL, while its
+    /// engine's answer is under way. The batch of that answer names the
+    /// handle that left, and what is booked at the URL belongs to the worker
+    /// that came: the routing side is told nothing there by the count of the
+    /// handle that left.
+    #[tokio::test]
+    async fn a_handle_that_left_trims_nothing_of_the_worker_at_its_url() {
+        let (_, told) = told_by_a_tick_across_a_swap(false).await;
+        assert!(
+            told.is_empty(),
+            "the handle that left trimmed what is booked on the worker at its URL: {told:?}"
+        );
+    }
+
+    /// A `replace()` hands the worker that comes the runtime of the handle
+    /// that leaves. The batch of an answer that was under way names the
+    /// handle that left, and its count is the live one at the URL: the
+    /// routing side is told the URL with it, as before.
+    #[tokio::test]
+    async fn a_replaced_handle_trims_by_the_count_it_shares() {
+        let (url, told) = told_by_a_tick_across_a_swap(true).await;
+        assert_eq!(told, vec![(url, 1)]);
+    }
+
     /// Every poll hands the routing side each polled worker, with the
     /// router's live in-flight count on it: the safety net for a completion
     /// the routing side never saw.
