@@ -524,5 +524,12 @@ name = "in_process"
 harness = false
 required-features = ["in-process"]
 
+# A batch of cache events through the worker host's adapter, beside the same
+# writes on a bare chain index.
+[[bench]]
+name = "kv_adapter"
+harness = false
+required-features = ["worker-host"]
+
 [lints]
 workspace = true

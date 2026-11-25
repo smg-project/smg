@@ -65,6 +65,8 @@ mod write;
 
 #[cfg(test)]
 pub(crate) use status::tests::stand;
+#[cfg(all(test, feature = "controller"))]
+pub(crate) use tests::stored_chain;
 
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2491,20 +2493,30 @@ mod tests {
         rows.iter().map(|row| tables.holds_lane(*row, 0)).collect()
     }
 
-    /// One block of `row`'s own written through its lane at rank 0, as the
-    /// body of an admitted batch writes it.
-    pub(super) fn one_block(tables: &KvTables, row: WorkerId, sequence: u64) -> BatchOutcome {
-        let block = [kv_tables::StoredBlock {
-            seq_hash: kv_tables::SequenceHash(1_000 + sequence),
-            content_hash: kv_index::ContentHash(2_000 + sequence),
-        }];
+    /// One batch of `sequence` that stores a chain of blocks from the root,
+    /// one for each of `contents`, written through `row`'s lane at rank 0
+    /// as the body of an admitted batch writes it. A block is named by its
+    /// batch and its content, so no two blocks of a case read alike.
+    pub(crate) fn stored_chain(
+        tables: &KvTables,
+        row: WorkerId,
+        sequence: u64,
+        contents: &[u64],
+    ) -> BatchOutcome {
+        let blocks: Vec<_> = contents
+            .iter()
+            .map(|&content| kv_tables::StoredBlock {
+                seq_hash: kv_tables::SequenceHash(1_000 * sequence + content),
+                content_hash: kv_index::ContentHash(content),
+            })
+            .collect();
         let facts = BatchFacts {
             sequence,
             ..BatchFacts::default()
         };
         tables.admit_through(row, 0, facts, &mut |lane| {
             let mut map = std::mem::take(lane.map());
-            let placed = lane.stored(&block, None, &mut map);
+            let placed = lane.stored(&blocks, None, &mut map);
             *lane.map() = map;
             placed.expect("stored");
         })
@@ -2529,7 +2541,7 @@ mod tests {
         assert_eq!(lanes(&tables, &[a, b, quiet]), [false, true, true]);
         // A replaced row's lane leaves with it, blocks and all, and its
         // next life under the same URL starts with an empty lane, unheard.
-        assert_eq!(one_block(&tables, b, 1), BatchOutcome::Applied);
+        assert_eq!(stored_chain(&tables, b, 1, &[1]), BatchOutcome::Applied);
         assert_eq!(tables.indexed_blocks(b, 0), 1);
         let again = store.upsert(asking(B, 2)).id();
         objects.follow(&store);
@@ -2543,7 +2555,7 @@ mod tests {
         assert_eq!(lanes(&tables, &[quiet, again]), [false, true]);
         // A row that stays keeps what was heard for it through a later
         // follow that changes nothing of it.
-        assert_eq!(one_block(&tables, again, 1), BatchOutcome::Applied);
+        assert_eq!(stored_chain(&tables, again, 1, &[1]), BatchOutcome::Applied);
         store.upsert(asking(D, 1));
         objects.follow(&store);
         assert_eq!(tables.indexed_blocks(again, 0), 1);

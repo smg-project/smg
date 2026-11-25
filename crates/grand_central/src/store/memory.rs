@@ -7,6 +7,8 @@
 
 #[cfg(test)]
 use std::sync::mpsc::{self, Receiver, SyncSender};
+#[cfg(feature = "controller")]
+use std::sync::OnceLock;
 use std::{
     collections::{HashMap, VecDeque},
     mem,
@@ -22,6 +24,8 @@ use arc_swap::ArcSwap;
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
+#[cfg(feature = "controller")]
+use crate::engine::CacheIndexes;
 use crate::{
     document::spec::AppliedSpec,
     engine::{
@@ -131,6 +135,12 @@ pub struct MemoryStore {
     /// the one instant the host's loop cannot have read. A lock of its own,
     /// the last taken and held for the call alone.
     wake: Mutex<Option<Wake>>,
+    /// The indexes of cache events the store's host lends its engines
+    /// ([`MemoryStore::lend_cache_indexes`]): handed once, and handed on to
+    /// the engine of each policy spec the store applies. The store holds
+    /// the engine's own trait object and names no index.
+    #[cfg(feature = "controller")]
+    indexes: OnceLock<Arc<dyn CacheIndexes>>,
 }
 
 /// The replicated rows at one place of the log's history. A controller's is
@@ -220,6 +230,8 @@ impl MemoryStore {
             engine_faults,
             journal: None,
             wake: Mutex::new(None),
+            #[cfg(feature = "controller")]
+            indexes: OnceLock::new(),
         }
     }
 
@@ -778,6 +790,22 @@ impl MemoryStore {
         }
     }
 
+    /// Lend this store's engines the indexes of cache events its host
+    /// keeps, once: a later call is ignored. The engine that stands is
+    /// handed them here, and the engine of each policy spec applied from
+    /// now on where the apply publishes it. Under the membership lock, as
+    /// an apply publishes: an apply finds them here, or its engine stands
+    /// when this call hands them. The store calls nothing of what it is
+    /// handed.
+    #[cfg(feature = "controller")]
+    pub(crate) fn lend_cache_indexes(&self, indexes: Arc<dyn CacheIndexes>) {
+        let _workers = self.workers.lock();
+        if self.indexes.set(Arc::clone(&indexes)).is_err() {
+            return;
+        }
+        self.world.load().front().affinity().set_indexes(indexes);
+    }
+
     /// [`MemoryStore::apply`], its telling at `at` where a standby's
     /// applier holds that place, and `admit` asked under both its locks
     /// (`MemoryStore::apply_admitted`, a controller's): `false` where it
@@ -831,6 +859,12 @@ impl MemoryStore {
             // A number that did not rise is refused here, behind that word,
             // as the writer refused it.
             let spec = built.as_ref().map_err(|stale| *stale)?;
+            // The host's indexes of cache events, where it lent them: the
+            // engine holds them before a decision can reach it.
+            #[cfg(feature = "controller")]
+            if let Some(indexes) = self.indexes.get() {
+                spec.front().affinity().set_indexes(Arc::clone(indexes));
+            }
             let writer = &mut loads.writer;
             let (world, before) = writer.apply(Arc::clone(spec), workers.members())?;
             spec.engine().succeed(self.world.load().spec().engine());
@@ -4049,6 +4083,53 @@ mod tests {
         }
         assert_eq!(takes(), 3, "asked at every pass from its deadline");
         assert_eq!(store.expire_where(after(1_200), |_| true).len(), 1);
+    }
+
+    /// Indexes that hold no index and name one block size: what a case
+    /// reads an engine's hold of them by.
+    #[cfg(feature = "controller")]
+    struct OneSize(u32);
+
+    #[cfg(feature = "controller")]
+    impl CacheIndexes for OneSize {
+        fn index(&self, _: &str) -> Option<Arc<dyn crate::engine::CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            Some(self.0)
+        }
+    }
+
+    /// The preset `round_robin` at `generation`.
+    #[cfg(feature = "controller")]
+    fn round_robin(generation: u64) -> AppliedSpec {
+        use crate::document::spec::PolicySpec;
+
+        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+        document.generation = generation;
+        AppliedSpec::validate(&document).expect("the document validates")
+    }
+
+    /// The indexes a store is lent reach the engine that stands at the
+    /// hand-over, in that call, and the engine of each policy spec applied
+    /// later, where the apply publishes it. The first lending stands: a
+    /// second is ignored, for the engine that stands and for the next one.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn the_engine_that_stands_and_each_one_applied_later_hold_the_lent_indexes() {
+        let store = MemoryStore::new();
+        let size = || store.snapshot().front().affinity().block_size("m");
+        store.apply(round_robin(1)).expect("generation 1");
+        assert_eq!(size(), None, "lent none yet");
+        store.lend_cache_indexes(Arc::new(OneSize(16)));
+        assert_eq!(size(), Some(16), "the engine that stood is handed them");
+        store.apply(round_robin(2)).expect("generation 2");
+        assert_eq!(size(), Some(16), "an engine applied later holds them");
+        store.lend_cache_indexes(Arc::new(OneSize(32)));
+        assert_eq!(size(), Some(16), "the first lending stands");
+        store.apply(round_robin(3)).expect("generation 3");
+        assert_eq!(size(), Some(16), "for the next engine too");
     }
 }
 
