@@ -390,11 +390,11 @@ one of them.
 
 A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). Either form is read into values first, and the document is built from those values by one typed read.
 
-So a YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map stands, a list item with nothing in it is refused in a list of the spec's own, and a tag is refused.
+So a YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map must stand, and reads as a key left out where the field may be null, as each block of a binding may, a list item with nothing in it is refused in a list of the spec's own, and a tag is refused.
 
 A number reads one way in both forms and in every build: a whole number of 64 bits as itself, and any other as the nearest double. The crate's manifest asks the JSON library for its exact reading (`float_roundtrip`). A field of single precision takes the number by a cast, so one that rounds past the largest single reads as infinite there and the spec's check refuses it by its field.
 
-A key written twice is refused by name in both forms. Three numbers read apart, by the forms' own rules: a zero written `-0`, a number past a double, and a YAML whole number in hex, octal or binary. A refusal names the field by its path, or the line and column where the file itself does not read.
+A key written twice is refused by name in both forms. Three numbers read apart, by the forms' own rules: a zero written `-0`, a number past a double, and a YAML whole number in hex, octal or binary. A field's refusal names it by its path, and a file that does not read is refused by its line and column. A document past 128 KiB (`MAX_DOCUMENT_BYTES`) is refused by its size, unread.
 
 ### 3.5 The stage interfaces
 
@@ -730,7 +730,8 @@ request goes to.
   route's rule. So a call that decides again stores the prompt once, for the worker it sends
   to, and a call shed under the rule's name stores nothing. A maker that does not answer is
   stored for the pick's first target. A pick that a session's pin made ahead of the walk stores
-  nothing where a leave or the workers that stand were told in between: its worker may be gone.
+  nothing where the engine's record of sent prefixes was told to forget a worker, or told the
+  workers that stand, in between: its worker may be gone.
 - **[built]** The one call takes a target by the answer the tree's walk was given on it: a
   worker's state is read, and its route's rule asked, once a decision. So the tree names the
   worker the prompt went to. A worker that stops being ready behind that read is still sent to,
@@ -1026,8 +1027,10 @@ pub struct RequestFacts<'a> {
     pub ring: Option<&'a dyn LentRing>, // the hash ring the host keeps, lent to this decision
     pub ring_positions: &'a [u64], // where the request stands on that ring, as the host states it
     pub decode_ring_positions: Option<&'a [u64]>, // a pair's decode side's own places, where its two sides read the ring by two words
-    // six more fields: `affinity`, `named`, `signal_cells`, `session_counted`,
-    // `session_key_from_rid` and `model_fingerprint`, which 5.8 removes
+    // six more fields: `affinity`, the column the affinity stages read, and `named`, the rows named
+    // in its place; `session_key_from_rid`, whether the request's own id gave the routing key; and
+    // three that 5.8 speaks of: `signal_cells` and `session_counted`, which stay, and
+    // `model_fingerprint`, which has yet to go
 }
 
 pub struct Constraints<'a> {
@@ -1047,7 +1050,9 @@ pub struct Constraints<'a> {
 
 What is not built in the engine: a request that states a subset hint is refused. So is one that
 states protocols where a worker of its list, or of either list of a pair, is dialed over one it
-does not state. The refusal names the input.
+does not state. The refusal names the input. A controller's request states no protocols and no hint
+above zero: a frame's wires are stated as places of the list (section 10.2), and such a hint is
+dropped.
 A pair's demand is kept a side at a time: each side of its two lists is held to the
 workers that meet it as that side's role is held to it, and a side it leaves nobody sheds the pair
 under that demand's stage, the prefills' first.
@@ -1359,8 +1364,8 @@ put there: from the reports of the load snapshot the decision holds, and with no
 snapshot. The cells are the list's own where the list holds the cells of the decision's snapshot.
 Where it does not, the decision converts the list's reports, ahead of a routing key's short answer
 too, and the decisions behind it read what it left. A decision that is not the one to convert
-writes cells of its own and waits for nothing: another is converting, or it began no later than the
-one whose cells the list holds. A row that is one rank of a data-parallel worker
+writes cells of its own and waits for nothing: another holds the list's claim, or it began no later
+than the one whose cells the list holds. A row that is one rank of a data-parallel worker
 reads its own rank's values. A worker object that stands for several ranks reads one value a
 name: its ranks' values made one as the signal's `across_ranks` says, under the oldest sample
 among them. The worker crate's report states each rank's own sample instant, so a rank that
@@ -1477,13 +1482,13 @@ gateway's policy. The engine keeps the word on the pick, and one function reads 
 two writes, a pair's two writes behind its pick, the tree's store, and the hand-over of a pin
 followed by its own row. Such a pin that is the profile's own
 goes through the lookup that names a request's holders with its answer made, so its prompt is
-recorded as a pin's the whole decision follows, unless a leave or the workers that stand were told
-meanwhile: the pin's worker may be gone, and the prompt is stored for no worker. A controller asks
+recorded as a pin's the whole decision follows, unless the record of sent prefixes was told to
+forget a worker, or told the workers that stand, meanwhile: the pin's worker may be gone, and the
+prompt is stored for no worker. A controller asks
 the same function where it files a single request's lease, and keeps the answer on the lease's
-record (`LeaseRecord::untold`): no stage hears
-that issue, and the dispatch it tells off the file moves the session's pin and reaches no stage
-and no count of sends. Its decision is the engine's own, so its record of sent prefixes follows the
-word too.
+record (`LeaseRecord::untold`). Where the answer is no, no stage hears that issue, and the dispatch
+the controller tells off the file moves the session's pin and reaches no stage and no count of
+sends. Its decision is the engine's own, so its record of sent prefixes follows the word too.
 
 Each side of a pair is placed by a decision of its own, under its own session, so the rule may
 place one side alone beside a side its stages placed. A pair's pick states a word for each side:
@@ -3113,7 +3118,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The ten presets and the conversion from routing settings | **[built]** | |
 | A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, and a registration that states a label is answered with a warning; planned: the gateway hands the builder its labels, and a document put in force keeps the stages of a profile that did not change |
 | The stage interfaces and a builder's own stages | **[built]** | |
-| The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint and mixed protocols; of the recorded lines only the three hard-demand sheets, `sticky_rank`, `encode_pair` and `pair_named` (109), and 31 lines of `prefix_hash`, replay through it |
+| The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint, and a request that states protocols where a worker of its list is dialed over one it does not state; of the recorded lines only the three hard-demand sheets, `sticky_rank`, `encode_pair` and `pair_named` (109), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
 | `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for, unless its profile reads the record alone: a request whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index. The gateway lends its string trees, and names the entry by classic's own key |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
