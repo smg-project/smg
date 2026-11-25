@@ -1241,8 +1241,9 @@ impl MemoryStore {
     }
 
     /// How many worlds the store published since it was made. A write that
-    /// changes nothing publishes none, and the gateways one sweep lets go
-    /// leave in one.
+    /// changes nothing publishes none, and neither does a status change: a
+    /// world holds no worker's status. The gateways one sweep lets go leave
+    /// in one.
     pub fn publications(&self) -> u64 {
         self.loads.lock().writer.publications()
     }

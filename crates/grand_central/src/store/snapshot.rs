@@ -605,7 +605,7 @@ impl StoreSnapshot {
 }
 
 /// Whether one member names an engine family or a zone outside the standing
-/// generation's lists, as last read ([`Writer::rebuild`], [`Writer::list`]).
+/// generation's lists, as last read ([`Writer::relist`], [`Writer::list`]).
 #[derive(Clone, Copy)]
 struct Held {
     id: WorkerId,
@@ -617,15 +617,17 @@ struct Held {
 }
 
 impl Held {
-    /// What `member` reads under `lists`.
+    /// What `member` reads under `lists`: the two bits alone, so its labels
+    /// are not read ([`ViewLists::outside`]).
     fn read(lists: &ViewLists, member: &WorkerRow) -> Self {
         let facts = &member.facts;
-        let listed = lists.positions(&facts.engine_kind, facts.zone.as_deref(), &facts.labels);
+        let (engine_outside, zone_outside) =
+            lists.outside(&facts.engine_kind, facts.zone.as_deref());
         Self {
             id: member.id,
             revision: member.revision,
-            engine_outside: listed.engine_outside,
-            zone_outside: listed.zone_outside,
+            engine_outside,
+            zone_outside,
         }
     }
 }
@@ -810,7 +812,7 @@ impl Writer {
     /// Read every member under the standing generation's lists and count
     /// those outside them. For an apply whose lists differ: a membership
     /// build reads the members written since the last and carries every
-    /// other's ([`Writer::rebuild`]).
+    /// other's ([`Writer::relist`]).
     fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>) {
         let Self {
             spec,
@@ -844,11 +846,41 @@ impl Writer {
         self.listed.clear();
     }
 
+    /// What the members of a membership build read under the standing
+    /// generation's lists, and the count of those outside them: carried
+    /// from the last read where a member's row stands at the revision it
+    /// was read at, read again where it moved or is new. A build so reads
+    /// the members written since the last. `members` stand in id order.
+    fn relist(&mut self, members: &[(WorkerId, &WorkerRow, WorkerSlot)]) {
+        let lists = self.spec.lists();
+        let outgoing = mem::take(&mut self.listed);
+        let mut incoming = mem::take(&mut self.listed_spare);
+        incoming.clear();
+        let mut from = 0;
+        let mut outside = OutsideLists::default();
+        for &(_, member, _) in members {
+            while outgoing.get(from).is_some_and(|held| held.id < member.id) {
+                from += 1;
+            }
+            let read = match outgoing.get(from) {
+                Some(held) if held.id == member.id && held.revision == member.revision => *held,
+                _ => Held::read(lists, member),
+            };
+            outside.engines += u32::from(read.engine_outside);
+            outside.zones += u32::from(read.zone_outside);
+            incoming.push(read);
+        }
+        self.listed = incoming;
+        self.listed_spare = outgoing;
+        self.outside = outside;
+    }
+
     /// Derive the pools of the membership `members` and publish them
     /// through the one door: each pool's index, each member's places and
     /// its slot, and the vetoes' runs by pool. Whether a member stands
     /// outside the standing generation's lists is read where its row's
-    /// revision moved since it was last read, and carried where it stands.
+    /// revision moved since it was last read, and carried where it stands
+    /// ([`Self::relist`]).
     pub(super) fn rebuild<'a>(
         &mut self,
         members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
@@ -867,18 +899,14 @@ impl Writer {
             .map(|(member, slot)| (member.id, member, slot))
             .collect();
         members.sort_unstable_by_key(|&(id, ..)| id);
-        // What each member reads under the standing generation's lists:
-        // carried from the last read where the member's row stands at the
-        // revision it was read at, read again where it moved or is new. A
-        // build so reads the members written since the last, and a
-        // generation with no list costs it this one test.
-        let lists = self.spec.lists();
-        let listing = !lists.is_empty();
-        let outgoing = mem::take(&mut self.listed);
-        let mut incoming = mem::take(&mut self.listed_spare);
-        incoming.clear();
-        let mut from = 0;
-        let mut outside = OutsideLists::default();
+        // What the members read under the standing generation's lists, in a
+        // walk of its own: the walk below holds no line of it. A generation
+        // with no list costs the build this one test. Nothing was read
+        // under it, and the apply that took the lists away cleared what
+        // stood ([`Self::list`]).
+        if !self.spec.lists().is_empty() {
+            self.relist(&members);
+        }
         // A pool takes its index where the walk first meets a member of it.
         let mut by_model: FxHashMap<Box<str>, [Option<u32>; ROLES]> = FxHashMap::default();
         let mut pools = 0u32;
@@ -886,18 +914,6 @@ impl Writer {
         for &(_, member, _) in &members {
             if standing {
                 ids.push(member.id);
-            }
-            if listing {
-                while outgoing.get(from).is_some_and(|held| held.id < member.id) {
-                    from += 1;
-                }
-                let read = match outgoing.get(from) {
-                    Some(held) if held.id == member.id && held.revision == member.revision => *held,
-                    _ => Held::read(lists, member),
-                };
-                outside.engines += u32::from(read.engine_outside);
-                outside.zones += u32::from(read.zone_outside);
-                incoming.push(read);
             }
             let facts = &member.facts;
             let side = role_slot(facts.role);
@@ -929,12 +945,6 @@ impl Writer {
         self.places
             .sort_unstable_by_key(|place| (place.id, place.pool));
         self.places.dedup_by_key(|place| (place.id, place.pool));
-        // What this build read or carried of the members under the lists,
-        // and the count outside the lists: none where the generation
-        // declares no list, whatever the last one counted.
-        self.listed = incoming;
-        self.listed_spare = outgoing;
-        self.outside = outside;
         // Every member's id and slot, in the id order of this write's one
         // sort: a member in a pool, and one that offers no model.
         let slots: Box<[(WorkerId, WorkerSlot)]> =

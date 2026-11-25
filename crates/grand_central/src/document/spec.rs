@@ -6131,16 +6131,41 @@ impl ViewLists {
         zone: Option<&str>,
         labels: &BTreeMap<String, String>,
     ) -> ViewListPositions {
-        let engine_at = self.engines.get(engine).copied();
-        let zone = zone.filter(|zone| !zone.is_empty());
-        let zone_at = zone.and_then(|zone| self.zones.get(zone).copied());
+        let (engine_at, engine_outside) = self.engine(engine);
+        let (zone_at, zone_outside) = self.zone(zone);
         ViewListPositions {
             engine_kind: engine_at.unwrap_or(0),
             zone: zone_at.unwrap_or(0),
             labels: self.met(labels),
-            engine_outside: engine_at.is_none() && !engine.is_empty() && !self.engines.is_empty(),
-            zone_outside: zone_at.is_none() && zone.is_some() && !self.zones.is_empty(),
+            engine_outside,
+            zone_outside,
         }
+    }
+
+    /// Whether a worker's engine family and its zone stand outside these
+    /// lists, the family first: the two bits [`Self::positions`] answers,
+    /// for a reader that keeps nothing else of that read. No label is read.
+    #[must_use]
+    pub(crate) fn outside(&self, engine: &str, zone: Option<&str>) -> (bool, bool) {
+        (self.engine(engine).1, self.zone(zone).1)
+    }
+
+    /// The position of an engine family, and whether it stands outside the
+    /// list: the worker names one, and the list holds entries and not that
+    /// one.
+    fn engine(&self, engine: &str) -> (Option<u16>, bool) {
+        let at = self.engines.get(engine).copied();
+        let outside = at.is_none() && !engine.is_empty() && !self.engines.is_empty();
+        (at, outside)
+    }
+
+    /// The position of a zone and whether it stands outside the list, as
+    /// [`Self::engine`] reads a family. An empty zone is no zone.
+    fn zone(&self, zone: Option<&str>) -> (Option<u16>, bool) {
+        let zone = zone.filter(|zone| !zone.is_empty());
+        let at = zone.and_then(|zone| self.zones.get(zone).copied());
+        let outside = at.is_none() && zone.is_some() && !self.zones.is_empty();
+        (at, outside)
     }
 
     /// The bits of the selectors a worker's labels meet, in one pass over
@@ -7968,11 +7993,18 @@ mod tests {
                 ViewListPositions::default()
             );
         }
+        // The narrow reader answers those two bits alone, the family's
+        // first.
+        assert_eq!(lists.outside("beta", Some("west")), (false, false));
+        assert_eq!(lists.outside("gamma", Some("west")), (true, false));
+        assert_eq!(lists.outside("beta", Some("north")), (false, true));
+        assert_eq!(lists.outside("", Some("")), (false, false));
         // No list: every worker reads 0 and none is outside.
         let none = AppliedSpec::validate(&spec_with_view("{}")).expect("the document validates");
         assert!(none.lists().is_empty() && AppliedSpec::unbound().lists().is_empty());
         let read = none.lists().positions("beta", Some("west"), &held);
         assert_eq!(read, ViewListPositions::default());
+        assert_eq!(none.lists().outside("beta", Some("west")), (false, false));
     }
 
     #[test]
