@@ -77,6 +77,42 @@ impl ChatPreparationStage {
     }
 }
 
+/// Whether a string of the request, a key or a value at any depth, holds a
+/// media anchor of the plan's modalities: the anchor token itself, or the
+/// text a template writes in its place, which
+/// `multimodal::anchor_rendered_markers` turns into the token as the
+/// tokenize step does for a rendered prompt.
+fn types_a_media_anchor(
+    request: &ChatCompletionRequest,
+    plan: &multimodal::MediaPlan,
+    placeholders: &multimodal::PlaceholderTokens,
+) -> bool {
+    fn any_string(value: &serde_json::Value, holds: &dyn Fn(&str) -> bool) -> bool {
+        match value {
+            serde_json::Value::String(text) => holds(text),
+            serde_json::Value::Array(items) => items.iter().any(|item| any_string(item, holds)),
+            serde_json::Value::Object(fields) => fields
+                .iter()
+                .any(|(key, field)| holds(key) || any_string(field, holds)),
+            _ => false,
+        }
+    }
+    serde_json::to_value(request).is_ok_and(|request| {
+        any_string(&request, &|text| {
+            let text = multimodal::anchor_rendered_markers(
+                Some(placeholders),
+                &llm_tokenizer::traits::PromptEncoding::FromText,
+                text.to_owned(),
+            );
+            plan.modalities().iter().any(|&modality| {
+                placeholders
+                    .get(modality)
+                    .is_some_and(|anchor| text.contains(anchor))
+            })
+        })
+    })
+}
+
 /// The chat request → prepared inputs pipeline, shared by the chat endpoint
 /// and the transcription endpoint (whose backend request is chat-shaped).
 ///
@@ -128,12 +164,15 @@ pub(crate) async fn prepare_chat_like(
         // where the rendered prompt's anchors of each modality are counted
         // against the request's media behind it: without a media plan, or
         // with one whose placeholders are the engine's own, the door's
-        // refusal stands.
+        // refusal stands. It stands too where a string of the request holds
+        // an anchor of the plan's modalities: the count takes a typed anchor
+        // for a written one, so where the render writes no anchor for the
+        // part it would pair the part with the typed place.
         if let Some(refusal) = unanchored_media_refusal.filter(|_| {
-            media
-                .media
-                .as_ref()
-                .is_none_or(|media| media.placeholders.is_worker_only())
+            media.media.as_ref().is_none_or(|media| {
+                media.placeholders.is_worker_only()
+                    || types_a_media_anchor(&body_ref, &media.plan, &media.placeholders)
+            })
         }) {
             return Err(error::bad_request("unsupported_content_part", refusal));
         }
@@ -488,7 +527,9 @@ mod tests {
     /// A system message's image is taken where the rendered prompt carries
     /// its anchor and refused by the anchor check where it carries none; a
     /// model without a media spec and a template that writes media as text
-    /// have no anchor check, and the door's refusal stands for them.
+    /// have no anchor check, and the door's refusal stands for them, as it
+    /// does where the user's text holds the anchor: the check counts a typed
+    /// anchor like a written one.
     #[tokio::test]
     async fn a_system_image_is_taken_only_under_the_anchor_check() {
         use std::sync::Arc;
@@ -507,23 +548,40 @@ mod tests {
 
         // The image anchor of the family the config below names.
         const ANCHOR: u32 = 32000;
-        for (has_spec, media_handling, rendered, refusal) in [
-            (true, MediaHandling::Preprocess, vec![1, ANCHOR, 3], None),
+        const QUESTION: &str = "What is in the system image?";
+        for (has_spec, media_handling, question, rendered, refusal) in [
             (
                 true,
                 MediaHandling::Preprocess,
+                QUESTION,
+                vec![1, ANCHOR, 3],
+                None,
+            ),
+            (
+                true,
+                MediaHandling::Preprocess,
+                QUESTION,
                 vec![1, 2, 3],
                 Some("multimodal_prompt_contract_mismatch"),
             ),
             (
                 false,
                 MediaHandling::Preprocess,
+                QUESTION,
                 vec![1, ANCHOR, 3],
                 Some("unsupported_content_part"),
             ),
             (
                 true,
                 MediaHandling::TemplateText,
+                QUESTION,
+                vec![1, ANCHOR, 3],
+                Some("unsupported_content_part"),
+            ),
+            (
+                true,
+                MediaHandling::Preprocess,
+                "What is in the system image? <image>",
                 vec![1, ANCHOR, 3],
                 Some("unsupported_content_part"),
             ),
@@ -560,7 +618,7 @@ mod tests {
                             {"type": "image_url", "image_url": {"url": "https://a/1.png"}},
                             {"type": "text", "text": "You are an image analyst."}
                         ]},
-                        {"role": "user", "content": "What is in the system image?"}
+                        {"role": "user", "content": question}
                     ]
                 }))),
                 None,
@@ -582,7 +640,7 @@ mod tests {
             assert_eq!(
                 refused_with.as_deref(),
                 refusal,
-                "media spec: {has_spec}, {media_handling:?}"
+                "media spec: {has_spec}, {media_handling:?}, {question}"
             );
         }
     }
