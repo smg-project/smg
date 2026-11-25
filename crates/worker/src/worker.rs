@@ -1726,9 +1726,10 @@ static FIXED_COUNT_NAMES: LazyLock<[Arc<str>; 3]> = LazyLock::new(|| {
 });
 
 /// One value an engine reports by name alongside its fixed fields. The name
-/// and the unit are shared strings: a copy of a report, which the load
-/// monitor makes at each publish, allocates none. A connection that knows
-/// a name ahead of its reports makes it once and clones it.
+/// and the unit are shared strings: a copy of an entry, which the load
+/// monitor makes where several workers share one polled answer and where
+/// it publishes a pushed report, allocates none. A connection that knows a
+/// name ahead of its reports makes it once and clones it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NamedValue {
     pub name: Arc<str>,
@@ -1836,11 +1837,10 @@ pub struct SchedulerLoadSnapshot {
     /// of the rank or by a poll's answer. The time is rounded up to a whole
     /// millisecond: a reader ends the count by this age, and a count must
     /// never read younger than it is. The load monitor writes it, for a
-    /// count this entry keeps ([`Self::kept`]), in a report that lists the
-    /// rank alone. `None` for a count this entry's own source states, for a
-    /// count nothing has stated, and in a report of several ranks: such a
-    /// report has one sample instant, which every rank's record moves, so
-    /// a reader cannot date one rank's count by it. Never serialized, as
+    /// count this entry keeps ([`Self::kept`]), in a report of one rank
+    /// and of several: the age counts back from this entry's own sample
+    /// ([`Self::sampled_at`]). `None` for a count this entry's own source
+    /// states and for a count nothing has stated. Never serialized, as
     /// the mark is not.
     #[serde(skip)]
     #[schemars(skip)]
@@ -1850,6 +1850,19 @@ pub struct SchedulerLoadSnapshot {
     #[serde(skip)]
     #[schemars(skip)]
     pub kept_total_tokens_age_ms: Option<u32>,
+    /// When this rank's state was sampled, on this process's clock, where
+    /// the entry's writer knows it apart from its report's
+    /// ([`WorkerLoadResponse::sampled_at`]). The load monitor states it
+    /// for each row of a worker that pushes its load: a record's receipt
+    /// less its age and the one-way margin, or the instant the poll that
+    /// laid the row is dated at. A report of several ranks is dated by its
+    /// last record of any rank, so a reader that dates one rank's values
+    /// takes this instant. `None`: the entry is as old as its report, as
+    /// every entry of a polled answer is. Not serialized: it is meaningful
+    /// only in the process that set it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub sampled_at: Option<std::time::Instant>,
 }
 
 impl SchedulerLoadSnapshot {
@@ -1881,9 +1894,9 @@ impl SchedulerLoadSnapshot {
     /// offered where the entry states how old it is
     /// ([`Self::kept_used_tokens_age_ms`]), under that age: the count as
     /// it was last stated, which a reader ends by the age. A
-    /// kept count with no age is not offered: it is stored as zero or as a
-    /// record's whose instant the entry does not know, as in a report of
-    /// several ranks. An entry with no token capacity offers neither count,
+    /// kept count with no age is not offered: no record of the rank has
+    /// stated it, and the entry stores a zero. An entry with no token
+    /// capacity offers neither count,
     /// whatever its source: an engine that reports its counts reports its
     /// capacity ([`WorkerLoadResponse::has_absolute_token_data`]), and one
     /// that keeps no such size fills both with zero on every record. The
@@ -2145,14 +2158,22 @@ impl WorkerLoadResponse {
             .sum()
     }
 
+    /// Whether the report lists at least one entry and as many as the ranks it
+    /// states: a report short of a rank states no whole-worker sum.
+    pub fn lists_every_rank(&self) -> bool {
+        !self.loads.is_empty()
+            && self.loads.len() >= usize::try_from(self.dp_rank_count).unwrap_or(0)
+    }
+
     /// Resident context tokens summed across all DP ranks; `None` unless
-    /// every rank reports them.
+    /// every rank reports them. A report that lists fewer entries than the
+    /// ranks it states answers `None` too, ahead of any sum: the ranks it
+    /// leaves out are in none.
     pub fn total_resident_tokens(&self) -> Option<i64> {
-        self.loads
-            .iter()
-            .map(|l| l.num_resident_tokens)
-            .sum::<Option<i64>>()
-            .filter(|_| !self.loads.is_empty())
+        if !self.lists_every_rank() {
+            return None;
+        }
+        self.loads.iter().map(|l| l.num_resident_tokens).sum()
     }
 
     /// Total running requests summed across all DP ranks.
@@ -2179,6 +2200,17 @@ impl WorkerLoadResponse {
     /// overwrites another's.
     pub fn ranks_are_dp_ranks(&self) -> bool {
         self.loads.iter().all(|l| l.worker.is_none())
+    }
+
+    /// Whether one engine's answer holds a row for every one of its `ranks`,
+    /// so that [`Self::for_dp_rank`] finds each rank's own report in it.
+    pub fn names_dp_ranks(&self, ranks: usize) -> bool {
+        self.ranks_are_dp_ranks()
+            && (0..ranks).all(|rank| {
+                self.loads
+                    .iter()
+                    .any(|load| usize::try_from(load.dp_rank) == Ok(rank))
+            })
     }
 
     pub fn dp_rank_loads(&self) -> HashMap<isize, isize> {
@@ -2648,6 +2680,20 @@ mod load_snapshot_tests {
                 (KV_TOKENS_CAPACITY.to_owned(), 1_373.0)
             ]
         );
+    }
+
+    /// An entry's size. A report holds its entries until the worker's next
+    /// one, a poll that several workers share copies entries for each of
+    /// them but the last (the entries of the worker's own rank where an
+    /// engine answers, every entry of a gateway's rollup), and a pushed
+    /// report's publish copies each of its entries, so a field the entry
+    /// gains is a cost of each, on the path with Grand Central and on the
+    /// one without: the pin is exact. The entry's own sample instant is two
+    /// words of it.
+    #[test]
+    fn a_load_entry_takes_the_pinned_bytes() {
+        assert_eq!(size_of::<Option<std::time::Instant>>(), 16);
+        assert_eq!(size_of::<SchedulerLoadSnapshot>(), 352);
     }
 
     /// A count the entry keeps from an older record is offered where the

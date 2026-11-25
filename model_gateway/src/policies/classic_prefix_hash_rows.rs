@@ -1,9 +1,9 @@
 //! The recorder of the gateway's prefix hash policy: each row is a pool of
 //! workers, what the router holds of each one (the requests in flight and
 //! whether it is ready), the policy's configuration and what the gateway's
-//! single-worker placement answered. The policy controller crate replays the
+//! single-worker placement answered. The Grand Central crate replays the
 //! rows through its own decision
-//! (`crates/policy_controller/tests/classic/prefix_hash.rs`).
+//! (`crates/grand_central/tests/classic/prefix_hash.rs`).
 //!
 //! A prompt is written as runs of consecutive token ids, `[first, count]`
 //! each. A request carries a prompt as tokens or as text (each token id
@@ -333,6 +333,7 @@ impl Bed {
             RoutingPool::HttpRegular,
             None,
             inputs,
+            placement::Stated::nothing,
         )
         .expect("the request is placed");
         let place = self

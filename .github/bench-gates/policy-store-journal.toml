@@ -1,16 +1,15 @@
-# Regression gate for `cargo bench -p smg-policy-controller --bench store_journal`, run by
+# Regression gate for `cargo bench -p smg-grand-central --bench store_journal`, run by
 # .github/workflows/benchmark-policy-store-journal.yml on pull requests through scripts/bench_gate.py.
 #
-# The gate runs the twenty-seven single-threaded rows of the store's journal. Twenty-four are at 8, 64 and 512
-# workers, each beside its twin on a store with no journal (`plain`): one load record's write with a journal of
-# every kind (`policy_store_journal/load_write/journaled/<n>`) and with one of the watched kinds alone
-# (`.../load_write/watched/<n>`), one status write (`.../status_write/<kind>/<n>`, `told` the journaled write
-# on a log with a listener) and one membership write (`.../member_write/<kind>/<n>`). Three read the log: a
-# batch of 16 and of 256 events (`policy_store_journal/read/<events>`) and a watch's read at the head
-# (`.../read/watched_at_head`).
+# The gate runs the twenty-four single-threaded rows of the store's journal. Twenty-one are at 8, 64 and 512
+# workers, each beside its twin on a store with no journal (`plain`): one load record's write on a journaled
+# store, whose journal is told nothing of it (`policy_store_journal/load_write/journaled/<n>`), one status write
+# (`.../status_write/<kind>/<n>`, `told` the journaled write on a log with a listener) and one membership write
+# (`.../member_write/<kind>/<n>`). Three read the log: a batch of 16 and of 256 events
+# (`policy_store_journal/read/<events>`) and a watch's read at the head (`.../read/watched_at_head`).
 #
-# The filter leaves out the binary's other rows: the cut's rows (`policy_store_journal/cut/`) and the write beside
-# a draining reader (`policy_store_journal/load_write_drained/`), which is for a run pinned to two cores.
+# The filter names the two load write kinds the gate runs, `plain` and `journaled`, and leaves every other row of
+# the binary out, the cut's rows (`policy_store_journal/cut/`) among them.
 #
 # Threshold (the method is described in tokenizer.toml): the identical-build spread, read through this gate as
 # three base and three pull-request runs of one build pinned to one core, the base a copy of the binary with one
@@ -29,10 +28,10 @@
 # read 2.1 to 24.0 % and is not the table's: that rule is what holds a row there.
 
 repeats = 3
-filter = "^policy_store_journal/(load_write|status_write|member_write|read)/"
+filter = "^policy_store_journal/(load_write/(plain|journaled)|status_write|member_write|read)/"
 
 sources = [
-    "crates/policy_controller/benches/store_journal.rs",
+    "crates/grand_central/benches/store_journal.rs",
 ]
 
 [[gate]]

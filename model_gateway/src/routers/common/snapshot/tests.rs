@@ -9,13 +9,16 @@ use std::{
 };
 
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+use smg_grand_central::engine::FixedFacts;
 use smg_worker::{
     identity::basic::BasicWorker,
     test_support::{no_health_check, worker_with_model_aliases},
 };
 
 use super::*;
-use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+use crate::routers::{
+    common::place_request::wire_number, grpc::backend_client::BasicWorkerBuilder,
+};
 
 /// A gRPC worker of `model` whose card names `window` as its context
 /// window.
@@ -343,6 +346,72 @@ fn a_refresh_keeps_the_list_its_order_and_its_handles() {
         .iter()
         .zip(&workers)
         .all(|(listed, registered)| Arc::ptr_eq(listed, registered)));
+}
+
+/// A pool's list is lent to Grand Central with what the gateway states
+/// of each worker: the number of its runtime and transport and nothing
+/// else, in the list's order. The list, its cell and its facts are made at
+/// the pool's first lending and handed again at every later one, and each
+/// pool has its own.
+#[test]
+fn a_pool_is_lent_with_the_wire_each_of_its_workers_is_on() {
+    let registry = WorkerRegistry::new();
+    let registered = [
+        ("grpc://w:1", ConnectionMode::Grpc, RuntimeType::Sglang),
+        ("grpc://w:2", ConnectionMode::Grpc, RuntimeType::Vllm),
+        ("http://w:3", ConnectionMode::Http, RuntimeType::Vllm),
+    ];
+    for (url, connection, runtime) in registered {
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("llama-3"))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(connection)
+                    .runtime_type(runtime)
+                    .health_config(no_health_check())
+                    .build(),
+            ))
+            .unwrap();
+    }
+    let snapshot = registry.get_routing_snapshot("llama-3");
+    let stated = |pool: RoutingPool| -> Vec<(String, u32)> {
+        let lent = snapshot.lent(pool);
+        assert!(Arc::ptr_eq(lent.workers, snapshot.pool(pool)));
+        let facts = lent.facts.expect("one fact a worker");
+        assert_eq!(facts.len(), lent.workers.len());
+        let wire_of = |(worker, facts): (&Arc<dyn Worker>, &FixedFacts)| {
+            let mut wire_alone = FixedFacts::default();
+            wire_alone.demands.runtime = facts.demands.runtime;
+            assert_eq!(*facts, wire_alone, "the wire and nothing else");
+            (worker.url().to_owned(), facts.demands.runtime)
+        };
+        let mut stated: Vec<_> = lent.workers.iter().zip(facts).map(wire_of).collect();
+        stated.sort();
+        stated
+    };
+    let on = |url: &str, runtime, connection| (url.to_owned(), wire_number(runtime, connection));
+    assert_eq!(
+        stated(RoutingPool::GrpcPipelineRegular),
+        [
+            on("grpc://w:1", RuntimeType::Sglang, ConnectionMode::Grpc),
+            on("grpc://w:2", RuntimeType::Vllm, ConnectionMode::Grpc),
+        ]
+    );
+    assert_eq!(
+        stated(RoutingPool::HttpRegular),
+        [on("http://w:3", RuntimeType::Vllm, ConnectionMode::Http)]
+    );
+    assert!(stated(RoutingPool::HttpPrefill).is_empty());
+
+    let grpc = snapshot.lent(RoutingPool::GrpcPipelineRegular);
+    let again = snapshot.lent(RoutingPool::GrpcPipelineRegular);
+    let http = snapshot.lent(RoutingPool::HttpRegular);
+    assert!(std::ptr::eq(grpc.cell, again.cell));
+    assert!(std::ptr::eq(grpc.workers, again.workers));
+    let at = |list: LentList<'_>| list.facts.map(<[FixedFacts]>::as_ptr);
+    assert_eq!(at(grpc), at(again));
+    assert!(!std::ptr::eq(grpc.cell, http.cell));
 }
 
 #[test]

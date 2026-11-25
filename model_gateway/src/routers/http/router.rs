@@ -73,7 +73,7 @@ use crate::{
     routers::{
         common::{
             attach_sized_body,
-            attempt_ledger::{mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{is_upstream_answer, mark_upstream_answer, AttemptLedger},
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
@@ -87,6 +87,7 @@ use crate::{
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
+            responses_compat::lower_responses_request_for_local_backend,
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
@@ -173,8 +174,9 @@ pub struct Router {
     /// wait lasts this long. `None` disables.
     stream_stall_timeout: Option<Duration>,
     /// Cap on buffering a request only to keep it retryable; larger eligible
-    /// requests stream and forfeit router retries. `0` never buffers for
-    /// retries.
+    /// requests stream and forfeit router retries. It also bounds the
+    /// transcription audio held for one resend after a pre-response connection
+    /// failure. `0` disables both kinds of buffering.
     max_buffered_request_bytes: u64,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -329,7 +331,12 @@ impl Router {
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers. `tried`
     /// are the engines the request's failed attempts dispatched to (see
-    /// `PlacementInputs::tried`).
+    /// `PlacementInputs::tried`). `stated` states what Grand Central
+    /// alone reads of the request ([`placement::Stated`]): the placement
+    /// calls it where the engine decides and nowhere else, so a body is read
+    /// for it under the engine alone. Always inlined, as the placement's
+    /// front is: a classic placement's way builds nothing for the call.
+    #[inline(always)]
     #[expect(
         clippy::too_many_arguments,
         reason = "selection threads every routing input the policy consumes"
@@ -345,6 +352,7 @@ impl Router {
         cache_namespace: Option<CacheNamespace>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
+        stated: impl FnOnce() -> placement::Stated,
     ) -> Option<placement::Placed> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -364,6 +372,7 @@ impl Router {
                 candidate_filter,
                 tried,
             },
+            stated,
         )
     }
 
@@ -566,14 +575,21 @@ impl Router {
                     // entry before routing: the cast of a validated id cannot wrap
                     .map(|ids| ids.iter().map(|&id| id as u32).collect())
             });
-        let text = tokens
-            .is_none()
-            .then(|| typed_req.extract_text_for_routing());
+        let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
+        // A classic policy is handed the text as before. Grand Central
+        // is handed it where a stage of its document reads it, or where the
+        // request names a cache partition, whose seed the engine states with
+        // a prompt. The hint was read above and a document's answer follows
+        // no routing key, so the registry is asked without the headers.
+        let text = (tokens.is_none()
+            && (self.policy_registry.engine().is_none()
+                || cache_namespace.is_some()
+                || self.policy_registry.any_policy_needs_request_text(None)))
+        .then(|| typed_req.extract_text_for_routing());
         let rid_key = self
             .policy_registry
             .derive_rid_key(typed_req.rid())
             .map(str::to_string);
-        let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
         RoutingDerivatives {
             tokens,
             text,
@@ -749,7 +765,7 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        self.account_attempt_outcome(attempt, worker, response, head_success_recorded)
+        self.account_attempt_outcome(attempt, &placed, response, head_success_recorded)
     }
 
     /// The worker of one attempt, as the placement answered it: selected
@@ -779,6 +795,7 @@ impl Router {
                     view.cache_namespace,
                     candidate_filter,
                     &tried,
+                    move || placement::Stated::of_limit(view.request.max_output_tokens()),
                 )
             })
         }) {
@@ -837,10 +854,10 @@ impl Router {
     }
 
     /// The attempt's dispatch: the request's load guard, made from the
-    /// placement's answer ([`placement::Placed::guard`]), the request-sent
-    /// event, the trace headers, the relay mode, the serialized body and the
-    /// send through the relay. Once the bytes exist the lease frees the parsed
-    /// request when retries are disabled.
+    /// placement's answer ([`placement::Placed::guard_keeping_end`]), the
+    /// request-sent event, the trace headers, the relay mode, the serialized
+    /// body and the send through the relay. Once the bytes exist the lease
+    /// frees the parsed request when retries are disabled.
     async fn dispatch_attempt<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
@@ -857,8 +874,11 @@ impl Router {
             route
         };
 
-        let load_guard = lease
-            .with_view(|view| placed.guard(self.policy_registry.sticky_key(headers, view.rid_key)));
+        // The attempt's account tells the outcome through the answer, which
+        // keeps a handle on the request's end from here.
+        let load_guard = lease.with_view(|view| {
+            placed.guard_keeping_end(self.policy_registry.sticky_key(headers, view.rid_key))
+        });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent {
@@ -962,19 +982,24 @@ impl Router {
     /// outcome, unless a streamed head already recorded a success that the
     /// verdict kept; the retry window settled on a definitive answer; the
     /// engine on the tried list after a replayable failure; the worker error
-    /// metric on a server error.
+    /// metric on a server error. Where the breaker's outcome is recorded,
+    /// the same status is reported through `placed`, the answer the
+    /// attempt keeps ([`placement::Placed::ended`]): a streamed answer's
+    /// good head is its relay's to report, at the stream's end.
     fn account_attempt_outcome<T>(
         &self,
         attempt: &TypedAttempt<'_, T>,
-        worker: &Arc<dyn Worker>,
+        placed: &placement::Placed,
         mut response: Response,
         head_success_recorded: bool,
     ) -> Response {
+        let worker = placed.worker();
         let model_id = attempt.model_id;
         let ledger = attempt.ledger;
         let status = response.status();
         if !head_success_recorded || !status.is_success() {
             ledger.record_outcome(worker.as_ref(), status.as_u16());
+            placed.ended(status.as_u16(), || is_upstream_answer(&response));
         }
         // A definitive answer closes the retry window on this worker: the next
         // attempt goes to another available worker, or the answer stands.
@@ -1141,8 +1166,11 @@ impl Router {
     /// canonical model, the request counted under its labels), the worker and
     /// its dispatch-time overload re-check, the form's send and the relay of
     /// the worker's answer. Separate from `route_typed_request` because the
-    /// endpoint is not JSON-bodied: the form is sent once (no retry could
-    /// replay it) and never passes through `prepare_request`.
+    /// endpoint is not JSON-bodied: its stream cannot be replayed (a resend
+    /// builds the form again), and the form never passes through
+    /// `prepare_request`. So the form names no data-parallel rank: a rank's
+    /// worker is sent the request with none, at its engine's own address, and
+    /// the engine places it among its ranks.
     async fn route_multipart_transcription(
         &self,
         headers: Option<&HeaderMap>,
@@ -1190,10 +1218,14 @@ impl Router {
         // Streamed requests have no rid; the header is the whole sticky key.
         let load_guard = placed.guard(self.policy_registry.sticky_header_key(headers));
 
+        // Endpoint input has nonempty audio: the multipart extractor rejects
+        // an empty file, so a zero limit cannot make a resend eligible.
+        let resend = audio.bytes.len() as u64 <= self.max_buffered_request_bytes;
         let res = match Self::send_transcription(
             headers,
             body,
             audio,
+            resend,
             worker.as_ref(),
             route,
             canonical_model.as_deref(),
@@ -1227,13 +1259,16 @@ impl Router {
     }
 
     /// The worker of a transcription, or the refusal this router answers.
-    /// Multipart transcription can't route through `worker.prepare_request`,
-    /// which is the hook that injects `data_parallel_rank` for DP-aware
-    /// workers: DP-aware workers are pre-filtered out of the candidate pool
-    /// so the policy can pick a non-DP worker when one exists, and the
-    /// request falls back to model_not_found / 400 only when the pool is
-    /// empty or every candidate is DP-aware. The verdict on a policy that
-    /// returns no worker is judged from the same pool.
+    /// The route reads the model's snapshot once and places the request
+    /// over its HTTP pool whole, by the selection every other single
+    /// request takes ([`placement::select_single_of`]): a worker that
+    /// registered a data-parallel rank takes a transcription like a plain
+    /// one. Multipart transcription can't route through
+    /// `worker.prepare_request`, the hook that injects `data_parallel_rank`
+    /// for a DP-aware worker, so no worker is sent a rank and the two are
+    /// the same send. An empty pool is answered model_not_found, and the
+    /// verdict on a placement that returns no worker is judged from the
+    /// same pool: the one read serves the refusals and the placement.
     fn select_transcription_worker(
         &self,
         headers: Option<&HeaderMap>,
@@ -1241,9 +1276,8 @@ impl Router {
         routing: &RoutingDerivatives,
         rid: Option<&str>,
     ) -> Result<placement::Placed, Response> {
-        let all_workers = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::HttpRegular);
+        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        let all_workers = snapshot.pool(RoutingPool::HttpRegular);
         if all_workers.is_empty() {
             return Err(self.report_refusal(
                 "Router::route_multipart_transcription",
@@ -1251,23 +1285,13 @@ impl Router {
                 error::model_not_found(model_id),
             ));
         }
-        let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
-            .iter()
-            .filter(|w| !w.is_dp_aware())
-            .cloned()
-            .collect();
-        if non_dp_workers.is_empty() {
-            return Err(error::bad_request(
-                "dp_aware_not_supported",
-                "/v1/audio/transcriptions does not yet support DP-aware workers",
-            ));
-        }
-        let Some(placed) = placement::select_from(
+        let Some(placed) = placement::select_single_of(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
+            &snapshot,
             RoutingPool::HttpRegular,
-            &non_dp_workers,
+            None,
             PlacementInputs {
                 text: routing.text.as_deref(),
                 tokens: routing.tokens.as_deref(),
@@ -1278,12 +1302,13 @@ impl Router {
                 candidate_filter: None,
                 tried: &[],
             },
+            placement::Stated::nothing,
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
             // or a self-filtering policy missed on an all-overloaded pool, so
             // a shed keeps its Retry-After, retryability and metric.
             let resp = match placement::failure_from(
-                &non_dp_workers,
+                all_workers,
                 model_id,
                 self.worker_registry.overload_shed_enabled(),
             ) {
@@ -1295,7 +1320,7 @@ impl Router {
                 | PlacementFailure::PrefillAtCapacity => {
                     // The verdict cannot tell a policy miss from a drained
                     // pool; the pool can.
-                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                    let message = if all_workers.iter().any(|w| w.is_available()) {
                         "Policy returned no eligible worker"
                     } else {
                         "All workers are unavailable (circuit breaker open or unhealthy)"
@@ -1314,13 +1339,20 @@ impl Router {
 
     /// The send of a transcription to its worker: the trace headers, the
     /// request-sent event, the multipart form, the forwarded headers and the
-    /// one send (the form's streamed body cannot be cloned, so the
-    /// stale-connection retry never fires). A form the request cannot
-    /// build or a send that fails is the finalized error answer.
+    /// send. The form's streamed body cannot be cloned, so one resend after a
+    /// pre-response transport failure builds the request again from held
+    /// audio. Audio outside the configured bound is given to its one form and
+    /// sent once. A form the request cannot build or a send that fails is the
+    /// finalized error answer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the form inputs and the dispatch accounting are passed separately"
+    )]
     async fn send_transcription(
         headers: Option<&HeaderMap>,
         body: &TranscriptionRequest,
         audio: AudioFile,
+        resend: bool,
         worker: &dyn Worker,
         route: &'static str,
         canonical_model: Option<&str>,
@@ -1335,28 +1367,46 @@ impl Router {
         }
         .emit();
 
-        let form = match build_transcription_form(body, audio, canonical_model) {
-            Ok(f) => f,
+        let request = |audio: &AudioFile| {
+            let form = build_transcription_form(body, audio, canonical_model)?;
+            let endpoint_url = worker.endpoint_url(route);
+            // reqwest sets the multipart Content-Type (with boundary) itself; the
+            // forward allow-list already excludes Content-Type/Content-Length.
+            Ok::<_, String>(header_utils::apply_forwarded_request_headers(
+                worker.http_client().post(&endpoint_url).multipart(form),
+                headers,
+                worker.api_key(),
+            ))
+        };
+        let first = match request(&audio) {
+            Ok(first) => first,
             Err(e) => {
                 let resp = error::bad_request("multipart_build_failed", e);
                 outcome.pre_send_error(&resp);
                 return Err(resp);
             }
         };
-
-        let endpoint_url = worker.endpoint_url(route);
-        let mut request_builder = worker.http_client().post(&endpoint_url).multipart(form);
-
-        // reqwest sets the multipart Content-Type (with boundary) itself; the
-        // forward allow-list already excludes Content-Type/Content-Length.
-        request_builder = header_utils::apply_forwarded_request_headers(
-            request_builder,
-            headers,
-            worker.api_key(),
-        );
+        // The first form owns its body from here on. Only audio eligible for a
+        // resend remains held until that send produces a response head.
+        let held = resend.then_some(audio);
 
         WorkerMetrics::record_worker_request(worker);
-        match send_with_stale_conn_retry(request_builder).await {
+        let sent = match send_with_stale_conn_retry(first).await {
+            // The form's streamed body cannot be cloned, so the helper's own
+            // resend never fires for it: build the request again (the inputs
+            // that built the first form build the second).
+            Err(e) if is_pre_response_transport_error(&e) => {
+                match held.as_ref().and_then(|audio| request(audio).ok()) {
+                    Some(again) => {
+                        Metrics::record_upstream_send_retry(metrics_labels::ROUTER_HTTP);
+                        untraced(again.send()).await
+                    }
+                    None => Err(e),
+                }
+            }
+            sent => sent,
+        };
+        match sent {
             Ok(res) => Ok(res),
             Err(e) => {
                 error!(
@@ -1498,6 +1548,10 @@ impl Router {
                     status,
                     upstream_sse,
                     source,
+                    // This router's routes tell Grand Central their
+                    // requests' ends: the relay reports through the handle
+                    // of the request's guard.
+                    end: placement::RequestEnd::of(&load_guard),
                     guard: load_guard,
                     headers: response_headers,
                     mode: rechunker.map_or(ChunkMode::Plain, |rechunker| {
@@ -1807,9 +1861,12 @@ impl From<&RerankRequest> for RerankResponseSpec {
 /// `canonical_model` is set only when the client addressed the model by an
 /// alias. The worker was registered under the canonical ID and has never heard
 /// of the alias, so that is the name the form carries.
+///
+/// The audio is borrowed so a second form can be built from it. Its bytes are
+/// shared, and each form takes a copy of its file name.
 fn build_transcription_form(
     body: &TranscriptionRequest,
-    audio: AudioFile,
+    audio: &AudioFile,
     canonical_model: Option<&str>,
 ) -> Result<Form, String> {
     let AudioFile {
@@ -1821,8 +1878,8 @@ fn build_transcription_form(
     // Wrap the already-buffered Bytes in a reqwest Body (Arc refcount, no
     // additional copy) instead of Part::bytes, which would force a Vec copy.
     let file_len = bytes.len() as u64;
-    let mut file_part =
-        Part::stream_with_length(reqwest::Body::from(bytes), file_len).file_name(file_name);
+    let mut file_part = Part::stream_with_length(reqwest::Body::from(bytes.clone()), file_len)
+        .file_name(file_name.clone());
     if let Some(ct) = content_type.as_deref() {
         file_part = file_part
             .mime_str(ct)
@@ -1874,8 +1931,8 @@ struct RouteOutcome<'a> {
 
 impl RouteOutcome<'_> {
     /// Finalize router metrics for an early error that never reached an
-    /// upstream worker (model_not_found, dp_aware_not_supported, no
-    /// available workers, build failure). Without this, pre-send failures
+    /// upstream worker (model_not_found, no available workers, build
+    /// failure). Without this, pre-send failures
     /// silently disappear from router_upstream_responses / router_error.
     fn pre_send_error(&self, response: &Response) {
         let rstatus = response.status();
@@ -2197,7 +2254,8 @@ async fn untraced<F: Future>(future: F) -> F::Output {
 }
 
 /// Send with a single retry on pre-response transport failures. Requests
-/// whose body cannot be cloned (multipart streams) fail through unchanged.
+/// whose body cannot be cloned (multipart streams) fail through unchanged;
+/// the transcription route builds such a request again itself.
 pub(crate) async fn send_with_stale_conn_retry(
     builder: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, reqwest::Error> {
@@ -2365,6 +2423,8 @@ impl Router {
             None,
             None,
             &[],
+            // No body is parsed on this path: nothing is stated.
+            placement::Stated::nothing,
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
@@ -2397,7 +2457,10 @@ impl Router {
             "false",
         );
 
-        let load_guard = placed.guard(self.policy_registry.sticky_header_key(Some(req.headers())));
+        // The outcome is told through the answer where the status is
+        // recorded below, so the answer keeps a handle on the request's end.
+        let load_guard =
+            placed.guard_keeping_end(self.policy_registry.sticky_header_key(Some(req.headers())));
         events::RequestSentEvent {
             url: worker.redacted_url(),
         }
@@ -2431,9 +2494,11 @@ impl Router {
         );
         if !client_body_fault {
             // A streamed head's success was recorded before its relay task
-            // was spawned (see `forward_worker_response`).
+            // was spawned (see `forward_worker_response`), and its end is
+            // that relay's to report.
             if !head_success_recorded(&response) {
                 worker.record_outcome(status.as_u16());
+                placed.ended(status.as_u16(), || is_upstream_answer(&response));
             }
             if status.is_server_error() {
                 Metrics::record_worker_error(
@@ -2740,9 +2805,12 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ResponsesRequest,
+        mut body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
+        if let Err(response) = lower_responses_request_for_local_backend(&mut body) {
+            return response;
+        }
         self.route_typed_request(headers, Some(tenant_meta), body, "/v1/responses", model_id)
             .await
     }
@@ -3036,6 +3104,8 @@ mod tests {
         tenant::TenantKey,
     };
 
+    mod transcription;
+
     /// Accepts `kill_first` connections and closes them before any response
     /// bytes, then serves a minimal 200 on every later connection. Returns
     /// (addr, accepted-connection counter).
@@ -3104,6 +3174,76 @@ mod tests {
             .body(stream_body);
 
         send_with_stale_conn_retry(builder).await.unwrap_err();
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    /// A transcription whose connection the worker closes before any answer
+    /// is sent once more, as a typed request is: the client gets the
+    /// worker's answer and the worker's breaker is not charged.
+    #[tokio::test]
+    async fn a_transcription_is_sent_once_more_when_its_connection_closes_unanswered() {
+        let (addr, accepted) = flaky_upstream(1).await;
+        // One attempt, and a breaker that one failure opens: the answer can
+        // only be the resend's, and a charge would show.
+        let mut router = breaker_router(&[&format!("http://{addr}")], fast_retry_config(1), 1);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64; // the edge: held
+        let worker = router.worker_registry.get_all().remove(0);
+        let body = TranscriptionRequest {
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"RIFF-clip"),
+            file_name: "clip.wav".to_string(),
+            content_type: Some("audio/wav".to_string()),
+        };
+
+        let response = router
+            .route_multipart_transcription(
+                None,
+                &body,
+                audio,
+                "/v1/audio/transcriptions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            2,
+            "one send and one resend reach the worker"
+        );
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// Audio over the retry buffer is sent once, and its failure stands.
+    #[tokio::test]
+    async fn a_transcription_larger_than_the_retry_buffer_is_sent_once() {
+        let (addr, accepted) = flaky_upstream(usize::MAX).await;
+        let mut router = breaker_router(&[&format!("http://{addr}")], fast_retry_config(1), 1);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64 - 1;
+        let body = TranscriptionRequest {
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"RIFF-clip"),
+            file_name: "clip.wav".to_string(),
+            content_type: Some("audio/wav".to_string()),
+        };
+
+        let response = router
+            .route_multipart_transcription(
+                None,
+                &body,
+                audio,
+                "/v1/audio/transcriptions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
     }
 
@@ -3522,6 +3662,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                placement::Stated::nothing,
             )
             .unwrap();
         assert!(selected.is_available());
@@ -3540,6 +3681,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                placement::Stated::nothing,
             )
             .is_none());
     }
@@ -7418,9 +7560,36 @@ mod tests {
         }
     }
 
-    /// A typed request the policy engine placed reaches the engine by its
-    /// load guard: one dispatch where this route makes the guard, one end
-    /// where the answer's body is read and the guard dropped, and no release.
+    /// A typed request's routing text is rendered for a classic policy, and
+    /// under Grand Central only where a stage of its document reads the
+    /// text: the document here reads none. A request that names a cache
+    /// partition is rendered there too, for its partition's seed.
+    #[tokio::test]
+    async fn a_typed_request_renders_no_text_for_a_document_that_reads_none() {
+        let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![]);
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap();
+        assert!(router.routing_derivatives(None, &request).text.is_some());
+
+        let _heard = hearing_engine_on(&router.policy_registry);
+        assert!(router.routing_derivatives(None, &request).text.is_none());
+
+        let salted: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "cache_salt": "tenant-a",
+        }))
+        .unwrap();
+        assert!(router.routing_derivatives(None, &salted).text.is_some());
+    }
+
+    /// A typed request Grand Central placed reaches the engine by its
+    /// load guard and by its answer: one dispatch where this route makes
+    /// the guard, and one end with the status the attempt recorded, told
+    /// through the answer the attempt keeps. No release.
     #[tokio::test]
     async fn the_engine_hears_a_typed_request_by_its_load_guard() {
         let url = spawn_sized_worker(r#"{"choices":[]}"#, "application/json").await;
@@ -7445,6 +7614,486 @@ mod tests {
 
         assert_eq!(
             *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// A typed request states its body's output limit to Grand Central:
+    /// the route reads the body for it where the engine decides, through the
+    /// body's own reader. A body that names no limit states none, as the
+    /// case above hears.
+    #[tokio::test]
+    async fn the_engine_reads_the_output_limit_a_typed_request_states() {
+        let url = spawn_sized_worker(r#"{"choices":[]}"#, "application/json").await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 64,
+        }))
+        .unwrap();
+
+        let response = router
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            [
+                "limit 64",
+                "issued",
+                "dispatched Single",
+                "completed Ok 200"
+            ]
+        );
+    }
+
+    /// What the test stage heard of the engine's leases, in order.
+    fn heard_of(heard: &placement::tests::Heard) -> Vec<String> {
+        heard.lock().expect("the stage heard").clone()
+    }
+
+    /// [`heard_of`] once the stage heard `words` words: a stream's end is
+    /// told by its relay's task, behind the body's last byte.
+    async fn heard_after(heard: &placement::tests::Heard, words: usize) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let said = heard_of(heard);
+                if said.len() >= words {
+                    return said;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| heard_of(heard))
+    }
+
+    /// The engine hears the status a worker answered, classed by the
+    /// gateway's one mapping: a worker's own 5xx is the server's error and
+    /// a 4xx the client's. One attempt is one end.
+    #[tokio::test]
+    async fn the_engine_hears_the_status_a_worker_answered() {
+        for (status, word) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "completed ServerError 500",
+            ),
+            (StatusCode::BAD_REQUEST, "completed ClientError 400"),
+        ] {
+            let (url, hits) = fixed_status_upstream(&["/generate"], status).await;
+            let router = breaker_router(&[&url], fast_retry_config(1), 5);
+            let heard = hearing_engine_on(&router.policy_registry);
+
+            let response = generate(&router, "a prompt").await;
+            drop(response);
+
+            assert_eq!(hits.load(AtomicOrdering::SeqCst), 1, "{status}");
+            assert_eq!(
+                heard_of(&heard),
+                ["issued", "dispatched Single", word],
+                "{status}"
+            );
+        }
+    }
+
+    /// A request that reached no worker ends with a status the router
+    /// made: the engine hears a failed connection, not the server's error.
+    #[tokio::test]
+    async fn the_engine_hears_a_failed_connection_as_the_routers_status() {
+        // A port nobody listens on.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let router = breaker_router(&[&url], fast_retry_config(1), 5);
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = generate(&router, "a prompt").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ConnectFailed 502"]
+        );
+    }
+
+    /// The Decisions adapter reads a worker's good answer whole and puts a
+    /// 502 of its own in the place of one it cannot map. That answer keeps
+    /// the worker's mark, and the route charges the worker's breaker with
+    /// the 502. The engine hears the same status as the server's error: the
+    /// worker answered, so it is no failed connection.
+    #[tokio::test]
+    async fn the_engine_hears_a_refused_decisions_answer_as_the_servers_error() {
+        // A good status over a body that is no Decisions answer.
+        let (url, hits) = fixed_status_upstream(&[UPSTREAM_ROUTE], StatusCode::OK).await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::Sglang)
+            .health_config(no_health_check())
+            .build();
+        let mut router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![worker]);
+        router.retry_config = fast_retry_config(1);
+        let heard = hearing_engine_on(&router.policy_registry);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: DecisionsRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "The sky is blue.",
+            "questions": [{"type": "predicate", "instructions": "Is the sky blue?"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_decisions(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
+        drop(response);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 502"]
+        );
+    }
+
+    /// Each attempt is a request of the engine's own: a first attempt its
+    /// worker refused and a second one served are two leases, each with the
+    /// end of its own answer.
+    #[tokio::test]
+    async fn the_engine_hears_each_attempts_own_end() {
+        // Whichever worker takes the first attempt refuses it: the two
+        // share one count of the requests they saw.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        async fn refusing_first(seen: Arc<AtomicUsize>) -> String {
+            let app = axum::Router::new().route(
+                "/generate",
+                axum::routing::post(move || {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        if seen.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                            (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response()
+                        } else {
+                            (StatusCode::OK, "{}").into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+        let seen = Arc::new(AtomicUsize::new(0));
+        let first = refusing_first(Arc::clone(&seen)).await;
+        let second = refusing_first(Arc::clone(&seen)).await;
+        let router = breaker_router(&[&first, &second], fast_retry_config(3), 5);
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = generate(&router, "a prompt").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(
+            heard_of(&heard),
+            [
+                "issued",
+                "dispatched Single",
+                "completed ServerError 503",
+                "issued",
+                "dispatched Single",
+                "completed Ok 200"
+            ]
+        );
+    }
+
+    /// A streamed answer's end is its relay's to tell. The engine hears no
+    /// end while the body stands, and the head's status once the stream
+    /// was read to its end.
+    #[tokio::test]
+    async fn the_engine_hears_a_streamed_answers_end_from_its_relay() {
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "text/event-stream").await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The relay may have read the whole answer by now: the guard rides
+        // in the body, and the end waits for it.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(heard_of(&heard), ["issued", "dispatched Single"]);
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(!bytes.is_empty());
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// A stream the worker cut behind a good head ends with the cut's
+    /// status, which the router made: the engine hears a failed connection.
+    #[tokio::test]
+    async fn the_engine_hears_a_cut_stream_by_the_cuts_status() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        let first = BODY.find("\n\n").unwrap() + 2;
+        let url = test_support::spawn_sized_sse_worker_cut_after(BODY, first).await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(http_body_util::BodyExt::collect(response.into_body()).await);
+
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed ConnectFailed 502"]
+        );
+    }
+
+    /// A client that leaves a stream is reported by nobody: the engine
+    /// hears that end as it did before, class cancelled and no status.
+    #[tokio::test]
+    async fn the_engine_hears_a_client_that_left_as_cancelled() {
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let url = spawn_parked_sse_worker(Arc::clone(&resume)).await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed Cancelled"]
+        );
+        resume.notify_waiters();
+    }
+
+    /// A streamed answer's failed head is its route's to report, where the
+    /// route records it. The relay lets the handle it was handed go before
+    /// its task starts, so the engine hears the end at the body's drop,
+    /// with no turn of that task between.
+    #[tokio::test]
+    async fn the_engine_hears_a_streams_failed_head_from_its_route() {
+        let (url, _) =
+            fixed_status_upstream(&["/v1/chat/completions"], StatusCode::INTERNAL_SERVER_ERROR)
+                .await;
+        let router = breaker_router(&[&url], fast_retry_config(1), 5);
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        drop(response);
+
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 500"]
+        );
+    }
+
+    /// A relay whose hook ends the stream reports the end there, through
+    /// the handle it was handed: the upstream is not read to its own end.
+    #[tokio::test]
+    async fn a_relays_hook_that_ends_the_stream_reports_its_end() {
+        use crate::routers::http::stream_relay::ChunkStep;
+
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker("http://127.0.0.1:1")],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+        let placed = router
+            .select_worker_for_model(
+                UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                placement::Stated::nothing,
+            )
+            .expect("the one worker");
+        let guard = placed.guard(None);
+        let hook = Box::new(|bytes: Bytes| ChunkStep {
+            last: bytes.as_ref() == b"data: [DONE]\n\n",
+            bytes,
+        });
+        // The upstream stays open behind the chunk the hook ends at.
+        let chunks: [&'static [u8]; 2] = [b"data: a\n\n", b"data: [DONE]\n\n"];
+        let upstream = stream::iter(chunks.map(|chunk| Ok(Bytes::from_static(chunk))))
+            .chain(stream::pending::<Result<Bytes, reqwest::Error>>());
+        let response = relay_streaming_body(
+            upstream,
+            Relay {
+                status: StatusCode::OK,
+                upstream_sse: true,
+                source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(placed.worker())),
+                end: placement::RequestEnd::of(&guard),
+                guard,
+                headers: HeaderMap::new(),
+                mode: ChunkMode::Hook(hook),
+            },
+        );
+        drop(placed);
+        drop(http_body_util::BodyExt::collect(response.into_body()).await);
+
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// The streamed pass-through tells the engine its ends as the typed
+    /// route does. An answer read whole is told where the route records
+    /// its status, through the answer the route keeps.
+    #[tokio::test]
+    async fn the_engine_hears_a_passed_through_answer_by_its_status() {
+        for (status, word) in [
+            (StatusCode::OK, "completed Ok 200"),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "completed ServerError 500",
+            ),
+        ] {
+            let (url, hits) = fixed_status_upstream(&["/generate"], status).await;
+            let router = streaming_router(
+                PolicyConfig::RoundRobin,
+                1024 * 1024,
+                vec![plain_worker(&url)],
+            );
+            let heard = hearing_engine_on(&router.policy_registry);
+
+            let response = router
+                .route_streaming_request(streamed_request(&[b"{}"]), "/generate", false)
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), status);
+            assert_eq!(hits.load(AtomicOrdering::SeqCst), 1, "{status}");
+            drop(response);
+            assert_eq!(
+                heard_of(&heard),
+                ["issued", "dispatched Single", word],
+                "{status}"
+            );
+        }
+    }
+
+    /// A streamed answer on the pass-through is told by its relay, at the
+    /// stream's end.
+    #[tokio::test]
+    async fn the_engine_hears_a_passed_through_streams_end_from_its_relay() {
+        let (url, _captured) = spawn_capture_stub("text/event-stream", SIZED_DELTA_BODY).await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            1024 * 1024,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_streaming_request(streamed_request(&[b"{}"]), "/generate", false)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(!bytes.is_empty());
+
+        assert_eq!(
+            heard_after(&heard, 3).await,
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// A client's own body fault on the pass-through is no worker's answer:
+    /// the route records nothing on the worker and tells the engine no
+    /// status.
+    #[tokio::test]
+    async fn the_engine_hears_no_status_of_a_clients_own_body_fault() {
+        let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
+        let router = streaming_router(PolicyConfig::RoundRobin, 8, vec![plain_worker(&url)]);
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_streaming_request(streamed_request(&[b"12345678", b"9"]), "/generate", false)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        drop(response);
+
+        assert_eq!(
+            heard_of(&heard),
             ["issued", "dispatched Single", "completed Cancelled"]
         );
     }
@@ -7489,6 +8138,143 @@ mod tests {
             .expect("the error event is a frame of its own");
         assert_eq!(error["error"]["type"], "stream_error", "{body}");
         assert_eq!(events[2], "data: [DONE]");
+    }
+
+    #[tokio::test]
+    async fn route_responses_lowers_codex_additional_tools_and_agent_message_before_forwarding() {
+        let captured = Arc::new(parking_lot::Mutex::new(None::<Value>));
+        let seen = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |Json(payload): Json<Value>| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    *seen.lock() = Some(payload);
+                    (
+                        StatusCode::OK,
+                        [(CONTENT_TYPE, "application/json")],
+                        serde_json::json!({
+                            "id": "resp_codex_sub",
+                            "object": "response",
+                            "status": "completed",
+                            "output": []
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}");
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-codex"));
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "tool_choice": "auto",
+            "store": false,
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "id": "at_1",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "description": "",
+                            "tools": [{
+                                "type": "function",
+                                "name": "exec_command",
+                                "description": "Execute shell command",
+                                "parameters": {"type": "object", "properties": {}}
+                            }]
+                        },
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "description": "Collab tools",
+                            "tools": [{
+                                "type": "function",
+                                "name": "send_message",
+                                "description": "Send message",
+                                "parameters": {"type": "object", "properties": {}}
+                            }]
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_dev",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "System policy"}]
+                },
+                {
+                    "type": "agent_message",
+                    "id": "am_task",
+                    "author": "/root",
+                    "recipient": "/root/subagent",
+                    "content": [{"type": "input_text", "text": "Compute SHA-256 of hello"}]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let response = router
+            .route_responses(None, &tenant, req, UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let forwarded = captured
+            .lock()
+            .take()
+            .expect("upstream /v1/responses must receive the lowered request");
+        let tools = forwarded["tools"].as_array().expect("lifted tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "exec_command");
+        assert_eq!(tools[1]["type"], "namespace");
+        assert_eq!(tools[1]["name"], "collaboration");
+
+        let input = forwarded["input"].as_array().expect("lowered input");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["id"], "am_task");
+        let text = input[1]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Sender: /root"), "{text}");
+        assert!(text.contains("Recipient: /root/subagent"), "{text}");
+        assert!(text.contains("Compute SHA-256 of hello"), "{text}");
+
+        // An encrypted agent_message must be refused locally with 400 and never reach upstream.
+        let encrypted_req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": [{
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/subagent",
+                "content": [{"type": "encrypted_content", "encrypted_content": "opaque"}]
+            }]
+        }))
+        .unwrap();
+        let refused = router
+            .route_responses(None, &tenant, encrypted_req, UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            captured.lock().is_none(),
+            "encrypted agent_message must not be forwarded upstream"
+        );
     }
 }
 
@@ -7573,7 +8359,3 @@ mod upstream_span_tests {
         );
     }
 }
-
-#[cfg(test)]
-#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
-mod classic_rank_rows;

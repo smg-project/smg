@@ -374,7 +374,7 @@ impl NemotronOmniProcessor {
 
     /// The checkpoint config field, as a JSON pointer, whose value differs from
     /// the geometry this port implements, if any.
-    pub fn mismatched_config_field(config: &Value) -> Option<&'static str> {
+    pub(crate) fn mismatched_config_field(config: &Value) -> Option<&'static str> {
         [
             ("/patch_size", json!(PATCH_SIZE)),
             ("/downsample_ratio", json!(0.5)),
@@ -419,7 +419,7 @@ impl NemotronOmniProcessor {
     /// `process_media` plans it at the per-image maximum; `None` for a strip so
     /// thin it rounds to no patches, which the engine fails on too, or for a
     /// tiling geometry.
-    pub fn plan_grid(&self, width: u32, height: u32) -> Option<(usize, usize)> {
+    pub(crate) fn plan_grid(&self, width: u32, height: u32) -> Option<(usize, usize)> {
         let (_, max) = self.geometry.dynamic?;
         self.plan_grid_within(width, height, max)
     }

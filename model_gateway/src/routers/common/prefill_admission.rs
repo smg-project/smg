@@ -8,7 +8,10 @@ use parking_lot::Mutex;
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 use tokio::sync::Notify;
 
-use crate::{observability::metrics::Metrics, routers::common::placement::Placed};
+use crate::{
+    observability::metrics::Metrics,
+    routers::common::placement::{Placed, Unsent},
+};
 
 const HEAD_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -87,21 +90,6 @@ pub struct PrefillReservation {
     load_guard: Option<WorkerLoadGuard>,
 }
 
-impl PrefillReservation {
-    /// This reservation, sent: its load guard is the prefill's, made under
-    /// the admission lock ahead of the prefill's send, under the route's
-    /// own key. The admission makes it behind the selection, of the
-    /// selected worker alone: it holds the answer as a value it does not
-    /// read. The guard is handed to the answer here ([`Placed::sent`]), so
-    /// the reservation's release is the end of the prefill's side.
-    fn sent(mut self, prefill: &Placed) -> Self {
-        if let Some(load_guard) = self.load_guard.take() {
-            self.load_guard = Some(prefill.sent(load_guard));
-        }
-        self
-    }
-}
-
 impl Drop for PrefillReservation {
     fn drop(&mut self) {
         let Some(load_guard) = self.load_guard.take() else {
@@ -115,7 +103,55 @@ impl Drop for PrefillReservation {
     }
 }
 
-/// The Prefill load held for one client request.
+/// The Prefill load one client request holds from its selection to its
+/// prefill's send: the one form of that load which is not sent. The worker
+/// is counted from the selection on, under the route's own key, and
+/// Grand Central is told nothing yet.
+///
+/// Its `sent` is the only way to the load a route holds through its
+/// Prefill phase ([`PrefillLoadGuard`]), so a route says the send where it
+/// hands the prefill's request to its client. This load has no replica: a
+/// request that goes out as several says its send once, ahead of them. A
+/// route that sends no prefill drops it: the worker is counted no more,
+/// and what the answer left with the load is let go behind that, which
+/// Grand Central hears as a release.
+#[must_use = "the load is sent where the prefill goes out, or dropped where it never does"]
+pub struct PrefillAhead {
+    /// The worker's count and, with admission, its slot. Released first.
+    load: PrefillLoadGuard,
+    /// What the prefill's answer owes its send ([`Placed::unsent`]).
+    /// `None` of an answer the classic policies gave.
+    unsent: Option<Unsent>,
+}
+
+impl PrefillAhead {
+    /// The prefill's request goes out now: the load as the request holds
+    /// it through its Prefill phase. An answer of the classic policies
+    /// hands its load on as it stands, by the one test of what the answer
+    /// left. For an answer of Grand Central the engine hears the
+    /// dispatch, the load's guard keeps the engine's side to the load's
+    /// release, and from here on it counts the worker under the routing
+    /// value the engine names ([`Unsent::sent`]).
+    #[inline]
+    pub(crate) fn sent(mut self) -> PrefillLoadGuard {
+        // The engine's arm alone writes the load again: the load of a
+        // classic answer goes on as it stands.
+        if let Some(unsent) = self.unsent {
+            self.load = self.load.sent_by(unsent);
+        }
+        self.load
+    }
+
+    /// A load of the classic policies' answer, for a case that needs one
+    /// not yet sent.
+    #[cfg(test)]
+    pub(crate) fn classic(load: PrefillLoadGuard) -> Self {
+        Self { load, unsent: None }
+    }
+}
+
+/// The Prefill load held for one client request, from its prefill's send
+/// on (`PrefillAhead::sent`).
 ///
 /// With admission enabled this is a queue reservation bounded by the per-worker
 /// limit. With admission disabled the load is still tracked, but not bounded.
@@ -131,6 +167,32 @@ pub enum PrefillLoadGuard {
 }
 
 impl PrefillLoadGuard {
+    /// This load, sent for an answer of Grand Central: the load's guard
+    /// is handed to what the answer left ([`Unsent::sent`]) and keeps the
+    /// engine's side from here on, so the load's release is the end of the
+    /// prefill's side. With admission that guard is the reservation's own,
+    /// made under the admission lock, and this handle is the reservation's
+    /// one: a load that is not sent has no replica. Out of line: the load
+    /// of a classic answer never comes here.
+    #[inline(never)]
+    fn sent_by(self, unsent: Unsent) -> Self {
+        match self {
+            Self::Unbounded { _guard } => Self::Unbounded {
+                _guard: unsent.sent(_guard),
+            },
+            Self::Admission { mut _reservation } => {
+                let held = Arc::get_mut(&mut _reservation);
+                debug_assert!(held.is_some(), "a load that is not sent has one handle");
+                if let Some(held) = held {
+                    if let Some(guard) = held.load_guard.take() {
+                        held.load_guard = Some(unsent.sent(guard));
+                    }
+                }
+                Self::Admission { _reservation }
+            }
+        }
+    }
+
     /// Acquire another guard for the same request.
     ///
     /// This is explicit instead of `Clone` because the unbounded variant
@@ -175,7 +237,29 @@ pub enum PrefillAcquireError<E> {
     Rejected(PrefillAdmissionRejection),
 }
 
-/// Select a Prefill worker for one client request and hold its load.
+/// The load of a prefill selected with admission disabled, held ahead of
+/// its send: what [`acquire_prefill`] does with what its selection answered
+/// there. The worker `prefill_of` names is counted under `routing_key` by a
+/// plain guard, with no test of the answer, and what `hand_on` says the
+/// answer owes its send goes with that load. The decision bench's pair
+/// route calls this too, so it makes the calls a pair route makes.
+#[inline]
+pub(crate) fn hold_unbounded<C, A>(
+    candidate: C,
+    routing_key: Option<&str>,
+    prefill_of: impl Fn(&C) -> &Placed,
+    hand_on: impl FnOnce(C) -> (A, Option<Unsent>),
+) -> (A, PrefillAhead) {
+    let prefill = Arc::clone(prefill_of(&candidate).worker());
+    let load = PrefillLoadGuard::Unbounded {
+        _guard: WorkerLoadGuard::with_key(prefill, routing_key),
+    };
+    let (handed_on, unsent) = hand_on(candidate);
+    (handed_on, PrefillAhead { load, unsent })
+}
+
+/// Select a Prefill worker for one client request and hold its load ahead
+/// of the prefill's send.
 ///
 /// With admission enabled the selection runs at the head of the FIFO queue and
 /// under the admission lock, so `select` must filter candidates with
@@ -184,31 +268,35 @@ pub enum PrefillAcquireError<E> {
 /// once.
 ///
 /// `prefill_of` names the prefill of what `select` answers, as the placement
-/// answers a worker ([`Placed`]): the load held is that answer's guard, the
-/// prefill's send being next. With admission disabled it is made here
-/// ([`Placed::guard`]). With admission enabled the reservation's own guard
-/// is handed to the answer ([`PrefillReservation::sent`]). The admission
-/// made that guard behind the selection, of the selected worker alone
-/// ([`PrefillAdmission::admit`] holds the answer as a value it does not
-/// read), so it counts under `routing_key` even where the policy engine
-/// names a routing value of its own.
-pub(crate) async fn acquire_prefill<C, E, S, P>(
+/// answers a worker ([`Placed`]). The load held is a plain guard of that
+/// worker under `routing_key`, made with no test of the answer: here with
+/// admission disabled, and by the admission itself behind the selection
+/// with it enabled ([`PrefillAdmission::admit`] holds the answer as a value
+/// it does not read). So the worker counts the request under the route's
+/// key up to the prefill's send, even where Grand Central names a
+/// routing value of its own.
+///
+/// `hand_on` takes what `select` answered as the route keeps it: the
+/// prefill's worker goes on behind its load, and what its answer owes its
+/// send ([`Placed::unsent`]) is handed back here and goes with the load
+/// ([`PrefillAhead`]). The route says the send where it sends the prefill
+/// ([`PrefillAhead::sent`]).
+pub(crate) async fn acquire_prefill<C, A, E, S, P, H>(
     admission: Option<&PrefillAdmission>,
     routing_key: Option<&str>,
     prefill_of: P,
     mut select: S,
-) -> Result<(C, PrefillLoadGuard), PrefillAcquireError<E>>
+    hand_on: H,
+) -> Result<(A, PrefillAhead), PrefillAcquireError<E>>
 where
     S: for<'a> FnMut(Option<&PrefillSelectionContext<'a>>) -> Result<C, E> + Send,
     P: Fn(&C) -> &Placed + Send + Sync,
+    H: FnOnce(C) -> (A, Option<Unsent>) + Send,
     E: PrefillCandidateError + Send,
 {
     let Some(admission) = admission else {
         let candidate = select(None).map_err(PrefillAcquireError::Candidate)?;
-        let guard = PrefillLoadGuard::Unbounded {
-            _guard: prefill_of(&candidate).guard(routing_key),
-        };
-        return Ok((candidate, guard));
+        return Ok(hold_unbounded(candidate, routing_key, prefill_of, hand_on));
     };
 
     // The selection verdict is kept so an unavailable fleet answers with the
@@ -230,11 +318,11 @@ where
 
     match (admitted, verdict) {
         (Ok(admitted), _) => {
-            let reservation = admitted.reservation.sent(prefill_of(&admitted.selected));
-            let guard = PrefillLoadGuard::Admission {
-                _reservation: Arc::new(reservation),
+            let load = PrefillLoadGuard::Admission {
+                _reservation: Arc::new(admitted.reservation),
             };
-            Ok((admitted.selected, guard))
+            let (handed_on, unsent) = hand_on(admitted.selected);
+            Ok((handed_on, PrefillAhead { load, unsent }))
         }
         (Err(PrefillAdmissionRejection::Unavailable), Some(error)) => {
             Err(PrefillAcquireError::Candidate(error))
@@ -612,8 +700,8 @@ mod tests {
                 pair_index::PdPairIndex,
                 placement::{
                     select_pair,
-                    tests::{hearing_pairs_on, one_pair, pairs_of, MODEL},
-                    PairFailure, PlacedPair, PlacementInputs,
+                    tests::{hearing_pairs_on, keyed_pairs_on, one_pair, pairs_of, MODEL},
+                    PairFailure, PlacedPair, PlacementInputs, Stated,
                 },
                 snapshot::WorkerRegistry,
             },
@@ -1166,48 +1254,101 @@ mod tests {
            + 'a {
         move |capacity| {
             let inputs = PlacementInputs::default();
-            select_pair(registry, policies, MODEL, pairs, None, capacity, inputs)
+            select_pair(
+                registry,
+                policies,
+                MODEL,
+                pairs,
+                None,
+                capacity,
+                inputs,
+                Stated::nothing,
+            )
         }
     }
 
-    /// A served pair of the policy engine through [`acquire_prefill`], with
-    /// admission off and on: the engine hears two dispatches and two ends,
-    /// and no release. With admission on the reservation's own load guard
-    /// is the prefill's: it is sent where the pair is admitted, the prefill
-    /// is counted once, and the reservation's release is the prefill
-    /// side's end.
+    /// A pair's prefill handed on behind its load, as a pair route hands it
+    /// to [`acquire_prefill`]: the prefill's worker and the decode's answer
+    /// as the route keeps them, and what the prefill's answer owes its
+    /// send.
+    fn handed_on(pair: PlacedPair) -> ((Arc<dyn Worker>, Placed), Option<Unsent>) {
+        let (prefill, unsent) = pair.prefill.unsent();
+        ((prefill, pair.decode), unsent)
+    }
+
+    /// A pair acquired as a pair route acquires it, under the route's key
+    /// `"key"`, with admission on where `admission` is one.
+    async fn acquired(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        admission: Option<&PrefillAdmission>,
+        inputs: PlacementInputs<'_>,
+    ) -> ((Arc<dyn Worker>, Placed), PrefillAhead) {
+        let pairs = pairs_of(registry, policies);
+        let select = |capacity: Option<&PrefillSelectionContext<'_>>| {
+            select_pair(
+                registry,
+                policies,
+                MODEL,
+                &pairs,
+                None,
+                capacity,
+                inputs,
+                Stated::nothing,
+            )
+        };
+        let acquired = acquire_prefill(
+            admission,
+            Some("key"),
+            |pair: &PlacedPair| &pair.prefill,
+            select,
+            handed_on,
+        )
+        .await;
+        let Ok(acquired) = acquired else {
+            panic!("the pair is placed");
+        };
+        acquired
+    }
+
+    /// A served pair of Grand Central through [`acquire_prefill`], with
+    /// admission off and on. The acquisition counts the prefill worker,
+    /// under the route's key, and tells the engine nothing. The engine
+    /// hears the prefill's dispatch where the route says its send, and the
+    /// load's release is the prefill side's end: two dispatches and two
+    /// ends in all, and no release. With admission on the reservation's own
+    /// load guard is the prefill's, so the prefill is counted once.
     #[tokio::test]
-    async fn a_served_pair_of_the_engine_is_heard_through_its_prefills_admission() {
+    async fn a_served_pair_of_the_engine_is_heard_at_its_prefills_send() {
         for admitted in [false, true] {
             let registry = one_pair();
             let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
             let heard = hearing_pairs_on(&policies, false);
             let said = || heard.lock().expect("the stage heard").clone();
-            let pairs = pairs_of(&registry, &policies);
             let admission = admitted.then(|| PrefillAdmission::new(1, 0, Duration::from_secs(1)));
-            let acquired = acquire_prefill(
-                admission.as_ref(),
-                Some("key"),
-                |pair: &PlacedPair| &pair.prefill,
-                pair_selection(&registry, &policies, &pairs),
-            )
-            .await;
-            let Ok((pair, prefill)) = acquired else {
-                panic!("the pair is placed, admission {admitted}");
-            };
-            assert_eq!(pair.prefill.load(), 1, "admission {admitted}");
+            let inputs = PlacementInputs::default();
+            let ((prefill, decode), ahead) =
+                acquired(&registry, &policies, admission.as_ref(), inputs).await;
+            assert_eq!(
+                (prefill.load(), prefill.routing_key_inflight("key")),
+                (1, 1),
+                "counted from the selection on: admission {admitted}"
+            );
             assert_eq!(
                 said(),
-                ["issued", "issued", "dispatched Prefill"],
-                "admission {admitted}"
+                ["issued", "issued"],
+                "nothing is said ahead of the send: admission {admitted}"
             );
-            let decode = pair.decode.sent(pair.decode.ahead(Some("key")));
-            let prefill_worker = Arc::clone(pair.prefill.worker());
-            drop(pair);
-            drop(prefill);
-            assert_eq!(prefill_worker.load(), 0, "admission {admitted}");
-            assert_eq!(said()[3..], ["dispatched Decode", "completed Cancelled"]);
+
+            let load = ahead.sent();
+            assert_eq!(said()[2..], ["dispatched Prefill"], "admission {admitted}");
+            assert_eq!(prefill.load(), 1, "counted once: admission {admitted}");
+            let decode_guard = decode.sent(decode.ahead(Some("key")));
             drop(decode);
+            drop(load);
+            assert_eq!(prefill.load(), 0, "admission {admitted}");
+            assert_eq!(said()[3..], ["dispatched Decode", "completed Cancelled"]);
+            drop(decode_guard);
             assert_eq!(
                 said()[3..],
                 [
@@ -1220,7 +1361,97 @@ mod tests {
         }
     }
 
-    /// Under the policy engine a pair whose prefills are all at the
+    /// A pair of Grand Central whose prefill is never sent, with
+    /// admission off and on: its load is dropped as it was acquired. The
+    /// worker is counted no more, the admission's slot takes the next
+    /// request, and the engine hears the prefill's side released: one
+    /// issue, one release, no dispatch and no end.
+    #[tokio::test]
+    async fn a_prefill_never_sent_is_heard_as_a_release() {
+        for admitted in [false, true] {
+            let registry = one_pair();
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let heard = hearing_pairs_on(&policies, false);
+            let said = || heard.lock().expect("the stage heard").clone();
+            let admission = admitted.then(|| PrefillAdmission::new(1, 0, Duration::from_secs(1)));
+            let inputs = PlacementInputs::default();
+            let ((prefill, decode), ahead) =
+                acquired(&registry, &policies, admission.as_ref(), inputs).await;
+            assert_eq!(prefill.load(), 1, "admission {admitted}");
+            assert_eq!(said(), ["issued", "issued"], "admission {admitted}");
+
+            drop(ahead);
+            assert_eq!(
+                (prefill.load(), prefill.routing_key_load()),
+                (0, 0),
+                "admission {admitted}"
+            );
+            assert_eq!(
+                said()[2..],
+                ["released Abandoned"],
+                "the prefill's side, with no dispatch: admission {admitted}"
+            );
+            drop(decode);
+            assert_eq!(
+                said()[2..],
+                ["released Abandoned", "released Abandoned"],
+                "admission {admitted}"
+            );
+
+            // The slot is free: the next request's pair is admitted.
+            let (_, next) = acquired(&registry, &policies, admission.as_ref(), inputs).await;
+            assert_eq!(prefill.load(), 1, "admission {admitted}");
+            drop(next);
+        }
+    }
+
+    /// Where Grand Central names a routing value for a pair, the
+    /// prefill worker counts the request under the route's own key from
+    /// the selection to the send, and under the engine's value from the
+    /// send on, with admission off and on. Its load stands at one from the
+    /// selection to the load's release. The document here reads the value
+    /// from the body's own id, which the engine keeps in the clear.
+    #[tokio::test]
+    async fn a_prefill_counts_under_the_engines_routing_value_from_its_send_on() {
+        for admitted in [false, true] {
+            let registry = one_pair();
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            keyed_pairs_on(&policies);
+            let admission = admitted.then(|| PrefillAdmission::new(1, 0, Duration::from_secs(1)));
+            let inputs = PlacementInputs {
+                rid: Some("conversation-1"),
+                ..Default::default()
+            };
+            let ((prefill, _decode), ahead) =
+                acquired(&registry, &policies, admission.as_ref(), inputs).await;
+            let counts = || {
+                (
+                    prefill.load(),
+                    prefill.routing_key_inflight("key"),
+                    prefill.routing_key_inflight("conversation-1"),
+                )
+            };
+            assert_eq!(
+                counts(),
+                (1, 1, 0),
+                "ahead of the send: admission {admitted}"
+            );
+
+            let load = ahead.sent();
+            assert_eq!(
+                counts(),
+                (1, 0, 1),
+                "from the send on: admission {admitted}"
+            );
+            let replica = load.replicate();
+            drop(load);
+            drop(replica);
+            assert_eq!(counts(), (0, 0, 0), "admission {admitted}");
+            assert_eq!(prefill.routing_key_load(), 0, "admission {admitted}");
+        }
+    }
+
+    /// Under Grand Central a pair whose prefills are all at the
     /// admission limit is answered as the wait, as a classic placement
     /// answers it: the request is not refused, and with no queue it is
     /// told the queue is full.
@@ -1237,6 +1468,7 @@ mod tests {
                 None,
                 |pair: &PlacedPair| &pair.prefill,
                 pair_selection(&registry, &policies, &pairs),
+                handed_on,
             )
         };
         let Ok(held) = acquire().await else {

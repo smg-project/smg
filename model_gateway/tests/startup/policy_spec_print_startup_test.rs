@@ -8,7 +8,7 @@ use std::{
     process::{Command, Output},
 };
 
-use smg_policy_controller::document::PolicySpec;
+use smg_grand_central::document::PolicySpec;
 
 /// The binary's whole answer to `args` and the print option.
 fn print(args: &[&str]) -> io::Result<Output> {
@@ -24,7 +24,7 @@ fn text(bytes: &[u8]) -> String {
 
 /// Whether `stderr` is the binary's one sentence of error that begins with
 /// `head`: one line, ended by one line break. The words behind the head are
-/// the policy crate's, and no case of the gateway holds them.
+/// the Grand Central crate's, and no case of the gateway holds them.
 fn is_one_sentence_headed(stderr: &str, head: &str) -> bool {
     stderr
         .strip_prefix("error: ")
@@ -57,9 +57,17 @@ fn the_print_is_the_document_alone_on_stdout_and_a_zero_exit() {
 
 #[test]
 fn a_setting_no_document_says_is_one_sentence_on_stderr_and_a_failing_exit() {
-    // The sticky override has no document beside the prefix hash ring.
-    let answer =
-        print(&["--policy", "prefix_hash", "--routing-key-override"]).expect("the binary runs");
+    // The sticky override's rule places single requests alone, and this
+    // line plans a pair.
+    let answer = print(&[
+        "--pd-disaggregation",
+        "--prefill",
+        "http://prefill-a:8000",
+        "--decode",
+        "http://decode-a:8000",
+        "--routing-key-override",
+    ])
+    .expect("the binary runs");
     assert_eq!(answer.status.code(), Some(1));
     assert_eq!(text(&answer.stdout), "");
     let stderr = text(&answer.stderr);

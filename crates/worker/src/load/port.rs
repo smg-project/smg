@@ -78,7 +78,7 @@ pub struct PolledRanks {
     pub leaving: Vec<i32>,
 }
 
-/// One polled member's report at the end of a group's tick.
+/// One polled member's report in a batch of its group's answers.
 #[derive(Clone, Copy)]
 pub struct PolledReport<'a> {
     /// The polled worker the report is of.
@@ -93,14 +93,16 @@ pub struct PolledReport<'a> {
     pub carries_rank_capacity: bool,
 }
 
-/// What a group's tick leaves, once every polled engine has answered and the
-/// collector has laid the stream's rows over each answer.
+/// What a batch of a group's answers leaves, once the collector has laid the
+/// stream's rows over each answer. The engines of a tick that answer
+/// together are one batch, an engine that answers later is a batch of its
+/// own, and a tick that no answer came in ends with a batch of no report.
 #[derive(Clone, Copy)]
 pub struct GroupTick<'a> {
     /// Every `Ready` worker of the group the sink says yes of
     /// ([`LoadSink::polls`]), polled or served by its stream.
     pub workers: &'a [Arc<dyn Worker>],
-    /// The polled members that answered with rows.
+    /// The batch's polled members that answered with rows.
     pub reports: &'a [PolledReport<'a>],
 }
 
@@ -161,7 +163,9 @@ pub trait LoadSink: Send + Sync {
     /// The worker's loads are forgotten: it left the registry, was
     /// replaced, or its status left `Ready`. It is also said for a worker
     /// whose pushed report a record of the registry's worker at the URL
-    /// replaced. It is not said at the eviction of a worker whose URL holds
+    /// replaced, and for every worker whose pushed report the collector
+    /// holds where its host stops it, whatever the worker's status. It is
+    /// not said at the eviction of a worker whose URL holds
     /// another worker's report: what the sink holds at the URL is that
     /// worker's since its first record. A worker that never pushed is then
     /// not said at all: a sink that keys its rows by the worker and not by
@@ -176,7 +180,9 @@ pub trait LoadSink: Send + Sync {
     /// says [`Self::forget`] for every worker whose pushed report it held
     /// and that is no longer the registry's `Ready` worker at its URL. So a
     /// sink may keep what it knows of a stream, as the collector keeps the
-    /// report of a pusher that stays. A polled worker that left while
+    /// report of a pusher that stays. A stop says it for every worker whose
+    /// pushed report the collector held, ahead of this call: no pusher's
+    /// report outlives a stop. A polled worker that left while
     /// events were lost is never said: in a sink that keeps rows of its
     /// own, nothing of a polled worker outlives this call. A sink whose
     /// rows end with the write that removes their worker keeps them: no row
@@ -209,7 +215,7 @@ pub trait LoadSink: Send + Sync {
         true
     }
 
-    /// The end of a group's tick. A sink that keeps rows of its own took
-    /// them at [`Self::report`] and needs nothing here.
+    /// A batch of a group's answers ([`GroupTick`]). A sink that keeps rows
+    /// of its own took them at [`Self::report`] and needs nothing here.
     fn tick(&self, _tick: &GroupTick<'_>) {}
 }

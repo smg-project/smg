@@ -38,7 +38,9 @@ providers = ["provider-openai", "provider-anthropic", "provider-gemini"]
 # Client-injection seam for this crate's own K8s discovery integration tests
 # (auto-enabled by the self dev-dependency below, never in production builds).
 # It turns on the worker crate's test support, which the gateway's re-exports.
-test-util = ["smg-worker/test-util", "smg-service-discovery/test-util"]
+# And the Grand Central crate's: the reference index's cases read its lookup over
+# holders a caller scored.
+test-util = ["smg-worker/test-util", "smg-service-discovery/test-util", "smg-grand-central/test-util"]
 
 vendored-openssl = ["openssl/vendored"]
 
@@ -108,7 +110,7 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
-smg-policy-controller = { workspace = true, features = ["in-process", "operator"] }
+smg-grand-central = { workspace = true, features = ["in-process", "operator"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true

@@ -37,7 +37,10 @@ use crate::{
         CircuitBreakerConfig, RouterConfig,
     },
     routers::{common::snapshot::WorkerRegistry, provider_support},
-    workflow::{job_queue::cancel_registration, Job, JobQueue, WorkerRegistrationMode},
+    workflow::{
+        job_queue::{add_worker_in_flight, cancel_registration},
+        Job, JobQueue, WorkerRegistrationMode,
+    },
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -76,6 +79,39 @@ const BOOLEAN_LABELS: [&str; 2] = ["supports_vision", "realtime"];
 
 fn bad_request(message: String) -> WorkerServiceError {
     WorkerServiceError::BadRequest { message }
+}
+
+/// A worker's view with its address as a read shows it: a plain address
+/// exactly as registered, any other in the form of the log lines
+/// ([`WorkerSpec::redacted_url`]). Applied where the answer is written: the
+/// engine load and the manifest export read the registered address.
+fn redacted(mut info: WorkerInfo) -> WorkerInfo {
+    let url = info.spec.redacted_url();
+    // A rank's address is its group's base and `@rank`; a base that is no
+    // part of the url is shown by its own value.
+    let base = info
+        .spec
+        .dp_base_url
+        .as_deref()
+        .map(|base| match url.rsplit_once('@') {
+            Some((shown, _)) if info.spec.url_is_ranked() => shown.to_string(),
+            _ => WorkerSpec::new(base).redacted_url(),
+        });
+    // A status kept under another registration's key shows that one's
+    // address, by its own value.
+    if let Some(status) = &mut info.job_status {
+        if status.worker_url == info.spec.url {
+            status.worker_url.clone_from(&url);
+        } else {
+            status.worker_url = WorkerSpec::new(status.worker_url.as_str()).redacted_url();
+        }
+    }
+    if url != info.spec.url || base != info.spec.dp_base_url {
+        let spec = Arc::make_mut(&mut info.spec);
+        spec.dp_base_url = base;
+        spec.url = url;
+    }
+    info
 }
 
 /// The strings of a model card that log lines and a failed job's text write
@@ -315,7 +351,7 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
 fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError> {
     match discovery_provider(worker) {
         Some(provider) => Err(WorkerServiceError::DiscoveryOwned {
-            url: worker.url().to_string(),
+            url: worker.redacted_url().to_string(),
             provider: provider.clone(),
         }),
         None => Ok(()),
@@ -601,7 +637,7 @@ impl IntoResponse for ListWorkersResult {
             regular_count: usize,
         }
         Json(Body {
-            workers: self.workers,
+            workers: self.workers.into_iter().map(redacted).collect(),
             total: self.total,
             stats: Stats {
                 prefill_count: self.prefill_count,
@@ -618,7 +654,7 @@ pub struct GetWorkerResponse(pub WorkerInfo);
 
 impl IntoResponse for GetWorkerResponse {
     fn into_response(self) -> Response {
-        Json(self.0).into_response()
+        Json(redacted(self.0)).into_response()
     }
 }
 
@@ -688,23 +724,48 @@ impl WorkerService {
         // A URL with a worker behind its mapping is a 409. A worker its
         // removal is draining holds the URL for the drain window; that answer
         // says so and when to retry, instead of offering a PUT or a PATCH of
-        // a worker that is leaving.
-        let live = self
+        // a worker that is leaving. A data-parallel group stands under its
+        // rank URLs, none under the id its POST answered: a rank that stays
+        // answers for the group, else the rank whose drain its removal waits
+        // for, the longest. Not while a registration of the URL is in flight:
+        // its id may never reach the ranks found (ranks registered at startup
+        // fail it, and its end releases the id). That POST is told to poll
+        // here, not at the claim below: a registration that ended before the
+        // claim would have this POST admitted over the ranks it registered.
+        let live = match self
             .worker_registry
             .get_id_by_url_or_reservation(&worker_url)
-            .and_then(|id| self.worker_registry.get(&id).map(|worker| (id, worker)));
+        {
+            Some(id) => match self.worker_registry.get(&id) {
+                Some(worker) => Some((id, worker)),
+                None if add_worker_in_flight(queue, &worker_url) => {
+                    return Err(WorkerServiceError::CreateInProgress {
+                        url: worker_url,
+                        worker_id: Some(id),
+                    });
+                }
+                None => find_workers_by_url(&self.worker_registry, &worker_url)
+                    .into_iter()
+                    .max_by_key(|rank| {
+                        (
+                            rank.status() != WorkerStatus::Draining,
+                            rank.metadata().health_config.drain_settle_secs,
+                        )
+                    })
+                    .map(|rank| (id, rank)),
+            },
+            None => None,
+        };
         if let Some((worker_id, existing)) = live {
+            let url = config.redacted_url();
             return Err(if existing.status() == WorkerStatus::Draining {
                 WorkerServiceError::RemovalInProgress {
-                    url: worker_url,
+                    url,
                     worker_id,
                     drain_secs: existing.metadata().health_config.drain_settle_secs,
                 }
             } else {
-                WorkerServiceError::Conflict {
-                    url: worker_url,
-                    worker_id,
-                }
+                WorkerServiceError::Conflict { url, worker_id }
             });
         }
 
@@ -728,7 +789,7 @@ impl WorkerService {
                 .worker_registry
                 .get_id_by_url_or_reservation(&worker_url);
             return Err(WorkerServiceError::CreateInProgress {
-                url: worker_url,
+                url: WorkerSpec::new(worker_url).redacted_url(),
                 worker_id,
             });
         }
@@ -761,7 +822,7 @@ impl WorkerService {
     fn require_provider_router(config: &WorkerSpec) -> Result<(), WorkerServiceError> {
         match provider_support::missing_router(config) {
             Some(missing) => Err(WorkerServiceError::ProviderNotCompiled {
-                url: config.url.clone(),
+                url: config.redacted_url(),
                 family: missing.label,
                 feature: missing.feature,
             }),
@@ -788,6 +849,7 @@ impl WorkerService {
         // the change, not which labels to strip.
         refuse_discovery_owned(existing.as_ref())?;
         let url = existing.url().to_string();
+        let shown_url = existing.redacted_url();
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
 
@@ -798,7 +860,7 @@ impl WorkerService {
         if existing.is_dp_aware() {
             return Err(WorkerServiceError::BadRequest {
                 message: format!(
-                    "Worker '{url}' belongs to a data-parallel group. \
+                    "Worker '{shown_url}' belongs to a data-parallel group. \
                     PUT is not supported for data-parallel workers. \
                     Use DELETE + POST instead."
                 ),
@@ -809,11 +871,10 @@ impl WorkerService {
         // URL changes are not supported via replace — use DELETE + POST instead.
         if config.url != url {
             return Err(WorkerServiceError::BadRequest {
-                message: format!(
-                    "URL mismatch: worker has URL '{url}' but request body has '{}'. \
-                    URL changes are not supported via PUT. Use DELETE + POST instead.",
-                    config.url
-                ),
+                message: "URL mismatch: a PUT carries the worker's URL exactly as it was \
+                    registered (a read may show it shortened). URL changes are not \
+                    supported via PUT. Use DELETE + POST instead."
+                    .to_string(),
             });
         }
 
@@ -822,7 +883,7 @@ impl WorkerService {
         // Draining status and be served again inside the drain.
         if existing.status() == WorkerStatus::Draining {
             return Err(WorkerServiceError::RemovalInProgress {
-                url,
+                url: shown_url.to_string(),
                 worker_id,
                 drain_secs: existing.metadata().health_config.drain_settle_secs,
             });
@@ -930,10 +991,7 @@ impl WorkerService {
                 .get_status(worker_id.as_str())
                 .filter(|status| status.job_type == Job::REGISTRATION_TYPE)
         };
-        if let Some(mut status) = in_flight.or_else(failed) {
-            // A plain address as registered, any other as the gateway's log
-            // lines write it.
-            status.worker_url = Endpoint::redacted_url(&status.worker_url);
+        if let Some(status) = in_flight.or_else(failed) {
             return Ok(GetWorkerResponse(WorkerInfo::pending(
                 worker_id.as_str(),
                 status.worker_url.clone(),
@@ -1094,7 +1152,7 @@ impl WorkerService {
                 .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
             if !admitted {
                 return Err(WorkerServiceError::CreateInProgress {
-                    url,
+                    url: WorkerSpec::new(url).redacted_url(),
                     worker_id: Some(worker_id),
                 });
             }
@@ -1919,6 +1977,80 @@ mod tests {
         );
     }
 
+    /// A registered data-parallel group stands under its rank URLs, none
+    /// under the id its `POST` answered. A second `POST` of its address is
+    /// refused with that id while a rank stays, and as a removal with the
+    /// longest drain once every rank is leaving. A registration of the
+    /// address in flight is still the answer to poll.
+    #[tokio::test]
+    async fn create_worker_refuses_the_address_of_a_registered_data_parallel_group() {
+        use openai_protocol::worker::HealthCheckConfig;
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "grpc://10.0.0.9:8000";
+        let id = registry.reserve_id_for_url(url);
+        for (rank, drain_settle_secs) in [3, 9].into_iter().enumerate() {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs,
+                    ..Default::default()
+                })
+                .dp_config(rank, 2)
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .expect("a rank registers");
+        }
+        let ranks = find_workers_by_url(&registry, url);
+
+        ranks[0].set_status(WorkerStatus::Draining);
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("the rank that stays holds the address");
+        assert!(
+            matches!(&err, WorkerServiceError::Conflict { worker_id, .. } if *worker_id == id),
+            "the refusal of a registered worker, with the id of the first POST: {err}"
+        );
+
+        ranks[1].set_status(WorkerStatus::Draining);
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("the draining ranks hold the address");
+        assert!(
+            matches!(
+                &err,
+                WorkerServiceError::RemovalInProgress { worker_id, drain_secs: 9, .. }
+                    if *worker_id == id
+            ),
+            "a group whose every rank is leaving is being removed, for its longest drain: {err}"
+        );
+
+        assert!(service
+            .get_job_queue()
+            .expect("the queue is set")
+            .claim_if_idle(&registration(url)));
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("a registration in flight holds the address");
+        assert!(
+            matches!(&err, WorkerServiceError::CreateInProgress { worker_id: Some(in_flight), .. } if *in_flight == id),
+            "a registration in flight answers with its id to poll, not for the ranks: {err}"
+        );
+    }
+
     /// A control character in a string the log writes as it came is refused
     /// at the door, on POST and PUT: the URL, a model's id, a parser's name.
     #[tokio::test]
@@ -2459,5 +2591,64 @@ mod tests {
             "discovery: the worker a provider owns"
         );
         assert_eq!(service.list_workers(None, None).total, 2, "no origin: both");
+    }
+
+    #[tokio::test]
+    async fn the_reads_of_a_worker_show_an_address_that_is_not_plain_in_the_log_form() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let live = "http://name:made-up@10.0.0.5:8000";
+        register_worker(&registry, live, None);
+        let queue = JobQueue::new(JobQueueConfig::default(), std::sync::Weak::new());
+        assert!(queue.claim_if_idle(&registration(live)));
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(queue).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+
+        let listed = service.list_workers(None, None);
+        let id = listed.workers[0].id.clone();
+        let read = service.get_worker(&id).expect("a read");
+        let refused = service
+            .create_worker(worker_spec(live))
+            .await
+            .expect_err("the address is registered")
+            .to_string();
+        let put = service
+            .replace_worker(&id, worker_spec("http://10.0.0.6:8000"))
+            .await
+            .expect_err("a PUT with another address is refused")
+            .to_string();
+
+        assert_eq!(
+            (
+                listed.workers[0].spec.url.as_str(),
+                read.0.spec.url.as_str()
+            ),
+            (live, live),
+            "the load and the export read the registered address"
+        );
+        let mut written = Vec::new();
+        for response in [listed.into_response(), read.into_response()] {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("a body");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON body");
+            let row = body.get("workers").map_or(&body, |rows| &rows[0]);
+            written.push(row["url"].clone());
+            written.extend(row["job_status"].get("worker_url").cloned());
+        }
+        let shown = worker_spec(live).redacted_url();
+        assert_eq!(
+            written,
+            [json!(shown), json!(shown), json!(shown)],
+            "url of the list's row, then url and job_status.worker_url of the read"
+        );
+        assert!(
+            refused.contains(&shown) && !refused.contains("made-up"),
+            "the refusal of a second registration: {refused}"
+        );
+        assert!(
+            put.contains("URL mismatch") && !put.contains("10.0.0."),
+            "the refusal of a PUT with another address names neither: {put}"
+        );
     }
 }

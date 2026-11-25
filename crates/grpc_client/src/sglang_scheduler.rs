@@ -767,6 +767,7 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             kept: Default::default(),
             kept_used_tokens_age_ms: None,
             kept_total_tokens_age_ms: None,
+            sampled_at: None,
         }
     }
 }

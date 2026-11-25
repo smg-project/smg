@@ -20,7 +20,10 @@ use llm_multimodal::{
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm, WorkerMediaFault};
-use smg_worker::{connection::http_client::build_with, identity::basic::RuntimeType};
+use smg_worker::{
+    connection::http_client::build_with,
+    identity::basic::{RuntimeType, WorkerType},
+};
 use tracing::{info, warn};
 
 use super::{
@@ -655,6 +658,9 @@ impl WorkerMediaPipeline {
             drain_fetches_on_error: true,
             inflight: None,
             video_frame_budget: settings.video_frame_budget,
+            // The worker processes its own requests' media: no router's
+            // mode applies.
+            pixels_go_to: WorkerType::Regular,
         };
         // Only processors with a pixel-less Decode metadata contract advertise reuse.
         let sglang_identity_key = if spec_name == "glm53_flash"

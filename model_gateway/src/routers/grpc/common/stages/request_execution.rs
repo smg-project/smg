@@ -45,7 +45,7 @@ use crate::{
             pd_admission,
             pd_failure::{PdSide, SidePhase},
             placement::Placed,
-            prefill_admission::PrefillLoadGuard,
+            prefill_admission::{PrefillAhead, PrefillLoadGuard},
             retry::mark_non_retryable,
         },
         error,
@@ -61,7 +61,7 @@ use crate::{
                 DispatchBooking, FanoutStream, FirstItem, PrefillTicket, ProtoEmbedRequest,
                 ProtoGenerateRequest, ProtoGenerateResponse, ProtoRequest, ProtoStream,
             },
-            sequential_pd::{execute_sequential_pd, DecodeBehindPrefill},
+            sequential_pd::{execute_sequential_pd, DecodeBehindPrefill, SequentialPlan},
             utils::{
                 account_pd_side_failure,
                 stream_failure::UpstreamClass,
@@ -426,13 +426,13 @@ pub(crate) async fn execute_plan(
             // attempt's dispatch future (and the run's one box) for a path the
             // request does not take.
             ExecutionPlan::PrefillDecode(req) => {
-                let prefill_guard = require_prefill_guard(prefill_guard)?;
+                let prefill = require_prefill_guard(prefill_guard)?;
                 Box::pin(execute_pd_dispatch(
                     req,
                     clients,
                     workers,
                     model,
-                    prefill_guard,
+                    prefill,
                     ledger,
                     room_residue,
                     None,
@@ -445,7 +445,7 @@ pub(crate) async fn execute_plan(
                 // A rendezvous plan's bootstrap info went into the prefill
                 // request at request building and its encode jobs go with the
                 // prefill/decode pair; a push plan runs its encode call first.
-                let prefill_guard = require_prefill_guard(prefill_guard)?;
+                let prefill = require_prefill_guard(prefill_guard)?;
                 Box::pin(execute_epd_dispatch(
                     request,
                     clients,
@@ -453,7 +453,7 @@ pub(crate) async fn execute_plan(
                     model,
                     encode,
                     encode_watch,
-                    prefill_guard,
+                    prefill,
                     ledger,
                     behind.take(),
                 ))
@@ -585,8 +585,9 @@ fn dispatch_timed_out(
 }
 
 /// A disaggregated dispatch without the Prefill admission slot worker
-/// selection took for it is a pipeline bug, not a routable request.
-fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadGuard, Response> {
+/// selection took for it is a pipeline bug, not a routable request. The
+/// slot is the load not yet sent, or a batch sub-request's replica of it.
+fn require_prefill_guard<G>(guard: Option<G>) -> Result<G, Response> {
     guard.ok_or_else(|| {
         error!(
             function = "execute_plan",
@@ -599,6 +600,32 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
     })
 }
 
+/// What a pair's dispatch is handed for its prefill's load. One request's
+/// dispatch is handed the load not yet sent ([`PrefillAhead`]): it says the
+/// send where the prefill goes out, by the one test of the prefill's
+/// answer. A sub-request of a batch is handed a replica of a load whose
+/// send the batch said ahead of its replicas ([`PrefillLoadGuard`]): it has
+/// nothing to say and makes no test.
+trait PrefillSend {
+    /// The load as the request holds it through its Prefill phase, with
+    /// the prefill's send said.
+    fn sent(self) -> PrefillLoadGuard;
+}
+
+impl PrefillSend for PrefillAhead {
+    #[inline]
+    fn sent(self) -> PrefillLoadGuard {
+        PrefillAhead::sent(self)
+    }
+}
+
+impl PrefillSend for PrefillLoadGuard {
+    #[inline]
+    fn sent(self) -> Self {
+        self
+    }
+}
+
 /// Whether the dispatch owes the plan's decode anything behind its prefill
 /// ([`DecodeBehindPrefill`]): one disaggregated request under a runtime
 /// whose protocol sends its two sides one behind the other, with a decode
@@ -606,7 +633,8 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
 /// ([`Placed::owed_behind_prefill`]). A batch's sub-requests, and both sides
 /// of the parallel shape, go out with the dispatch. A decode the classic
 /// policies picked goes out behind its prefill and is owed nothing there:
-/// its answer's test is made first, and is all that pair pays here.
+/// its answer's test is made ahead of the runtime's, and the dispatch holds
+/// nothing for it.
 fn decode_is_owed_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelection) -> bool {
     matches!(
         plan,
@@ -628,13 +656,16 @@ fn decode_is_owed_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelec
 /// decode, which goes out behind its prefill (see [`DecodeBehindPrefill`]);
 /// `None` for every dispatch whose decode guard said its send where it was
 /// made.
+/// `prefill` is the prefill's load as the dispatch was handed it
+/// ([`PrefillSend`]): one request's send is said here, where the shape is
+/// dispatched.
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
-    prefill_guard: PrefillLoadGuard,
+    prefill: impl PrefillSend,
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
@@ -665,45 +696,59 @@ async fn execute_pd_dispatch(
     // `PdProtocol::for_runtime`): sequential sides relay the KV handoff
     // through the router, parallel sides rendezvous on bootstrap info
     // carried in the request.
+    //
+    // The prefill goes out with the shape's dispatch, so one request's
+    // send is said here ([`PrefillSend::sent`]), behind every refusal of
+    // the request: the runtime's above, and the sequential plan's. What
+    // still stands between that word and the client's call is the
+    // pipeline's own fault alone, a client selection that is no pair's. A
+    // batch said its send once, ahead of its sub-requests' dispatches
+    // ([`execute_batch_dispatch`]): for one of those the word is said
+    // already, and these refusals come behind it.
     let result = match protocol.dispatch {
         PdDispatch::Sequential => {
+            let plan = SequentialPlan::decide(&proto_request, workers)?;
             execute_sequential_pd(
+                plan,
                 proto_request,
                 clients,
                 workers,
                 model,
-                prefill_guard,
+                prefill.sent(),
                 ledger,
                 behind,
             )
             .await
         }
-        PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
-            Some(n) => {
-                execute_fanout_pd(
-                    proto_request,
-                    n,
-                    clients,
-                    workers,
-                    prefill_guard,
-                    ledger,
-                    room_residue,
-                    encode,
-                )
-                .await
+        PdDispatch::Parallel => {
+            let prefill_guard = prefill.sent();
+            match pd_fanout_width(&proto_request, protocol) {
+                Some(n) => {
+                    execute_fanout_pd(
+                        proto_request,
+                        n,
+                        clients,
+                        workers,
+                        prefill_guard,
+                        ledger,
+                        room_residue,
+                        encode,
+                    )
+                    .await
+                }
+                None => {
+                    execute_parallel_pd(
+                        proto_request,
+                        clients,
+                        workers,
+                        prefill_guard,
+                        ledger,
+                        encode,
+                    )
+                    .await
+                }
             }
-            None => {
-                execute_parallel_pd(
-                    proto_request,
-                    clients,
-                    workers,
-                    prefill_guard,
-                    ledger,
-                    encode,
-                )
-                .await
-            }
-        },
+        }
     }?;
     Ok(attribute_pd_sides(result, workers))
 }
@@ -848,7 +893,7 @@ async fn execute_epd_dispatch(
     model: &str,
     encode: Option<EncodeOutputs>,
     encode_watch: &mut Option<EncodeWatch>,
-    prefill_guard: PrefillLoadGuard,
+    prefill: PrefillAhead,
     ledger: &AttemptLedger,
     behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
@@ -859,7 +904,7 @@ async fn execute_epd_dispatch(
         clients,
         workers,
         model,
-        prefill_guard,
+        prefill,
         ledger,
         None,
         encode_watch.clone(),
@@ -1032,15 +1077,19 @@ async fn execute_batch_dispatch(
     clients: &ClientSelection,
     workers: &WorkerSelection,
     model: &str,
-    prefill_guard: Option<PrefillLoadGuard>,
+    prefill_guard: Option<PrefillAhead>,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
+    // The batch's prefills go out with the dispatches below: the send is
+    // said here, once, ahead of the handles made of the load, and so ahead
+    // of what a sub-request's dispatch may still refuse.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
         ExecutionPlanKind::Single => requests.iter().map(|_| None).collect(),
         ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
             require_prefill_guard(prefill_guard)?
+                .sent()
                 .replicate_to(requests.len())
                 .into_iter()
                 .map(Some)
@@ -1265,7 +1314,9 @@ async fn execute_single(
         dispatched_at,
     )
     .await;
-    if let Some(status) = result.breaker_status() {
+    // A call the worker took is no success yet: the stream samples it at its
+    // first response (see `ProtoStream::tracked_single_booked`).
+    if let Some(status) = result.breaker_status().filter(|_| result.is_err()) {
         workers.record_outcome(ledger, status);
     }
 
@@ -1316,7 +1367,7 @@ async fn dispatch_single_booked(
     };
     let booking = DispatchBooking::book_at(worker, prompt_tokens, streaming, dispatched_at);
     let stream = call.await?;
-    Ok(stream.tracked_booked(Arc::clone(worker), booking))
+    Ok(stream.tracked_single_booked(Arc::clone(worker), booking))
 }
 
 /// Client answer for a request the worker did not start; an engine rejection (4xx) is not a fault.
@@ -5449,10 +5500,12 @@ pub(crate) mod tests {
     }
 
     /// One request of a sequential dispatch holds something for its decode
-    /// where the policy engine placed the pair: the decode is owed its ask
+    /// where Grand Central placed the pair: the decode is owed its ask
     /// and its send behind the prefill. A pair the classic policies picked
     /// is owed neither, so its dispatch holds nothing and makes the guard
-    /// it made with no engine. The parallel shape holds nothing for either.
+    /// it made with no engine. The parallel shape holds nothing for either,
+    /// and neither does a batch, whose sub-requests go out with the dispatch
+    /// whatever placed the pair.
     #[test]
     fn a_sequential_dispatch_holds_nothing_for_a_classic_pairs_decode() {
         use crate::{
@@ -5461,7 +5514,7 @@ pub(crate) mod tests {
             routers::common::placement::{
                 select_pair,
                 tests::{hearing_pairs_on, one_pair, pairs_of, MODEL},
-                PlacementInputs,
+                PlacementInputs, Stated,
             },
         };
 
@@ -5470,7 +5523,16 @@ pub(crate) mod tests {
         let selected = |policies: &PolicyRegistry, runtime_type| {
             let pairs = pairs_of(&registry, policies);
             let inputs = PlacementInputs::default();
-            let pair = select_pair(&registry, policies, MODEL, &pairs, None, None, inputs);
+            let pair = select_pair(
+                &registry,
+                policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                inputs,
+                Stated::nothing,
+            );
             let pair = pair.expect("the pair is placed");
             WorkerSelection::Disaggregated {
                 encode_assignments: None,
@@ -5495,6 +5557,18 @@ pub(crate) mod tests {
         assert!(
             !decode_is_owed_behind_its_prefill(&plan, &selected(&by_engine, RuntimeType::Sglang)),
             "both sides of the parallel shape go out with the dispatch"
+        );
+
+        // A batch over the engine's pair, under the runtime that sends one
+        // request's sides one behind the other.
+        let batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl-1".to_string(),
+            requests: vec![ProtoGenerateRequest::Vllm(Box::default())],
+        };
+        assert!(
+            !decode_is_owed_behind_its_prefill(&batch, &selected(&by_engine, RuntimeType::Vllm)),
+            "a batch's sub-requests go out with the dispatch"
         );
     }
 

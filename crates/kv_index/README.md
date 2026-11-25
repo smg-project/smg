@@ -263,6 +263,19 @@ capture on, and they are independent of each other. A request header asks for it
   worker: on the event index `overlap_blocks` of `request_blocks`, on the approximate tree
   `matched_units` of `input_units` with the `credited_units` the chosen worker is expected to have
   cached.
+
+  With `--grand-central on` Grand Central places the request, each list it picked from is
+  one entry, and four of these read differently:
+  - `origin` is `engine`, whichever rule of the engine placed the request.
+  - `prediction` is `null`.
+  - `policy` is the profile that picked. Under the gateway's own routing settings an entry reads
+    as a classic one: a pair's side is under that side's policy, and an entry whose profile the
+    engine does not name, as one with no worker, is under the policy the settings name. Under a
+    supplied policy document `policy` is the profile's own name, and empty where the engine names
+    none: the settings name nothing that runs there.
+  - The last entry is not always the response's `x-smg-routed-worker-id`. Under a document that
+    picks a pair's decode behind its prefill, that decode may be decided again after the record is
+    written: the record holds the prefill's entry alone.
 - A request that carries the header `x-smg-cache-trace: 1` gets the same response header whatever
   the two switches say: one request's evidence on a running gateway, without a restart. The header
   alone writes no log line; `SMG_CACHE_TRACE=1` keeps logging every dispatch, the opted-in ones

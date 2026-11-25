@@ -41,7 +41,9 @@ impl Inkling2ImageProcessor {
     /// The processor for `config`, which must be one of the checkpoint's
     /// two forms of the fixed policy (see [`Self::validate_config`]); any
     /// other config is refused here, before a request.
-    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Result<Self, TransformError> {
+    pub(crate) fn from_preprocessor_config(
+        config: &PreProcessorConfig,
+    ) -> Result<Self, TransformError> {
         Self::validate_config(config)?;
         Ok(Self)
     }

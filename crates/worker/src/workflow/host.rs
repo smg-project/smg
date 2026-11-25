@@ -215,6 +215,13 @@ pub(crate) mod testing {
                 }),
             );
         }
+        serve_router(router).await
+    }
+
+    /// `router` served on a loopback port of the system's choice, any path
+    /// it does not route a 404. Returns the base URL; the stub serves for as
+    /// long as the runtime that spawned it runs.
+    pub(crate) async fn serve_router(router: axum::Router) -> String {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("a loopback port of the system's choice");

@@ -85,8 +85,22 @@ fn extract_text_for_routing_old(req: &ResponsesRequest) -> String {
                 ResponseInputOutputItem::LocalShellCall { .. }
                 | ResponseInputOutputItem::LocalShellCallOutput { .. } => None,
                 // T11 schema-only: forced-cascade arm, no behavior.
+                ResponseInputOutputItem::AdditionalTools { .. } => None,
+                ResponseInputOutputItem::AgentMessage { content, .. } => {
+                    let texts: Vec<&str> = content.iter().filter_map(|p| p.text()).collect();
+                    if texts.is_empty() {
+                        None
+                    } else {
+                        Some(texts.join(" "))
+                    }
+                }
                 ResponseInputOutputItem::McpCall { .. }
-                | ResponseInputOutputItem::McpListTools { .. } => None,
+                | ResponseInputOutputItem::McpListTools { .. }
+                | ResponseInputOutputItem::ToolSearchCall { .. }
+                | ResponseInputOutputItem::ToolSearchOutput { .. }
+                | ResponseInputOutputItem::WebSearchCall { .. }
+                | ResponseInputOutputItem::Program { .. }
+                | ResponseInputOutputItem::ProgramOutput { .. } => None,
             })
             .collect::<Vec<String>>()
             .join(" "),

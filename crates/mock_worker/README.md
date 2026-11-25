@@ -64,7 +64,31 @@ realistic engine's admission hooks, counts in the admin API's `encodes` and
 answers accepted; it reports health under the encoder service's name, as the
 engine does in that role; its `Generate` is refused as the wrong pool, and a
 prefill worker on that wire refuses a request whose `encode_bootstrap_info`
-does not name a rendezvous for each media item once.
+does not name a rendezvous for each media item once. A request reaches that
+`Encode` only when the gateway processes the media itself, which it does for
+a model whose family it has a media spec for, matched by a model id that
+names the family (`llava` in it) or by the `model_type` in the model
+directory's `config.json`: with the default model id and a text model's
+tokenizer a chat request that carries an image is refused with
+`multimodal_not_supported`. A model directory of a vision family serves it:
+every worker is started with `--model mock-llava --tokenizer <dir>` and
+registered with `<dir>` as its tokenizer path, which the gateway reads itself
+(the mock serves no tokenizer: where the gateway cannot read `<dir>`, the
+model's requests are answered with `tokenizer_load_failed` once the load has
+failed), and `<dir>` holds a `config.json` of the llava family (`model_type`,
+`image_token_index`, the vision tower's `patch_size` and `image_size`),
+tokenizer files with the token `<image>`, a `preprocessor_config.json` of a
+CLIP image processor, and a chat template whose prompt holds one `<image>`
+for each image: a template that walks the content parts renders an image
+part as `<image>`, and one that prints the content as a string is given the
+tag by the gateway. A prompt with another count of the tag (a walk of the
+parts with no clause for an image part, a literal `<image>` in the text) is
+refused with `multimodal_prompt_contract_mismatch`; with the right count the
+request is answered, the encode worker takes one `Encode` for each image, and
+a prefill and a decode worker take the request. That holds with the gateway's
+Grand Central off and its media processing at `auto` or `router` (the
+defaults are off and `auto`); with `--mm-processing worker` the gateway does
+not process the media and refuses the request with `multimodal_not_supported`.
 The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a
 request's media items are checked against the shape the engine's adapter
 requires before the canned answer: a known modality, the TokenSpeed item's
@@ -314,7 +338,11 @@ engines do not expose:
   `http:<port>` / `zmq:<index>`): a realistic engine with cache size, load,
   cached blocks and preemptions under `"engine": "realistic"` and, in a
   canned process, each listener with its name under `"engine": "canned"`
-  alone (a realistic process lists its engines alone, since a listener
+  and, on an HTTP or gRPC worker, `requests`: the generation requests that
+  reached it since the process started, one it refused for its rendezvous or
+  failed by a fault hook included, one its server could not read (a message
+  the wire refuses, a body over the size limit) left out (a realistic
+  process lists its engines alone, since a listener
   registers before its engine spawns; a listener joins the fleet once its
   bootstrap port, when it has one, is bound, so a worker that stopped at
   that bind is never listed); with the shared KV tier on, `global_l3` beside
@@ -333,7 +361,9 @@ engines do not expose:
 - `GET /admin/cache/{worker}` — the worker's cached block keys;
 - `GET /admin/ops/{worker}` — what the gateway's admin fan-out reached on the
   worker: `flushes`, `profiles_started`, `profiles_stopped`, whether a run is
-  `profiling`, the `last_trace` written (`all`: every worker);
+  `profiling`, the `last_trace` written, and beside them `requests`, the
+  generation requests the worker received, in either engine mode (`all`:
+  every worker);
 - `POST /admin/reset[/{worker}]` — clear caches and publish `AllBlocksCleared`
   (an engine restart, to the index).
 
@@ -346,13 +376,15 @@ but cannot drive event-driven `cache_aware`, which requires token ids.)
 ### Fault hooks
 
 All under the admin API; `{worker}` is a worker name (`grpc:<port>`,
-`http:<port>`, `zmq:<index>`) or `all`. A hook applies to every KV-event
+`http:<port>`, `zmq:<index>`) or `all`. The name of a gRPC worker with
+data-parallel ranks addresses each of its ranks (engines of their own, named
+`grpc:<port>:r<k>`), and a rank's name that rank alone. A hook applies to every KV-event
 transport of the worker (gRPC `SubscribeKvEvents` and the ZMQ publisher alike)
 and answers with the worker's hook state (`drop_pending`, `dropped_total`,
-`delay_ms`, `admit_delay_ms`, `admit_per_sec`, `cold_shape_ms`, `paused`, `generation`,
+`delay_ms`, `admit_delay_ms`, `admit_per_sec`, `cold_shape_ms`, `load_lag_ms`, `load_frozen`, `paused`, `generation`,
 `restarts`, and the request fault's `fail_status`, `fail_pending`,
 `fail_secs_left`, `fail_after_tokens`, `fail_finish_error`, `fail_stall_ms`, `failed_total`,
-`cut_total`, `stalled_total`). The hooks need `--engine realistic`: the canned
+`cut_total`, `stalled_total`, `load_fail_status`, `load_muted`). The hooks need `--engine realistic`: the canned
 path has no engine to hook.
 
 | Hook | Effect |
@@ -362,10 +394,14 @@ path has no engine to hook.
 | `POST /admin/fault/{worker}/admit-delay?ms=D` | every new gRPC request is held D ms before the engine sees it (0 clears): the gateway has dispatched it, the load record does not count it yet, as a backlog in transit between the two would behave |
 | `POST /admin/fault/{worker}/admit-rate?per_sec=R` | at most R new gRPC requests per second enter the engine (0 clears); the rest wait their turn, unseen by the load record: a throttled input path whose backlog grows while the gateway keeps sending |
 | `POST /admin/fault/{worker}/cold-shape?ms=D` | the engine holds D ms before the pass that first runs a prompt longer than any it has run (0 clears): a kernel built for a new shape. It produces nothing meanwhile, its load record keeps flowing with its silence growing; paid once per new longest prompt, and the lengths run before the hook was set count as run |
+| `POST /admin/fault/{worker}/load-lag?ms=D` | every load report of the worker (`GetLoads`, `/v1/loads`, the pushed load record, a ZMQ rank's scheduler stats) states the counts the engine published D ms before the report is read (0 clears; a minute at most, a larger D is taken as 60000): an engine whose counters trail its intake. The requests are served on time, and what a servicer counts itself (the pushed record's silence and pending prefill tokens) does not trail, and `GET /admin/fleet` keeps stating the engine's own counts. The report that stood when the lag was set is stated for the first D ms; a lag set over a set one keeps its history |
+| `POST /admin/fault/{worker}/load-freeze?on=true` | every load report of the worker (`GetLoads`, `/v1/loads`, the pushed load record, a ZMQ rank's scheduler stats) states what a report read when the hook was set, until `on=false`: an engine that serves its requests while its counters stand still. The requests are served, what a servicer counts itself (the pushed record's silence and pending prefill tokens) moves on, and `GET /admin/fleet` keeps stating the engine's own counts. Set under a `load-lag`, the trailing report of that moment stands, and a `load-lag` set while the hook is on starts from the engine's own counts of that moment, which a report states once the hook is off; set again while it is set, the report that stands stays |
 | `POST /admin/fault/{worker}/restart-publisher` | the publisher restarts: gRPC sequence numbers start over at 1 and the ZMQ sequence at 0, the replay buffers are emptied, the cache is kept (no `AllBlocksCleared`); `generation` increments |
 | `POST /admin/fault/{worker}/pause` | the engine freezes after its current pass: no passes, no tokens, no events; requests queue (and count as waiting); health and `GetLoads` keep answering |
 | `POST /admin/fault/{worker}/resume` | the engine runs again |
 | `POST /admin/fault/{worker}/fail?status=S[&count=N\|&secs=T][&after_tokens=K][&stall_ms=M][&finish=error]` | the worker answers status S (400-599) instead of serving: the next N requests, every request for T seconds, or every request until cleared; an HTTP worker answers the status with `{"error": {"message": "injected", "type": "fault"}}`, a gRPC worker the status code the gateway maps back to it (429 `resource_exhausted`, 500 `internal`, 502/503 `unavailable`, 504 `deadline_exceeded`). Before admission, so the request never counts as served and leaves no record. With `after_tokens=K` the request is admitted and served for K tokens, then the stream is cut with S (the gRPC trailer; an HTTP body that ends without its finish frame): the non-retryable case, for a duplication check (a non-streaming HTTP request is answered with S after K tokens instead, which the gateway may retry: the duplicated-work case). On the gRPC worker 408 reads back at the gateway as 504 and 502 as 503 (both retryable), 499 as 502 (`cancelled`, retryable), any other 4xx as 400. `finish=error` ends the stream the way an engine that failed the request does, with no status needed: a gRPC worker sends a `Complete` whose finish reason is `error` after K tokens (0 when `after_tokens` is unset), the shape the gateway turns into a stream error for the client; an HTTP worker, whose wire has no such frame, cuts with 500 instead. `stall_ms=M` holds the request M ms first; `status=0&stall_ms=M` stalls and then serves. `status=0` alone clears |
+| `POST /admin/fault/{worker}/load-fail?status=S` | every load poll of the worker is answered with status S (400-599) instead of a report, until `status=0`: `/v1/loads` answers S with the `fail` hook's body, `GetLoads` the status code the `fail` hook maps S to (501 `unimplemented`, a worker that does not implement the call; 502/503 `unavailable`; 422 the code alone, with no constraint trailer). A data-parallel rank under the hook has no row in the worker's answer, and a poll the hook leaves with no row is answered with S. The requests are served, and what the worker pushes (the load record, a ZMQ rank's scheduler stats) is no poll and keeps flowing: a worker whose load call fails or is missing, and once cleared one that reports again. A gateway's load monitor takes a `/v1/loads` answered 404, 405 or 501 as a route the worker does not have and asks it no more until the worker leaves the ready state, is replaced or is removed: 503 is the status for a poll that is to come back |
+| `POST /admin/fault/{worker}/load-mute?on=true\|false` | while `on=true` the worker pushes no load report: a batch of its KV events goes out without a load record (its sequence still counts as the rank's last), no `load_only` batch of it is sent on an event stream or on a `loads_only` subscription, and a ZMQ rank's request outputs carry no scheduler stats (a rank that sends in steps, `--zmq-step-ms`, may still send the stats it took before the hook was set with the step under way). Its load polls (`/v1/loads`, `GetLoads`) are answered and its requests are served: a worker whose pushed reports stop, so that the last one a gateway holds ages. An HTTP worker pushes none and the hook changes nothing there. `on=false` and the worker reports as before, on the batches that carry a report: its next batch of events, its next `load_only` batch once the record moved from the last one sent or the rank's heartbeat is due, and a ZMQ rank's next request output that carries stats |
 | `GET /admin/fault/{worker}` | the hooks' current state (pending drops, delay, restarts, paused, generation, the request fault and its counts) |
 | `POST /admin/reset/{worker}` | (already there) clear the cache and publish `AllBlocksCleared` |
 

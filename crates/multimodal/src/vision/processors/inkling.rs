@@ -18,11 +18,11 @@ use crate::{
     },
 };
 
-pub const INKLING_IMAGE_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
-pub const INKLING_IMAGE_STD: [f64; 3] = [0.26862954, 0.2613026, 0.2757771];
-pub const DEFAULT_PATCH_SIZE: usize = 40;
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
-pub const DEFAULT_RESCALE_IMAGE_MAX_UPSCALED_LONG_EDGE: u32 = 2048;
+pub(crate) const INKLING_IMAGE_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const INKLING_IMAGE_STD: [f64; 3] = [0.26862954, 0.2613026, 0.2757771];
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 40;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const DEFAULT_RESCALE_IMAGE_MAX_UPSCALED_LONG_EDGE: u32 = 2048;
 const PAD_RAW_VALUE: f32 = -1.0 / 255.0;
 
 /// Default cap on the total number of patches materialized for one preprocess
@@ -31,7 +31,7 @@ const PAD_RAW_VALUE: f32 = -1.0 / 255.0;
 /// small crafted image that decodes to huge dimensions drives a multi-GB
 /// allocation that aborts the process. Override via the `in_patch_limit`
 /// preprocessor-config key.
-pub const DEFAULT_INKLING_MAX_PATCHES: usize = 32_768;
+pub(crate) const DEFAULT_INKLING_MAX_PATCHES: usize = 32_768;
 
 #[derive(Debug, Clone)]
 pub struct InklingImageProcessor {

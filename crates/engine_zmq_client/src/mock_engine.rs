@@ -106,6 +106,8 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         spatial_merge_size: None,
         image_token_id: None,
         video_token_id: None,
+        vision_patch_size: None,
+        vision_downsample_ratio: None,
     }
 }
 

@@ -18,8 +18,8 @@ path = "src/main.rs"
 name = "replay"
 path = "src/bin/replay.rs"
 
-# The open-loop stress client of scripts/bench/grpc_stress (chat, tools,
-# responses, image traffic at a fixed rate against the gateway).
+# The stress client of scripts/bench/grpc_stress (chat, tools, responses,
+# image traffic against the gateway, at a fixed rate or in a closed loop).
 [[bin]]
 name = "stress_load"
 path = "src/bin/stress_load.rs"

@@ -166,7 +166,7 @@ async fn route_responses_streaming(
     let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(
         &ctx.mcp_orchestrator,
         &ctx.mcp_format_registry,
-        request.tools.as_deref(),
+        modified_request.tools.as_deref(),
     )
     .await
     {
@@ -200,6 +200,7 @@ async fn route_responses_streaming(
     streaming::convert_chat_stream_to_responses_stream(
         ctx,
         chat_request,
+        modified_request.tools,
         params,
         &request,
         background,

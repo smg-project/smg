@@ -50,19 +50,19 @@ use crate::{
 };
 
 /// Default normalization mean for LLaMA 4 Vision.
-pub const LLAMA4_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const LLAMA4_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
 
 /// Default normalization std for LLaMA 4 Vision.
-pub const LLAMA4_STD: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const LLAMA4_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
 /// Default tile size for LLaMA 4 Vision.
-pub const TILE_SIZE: u32 = 336;
+pub(crate) const TILE_SIZE: u32 = 336;
 
 /// Default maximum number of patches/tiles.
-pub const DEFAULT_MAX_PATCHES: usize = 16;
+pub(crate) const DEFAULT_MAX_PATCHES: usize = 16;
 
 /// Patch size used in vision encoder.
-pub const PATCH_SIZE: usize = 14;
+pub(crate) const PATCH_SIZE: usize = 14;
 
 /// LLaMA 4 Vision image processor.
 ///
@@ -89,7 +89,7 @@ impl Default for Llama4VisionProcessor {
 
 impl Llama4VisionProcessor {
     /// Create a new LLaMA 4 Vision processor with default settings.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tile_size: TILE_SIZE,
             max_patches: DEFAULT_MAX_PATCHES,
@@ -370,7 +370,10 @@ impl Llama4VisionProcessor {
     }
 
     /// Calculate number of image tokens for a given aspect ratio.
-    pub fn calculate_num_tokens_for_aspect_ratio(&self, aspect_ratio: (usize, usize)) -> usize {
+    pub(crate) fn calculate_num_tokens_for_aspect_ratio(
+        &self,
+        aspect_ratio: (usize, usize),
+    ) -> usize {
         let (h_tiles, w_tiles) = aspect_ratio;
         let num_tiles = h_tiles * w_tiles;
         // Add 1 for global tile if num_tiles > 1

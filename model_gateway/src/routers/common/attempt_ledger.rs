@@ -33,15 +33,21 @@ use smg_worker::identity::basic::{Worker, WorkerType};
 
 use crate::routers::common::{placement::CandidateFilter, retry::mark_non_retryable};
 
-/// Response extension: the worker answered the request itself, so the status
-/// is the worker's verdict on this payload rather than a transport failure or
-/// a status the router synthesized.
+/// Response extension: the worker answered the request itself. The status is
+/// the worker's own, or the router's judgement of an answer the worker gave
+/// (the Decisions adapter's 502 for an answer it cannot map). A transport
+/// failure carries no mark.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamAnswer;
 
 /// Mark `response` as answered by the worker (see [`UpstreamAnswer`]).
 pub(crate) fn mark_upstream_answer(response: &mut Response) {
     response.extensions_mut().insert(UpstreamAnswer);
+}
+
+/// Whether the worker itself answered `response` (see [`UpstreamAnswer`]).
+pub(crate) fn is_upstream_answer(response: &Response) -> bool {
+    response.extensions().get::<UpstreamAnswer>().is_some()
 }
 
 /// Response extension: the attempt failed on one side of a disaggregated pair,
@@ -95,8 +101,7 @@ pub(crate) fn failed_side_type(response: &Response) -> Option<WorkerType> {
 /// gives a request it processed and failed on. Its "not served now" statuses
 /// (502, 503, 504) stay replayable.
 pub(crate) fn is_definitive_failure(response: &Response) -> bool {
-    response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        && response.extensions().get::<UpstreamAnswer>().is_some()
+    response.status() == StatusCode::INTERNAL_SERVER_ERROR && is_upstream_answer(response)
 }
 
 /// What one request's attempts have told the worker pool so far.

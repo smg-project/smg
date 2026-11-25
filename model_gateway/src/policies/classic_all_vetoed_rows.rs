@@ -5,8 +5,8 @@
 //! open circuit breaker), the
 //! policy the pool runs under, whether shedding is on, a list of steps and
 //! what the gateway's single-worker placement answered at each request. The
-//! policy controller crate replays the rows through its own decision
-//! (`crates/policy_controller/tests/classic_rows.rs`).
+//! Grand Central crate replays the rows through its own decision
+//! (`crates/grand_central/tests/classic_rows.rs`).
 //!
 //! A request's answer is the worker it was placed on, by its place in the
 //! row's list. A request that is placed nowhere is recorded as a number past
@@ -16,8 +16,8 @@
 //! This file is an ignored test of the gateway crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
@@ -250,6 +250,7 @@ impl Bed {
             RoutingPool::HttpRegular,
             None,
             inputs,
+            placement::Stated::nothing,
         );
         match picked {
             Some(worker) => {

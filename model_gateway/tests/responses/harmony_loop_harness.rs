@@ -143,12 +143,16 @@ pub(super) struct Served {
 /// worker answers `turns` in order, with the mock tool server as the
 /// request's MCP tool. Protocol, setup, or storage failures panic and stop
 /// the calling table; successful responses are returned for collective checks.
+pub(super) async fn serve(turns: &[Turn], stream: bool) -> Served {
+    serve_with_input(turns, stream, json!("Hello")).await
+}
+
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test helper: failures should panic"
 )]
-pub(super) async fn serve(turns: &[Turn], stream: bool) -> Served {
+pub(super) async fn serve_with_input(turns: &[Turn], stream: bool, input: Value) -> Served {
     let mut mcp = common::mock_mcp_server::MockMCPServer::start()
         .await
         .unwrap();
@@ -189,7 +193,7 @@ pub(super) async fn serve(turns: &[Turn], stream: bool) -> Served {
     let router = RouterFactory::create_router(&context).await.unwrap();
     let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let request = json!({
-        "model": MODEL, "input": "Hello", "stream": stream, "store": true,
+        "model": MODEL, "input": input, "stream": stream, "store": true,
         "tools": [{
             "type": "mcp", "server_label": "test-tools", "server_url": mcp.url(),
             "require_approval": "never",

@@ -241,16 +241,18 @@ fn string_tree_totals_sums_tenant_chars() {
     tree.insert_text("", "http://w1:8000");
     assert_eq!(string_tree_totals(&tree), (0, 1));
 
+    // A node counts 1024 beside its chars, for every tenant on it.
     tree.insert_text("hello", "http://w1:8000");
-    assert_eq!(string_tree_totals(&tree), (5, 1));
+    assert_eq!(string_tree_totals(&tree), (5 + 1024, 1));
 
     // A shared path counts its chars for every tenant on it.
     tree.insert_text("hello", "http://w2:8000");
-    assert_eq!(string_tree_totals(&tree), (10, 2));
+    assert_eq!(string_tree_totals(&tree), (10 + 2 * 1024, 2));
 
-    // "help!" shares "hel", adds only "p!" for w1.
+    // "help!" shares "hel", adds only "p!" for w1: both tenants stand on
+    // "hel" and "lo" now, and w1 on "p!".
     tree.insert_text("help!", "http://w1:8000");
-    assert_eq!(string_tree_totals(&tree), (12, 2));
+    assert_eq!(string_tree_totals(&tree), (12 + 5 * 1024, 2));
 }
 
 #[test]
@@ -1986,7 +1988,8 @@ fn a_repaired_path_resolves_until_the_tree_evicts_it() {
     ));
 
     // Both workers hold each path now, so a budget under one copy of the
-    // tokens evicts both from the token tree and one from the string tree.
+    // tokens evicts both from the token tree; it is under the 1024 a node of
+    // the string tree counts too, so that tree keeps neither.
     let string_tree = policy.trees.string_tree("model1").unwrap();
     let token_tree = policy.trees.token_tree("model1").unwrap();
     assert_eq!(
@@ -2001,8 +2004,6 @@ fn a_repaired_path_resolves_until_the_tree_evicts_it() {
         kv_index::hash_token_path(&tokens),
         "http://w3",
     ));
-    assert_eq!(string_tree.hashed_paths(), 1);
-    policy.evict_cache(text.len() - 1);
     assert_eq!(string_tree.hashed_paths(), 0);
     assert!(!policy.apply_known_remote_insert(
         "model1",
@@ -2075,9 +2076,11 @@ fn a_peer_delta_attaches_the_worker_along_the_whole_request() {
         "http://remote",
     ));
     let tree = policy.trees.string_tree(model).unwrap();
+    // Two nodes (the first turn and what the second adds): 1024 each beside
+    // their characters.
     assert_eq!(
         tree.tenant_char_size(&Arc::<str>::from("http://remote")),
-        second.chars().count()
+        second.chars().count() + 2 * 1024
     );
 }
 

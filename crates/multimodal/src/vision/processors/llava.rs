@@ -53,10 +53,10 @@ use crate::vision::{
 };
 
 /// CLIP normalization mean values used by LLaVA models.
-pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 
 /// CLIP normalization std values used by LLaVA models.
-pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub(crate) const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 /// The reference processor's default grid pinpoints, `[[336, 672], [672, 336],
 /// [672, 672], [1008, 336], [336, 1008]]` as `[height, width]`, here as
@@ -190,7 +190,7 @@ impl LlavaProcessor {
     /// Create a processor from model config JSON.
     ///
     /// Extracts patch_size, image_size, and image_aspect_ratio from config.
-    pub fn from_config(config: &Value) -> Self {
+    pub(crate) fn from_config(config: &Value) -> Self {
         let patch_size = config
             .get("vision_config")
             .and_then(|v| v.get("patch_size"))
@@ -438,13 +438,13 @@ impl Default for LlavaNextProcessor {
 
 impl LlavaNextProcessor {
     /// Resolve model geometry and image transforms once for a loaded model.
-    pub fn from_configs(model_config: &Value, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_configs(model_config: &Value, config: &PreProcessorConfig) -> Self {
         Self::from_config(model_config).with_preprocessor_config(config)
     }
 
     /// Resolve the image transforms from `config`, keeping this processor's
     /// model geometry.
-    pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
         self.base.transforms = LlavaTransforms::new(config);
         self
     }
@@ -476,7 +476,7 @@ impl LlavaNextProcessor {
     /// Create a new LLaVA-NeXT processor with default settings.
     ///
     /// Default grid pinpoints are common LLaVA-NeXT resolutions.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             base: LlavaProcessor::new(),
             image_grid_pinpoints: DEFAULT_GRID_PINPOINTS.to_vec(),
@@ -484,7 +484,7 @@ impl LlavaNextProcessor {
     }
 
     /// Create a processor from model config.
-    pub fn from_config(config: &Value) -> Self {
+    pub(crate) fn from_config(config: &Value) -> Self {
         let base = LlavaProcessor::from_config(config);
 
         let grid_pinpoints = config
@@ -512,7 +512,7 @@ impl LlavaNextProcessor {
     /// Select the best resolution from grid pinpoints for the given image.
     ///
     /// Minimizes wasted pixels while maximizing effective resolution.
-    pub fn select_best_resolution(&self, original_size: (u32, u32)) -> (u32, u32) {
+    pub(crate) fn select_best_resolution(&self, original_size: (u32, u32)) -> (u32, u32) {
         select_best_resolution(original_size, &self.image_grid_pinpoints)
     }
 
@@ -520,7 +520,7 @@ impl LlavaNextProcessor {
     ///
     /// Returns (grid_width, grid_height) — the number of 336×336 crops along
     /// each axis of the best-fit resolution.
-    pub fn get_anyres_grid_shape(&self, image_size: (u32, u32)) -> (u32, u32) {
+    pub(crate) fn get_anyres_grid_shape(&self, image_size: (u32, u32)) -> (u32, u32) {
         let (width, height) = self.select_best_resolution(image_size);
         (width / self.base.image_size, height / self.base.image_size)
     }

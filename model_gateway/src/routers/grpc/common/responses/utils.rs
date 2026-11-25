@@ -248,17 +248,12 @@ pub(crate) async fn ensure_mcp_connection(
     Ok((false, Vec::new()))
 }
 
-/// Refuse a Responses request with a function or custom tool, alone or in a
-/// namespace, that only code may call (`allowed_callers` without `direct`).
-/// This router runs no programmatic tool calls, and its chat template offers
-/// the model every function tool it is handed, so it could serve such a tool
-/// only as one the model calls directly, which the request forbids.
+/// Refuse tools that disallow direct calls, including namespace members.
+/// This router can offer tools to the model only for direct calls.
 pub(crate) fn refuse_tools_without_a_direct_caller(
     tools: Option<&[ResponseTool]>,
 ) -> Option<Response> {
     let refused_at = |idx: usize, tool: &ResponseTool| match tool {
-        ResponseTool::Function(ft) => (!ft.allows_direct_calls()).then(|| format!("tools[{idx}]")),
-        ResponseTool::Custom(ct) => (!ct.allows_direct_calls()).then(|| format!("tools[{idx}]")),
         ResponseTool::Namespace(namespace) => {
             namespace
                 .tools
@@ -272,7 +267,7 @@ pub(crate) fn refuse_tools_without_a_direct_caller(
                     (!direct).then(|| format!("tools[{idx}].tools[{member_idx}]"))
                 })
         }
-        _ => None,
+        _ => (!tool.allows_direct_calls()).then(|| format!("tools[{idx}]")),
     };
     let at = tools
         .unwrap_or_default()
@@ -379,12 +374,13 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
 }
 
 /// Recover a custom tool's raw `input` from the `{"input": "..."}` arguments
-/// of its downgraded function call.
+/// of its downgraded function call, preserving the raw `arguments` string if
+/// the model emitted plain text or another JSON shape instead.
 pub(crate) fn custom_tool_input(arguments: &str) -> String {
     serde_json::from_str::<Value>(arguments)
         .ok()
         .and_then(|v| v.get("input")?.as_str().map(str::to_owned))
-        .unwrap_or_default()
+        .unwrap_or_else(|| arguments.to_owned())
 }
 
 /// Collect the names of all declared custom tools (top-level and namespaced),
@@ -446,17 +442,20 @@ pub(crate) fn resolve_function_identity(
     name: &str,
 ) -> (String, Option<String>) {
     let tools = tools.unwrap_or_default();
-    if !tools
-        .iter()
-        .any(|tool| matches!(tool, ResponseTool::Function(ft) if ft.function.name == name))
-    {
+    if !tools.iter().any(|tool| match tool {
+        ResponseTool::Function(ft) => ft.function.name == name,
+        ResponseTool::Custom(ct) => ct.name == name,
+        _ => false,
+    }) {
         for tool in tools {
             if let ResponseTool::Namespace(namespace) = tool {
                 for member in &namespace.tools {
-                    if let NamespaceTool::Function(ft) = member {
-                        if is_namespaced(name, &namespace.name, &ft.function.name) {
-                            return (ft.function.name.clone(), Some(namespace.name.clone()));
-                        }
+                    let member_name = match member {
+                        NamespaceTool::Function(ft) => &ft.function.name,
+                        NamespaceTool::Custom(ct) => &ct.name,
+                    };
+                    if is_namespaced(name, &namespace.name, member_name) {
+                        return (member_name.clone(), Some(namespace.name.clone()));
                     }
                 }
             }
@@ -1457,6 +1456,23 @@ mod tests {
             (json!([function(json!(["programmatic"]))]), "tools[0]"),
             (json!([function(json!([]))]), "tools[0]"),
             (
+                json!([{"type": "mcp", "server_label": "docs", "server_url": "https://example.com/mcp",
+                         "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
+                json!([{"type": "code_interpreter", "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
+                json!([{"type": "shell", "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
+                json!([{"type": "apply_patch", "allowed_callers": ["programmatic"]}]),
+                "tools[0]",
+            ),
+            (
                 json!([{"type": "function", "name": "a", "parameters": {}}, custom(json!(["programmatic"]))]),
                 "tools[1]",
             ),
@@ -1666,5 +1682,19 @@ mod tests {
             tool_call_overflow(Some(DEFAULT_MAX_ITERATIONS + 5), DEFAULT_MAX_ITERATIONS, 1),
             Some((McpToolCallLimit::Safety, 0))
         );
+    }
+
+    #[test]
+    fn custom_tool_input_extracts_input_or_preserves_raw_arguments() {
+        assert_eq!(
+            custom_tool_input(r#"{"input":"*** Begin Patch"}"#),
+            "*** Begin Patch"
+        );
+        assert_eq!(
+            custom_tool_input(r#"{"patch":"raw"}"#),
+            r#"{"patch":"raw"}"#
+        );
+        assert_eq!(custom_tool_input("*** Begin Patch"), "*** Begin Patch");
+        assert_eq!(custom_tool_input(""), "");
     }
 }
