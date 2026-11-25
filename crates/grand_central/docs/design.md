@@ -987,7 +987,7 @@ pub struct Request<'a> {
     pub constraints: Constraints<'a>, // what only the deciding host knows
 }
 
-// engine/view.rs (the fields a stage reads; 30 in all)
+// engine/view.rs (the fields a stage reads; 31 in all)
 pub struct RequestFacts<'a> {
     pub model: &'a str,            // the resolved model id
     pub phase: Phase,              // Single, Prefill, Decode or Encode
@@ -1029,10 +1029,11 @@ pub struct Constraints<'a> {
     pub stalled: &'a [u32],       // positions the host itself holds back
     pub held: &'a [u32],          // those of `stalled` that no rule may lift
     pub places: Option<&'a [u32]>, // the places of the list the request may take; `None`: every place
+    pub target_worker: Option<u32>, // the number a pair names its decode by, where the prefill is the decision's own pick
 }
 ```
 
-What is not built in the engine that stays: a request that states a subset hint, or protocols
+What is not built in the engine: a request that states a subset hint, or protocols
 that not every worker of its list serves is refused. The refusal names the input.
 A pair's demand is kept a side at a time: each side of its two lists is held to the
 workers that meet it as that side's role is held to it, and a side it leaves nobody sheds the pair
@@ -1074,7 +1075,6 @@ place in its list, and what its host says of it and of each prefill is laid by t
 host has no narrowed list to hand. The decision leaves out each encoder that serves no protocol
 the request states, and a request with items is refused under `wires` where the list holds
 encoders and none serves one. The pair's two lists are refused as a pair's are.
-The other inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
 names `places`, where the request is a pair or an encode request: one list of places cannot hold
 a pair's two lists, or an encode request's three. A single request that states places is decided
@@ -1342,9 +1342,10 @@ The types the two engines shared stay where they were moved ahead of the deletio
 - The record of sent prefixes leaves the single decision. The two trees a request is then
   decided in are the host's own, lent (section 4.5).
 
-`signal_cells` stays, and it is built for a single request: where the request's profile reads a
-named signal, the engine fills the field itself, from the reports of the load snapshot the
-decision holds. Such a decision converts its list's reports where no decision under its snapshot
+`signal_cells` stays, and it is built for a single request: where the request's profile or its
+binding's shadow reads a named signal, the engine fills the field itself, whatever cells its caller
+put there: from the reports of the load snapshot the decision holds, and with none under no
+snapshot. Such a decision converts its list's reports where no decision under its snapshot
 has, ahead of a routing key's short answer too. A row that is one rank of a data-parallel worker
 reads its own rank's values. A worker object that stands for several ranks reads one value a
 name: its ranks' values made one as the signal's `across_ranks` says, under the oldest sample
@@ -1417,7 +1418,7 @@ the prefill is dispatched, as its booking stands in a gateway's own process, and
 deadline from the file's first pass behind the prefill's end. A side a decode call issued keeps
 the call's own deadline.
 
-The kept engine stores nothing about a lease. The host keeps what it was handed and hands it back
+The engine stores nothing about a lease. The host keeps what it was handed and hands it back
 with each event (`DecisionEngine::say`). The crate has a guard for that, `DecisionGuard`
 (`tracking/decision_guard.rs`): it holds one decision's lease, has `dispatched`, `completed` and
 `released`, and releases at its drop. A controller keeps its leases in a file. It lends a lease
@@ -1459,9 +1460,11 @@ the sticky override's rule alone: a gateway's sticky map keeps a request it plac
 gateway's policy. The engine keeps the word on the pick, and one function reads it
 (`lease_events::stages_hear`) wherever it is asked, among them a single's lease words, the record's
 two writes, a pair's two writes behind its pick, the tree's store, and the hand-over of a pin
-followed by one row. Such a pin that is the profile's own
+followed by its own row. Such a pin that is the profile's own
 goes through the lookup that names a request's holders with its answer made, so its prompt is
-recorded as a pin's the whole decision follows. A controller asks the same function where it files
+recorded as a pin's the whole decision follows, unless a worker's leave was told meanwhile: the
+pin's worker may be the one that left, and the prompt is stored for no worker. A controller asks the
+same function where it files
 a pick's lease, and keeps the answer on the lease's record (`LeaseRecord::untold`): no stage hears
 that issue, and the dispatch it tells off the file moves the session's pin and reaches no stage
 and no count of sends. Its decision is the engine's own, so its record of sent prefixes follows the
@@ -2872,7 +2875,7 @@ On main: 20 sheets, 512 lines.
 |---|---|---|
 | replayed and passing | 19 | 507 |
 | recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
-| replayed through the engine that stays (`InProcess`) | **6**, and 31 lines of `prefix_hash` | **140** |
+| replayed through the engine (`InProcess`) | **6**, and 31 lines of `prefix_hash` | **140** |
 | replayed lines held to an answer of the crate's own, not classic's | | 7 |
 
 A replay of all sixteen decision sheets through `InProcess` over worker objects is in work and not on main yet: on main the three hard-demand sheets (`retry_wire`, `media_refs`, `context_window`; 26 lines), `sticky_rank` (8 lines), `encode_pair` (52 lines), `pair_named` (23 lines) and 31 lines of `prefix_hash` replay through it. Measured
@@ -2885,11 +2888,11 @@ the ring) lose lines, so the replay can fail.
 
 Five things follow, and they are the first work of section 16.
 
-1. **Only the three hard-demand sheets, `sticky_rank`, `encode_pair`, `pair_named` and 31 lines of `prefix_hash` (140 lines) go through the engine that stays** in main's own tests. The other replays of a decision sheet
+1. **Only the three hard-demand sheets, `sticky_rank`, `encode_pair`, `pair_named` and 31 lines of `prefix_hash` (140 lines) go through the engine** in main's own tests. The other replays of a decision sheet
    call the decision function over hand-built candidates. Sixteen sheets
    (438 lines) record a decision, and each has to replay through `InProcess` over worker
    objects. The other four (74 lines: `overload` 25, `pair_index` 23, `minimum_tokens` 18,
-   `sticky_rank` 8) record an answer of the host, which the engine is never asked for. It
+   `sticky_rank` 8) record an answer of the host. The engine
    reads the overload verdict that the host's load monitor wrote on the worker object. It is
    handed each prefill's partners with a pair's two lists. It names the rank a worker
    registered, never one of the ranks behind a worker that stands for all of them. In a host's
@@ -2898,7 +2901,7 @@ Five things follow, and they are the first work of section 16.
    (section 9.2). On main `pair_index` replays through the pairing rule a controller derives its pair classes by (`PairClasses::derive`), `sticky_rank` replays over rank objects through `InProcess`, and `overload` (25 lines) replays as recorded through the worker crate's load monitor, built as a host builds it, where the worker is one object for all its ranks. Eleven of its lines answer differently where each rank is a worker object, by the one rule stage 4's line names (section 16). `minimum_tokens` (18 lines) replays as recorded through the rank cache of that load monitor, where the worker is one object for all its ranks or the object of its one rank. No test replays it through the engine's pick among rank objects, which stage 4's line counts (section 16).
 2. **23 lines were held to the crate's own answer** (`minimum_tokens` 10, `overload` 6,
    `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The 16 of `minimum_tokens` and `overload` were held by the old engine's store. The 6 of `overload` replay as classic recorded now, through the host's load monitor (point 1). The 10 of `minimum_tokens` replay as classic recorded now too, through that monitor's rank cache (point 1); three of them are rules of the scorer and the picker, which the engine shares where it picks among rank objects. The 4 of `sticky_rank` are held the same through `InProcess`, by the ring and the picker. The
-   other three are the engine's. The 2 of `prefix_hash` differ from classic there too (a
+   other three were the engine's. The 2 of `prefix_hash` differ from classic there too (a
    key folds whole blocks). One of them turns in the crate on a ring its caller lends
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
@@ -3035,7 +3038,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | A binding's overload switch (`overload.enabled`) under worker objects | **[built]** | |
 | Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that writes one is refused as not in this build |
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
-| `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; it runs a pair's shadows by side at the pair's first decision, and the decode side's at a decode decided again, in a host's own process; a gateway takes a document that names them, and no served controller asks them, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where the gateway answers a record at `GET /policy/explain/{request_id}` (decision 7) |
+| `shadow`, `explain.sample` | **[partly]** | the engine runs a single request's shadow, but not one that reads affinity rows of its own; it runs a pair's shadows by side at the pair's first decision, and the decode side's at a decode decided again, in a host's own process; a gateway takes a document that names them, and no served controller asks them, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where the gateway answers a record at `GET /policy/explain/{request_id}` (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, and a registration that states a label is answered with a warning; planned: the gateway hands the builder its labels, and a document put in force keeps the stages of a profile that did not change |
 | The stage interfaces and a builder's own stages | **[built]** | |
@@ -3175,7 +3178,7 @@ every fallback engine".
 
 ### Decision 7: shadow and explain
 
-The kept engine runs a single request's shadow, and counts as skipped one that reads affinity
+The engine runs a single request's shadow, and counts as skipped one that reads affinity
 rows of its own. It runs a pair's shadows by side at the pair's first decision, and the decode
 side's at a decode decided again, where a host decides in its own process. It counts them by
 side, a decode decided again apart. A side its binding's sessions rule or its picker's
