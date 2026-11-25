@@ -2462,12 +2462,12 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    store over a write of the registry. The store takes a decided change only where the record
    it was decided over still stands at the revision the keeper read, tested under the
    membership lock: a write that landed between the two is never written over, and the keeper
-   reads the store again before it answers. A first copy is cut from the objects in the
+   reads that record again before it answers. A first copy is cut from the objects in the
    keeper's turn, the last part of step 2. Since step 3 a status is the object's
    word: a drain and a connect signal write the object and tell the table, a key's next life
    starts in the status its worker object stood in, and a call's answer waits on no follow. A
    change the store took and the registry did not get is laid where the store next refuses a
-   write of the record: the keeper reads the store again before it answers. A record with no
+   write of the record: the keeper reads that record again before it answers. A record with no
    object at all is reached so by a registration under its key alone. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
@@ -2485,12 +2485,14 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    and an object, and the task that follows the table are deleted. The task is deleted
    **[built]**: the calls a record is written by are public, a host of the worker objects
    writes through them, and a served controller hands the code that keeps its objects. A
-   record written through the store's own entries gets its object where that code next reads
-   the store, and no task lays it. No turn that takes the controller's own store starts with
+   record written through the store's own entries gets its object in three places: where the
+   store refuses the next write under its key, where a cut is laid whole, and where its host
+   reads the store's log. No task lays it. No turn that takes the controller's own store starts with
    a read of its table **[built]**: a write call decides over the object that stands, a call's read
    and a first copy read the objects, and a standby's applier lays its leader's event. A
-   host's follow and its call that lays a kept credential again still read the store they are
-   handed.
+   refused write reads its own record, and a cut laid whole reads the store's records once
+   **[built]**. A
+   host's follow and its call that lays a kept credential again still read the store's log.
 
 **One rule for a registration's write [built].** What a registration makes of the record under
 its address is one function beside the other membership rules (`WorkerFacts::laid_over`,

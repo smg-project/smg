@@ -52,7 +52,9 @@
 use smg_worker::registry::Generation;
 
 use super::Objects;
-use crate::store::{MembershipChange, MemoryStore, Position, StoreCheckpoint, WorkerRow};
+use crate::store::{
+    MembershipChange, MemoryStore, Position, StoreCheckpoint, WorkerRow, WorkersStore,
+};
 
 #[cfg_attr(
     not(any(test, feature = "controller")),
@@ -141,7 +143,11 @@ impl<G: Generation> Objects<G> {
 
     /// One body for a cut the store takes whole: `door` is the store's own
     /// entry for it. The store's write and the read of its rows are one
-    /// turn of the holder.
+    /// turn of the holder. The rows are read once, whole, and each is held
+    /// against the object that stands for it: the store's tail is not
+    /// read. The holder's place moves to the cut's rows, as at a follow's
+    /// snapshot, so a later read of the tail starts behind the cut. The
+    /// keeper forgets the rows that left behind the read.
     fn laid_whole(
         &self,
         store: &MemoryStore,
@@ -152,11 +158,12 @@ impl<G: Generation> Objects<G> {
         if !door(store, cut) {
             return false;
         }
-        self.follow_from(store, &mut place);
+        let read = self.keeper_clock();
+        let rows = self.read_whole(store, &mut place, store.history());
+        self.forget_left(read);
         // A cut's statuses are told ones, as a status event's is.
-        let rows: Vec<_> = self.held.read().objects.keys().copied().collect();
         for row in rows {
-            self.copy_status(store, row);
+            self.copy_status(store, row.id);
         }
         true
     }

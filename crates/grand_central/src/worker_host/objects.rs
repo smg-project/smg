@@ -214,9 +214,14 @@ impl Held {
 ///
 /// With a keeper ([`Self::with_credentials`]), each read of the store has
 /// the keeper forget the rows that left, whoever wrote the removal, and an
-/// entry goes with its last row. The keeper's clock is read ahead of the
-/// store: a row bound behind that read stays, and the next read forgets it
-/// whatever it finds.
+/// entry goes with its last row. The holder reads the store in four
+/// places. [`Self::follow`] and [`Self::lay_again`] read its tail, and a
+/// cut laid whole reads the store's rows once. A write
+/// the store refuses reads the write's own record, and
+/// the keeper forgets that one row where it left. The
+/// keeper's clock is read ahead of the store: a row bound behind that read
+/// stays, and the next read of the tail or of a cut forgets it whatever it
+/// finds.
 ///
 /// The holder is the registry's one writer: an object any other writer left
 /// under a row's URL is replaced by the row's.
@@ -231,8 +236,10 @@ impl Held {
 /// membership lock. A generation's apply and a term's start change no row.
 /// A caller of the store's own registration, patch or removal takes no
 /// turn either: no product code calls those, and they go with the store's
-/// table. A row written so has no object, and no copy holds it, until its
-/// host calls [`Self::follow`].
+/// table. A row written so has no object, and no copy holds it, until the
+/// holder reads it: where the store refuses its key's next write, where a
+/// cut is laid whole, or where its host calls [`Self::follow`] or
+/// [`Self::lay_again`], which follows first.
 ///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
@@ -741,6 +748,12 @@ impl<G: Generation> Objects<G> {
     /// Read `store`'s membership to its end and leave the registry holding
     /// the object of every row that stands.
     ///
+    /// A host calls it for a row written through the store's own entries.
+    /// Such a row gets its object here, at [`Self::lay_again`], which
+    /// follows first, where the store refuses its key's next write, or
+    /// where a cut is laid whole. Every other writer of a row lays its
+    /// object itself.
+    ///
     /// The first read is the store's snapshot. So is a read the store's
     /// tail no longer reaches back to, and one behind a move of the store's
     /// history ([`WorkersStore::history`]). A snapshot lays again every
@@ -768,12 +781,7 @@ impl<G: Generation> Objects<G> {
     /// [`Self::follow`] for the caller that holds the turn.
     fn follow_from<S: WorkersStore + ?Sized>(&self, store: &S, place: &mut Place) {
         loop {
-            // The keeper's clock ahead of the read of the store: a row a
-            // registration bound behind it is kept by the forgetting.
-            let read = self
-                .credentials
-                .as_ref()
-                .map(|credentials| credentials.taken());
+            let read = self.keeper_clock();
             // The history ahead of the rows: a restore that lands behind
             // this read of it is seen by the next.
             let history = store.history();
@@ -800,16 +808,39 @@ impl<G: Generation> Objects<G> {
                     place.epoch = Some(last);
                 }
                 MembershipTail::SnapshotRequired => {
-                    let (epoch, rows) = store.all_rows();
-                    self.reconcile(store, &rows);
-                    *place = Place {
-                        epoch: Some(epoch),
-                        history,
-                    };
+                    self.read_whole(store, place, history);
                 }
             }
             self.forget_left(read);
         }
+    }
+
+    /// The store's rows, read whole and once: each is held against the
+    /// object that stands for it ([`Self::reconcile`]), and `place` moves
+    /// to the rows' epoch in `history`, which the caller read ahead of
+    /// them. So the next read of the tail starts behind these rows. The
+    /// rows, for a caller that lays their statuses.
+    fn read_whole<S: WorkersStore + ?Sized>(
+        &self,
+        store: &S,
+        place: &mut Place,
+        history: u64,
+    ) -> Vec<WorkerRow> {
+        let (epoch, rows) = store.all_rows();
+        self.reconcile(store, &rows);
+        *place = Place {
+            epoch: Some(epoch),
+            history,
+        };
+        rows
+    }
+
+    /// The keeper's clock, read ahead of a read of the store: a row a
+    /// registration bound behind it is kept by the forgetting.
+    fn keeper_clock(&self) -> Option<u64> {
+        self.credentials
+            .as_ref()
+            .map(|credentials| credentials.taken())
     }
 
     /// Have the keeper forget the rows that left: each row a registration
@@ -824,6 +855,18 @@ impl<G: Generation> Objects<G> {
         let held = self.held.read();
         credentials.forget_left(read, |row| held.facts.contains_key(&row));
         self.forgotten_at.store(read, Relaxed);
+    }
+
+    /// Have the keeper forget the one row `left`, where no object stands
+    /// for it any more: a read of one record found it gone. No other bound
+    /// row is asked about, since that read saw no other row of the store.
+    /// A row bound for a write the holder has not read yet so stays.
+    fn forget_one(&self, read: Option<u64>, left: WorkerId) {
+        let (Some(credentials), Some(read)) = (&self.credentials, read) else {
+            return;
+        };
+        let held = self.held.read();
+        credentials.forget_left(read, |row| row != left || held.facts.contains_key(&row));
     }
 
     /// One change of the tail: a row it says left ends its object, then the
@@ -2934,6 +2977,41 @@ mod tests {
         objects.follow(&store);
         let later = registry.get_by_url(A).expect("the later worker's object");
         assert!(later.api_key().is_none());
+    }
+
+    /// A refused write's read and a cut laid whole forget, each what it
+    /// read. A registration decided over a row that left around the holder
+    /// is refused: its read ends the key's object, and the keeper drops
+    /// that row and asks about no other. So a row a registration bound and
+    /// the holder has not read yet keeps its credential, and its object is
+    /// built with it. A cut that drops a row ends its object, and the
+    /// keeper drops every row that left. A credential goes with its
+    /// address's last row.
+    #[test]
+    fn a_refused_write_and_a_cut_laid_whole_forget_the_rows_that_left() {
+        let replica = Replica::new();
+        let store = replica.store.as_ref();
+        replica.register(facts(A, 1), Some(KEY_A));
+        // A second registration, bound and not read by the holder yet.
+        let token = replica.kept(&facts(B, 1), Some(KEY_B));
+        assert!(token.accepted(store.upsert(facts(B, 1)).id()));
+        // Another writer's removal, then the holder's own write of the key.
+        replica.remove(A);
+        let labelled = WorkerFacts {
+            labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
+            ..facts(A, 1)
+        };
+        let refused = replica.objects.upsert(store, labelled, Registrant::Control);
+        assert_eq!(refused, None, "decided over a row that left");
+        assert_eq!(replica.credentials.len(), 1, "the row that left alone");
+        replica.follow();
+        assert!(replica.holds_credential(B, Some(KEY_B)), "the unread row's");
+
+        // A cut with no row.
+        let cut = MemoryStore::new().checkpoint();
+        assert!(replica.objects.restore_from(store, cut));
+        assert!(replica.objects.is_empty(), "the cut dropped the row");
+        assert!(replica.credentials.is_empty(), "behind the cut's read");
     }
 
     #[test]
