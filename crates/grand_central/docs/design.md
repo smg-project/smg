@@ -3168,15 +3168,18 @@ workers in one order. Where every worker can take a request, the picks of two wo
 at most.
 
 The engine's round robin takes one step of its list's counter at every pick too
-(`policies/round_robin.rs`), so requests decided on any threads take the list's workers in the one
-order classic gives.
+(`policies/round_robin.rs`), so requests decided on any threads take the list's workers in one
+order as well, one after the other as the list holds them. The two start a list at workers of
+their own: classic starts its first list at that list's first worker, the engine starts each list
+at a drawn worker.
 
 The other form takes a thread's turns of a list in runs: single steps for the thread's first turns,
 64 for each worker, and past them a run of the counter's turns in one write, 61 as a rule, played
-in order. Between two such writes a pick writes no word that the deciding threads share. Where
-several threads decide, the picks then follow no one order: inside a run a thread takes the list's
-workers one after the other, so two requests decided at one moment can go to one worker while
-another worker has none. Each worker still takes its even share, to within one pick and one more
+in order. Between two such writes a pick whose turn the filters keep writes no word that the
+deciding threads share. Where several threads decide, the picks then follow no one order: inside a
+run a thread takes the list's workers one after the other, so two requests decided at one moment
+can go to one worker while another worker has none. Where the filters keep every worker and the
+counter has not wrapped, each worker still takes its even share, to within one pick and one more
 for each run that is not played out.
 
 | Option | Cost |
