@@ -72,7 +72,9 @@ pub use in_process::place::{HeaderRead, PlaceRequest, Prompt, TokenEntry, Unplac
 #[cfg(feature = "in-process")]
 pub use in_process::start::WorkerData;
 #[cfg(feature = "in-process")]
-pub use in_process::{InProcess, SpecHandle};
+pub use in_process::{
+    InProcess, SpecHandle, POLICY_FAULTS_HELP, POLICY_FAULTS_TOTAL, POLICY_FAULT_KINDS,
+};
 #[cfg(feature = "in-process")]
 pub use list_cell::{LentList, ListCell, ModelLists, PublishedList};
 pub use pair_classes::PartnerClasses;

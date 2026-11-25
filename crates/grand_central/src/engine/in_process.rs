@@ -153,6 +153,26 @@ impl HeldFaults {
     }
 }
 
+/// The counter family a host publishes an engine's held panics under, one
+/// series a kind ([`POLICY_FAULT_KINDS`]). A gateway's metrics endpoint and
+/// a controller's publish this one family, so its name, its kinds and its
+/// description ([`POLICY_FAULTS_HELP`]) are said here once.
+pub const POLICY_FAULTS_TOTAL: &str = "smg_policy_faults_total";
+
+/// The description of [`POLICY_FAULTS_TOTAL`], the same on every page that
+/// publishes the family. It names the engine's own catches and no host's
+/// detail: which words and which steps pass those catches is each host's
+/// to say.
+pub const POLICY_FAULTS_HELP: &str = "Panics Grand Central held under its own catches, by kind: \
+    decision (a decision that panicked, a shadow's beside a live decision among them), event (a \
+    stage at a word Grand Central told it), upkeep (a step of Grand Central's upkeep)";
+
+/// The kinds of [`POLICY_FAULTS_TOTAL`], in the order of an engine's three
+/// counts: the decisions that panicked ([`DecisionEngine::faults`]), the
+/// words a stage did not hear ([`InProcess::unheard`]) and the steps of
+/// the upkeep that panicked ([`InProcess::upkeep_faults`]).
+pub const POLICY_FAULT_KINDS: [&str; 3] = ["decision", "event", "upkeep"];
+
 /// The engine that decides in its host's own process.
 ///
 /// Built once, at the gateway's start, from the document in force then. It

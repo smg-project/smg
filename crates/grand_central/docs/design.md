@@ -1240,7 +1240,9 @@ at each scrape of its metrics endpoint, as the series `smg_policy_faults_total` 
 `decision`, `event` and `upkeep`. A controller shows the same series on its metrics page,
 counted over every engine its store built, so a count outlasts the document it rose under. Its
 `event` is a change of membership alone: a controller holds a stage's panic at a word of a
-lease under catches of its own, and counts it in series of its own.
+lease under catches of its own, and counts it in series of its own. Where such a panic unwinds
+the decision that told the word, as at the issue of a single's or a pair's lease, the request
+is answered with no decision.
 
 A request whose host hands no list (`WorkerLists::None`) is decided over no worker: it is shed
 with no endpoint under the stage `none`, and its trace names no profile. A controller hands none
