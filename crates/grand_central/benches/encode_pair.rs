@@ -32,7 +32,7 @@ use smg_grand_central::{
     document::PolicySpec,
     engine::{
         Candidate, Constraints, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Identity,
-        MediaCounts, PairPools, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
+        PairPools, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
     },
 };
 
@@ -74,44 +74,33 @@ fn encode_pair(c: &mut Criterion) {
             let prefills = side_view(n / 4, Role::Prefill, 10_000);
             let decodes = side_view(n - n / 4, Role::Decode, 20_000);
             let encoders = side_view((n / 8).max(1), Role::Encode, 30_000);
-            let of_encoders = vec![
-                EncoderFacts {
-                    class: 1,
-                    pushes: true,
-                    references: false,
-                };
-                encoders.len()
-            ];
+            let mut encoder = EncoderFacts::default();
+            encoder.class = 1;
+            encoder.pushes = true;
+            encoder.references = false;
+            let of_encoders = vec![encoder; encoders.len()];
             let prefill_classes = vec![1u32; prefills.len()];
-            let pools = PairPools {
-                prefills: &prefills,
-                decodes: &decodes,
-                ..PairPools::default()
-            };
-            let encode = EncodePool {
-                encoders: &encoders,
-                facts: &of_encoders,
-                prefill_classes: &prefill_classes,
-                affinity: &[],
-                ..EncodePool::default()
-            };
-            let pool = PoolFacts {
-                pool_size: prefills.len() as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pools = PairPools::default();
+            pools.prefills = &prefills;
+            pools.decodes = &decodes;
+            let mut encode = EncodePool::default();
+            encode.encoders = &encoders;
+            encode.facts = &of_encoders;
+            encode.prefill_classes = &prefill_classes;
+            encode.affinity = &[];
+            let mut pool = PoolFacts::default();
+            pool.pool_size = prefills.len() as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             let mut scratch = Scratch::new();
             let mut placed = EncodePlaced::new();
-            let facts_of = |seed: u64| RequestFacts {
-                model: "m",
-                media: MediaCounts {
-                    images: 1,
-                    ..MediaCounts::default()
-                },
-                seed,
-                now_micros: 1_000_000,
-                ..RequestFacts::default()
+            let facts_of = |seed: u64| {
+                let mut facts = RequestFacts::default();
+                facts.model = "m";
+                facts.media.images = 1;
+                facts.seed = seed;
+                facts.now_micros = 1_000_000;
+                facts
             };
             if preset == "consistent_hashing" {
                 group.bench_with_input(BenchmarkId::new("pair_alone", n), &n, |b, _| {
@@ -142,13 +131,12 @@ fn encode_pair(c: &mut Criterion) {
                                 let hash = (seed * 16 + item).wrapping_mul(0x9e37_79b9_7f4a_7c15);
                                 *key = Identity::hashed(hash | 1);
                             }
-                            let asked = EncodeItems {
-                                keys: &keys,
-                                one: None,
-                                references: false,
-                                decode_images: false,
-                                ring: None,
-                            };
+                            let mut asked = EncodeItems::default();
+                            asked.keys = &keys;
+                            asked.one = None;
+                            asked.references = false;
+                            asked.decode_images = false;
+                            asked.ring = None;
                             let decision = engine.decide_encode_pair(
                                 &facts_of(seed),
                                 &pool,
@@ -196,32 +184,28 @@ fn left_out(c: &mut Criterion) {
         }
         for (name, first) in [("left_out", 1u32), ("far", 1 << 20)] {
             let of_encoders: Vec<EncoderFacts> = (0..encoders.len() as u32)
-                .map(|at| EncoderFacts {
-                    class: first + at % 2,
-                    pushes: true,
-                    references: false,
+                .map(|at| {
+                    let mut encoder = EncoderFacts::default();
+                    encoder.class = first + at % 2;
+                    encoder.pushes = true;
+                    encoder.references = false;
+                    encoder
                 })
                 .collect();
             let prefill_classes: Vec<u32> = (0..prefills.len() as u32)
                 .map(|at| first + at % 2)
                 .collect();
-            let pools = PairPools {
-                prefills: &prefills,
-                decodes: &decodes,
-                ..PairPools::default()
-            };
-            let encode = EncodePool {
-                encoders: &encoders,
-                facts: &of_encoders,
-                prefill_classes: &prefill_classes,
-                affinity: &[],
-                ..EncodePool::default()
-            };
-            let pool = PoolFacts {
-                pool_size: prefills.len() as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pools = PairPools::default();
+            pools.prefills = &prefills;
+            pools.decodes = &decodes;
+            let mut encode = EncodePool::default();
+            encode.encoders = &encoders;
+            encode.facts = &of_encoders;
+            encode.prefill_classes = &prefill_classes;
+            encode.affinity = &[];
+            let mut pool = PoolFacts::default();
+            pool.pool_size = prefills.len() as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             let mut scratch = Scratch::new();
             let mut placed = EncodePlaced::new();
@@ -229,26 +213,20 @@ fn left_out(c: &mut Criterion) {
                 let mut seed = 0u64;
                 b.iter(|| {
                     seed += 1;
-                    let facts = RequestFacts {
-                        model: "m",
-                        media: MediaCounts {
-                            images: 1,
-                            ..MediaCounts::default()
-                        },
-                        seed,
-                        now_micros: 1_000_000,
-                        ..RequestFacts::default()
-                    };
+                    let mut facts = RequestFacts::default();
+                    facts.model = "m";
+                    facts.media.images = 1;
+                    facts.seed = seed;
+                    facts.now_micros = 1_000_000;
                     let keys = [Identity::hashed(
                         (seed * 16).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
                     )];
-                    let asked = EncodeItems {
-                        keys: &keys,
-                        one: None,
-                        references: false,
-                        decode_images: true,
-                        ring: None,
-                    };
+                    let mut asked = EncodeItems::default();
+                    asked.keys = &keys;
+                    asked.one = None;
+                    asked.references = false;
+                    asked.decode_images = true;
+                    asked.ring = None;
                     let decision = engine.decide_encode_pair(
                         &facts,
                         &pool,

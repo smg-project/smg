@@ -3,8 +3,8 @@
 //!
 //! A standby's applier hands the holder what it would have handed the
 //! store: a membership event at its place in the leader's log, or the
-//! leader's snapshot whole. The holder takes its turn and reads the store
-//! to its end, as at a write of its own ([`mod@super::write`]). The leader
+//! leader's snapshot whole. The holder takes its turn,
+//! as at a write of its own ([`mod@super::write`]). The leader
 //! decided the change, so nothing is decided here. The holder builds the
 //! object of the row the event tells, hands the store the event
 //! ([`MemoryStore::follow_landed`]), and puts the object in the registry
@@ -52,7 +52,9 @@
 use smg_worker::registry::Generation;
 
 use super::Objects;
-use crate::store::{MembershipChange, MemoryStore, Position, StoreCheckpoint, WorkerRow};
+use crate::store::{
+    MembershipChange, MemoryStore, Position, StoreCheckpoint, WorkerRow, WorkersStore,
+};
 
 #[cfg_attr(
     not(any(test, feature = "controller")),
@@ -76,8 +78,7 @@ impl<G: Generation> Objects<G> {
         change: MembershipChange,
         row: Option<WorkerRow>,
     ) -> bool {
-        let mut place = self.read_to.lock();
-        self.follow_from(store, &mut place);
+        let _turn = self.read_to.lock();
         match (change, row) {
             // The object leaves the registry, then the store is told.
             (MembershipChange::Removed { id }, None) => {
@@ -142,7 +143,11 @@ impl<G: Generation> Objects<G> {
 
     /// One body for a cut the store takes whole: `door` is the store's own
     /// entry for it. The store's write and the read of its rows are one
-    /// turn of the holder.
+    /// turn of the holder. The rows are read once, whole, and each is held
+    /// against the object that stands for it: the store's tail is not
+    /// read. The holder's place moves to the cut's rows, as at a follow's
+    /// snapshot, so a later read of the tail starts behind the cut. The
+    /// keeper forgets the rows that left behind the read.
     fn laid_whole(
         &self,
         store: &MemoryStore,
@@ -153,11 +158,12 @@ impl<G: Generation> Objects<G> {
         if !door(store, cut) {
             return false;
         }
-        self.follow_from(store, &mut place);
+        let read = self.keeper_clock();
+        let rows = self.read_whole(store, &mut place, store.history());
+        self.forget_left(read);
         // A cut's statuses are told ones, as a status event's is.
-        let rows: Vec<_> = self.held.read().objects.keys().copied().collect();
         for row in rows {
-            self.copy_status(store, row);
+            self.copy_status(store, row.id);
         }
         true
     }
@@ -174,7 +180,7 @@ mod tests {
 
     use super::{
         super::{
-            tests::one_block,
+            tests::stored_chain,
             write::tests::{facts, Replica, A},
         },
         *,
@@ -416,7 +422,7 @@ mod tests {
         assert_eq!(table.status, WorkerStatus::Ready);
         let object = standby.object(A).expect("the row's object");
         assert_eq!(standby.objects.row_of(&object), Some(table));
-        assert_eq!(standby.objects.read_to(), Some(1), "no follow read it");
+        assert_eq!(standby.objects.read_to(), None, "no follow read it");
     }
 
     /// A tell the store takes no word of leaves the object at the status
@@ -666,7 +672,7 @@ mod tests {
             assert_eq!(tables.lanes(), 1, "{name}: the quiet row holds none");
             // The replica hears one block of the row, and the leader's next
             // cut brings one row more: the row that stays keeps its block.
-            let heard = one_block(&tables, asks, 1);
+            let heard = stored_chain(&tables, asks, 1, &[1]);
             assert_eq!(heard, BatchOutcome::Applied, "{name}");
             assert_eq!(tables.indexed_blocks(asks, 0), 1, "{name}");
             leader.upsert(asking("http://d:8000", true));

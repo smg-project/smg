@@ -256,6 +256,14 @@ impl Of {
         }
     }
 
+    /// [`PlacementSide::decode_chosen`].
+    fn decode_chosen(&self) -> bool {
+        match self {
+            Self::Whole(placement) => placement.decode_chosen(),
+            Self::Shared(pair) => pair.lock().placement.decode_chosen(),
+        }
+    }
+
     /// `side`'s end, as `end` states it.
     fn ended(&mut self, side: Side, end: End) {
         match self {
@@ -311,8 +319,8 @@ impl Placement<'static> {
         if !pair {
             if !told {
                 // One expression, so that a build can write the side where
-                // it is returned. Behind the two arms of `new` it copies
-                // the placement at each step on the way.
+                // it is returned. Handed through a call, the placement is
+                // copied at each step on the way.
                 let whole = PlacementSide {
                     side: Side::Single,
                     profile,
@@ -320,7 +328,7 @@ impl Placement<'static> {
                 };
                 return (whole, None);
             }
-            let whole = PlacementSide::new(Side::Single, profile, Of::Whole(self), told);
+            let whole = PlacementSide::told(Side::Single, profile, Of::Whole(self));
             return (whole, None);
         }
         let decode_profile = self.decode_profile.unwrap_or(profile);
@@ -328,35 +336,47 @@ impl Placement<'static> {
             placement: self,
             held_end: None,
         }));
-        let shared = Of::Shared(Arc::clone(&pair));
-        let prefill = PlacementSide::new(Side::Prefill, profile, shared, told);
-        let decode = PlacementSide::new(Side::Decode, decode_profile, Of::Shared(pair), told);
+        let shared = Arc::clone(&pair);
+        if !told {
+            // As a single request's side above: each side is written where
+            // the pair is returned. Handed through a call, a side is copied
+            // whole on the way: one shared pointer in a placement's room.
+            return (
+                PlacementSide {
+                    side: Side::Prefill,
+                    profile,
+                    kept: Kept::Own(Of::Shared(shared)),
+                },
+                Some(PlacementSide {
+                    side: Side::Decode,
+                    profile: decode_profile,
+                    kept: Kept::Own(Of::Shared(pair)),
+                }),
+            );
+        }
+        let prefill = PlacementSide::told(Side::Prefill, profile, Of::Shared(shared));
+        let decode = PlacementSide::told(Side::Decode, decode_profile, Of::Shared(pair));
         (prefill, Some(decode))
     }
 }
 
 impl PlacementSide {
-    /// `side` of the placement `of`, shared with the handles on its end
-    /// where a report through one is `told` to a stage.
+    /// `side` of the placement `of`, shared with the handles on its end: a
+    /// side under a document one of whose stages takes an end.
     ///
-    /// A single request's side kept by itself is built in
-    /// [`Placement::sides`] directly, so its placement is not moved
-    /// through here.
-    fn new(side: Side, profile: &'static str, of: Of, told: bool) -> Self {
-        let kept = if told {
-            Kept::Told(Arc::new(Mutex::new(Told {
-                side,
-                of,
-                reported: None,
-                dropped: None,
-            })))
-        } else {
-            Kept::Own(of)
-        };
+    /// A side kept by itself is built in [`Placement::sides`] directly, so
+    /// that neither a placement nor a side is moved through here.
+    fn told(side: Side, profile: &'static str, of: Of) -> Self {
+        let handles = Arc::new(Mutex::new(Told {
+            side,
+            of,
+            reported: None,
+            dropped: None,
+        }));
         Self {
             side,
             profile,
-            kept,
+            kept: Kept::Told(handles),
         }
     }
 
@@ -391,6 +411,22 @@ impl PlacementSide {
         match &mut self.kept {
             Kept::Own(of) => of.sent(self.side),
             Kept::Told(told) => told.lock().of.sent(self.side),
+        }
+    }
+
+    /// Whether the pair's decode stands chosen
+    /// ([`Placement::decode_chosen`]): the answer of the pair's one
+    /// placement, the same on either of its sides, and `false` on a single
+    /// request's one side. The host of a pair's decode side asks it ahead
+    /// of [`Self::decode_again`]: where it answers `false` that call is
+    /// refused by name with no decision made, so the host states no request
+    /// again and sends the decode it holds. It is read under the pair's
+    /// lock, as that call is.
+    #[must_use]
+    pub fn decode_chosen(&self) -> bool {
+        match &self.kept {
+            Kept::Own(of) => of.decode_chosen(),
+            Kept::Told(told) => told.lock().of.decode_chosen(),
         }
     }
 
@@ -1213,6 +1249,46 @@ mod tests {
         assert!(singles.words().is_empty());
     }
 
+    /// A side says whether its pair's decode stands chosen, the word its
+    /// host reads ahead of the second ask: the pair's one answer on either
+    /// side, `true` from the pair's first decision and across its
+    /// prefill's send, `false` from the call that took a decode and from
+    /// the first decode's send. Both sides of a pair booked with its
+    /// prefill answer `false`, and so does a single request's one side.
+    /// The read says nothing to a stage.
+    #[test]
+    fn a_side_says_whether_its_pairs_decode_stands_chosen() {
+        let host = Host::of_later_pairs();
+        let classes = PartnerClasses::number(1, [&[0_u32][..]]);
+        let request = later(host.lists(&classes));
+        let (mut prefill, mut decode) = sides_of(&host, &request);
+        assert!(prefill.decode_chosen() && decode.decode_chosen());
+        prefill.sent();
+        host.words();
+        assert!(prefill.decode_chosen() && decode.decode_chosen());
+        assert!(host.words().is_empty(), "the read says nothing");
+        decode.decode_again(&request).expect("a decode");
+        assert!(!prefill.decode_chosen() && !decode.decode_chosen());
+        drop((prefill, decode));
+        host.words();
+
+        // The first decision's decode, sent as it stands.
+        let (mut prefill, mut decode) = sides_of(&host, &request);
+        prefill.sent();
+        decode.sent();
+        assert!(!prefill.decode_chosen() && !decode.decode_chosen());
+        drop((prefill, decode));
+        host.words();
+
+        // A pair booked whole, as every pair is under the stock document.
+        let (prefill, decode) = Host::of_pairs().pair(false);
+        assert!(!prefill.decode_chosen() && !decode.decode_chosen());
+
+        let singles = Host::of_singles();
+        let single = singles.single();
+        assert!(!single.decode_chosen());
+    }
+
     /// A single request's one side owns its placement: its dispatch, and
     /// at its drop its end, or its release where it never went out. A
     /// placement that owes no event gives a side that says nothing.
@@ -1273,6 +1349,14 @@ mod tests {
 
         let host = Host::of_singles();
         assert_eq!(host.single().profile(), "round_robin");
+    }
+
+    /// A side that keeps its placement by itself answers the same labels:
+    /// the case above, run under a document none of whose stages takes an
+    /// end.
+    #[test]
+    fn a_sides_label_stands_where_no_stage_takes_an_end() {
+        without_an_end(a_side_answers_the_label_of_the_profile_that_picked_it);
     }
 
     /// A pair's placement whose host took the decode worker out stops a
@@ -1347,11 +1431,12 @@ mod tests {
     /// A pair's sides say the same words in the same order where no stage
     /// of the document takes an end, and each side keeps the pair's
     /// placement by itself: every case of a pair's words above, run again
-    /// under such a document. A pair's every word is told, so its stage
+    /// under such a document, and the case of what a side says of its
+    /// decode standing chosen. A pair's every word is told, so its stage
     /// still hears the ends it did not name.
     #[test]
     fn a_pairs_words_stand_where_no_stage_takes_an_end() {
-        let cases: [fn(); 9] = [
+        let cases: [fn(); 10] = [
             each_side_of_a_pair_says_its_dispatch_and_its_end_at_its_drop,
             a_side_dropped_unsent_is_released_by_name,
             a_prefill_side_dropped_first_holds_its_end_for_the_decodes_word,
@@ -1360,6 +1445,7 @@ mod tests {
             a_decode_side_asks_its_decode_again_behind_its_prefills_send,
             a_second_ask_that_takes_no_decode_leaves_a_held_end_waiting,
             a_refused_second_ask_leaves_an_unsent_prefills_release_waiting,
+            a_side_says_whether_its_pairs_decode_stands_chosen,
             a_pairs_two_sides_speak_from_two_threads,
         ];
         for case in cases {

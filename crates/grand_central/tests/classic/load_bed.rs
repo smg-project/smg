@@ -4,8 +4,8 @@
 //! builds its own with, and the worker is written into the store the holder
 //! follows. A replay scripts the engine's answer to a load poll, polls the
 //! worker's group once through the worker crate's own monitor, and has the
-//! monitor's own loop drop the worker's loads when its row leaves the ready
-//! set.
+//! monitor's own loop drop the worker's loads when its object leaves the
+//! ready set.
 
 use std::{
     collections::HashMap,
@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use smg_grand_central::{
     engine::WireModes,
-    store::{MemoryStore, Overload, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{MemoryStore, Overload, Registrant, WorkerFacts, WorkersStore},
     worker_host::{load_monitor, Members, Objects},
 };
 use smg_worker::{
@@ -29,7 +29,8 @@ use smg_worker::{
     load::monitor::{poll_group_once_for_test, WorkerMonitor},
     registry::WorkerRegistry,
     worker::{
-        ConnectionMode, ProfileOptions, RuntimeType, WorkerGroupKey, WorkerLoadResponse, WorkerType,
+        ConnectionMode, ProfileOptions, RuntimeType, WorkerGroupKey, WorkerLoadResponse,
+        WorkerStatus as ObjectStatus, WorkerType,
     },
 };
 
@@ -174,7 +175,6 @@ impl EngineConnector for Dials {
 /// One worker among a host's objects, its engine and the host's load
 /// monitor over them.
 pub struct Bed {
-    store: MemoryStore,
     objects: Arc<Objects<Members>>,
     engine: Arc<Engine>,
     monitor: Arc<WorkerMonitor<Members>>,
@@ -202,7 +202,6 @@ impl Bed {
             Objects::new(Arc::new(WorkerRegistry::new()))
                 .with_connector(dials)
                 .with_host_local_unchecked()
-                .with_status_followed()
                 .with_overload_thresholds(defaults),
         );
         let store = MemoryStore::with_publish_window(Duration::ZERO);
@@ -215,7 +214,7 @@ impl Bed {
             Laid::Whole | Laid::Ranks => vec![(ENGINE.to_string(), 0)],
         };
         for (key, rank) in &keys {
-            let written = store.upsert(WorkerFacts {
+            let facts = WorkerFacts {
                 key: key.clone(),
                 engine: ENGINE.to_string(),
                 incarnation: 1,
@@ -225,15 +224,13 @@ impl Bed {
                 wire_modes: WireModes::GRPC,
                 overload: own,
                 ..WorkerFacts::default()
-            });
-            let id = written.id();
+            };
+            let written = objects.upsert(&store, facts, Registrant::Control);
+            let id = written.ok_or("a write the store did not take")?.id();
             let stored = WorkersStore::get(&store, id).ok_or("no row behind its write")?;
-            store
-                .set_status(id, WorkerStatus::Ready, stored.revision)
-                .ok_or("a status the store did not take")?;
+            objects.connect_row(&store, id, stored.revision);
         }
         store.publish_now();
-        objects.follow(&store);
         let mut workers = Vec::with_capacity(keys.len());
         for (key, _) in &keys {
             let object = objects.registry().get_by_url(key);
@@ -241,7 +238,6 @@ impl Bed {
         }
         let monitor = load_monitor(&objects, IDLE);
         Ok(Self {
-            store,
             objects,
             engine,
             monitor,
@@ -282,32 +278,30 @@ impl Bed {
         poll_group_once_for_test(&self.monitor, &group, INTERVAL, now).await;
     }
 
-    /// The worker leaves the ready set: its rows are written not ready, the
-    /// holder moves each object's status, and the monitor's loop drops the
-    /// worker's loads at that word. The recorders' worker is polled again
-    /// behind the drop, so its rows are ready again.
+    /// The worker leaves the ready set: each of its objects is moved to not
+    /// ready, and the monitor's loop drops the worker's loads at that word.
+    /// The recorders' worker is polled again behind the drop, so its
+    /// objects are ready again.
     pub async fn evict(&self) -> Result<(), String> {
-        self.status(WorkerStatus::NotReady)?;
+        self.status(ObjectStatus::NotReady)?;
         settle().await;
-        self.status(WorkerStatus::Ready)?;
+        self.status(ObjectStatus::Ready)?;
         settle().await;
         Ok(())
     }
 
-    /// Writes `status` on each row of the worker and has the holder read
-    /// the change.
-    fn status(&self, status: WorkerStatus) -> Result<(), String> {
+    /// Moves each object of the worker to `status`, as a health driver's
+    /// verdict moves it: the registry writes the status and tells it.
+    fn status(&self, status: ObjectStatus) -> Result<(), String> {
+        let registry = self.objects.registry();
         for worker in &self.workers {
-            let row = self
-                .store
-                .by_key(worker.url())
-                .ok_or("a worker object with no row")?;
-            self.store
-                .set_status(row.id, status, row.revision)
-                .ok_or("a status the store did not take")?;
+            let id = registry
+                .get_id_by_url(worker.url())
+                .ok_or("a worker with no object")?;
+            registry
+                .apply_if_revision(&id, worker.revision(), |_| ((), Some(status)))
+                .ok_or("an object that moved")?;
         }
-        self.store.publish_now();
-        self.objects.follow(&self.store);
         Ok(())
     }
 

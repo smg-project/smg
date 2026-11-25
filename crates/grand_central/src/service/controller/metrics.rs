@@ -28,7 +28,10 @@ use super::{
     generations::Generations,
     readiness::{Sample, State},
 };
-use crate::store::StoreStats;
+use crate::{
+    engine::{POLICY_FAULTS_HELP, POLICY_FAULT_KINDS},
+    store::StoreStats,
+};
 
 /// `1` for the controller's state (`starting`, `leader`, `syncing`,
 /// `follower`, `draining`), `0` for the other four. The admin listener sets it from the
@@ -124,12 +127,16 @@ pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_grand_central_overload_flips_total";
 /// of a single request's lease or a pair's, the release of a lease the
 /// decision gives up) counts with the requests that got no decision.
 pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_grand_central_lifecycle_faults_total";
-/// Panics the engine held under its own catches, by `kind`, over
-/// every engine the store built: `decision` (a whole decision, a shadow's
+/// Panics the store's one engine held under its own catches, by
+/// `kind`: `decision` (a whole decision, a shadow's
 /// beside a live decision among them), `event` (a stage at a word the
 /// engine tells it) and `upkeep` (a step of the engine's upkeep). It is a
-/// gateway's family of that name, with one definition in both processes,
-/// and it never starts again at a new document.
+/// gateway's family of that name, with one definition in both processes:
+/// each page takes the kinds and the description from the engine's
+/// constants ([`POLICY_FAULT_KINDS`], [`POLICY_FAULTS_HELP`]). The name
+/// stays a literal here, as every series this module declares (the
+/// README's guard reads them), and a case holds it to the engine's. It
+/// never starts again at a new document.
 ///
 /// On a controller `upkeep` is a run of the upkeep at the presence sweep's
 /// tick, and `event` is a stage's panic at a change of membership: the one
@@ -157,7 +164,7 @@ pub(crate) struct Metrics {
     outside: [Gauge; 2],
     overload_flips: Counter,
     lifecycle_faults: Counter,
-    /// The panics the store's engines held: `decision`, `event`, `upkeep`.
+    /// The panics the store's engine held: `decision`, `event`, `upkeep`.
     policy_faults: [Counter; 3],
     /// Held from a scrape's sample of the state to the end of its render:
     /// the gauges are written from one sample and read back whole.
@@ -351,8 +358,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(POLICY_FAULTS_TOTAL),
             None,
-            "Panics Grand Central held and counted, by kind: decision (a decision that panicked, a shadow's beside a live decision among them), event (a stage at a lease event or a change of membership), upkeep (a step of the engine's upkeep: its sweep, the registry's follow, a load report, a fill of worker lists)"
-                .into(),
+            POLICY_FAULTS_HELP.into(),
         );
         recorder.describe_gauge(
             KeyName::from_const_str(MEMBERS_OUTSIDE_LIST),
@@ -422,7 +428,7 @@ impl Metrics {
         let lifecycle_faults =
             recorder.register_counter(&Key::from_name(LIFECYCLE_FAULTS_TOTAL), &metadata);
         let policy_faults =
-            ["decision", "event", "upkeep"].map(|kind| counter(POLICY_FAULTS_TOTAL, "kind", kind));
+            POLICY_FAULT_KINDS.map(|kind| counter(POLICY_FAULTS_TOTAL, "kind", kind));
         start.set(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -550,13 +556,13 @@ impl Metrics {
 
     /// Sets the store's series from one read of its counts: the members
     /// outside a list, the lifecycle calls that panicked, and the panics
-    /// its engines held, by kind.
+    /// its engine held, by kind.
     fn observe_store(&self, counts: StoreStats) {
         let [engines, zones] = &self.outside;
         engines.set(f64::from(counts.outside.engines));
         zones.set(f64::from(counts.outside.zones));
         self.lifecycle_faults.absolute(counts.lifecycle_faults);
-        // The engines' counts are the store's own for its life, whichever
+        // The engine's counts stand for the store's life, whichever
         // document each rose under: each series is set to its count as read.
         let held = counts.engine_faults;
         let read = [held.decisions, held.events, held.upkeep];
@@ -600,9 +606,9 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{
-        Generations, LoadTotals, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST, POLICY_FAULTS_TOTAL,
-        REPLICATION_LAG_SECONDS, REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED,
-        SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
+        Generations, LoadTotals, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST, POLICY_FAULTS_HELP,
+        POLICY_FAULTS_TOTAL, REPLICATION_LAG_SECONDS, REPLICATION_RESTORES_ASKED_TOTAL,
+        REPLICATION_SYNCED, SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
     };
     use crate::{
         service::controller::{
@@ -973,13 +979,13 @@ mod tests {
         );
     }
 
-    /// The panics the store's engines held render as the engine's
+    /// The panics the store's engine held render as the engine's
     /// family, a series a kind, each at zero from the first scrape. Each is
     /// set to its count as its scrape's read answers it, under its own kind.
     /// The store's counts never fall. Were a read to answer less, the series
     /// would stay where it stood: a scraper reads a fall as a restart.
     #[test]
-    fn the_panics_the_stores_engines_held_render_by_kind_and_never_fall() {
+    fn the_panics_the_stores_engine_held_render_by_kind_and_never_fall() {
         let metrics = Metrics::new();
         let scraped = |held: [u64; 3]| {
             let [decisions, events, upkeep] = held;
@@ -997,7 +1003,9 @@ mod tests {
                 &DecideStats::default(),
                 || counts,
             );
-            assert!(rendered.contains("# HELP smg_policy_faults_total Panics Grand Central "));
+            assert_eq!(POLICY_FAULTS_TOTAL, crate::engine::POLICY_FAULTS_TOTAL);
+            let help = format!("# HELP smg_policy_faults_total {POLICY_FAULTS_HELP}\n");
+            assert!(rendered.contains(&help), "{rendered}");
             assert!(rendered.contains("# TYPE smg_policy_faults_total counter"));
             ["decision", "event", "upkeep"].map(|kind| {
                 let label = format!("kind=\"{kind}\"");

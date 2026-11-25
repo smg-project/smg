@@ -356,9 +356,11 @@ static NO_NAMES: Names = Names {
 
 /// The parser names set for one model, apart by who set them ([`ParserResolver::names_of`]): the
 /// names of its card, which its workers' labels (or the operator's card) set for the one model,
-/// and the gateway's flags, which every model shares. Symphony reads the two in that order with
-/// its registry between them (`regular::symphony::names::reads`): the card's names when they select
-/// anything, else the registry's table for a model it knows, else the flags; the legacy parsers
+/// and the gateway's flags, which every model shares. Symphony reads the two in that order ahead
+/// of its registry (`regular::symphony::names::reads`): the card's names when they select
+/// anything, else the flags when they select anything (a reasoning name alone that selects a table
+/// excepted, `regular::symphony::names::flags_read_first`), else the registry's table for a model it
+/// knows; the legacy parsers
 /// take each kind's first name, from the flags only one a legacy parser of the kind has
 /// ([`ParserResolver::tool_parser`], [`ParserResolver::legacy_tool`]).
 #[derive(Clone, Debug, PartialEq, Eq)]

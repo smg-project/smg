@@ -43,8 +43,9 @@
 //! same traits over the structures it already holds.
 //!
 //! A decision reads none of the tables behind those traits. The store
-//! derives a [`StoreSnapshot`] from them (every pool as whole candidate rows)
-//! and publishes it by pointer swap: `snapshot` holds the read side. Every
+//! derives a [`StoreSnapshot`] from them (each pool's standing vetoes and
+//! each member's slot, with no row of a worker's facts or status) and
+//! publishes it by pointer swap: `snapshot` holds the read side. Every
 //! world is published under the generation the store holds, which
 //! [`MemoryStore::apply`] alone replaces: a decision reads the world and its
 //! engine in one load.

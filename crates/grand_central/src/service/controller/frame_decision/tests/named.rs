@@ -2,7 +2,8 @@
 //! (`DecideRequest.named_worker`): its ask [`decide`](super::decide) as a
 //! deciding thread asks it, under the stock hash ring document, whose
 //! binding names a target source, and
-//! [`decide_alone`](super::decide_alone) for a frame that stands alone.
+//! [`decide_alone`](super::decide_alone) for a frame that stands alone. A
+//! pair's frame has its cases in a file of their own.
 
 use std::{
     collections::BTreeSet,
@@ -28,6 +29,8 @@ use crate::{
     store::{GatewayId, HealthSink, LeasesStore, MemoryStore},
     worker_host::{Members, Objects},
 };
+
+mod pair;
 
 /// The shed of a request whose named worker cannot take it.
 const MISSED: Option<(ShedReason, &str)> = Some((ShedReason::NoEndpoints, "target-worker"));
@@ -94,10 +97,14 @@ fn reached_by(answer: &Decision) -> Result<WorkerId, Option<(ShedReason, &'stati
 #[test]
 fn a_frame_that_names_its_worker_is_answered_the_worker_its_number_reaches() {
     let store = ring_store();
-    let member = |name: &'static str| (name, side_member(&store, name, Role::Single, None));
-    let members = ["s0", "s1", "s2", "s3", "s4"].map(member);
     let objects = holder(&store);
-    objects.follow(&*store);
+    let member = |name: &'static str| {
+        (
+            name,
+            side_member(&store, &objects, name, Role::Single, None),
+        )
+    };
+    let members = ["s0", "s1", "s2", "s3", "s4"].map(member);
     let order = list_order(&objects, Role::Single, &members);
     let now = Instant::now();
     let asked = |frame: proto::DecideRequest| {
@@ -133,10 +140,10 @@ fn a_frame_that_names_its_worker_is_answered_the_worker_its_number_reaches() {
 #[test]
 fn a_number_that_reaches_no_worker_is_shed_under_target_worker() {
     let store = ring_store();
-    for name in ["s0", "s1", "s2"] {
-        side_member(&store, name, Role::Single, None);
-    }
     let objects = holder(&store);
+    for name in ["s0", "s1", "s2"] {
+        side_member(&store, &objects, name, Role::Single, None);
+    }
     let now = Instant::now();
     for number in [3, 4, 1 << 20, u32::MAX] {
         for frame in [frame_for(PAIRED, 1, 9), keyed(frame_for(PAIRED, 1, 9), 9)] {
@@ -158,7 +165,13 @@ fn a_number_that_reaches_no_worker_is_shed_under_target_worker() {
 #[test]
 fn a_standing_veto_ahead_of_the_place_moves_the_count() {
     let store = ring_store();
-    let member = |name: &'static str, only| (name, side_member(&store, name, Role::Single, only));
+    let objects = holder(&store);
+    let member = |name: &'static str, only| {
+        (
+            name,
+            side_member(&store, &objects, name, Role::Single, only),
+        )
+    };
     let members = [
         member("s0", None),
         member("s1", None),
@@ -166,8 +179,6 @@ fn a_standing_veto_ahead_of_the_place_moves_the_count() {
         member("s3", None),
         member("s4", None),
     ];
-    let objects = holder(&store);
-    objects.follow(&*store);
     let order = list_order(&objects, Role::Single, &members);
     let theirs = members[2].1;
     let dialed: Vec<WorkerId> = order.iter().copied().filter(|&id| id != theirs).collect();
@@ -229,16 +240,15 @@ fn a_standing_veto_ahead_of_the_place_moves_the_count() {
 #[test]
 fn where_no_worker_can_be_counted_the_request_leaves_its_hold_with_no_key() {
     let store = ring_store();
+    let objects = holder(&store);
     let names = ["s0", "s1", "s2", "s3"];
-    let members = names.map(|name| side_member(&store, name, Role::Single, None));
+    let members = names.map(|name| side_member(&store, &objects, name, Role::Single, None));
     let now = Instant::now();
     let held = members.iter().zip([3_u64, 2, 0, 1]);
     let targets = held.flat_map(|(&member, held)| (0..held).map(move |_| member));
     for (target, id) in targets.zip(1..) {
         file(&store, id, target, now);
     }
-    let objects = holder(&store);
-    objects.follow(&*store);
     for name in names {
         let object = objects
             .registry()
@@ -302,13 +312,17 @@ fn a_named_worker_its_decision_refuses_is_shed_under_target_worker() {
     let profile = profile.expect("the preset's profile");
     profile.filter.push("refuses".into());
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(staged(&document, &catalog))
         .expect("above the unbound start");
-    let member = |name: &'static str| (name, side_member(&store, name, Role::Single, None));
+    let member = |name: &'static str| {
+        (
+            name,
+            side_member(&store, &objects, name, Role::Single, None),
+        )
+    };
     let members = ["s0", "s1", "s2"].map(member);
-    let objects = holder(&store);
-    objects.follow(&*store);
     let order = list_order(&objects, Role::Single, &members);
     let now = Instant::now();
     let reached = |named: Option<u32>| {
@@ -342,10 +356,10 @@ fn a_named_worker_its_decision_refuses_is_shed_under_target_worker() {
 #[test]
 fn a_number_is_not_read_under_a_binding_that_names_no_target_source() {
     let store = store_under("round_robin");
-    for name in ["s0", "s1", "s2", "s3"] {
-        side_member(&store, name, Role::Single, None);
-    }
     let objects = holder(&store);
+    for name in ["s0", "s1", "s2", "s3"] {
+        side_member(&store, &objects, name, Role::Single, None);
+    }
     let now = Instant::now();
     let named = |number: Option<u32>| -> BTreeSet<WorkerId> {
         let turns = (1..=16).map(|n| {
@@ -371,13 +385,12 @@ fn a_number_is_not_read_under_a_binding_that_names_no_target_source() {
 #[test]
 fn a_frame_that_stands_alone_counts_over_its_own_phases_list() {
     let store = ring_store();
-    let member = |name: &'static str, role| (name, side_member(&store, name, role, None));
+    let objects = holder(&store);
+    let member = |name: &'static str, role| (name, side_member(&store, &objects, name, role, None));
     let (prefill, decode) = (Role::Prefill, Role::Decode);
     let prefills = ["p0", "p1", "p2"].map(|name| member(name, prefill));
     let decodes = ["d0", "d1"].map(|name| member(name, decode));
     member("s0", Role::Single);
-    let objects = holder(&store);
-    objects.follow(&*store);
     let ahead = list_order(&objects, prefill, &prefills);
     let behind = list_order(&objects, decode, &decodes);
     let now = Instant::now();

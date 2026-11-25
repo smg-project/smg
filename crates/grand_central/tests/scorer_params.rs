@@ -68,30 +68,29 @@ profiles:
         .expect("a well-formed document");
         document.validate_in(&catalog, &[]).expect("validates")
     };
-    let health = Health {
-        healthy: true,
-        ..Health::default()
-    };
+    let mut health = Health::default();
+    health.healthy = true;
     let rows = [
-        Candidate {
-            id: WorkerId(31),
-            health,
-            ..Candidate::default()
+        {
+            let mut row = Candidate::default();
+            row.id = WorkerId(31);
+            row.health = health;
+            row
         },
-        Candidate {
-            position: 1,
-            id: WorkerId(89),
-            in_flight: 19,
-            health,
-            ..Candidate::default()
+        {
+            let mut row = Candidate::default();
+            row.position = 1;
+            row.id = WorkerId(89);
+            row.in_flight = 19;
+            row.health = health;
+            row
         },
     ];
+    let mut pool = PoolFacts::default();
+    pool.pool_size = rows.len() as u32;
     let decision = engine.decide(
         &RequestFacts::default(),
-        &PoolFacts {
-            pool_size: rows.len() as u32,
-            ..PoolFacts::default()
-        },
+        &pool,
         &rows,
         &Constraints::default(),
         &mut Scratch::new(),
@@ -164,26 +163,21 @@ profiles:
         .expect("a well-formed document");
         document.validate_in(&catalog, &[]).expect("validates")
     };
-    let health = Health {
-        healthy: true,
-        ..Health::default()
-    };
-    let rows = [0, 1].map(|position| Candidate {
-        position,
-        id: WorkerId(u64::from(position) + 1),
-        health,
-        ..Candidate::default()
+    let mut health = Health::default();
+    health.healthy = true;
+    let rows = [0, 1].map(|position| {
+        let mut row = Candidate::default();
+        row.position = position;
+        row.id = WorkerId(u64::from(position) + 1);
+        row.health = health;
+        row
     });
-    let pool = PoolFacts {
-        pool_size: rows.len() as u32,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = rows.len() as u32;
     let mut ways = [0u32; 4];
     for seed in 0..4_000u64 {
-        let facts = RequestFacts {
-            seed,
-            ..RequestFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.seed = seed;
         let decision = engine.decide(
             &facts,
             &pool,

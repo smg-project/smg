@@ -47,13 +47,11 @@ fn shadowed(c: &mut Criterion, preset: &str, group: &str, facts: RequestFacts<'_
         } else {
             (0, Engines::default())
         };
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: engine.generation(),
-            membership_epoch,
-            engines,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = engine.generation();
+        pool.membership_epoch = membership_epoch;
+        pool.engines = engines;
         let cx = Constraints::default();
         let live = engine.decide(&facts, &pool, &rows, &cx, &mut scratch);
         let shadow = engine
@@ -75,10 +73,11 @@ fn shadowed(c: &mut Criterion, preset: &str, group: &str, facts: RequestFacts<'_
             let mut seed = 0u64;
             b.iter(|| {
                 seed += 1;
-                let facts = RequestFacts {
-                    seed,
-                    client_key: facts.client_key.wrapping_mul(seed),
-                    ..facts
+                let facts = {
+                    let mut request_facts = facts;
+                    request_facts.seed = seed;
+                    request_facts.client_key = facts.client_key.wrapping_mul(seed);
+                    request_facts
                 };
                 let rows = black_box(rows.as_slice());
                 let live = engine.decide(&facts, &pool, rows, &cx, &mut scratch);
@@ -92,17 +91,13 @@ fn shadowed(c: &mut Criterion, preset: &str, group: &str, facts: RequestFacts<'_
 
 fn decide_with_shadow(c: &mut Criterion) {
     let now_micros = 1_000_000;
-    let sized = RequestFacts {
-        prompt_tokens: 512,
-        now_micros,
-        ..RequestFacts::default()
-    };
+    let mut sized = RequestFacts::default();
+    sized.prompt_tokens = 512;
+    sized.now_micros = now_micros;
     shadowed(c, "least_load", "decide_with_shadow", sized, false);
-    let by_client = RequestFacts {
-        client_key: CLIENT_MIX,
-        now_micros,
-        ..RequestFacts::default()
-    };
+    let mut by_client = RequestFacts::default();
+    by_client.client_key = CLIENT_MIX;
+    by_client.now_micros = now_micros;
     shadowed(
         c,
         "consistent_hashing",

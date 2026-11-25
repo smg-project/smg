@@ -42,8 +42,14 @@ use crate::{
 };
 
 /// [`member_of`] for [`ENCODED`].
-fn member(store: &MemoryStore, name: &str, role: Role, stated: Stated) -> WorkerId {
-    member_of(store, ENCODED, name, role, stated)
+fn member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    name: &str,
+    role: Role,
+    stated: Stated,
+) -> WorkerId {
+    member_of(store, objects, ENCODED, name, role, stated)
 }
 
 /// A store under the encode plan.
@@ -61,8 +67,8 @@ fn encode_frame(n: u8, keys: u64) -> proto::DecideRequest {
 
 /// One encode request's decision on `frames`, a deciding thread's buffers,
 /// and where its answer says its items go (`DecideAnswer.encode`): what
-/// the thread asks for `frame` as `gateway`'s at `now`, behind the holder's
-/// follow. The load monitor published nothing: the request reads no report.
+/// the thread asks for `frame` as `gateway`'s at `now`. The load monitor
+/// published nothing: the request reads no report.
 fn decided_on(
     frames: &mut FrameBuffers,
     store: &MemoryStore,
@@ -72,7 +78,6 @@ fn decided_on(
 ) -> (Decision, Option<proto::EncodePlaced>) {
     let request = Checked::new(frame).expect("a frame the record holds");
     assert!(request.carries_items(), "an encode request's frame");
-    objects.follow(store);
     let own = Part::default();
     let loads = Arc::new(LoadSnapshot::default());
     let decision = {
@@ -114,15 +119,15 @@ fn encoders_of(placed: Option<&proto::EncodePlaced>) -> Vec<WorkerId> {
 #[test]
 fn an_encode_request_is_decided_for_its_pair_and_for_each_items_encoder() {
     let store = encode_store();
-    let p = member(&store, "p0", Role::Prefill, PUSHING);
-    let d = member(&store, "d0", Role::Decode, PUSHING);
-    let e = member(&store, "e0", Role::Encode, PUSHING);
+    let objects = holder(&store);
+    let p = member(&store, &objects, "p0", Role::Prefill, PUSHING);
+    let d = member(&store, &objects, "d0", Role::Decode, PUSHING);
+    let e = member(&store, &objects, "e0", Role::Encode, PUSHING);
     let unstated = Stated {
         pushes: false,
         ..PUSHING
     };
-    member(&store, "e1", Role::Encode, unstated);
-    let objects = holder(&store);
+    member(&store, &objects, "e1", Role::Encode, unstated);
     let now = Instant::now();
     for n in 1..=16 {
         let frame = encode_frame(n, 2);
@@ -171,11 +176,11 @@ fn a_one_key_with_no_form_crosses_a_link_as_one_placement() {
         service::client::wire::{encode_request, placed},
     };
     let store = encode_store();
-    let p = member(&store, "p0", Role::Prefill, PUSHING);
-    let d = member(&store, "d0", Role::Decode, PUSHING);
-    let e0 = member(&store, "e0", Role::Encode, PUSHING);
-    let e1 = member(&store, "e1", Role::Encode, PUSHING);
     let objects = holder(&store);
+    let p = member(&store, &objects, "p0", Role::Prefill, PUSHING);
+    let d = member(&store, &objects, "d0", Role::Decode, PUSHING);
+    let e0 = member(&store, &objects, "e0", Role::Encode, PUSHING);
+    let e1 = member(&store, &objects, "e1", Role::Encode, PUSHING);
     let now = Instant::now();
     let keys = [11, 12, 13].map(Identity::hashed);
     let each = EncodeItems {
@@ -235,12 +240,12 @@ fn an_encode_request_with_no_key_is_decided_as_its_pair_and_takes_no_encoder() {
     };
     for encoders in [&[][..], &[theirs][..]] {
         let store = encode_store();
-        let p = member(&store, "p0", Role::Prefill, PUSHING);
-        let d = member(&store, "d0", Role::Decode, PUSHING);
-        for (n, &stated) in encoders.iter().enumerate() {
-            member(&store, &format!("e{n}"), Role::Encode, stated);
-        }
         let objects = holder(&store);
+        let p = member(&store, &objects, "p0", Role::Prefill, PUSHING);
+        let d = member(&store, &objects, "d0", Role::Decode, PUSHING);
+        for (n, &stated) in encoders.iter().enumerate() {
+            member(&store, &objects, &format!("e{n}"), Role::Encode, stated);
+        }
         let frame = encode_frame(1, 0);
         let (answer, placed) = served_encode(&store, &objects, frame, GATEWAY, now);
         assert_eq!(pairs_of(&answer), [(p, d)], "{} encoders", encoders.len());
@@ -260,18 +265,18 @@ fn an_encode_request_with_no_key_is_decided_as_its_pair_and_takes_no_encoder() {
 #[test]
 fn an_encode_request_takes_its_encoders_by_their_own_places_and_vetoes() {
     let store = encode_store();
-    let p = member(&store, "p0", Role::Prefill, PUSHING);
-    let d = member(&store, "d0", Role::Decode, PUSHING);
+    let objects = holder(&store);
+    let p = member(&store, &objects, "p0", Role::Prefill, PUSHING);
+    let d = member(&store, &objects, "d0", Role::Decode, PUSHING);
     let theirs = Stated {
         only: Some(OTHER),
         ..PUSHING
     };
     let encoders = [
-        member(&store, "e0", Role::Encode, PUSHING),
-        member(&store, "e1", Role::Encode, theirs),
-        member(&store, "e2", Role::Encode, PUSHING),
+        member(&store, &objects, "e0", Role::Encode, PUSHING),
+        member(&store, &objects, "e1", Role::Encode, theirs),
+        member(&store, &objects, "e2", Role::Encode, PUSHING),
     ];
-    let objects = holder(&store);
     let now = Instant::now();
     store.gateway_veto(GATEWAY, encoders[2], Some(now + Duration::from_secs(60)));
     let named = |gateway: GatewayId| -> BTreeSet<WorkerId> {
@@ -314,16 +319,16 @@ fn an_encode_requests_frame_answers_its_three_lists_in_a_pairs_order() {
     // and `encoders`, stating `wires` and `hint`.
     let answered = |prefill: bool, decodes: &[Stated], encoders: &[Stated], wires, hint| {
         let store = encode_store();
+        let objects = holder(&store);
         if prefill {
-            member(&store, "p0", Role::Prefill, both);
+            member(&store, &objects, "p0", Role::Prefill, both);
         }
         for (n, &stated) in decodes.iter().enumerate() {
-            member(&store, &format!("d{n}"), Role::Decode, stated);
+            member(&store, &objects, &format!("d{n}"), Role::Decode, stated);
         }
         for (n, &stated) in encoders.iter().enumerate() {
-            member(&store, &format!("e{n}"), Role::Encode, stated);
+            member(&store, &objects, &format!("e{n}"), Role::Encode, stated);
         }
-        let objects = holder(&store);
         let frame = frame_of(ENCODED, 1, 1, wires, hint);
         let (answer, placed) = served_encode(&store, &objects, frame, GATEWAY, now);
         assert_eq!(placed.is_some(), answer.pick().is_some(), "{answer:?}");
@@ -369,17 +374,16 @@ fn an_encode_requests_frame_answers_its_three_lists_in_a_pairs_order() {
 #[test]
 fn an_encode_requests_pick_is_filed_its_pairs_leases_and_none_for_an_encoder() {
     let store = encode_store();
-    let p = member(&store, "p0", Role::Prefill, PUSHING);
-    let d = member(&store, "d0", Role::Decode, PUSHING);
-    let e = member(&store, "e0", Role::Encode, PUSHING);
-    LeasesStore::set_term(&*store, 1);
     let objects = holder(&store);
+    let p = member(&store, &objects, "p0", Role::Prefill, PUSHING);
+    let d = member(&store, &objects, "d0", Role::Decode, PUSHING);
+    let e = member(&store, &objects, "e0", Role::Encode, PUSHING);
+    LeasesStore::set_term(&*store, 1);
     let now = Instant::now();
     let leased = |n: u8, later: bool| {
         let mut frame = encode_frame(n, 1);
         frame.decode_later = later;
         let request = Checked::new(frame).expect("a frame the record holds");
-        objects.follow(&*store);
         let (mut frames, own) = (FrameBuffers::default(), Part::default());
         let loads = Arc::new(LoadSnapshot::default());
         let (decision, filed) = {
@@ -433,11 +437,11 @@ fn a_frame_with_items_under_a_plan_with_no_encode_side_is_declined_by_its_bindin
     };
     for (plan, spec) in [("pd-pair", stock_pair_plan()), ("single", single)] {
         let store = Arc::new(MemoryStore::new());
-        store.apply(spec).expect("above the unbound start");
-        member(&store, "p0", Role::Prefill, PUSHING);
-        member(&store, "d0", Role::Decode, PUSHING);
-        member(&store, "e0", Role::Encode, PUSHING);
         let objects = holder(&store);
+        store.apply(spec).expect("above the unbound start");
+        member(&store, &objects, "p0", Role::Prefill, PUSHING);
+        member(&store, &objects, "d0", Role::Decode, PUSHING);
+        member(&store, &objects, "e0", Role::Encode, PUSHING);
         for keys in [0, 1] {
             let frame = encode_frame(1, keys);
             let (answer, placed) = served_encode(&store, &objects, frame, GATEWAY, now);
@@ -491,13 +495,13 @@ fn an_answer_names_its_encoders_in_the_order_of_the_frames_keys() {
         .picker("by-key", || Box::new(ByKey))
         .expect("a free name");
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     let plan = encode_plan_in(&catalog, 1, ["by-key", "random", "random"]);
     store.apply(plan).expect("above the unbound start");
-    member(&store, "p0", Role::Prefill, PUSHING);
-    member(&store, "d0", Role::Decode, PUSHING);
-    member(&store, "e0", Role::Encode, PUSHING);
-    member(&store, "e1", Role::Encode, PUSHING);
-    let objects = holder(&store);
+    member(&store, &objects, "p0", Role::Prefill, PUSHING);
+    member(&store, &objects, "d0", Role::Decode, PUSHING);
+    member(&store, &objects, "e0", Role::Encode, PUSHING);
+    member(&store, &objects, "e1", Role::Encode, PUSHING);
     let now = Instant::now();
     let asked = |n, keys: &[u64]| {
         let mut frame = encode_frame(n, 0);
@@ -527,10 +531,10 @@ fn an_answer_names_its_encoders_in_the_order_of_the_frames_keys() {
 #[test]
 fn an_answer_carries_no_item_of_the_threads_earlier_frame() {
     let store = encode_store();
-    let p = member(&store, "p0", Role::Prefill, PUSHING);
-    let d = member(&store, "d0", Role::Decode, PUSHING);
-    let e = member(&store, "e0", Role::Encode, PUSHING);
     let objects = holder(&store);
+    let p = member(&store, &objects, "p0", Role::Prefill, PUSHING);
+    let d = member(&store, &objects, "d0", Role::Decode, PUSHING);
+    let e = member(&store, &objects, "e0", Role::Encode, PUSHING);
     let now = Instant::now();
     let mut frames = FrameBuffers::default();
     let mut asked =
@@ -571,22 +575,21 @@ fn an_encode_request_any_of_whose_sides_may_refuse_by_reports_applies_what_waits
     ];
     for (picks, waited) in cases {
         let store = Arc::new(MemoryStore::new().with_decision_slots(2));
+        let objects = holder(&store);
         store
             .apply(encode_plan_in(&catalog, 1, picks))
             .expect("above the unbound start");
-        let p = member(&store, "p0", Role::Prefill, PUSHING);
-        member(&store, "d0", Role::Decode, PUSHING);
-        member(&store, "e0", Role::Encode, PUSHING);
+        let p = member(&store, &objects, "p0", Role::Prefill, PUSHING);
+        member(&store, &objects, "d0", Role::Decode, PUSHING);
+        member(&store, &objects, "e0", Role::Encode, PUSHING);
         LeasesStore::set_term(&*store, 1);
         let mut watch = a_frame_under_the_second_files_watch(&store, p);
         // The first file's decision, its place lent.
         let _acting = DecisionSlot::new(0).enter();
         let place = store.at_work();
-        let objects = holder(&store);
         let now = Instant::now();
         let request = Checked::new(encode_frame(1, 1)).expect("a frame the record holds");
         let taken = taken_at(&request, GATEWAY, (now, now), Some(&place));
-        objects.follow(&*store);
         let (mut frames, own) = (FrameBuffers::default(), Part::default());
         let loads = Arc::new(LoadSnapshot::default());
         let decided = store
@@ -607,23 +610,22 @@ fn an_encode_request_any_of_whose_sides_may_refuse_by_reports_applies_what_waits
 #[test]
 fn the_encoders_a_gateways_wires_take_are_counted_for_a_request_with_a_key() {
     let store = encode_store();
+    let objects = holder(&store);
     let (http, grpc) = (WireModes::HTTP, WireModes::GRPC);
     let both = Stated {
         wires: http.union(grpc),
         ..PUSHING
     };
-    member(&store, "p0", Role::Prefill, both);
-    member(&store, "d0", Role::Decode, both);
-    member(&store, "e0", Role::Encode, PUSHING);
-    let other_wire = member(&store, "e1", Role::Encode, both);
-    let objects = holder(&store);
+    member(&store, &objects, "p0", Role::Prefill, both);
+    member(&store, &objects, "d0", Role::Decode, both);
+    member(&store, &objects, "e0", Role::Encode, PUSHING);
+    let other_wire = member(&store, &objects, "e1", Role::Encode, both);
     let now = Instant::now();
     let (mut frames, own) = (FrameBuffers::default(), Part::default());
     let loads = Arc::new(LoadSnapshot::default());
     let mut counted = |n: u8, keys: u64| {
         let frame = frame_of(ENCODED, n, keys, grpc, None);
         let request = Checked::new(frame).expect("a frame the record holds");
-        objects.follow(&*store);
         let decision = {
             let taken = taken_at(&request, GATEWAY, (now, now), None);
             let decided = store.deciding(|world| {
@@ -642,4 +644,40 @@ fn the_encoders_a_gateways_wires_take_are_counted_for_a_request_with_a_key() {
     assert_eq!(counted(1, 1), (vec![other_wire], 1));
     assert_eq!(counted(2, 0), (Vec::new(), 1), "no key reads no encoder");
     assert_eq!(counted(3, 1), (vec![other_wire], 2));
+}
+
+/// An encode request's frame is read for no number its request names its
+/// worker by. Under an encode plan whose pair's two sides are plain hash
+/// rings, so that its binding names a target source, a frame that states a
+/// number is answered the pair the same frame is answered with none,
+/// whatever the number: the widest one sheds nothing.
+#[test]
+fn an_encode_requests_frame_is_read_for_no_number() {
+    let ring = "consistent_hashing";
+    let document = PolicySpec::epd_presets("random", ring, ring);
+    let mut document = document.expect("presets of this build");
+    document.generation = 1;
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    store
+        .apply(staged(&document, &StageRegistry::builtin()))
+        .expect("above the unbound start");
+    for name in ["p0", "p1", "p2"] {
+        member(&store, &objects, name, Role::Prefill, PUSHING);
+    }
+    for name in ["d0", "d1", "d2"] {
+        member(&store, &objects, name, Role::Decode, PUSHING);
+    }
+    member(&store, &objects, "e0", Role::Encode, PUSHING);
+    let now = Instant::now();
+    let asked = |number: Option<u32>| {
+        let mut frame = encode_frame(1, 1);
+        frame.named_worker = number;
+        pairs_of(&served_encode(&store, &objects, frame, GATEWAY, now).0)
+    };
+    let unnamed = asked(None);
+    assert!(!unnamed.is_empty(), "a pick");
+    for number in [0, 1, 2, u32::MAX] {
+        assert_eq!(asked(Some(number)), unnamed, "{number}");
+    }
 }

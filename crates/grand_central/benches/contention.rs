@@ -87,14 +87,15 @@ fn decide_and_book(
     // Dated after every row's sample, so the credit stands and the next
     // decision prices it: at one instant, or at the clock every booking of
     // every thread advances, so the lanes interleave.
-    let dated = || Lease {
-        issued_micros: if shape.rising {
+    let dated = || {
+        let mut lease = Lease::default();
+        lease.issued_micros = if shape.rising {
             1_000_000 + CLOCK.fetch_add(1, Ordering::Relaxed)
         } else {
             1_000_000
-        },
-        tokens: 512,
-        ..Lease::default()
+        };
+        lease.tokens = 512;
+        lease
     };
     let mut seed = thread << 48;
     let decide = |seed: u64, scratch: &mut Scratch| {
@@ -105,14 +106,12 @@ fn decide_and_book(
             view[((z >> 16) % n) as usize].id,
             view[((z >> 32) % n) as usize].id,
         ];
-        let facts = RequestFacts {
-            model: "m",
-            prompt_tokens: 512,
-            seed,
-            now_micros: 1_000_000,
-            tried: &drawn[..shape.exclusions],
-            ..RequestFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.prompt_tokens = 512;
+        facts.seed = seed;
+        facts.now_micros = 1_000_000;
+        facts.tried = &drawn[..shape.exclusions];
         let decision = engine.decide(&facts, pool, black_box(view), cx, scratch);
         if let Some(target) = decision.pick().and_then(|p| p.targets.first()) {
             engine.on_dispatched(&dated(), target, Side::Single, 0);
@@ -151,11 +150,9 @@ fn decide_threads(c: &mut Criterion) {
             let fleet = common::fleet(n);
             let mut view = Vec::with_capacity(n);
             common::build_view(&fleet, &mut view);
-            let pool = PoolFacts {
-                pool_size: n as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool = PoolFacts::default();
+            pool.pool_size = n as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             for &threads in &THREADS {
                 group.bench_with_input(

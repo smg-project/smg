@@ -76,7 +76,7 @@ use std::{sync::Arc, time::Instant};
 
 use smg_worker::load::state::LoadSnapshot;
 
-use super::{Loaded, PoolMembers};
+use super::{place::Made, Loaded, PoolMembers};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
@@ -135,13 +135,19 @@ impl PoolMembers {
 /// request's entry there. It is taken as a trait object, so this function
 /// is compiled once, and the copy's decision is no second caller of the
 /// decision a request with no cells takes: as one, it put that decision
-/// out of line for every request.
+/// out of line for every request. `late` is handed on with it
+/// ([`Loaded::decide_into`]).
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what the decision of a request with no cells takes, and the word its shadow said"
+)]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
     request: &mut Request<'_>,
     members: &PoolMembers,
     maker: &dyn RequestMaker,
+    late: Option<&Made<'_, '_>>,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     said: &mut Option<Shadowed>,
@@ -157,7 +163,7 @@ pub(super) fn decide(
         },
         ..*request
     };
-    let decision = own.decide_with_loads(&mut lent, members, maker, loads, now, said);
+    let decision = own.decide_with_loads(&mut lent, members, maker, late, loads, now, said);
     hand_back(request, &lent);
     decision
 }

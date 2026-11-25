@@ -21,9 +21,11 @@
 //! ([`decide_decode`]), and its pick is issued under the pair's own lease
 //! ([`issue_decode`]).
 //!
-//! The engine that decides and the stages that are told are one object:
-//! the world's ([`StoreSnapshot::front`]). A lease is dated on that
-//! engine's clock, the one its decisions read.
+//! A decision runs on the store's one engine, under the document of the
+//! world it read ([`StoreSnapshot::front`]). The list's value it asks, the
+//! lease it files, the stages told that issue and its shadow's count are
+//! that document's, whatever document the store applies meanwhile. A lease
+//! is dated on that engine's clock, the one its decisions read.
 //!
 //! A prefill frame, and a decode frame that names no lease, whose plan
 //! pairs no side of its phase stands alone: it is decided as a single
@@ -34,12 +36,17 @@
 //! (`DecideRequest.named_worker`), under a binding that names a target
 //! source: its decision is held to the place of the worker that number
 //! reaches, counted as the one call counts it in a host's own process
-//! ([`decide_named`]).
+//! ([`decide_named`]). A pair's frame may state the number too, one for
+//! its two sides: its decision is held to the places the pair's count
+//! reaches, or counts the decode's number itself ([`decide_named_pair`]).
+//! A decode call whose frame states the number is refused where the
+//! decode's side reads it ([`names_decode`]): the decode its request named
+//! stands.
 //!
 //! An encode request is its pair's one request, read at the prefill phase
 //! ([`Checked::carries_items`]): [`decide_encode`] decides it over its
 //! model's three lists, the pair's two and the encoders', by the engine's
-//! entry for the three ([`InProcess::decide_encode_without_lease`]).
+//! entry for the three ([`Loaded::decide_encode_without_lease`]).
 //! Its pick is issued as a pair's is ([`issue_pair`]), with no lease for an
 //! encoder, and its answer names each item's encoder
 //! ([`FrameBuffers::answered`]).
@@ -69,12 +76,12 @@ use super::{
 use crate::{
     document::{spec::AppliedSpec, KeySources},
     engine::{
-        decision::{shed, Decision, Pair, Pick, ShedReason, Target},
+        decision::{shed, Decision, Pair, Pick, ShedReason, Target, TARGET_WORKER},
         decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
         framework::{release, EncodeItems, EncodePlaced},
         in_process::{
-            named_worker::{self, Reached},
-            InProcess,
+            named_worker::{self, Reached, ReachedPair},
+            Loaded,
         },
         lease_events,
         shadow::Shadowed,
@@ -246,9 +253,8 @@ fn decide_at(
     let (decision, said) = match generation.as_deref() {
         Some(generation) => {
             let lent = objects.lent(generation, role);
-            // The list's value is asked under the document in force at this
-            // call, and the decision below loads that document again. The
-            // two read one document: a store's engine takes no new one.
+            // The list's value is asked under the world's document, the
+            // one the decision below runs under.
             let members = front.members_of(lent);
             let records = members.records(spec, front.clock());
             let reach = objects.reach(generation, role);
@@ -403,7 +409,7 @@ struct Named<'a> {
 #[cold]
 #[inline(never)]
 fn decide_named(
-    front: &InProcess,
+    front: Loaded<'_, '_>,
     spec: &AppliedSpec,
     frame: &Checked,
     maker: FrameRequest<'_>,
@@ -443,7 +449,7 @@ fn decide_named(
         }
         Reached::NoWorker => {
             let (seed, generation) = (frame.seed(), spec.generation());
-            let stage = named_worker::TARGET_WORKER;
+            let stage = TARGET_WORKER;
             let answer = shed(ShedReason::NoEndpoints, stage, seed, generation);
             Ok(booked(answer, None, frame, read, true))
         }
@@ -493,6 +499,10 @@ fn hands_reports(spec: &AppliedSpec) -> bool {
 /// by phase, and the decode phase's also carries a decode binding of the
 /// model's own: such a binding asks the apply too.
 ///
+/// A frame whose request names its worker is decided for the workers its
+/// number reaches ([`decide_named_pair`]). A frame that names none pays one
+/// test of the number for it.
+///
 /// # Errors
 ///
 /// [`DecisionRefused::Faulted`] where the decision panicked: the engine
@@ -513,7 +523,7 @@ pub(crate) fn decide_pair(
 /// three lists the worker objects' registry holds for the frame's model,
 /// with the pair's classes and the holder's encode columns
 /// ([`Objects::encode_columns`]). The engine's entry for the three lists
-/// decides it ([`InProcess::decide_encode_without_lease`]), the one a
+/// decides it ([`Loaded::decide_encode_without_lease`]), the one a
 /// gateway's own engine runs under its leasing entry. Where the decision
 /// puts the items stays in `buffers` for the frame's answer
 /// ([`FrameBuffers::answered`]).
@@ -532,6 +542,9 @@ pub(crate) fn decide_pair(
 ///
 /// Each of the three profiles that holds a stage that may refuse by a
 /// report of leases asks the apply a pair's frame asks.
+///
+/// An encode request's frame is read for no number its request names its
+/// worker by: it is placed by the rest of its document.
 ///
 /// Out of line: a pair's decision holds no part of it.
 ///
@@ -677,7 +690,19 @@ fn decide_sides(
                             Some(items) => front
                                 .decide_encode_without_lease(&maker, items, placed, now)
                                 .map(|decision| (decision, None)),
-                            None => front.decide_without_lease(&maker, now),
+                            None => match frame.named_worker() {
+                                None => front.decide_without_lease(&maker, now),
+                                // A pair's frame that names its worker goes
+                                // its own way to its answer, out of line.
+                                Some(number) => decide_named_pair(
+                                    front,
+                                    spec,
+                                    maker,
+                                    pair,
+                                    (frame, number),
+                                    now,
+                                ),
+                            },
                         }
                     }
                     (Taken::Emptied(stage), ..)
@@ -726,6 +751,146 @@ fn decide_sides(
     Ok((decision, booked))
 }
 
+/// The decision of a pair's frame whose request names its worker by a
+/// number (`DecideRequest.named_worker`), over `pair`: the two lists
+/// `maker` is made over, with what the asking gateway may take of each.
+/// The frame states one number for its two sides, as one header gives a
+/// host's own process one. It is counted as the one call counts a pair's
+/// in that process, by the same functions
+/// ([`named_worker::reached_pair`], [`named_worker::opened`]), with a
+/// controller's own tests of a worker, as a single request's count has
+/// them ([`decide_named`]), and with no route's rule. The widest number
+/// is a text that was no number: it reaches no worker.
+///
+/// The sides that read the number are the binding's ([`sides_named`]):
+///
+/// - **The prefill's side.** The frame's one decision is held to the place
+///   of the prefill the number reaches, and to the place of the decode it
+///   reaches among that prefill's partners where the decode's side reads
+///   it too. A shed of that decision with no endpoint, or for workers over
+///   their thresholds, is the pair's shed under `target-worker`
+///   ([`named_worker::held_answer`]). A number that reaches no worker on a
+///   side sheds the pair so, and the engine is asked nothing. Where every
+///   decode is over its thresholds and the binding steers such a pool, the
+///   decision is held to the prefill alone and takes its decode by load.
+/// - **The decode's side alone.** The prefill is the decision's own pick.
+///   The decision is lent the places of the decodes the gateway can be
+///   sent to and is stated the number ([`FrameRequest::naming_decode`]):
+///   it counts the number among the partners there of the prefill it
+///   picks, and sheds the pair under `target-worker` itself.
+/// - **Neither side.** The number is not read.
+///
+/// Where no prefill is counted, or none opens the pair, the frame is
+/// decided as one that names no worker. It keeps its keys there, unlike a
+/// single request's frame: under the plain ring a pair's key keeps no
+/// prefill over a veto.
+///
+/// The frame's word of its later decode stands
+/// (`DecideRequest.decode_later`): [`issue_pair`] then files the decode
+/// side chosen, with the one decode a held decision named.
+///
+/// Out of line and cold: a pair's frame that names no worker holds no part
+/// of it.
+///
+/// # Errors
+///
+/// Those of [`decide_pair`].
+#[cold]
+#[inline(never)]
+fn decide_named_pair(
+    front: Loaded<'_, '_>,
+    spec: &AppliedSpec,
+    maker: FrameRequest<'_>,
+    pair: PairLists<'_>,
+    (frame, number): (&Checked, u32),
+    now: Instant,
+) -> Result<(Decision, Option<Shadowed>), DecisionRefused> {
+    let model = frame.model();
+    let unnamed = || front.decide_without_lease(&maker, now);
+    let counted = [
+        (pair.prefill_places, pair.prefill_stalled),
+        (pair.decode_places, pair.decode_stalled),
+    ];
+    let reached = match sides_named(spec, model) {
+        [true, decode_named] => {
+            let steers = || spec.engine().steers_all_vetoed(model);
+            let named = (Some(number), decode_named);
+            named_worker::reached_pair(&pair, counted, named, None, steers)
+        }
+        [false, true] => {
+            let lifts = || spec.engine().lifts_prefills(model);
+            let Some(decodes) = named_worker::opened(&pair, counted, None, lifts) else {
+                return unnamed();
+            };
+            let lent = PairLists {
+                decode_places: Some(&decodes),
+                ..pair
+            };
+            let maker = maker.over(WorkerLists::Pair(lent)).naming_decode();
+            return front.decide_without_lease(&maker, now);
+        }
+        [false, false] => return unnamed(),
+    };
+    match reached {
+        ReachedPair::Places(prefill, decode) => {
+            let (prefill, decode) = ([prefill], decode.map(|decode| [decode]));
+            let held_to = PairLists {
+                prefill_places: Some(&prefill),
+                decode_places: decode
+                    .as_ref()
+                    .map_or(pair.decode_places, |decode| Some(decode)),
+                ..pair
+            };
+            let maker = maker.over(WorkerLists::Pair(held_to));
+            let (decision, said) = front.decide_without_lease(&maker, now)?;
+            Ok((named_worker::held_answer(decision), said))
+        }
+        ReachedPair::NoWorker => {
+            let (seed, generation) = (frame.seed(), spec.generation());
+            let answer = shed(ShedReason::NoEndpoints, TARGET_WORKER, seed, generation);
+            Ok((answer, None))
+        }
+        ReachedPair::NoneToCount => unnamed(),
+    }
+}
+
+/// Which sides of `model`'s pair read the number a frame names its worker
+/// by under `spec`, the prefill's and then the decode's: those whose
+/// profile is the plain hash ring
+/// ([`Engine::names_worker_on`](crate::engine::framework::Engine::names_worker_on)).
+/// Neither under a spec whose binding for the pair names no target source:
+/// the frame's host read the number under another document.
+#[cold]
+fn sides_named(spec: &AppliedSpec, model: &str) -> [bool; 2] {
+    let sources = spec.key_sources_for(model, Phase::Prefill);
+    if sources.is_some_and(KeySources::names_target) {
+        spec.engine().names_worker_on(model)
+    } else {
+        [false; 2]
+    }
+}
+
+/// Whether a decode call's `frame` asks again a decode its request names:
+/// the frame names its worker (`DecideRequest.named_worker`), and the
+/// decode side of the pair's binding reads that number under `spec`
+/// ([`sides_named`]). Such a call is refused as one whose decode never
+/// stood chosen, and its gateway sends the decode the pair's first
+/// decision named. A decode decided again is picked by the pair's routing
+/// value, off the worker the request names: a host's own process refuses
+/// the same call
+/// ([`Placement::decode_again`](crate::tracking::Placement::decode_again)).
+///
+/// `spec` is the spec in force at the call, and the call is judged by it,
+/// whatever spec decided the pair's first frame and whatever that decision
+/// counted: the lease on file keeps no word of either. A call whose frame
+/// leaves the number out is decided again as any pair's decode.
+///
+/// A frame that names no worker pays one test of the number.
+#[inline]
+pub(crate) fn names_decode(spec: &AppliedSpec, frame: &Checked) -> bool {
+    frame.named_worker().is_some() && sides_named(spec, frame.model())[1]
+}
+
 /// The record of the lease a pick asks on `side`, as the store takes it: a
 /// credit on the pick's first target, dated on the engine's own clock at
 /// the decision's first read, with the dispatch span that runs from it.
@@ -736,7 +901,7 @@ fn decide_sides(
 /// pair's shared the record with it.
 #[inline(always)]
 fn record_of(
-    front: &InProcess,
+    front: Loaded<'_, '_>,
     taken: &DecisionCall<'_, Checked>,
     term: u64,
     (pick, first): (&Pick, &Target),
@@ -828,7 +993,7 @@ pub(crate) fn issue(
     let sized = (session, tokens);
     // The stages hear of every pick but one the binding's sessions rule
     // keeps from the profile: that one's lease is filed under the word.
-    let hears = lease_events::stages_hear(decision);
+    let hears = lease_events::stages_hear(decision, Side::Single);
     let record = LeaseRecord {
         untold: !hears,
         ..record_of(front, taken, term, (pick, first), Side::Single, sized)
@@ -1092,8 +1257,9 @@ pub(crate) fn decide_decode(
 /// ([`MemoryStore::unissue_decode`]). `None` for a shed, which files none.
 ///
 /// The engine told is the one of the lease's own generation ([`issuing`]):
-/// behind a reload the engine of this instant decided the side and hears
-/// nothing of the lease. The issue is dated at this call
+/// behind a reload the engine of this instant decided the side, and of
+/// its stages the ones it kept hear of the lease. The issue is dated at
+/// this call
 /// ([`issued_later`]). A stage that panics there is held and counted, as
 /// under a report, and the caller still gets the pick the file holds.
 ///
@@ -1133,9 +1299,8 @@ pub(crate) fn issue_decode(
     let slot = world
         .booked_of(chosen.decode_id)
         .or_else(|| store.filed_slot(chosen.decode_id));
-    let spec = world.spec();
     let told = |lease: &Lease| {
-        let Some(engine) = issuing(spec, lease) else {
+        let Some(engine) = issuing(world, lease) else {
             return;
         };
         let heard = || issued_later(world, engine, lease, decision, taken.now);

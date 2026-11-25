@@ -70,16 +70,22 @@ pub(in crate::engine) struct InForce {
     pub(super) hears: EventSet,
     /// The kinds the document takes of a pick its session table has no
     /// word for: [`Self::hears`] without the table's own, read once, here.
-    /// Under a sessions rule over stages that take no word on a lease,
-    /// such a pick costs its request no lease either
-    /// ([`super::single::issued`]).
+    /// Under a sessions rule beside which no stage and no count of sends
+    /// takes a word on a lease, such a pick of a whole pass costs its
+    /// request no lease either ([`super::single::issued`]), and a place one
+    /// pick decided is its request's whole answer where its worker reads
+    /// ready a second time ([`super::single::still_ready`]). Where it does
+    /// not, the pick is noted and takes its lease.
     pub(super) hears_beside_table: EventSet,
-    /// Whether a place one pick decided is not the whole of what the
-    /// document asks of its request: a stage takes a word on a lease
-    /// ([`Self::hears`]), or the document keeps a sample of its decisions
-    /// ([`Self::samples`]). Read once, here: a place tests this word once,
-    /// and under a document that asks neither it is the whole answer behind
-    /// that test.
+    /// Whether a place one pick decided may not be the whole of what the
+    /// document asks of its request: a stage, a count of sends or the
+    /// session table takes a word on a lease ([`Self::hears`]), or the
+    /// document keeps a sample of its decisions ([`Self::samples`]). Read
+    /// once, here: a place tests this word once, and under a document that
+    /// asks neither it is the whole answer behind that test. Under one whose
+    /// table alone takes a word, a place is the whole answer all the same
+    /// where its worker reads ready a second time
+    /// ([`Self::hears_beside_table`]).
     pub(super) leases_or_samples: bool,
     /// Each profile's name as a label that lives as long as the process,
     /// by the profile's position in the document
@@ -157,10 +163,31 @@ impl InForce {
     /// hears none of it: it never heard that lease's issue. The lease's
     /// dispatch is counted apart, by every count of sends in force
     /// ([`lease_events::of_host`](crate::engine::lease_events::of_host)).
+    ///
+    /// It is written for an earlier generation alone. Asked the document's
+    /// own generation or one above it, it answers every stage the document
+    /// kept and no stage it built: a caller that may hold such a lease
+    /// tests the number first (`InForce::hearing`).
     pub(super) fn stood_at(&self, generation: u64) -> &Engine {
         let stood = |kept: &&(u64, Engine)| kept.0 <= generation;
         let kept = self.older.iter().rev().find(stood);
         kept.map_or(&self.table, |kept| &kept.1)
+    }
+
+    /// What hears a word of a lease issued under `generation`, for a host
+    /// that tells a lease's words off a file of its own and may find a
+    /// lease of any generation there. A lease of the document's own
+    /// generation is heard by the document's whole engine. One of an
+    /// earlier generation is heard by what the document kept
+    /// ([`Self::stood_at`]). One of a generation above the document's is
+    /// heard by no stage and no table: no stage of this engine booked it.
+    #[cfg(feature = "controller")]
+    fn hearing(&self, generation: u64) -> Option<&Engine> {
+        match generation.cmp(&self.spec.generation()) {
+            std::cmp::Ordering::Equal => Some(self.spec.engine()),
+            std::cmp::Ordering::Less => Some(self.stood_at(generation)),
+            std::cmp::Ordering::Greater => None,
+        }
     }
 }
 
@@ -190,6 +217,22 @@ impl Deref for SpecHandle {
 
     fn deref(&self) -> &AppliedSpec {
         &self.0.spec
+    }
+}
+
+impl SpecHandle {
+    /// `engine` with this handle's document, as one decision reads it
+    /// ([`Loaded`]). For a host that keeps a handle beside each state it
+    /// publishes, and decides a request under the document of the state
+    /// the request read, whatever document is in force by then: a store's
+    /// world is such a state. `engine` is the engine the handle was asked
+    /// of. The value borrows the handle: taking it counts nothing.
+    #[cfg_attr(
+        not(any(test, feature = "controller")),
+        expect(dead_code, reason = "a store's world asks it for a deciding thread")
+    )]
+    pub(crate) fn under<'a>(&'a self, engine: &'a InProcess) -> Loaded<'a, 'a> {
+        engine.under(&self.0)
     }
 }
 
@@ -259,7 +302,7 @@ impl Deref for Loaded<'_, '_> {
     }
 }
 
-impl Loaded<'_, '_> {
+impl<'d> Loaded<'_, 'd> {
     /// Whether a stage of the document this decision runs under takes
     /// events of `kind` ([`InForce::hears`]): what the call that places a
     /// request states of its placement, for the split that keeps something
@@ -268,6 +311,27 @@ impl Loaded<'_, '_> {
     #[inline]
     pub(crate) fn takes(self, kind: EventKind) -> bool {
         self.document.hears.contains(kind)
+    }
+
+    /// What hears a word of a lease issued under `generation`, by the
+    /// document this value holds ([`InForce::hearing`]): `None` for a
+    /// lease of a generation above that document's.
+    #[cfg(feature = "controller")]
+    #[inline]
+    pub(crate) fn hearing(self, generation: u64) -> Option<&'d Engine> {
+        self.document.hearing(generation)
+    }
+
+    /// Whether the document this value holds is the one in force on its
+    /// engine: one atomic load of the engine's number, compared with the
+    /// document's own, and no read of the engine's cell. The test an entry
+    /// makes of the document its thread kept ([`InProcess::in_force`]).
+    /// A host that holds a document beside a state it published asks it,
+    /// where it tells a word that goes by the document in force.
+    #[cfg(feature = "controller")]
+    #[inline]
+    pub(crate) fn still_in_force(self) -> bool {
+        self.object.applied.load(Ordering::Acquire) == self.document.applied
     }
 }
 

@@ -133,7 +133,6 @@ fn engine_with(picker: Box<dyn Picker>) -> Engine {
         shadow: None,
         decode_shadow: None,
         sessions: None,
-        overload: None,
     };
     Engine::new(vec![profile], vec![binding], 1, Needs::default())
 }
@@ -633,7 +632,6 @@ fn engine_under(
         shadow: None,
         decode_shadow: None,
         sessions: None,
-        overload: None,
     };
     Engine::new(vec![profile], vec![binding], 1, Needs::default())
 }
@@ -890,7 +888,6 @@ fn a_shadow_is_walked_as_its_live_decision_is() {
         shadow: Some(1),
         decode_shadow: None,
         sessions: None,
-        overload: None,
     };
     let engine = Engine::new(
         vec![ring("ring"), ring("next")],

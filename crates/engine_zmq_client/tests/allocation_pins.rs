@@ -163,7 +163,8 @@ fn decoding_a_step_of_plain_outputs_allocates_one_block_per_output() {
     let mut rows = Vec::new();
     for (outputs, expected) in [(1, 3), (32, 34)] {
         let frames = plain_step(outputs);
-        let (decoded, allocations) = decode_allocations::<VllmProtocol>(&frames, &());
+        let (decoded, allocations) =
+            decode_allocations::<VllmProtocol>(&frames, &Default::default());
         assert_eq!(decoded, outputs);
         rows.push((outputs, allocations, expected));
     }
@@ -335,7 +336,8 @@ fn encoding_an_add_request_allocates_once_on_every_wire() {
         sampling_params: Some(Default::default()),
         ..Default::default()
     };
-    let (payload, allocations, bytes) = encode_allocations::<VllmProtocol>(&request, &());
+    let (payload, allocations, bytes) =
+        encode_allocations::<VllmProtocol>(&request, &Default::default());
     assert_eq!(payload, rmp_serde::to_vec_named(&request).expect("encode"));
     rows.push(("vllm", payload.len(), allocations, bytes));
 

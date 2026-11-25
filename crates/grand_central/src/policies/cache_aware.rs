@@ -497,8 +497,12 @@ impl PrefixAffinity {
         };
         let predicted = match self.source {
             AffinitySource::Index => 0,
+            // A candidate that predicts no block holds none by this
+            // source whichever way its share reads: the share is not
+            // divided for it.
             AffinitySource::Predictor | AffinitySource::Merged
-                if whole.clears(held.predicted_blocks, self.threshold) =>
+                if held.predicted_blocks > 0
+                    && whole.clears(held.predicted_blocks, self.threshold) =>
             {
                 held.predicted_blocks
             }
@@ -509,9 +513,11 @@ impl PrefixAffinity {
 
     /// The stage's scores over what its two passes read of the kept rows.
     /// `feed` says whether anybody holds anything and carries the drawn
-    /// rows' mean where the engine set one. `reads` hands each pass a
-    /// reader of its own: a column's is a read by index, and the rows a
-    /// host named are walked beside the kept rows. One body a feed, the
+    /// rows' mean where the engine set one. `reads` hands the first pass
+    /// its reader: a column's is a read by index, and the rows a host
+    /// named are walked beside the kept rows. A row's entry is read once:
+    /// its match rides the row's score slot to the pass that scores, so
+    /// `out` holds a slot for every kept row. One body a feed, the
     /// feed chosen where the body is entered. The rows of a draw are
     /// scored by [`Self::rank_drawn`]. The count of the rows written the
     /// ceiling comes back beside the band: the entry that says the stage's
@@ -525,21 +531,24 @@ impl PrefixAffinity {
         kept: &[u32],
         out: &mut [f32],
         feed: Feed<'_>,
-        reads: impl Fn() -> R,
+        reads: impl FnOnce() -> R,
     ) -> (TieBand, u32) {
+        debug_assert_eq!(out.len(), kept.len(), "one score slot a kept row");
         let whole = self.gates.whole(facts);
         let holds = !feed.is_empty();
         // Nobody holding anything, the deepest match is zero without a
         // pass; any other feed answers for every kept row.
-        let best = if holds {
+        let mut best = 0;
+        if holds {
+            // Each row's entry is read once: its match rides the row's
+            // score slot, bit for bit, to the pass that scores.
             let mut entry = reads();
-            kept.iter()
-                .map(|&i| self.matched(entry(i), whole))
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let matched = self.matched(entry(i), whole);
+                *o = f32::from_bits(matched);
+                best = best.max(matched);
+            }
+        }
         let avg = spill_mean(feed.drawn_mean(), facts, candidates, kept);
         // A decode worker prefills nothing again: its held prefix is not
         // priced.
@@ -549,16 +558,13 @@ impl PrefixAffinity {
         } else {
             0.0
         };
-        let mut entry = reads();
         let mut ceilings = 0u32;
         for (o, &i) in out.iter_mut().zip(kept) {
             let c = &candidates[i as usize];
             let load = facts.in_flight(c) as f32;
-            // A match above zero was read from a feed that holds entries.
-            *o = if best > 0
-                && self.matched(entry(i), whole) == best
-                && !self.gates.over(load, avg, held)
-            {
+            // Where the deepest match is above zero, the pass above wrote
+            // this row's match into its slot.
+            *o = if best > 0 && o.to_bits() == best && !self.gates.over(load, avg, held) {
                 // Counted where it is written: a row under the ceiling
                 // adds nothing to the pass.
                 ceilings += 1;
@@ -619,8 +625,8 @@ impl PrefixAffinity {
     }
 
     /// The stage's scores over the rows a host named: a holder reads its
-    /// depth. Each pass walks the holders beside its kept rows where the
-    /// pool is read whole; behind a draw each row is searched once
+    /// depth. The first pass walks the holders beside the kept rows where
+    /// the pool is read whole; behind a draw each row is searched once
     /// ([`Self::rank_drawn`]). Out of line: see [`Scorer::score`] of this
     /// stage.
     #[inline(never)]
@@ -1613,6 +1619,61 @@ mod tests {
             ..hashed
         };
         assert_eq!(whole(text), (64, 200));
+    }
+
+    /// A request the engine makes of a prompt's token ids with no block
+    /// hashed is sized as the one it makes with its list. The stage reads
+    /// the list's length alone, under a `max` with the count the prompt's
+    /// size gives ([`Gates::whole`], [`RequestFacts::blocks`]), and the
+    /// list the engine makes is never longer than that count: one hash for
+    /// each whole block, as deep as the document reads at most, one for a
+    /// shorter prompt, none for an empty one. So an empty prompt, one
+    /// under one block, one that ends on a block's edge, one that ends
+    /// inside a block and one longer than the document reads each state
+    /// one size both ways: the prompt's own.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_request_made_with_no_block_hashed_is_sized_as_the_one_hashed() {
+        use crate::{
+            document::spec::AppliedSpec,
+            engine::prompt_hashes::{HashSeeds, PromptHashes},
+        };
+        let document = PolicySpec::preset("cache_aware").expect("a preset");
+        let spec = AppliedSpec::validate(&document).expect("the preset validates");
+        let gates = Gates::of(None, None, Some(16));
+        // A prompt's tokens, the hashes of its list and its size in blocks.
+        let prompts = [
+            (0_u32, 0, 1),
+            (7, 1, 1),
+            (16, 1, 1),
+            (54, 3, 3),
+            (64, 4, 4),
+            (1_600, 100, 100),
+            (100_000, 256, 6_250),
+        ];
+        for (tokens, hashes, blocks) in prompts {
+            let prompt: Vec<u32> = (0..tokens).collect();
+            let listed = PromptHashes::under_document(
+                &spec,
+                Some(16),
+                Some(&prompt),
+                None,
+                HashSeeds::PLAIN,
+            );
+            let unhashed = PromptHashes::unhashed(&spec, Some(16), &prompt, HashSeeds::PLAIN);
+            let mut with_list = RequestFacts::default();
+            listed.write_to(&mut with_list);
+            let mut without = RequestFacts::default();
+            unhashed.write_to(&mut without);
+            assert_eq!(with_list.block_hashes.len(), hashes, "{tokens}");
+            assert!(without.block_hashes.is_empty(), "{tokens}");
+            let counted = (with_list.blocks(16), without.blocks(16));
+            assert_eq!(counted, (blocks, blocks), "{tokens}");
+            let size = (16, tokens.max(16));
+            let (full, bare) = (gates.whole(&with_list), gates.whole(&without));
+            assert_eq!((full.block, full.size), size, "{tokens}");
+            assert_eq!((bare.block, bare.size), size, "{tokens}");
+        }
     }
 
     /// The engine of the built-in `cache_aware` document.

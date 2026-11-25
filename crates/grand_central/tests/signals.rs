@@ -112,11 +112,12 @@ fn engine() -> (Engine, Arc<Mutex<Vec<Read>>>) {
 }
 
 fn rows(ids: &[u64]) -> Vec<Candidate> {
-    let row = |(position, &id): (u32, &u64)| Candidate {
-        position,
-        id: WorkerId(id),
-        pair_class: 1,
-        ..Candidate::default()
+    let row = |(position, &id): (u32, &u64)| {
+        let mut candidate = Candidate::default();
+        candidate.position = position;
+        candidate.id = WorkerId(id);
+        candidate.pair_class = 1;
+        candidate
     };
     (0u32..).zip(ids).map(row).collect()
 }
@@ -132,15 +133,11 @@ fn cell(value: f64, age_micros: u64) -> SignalCell {
 /// scorer read.
 fn reads(rows: &[Candidate], cells: Option<&SignalCells>) -> Vec<Read> {
     let (engine, seen) = engine();
-    let facts = RequestFacts {
-        now_micros: NOW,
-        signal_cells: cells,
-        ..RequestFacts::default()
-    };
-    let pool = PoolFacts {
-        pool_size: rows.len() as u32,
-        ..PoolFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.now_micros = NOW;
+    facts.signal_cells = cells;
+    let mut pool = PoolFacts::default();
+    pool.pool_size = rows.len() as u32;
     let decision = engine.decide(
         &facts,
         &pool,
@@ -358,23 +355,20 @@ fn each_side_of_a_pair_reads_its_own_pools_cells() {
     let prefill = SignalCells::new(prefill.to_vec(), 2);
     let decode = SignalCells::new(decode.to_vec(), 2);
     let request = SignalCells::new(request.to_vec(), 2);
-    let facts = RequestFacts {
-        phase: Phase::Prefill,
-        now_micros: NOW,
-        signal_cells: Some(&request),
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.phase = Phase::Prefill;
+    facts.now_micros = NOW;
+    facts.signal_cells = Some(&request);
     let cx = Constraints::default();
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
+    pools.prefill_signal_cells = Some(&prefill);
+    pools.decode_signal_cells = Some(&decode);
     let decision = engine.decide_pair(
         &facts,
         &PoolFacts::default(),
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            prefill_signal_cells: Some(&prefill),
-            decode_signal_cells: Some(&decode),
-            ..PairPools::default()
-        },
+        pools,
         &cx,
         &cx,
         &mut Scratch::new(),
@@ -397,11 +391,9 @@ fn cells_that_end_before_the_rows_read_no_value_past_their_end() {
     let rows = rows(&[31, 32]);
     // The cells of one row, for two.
     let cells = SignalCells::new(vec![cell(10.0, 0), cell(1.0, 0)], 2);
-    let facts = RequestFacts {
-        now_micros: NOW,
-        signal_cells: Some(&cells),
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.now_micros = NOW;
+    facts.signal_cells = Some(&cells);
     // The stage alone: a decision over such cells is refused by a debug
     // build's assertion, and a release build tests nothing first.
     let scorer = &engine.profiles()[0].scorers[0].scorer;
@@ -419,11 +411,9 @@ fn a_column_past_a_rows_cells_reads_no_value() {
     // One cell a row under a document of two signals: the second column
     // of a row would be the next row's first.
     let cells = SignalCells::new(vec![cell(10.0, 0), cell(20.0, 0)], 1);
-    let facts = RequestFacts {
-        now_micros: NOW,
-        signal_cells: Some(&cells),
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.now_micros = NOW;
+    facts.signal_cells = Some(&cells);
     let scorer = &engine.profiles()[0].scorers[0].scorer;
     let _ = scorer.score(&facts, &rows, &[0, 1], &mut [0.0; 2]);
     assert_eq!(
@@ -717,15 +707,11 @@ profiles:
     // Rows 31 and 32 hold 9 and 3 pending tokens: the second alone stays.
     let rows = rows(&[31, 32]);
     let cells = SignalCells::new(vec![cell(9.0, 0), cell(3.0, 0)], 1);
-    let facts = RequestFacts {
-        now_micros: NOW,
-        signal_cells: Some(&cells),
-        ..RequestFacts::default()
-    };
-    let pool = PoolFacts {
-        pool_size: rows.len() as u32,
-        ..PoolFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.now_micros = NOW;
+    facts.signal_cells = Some(&cells);
+    let mut pool = PoolFacts::default();
+    pool.pool_size = rows.len() as u32;
     let decision = engine.decide(
         &facts,
         &pool,

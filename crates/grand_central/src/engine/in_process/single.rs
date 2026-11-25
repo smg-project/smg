@@ -68,7 +68,7 @@ use std::{
 
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
-use super::{keys, overlap, Loaded, PoolMembers};
+use super::{keys, overlap, place::Made, Loaded, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
@@ -145,7 +145,11 @@ const NO_STAGE: &str = "none";
 /// It ends in the place picked. It reads no fact of a request, so none is
 /// made ahead of it, and nothing a host is handed of a pick is built here.
 /// Under a document that takes no word on a lease the place is the whole
-/// answer. Under any other the pick is noted ([`noted`]).
+/// answer. Under one whose session table alone takes a word it is the whole
+/// answer where its worker reads ready a second time ([`still_ready`]): the
+/// table has no word for a pick made under a binding that states no rule,
+/// as a whole pass's lease has it ([`issued`]). Any other pick is noted
+/// ([`noted`]).
 pub(super) fn alone(
     own: Loaded<'_, '_>,
     model: &str,
@@ -164,6 +168,24 @@ pub(super) fn alone(
         profile: profile.0,
         generation: own.document.spec.generation(),
     })
+}
+
+/// Whether the worker at the place `pick` names reads ready now
+/// ([`super::place::ready`]): the second read of it, behind the one that
+/// found it eligible, as a noted pick's target has at its walk. Under a
+/// document whose session table alone takes a word on a lease a place is
+/// the whole answer where this holds. A pick whose worker turned not
+/// ready between the two reads is noted ([`noted`]) and takes its lease,
+/// and the walk of its target reads that worker once more.
+///
+/// Out of line: no decision of a document that takes no word runs it.
+#[cold]
+#[inline(never)]
+pub(super) fn still_ready(pick: AlonePick, members: &PoolMembers) -> bool {
+    members
+        .workers()
+        .get(pick.place as usize)
+        .is_some_and(|worker| super::place::ready(worker.as_ref()))
 }
 
 /// The short path's pick under a document that takes a word on a lease,
@@ -287,11 +309,20 @@ impl WholeDecision for WithoutShadow {
 /// with every worker of the engines it tried named as tried ([`retried`]).
 /// A first attempt pays one test for it, and a retry over any other list
 /// one more.
+///
+/// `late` is the request as the engine's own call made it, where that call
+/// asks ([`Loaded::decide_into`]): the lookup asks it for the prompt's
+/// block hashes on a road that reads them ([`Made::hashed_whole`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a made request, its list, its maker and the request its call made, the loads, the instant and the whole decision"
+)]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
     request: &mut Request<'_>,
     members: &PoolMembers,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     whole: impl WholeDecision,
@@ -343,9 +374,9 @@ pub(super) fn decide(
     // A retry leaves every worker of the engines it tried: over a list
     // where an engine holds several, its facts name them all.
     let decision = if facts.tried.is_empty() || !records.has_ranks() {
-        by_facts::<false>(own, members, records, &live, facts, cx, maker, whole)
+        by_facts::<false>(own, members, records, &live, facts, cx, maker, late, whole)
     } else {
-        retried(own, members, records, &live, facts, cx, maker, whole)
+        retried(own, members, records, &live, facts, cx, maker, late, whole)
     };
     if let Some(meeting) = meeting {
         MEETING.set(meeting);
@@ -377,7 +408,7 @@ pub(super) fn decide(
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "a decision's inputs, the request's maker and the whole decision"
+    reason = "a decision's inputs, the request's maker, the request its call made and the whole decision"
 )]
 fn by_facts<const RETRY: bool>(
     own: Loaded<'_, '_>,
@@ -387,6 +418,7 @@ fn by_facts<const RETRY: bool>(
     facts: &mut RequestFacts<'_>,
     cx: &Constraints<'_>,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     mut whole: impl WholeDecision,
 ) -> Decision {
     let spec = &own.document.spec;
@@ -399,15 +431,15 @@ fn by_facts<const RETRY: bool>(
     match keys::decide(engine, records, workers, live, facts, cx) {
         // A pin its rule keeps from the profile: no holder is named for it
         // and nothing is kept of where its prompt went.
-        Some(keyed) if !lease_events::stages_hear(&keyed) => keyed,
+        Some(keyed) if !lease_events::stages_hear(&keyed, Side::Single) => keyed,
         // A pin that is the profile's own goes through the same lookup with
         // its answer made.
-        Some(keyed) => handed_on(own, members, records, facts, maker, keyed, leaves),
+        Some(keyed) => handed_on(own, members, records, facts, maker, late, keyed, leaves),
         // A profile whose stages read who holds the prompt is named its
         // rows from the gateway's own data, at the decision's instant the
         // keyed entry wrote, and its pick is recorded behind it; any other
         // passes straight to the whole pass.
-        None => overlap::decide(
+        None => overlap::decide_hashed(
             &own.affinity,
             members.affinity(),
             spec,
@@ -418,6 +450,7 @@ fn by_facts<const RETRY: bool>(
             |page| maker.token_key(page),
             || maker.text_key(),
             |target| maker.sends_to(target),
+            || late?.hashed_whole(spec),
             |facts| whole.decide(engine, records, workers, live, facts, cx),
         ),
     }
@@ -440,25 +473,32 @@ fn by_facts<const RETRY: bool>(
 /// Out of line: its code stays off the path of a request with no pin, and
 /// of a pin its rule keeps from the profile.
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the list and its records, the request's facts, its maker and the request its call made, the answer and the leaves read ahead of it"
+)]
 fn handed_on(
     own: Loaded<'_, '_>,
     members: &PoolMembers,
     records: &PoolRecords,
     facts: &mut RequestFacts<'_>,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     keyed: Decision,
     leaves: u64,
 ) -> Decision {
+    let spec = &own.document.spec;
     overlap::decide_behind(
         &own.affinity,
         members.affinity(),
-        &own.document.spec,
+        spec,
         members.workers(),
         records.ids(),
         facts,
         |page| maker.token_key(page),
         || maker.text_key(),
         |target| maker.sends_to(target),
+        || late?.hashed_whole(spec),
         leaves,
         keyed,
     )
@@ -482,7 +522,7 @@ fn handed_on(
 #[inline(never)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "a decision's inputs, the request's maker and the whole decision"
+    reason = "a decision's inputs, the request's maker, the request its call made and the whole decision"
 )]
 fn retried(
     own: Loaded<'_, '_>,
@@ -492,6 +532,7 @@ fn retried(
     facts: &mut RequestFacts<'_>,
     cx: &Constraints<'_>,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     whole: impl WholeDecision,
 ) -> Decision {
     let mut tried = TRIED.take();
@@ -500,7 +541,17 @@ fn retried(
         tried: &tried,
         ..*facts
     };
-    let decision = by_facts::<true>(own, members, records, live, &mut widened, cx, maker, whole);
+    let decision = by_facts::<true>(
+        own,
+        members,
+        records,
+        live,
+        &mut widened,
+        cx,
+        maker,
+        late,
+        whole,
+    );
     facts.now_micros = widened.now_micros;
     TRIED.set(tried);
     decision
@@ -655,7 +706,7 @@ pub(super) fn issued(
     if let Some(lease) = lease.as_ref().filter(|_| issue) {
         // Asked behind the document's own word: a document whose stages
         // take no issue reads nothing of the pick here.
-        if lease_events::stages_hear(&decision) {
+        if lease_events::stages_hear(&decision, Side::Single) {
             own.word_caught(|| document.spec.engine().on_decision_issued(lease, &decision));
         }
     }
@@ -730,6 +781,22 @@ pub(crate) mod tests {
             profile.filter.clear();
         }
         InProcess::new(AppliedSpec::validate(&document).expect("the document validates"))
+    }
+
+    /// `document` with a binding ahead of its first that states a sessions
+    /// rule for the models `ruled-*`: the rule of the preset `manual`, its
+    /// keys placed by the binding's own stages. The document's session
+    /// table takes a lease's words, whatever its stages take.
+    pub(crate) fn ruled_ahead(mut document: PolicySpec) -> PolicySpec {
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        document.view.headers.clone_from(&manual.view.headers);
+        let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+        rule.assignment = Assignment::Delegate;
+        let mut ruled = document.bindings[0].clone();
+        ruled.matcher.model = "ruled-*".to_owned();
+        ruled.sessions = Some(rule);
+        document.bindings.insert(0, ruled);
+        document
     }
 
     pub(crate) fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
@@ -1080,6 +1147,32 @@ pub(crate) mod tests {
         let taken = engine.leases.0.load(Ordering::Relaxed);
         assert_eq!(taken, ID_RUN, "eight ids, one write of the shared word");
         assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+    }
+
+    /// Under a document whose session table alone takes a word on a lease,
+    /// a plain request of a place one pick decides is answered the place,
+    /// as under a document that takes no word: its binding states no rule,
+    /// so the table has no word for its pick. No request is made and no
+    /// lease takes an id.
+    #[test]
+    fn a_place_picked_under_a_table_that_alone_takes_a_word_is_the_whole_answer() {
+        let document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let spec = AppliedSpec::validate(&ruled_ahead(document)).expect("the document validates");
+        let engine = InProcess::new(spec);
+        let hears = engine.in_force().hears.intersects(EventSet::LEASE);
+        let beside = engine.in_force().hears_beside_table;
+        assert!(
+            hears && !beside.intersects(EventSet::LEASE),
+            "the session table alone takes a word"
+        );
+        let list = pool(4);
+        let members = PublishedList::new(Arc::clone(&list));
+        let mut plain = request();
+        plain.facts.session_key = Identity::plain("a-key");
+        let asks = Asks::of(plain, Some(&members));
+        placed(&engine, &asks);
+        assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+        assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
     }
 
     /// A request that is not plain, and a plain one the turn finds no
@@ -2376,7 +2469,7 @@ pub(crate) mod tests {
     /// The document of the default policy's profile under the stock
     /// sessions rule, a new key placed by the profile's own stages, and
     /// `kept`, the rule's word of a request it places alone.
-    fn default_under_sessions(kept: RulePlaced) -> AppliedSpec {
+    pub(crate) fn default_under_sessions(kept: RulePlaced) -> AppliedSpec {
         let mut document = PolicySpec::preset("manual").expect("a built-in preset");
         let default = PolicySpec::preset("cache_aware").expect("a built-in preset");
         document.profiles = default.profiles;

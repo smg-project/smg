@@ -48,22 +48,20 @@ fn prompt() -> Vec<u64> {
 }
 
 fn facts(hashes: &[u64], seed: u64) -> RequestFacts<'_> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 1_024,
-        block_hashes: hashes,
-        seed,
-        now_micros: 1_000_000,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.prompt_tokens = 1_024;
+    facts.block_hashes = hashes;
+    facts.seed = seed;
+    facts.now_micros = 1_000_000;
+    facts
 }
 
 fn pool_of(view: &[Candidate]) -> PoolFacts<'static> {
-    PoolFacts {
-        pool_size: view.len() as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    }
+    let mut pool = PoolFacts::default();
+    pool.pool_size = view.len() as u32;
+    pool.generation = 1;
+    pool
 }
 
 /// The row the prompt is placed on over `view`.

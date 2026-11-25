@@ -57,14 +57,9 @@ struct Cli {
     controller_id: String,
 
     // ==================== Listeners ====================
-    /// The gateways' listener: Session, Decide and WatchWorkers, and the
-    /// relays' PushLoad and PushKvEvents unless --ingestion-listen is set
+    /// The gateways' listener: Session, Decide and WatchWorkers
     #[arg(long, default_value = DEFAULT_GATEWAY_LISTEN, help_heading = "Listeners")]
     gateway_listen: SocketAddr,
-
-    /// A listener of the relays' own for PushLoad and PushKvEvents
-    #[arg(long, help_heading = "Listeners")]
-    ingestion_listen: Option<SocketAddr>,
 
     /// The operators' listener: the unary calls and WatchRegime
     #[arg(long, default_value = DEFAULT_CONTROL_LISTEN, help_heading = "Listeners")]
@@ -83,8 +78,8 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_ADMIN_LISTEN, help_heading = "Listeners")]
     admin_listen: SocketAddr,
 
-    /// The listeners, by name (gateway, control, replication, and ingestion
-    /// where --ingestion-listen makes it a listener), that take a caller's
+    /// The listeners, by name (gateway, control and replication, each
+    /// after its own flag), that take a caller's
     /// identity as told: the caller states its name in the x-smg-principal
     /// metadata entry and nothing is verified, so whoever reaches such a
     /// listener acts as any principal of its scopes. For a loopback, or a
@@ -113,12 +108,6 @@ struct Cli {
     /// on the gateway scope's listener
     #[arg(long, help_heading = "TLS")]
     gateway_client_ca: Option<PathBuf>,
-
-    /// The authority the relays' client certificates chain to: mutual TLS on
-    /// the ingestion scope's listener (its own with --ingestion-listen, else
-    /// the gateways' listener, whose authority must then be the same file)
-    #[arg(long, help_heading = "TLS")]
-    ingestion_client_ca: Option<PathBuf>,
 
     /// The authority the operators' client certificates chain to: mutual
     /// TLS on the control scope's listener
@@ -377,7 +366,6 @@ impl Cli {
         let client_ca = |scope: Scope| -> Option<&PathBuf> {
             match scope {
                 Scope::Gateway => self.gateway_client_ca.as_ref(),
-                Scope::Ingestion => self.ingestion_client_ca.as_ref(),
                 Scope::Control => self.control_client_ca.as_ref(),
                 Scope::Replication => self.replication_client_ca.as_ref(),
             }
@@ -388,66 +376,26 @@ impl Cli {
             }
         }
 
-        let mut mounts: Vec<(&str, SocketAddr, Vec<Scope>)> = Vec::with_capacity(4);
-        match self.ingestion_listen {
-            Some(addr) => {
-                mounts.push(("gateway", self.gateway_listen, vec![Scope::Gateway]));
-                mounts.push(("ingestion", addr, vec![Scope::Ingestion]));
-            }
-            None => mounts.push((
-                "gateway",
-                self.gateway_listen,
-                vec![Scope::Gateway, Scope::Ingestion],
-            )),
-        }
-        mounts.push(("control", self.control_listen, vec![Scope::Control]));
-        mounts.push((
-            "replication",
-            self.replication_listen,
-            vec![Scope::Replication],
-        ));
-
-        let mut listeners = Vec::with_capacity(mounts.len());
-        for (name, addr, scopes) in mounts {
-            let tls = match identity {
-                None => None,
-                Some((cert, key)) => {
-                    // One credential rule per listener: every scope on it
-                    // names the same authority, or none of them does.
-                    if let Some(first) = scopes.iter().copied().find(|s| client_ca(*s).is_some()) {
-                        let authority = client_ca(first);
-                        if let Some(second) =
-                            scopes.iter().copied().find(|s| client_ca(*s) != authority)
-                        {
-                            return Err(if client_ca(second).is_none() {
-                                ConfigError::ScopesDisagreeOnClientCa {
-                                    listener: name.to_owned(),
-                                    with: first,
-                                    without: second,
-                                }
-                            } else {
-                                ConfigError::ScopesNameDifferentClientCas {
-                                    listener: name.to_owned(),
-                                    first,
-                                    second,
-                                }
-                            });
-                        }
-                    }
-                    Some(Tls {
-                        cert: cert.clone(),
-                        key: key.clone(),
-                        client_ca: scopes.first().and_then(|s| client_ca(*s)).cloned(),
-                    })
-                }
-            };
-            listeners.push(Listener {
+        // Each listener mounts one scope, so its credential rule is that
+        // scope's authority.
+        let mounts = [
+            ("gateway", self.gateway_listen, Scope::Gateway),
+            ("control", self.control_listen, Scope::Control),
+            ("replication", self.replication_listen, Scope::Replication),
+        ];
+        let listeners = mounts
+            .into_iter()
+            .map(|(name, addr, scope)| Listener {
                 name: name.to_owned(),
                 addr,
-                scopes,
-                tls,
-            });
-        }
+                scopes: vec![scope],
+                tls: identity.map(|(cert, key)| Tls {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    client_ca: client_ca(scope).cloned(),
+                }),
+            })
+            .collect();
         Ok(Config {
             controller_id: self.controller_id.clone(),
             listeners,
@@ -727,7 +675,7 @@ mod tests {
         time::Duration,
     };
 
-    use clap::Parser;
+    use clap::{error::ErrorKind, Parser};
     use tokio::{runtime::Handle, sync::oneshot};
 
     use super::{bind, color_for, set, truthy, Cli, OverloadThresholds, SpecSource};
@@ -920,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_mount_the_relays_beside_the_gateways() {
+    fn the_defaults_mount_each_scope_on_a_listener_of_its_own() {
         let config = config(&[]).expect("the defaults");
         assert_eq!(config.controller_id, "controller-0");
         let mounts: Vec<(&str, &[Scope])> = config
@@ -931,7 +879,7 @@ mod tests {
         assert_eq!(
             mounts,
             vec![
-                ("gateway", &[Scope::Gateway, Scope::Ingestion][..]),
+                ("gateway", &[Scope::Gateway][..]),
                 ("control", &[Scope::Control][..]),
                 ("replication", &[Scope::Replication][..]),
             ]
@@ -946,15 +894,23 @@ mod tests {
         assert_eq!(config.validate(), Ok(()));
     }
 
+    /// The relays' listener left with their two calls, and the ingestion
+    /// scope's authority with the scope. A command line that still names
+    /// either flag is refused by the parser as a usage error, with exit
+    /// code 2, before a listener opens.
     #[test]
-    fn an_ingestion_listener_splits_the_relays_off() {
-        let config = config(&["--ingestion-listen", "127.0.0.1:30104"]).expect("four listeners");
-        let names: Vec<&str> = config.listeners.iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["gateway", "ingestion", "control", "replication"]);
-        assert_eq!(config.listeners[0].scopes, [Scope::Gateway]);
-        assert_eq!(config.listeners[1].scopes, [Scope::Ingestion]);
-        assert_eq!(config.listeners[1].addr.port(), 30104);
-        assert_eq!(config.validate(), Ok(()));
+    fn the_parser_refuses_the_flags_of_the_ingestion_scope() {
+        for flag in [
+            ["--ingestion-listen", "127.0.0.1:30104"],
+            ["--ingestion-client-ca", "relays.pem"],
+        ] {
+            let mut argv = vec!["smg-grand-central", "--controller-id", "c"];
+            argv.extend(SOURCE);
+            argv.extend(flag);
+            let refused = Cli::try_parse_from(argv).expect_err("the flag is gone");
+            assert_eq!(refused.kind(), ErrorKind::UnknownArgument, "{flag:?}");
+            assert_eq!(refused.exit_code(), 2, "{flag:?}");
+        }
     }
 
     #[test]
@@ -964,8 +920,6 @@ mod tests {
             "gateways.pem",
             "--replication-client-ca",
             "replicas.pem",
-            "--ingestion-listen",
-            "127.0.0.1:30104",
         ]))
         .expect("tls on every listener");
         assert_eq!(
@@ -973,67 +927,15 @@ mod tests {
             [
                 Some(PathBuf::from("gateways.pem")),
                 None,
-                None,
                 Some(PathBuf::from("replicas.pem")),
             ],
-            "the relays and the operators stay server-TLS"
+            "the operators stay server-TLS"
         );
         assert!(config.listeners.iter().all(|l| l
             .tls
             .as_ref()
             .is_some_and(|t| t.cert == Path::new("server.pem"))));
         assert_eq!(config.validate(), Ok(()));
-    }
-
-    #[test]
-    fn scopes_sharing_a_listener_share_its_authority_or_get_their_own_listener() {
-        let shared = config(&with_identity(&[
-            "--gateway-client-ca",
-            "gateways.pem",
-            "--ingestion-client-ca",
-            "relays.pem",
-        ]));
-        assert_eq!(
-            shared,
-            Err(ConfigError::ScopesNameDifferentClientCas {
-                listener: "gateway".to_owned(),
-                first: Scope::Gateway,
-                second: Scope::Ingestion,
-            }),
-            "two authorities on one listener are refused, never reduced to the first"
-        );
-
-        let split = config(&with_identity(&[
-            "--gateway-client-ca",
-            "gateways.pem",
-            "--ingestion-client-ca",
-            "relays.pem",
-            "--ingestion-listen",
-            "127.0.0.1:30104",
-        ]))
-        .expect("each scope on its own listener");
-        assert_eq!(
-            authorities(&split),
-            [
-                Some(PathBuf::from("gateways.pem")),
-                Some(PathBuf::from("relays.pem")),
-                None,
-                None,
-            ]
-        );
-        assert_eq!(split.validate(), Ok(()));
-
-        let same = config(&with_identity(&[
-            "--gateway-client-ca",
-            "fleet.pem",
-            "--ingestion-client-ca",
-            "fleet.pem",
-        ]))
-        .expect("one authority for both scopes is one rule");
-        assert_eq!(
-            authorities(&same),
-            [Some(PathBuf::from("fleet.pem")), None, None]
-        );
     }
 
     #[test]
@@ -1056,33 +958,13 @@ mod tests {
             config(&["--control-client-ca", "operators.pem"]),
             Err(ConfigError::ClientCaWithoutTls(Scope::Control))
         );
+        // The gateways' authority alone is in order: their listener
+        // mounts no second scope to share its rule.
+        let alone = config(&with_identity(&["--gateway-client-ca", "gateways.pem"]))
+            .expect("one scope, one authority");
         assert_eq!(
-            config(&with_identity(&["--gateway-client-ca", "gateways.pem"])),
-            Err(ConfigError::ScopesDisagreeOnClientCa {
-                listener: "gateway".to_owned(),
-                with: Scope::Gateway,
-                without: Scope::Ingestion,
-            }),
-            "the relays share the gateways' listener, so they share its rule or get their own"
-        );
-        assert_eq!(
-            config(&with_identity(&["--ingestion-client-ca", "relays.pem"])),
-            Err(ConfigError::ScopesDisagreeOnClientCa {
-                listener: "gateway".to_owned(),
-                with: Scope::Ingestion,
-                without: Scope::Gateway,
-            })
-        );
-        let split = config(&with_identity(&[
-            "--gateway-client-ca",
-            "gateways.pem",
-            "--ingestion-listen",
-            "127.0.0.1:30104",
-        ]))
-        .expect("the relays on their own listener, server-TLS");
-        assert_eq!(
-            authorities(&split),
-            [Some(PathBuf::from("gateways.pem")), None, None, None]
+            authorities(&alone),
+            [Some(PathBuf::from("gateways.pem")), None, None]
         );
     }
 
@@ -1570,8 +1452,8 @@ mod tests {
                 .map(drop)
             }
         };
-        // The relays' calls ride the gateways' listener unless they get
-        // their own: there is none of that name to take them as told.
+        // A name the flags mount no listener under: the ingestion scope's
+        // left with the scope.
         let refused = start(&["--identity-as-told", "ingestion"]).await;
         assert!(
             matches!(
@@ -1580,14 +1462,9 @@ mod tests {
             ),
             "{refused:?}"
         );
-        start(&[
-            "--identity-as-told",
-            "gateway,ingestion",
-            "--ingestion-listen",
-            "127.0.0.1:0",
-        ])
-        .await
-        .expect("both are listeners the flags mount");
+        start(&["--identity-as-told", "gateway,replication"])
+            .await
+            .expect("both are listeners the flags mount");
     }
 
     #[test]
@@ -1914,6 +1791,55 @@ mod tests {
             ),
             Err(other) => panic!("a file was refused as {other}"),
             Ok(_) => panic!("a file is no directory"),
+        }
+    }
+
+    /// A start ends on the refusal's words where its document's bindings
+    /// differ on the overload switch: a spec store whose newest generation
+    /// on file is such a document does not bind, and a spec file that holds
+    /// one does not start. Nothing serves until the document is edited.
+    #[tokio::test]
+    async fn a_document_whose_bindings_differ_on_the_overload_switch_ends_the_start() {
+        const WORDS: &str = "bindings[1].overload.enabled = true is not the false bindings[0] says, by its block or the block's default: a controller builds its workers with one default set of overload thresholds, so the bindings of its document say one word";
+        let dir = tempfile::tempdir().expect("a directory");
+        let head = "apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\nbindings:\n";
+        let first = "  - match:\n      model: chat/*\n    profile: p\n    overload:\n      enabled: false\n";
+        let differs = format!("{head}{first}  - profile: p\n");
+        let store = dir.path().join("store");
+        std::fs::create_dir(&store).expect("the directory");
+        std::fs::write(store.join("00000000000000000004.yaml"), &differs).expect("the file");
+        let file = dir.path().join("spec.yaml");
+        std::fs::write(&file, &differs).expect("the file");
+        let start = |source: SpecSource| {
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            bind(config, StageRegistry::builtin(), &[], source)
+        };
+
+        match start(SpecSource::Store(store.clone())).await {
+            Err(
+                refused @ Error::SpecStore {
+                    source: StoreRefused::Rejected { generation: 4, .. },
+                    ..
+                },
+            ) => assert_eq!(
+                refused.to_string(),
+                format!("the spec store {}: generation 4: {WORDS}", store.display())
+            ),
+            Err(other) => panic!("the store was refused as {other}"),
+            Ok(_) => panic!("the store's newest generation does not run"),
+        }
+        match start(SpecSource::File(file.clone())).await {
+            Err(
+                refused @ Error::SpecFile {
+                    source: SpecRejected::Invalid(_),
+                    ..
+                },
+            ) => assert_eq!(
+                refused.to_string(),
+                format!("the spec file {}: {WORDS}", file.display())
+            ),
+            Err(other) => panic!("the file was refused as {other}"),
+            Ok(_) => panic!("the file's document does not run"),
         }
     }
 

@@ -45,9 +45,12 @@ pub struct Position {
 /// store.
 pub trait Journal: Send + Sync {
     /// A membership or status write: the epoch it made, the change, the
-    /// row it is about as the write left it in the table (`None` for a
-    /// removal) and the row the write took out of the table (a removal's
-    /// row, a replacement's old incarnation). `at` is the place of the
+    /// row it is about as the write leaves it (`None` for a removal) and
+    /// the row the write took out of the table (a removal's row, a
+    /// replacement's old incarnation). Where a write's writer handed the
+    /// store the row it leaves, that row is told and the table then takes
+    /// it. A write that hands none, a status among them, tells the row as
+    /// the table holds it. `at` is the place of the
     /// leader's event the write applies, on a store that follows
     /// ([`crate::store::MemoryStore::follow`]), and none for a write of the
     /// store's own: a journal keeps that place for the applier's write

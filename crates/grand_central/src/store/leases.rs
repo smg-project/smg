@@ -230,7 +230,10 @@ pub struct LeaseRecord {
     /// The term of the leader that issued the lease.
     pub term: u64,
     pub issued_at: Instant,
-    /// Past it, an issued side is released as abandoned.
+    /// Past it, an issued side is released as abandoned. A file writes it
+    /// anew for a pair's decode side that was issued with its prefill:
+    /// at each deadline while that prefill is dispatched, and once behind
+    /// the prefill's end.
     pub dispatch_deadline: Instant,
     /// The state of a single's lease or a pair's prefill side.
     pub state: LeaseState,
@@ -381,9 +384,10 @@ impl Sides {
     /// A file meets words no guard says, and the calls turn them into
     /// words the rule knows:
     ///
-    /// - **An end** is lent for a side that is issued or dispatched, and
-    ///   for no other: a second end of a side, and an end of a decode side
-    ///   still chosen, call nothing. A release that names no side is lent
+    /// - **An end** is lent for a side that is issued or dispatched, and a
+    ///   release for a decode side still chosen that it names alone: a
+    ///   second end of a side, and a completion of a decode side still
+    ///   chosen, call nothing. A release that names no side is lent
     ///   once for each such side, the prefill's first, and each call's
     ///   word names its side.
     /// - **A dispatch** is lent for the side it names, where its index
@@ -408,7 +412,11 @@ impl Sides {
     ///   which reads none. With a word of the decode side it is the pick's
     ///   first target as the rule reads it: the decode the side's lease
     ///   books, by its id, with the side's own session verdict, but for a
-    ///   release behind a dispatch on another worker (below). The
+    ///   release behind a dispatch on another worker (below). The release
+    ///   of a prefill whose decode stands chosen ends that side with it and
+    ///   is lent that first target too, as a release that names such a
+    ///   decode alone is: no stage heard of the side, and neither word
+    ///   reaches one for it. The
     ///   dispatch of a side that stood chosen is the side's issue too, and
     ///   carries its pick to the stages. There the pick is every target
     ///   the record keeps, each side's worker and rank, under no trace
@@ -520,9 +528,16 @@ impl Sides {
         };
         let target = pair_target(prefill, Some(stands), DecodeVerdict::NONE);
         if ends(Side::Prefill) && record.state.is_live() {
-            lend(&EMPTY_PICK, lease.target_index, target, of(Side::Prefill));
+            // A decode that stands chosen leaves with its prefill's
+            // release: the word names the decode the side is filed on.
+            let leaves = side.chosen && matches!(said, Said::Released(..));
+            let pick = leaves.then(|| first_alone(decode.target));
+            let pick = pick.as_ref().unwrap_or(&EMPTY_PICK);
+            lend(pick, lease.target_index, target, of(Side::Prefill));
         }
-        if ends(Side::Decode) && decode.state.is_live() {
+        // A release that names a decode still chosen ends that side too.
+        let named_chosen = side.chosen && matches!(said, Said::Released(Some(Side::Decode), _));
+        if ends(Side::Decode) && (decode.state.is_live() || named_chosen) {
             // A release names the worker the side stands on.
             let first = match said {
                 Said::Released(..) => decode.target,
@@ -574,7 +589,8 @@ fn pair_target(
 /// with a word of a pair's prefill side ([`Sides::with_held_pair`]): no
 /// target, under no trace. A file keeps of a single's pick the workers a
 /// dispatch names by its index, and lists none of them for a word: no word
-/// of a single carries its pick to a stage.
+/// of a single carries its pick to a stage. The release of a prefill whose
+/// decode stands chosen is lent the decode side's first target in its place.
 static EMPTY_PICK: Decision = lent_pick(Targets::new(), 0);
 
 /// [`EMPTY_PICK`] for a lease whose request is kept from its profile
@@ -710,7 +726,10 @@ pub trait LeasesStore: Send + Sync {
 
     /// Releases issued sides past their dispatch deadline at `now` as
     /// abandoned and returns both parts of each lease as the call left
-    /// them. A file whose decider is at work is left to its decider, who
+    /// them. A pair's decode side that was issued with its prefill is not
+    /// released while that prefill is dispatched, nor at the first
+    /// deadline behind the prefill's end: it has a whole deadline from
+    /// there. A file whose decider is at work is left to its decider, who
     /// ends due leases at its issues. The store tells the lifecycle of
     /// each end itself.
     fn expire(&self, now: Instant) -> Vec<Sides>;

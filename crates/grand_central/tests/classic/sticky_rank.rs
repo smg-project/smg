@@ -171,11 +171,12 @@ impl Bed {
         let asked = Asked {
             request: Request {
                 id: b"request",
-                facts: RequestFacts {
-                    model: MODEL,
-                    session_key: key.map_or(Identity::NONE, Identity::plain),
-                    seed: self.seed,
-                    ..RequestFacts::default()
+                facts: {
+                    let mut facts = RequestFacts::default();
+                    facts.model = MODEL;
+                    facts.session_key = key.map_or(Identity::NONE, Identity::plain);
+                    facts.seed = self.seed;
+                    facts
                 },
                 constraints: Constraints::default(),
             },

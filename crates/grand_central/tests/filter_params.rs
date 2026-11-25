@@ -3,8 +3,7 @@
 use smg_grand_central::{
     document::{PolicySpec, API_VERSION},
     engine::{
-        Candidate, Constraints, Decision, Filter, Health, PoolFacts, RequestFacts, Scratch,
-        WorkerId,
+        Candidate, Constraints, Decision, Filter, PoolFacts, RequestFacts, Scratch, WorkerId,
     },
     stages::{StageBuild, StageError, StageRegistry},
 };
@@ -39,15 +38,11 @@ fn a_yaml_parameter_moves_the_rows_kept() {
         })
         .expect("a free name");
     // One healthy row with six of its eight slots taken.
-    let rows = [Candidate {
-        id: WorkerId(89),
-        in_flight: 6,
-        health: Health {
-            healthy: true,
-            ..Health::default()
-        },
-        ..Candidate::default()
-    }];
+    let mut row = Candidate::default();
+    row.id = WorkerId(89);
+    row.in_flight = 6;
+    row.health.healthy = true;
+    let rows = [row];
     let decide = |slots: u32| {
         let document: PolicySpec = serde_yaml::from_str(&format!(
             "apiVersion: {API_VERSION}
@@ -61,12 +56,11 @@ profiles:
         ))
         .expect("a well-formed document");
         let engine = document.validate_in(&catalog, &[]).expect("validates");
+        let mut pool = PoolFacts::default();
+        pool.pool_size = rows.len() as u32;
         engine.decide(
             &RequestFacts::default(),
-            &PoolFacts {
-                pool_size: rows.len() as u32,
-                ..PoolFacts::default()
-            },
+            &pool,
             &rows,
             &Constraints::default(),
             &mut Scratch::new(),

@@ -171,14 +171,7 @@ enum Hop {
     Gone,
 }
 
-/// Where one of a worker's blocks lives: the run and the offset of the block within it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BlockRef {
-    pub run: u32,
-    pub offset: u32,
-}
-
-pub use crate::lane_map::ChainBlockMap;
+pub use crate::lane_map::{BlockRef, ChainBlockMap};
 
 /// Memory and shape counters, as the replay harness reports them and the gateway exports them.
 #[derive(Debug, Clone, Copy, Default)]
@@ -268,6 +261,9 @@ pub struct ChainIndex {
     max_workers: usize,
     worker_to_id: DashMap<Arc<str>, u32, FxBuildHasher>,
     registry: Mutex<WorkerRegistry>,
+    /// Ids handed out a second time ([`Self::ids_reused`]): written where a freed id is
+    /// interned for the next name, under the registry's lock.
+    ids_reused: AtomicU64,
     /// Blocks held per worker, one cache line each: the lanes write these on every event.
     worker_blocks: Box<[CachePadded<AtomicUsize>]>,
     /// Per-worker signed contributions to the distinct-block count, summed on demand.
@@ -430,6 +426,7 @@ impl ChainIndex {
             max_workers,
             worker_to_id: DashMap::with_hasher(FxBuildHasher),
             registry: Mutex::new(WorkerRegistry::default()),
+            ids_reused: AtomicU64::new(0),
             worker_blocks: (0..max_workers)
                 .map(|_| CachePadded::new(AtomicUsize::new(0)))
                 .collect(),
@@ -485,7 +482,12 @@ impl ChainIndex {
             Entry::Vacant(entry) => {
                 let mut registry = self.registry.lock();
                 let id = match registry.free.pop() {
-                    Some(id) => id,
+                    Some(id) => {
+                        // Counted before the id can hold anything of its new name, as
+                        // `live_words` below is published.
+                        self.ids_reused.fetch_add(1, Ordering::Release);
+                        id
+                    }
                     None if registry.names.len() < self.max_workers => {
                         registry.names.push(None);
                         let id = (registry.names.len() - 1) as u32;
@@ -524,6 +526,14 @@ impl ChainIndex {
 
     pub fn worker_id(&self, worker: &str) -> Option<u32> {
         self.worker_to_id.get(worker).map(|entry| *entry.value())
+    }
+
+    /// How many times an id a removed worker freed was interned for the next name. A removal
+    /// alone does not move it. It does not say which id changed hands: a caller that keeps ids
+    /// across calls reads this before it reads them, and again behind a lookup it maps by
+    /// them, and once it moved any id it kept may name another worker.
+    pub fn ids_reused(&self) -> u64 {
+        self.ids_reused.load(Ordering::Acquire)
     }
 
     /// Whether no worker holds any block: the root has no live child, read under the root's

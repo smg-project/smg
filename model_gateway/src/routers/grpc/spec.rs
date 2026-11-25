@@ -111,6 +111,11 @@ pub(crate) struct ChatResponseSpec {
     pub ignore_eos: bool,
     /// Fallback when preparation derived no override.
     pub skip_special_tokens: bool,
+    /// The rendered prompt a stream's first opening chunk carries, for a
+    /// request that asked for it (`return_prompt_text`): moved in by response
+    /// processing from `ResponseState::prompt_text` for the attempt that
+    /// answers, so no attempt's clone of the spec copies the text.
+    pub prompt_text: Option<String>,
     /// Rendered prompt tokens the provider does not bill; set by request building.
     pub unbilled_prompt_tokens: u32,
     /// The image tokens the gateway's multimodal expansion wrote into the
@@ -196,6 +201,7 @@ impl ChatResponseSpec {
             no_stop_trim: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
+            prompt_text: None,
             unbilled_prompt_tokens: 0,
             image_tokens: None,
             reasoning_in_prefill: false,

@@ -954,7 +954,7 @@ def test_the_arguments_follow_the_values():
         "grandCentral.runtimeWorkerThreads=8",
         "grandCentral.logging.level=debug",
         "grandCentral.logging.json=true",
-        "grandCentral.extraArgs={--ingestion-listen,0.0.0.0:31104,--load-monitor-interval,2}",
+        "grandCentral.extraArgs={--decide-shards,4,--load-monitor-interval,2}",
     )
     assert container(documents)["args"] == [
         "--gateway-listen",
@@ -978,8 +978,8 @@ def test_the_arguments_follow_the_values():
         "--log-json",
         "--spec-file",
         SPEC_FILE,
-        "--ingestion-listen",
-        "0.0.0.0:31104",
+        "--decide-shards",
+        "4",
         "--load-monitor-interval",
         "2",
     ]
@@ -1715,9 +1715,7 @@ ARGUMENT_SETS = {
         "grandCentral.ports.admin=31103",
     ),
     "listeners-as-told": ("grandCentral.identityAsTold={gateway,control,replication}",),
-    "extra-arguments": (
-        "grandCentral.extraArgs={--ingestion-listen,0.0.0.0:30104,--load-monitor-interval,2}",
-    ),
+    "extra-arguments": ("grandCentral.extraArgs={--decide-shards,4,--load-monitor-interval,2}",),
     "an-election": ("grandCentral.election.enabled=true", "grandCentral.replicas=2"),
     "an-election-over-a-named-lease": (
         "grandCentral.election.enabled=true",
@@ -1811,8 +1809,8 @@ def test_the_image_job_starts_on_what_these_cases_read():
     them: the unit job, which starts on every pull request, runs those. The
     binary the cases run is built by the image's file from the crate's
     manifest, build script, source and contracts under the pinned toolchain,
-    and from the engine wire's messages the protocol imports: the job starts
-    on each of those too."""
+    and from the engine wire's messages, which the worker crate it links
+    compiles: the job starts on each of those too."""
     document = yaml.safe_load(IMAGE_WORKFLOW.read_text())
     # PyYAML reads the bare key `on` as the boolean true.
     entries = document[True]["pull_request"]["paths"]
@@ -1834,8 +1832,8 @@ def test_the_image_job_starts_on_what_these_cases_read():
         # chart's texts say in words.
         crate / "src" / "document" / "operator" / "spec_store.rs",
         crate / "contracts" / "smg-policy.wit",
-        # The engine wire's messages the controller's protocol imports: the
-        # build script reads them beside the contract.
+        # The engine wire's messages: the worker crate the binary links
+        # compiles them.
         REPO / "crates" / "worker" / "proto" / "common.proto",
         # The example controller, whose image the job builds beside the
         # stock one: its package and what the package compiles.
@@ -1998,7 +1996,7 @@ def test_the_binary_starts_on_the_rendered_arguments(binary, tmp_path):
     ports free here, a short grace period, each gRPC listener named to take
     identities as told, the spec document's ConfigMap mounted) answers its
     readiness probe and stops clean on SIGTERM."""
-    gateway, control, replication, admin, ingestion = free_ports(5)
+    gateway, control, replication, admin = free_ports(4)
     documents = render(
         *ON,
         f"grandCentral.ports.gateway={gateway}",
@@ -2008,11 +2006,9 @@ def test_the_binary_starts_on_the_rendered_arguments(binary, tmp_path):
         "grandCentral.shutdownGracePeriodSeconds=4",
         "grandCentral.shutdownSettleSeconds=1",
         "grandCentral.identityAsTold={gateway,control,replication}",
-        # A flag in extraArgs adds to the value's set: the ingestion listener
-        # is named where it is turned on, and a name said in both places
-        # names its listener once more.
-        "grandCentral.extraArgs={--ingestion-listen,"
-        f"127.0.0.1:{ingestion},--identity-as-told,ingestion,--identity-as-told,gateway}}",
+        # A flag in extraArgs adds to the value's set: a name said in both
+        # places names its listener once more.
+        "grandCentral.extraArgs={--identity-as-told,gateway}",
         "router.metrics.serviceMonitor.enabled=true",
     )
     found = container(documents)
@@ -2058,12 +2054,12 @@ def test_the_binary_starts_on_the_rendered_arguments(binary, tmp_path):
         # The output is a pipe here, as it is under a container runtime: the
         # log is plain text, with no color escape.
         assert "smg_grand_central" in output, "the controller logged nothing"
-        # Each of the chart's three names is a listener of the controller's,
-        # and so is the one extraArgs turns on: the controller says so once
-        # a naming, the gateways' listener named in both places twice.
+        # Each of the chart's three names is a listener of the controller's:
+        # the controller says so once a naming, the gateways' listener named
+        # in both places twice.
         told = [line for line in output.splitlines() if "identities are taken as told" in line]
-        assert len(told) == 5, output
-        for listener in ("gateway", "control", "replication", "ingestion"):
+        assert len(told) == 4, output
+        for listener in ("gateway", "control", "replication"):
             assert any(f"listener={listener}" in line for line in told), (listener, output)
         assert "\x1b" not in output, f"an escape byte with no terminal: {output!r}"
     finally:

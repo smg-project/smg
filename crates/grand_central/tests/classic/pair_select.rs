@@ -73,12 +73,11 @@ enum State {
 
 impl State {
     fn health(self) -> Health {
-        Health {
-            healthy: self != Self::Down,
-            overloaded: self == Self::Over,
-            stalled: self == Self::Stalled,
-            ..Health::default()
-        }
+        let mut health = Health::default();
+        health.healthy = self != Self::Down;
+        health.overloaded = self == Self::Over;
+        health.stalled = self == Self::Stalled;
+        health
     }
 }
 
@@ -202,17 +201,16 @@ fn engine(row: &Row) -> Result<Engine, String> {
 /// One worker's row in a pool of the replay, every admission bit set.
 fn candidate(at: usize, first: u64, role: Role, worker: &Worker) -> Candidate {
     let id = first + at as u64;
-    Candidate {
-        position: at as u32,
-        id: WorkerId(id),
-        role,
-        health: worker.state.health(),
-        in_flight: worker.in_flight,
-        has_capacity: true,
-        has_room: true,
-        key: id as u32,
-        ..Candidate::default()
-    }
+    let mut row = Candidate::default();
+    row.position = at as u32;
+    row.id = WorkerId(id);
+    row.role = role;
+    row.health = worker.state.health();
+    row.in_flight = worker.in_flight;
+    row.has_capacity = true;
+    row.has_room = true;
+    row.key = id as u32;
+    row
 }
 
 /// A row's pair classes as its decision reads them: each prefill's class
@@ -365,17 +363,19 @@ enum Here {
 /// `draw` separating the seeds of a drawn row's runs.
 fn run(row: &Row, engine: &Engine, draw: u64, classes: &Classes<'_>) -> Result<Vec<Here>, String> {
     let prefills: Vec<Candidate> = (row.prefills.iter().enumerate())
-        .map(|(at, worker)| Candidate {
-            pair_class: classes.prefills[at],
-            has_capacity: (row.prefill_bound).is_none_or(|bound| worker.in_flight < bound),
-            ..candidate(at, 1_000, Role::Prefill, worker)
+        .map(|(at, worker)| {
+            let mut record = candidate(at, 1_000, Role::Prefill, worker);
+            record.pair_class = classes.prefills[at];
+            record.has_capacity = (row.prefill_bound).is_none_or(|bound| worker.in_flight < bound);
+            record
         })
         .collect();
     let decodes: Vec<Candidate> = (row.decodes.iter().enumerate())
-        .map(|(at, worker)| Candidate {
-            pair_class: classes.decodes[at],
-            has_room: (worker.rooms).is_none_or(|rooms| rooms.admitted < rooms.window),
-            ..candidate(at, 2_000, Role::Decode, worker)
+        .map(|(at, worker)| {
+            let mut record = candidate(at, 2_000, Role::Decode, worker);
+            record.pair_class = classes.decodes[at];
+            record.has_room = (worker.rooms).is_none_or(|rooms| rooms.admitted < rooms.window);
+            record
         })
         .collect();
     let Classes { table, first, .. } = *classes;
@@ -389,29 +389,23 @@ fn run(row: &Row, engine: &Engine, draw: u64, classes: &Classes<'_>) -> Result<V
     let (pools, pool_size) = if prefills.is_empty() || decodes.is_empty() {
         (PairPools::default(), 0)
     } else {
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            table,
-            first,
-            ..PairPools::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = &decodes;
+        pools.table = table;
+        pools.first = first;
         (pools, prefills.len() as u32)
     };
-    let pool_facts = PoolFacts {
-        pool_size,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = pool_size;
+    pool_facts.generation = 1;
     let cx = Constraints::default();
     let mut scratch = Scratch::new();
     Ok((0..row.requests)
         .map(|at| {
-            let facts = RequestFacts {
-                model: "m",
-                seed: draw * 1_000 + at as u64 + 1,
-                ..RequestFacts::default()
-            };
+            let mut facts = RequestFacts::default();
+            facts.model = "m";
+            facts.seed = draw * 1_000 + at as u64 + 1;
             match engine.decide_pair(&facts, &pool_facts, pools, &cx, &cx, &mut scratch) {
                 Decision::Pick(pick) => {
                     let target = pick.targets.first().expect("a target");

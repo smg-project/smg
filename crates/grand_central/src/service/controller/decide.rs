@@ -229,9 +229,9 @@ pub(crate) fn serve<S>(
     inbound: S,
 ) -> Result<Answers<S>, Status> {
     let gateway = principal.gateway();
-    // A receiver made after the word has seen it: a stream that opens
-    // after the listeners' close is refused in an open one's last words.
-    let stop = shared.stop.subscribe();
+    // The word is said once, and read here: a stream that opens after the
+    // listeners' close is refused in an open one's last words.
+    let stop = shared.stop.clone();
     if *stop.borrow() {
         return Err(Status::unavailable(CLOSING));
     }
@@ -579,7 +579,7 @@ mod tests {
                         busy,
                         encode::{encode_plan_in, frame_of, member_of, ENCODED, PUSHING},
                         fleet, followed, frame, frame_for, gone, hearing, lease_of, picked, preset,
-                        settled, Script, Step, BUDGET, PATIENCE,
+                        settled, unserved, Script, Step, BUDGET, PATIENCE,
                     },
                     Clock, DecideStats, DecisionSlots, Job, Reads,
                 },
@@ -622,6 +622,9 @@ mod tests {
     struct Bed {
         elector: Elector,
         standing: watch::Sender<ElectionObservation>,
+        /// The listeners' close, in the case's hand as the serve's drain
+        /// holds it: the state holds its receiver.
+        stop: watch::Sender<bool>,
         shared: Arc<Shared>,
         script: Arc<Script>,
         /// The members serving the cases' model in the single role, ready.
@@ -660,7 +663,6 @@ mod tests {
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
         let (store, feed) = journaled_at(&LeasePlace::Process, 0, deciders);
-        let (workers, _sides) = fleet(&store);
         store
             .apply(preset("random", 1))
             .expect("above the unbound start");
@@ -700,16 +702,22 @@ mod tests {
         // One holder for the service's calls, the store's word to the engine
         // and the bed's own deciders, as a replica has one.
         let (store, feed, objects, loads) = followed((store, feed));
+        // The listeners' close is the case's to say: the bed keeps its
+        // sender, and the state its receiver.
+        let (stop, stopped) = watch::channel(false);
+        let (looks, _unsaid, role, lag) = unserved(stood.clone());
         let mut shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood.clone(),
+            (looks, stopped, role, lag),
             (Arc::clone(&store), feed, Arc::clone(&objects), loads),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             deciders,
         )
         .expect("the deciders start");
+        // The fleet is written through the holder, as a registration's is.
+        let (workers, _sides) = fleet(&store, &objects);
         let reads = Reads {
             objects,
             loads: frame_loads::silent(),
@@ -738,6 +746,7 @@ mod tests {
         Bed {
             elector,
             standing,
+            stop,
             shared,
             script,
             workers,
@@ -1043,7 +1052,7 @@ mod tests {
         bed.decides(&mut asked, 1, 1).await;
         // The word wakes a stream that waits for its next frame and one
         // that read none.
-        bed.shared.stop.send_replace(true);
+        bed.stop.send_replace(true);
         assert_eq!(asked.status().await, closing);
         assert_eq!(idle.status().await, closing);
         // A stream that opens after the word is refused in the same words.
@@ -1059,9 +1068,27 @@ mod tests {
         let mut stream = bed.opened(NAME).await;
         stream.send(frame(1, 1)).await;
         assert_eq!(busy(&stream.answer().await), Reason::NotLeader);
-        bed.shared.stop.send_replace(true);
+        bed.stop.send_replace(true);
         let closing = (Code::Unavailable, CLOSING.to_owned());
         assert_eq!(stream.status().await, closing);
+    }
+
+    /// The close's sender goes with the serve. Where the serve is gone with
+    /// no word said, an open stream is woken and ends in the close's words:
+    /// one that waits for its next frame, and one that read none.
+    #[tokio::test]
+    async fn an_open_stream_ends_where_the_serve_is_gone_with_no_close_said() {
+        let closing = (Code::Unavailable, CLOSING.to_owned());
+        let mut bed = bed().await;
+        let _seat = bed.welcomed(NAME, 1);
+        let mut asked = bed.opened(NAME).await;
+        let mut idle = bed.opened(NAME).await;
+        bed.decides(&mut asked, 1, 1).await;
+        // The state's receiver is of the sender that goes: another takes
+        // its place in the bed.
+        drop(std::mem::replace(&mut bed.stop, watch::channel(false).0));
+        assert_eq!(asked.status().await, closing);
+        assert_eq!(idle.status().await, closing);
     }
 
     /// At a take every gone gateway's period starts again, and a stream's
@@ -1266,7 +1293,7 @@ mod tests {
         let _seat = bed.welcomed(NAME, 1);
         let (_frames, mut stream) = by_hand(&bed);
         let second = slept_under_two(&mut stream);
-        bed.shared.stop.send_replace(true);
+        bed.stop.send_replace(true);
         assert_eq!(second.wakes(), 1);
     }
 
@@ -1316,7 +1343,7 @@ mod tests {
         let (_frames, mut stream) = by_hand(&bed);
         let woken = slept_with_no_budget(&mut stream).await;
         let before = woken.wakes();
-        bed.shared.stop.send_replace(true);
+        bed.stop.send_replace(true);
         assert_eq!(woken.wakes(), before + 1);
     }
 
@@ -2052,7 +2079,8 @@ mod tests {
         let store = &bed.shared.store;
         let later = encode_plan_in(&StageRegistry::builtin(), 2, ["random"; 3]);
         store.apply(later).expect("a later generation");
-        let member = |name: &str, role| member_of(store, ENCODED, name, role, PUSHING);
+        let objects = &bed.shared.objects;
+        let member = |name: &str, role| member_of(store, objects, ENCODED, name, role, PUSHING);
         let p = member("ep0", Role::Prefill);
         let d = member("ed0", Role::Decode);
         let e = member("ee0", Role::Encode);

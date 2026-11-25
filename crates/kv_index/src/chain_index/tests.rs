@@ -1447,6 +1447,20 @@ fn worker_slots_are_bounded_and_reused_after_removal() {
     assert_eq!(index.intern_worker("a"), Err(WorkerIdExhausted));
 }
 
+/// The count of reused ids moves where a freed id is interned for the next name: a fresh id
+/// and a removal alone leave it.
+#[test]
+fn the_reuse_count_moves_where_a_freed_id_is_interned() {
+    let index = ChainIndex::new();
+    let a = index.intern_worker("a").expect("id");
+    index.intern_worker("b").expect("id");
+    assert_eq!(index.ids_reused(), 0, "fresh ids");
+    index.remove_worker(a, ChainBlockMap::default());
+    assert_eq!(index.ids_reused(), 0, "a removal alone");
+    assert_eq!(index.intern_worker("c"), Ok(a), "the freed id");
+    assert_eq!(index.ids_reused(), 1);
+}
+
 // ---- the deepest holders under a cap
 
 /// Every worker: a caller that reads the whole fleet.

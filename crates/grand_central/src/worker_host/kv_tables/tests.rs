@@ -649,7 +649,7 @@ fn a_lent_body_reads_each_emptying_of_its_rank() {
     assert_ne!(gone, restarted);
 }
 
-/// The store makes a row's lane again under the row's id: here the row
+/// The holder makes a row's lane again under the row's id: here the row
 /// stops asking for events and asks again. A lane usually sees one resync,
 /// its first snapshot, so two lanes that each counted from nothing would
 /// read alike. The new lane reads another value than the old one did, and

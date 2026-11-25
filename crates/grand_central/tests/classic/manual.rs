@@ -6,7 +6,7 @@ use serde::Deserialize;
 use smg_grand_central::{
     document::{Assignment, PolicySpec},
     engine::{
-        Candidate, Constraints, Engine, Health, Identity, PairPools, PairTable, Phase, PoolFacts,
+        Candidate, Constraints, Engine, Identity, PairPools, PairTable, Phase, PoolFacts,
         RequestFacts, Role as WorkerRole, Scratch, Target, WorkerId,
     },
     stages::Lifecycle,
@@ -120,17 +120,15 @@ impl Bed {
             .workers
             .iter()
             .enumerate()
-            .map(|(i, worker)| Candidate {
-                position: i as u32,
-                id: WorkerId(1_000 + i as u64),
-                key: 1_000 + i as u32,
-                health: Health {
-                    healthy: true,
-                    ..Health::default()
-                },
-                in_flight: worker.in_flight,
-                active_sessions: worker.keys,
-                ..Candidate::default()
+            .map(|(i, worker)| {
+                let mut candidate = Candidate::default();
+                candidate.position = i as u32;
+                candidate.id = WorkerId(1_000 + i as u64);
+                candidate.key = 1_000 + i as u32;
+                candidate.health.healthy = true;
+                candidate.in_flight = worker.in_flight;
+                candidate.active_sessions = worker.keys;
+                candidate
             })
             .collect();
         Ok(Self {
@@ -147,18 +145,14 @@ impl Bed {
     /// move by the row's own steps, as they did under the recorder.
     fn pick(&mut self, key: Option<&str>, seed: u64) -> usize {
         self.clock += 1_000;
-        let facts = RequestFacts {
-            model: "m",
-            session_key: key.map_or(Identity::NONE, Identity::plain),
-            seed,
-            now_micros: self.clock,
-            ..RequestFacts::default()
-        };
-        let pool_facts = PoolFacts {
-            pool_size: self.pool.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.session_key = key.map_or(Identity::NONE, Identity::plain);
+        facts.seed = seed;
+        facts.now_micros = self.clock;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = self.pool.len() as u32;
+        pool_facts.generation = 1;
         let decision = self.engine.decide(
             &facts,
             &pool_facts,
@@ -168,12 +162,10 @@ impl Bed {
         );
         let pick = decision.pick().expect("a pick");
         let target = *pick.targets.first().expect("a target");
-        let lease = Lease {
-            issued_micros: self.clock,
-            session: facts.session(),
-            session_verdict: pick.session_verdict,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = self.clock;
+        lease.session = facts.session();
+        lease.session_verdict = pick.session_verdict;
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);
         target.position as usize
     }
@@ -185,37 +177,32 @@ impl Bed {
     /// pairs with every decode. It answers the worker of each side.
     fn pair(&mut self, prefills: &[Candidate], key: Option<&str>, seed: u64) -> [usize; 2] {
         self.clock += 1_000;
-        let facts = RequestFacts {
-            model: "m",
-            session_key: key.map_or(Identity::NONE, Identity::plain),
-            seed,
-            now_micros: self.clock,
-            ..RequestFacts::default()
-        };
-        let pool_facts = PoolFacts {
-            pool_size: prefills.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.session_key = key.map_or(Identity::NONE, Identity::plain);
+        facts.seed = seed;
+        facts.now_micros = self.clock;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = prefills.len() as u32;
+        pool_facts.generation = 1;
         let side = |pool: &[Candidate], role| -> Vec<Candidate> {
             (pool.iter())
-                .map(|worker| Candidate {
-                    role,
-                    pair_class: 1,
-                    has_capacity: true,
-                    has_room: true,
-                    ..*worker
+                .map(|worker| {
+                    let mut record = *worker;
+                    record.role = role;
+                    record.pair_class = 1;
+                    record.has_capacity = true;
+                    record.has_room = true;
+                    record
                 })
                 .collect()
         };
         let prefills = side(prefills, WorkerRole::Prefill);
         let decodes = side(&self.pool, WorkerRole::Decode);
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            table: PairTable::new(&[1], &[1]),
-            ..PairPools::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = &decodes;
+        pools.table = PairTable::new(&[1], &[1]);
         let cx = Constraints::default();
         let decision =
             (self.engine).decide_pair(&facts, &pool_facts, pools, &cx, &cx, &mut self.scratch);
@@ -224,29 +211,31 @@ impl Bed {
         let pair = target.pair.expect("the target's pair");
         // The host's two dispatches: the prefill's under the pick's verdict,
         // the decode's under the one the first target's pair states.
-        let session = |phase| RequestFacts { phase, ..facts }.session();
-        let prefill = Lease {
-            issued_micros: self.clock,
-            side: Side::Prefill,
-            session: session(Phase::Prefill),
-            session_verdict: pick.session_verdict,
-            ..Lease::default()
+        let session = |phase| {
+            {
+                let mut request_facts = facts;
+                request_facts.phase = phase;
+                request_facts
+            }
+            .session()
         };
+        let mut prefill = Lease::default();
+        prefill.issued_micros = self.clock;
+        prefill.side = Side::Prefill;
+        prefill.session = session(Phase::Prefill);
+        prefill.session_verdict = pick.session_verdict;
         self.engine
             .on_dispatched(&prefill, &target, Side::Prefill, 0);
-        let decode = Lease {
-            side: Side::Decode,
-            booked: pair.decode_id,
-            session: session(Phase::Decode),
-            session_verdict: pair.decode_verdict.on(pair.decode_id),
-            ..prefill
-        };
-        let went = Target {
-            position: pair.decode_position,
-            id: pair.decode_id,
-            dp_rank: pair.decode_dp_rank,
-            pair: None,
-        };
+        let mut decode = prefill;
+        decode.side = Side::Decode;
+        decode.booked = pair.decode_id;
+        decode.session = session(Phase::Decode);
+        decode.session_verdict = pair.decode_verdict.on(pair.decode_id);
+        let mut went = Target::default();
+        went.position = pair.decode_position;
+        went.id = pair.decode_id;
+        went.dp_rank = pair.decode_dp_rank;
+        went.pair = None;
         self.engine.on_dispatched(&decode, &went, Side::Decode, 0);
         [target.position as usize, pair.decode_position as usize]
     }

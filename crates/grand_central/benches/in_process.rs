@@ -30,7 +30,9 @@
 //! rule for such a list has loads to steer by. `--refused limit` puts every
 //! prefill of a pair's cell at its host's admission limit, and `--refused
 //! partners` takes its every decode out of service: each decision is then
-//! refused, and a turn refused that way counts. `--shadow twin` names a
+//! refused, and a turn refused that way counts. `--refused overload` puts
+//! its every decode over its thresholds under a binding that sheds such a
+//! list: each request is then shed as saturated. `--shadow twin` names a
 //! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
@@ -85,6 +87,8 @@ mod conversations;
 mod counting_alloc;
 #[path = "in_process/encode.rs"]
 mod encode;
+#[path = "in_process/indexed.rs"]
+mod indexed;
 #[path = "in_process/pair.rs"]
 mod pair;
 #[path = "in_process/place.rs"]
@@ -117,8 +121,8 @@ use parking_lot::{Condvar, Mutex};
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec, RulePlaced, ShadowSpec},
     engine::{
-        Constraints, Decided, FixedFacts, Identity, InProcess, Phase, Plain, PublishedList,
-        Request, RequestFacts, RequestMaker, TokenEntry, TokenKey, WorkerId, WorkerLists,
+        Constraints, Decided, FixedFacts, Identity, InProcess, Phase, Plain, PromptEntry,
+        PublishedList, Request, RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
     },
     policies::{
         consistent_hashing::{Head, LentRing},
@@ -159,6 +163,11 @@ pub static MALLOC_CONF: &[u8; 100] =
     b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
 
 const MODEL: &str = "bench-model";
+
+/// The address of the list's worker at `at`.
+fn address(at: usize) -> String {
+    format!("http://worker-{at:04}:8000")
+}
 
 /// Decisions a caller makes untimed first: the buffers a thread keeps.
 const CALLER_WARM: u64 = 256;
@@ -230,6 +239,25 @@ const CELLS: &[Cell] = &[
         name: "cache_aware",
         document: || preset("cache_aware"),
         behind: conversations::lends,
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        words: conversations::words,
+        ..Cell::PLAIN
+    },
+    // The cache-aware preset over one prompt at every turn, under a host
+    // that lends no tree. Asked by the one call (`--entry place`), a turn
+    // is named its worker by the engine's record of sent prefixes. Under
+    // `--entry place_text` the prompt is stated as text, hashed by its
+    // windows and read from the same record.
+    Cell {
+        name: "cache_aware_one_prompt",
+        document: || preset("cache_aware"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "cache_aware_indexed",
+        document: || preset("cache_aware"),
+        behind: indexed::keeps,
         caller: Some(conversations::caller),
         fits: conversations::fits,
         words: conversations::words,
@@ -334,11 +362,30 @@ const CELLS: &[Cell] = &[
         request: pair::request,
         ..Cell::PLAIN
     },
+    // A round-robin prefill beside the hash ring's decode, with a request
+    // that carries no key: `--entry place_named` names its decode alone,
+    // which each decision counts behind the prefill it picks.
+    Cell {
+        name: "pair_ring_decode_no_key",
+        document: ring_decode,
+        request: pair::request,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "least_load_on_runtime",
         document: || preset("least_load"),
         behind: states_runtimes,
         request: on_runtime,
+        ..Cell::PLAIN
+    },
+    // The cache-aware preset on both sides of a pair: each side is handed
+    // its own list's column. Asked by the one call (`--entry place`), a
+    // turn's prompt is hashed, each side's column is filled from the
+    // engine's record of sent prefixes, and its pick is written there.
+    Cell {
+        name: "pair_cache_aware",
+        document: || pair::of("cache_aware"),
+        request: pair::request,
         ..Cell::PLAIN
     },
     Cell {
@@ -426,6 +473,12 @@ fn preset(name: &str) -> PolicySpec {
     PolicySpec::preset(name).expect("a preset's name")
 }
 
+/// The pair document of a round-robin prefill beside the hash ring's
+/// decode: the decode's side alone reads a request's target source.
+fn ring_decode() -> PolicySpec {
+    PolicySpec::pair_presets("round_robin", "consistent_hashing").expect("a preset's name")
+}
+
 /// The `resident_work` cell's document: the `power_of_two` preset over
 /// resident tokens, which costs every worker by the `resident-work`
 /// scorer. The cell's reports count their resident tokens ([`resident`]).
@@ -498,13 +551,11 @@ fn session(seed: u64) -> Request<'static> {
 
 /// A plain single request of 1,024 prompt tokens: it asks only a worker.
 fn plain(seed: u64) -> Request<'static> {
-    let facts = RequestFacts {
-        model: MODEL,
-        phase: Phase::Single,
-        prompt_tokens: 1_024,
-        seed,
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.model = MODEL;
+    facts.phase = Phase::Single;
+    facts.prompt_tokens = 1_024;
+    facts.seed = seed;
     Request {
         id: b"bench",
         facts,
@@ -921,12 +972,15 @@ fn warm_stack() {
 fn main() {
     let run = run();
     // A pair's cell hands two lists and an encode request's three: such a
-    // run is its file's.
-    if pair::runs(&run) || encode::runs(&run) {
+    // run is its file's. A pair's cell alone runs refused.
+    if pair::runs(&run) {
         return;
     }
     let open = run.refused == pair::Refused::No;
     assert!(open, "a pair's cell alone runs refused");
+    if encode::runs(&run) {
+        return;
+    }
     let Cell {
         behind,
         document,
@@ -942,7 +996,7 @@ fn main() {
         "--cold-kb: this cell's callers time their own turns"
     );
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
-        .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
+        .map(|at| ready_worker(&address(at), MODEL))
         .collect();
     lend(&workers);
     if run.overloaded {

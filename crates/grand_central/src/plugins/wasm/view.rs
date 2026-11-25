@@ -1225,6 +1225,35 @@ mod tests {
         assert_eq!(packed, vec![0, 7, 3]);
     }
 
+    /// Beside rows a host named in the column's place, the packed fill
+    /// carries each candidate's requests in flight: the row's own count.
+    #[test]
+    fn the_packed_fill_gives_a_row_its_count_beside_named_rows() {
+        let facts = RequestFacts {
+            named: Some(AffinityRows {
+                holders: &[AffinityHolder {
+                    row: 1,
+                    overlap_blocks: 17,
+                    predicted_blocks: 0,
+                }],
+                ..AffinityRows::default()
+            }),
+            ..RequestFacts::default()
+        };
+        let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
+        rows[2].in_flight = 3;
+        let mut packed = Packed::default();
+        packed.fill_candidates(&facts, &rows);
+        let counts: Vec<u32> = packed
+            .candidates
+            .as_chunks::<ROW>()
+            .0
+            .iter()
+            .map(|row| le_u32(row, ROW_IN_FLIGHT))
+            .collect();
+        assert_eq!(counts, vec![0, 7, 3]);
+    }
+
     /// Both fills carry each candidate's count of the request's session
     /// key, the row's own, and the two forms agree.
     #[test]
@@ -1545,6 +1574,7 @@ mod tests {
             client_key: 0,
             ring: None,
             ring_positions: &[],
+            decode_ring_positions: None,
             session_key_from_rid: false,
         };
         let exposure = Exposure {

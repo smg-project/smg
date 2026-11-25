@@ -130,6 +130,14 @@ pub(crate) trait TonicStatusExt {
     /// either.
     fn breaker_status(&self) -> Option<u16>;
 
+    /// What Grand Central is told where this failure ends a request
+    /// (`RequestEnd::report_with`): the status the circuit breaker samples
+    /// for it ([`TonicStatusExt::breaker_status`]), and whether the worker
+    /// itself answered it ([`TonicStatusExt::is_no_answer`]). `None` where
+    /// the breaker takes no sample: the failure says nothing about the
+    /// worker, and nobody reports it.
+    fn end_status(&self) -> Option<(u16, bool)>;
+
     /// The client's answer when the status is a worker's report that the
     /// engine could not continue the request under the request's own
     /// constraint (the `smg-constraint-failed` trailer, see
@@ -343,6 +351,11 @@ impl TonicStatusExt for tonic::Status {
             return None;
         }
         Some(self.http_status().as_u16())
+    }
+
+    fn end_status(&self) -> Option<(u16, bool)> {
+        self.breaker_status()
+            .map(|status| (status, !self.is_no_answer()))
     }
 
     fn constraint_failure_response(&self) -> Option<Response> {
@@ -618,6 +631,28 @@ mod tests {
         ] {
             assert_eq!(status.is_no_answer(), no_answer, "{status:?}");
         }
+    }
+
+    /// What a failure tells Grand Central where it ends a request: the
+    /// status the breaker samples for it and whether the worker answered
+    /// it. A failure the breaker takes no sample of tells nothing.
+    #[test]
+    fn a_failure_tells_the_engine_what_the_breaker_samples_and_who_answered() {
+        assert_eq!(
+            tonic::Status::internal("the engine failed").end_status(),
+            Some((500, true))
+        );
+        assert_eq!(
+            tonic::Status::invalid_argument("a bad request").end_status(),
+            Some((400, true))
+        );
+        assert_eq!(
+            tonic::Status::cancelled("the worker's side ended the call").end_status(),
+            Some((502, false))
+        );
+        let constraint = smg_grpc_client::constraint_failed_status("no token fits the grammar");
+        assert_eq!(constraint.breaker_status(), None);
+        assert_eq!(constraint.end_status(), None);
     }
 
     #[test]

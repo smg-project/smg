@@ -8,7 +8,8 @@
 //! held to the workers it takes on each, as a pair's are and by the pair's
 //! own routine ([`pair::again`]). The rule is asked of no encoder there
 //! either, and no item is held to places of the rule's. So a shed made
-//! over the encoders stands, and no rule is asked behind it ([`asks`]).
+//! over the encoders stands, and no rule is asked behind it: the routine
+//! reads the decision's word of the list it shed over.
 //!
 //! The engine's entry for an encode request decides the pair and each
 //! item's encoder in one call ([`Loaded::decide_encode_at`]). The
@@ -176,9 +177,6 @@ fn asked<'a>(
         }
     });
     let Ok(walked) = &mut taken else {
-        // The decision's word of a shed it made over its encoders: such a
-        // shed stands ([`asks`]).
-        call.over_encoders = placed.shed_over_encoders();
         return taken;
     };
     let (workers, down) = read.into_inner().unwrap_or_default();
@@ -209,7 +207,8 @@ fn asked<'a>(
 /// What an ask answers, and [`Unplaced::NoWorkers`] where the call's last
 /// ask takes no placement. A rule that takes no worker of one of the
 /// pair's two lists sheds the request with no endpoint, under `admits`
-/// ([`super::hold_to_rule`]).
+/// ([`super::hold_to_rule`]), or leaves it its first decision's shed as
+/// saturated ([`pair::again`]).
 pub(super) fn place<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
@@ -228,14 +227,12 @@ pub(super) fn place<'a>(
 /// lent the three lists with each side's places of the pair beside it: the
 /// pair's own routine does both ([`pair::again`]), whatever kept the ask
 /// from a placement, a side of the pair or an encoder. An ask that sheds
-/// the request as saturated over a list of its pair goes there too: it
-/// judged the overload over the lists it was lent, which a rule may
-/// narrow. A shed made over the encoders stands, and no rule is asked
-/// behind it: the rule is asked of no encoder, so it narrows nothing that
-/// decision judged, and a decision among its workers could only shed
-/// again. The decision says which shed it made
-/// ([`EncodePlaced::shed_over_encoders`]), whatever profiles its sides are
-/// decided under.
+/// the request as saturated goes there too. One made over a list of its
+/// pair judged the overload over the lists it was lent, which a rule may
+/// narrow. One made over the encoders stands there, and no rule is asked
+/// behind it. The routine tells the two by the decision's own word of the
+/// list it shed over ([`ShedOver`](crate::engine::framework::ShedOver)),
+/// whatever profiles the request's sides are decided under.
 fn asks<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
@@ -252,7 +249,7 @@ fn asks<'a>(
                 reason: ShedReason::Saturated,
                 ..
             },
-        ) if !call.over_encoders => Some(shed),
+        ) => Some(shed),
         Err(unplaced) => return Err(unplaced),
     };
     let next =

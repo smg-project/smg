@@ -113,7 +113,7 @@ profiles:
 `Pack` takes a weight from the document and nothing else:
 `- pack: { weight: 2 }`. A bare name weighs one. A scorer with settings of
 its own registers with `scorer_with` and reads them from the document as
-typed parameters: the crate's README shows one. The command line is the
+typed parameters: the crate's [reference](../../crates/grand_central/REFERENCE.md#register-a-rust-stage) shows one. The command line is the
 crate's, and it refuses a flag it does not know.
 
 The stock `not-overloaded` filter is where `pack` stops filling a worker. It
@@ -121,7 +121,8 @@ drops a worker judged overloaded: the queue or the KV-cache usage in its
 engine's load reports stands at or over a threshold. A started controller's
 load monitor judges each worker by the threshold its registration names, or
 by the program's: by default 8 queued requests and a usage of 0.8, and a
-start may state others. A worker of the
+start may state others. A document whose every binding sets
+`overload.enabled: false` switches the program's off. A worker of the
 `external` runtime is judged by its registration's alone. The example's tests
 show what the verdict does: a worker judged overloaded is passed over, and
 the next one opens.
@@ -160,15 +161,11 @@ This example registers the one the stock controller's binary runs on, with
 the same settings: `src/main.rs` declares both, and `Cargo.toml` names one
 dependency under a target rule. The rule leaves an Apple target out: the
 allocator compiles no background thread there, which the settings ask for,
-and the example runs on the system allocator. The choice shows under
-registrations. Each one builds the store's world again, and the system
-allocator keeps resident what those builds free. In a one-thread probe of the
-store, 4,096 registrations of one model leave hundreds of megabytes resident
-under the system allocator and about a dozen under this one. A controller
-that registers none runs on the system allocator and pays that. On Linux
-aarch64 the allocator is built for 64 KiB pages, so one binary runs on every
-page size: the workspace's cargo configuration sets it, and a repository of
-your own needs the same line.
+and the example runs on the system allocator. A controller that registers
+none runs on the system allocator. On Linux aarch64 the allocator is built
+for 64 KiB pages, so one binary runs on every page size: the workspace's
+cargo configuration sets it, and a repository of your own needs the same
+line.
 
 ## In a repository of your own
 

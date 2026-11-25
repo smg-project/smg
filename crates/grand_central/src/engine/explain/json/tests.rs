@@ -116,16 +116,17 @@ fn written(record: &DecisionRecord, spec: &AppliedSpec, before: SystemTime) -> V
 }
 
 /// A pick is written whole: its targets with the decode side of a pair, its
-/// trace, its names under the standing generation and what its shadow
-/// said. A 64-bit id, a seed and a generation are decimal strings. A worker
-/// its host holds no more has no address. No id of the request stands in
-/// it.
+/// trace, its names under the standing generation, what its shadow said
+/// and, in the trace, the worker that shadow picked. A 64-bit id, a seed
+/// and a generation are decimal strings. A worker its host holds no more
+/// has no address. No id of the request stands in it.
 #[test]
 fn a_pick_is_written_with_its_targets_its_trace_and_its_names() {
     let spec = standing();
     let before = SystemTime::now();
     let mut record = record(pick(), Some(0));
     record.shadow = Some(ShadowKind::OtherTarget);
+    record.shadow_target = Some(WorkerId(u64::MAX - 2));
     let names = record.names(spec.engine()).expect("the standing names");
     assert_eq!(
         (names.plan, names.profile.as_str()),
@@ -159,6 +160,7 @@ fn a_pick_is_written_with_its_targets_its_trace_and_its_names() {
                 "seed": "18446744073709551614",
                 "generation": "7",
                 "lifted": "LIFTED_VETO_OVERLOAD",
+                "shadow_pick": "18446744073709551613",
             },
         },
         "plan_name": "single",
@@ -173,9 +175,9 @@ fn a_pick_is_written_with_its_targets_its_trace_and_its_names() {
 
 /// A shed is written with its reason in the contract's word. An option
 /// that holds no value is left out: no binding matched, the generation
-/// that decided is not the standing one, no survivor was counted and no
-/// shadow was due. A zero and an empty list are written. A queue ticket is
-/// a decimal string.
+/// that decided is not the standing one, no survivor was counted, no
+/// shadow was due and none picked a worker. A zero and an empty list are
+/// written. A queue ticket is a decimal string.
 #[test]
 fn a_shed_is_written_with_its_reason_and_no_unset_option() {
     let spec = standing();
@@ -210,6 +212,24 @@ fn a_shed_is_written_with_its_reason_and_no_unset_option() {
     let json = written(&record(queue, None), &spec, before);
     let wanted = json!({ "ticket": "18446744073709551615", "max_wait_micros": 9 });
     assert_eq!(json["decision"]["queue"], wanted);
+}
+
+/// A score that is no number has no JSON form: its row is written without
+/// the name, beside a row whose score is one.
+#[test]
+fn a_score_that_is_no_number_is_left_out_of_its_row() {
+    let spec = standing();
+    for unwritten in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let Decision::Pick(mut picked) = pick() else {
+            panic!("the fixture is a pick");
+        };
+        picked.trace.top[1].1 = unwritten;
+        let json = record(Decision::Pick(picked), Some(0)).json(spec.engine(), &url);
+        let rows = &json["decision"]["trace"]["top"];
+        assert_eq!(rows[0]["score"], json!(0.75), "{unwritten}");
+        let wanted = json!({ "worker_id": "11", "url": "http://worker-11:8000" });
+        assert_eq!(rows[1], wanted, "{unwritten}");
+    }
 }
 
 /// The names of a wire message's fields, read from the print of a value
@@ -265,7 +285,7 @@ fn closed(
 /// leaves out, held for a pick that holds every option. At the record
 /// those are the two ids of the request, which the record does not hold,
 /// and six fields that no kept record holds and the control call leaves
-/// unset. Below it they are a decision's leases, six fields of a trace and
+/// unset. Below it they are a decision's leases, five fields of a trace and
 /// two of a top row, which no trace holds. A decision's outcome stands
 /// under the contract's word for it, and so does each reason and each
 /// lifted veto.
@@ -281,6 +301,7 @@ fn every_name_is_the_contracts_but_two_closed_lists() {
     };
     let mut kept = record(pick(), Some(0));
     kept.shadow = Some(ShadowKind::Agreed);
+    kept.shadow_target = Some(WorkerId(11));
     let outcomes = [
         (kept, Outcome::Pick(proto::Pick::default())),
         (record(shed(), None), Outcome::Shed(proto::Shed::default())),
@@ -328,14 +349,7 @@ fn every_name_is_the_contracts_but_two_closed_lists() {
                 let pair = &targets[0]["pair"];
                 let sides = &proto::Pair::default();
                 closed(pair, sides, (&["decode_url"], &[]), "a pair");
-                let untraced = [
-                    "affinity_source",
-                    "drops",
-                    "fallback",
-                    "picker",
-                    "plan",
-                    "shadow_pick",
-                ];
+                let untraced = ["affinity_source", "drops", "fallback", "picker", "plan"];
                 let traced = &proto::Trace::default();
                 closed(trace, traced, (&[], &untraced), "a trace");
                 let rows = trace["top"].as_array().expect("its top rows");
@@ -394,7 +408,9 @@ fn a_number_is_written_by_the_width_the_contract_carries_it_in() {
         max_wait_micros: 9,
         trace: Trace::default(),
     });
-    let picked = record(pick(), Some(0)).json(spec.engine(), &url);
+    let mut picked = record(pick(), Some(0));
+    picked.shadow_target = Some(WorkerId(11));
+    let picked = picked.json(spec.engine(), &url);
     let refused = record(shed(), None).json(spec.engine(), &url);
     let queued = record(waits, None).json(spec.engine(), &url);
     let (kept, trace) = (proto::DecisionRecord::default(), proto::Trace::default());
@@ -436,6 +452,11 @@ fn a_number_is_written_by_the_width_the_contract_carries_it_in() {
             "a trace's generation",
             &traced["generation"],
             wide(&trace.generation),
+        ),
+        (
+            "shadow_pick",
+            &traced["shadow_pick"],
+            wide(&trace.shadow_pick),
         ),
         (
             "worker_id",

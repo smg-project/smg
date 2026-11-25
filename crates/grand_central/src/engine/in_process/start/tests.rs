@@ -4,14 +4,14 @@
 //! load monitor's stand-in and the requests are the neighbouring cases' own:
 //! the follow's and the task's.
 
-use std::{sync::Arc, thread, time::Instant};
+use std::{collections::BTreeSet, sync::Arc, thread, time::Instant};
 
 use kv_index::{request_prefix_hashes, ChainBlockMap, ChainIndex, ContentHash, StoredBlock};
 use smg_worker::identity::basic::Worker;
 use tokio::{runtime::Builder, task::yield_now};
 
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::spec::{AffinitySource, AppliedSpec, PolicySpec, ScoreSpec, ScoreStage},
     engine::{
         decision_engine::DecisionEngine,
         in_process::{
@@ -25,8 +25,8 @@ use crate::{
             InProcess,
         },
         list_cell::{ModelLists, PublishedList},
-        prompt_hashes::HashSeeds,
-        view::RequestFacts,
+        prompt_hashes::{HashSeeds, PromptHashes},
+        view::{HashKind, RequestFacts, TEXT_BYTES_PER_TOKEN},
         WorkerData,
     },
     store::GatewayId,
@@ -245,6 +245,123 @@ async fn a_started_engine_reads_the_cache_indexes_it_was_handed() {
         assert_eq!(place, place_of(&list, 5), "seed {seed}: the holder");
     }
     task.abort();
+}
+
+/// Beside an index of cache events that holds a block for every worker of
+/// its list, a request of text is placed by the prefixes the engine sent:
+/// each request of the text goes to the worker its first one went to,
+/// whatever its seed. An index speaks of token blocks, so the engine's
+/// record of sent prefixes speaks for every worker on such a request, as
+/// the classic router's tree of sent texts does
+/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`). A
+/// request of token ids goes to the worker the index holds its blocks for,
+/// as before.
+#[tokio::test(start_paused = true)]
+async fn a_started_engine_places_a_text_by_the_prefix_it_sent_beside_the_index() {
+    let registry = registry(8);
+    let index = Arc::new(ChainIndex::new());
+    let data = WorkerData {
+        registry: handed(&registry),
+        loads: None,
+        cache_indexes: Some(indexes(&index)),
+    };
+    let (engine, task) = InProcess::start(preset("cache_aware"), data);
+    let task = spawned(task).await;
+
+    let tokens: Vec<u32> = (0..1_024).collect();
+    let by_tokens = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+    let mut stated = RequestFacts::default();
+    by_tokens.write_to(&mut stated);
+    store(&index, 5, stated.block_hashes);
+    for at in (0..8_usize).filter(|&at| at != 5) {
+        store(&index, at, &[at as u64 + 1]);
+    }
+    let text: String = (0..512).map(|at| format!("{at:07} ")).collect();
+    let by_text = engine.prompt_hashes(MODEL, None, Some(&text), HashSeeds::PLAIN);
+    let mut stated = RequestFacts::default();
+    by_text.write_to(&mut stated);
+    let window = (INDEX_BLOCK * TEXT_BYTES_PER_TOKEN) as usize;
+    assert_eq!(
+        (stated.hash_kind, stated.block_hashes.len()),
+        (HashKind::Text, text.len() / window)
+    );
+
+    let list = list(&registry);
+    let members = PublishedList::new(Arc::clone(&list));
+    let placed = |seed: u64, hashes: &PromptHashes| {
+        let mut asked = asks(seed, &members, None);
+        hashes.write_to(&mut asked.request.facts);
+        picked(engine, &asked)
+    };
+    let sent = placed(0, &by_text);
+    for seed in 1..32 {
+        assert_eq!(placed(seed, &by_text), sent, "seed {seed}: the text");
+        let holder = place_of(&list, 5);
+        assert_eq!(placed(seed, &by_tokens), holder, "seed {seed}: the holder");
+    }
+    task.abort();
+}
+
+/// The places 32 requests of one prompt of token ids go to, a seed each,
+/// under a started engine of `spec`. Its index of cache events holds a
+/// block of another prompt for every worker of the list, and none of the
+/// prompt asked.
+async fn placed_beside_blocks(spec: AppliedSpec) -> Vec<u32> {
+    let registry = registry(8);
+    let index = Arc::new(ChainIndex::new());
+    let data = WorkerData {
+        registry: handed(&registry),
+        loads: None,
+        cache_indexes: Some(indexes(&index)),
+    };
+    let (engine, task) = InProcess::start(spec, data);
+    let task = spawned(task).await;
+    for at in 0..8_usize {
+        store(&index, at, &[at as u64 + 1]);
+    }
+    let tokens: Vec<u32> = (0..1_024).collect();
+    let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+    let members = PublishedList::new(list(&registry));
+    let placed = |seed: u64| {
+        let mut asked = asks(seed, &members, None);
+        hashes.write_to(&mut asked.request.facts);
+        picked(engine, &asked)
+    };
+    let places = (0..32).map(placed).collect();
+    task.abort();
+    places
+}
+
+/// Beside an index of cache events that holds a block for every worker of
+/// its list, an engine whose prefix stage reads sent prefixes alone
+/// (`source: predictor`) places a request of token ids by the prefixes it
+/// sent: each request of the prompt goes to the worker its first one went
+/// to, whatever its seed. No stage of that profile reads what the index
+/// holds, so the engine's record of sent prefixes speaks to it for every
+/// worker. The gateway's own selection reads its approximate token tree
+/// alone where the model has no index that holds a block, and there for
+/// every worker a prefix was sent to
+/// (`model_gateway/src/policies/cache_aware.rs:1511-1534`, `:3430-3516`).
+///
+/// Under the preset, whose prefix stage reads cache events too, the index
+/// speaks for those workers, as before: the prompt takes its draws.
+#[tokio::test(start_paused = true)]
+async fn a_started_engine_that_reads_sent_prefixes_alone_places_by_them_beside_the_index() {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    for profile in document.profiles.values_mut() {
+        for stage in &mut profile.score {
+            if let ScoreSpec::Params(ScoreStage::PrefixAffinity(prefix)) = stage {
+                prefix.source = Some(AffinitySource::Predictor);
+            }
+        }
+    }
+    let alone = AppliedSpec::validate(&document).expect("the document validates");
+    let places = placed_beside_blocks(alone).await;
+    assert_eq!(places, [places[0]; 32], "the worker its first went to");
+
+    let drawn = placed_beside_blocks(preset("cache_aware")).await;
+    let distinct: BTreeSet<u32> = drawn.iter().copied().collect();
+    assert!(distinct.len() > 1, "{drawn:?}");
 }
 
 /// A program with no load monitor and no index of cache events says so at

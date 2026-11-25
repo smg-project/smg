@@ -1017,7 +1017,7 @@ mod tests {
         engine::view::{Role, WireModes, WorkerId},
         service::{
             controller::{
-                decision_slots::tests::{followed, frame_for, holder, lent_pick, preset},
+                decision_slots::tests::{followed, frame_for, holder, lent_pick, preset, unserved},
                 election::LeasePlace,
                 replication::{journaled, journaled_from, parts, Replication},
                 worker_objects::WorkerObjects,
@@ -1314,7 +1314,10 @@ mod tests {
         let Ok(TickOutcome::Acquired { term }) = elector.tick(at) else {
             panic!("a free lease is taken at the first tick");
         };
+        // The cases write the leader's rows through its store's own
+        // entries: the holder its cut is taken from follows the store.
         let cut_from = holder(store);
+        cut_from.follow(&**store);
         let cut = Replication::new(
             Arc::clone(store),
             Arc::clone(log),
@@ -1977,8 +1980,6 @@ mod tests {
         session(Streaming<proto::GatewayFrame>) -> Unscripted<proto::ControllerFrame>;
         decide(Streaming<proto::DecideRequest>) -> Unscripted<proto::DecideAnswer>;
         watch_workers(proto::WatchWorkersRequest) -> Unscripted<proto::WorkerEvent>;
-        push_load(Streaming<proto::LoadReport>) -> proto::Ack;
-        push_kv_events(Streaming<proto::RelayKvFrame>) -> proto::Ack;
         register_worker(proto::RegisterWorkerRequest) -> proto::WorkerEvent;
         patch_worker(proto::PatchWorkerRequest) -> proto::WorkerEvent;
         deregister_worker(proto::DeregisterWorkerRequest) -> proto::WorkerEvent;
@@ -2060,11 +2061,15 @@ mod tests {
         let elector = Elector::alone(OWN, ElectionSettings::default())
             .expect("the default settings are in order");
         let (standing, stood) = watch::channel(ElectionObservation::default());
-        let journal = journaled(&LeasePlace::File("shared".into()), 1);
+        // One place for the log and for the document door: a standby's
+        // lease is one another replica can take.
+        let place = LeasePlace::File("shared".into());
+        let journal = journaled(&place, 1);
         let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
         let catalog = Arc::new(crate::stages::StageRegistry::builtin());
         let journal = followed(journal);
-        let shared = Shared::new(id, address, &elector, stood, journal, catalog, 1)
+        let source = (catalog, &place);
+        let shared = Shared::new(id, address, &elector, unserved(stood), journal, source, 1)
             .expect("the deciders start");
         let mut standby = Standby::new(Arc::new(shared), bed.addr.port());
         // The bound a replica runs with: three of its leader's heartbeats,
@@ -3191,5 +3196,75 @@ mod tests {
             spec_document(following.document(0).expect("held")),
             spec_document(leading.document(0).expect("held"))
         );
+    }
+
+    /// A restore lands the snapshot's generation behind the cut's rows: the
+    /// rows are built under the word that stood, and the replica's door
+    /// then states the generation's overload switch on the holder. Under a
+    /// document that switches the default off, the restore returns with
+    /// every row that takes a default under the document's word: the row
+    /// that stood, laid again with its id, its status and its count in
+    /// flight, and the row the cut brought.
+    #[test]
+    fn a_restore_leaves_every_row_under_its_generations_overload_switch() {
+        use smg_worker::{
+            health::overload::OverloadThresholds, registry::WorkerRegistry,
+            worker::WorkerStatus as ObjectStatus,
+        };
+
+        use crate::service::controller::generations::{
+            tests::{election, switched},
+            Format,
+        };
+
+        let (a, b) = ("http://a:8000", "http://b:8000");
+        let start = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        };
+        let none = OverloadThresholds::default();
+        let (leader, _, standby) = pair();
+        let leading = door(&leader);
+        // The standby's holder states a start's thresholds, and its door
+        // states each generation's word on it.
+        let objects = Objects::new(Arc::new(WorkerRegistry::new())).with_overload_thresholds(start);
+        let objects = Arc::new(objects);
+        let catalog = Arc::new(registry::StageRegistry::builtin());
+        let (store, log) = (Arc::clone(&standby.0), Arc::clone(&standby.1));
+        // Under a shared lease, and it has not led: its door writes no row.
+        let elector = election();
+        let fence = Some(elector.fence());
+        let following =
+            Generations::stating(Arc::clone(&store), catalog, Arc::clone(&objects), fence);
+        let follower = Follower::new(store, log, Arc::clone(&objects)).through(Arc::new(following));
+        let object = |url: &str| objects.registry().get_by_url(url).expect("an object");
+        let at = Instant::now();
+
+        // A first restore under no generation: the row takes the start's.
+        let row = leader.0.upsert(facts(a, 1)).id();
+        let revision = WorkersStore::get(&*leader.0, row)
+            .expect("the row")
+            .revision;
+        leader.0.set_status(row, WorkerStatus::Ready, revision);
+        let cut = staged(&snapshot(&leader, at), at);
+        assert_eq!(follower.restore(cut, None), Ok(true));
+        assert_eq!(object(a).metadata().overload, start);
+        let id = objects.registry().get_id_by_url(a);
+        object(a).increment_load();
+
+        // The leader runs a document that switches the default off, and
+        // takes a second row: the next restore brings both.
+        leading
+            .apply(switched(Some(false), Some(false)).into(), Format::Yaml)
+            .expect("every binding off");
+        leader.0.upsert(facts(b, 1));
+        let told = leading.standing_sent();
+        let cut = staged(&snapshot(&leader, at), at);
+        assert_eq!(follower.restore(cut, told.as_ref()), Ok(true));
+        assert_eq!(object(a).metadata().overload, none);
+        assert_eq!(object(b).metadata().overload, none);
+        assert_eq!(objects.registry().get_id_by_url(a), id, "the same id");
+        let running = (object(a).status(), object(a).load());
+        assert_eq!(running, (ObjectStatus::Ready, 1), "its running state");
     }
 }

@@ -26,9 +26,9 @@ use std::{
 use smg_grand_central::{
     document::Needs,
     engine::{
-        Binding, Candidate, Constraints, Decision, DecisionSlot, Engine, Health, Identity,
-        PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch, ShedReason,
-        Target, WeightedScorer, WorkerId,
+        Binding, Candidate, Constraints, Decision, DecisionSlot, Engine, Identity, PairPools, Pick,
+        Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch, ShedReason, Target,
+        WeightedScorer, WorkerId,
     },
     plugins::{
         shared::{BreakerSpec, Failure, FrameBudget, OpenDecisions, Reveal},
@@ -289,37 +289,32 @@ fn bound_profile(
     scorer_fallback: Option<Box<dyn smg_grand_central::engine::Scorer>>,
     picker_fallback: Option<Box<dyn smg_grand_central::engine::Picker>>,
 ) -> Profile {
-    Profile {
-        name: "plugin".into(),
-        filters: vec![Box::new(WasmFilter::new(
-            Arc::clone(&bound),
-            filter_fallback,
-        ))],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(Arc::clone(&bound), scorer_fallback)),
-            weight: 1.0,
-        }],
-        picker: Box::new(WasmPicker::new(bound, picker_fallback)),
-    }
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> = vec![Box::new(WasmFilter::new(
+        Arc::clone(&bound),
+        filter_fallback,
+    ))];
+    let scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(Arc::clone(&bound), scorer_fallback)),
+        1.0,
+    )];
+    let mut profile = Profile::of(
+        "plugin".into(),
+        Box::new(WasmPicker::new(bound, picker_fallback)),
+    );
+    profile.filters = filters;
+    profile.scorers = scorers;
+    profile
 }
 
 fn single_engine(profile: Profile) -> Engine {
-    Engine::new(
-        vec![profile],
-        vec![Binding {
-            model: "*".into(),
-            phases: vec![],
-            plan: Plan::Single,
-            profile: 0,
-            decode_profile: None,
-            shadow: None,
-            decode_shadow: None,
-            sessions: None,
-            overload: None,
-        }],
-        1,
-        Needs::default(),
-    )
+    let mut binding = Binding::of("*".into(), 0);
+    binding.phases = vec![];
+    binding.plan = Plan::Single;
+    binding.decode_profile = None;
+    binding.shadow = None;
+    binding.decode_shadow = None;
+    binding.sessions = None;
+    Engine::new(vec![profile], vec![binding], 1, Needs::default())
 }
 
 fn plugin_engine(plugin: &Arc<Plugin>) -> Engine {
@@ -330,15 +325,13 @@ fn plugin_engine(plugin: &Arc<Plugin>) -> Engine {
 /// loaded is the last one.
 fn pool(n: u32) -> Vec<Candidate> {
     (0..n)
-        .map(|i| Candidate {
-            position: i,
-            id: WorkerId(u64::from(i) + 100),
-            health: Health {
-                healthy: true,
-                ..Health::default()
-            },
-            in_flight: n - i,
-            ..Candidate::default()
+        .map(|i| {
+            let mut row = Candidate::default();
+            row.position = i;
+            row.id = WorkerId(u64::from(i) + 100);
+            row.health.healthy = true;
+            row.in_flight = n - i;
+            row
         })
         .collect()
 }
@@ -346,22 +339,20 @@ fn pool(n: u32) -> Vec<Candidate> {
 /// A request under the untimed budget. A case that tests the decision's
 /// budget names its own (`timed`, or the field).
 fn facts(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        model: "m",
-        budget_micros: UNTIMED_BUDGET_MICROS,
-        seed,
-        now_micros: 777_000,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.budget_micros = UNTIMED_BUDGET_MICROS;
+    facts.seed = seed;
+    facts.now_micros = 777_000;
+    facts
 }
 
 /// A request whose decision budget is one frame: for the cases that assert
 /// what a spent budget does.
 fn timed(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        budget_micros: FRAME_MICROS,
-        ..facts(seed)
-    }
+    let mut facts = facts(seed);
+    facts.budget_micros = FRAME_MICROS;
+    facts
 }
 
 fn decide(engine: &Engine, candidates: &[Candidate], seed: u64) -> Decision {
@@ -369,11 +360,9 @@ fn decide(engine: &Engine, candidates: &[Candidate], seed: u64) -> Decision {
 }
 
 fn decide_with(engine: &Engine, candidates: &[Candidate], facts: &RequestFacts<'_>) -> Decision {
-    let pool_facts = PoolFacts {
-        pool_size: candidates.len() as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = candidates.len() as u32;
+    pool_facts.generation = 1;
     engine.decide(
         facts,
         &pool_facts,
@@ -628,15 +617,13 @@ fn band_engine(
     plugin: &Arc<Plugin>,
     fallback: Option<Box<dyn smg_grand_central::engine::Scorer>>,
 ) -> Engine {
-    single_engine(Profile {
-        name: "band".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(plugin.bind(), fallback)),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    })
+    let mut profile = Profile::of("band".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(plugin.bind(), fallback)),
+        1.0,
+    )];
+    single_engine(profile)
 }
 
 fn lead(decision: &Decision) -> Option<WorkerId> {
@@ -733,10 +720,8 @@ fn a_band_is_not_carried_to_the_next_decision() {
         for seed in BAND_SEEDS {
             let first = lead(&decide(&engine, &candidates, seed));
             second_row_led |= first == Some(candidates[2].id);
-            let without_band = RequestFacts {
-                now_micros: 0,
-                ..facts(seed)
-            };
+            let mut without_band = facts(seed);
+            without_band.now_micros = 0;
             assert_eq!(
                 lead(&decide_with(&engine, &candidates, &without_band)),
                 Some(candidates[3].id),
@@ -759,10 +744,8 @@ fn a_score_answer_keeps_its_band_with_its_scores() {
     let runtime = runtime();
     let candidates = band_pool();
     let facts = facts(BAND_SEEDS.start);
-    let pool = PoolFacts {
-        pool_size: candidates.len() as u32,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = candidates.len() as u32;
     for band in [Some(0.0), Some(1.0), None] {
         let guest_mode = if band.is_some() {
             mode::SCORE_BAND
@@ -835,15 +818,13 @@ fn a_plugin_scorer_under_a_two_draw_picker_scores_the_two_drawn() {
         ("packed", guest::packed_guest()),
     ] {
         let plugin = load(&runtime, name, component, mode::LEAST_IN_FLIGHT);
-        let engine = single_engine(Profile {
-            name: "two-draw".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-                weight: 1.0,
-            }],
-            picker: Box::new(PowerOfTwo),
-        });
+        let mut profile = Profile::of("two-draw".into(), Box::new(PowerOfTwo));
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(
+            Box::new(WasmScorer::new(plugin.bind(), None)),
+            1.0,
+        )];
+        let engine = single_engine(profile);
         // The in-flight counts descend, so of two rows the later scores
         // higher: one less a hundredth a request in flight.
         let candidates = pool(8);
@@ -1065,10 +1046,8 @@ fn a_guest_with_no_budget_is_cut_at_the_default_frame_in_a_try(made: u32) -> boo
     ));
     let candidates = pool(4);
     // What a stage is shown for a request that states no budget.
-    let widest = RequestFacts {
-        budget_micros: u32::MAX,
-        ..facts(1)
-    };
+    let mut widest = facts(1);
+    widest.budget_micros = u32::MAX;
     let (wall, cpu) = (std::time::Instant::now(), bound_clock());
     let decision = decide_with(&engine, &candidates, &widest);
     let held = off_cpu_since(wall, cpu);
@@ -1411,16 +1390,12 @@ fn a_gone_budget_is_never_forwarded_and_counts_on_the_breaker() {
     );
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
-    let pool_facts = PoolFacts {
-        pool_size: 4,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 4;
+    pool_facts.generation = 1;
     let decide_gone = |seed: u64| {
-        let gone = RequestFacts {
-            budget_micros: 0,
-            ..facts(seed)
-        };
+        let mut gone = facts(seed);
+        gone.budget_micros = 0;
         engine.decide(
             &gone,
             &pool_facts,
@@ -1473,15 +1448,11 @@ fn the_packed_form_skips_a_request_it_cannot_carry() {
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     let long = "m".repeat(70_000);
-    let pool_facts = PoolFacts {
-        pool_size: 4,
-        generation: 1,
-        ..PoolFacts::default()
-    };
-    let long_model = RequestFacts {
-        model: &long,
-        ..facts(1)
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 4;
+    pool_facts.generation = 1;
+    let mut long_model = facts(1);
+    long_model.model = &long;
     let decision = engine.decide(
         &long_model,
         &pool_facts,
@@ -1540,16 +1511,14 @@ fn a_view_carries_block_hashes_to_a_row_that_declares_them_alone() {
             row.needs = needs;
             let plugin = loaded(&runtime, row);
             let engine = plugin_engine(&plugin);
+            let mut request_facts = facts(1);
+            request_facts.block_hashes = &hashes;
+            let mut pool = PoolFacts::default();
+            pool.pool_size = 4;
+            pool.generation = 1;
             let decision = engine.decide(
-                &RequestFacts {
-                    block_hashes: &hashes,
-                    ..facts(1)
-                },
-                &PoolFacts {
-                    pool_size: 4,
-                    generation: 1,
-                    ..PoolFacts::default()
-                },
+                &request_facts,
+                &pool,
                 &candidates,
                 &Constraints::default(),
                 &mut Scratch::new(),
@@ -1660,22 +1629,14 @@ fn one_profile_on_both_pair_sides_opens_a_resource_per_side() {
 }
 
 fn pair_engine(profiles: Vec<Profile>, decode_profile: u16) -> Engine {
-    Engine::new(
-        profiles,
-        vec![Binding {
-            model: "*".into(),
-            phases: vec![],
-            plan: Plan::PdPair,
-            profile: 0,
-            decode_profile: Some(decode_profile),
-            shadow: None,
-            decode_shadow: None,
-            sessions: None,
-            overload: None,
-        }],
-        1,
-        Needs::default(),
-    )
+    let mut binding = Binding::of("*".into(), 0);
+    binding.phases = vec![];
+    binding.plan = Plan::PdPair;
+    binding.decode_profile = Some(decode_profile);
+    binding.shadow = None;
+    binding.decode_shadow = None;
+    binding.sessions = None;
+    Engine::new(profiles, vec![binding], 1, Needs::default())
 }
 
 /// Three prefills (100..102) and four decodes (200..203) of one pair class,
@@ -1694,22 +1655,18 @@ fn pair_decide_under(engine: &Engine, budget_micros: u32) -> Decision {
     for (i, c) in decodes.iter_mut().enumerate() {
         c.id = WorkerId(200 + i as u64);
     }
-    let pool_facts = PoolFacts {
-        pool_size: 7,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 7;
+    pool_facts.generation = 1;
+    let mut request_facts = facts(9);
+    request_facts.budget_micros = budget_micros;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     engine.decide_pair(
-        &RequestFacts {
-            budget_micros,
-            ..facts(9)
-        },
+        &request_facts,
         &pool_facts,
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -1802,14 +1759,11 @@ fn warm_creates_the_threads_instance_and_a_cold_thread_counts_its_first_decision
 
 #[test]
 fn a_profile_of_built_ins_holds_no_scope_and_a_plugin_profile_does() {
-    let native = Profile {
-        name: "native".into(),
-        filters: vec![Box::new(Healthy)],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
+    let native = {
+        let mut profile = Profile::of("native".into(), Box::new(Best));
+        profile.filters = vec![Box::new(Healthy)];
+        profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+        profile
     };
     assert!(!native.scoped());
     let runtime = runtime();
@@ -1837,16 +1791,12 @@ fn a_withheld_session_key_is_withheld_from_the_lifecycle_too() {
         let hashed = load(&runtime, name, component, mode::LEAST_IN_FLIGHT);
         // A lease carries a request's session, which the request's facts
         // alone make.
-        let session = RequestFacts {
-            model: "m",
-            session_key: Identity::hashed(0xBEEF),
-            ..RequestFacts::default()
-        }
-        .session();
-        let lease = Lease {
-            session,
-            ..Lease::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.session_key = Identity::hashed(0xBEEF);
+        let session = facts.session();
+        let mut lease = Lease::default();
+        lease.session = session;
         for plugin in [&withheld, &hashed] {
             plugin_engine(plugin).on_dispatched(&lease, &Target::default(), Side::Single, 3);
         }
@@ -1936,16 +1886,12 @@ fn the_decisions_budget_bounds_the_sum_of_its_calls() {
         let plugin = loaded(&runtime, burner);
         let engine = plugin_engine(&plugin);
         let candidates = pool(4);
-        let pool_facts = PoolFacts {
-            pool_size: 4,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = 4;
+        pool_facts.generation = 1;
         let decide_under = |budget_micros: u32, seed: u64| {
-            let facts = RequestFacts {
-                budget_micros,
-                ..facts(seed)
-            };
+            let mut facts = facts(seed);
+            facts.budget_micros = budget_micros;
             engine.decide(
                 &facts,
                 &pool_facts,
@@ -2272,15 +2218,14 @@ fn a_pair_shares_one_decision_budget() {
     // One burning decision on a single profile calibrates a call's cost.
     let single = plugin_engine(&plugin);
     let before = plugin.stats().fuel_used;
-    let facts_of = |budget_micros: u32| RequestFacts {
-        budget_micros,
-        ..facts(1)
+    let facts_of = |budget_micros: u32| {
+        let mut facts = facts(1);
+        facts.budget_micros = budget_micros;
+        facts
     };
-    let pool_facts = PoolFacts {
-        pool_size: 4,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 4;
+    pool_facts.generation = 1;
     single.decide(
         &facts_of(SLOW_FRAME_MICROS),
         &pool_facts,
@@ -2305,18 +2250,16 @@ fn a_pair_shares_one_decision_budget() {
     for (i, c) in decodes.iter_mut().enumerate() {
         c.id = WorkerId(200 + i as u64);
     }
+    let mut record = PoolFacts::default();
+    record.pool_size = 7;
+    record.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = pair.decide_pair(
         &facts_of(budget_micros),
-        &PoolFacts {
-            pool_size: 7,
-            generation: 1,
-            ..PoolFacts::default()
-        },
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        &record,
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -2371,18 +2314,16 @@ fn a_fault_on_one_side_of_a_two_profile_pair_rebuilds_once_in_a_try(made: u32) -
         c.id = WorkerId(200 + i as u64);
     }
     let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 7;
+    pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = pair.decide_pair(
         &facts(1),
-        &PoolFacts {
-            pool_size: 7,
-            generation: 1,
-            ..PoolFacts::default()
-        },
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        &pool_facts,
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -2424,15 +2365,11 @@ fn a_spent_budget_drops_no_healthy_instance() {
     // Three microseconds: every call is charged at least one, so the
     // constructor, the filter and the scorer spend it and the pick finds
     // nothing left.
-    let facts = RequestFacts {
-        budget_micros: 3,
-        ..facts(1)
-    };
-    let pool_facts = PoolFacts {
-        pool_size: 4,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut facts = facts(1);
+    facts.budget_micros = 3;
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 4;
+    pool_facts.generation = 1;
     let decision = engine.decide(
         &facts,
         &pool_facts,
@@ -2502,23 +2439,21 @@ fn the_decisions_cpu_is_bounded_by_its_budget_whatever_the_fuel() {
         profile
             .filters
             .push(Box::new(SaysWhenAsked(Arc::clone(&asked))));
-        profile.scorers.push(WeightedScorer {
-            scorer: Box::new(ReadsTheClockWhenAsked(Arc::clone(&scored))),
-            weight: 1.0,
-        });
+        profile.scorers.push(WeightedScorer::of(
+            Box::new(ReadsTheClockWhenAsked(Arc::clone(&scored))),
+            1.0,
+        ));
         let engine = single_engine(profile);
         let cpu_before = bound_clock();
         let started = std::time::Instant::now();
+        let mut request_facts = facts(1);
+        request_facts.budget_micros = 1_000_000;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = 4;
+        pool_facts.generation = 1;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: 1_000_000,
-                ..facts(1)
-            },
-            &PoolFacts {
-                pool_size: 4,
-                generation: 1,
-                ..PoolFacts::default()
-            },
+            &request_facts,
+            &pool_facts,
             &pool(4),
             &Constraints::default(),
             &mut Scratch::new(),
@@ -2733,46 +2668,39 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent_in_a_
     let picker = loaded(&runtime, picker_spec);
     // One burn's fuel, from the scorer alone at a large budget.
     let before = scorer.stats().fuel_used;
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = 1_000_000;
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 4;
+    pool_facts.generation = 1;
     plugin_engine(&scorer).decide(
-        &RequestFacts {
-            budget_micros: 1_000_000,
-            ..facts(1)
-        },
-        &PoolFacts {
-            pool_size: 4,
-            generation: 1,
-            ..PoolFacts::default()
-        },
+        &request_facts,
+        &pool_facts,
         &pool(4),
         &Constraints::default(),
         &mut Scratch::new(),
     );
     let burn = (scorer.stats().fuel_used - before) / 3;
-    let profile = Profile {
-        name: "two".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(WasmPicker::new(picker.bind(), None)),
-    };
+    let mut profile = Profile::of("two".into(), Box::new(WasmPicker::new(picker.bind(), None)));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(scorer.bind(), None)),
+        1.0,
+    )];
     let engine = single_engine(profile);
     let gauged = scorer.stats().answered;
     // A burn and a half, plus a little for the constructors: the scorer's
     // burn fits, the picker's does not.
     let budget_micros = u32::try_from((burn * 3 / 2).div_ceil(fuel_per_micro) + 20).expect("fits");
     let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = budget_micros;
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 4;
+    pool_facts.generation = 1;
     let decision = engine.decide(
-        &RequestFacts {
-            budget_micros,
-            ..facts(1)
-        },
-        &PoolFacts {
-            pool_size: 4,
-            generation: 1,
-            ..PoolFacts::default()
-        },
+        &request_facts,
+        &pool_facts,
         &pool(4),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -2843,16 +2771,14 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it_in_a_try(made: u32
     // One decision's fuel on a single profile: the burning constructor and
     // three cheap stages.
     let before = plugin.stats().fuel_used;
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = 1_000_000;
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 4;
+    pool_facts.generation = 1;
     plugin_engine(&plugin).decide(
-        &RequestFacts {
-            budget_micros: 1_000_000,
-            ..facts(1)
-        },
-        &PoolFacts {
-            pool_size: 4,
-            generation: 1,
-            ..PoolFacts::default()
-        },
+        &request_facts,
+        &pool_facts,
         &pool(4),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -2871,21 +2797,18 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it_in_a_try(made: u32
     }
     let before = plugin.stats();
     let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = budget_micros;
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 7;
+    pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = pair.decide_pair(
-        &RequestFacts {
-            budget_micros,
-            ..facts(1)
-        },
-        &PoolFacts {
-            pool_size: 7,
-            generation: 1,
-            ..PoolFacts::default()
-        },
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        &request_facts,
+        &pool_facts,
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -2939,46 +2862,40 @@ fn runtimes_built_over_the_same_open_decisions_draw_one_remainder_and_apart_draw
         );
         // One burn's fuel, from the scorer alone at a large budget.
         let before = scorer.stats().fuel_used;
+        let mut request_facts = facts(1);
+        request_facts.budget_micros = 1_000_000;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = 4;
+        pool_facts.generation = 1;
         plugin_engine(&scorer).decide(
-            &RequestFacts {
-                budget_micros: 1_000_000,
-                ..facts(1)
-            },
-            &PoolFacts {
-                pool_size: 4,
-                generation: 1,
-                ..PoolFacts::default()
-            },
+            &request_facts,
+            &pool_facts,
             &pool(4),
             &Constraints::default(),
             &mut Scratch::new(),
         );
         let burn = (scorer.stats().fuel_used - before) / 3;
-        let engine = single_engine(Profile {
-            name: "two".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
-                weight: 1.0,
-            }],
-            picker: Box::new(WasmPicker::new(picker.bind(), None)),
-        });
+        let mut profile = Profile::of("two".into(), Box::new(WasmPicker::new(picker.bind(), None)));
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(
+            Box::new(WasmScorer::new(scorer.bind(), None)),
+            1.0,
+        )];
+        let engine = single_engine(profile);
         let gauged = scorer.stats().answered;
         // A burn and a half, plus a little for the constructors: the
         // scorer's burn fits, and the picker's fits only in a remainder the
         // scorer did not draw.
         let budget_micros =
             u32::try_from((burn * 3 / 2).div_ceil(SLOW_CALIBRATION) + 20).expect("fits");
+        let mut request_facts = facts(1);
+        request_facts.budget_micros = budget_micros;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = 4;
+        pool_facts.generation = 1;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros,
-                ..facts(1)
-            },
-            &PoolFacts {
-                pool_size: 4,
-                generation: 1,
-                ..PoolFacts::default()
-            },
+            &request_facts,
+            &pool_facts,
             &pool(4),
             &Constraints::default(),
             &mut Scratch::new(),
@@ -3127,16 +3044,12 @@ fn a_scope_that_panics_at_its_open_leaves_the_threads_next_decision_its_own() {
         .push(Box::new(PanicsAtItsOpen(AtomicBool::new(true))));
     let engine = single_engine(profile);
     let candidates = pool(3);
-    let pool_facts = PoolFacts {
-        pool_size: 3,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 3;
+    pool_facts.generation = 1;
     // A budget gone on arrival: the plugin fails this decision at its open.
-    let gone = RequestFacts {
-        budget_micros: 0,
-        ..facts(1)
-    };
+    let mut gone = facts(1);
+    gone.budget_micros = 0;
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         engine.decide(
             &gone,
@@ -3247,21 +3160,14 @@ fn a_scope_is_closed_only_after_its_open_returned() {
     let (panics, panicked) = StoresAtItsOpen::stage(true);
     let (after, never_reached) = StoresAtItsOpen::stage(false);
     let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> = vec![before, panics, after];
-    let engine = single_engine(Profile {
-        name: "host-scopes".into(),
-        filters,
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("host-scopes".into(), Box::new(Best));
+    profile.filters = filters;
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    let engine = single_engine(profile);
     let candidates = pool(3);
-    let pool_facts = PoolFacts {
-        pool_size: 3,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 3;
+    pool_facts.generation = 1;
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         engine.decide(
             &facts(1),
@@ -3342,21 +3248,14 @@ fn a_close_that_panics_inside_an_opens_unwinding_stops_at_the_engine() {
     let (panics, panicked) = StoresAtItsOpen::stage(true);
     let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
         vec![close_panics, after_it, panics];
-    let engine = single_engine(Profile {
-        name: "host-scopes".into(),
-        filters,
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("host-scopes".into(), Box::new(Best));
+    profile.filters = filters;
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    let engine = single_engine(profile);
     let candidates = pool(3);
-    let pool_facts = PoolFacts {
-        pool_size: 3,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 3;
+    pool_facts.generation = 1;
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         engine.decide(
             &facts(1),
@@ -3397,15 +3296,10 @@ fn a_close_that_panics_inside_an_opens_unwinding_stops_at_the_engine() {
 
 /// A profile of the host's own stages, in their order.
 fn host_profile(filters: Vec<Box<dyn smg_grand_central::engine::Filter>>) -> Profile {
-    Profile {
-        name: "host-scopes".into(),
-        filters,
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    }
+    let mut profile = Profile::of("host-scopes".into(), Box::new(Best));
+    profile.filters = filters;
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    profile
 }
 
 /// A scope whose close panics, once, with its counts.
@@ -3469,11 +3363,9 @@ impl smg_grand_central::engine::Filter for PanicsAtItsKeep {
 /// One decision of three candidates, its panic caught.
 fn decide_caught(engine: &Engine) -> Box<dyn std::any::Any + Send> {
     let candidates = pool(3);
-    let pool_facts = PoolFacts {
-        pool_size: 3,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 3;
+    pool_facts.generation = 1;
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         engine.decide(
             &facts(1),
@@ -4075,15 +3967,16 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
             ..BreakerSpec::default()
         };
         let plugin = loaded(&runtime, filler);
-        let engine = single_engine(Profile {
-            name: "one-stage".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-                weight: 1.0,
-            }],
-            picker: Box::new(TellsThePick(Arc::clone(&shared))),
-        });
+        let mut profile = Profile::of(
+            "one-stage".into(),
+            Box::new(TellsThePick(Arc::clone(&shared))),
+        );
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(
+            Box::new(WasmScorer::new(plugin.bind(), None)),
+            1.0,
+        )];
+        let engine = single_engine(profile);
         let candidates = pool(3);
         shared.armed.store(true, Ordering::Relaxed);
         let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4163,15 +4056,13 @@ impl LeftLent {
     fn of(runtime: &Arc<Runtime>, row: PluginSpec) -> Self {
         let name = row.name.clone();
         let plugin = loaded(runtime, row);
-        let engine = single_engine(Profile {
-            name: "one-stage".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-                weight: 1.0,
-            }],
-            picker: Box::new(Best),
-        });
+        let mut profile = Profile::of("one-stage".into(), Box::new(Best));
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(
+            Box::new(WasmScorer::new(plugin.bind(), None)),
+            1.0,
+        )];
+        let engine = single_engine(profile);
         let left = Self {
             plugin,
             engine,
@@ -4809,11 +4700,9 @@ fn a_score_the_host_held_that_then_traps_is_the_plugins_failure_and_no_stall() {
     let engine = plugin_engine(&plugin);
     // On three candidates the guest's score traps after its log line.
     let candidates = pool(3);
-    let three = PoolFacts {
-        pool_size: 3,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut three = PoolFacts::default();
+    three.pool_size = 3;
+    three.generation = 1;
     let nap = std::time::Duration::from_micros(u64::from(FRAME_MICROS) * 3);
     let slack = std::time::Duration::from_micros(u64::from(FRAME_MICROS) / 4);
     hold("held-trap", nap, 2);
@@ -4893,11 +4782,10 @@ fn burn_after_a_hold(
     let candidates = pool(4);
     hold(name, held, 1);
     let wall = std::time::Instant::now();
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = budget_micros;
     let decision = engine.decide(
-        &RequestFacts {
-            budget_micros,
-            ..facts(1)
-        },
+        &request_facts,
         &four(),
         &candidates,
         &Constraints::default(),
@@ -5014,11 +4902,10 @@ fn a_burn_that_runs_out_under_what_a_hold_short_of_late_left_is_the_decisions_bu
     // The second decision: its budget (20 ms) is short of this hold (30 ms),
     // so the held score is late past its bound and spends the remainder.
     hold("starved-short", std::time::Duration::from_millis(30), 1);
+    let mut request_facts = facts(2);
+    request_facts.budget_micros = 20_000;
     let decision = engine.decide(
-        &RequestFacts {
-            budget_micros: 20_000,
-            ..facts(2)
-        },
+        &request_facts,
         &four(),
         &pool(4),
         &Constraints::default(),
@@ -5449,16 +5336,13 @@ fn a_scorer_held_short_of_late_through_half_a_window_before_a_spinner_stays_shut
         guest::record_guest(),
         mode::SPIN_IN_SCORE,
     );
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
-    let engine = single_engine(Profile {
-        name: "held-first".into(),
-        filters: vec![],
-        scorers: vec![scorer(&held), scorer(&spinner)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("held-first".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&held), scorer(&spinner)];
+    let engine = single_engine(profile);
     let candidates = pool(4);
     let frame = std::time::Duration::from_micros(u64::from(FRAME_MICROS));
     let short = frame * 7 / 10;
@@ -5553,11 +5437,10 @@ fn two_scores_held_past_a_small_budget_and_short_of_late_are_one_slow_sample() {
     let mut cheap = true;
     for seed in 1..=64 {
         let cpu = bound_clock();
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = BUDGET_MICROS;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: BUDGET_MICROS,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &candidates,
             &Constraints::default(),
@@ -5632,11 +5515,10 @@ fn a_guest_slow_in_what_fuel_does_not_price_is_opened_by_its_samples_at_the_firs
             "decision {seed}: the ring is not read before the sixty-fourth"
         );
         let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = BUDGET_MICROS;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: BUDGET_MICROS,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -5682,11 +5564,10 @@ fn one_burn_micros(runtime: &Arc<Runtime>) -> u32 {
     gauge.budget_micros = SLOW_FRAME_MICROS;
     let gauge = loaded(runtime, gauge);
     let before = gauge.stats().fuel_used;
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = SLOW_FRAME_MICROS;
     let decision = plugin_engine(&gauge).decide(
-        &RequestFacts {
-            budget_micros: SLOW_FRAME_MICROS,
-            ..facts(1)
-        },
+        &request_facts,
         &four(),
         &pool(4),
         &Constraints::default(),
@@ -5702,11 +5583,10 @@ fn one_burn_micros(runtime: &Arc<Runtime>) -> u32 {
 fn decide_64_with_no_budget(plugin: &Arc<Plugin>) {
     let engine = plugin_engine(plugin);
     for seed in 1..=64 {
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = u32::MAX;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: u32::MAX,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -5800,21 +5680,18 @@ fn a_guest_bound_as_one_stage_is_read_against_its_two_frames() {
     near.fuel_per_micro = SLOW_CALIBRATION;
     near.budget_micros = burn_micros * 10 / 9;
     let plugin = loaded(&runtime, near);
-    let engine = single_engine(Profile {
-        name: "one-stage".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("one-stage".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(plugin.bind(), None)),
+        1.0,
+    )];
+    let engine = single_engine(profile);
     for seed in 1..=64 {
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = u32::MAX;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: u32::MAX,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -5870,16 +5747,14 @@ fn a_held_call_its_bound_ended_under_the_remainder_is_still_an_unread_sample() {
     held.fuel_per_micro = 20_000_000;
     held.budget_micros = LEFT_MICROS * 4;
     let held = loaded(&runtime, held);
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
     let decide_with_budget = |engine: &Engine, budget_micros: u32, seed: u64| {
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = budget_micros;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -5892,23 +5767,19 @@ fn a_held_call_its_bound_ended_under_the_remainder_is_still_an_unread_sample() {
     };
     // What a decision costs the front plugin, read off one of its own under
     // its frame: a charge at the slow calibration is its fuel.
-    let alone = single_engine(Profile {
-        name: "front-alone".into(),
-        filters: vec![],
-        scorers: vec![scorer(&front)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("front-alone".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&front)];
+    let alone = single_engine(profile);
     let before = front.stats().fuel_used;
     decide_with_budget(&alone, SLOW_FRAME_MICROS, 0);
     let front_micros =
         u32::try_from((front.stats().fuel_used - before).div_ceil(SLOW_CALIBRATION)).expect("fits");
     let budget_micros = front_micros + LEFT_MICROS;
-    let engine = single_engine(Profile {
-        name: "front-then-held".into(),
-        filters: vec![],
-        scorers: vec![scorer(&front), scorer(&held)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("front-then-held".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&front), scorer(&held)];
+    let engine = single_engine(profile);
     hold(
         name,
         std::time::Duration::from_micros(u64::from(budget_micros)),
@@ -5963,25 +5834,22 @@ fn a_held_call_its_own_bound_ended_is_the_plugins_and_never_unread() {
     held.fuel_per_micro = 20_000_000;
     held.budget_micros = OWN_FRAME_MICROS;
     let held = loaded(&runtime, held);
-    let engine = single_engine(Profile {
-        name: "held-alone".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(held.bind(), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("held-alone".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(held.bind(), None)),
+        1.0,
+    )];
+    let engine = single_engine(profile);
     hold(
         name,
         std::time::Duration::from_micros(u64::from(OWN_FRAME_MICROS) * 2),
         1,
     );
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = u32::MAX;
     let decision = engine.decide(
-        &RequestFacts {
-            budget_micros: u32::MAX,
-            ..facts(1)
-        },
+        &request_facts,
         &four(),
         &pool(4),
         &Constraints::default(),
@@ -6023,21 +5891,18 @@ fn a_guest_another_plugins_draw_left_little_is_read_against_its_own_frames() {
         guest::record_guest(),
         mode::BURN_IN_CONSTRUCTOR,
     );
-    let engine = single_engine(Profile {
-        name: "two".into(),
-        filters: vec![],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
-            weight: 1.0,
-        }],
-        picker: Box::new(WasmPicker::new(picker.bind(), None)),
-    });
+    let mut profile = Profile::of("two".into(), Box::new(WasmPicker::new(picker.bind(), None)));
+    profile.filters = vec![];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(WasmScorer::new(scorer.bind(), None)),
+        1.0,
+    )];
+    let engine = single_engine(profile);
     let decide_under = |budget_micros: u32, seed: u64| {
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = budget_micros;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -6146,11 +6011,9 @@ fn measure_rss_per_kept_instance_and_cpu_per_decision() {
         }
         let engine = plugin_engine(&plugin);
         let candidates = pool(64);
-        let pool_facts = PoolFacts {
-            pool_size: 64,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = 64;
+        pool_facts.generation = 1;
         let cx = Constraints::default();
         let mut scratch = Scratch::new();
         let decisions = 200_000u64;
@@ -6303,11 +6166,10 @@ fn ticker_cpu_ticks() -> u64 {
 
 /// The pool of four every shared-budget case decides over.
 fn four() -> PoolFacts<'static> {
-    PoolFacts {
-        pool_size: 4,
-        generation: 1,
-        ..PoolFacts::default()
-    }
+    let mut pool = PoolFacts::default();
+    pool.pool_size = 4;
+    pool.generation = 1;
+    pool
 }
 
 /// How long the calling thread was off the CPU since `wall` and `cpu` were
@@ -6618,21 +6480,18 @@ fn a_spinner_behind_an_honest_scorer_opens_its_breaker_at_the_window_in_either_o
             guest::record_guest(),
             mode::SPIN_IN_SCORE,
         );
-        let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-            scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-            weight: 1.0,
+        let scorer = |plugin: &Arc<Plugin>| {
+            WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
         };
         let scorers = if spinner_first {
             vec![scorer(&spinner), scorer(&honest)]
         } else {
             vec![scorer(&honest), scorer(&spinner)]
         };
-        let engine = single_engine(Profile {
-            name: "shared".into(),
-            filters: vec![],
-            scorers,
-            picker: Box::new(Best),
-        });
+        let mut profile = Profile::of("shared".into(), Box::new(Best));
+        profile.filters = vec![];
+        profile.scorers = scorers;
+        let engine = single_engine(profile);
         let decide = |seed: u64| {
             engine.decide(
                 &timed(seed),
@@ -6714,42 +6573,37 @@ fn three_honest_quarters_and_a_spinner_charge_nobody_in_a_try(made: u32) -> bool
     let spinner = loaded(&runtime, spinner_spec);
     // One burn's fuel, from a burner alone at a large budget.
     let before = burners[0].stats().fuel_used;
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = 1_000_000;
     plugin_engine(&burners[0]).decide(
-        &RequestFacts {
-            budget_micros: 1_000_000,
-            ..facts(1)
-        },
+        &request_facts,
         &four(),
         &pool(4),
         &Constraints::default(),
         &mut Scratch::new(),
     );
     let burn = (burners[0].stats().fuel_used - before) / 3;
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
-    let engine = single_engine(Profile {
-        name: "quarters".into(),
-        filters: vec![],
-        scorers: vec![
-            scorer(&burners[0]),
-            scorer(&burners[1]),
-            scorer(&burners[2]),
-            scorer(&spinner),
-        ],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("quarters".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![
+        scorer(&burners[0]),
+        scorer(&burners[1]),
+        scorer(&burners[2]),
+        scorer(&spinner),
+    ];
+    let engine = single_engine(profile);
     // Four burns and a half, plus a little for the constructors.
     let budget_micros = u32::try_from((burn * 9 / 2).div_ceil(fuel_per_micro) + 40).expect("fits");
     let mut worst = std::time::Duration::ZERO;
     for seed in 1..=65 {
         let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+        let mut record = facts(seed);
+        record.budget_micros = budget_micros;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros,
-                ..facts(seed)
-            },
+            &record,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -6830,29 +6684,26 @@ fn an_init_the_remainder_clamps_is_the_decisions_budget_spent_and_the_close_rebu
         mode::LEAST_IN_FLIGHT,
     );
     let bound = heavy.bind();
-    let engine = single_engine(Profile {
-        name: "clamped-init".into(),
-        filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-        scorers: vec![
-            WeightedScorer {
-                scorer: Box::new(WasmScorer::new(bound.clone(), None)),
-                weight: 1.0,
-            },
-            WeightedScorer {
-                scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
-                weight: 1.0,
-            },
-        ],
-        picker: Box::new(WasmPicker::new(bound, None)),
-    });
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+        vec![Box::new(WasmFilter::new(bound.clone(), None))];
+    let scorers = vec![
+        WeightedScorer::of(Box::new(WasmScorer::new(bound.clone(), None)), 1.0),
+        WeightedScorer::of(Box::new(WasmScorer::new(neighbour.bind(), None)), 1.0),
+    ];
+    let mut profile = Profile::of(
+        "clamped-init".into(),
+        Box::new(WasmPicker::new(bound, None)),
+    );
+    profile.filters = filters;
+    profile.scorers = scorers;
+    let engine = single_engine(profile);
     for seed in 1..=5 {
         heavy.forget_instance();
         let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = 200;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: 200,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -6944,29 +6795,23 @@ fn decide_on_a_cold_slot(
     budget_micros: u32,
 ) -> std::time::Duration {
     let bound = cold.bind();
-    let engine = single_engine(Profile {
-        name: "cold-init".into(),
-        filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-        scorers: vec![
-            WeightedScorer {
-                scorer: Box::new(WasmScorer::new(bound.clone(), None)),
-                weight: 1.0,
-            },
-            WeightedScorer {
-                scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
-                weight: 1.0,
-            },
-        ],
-        picker: Box::new(WasmPicker::new(bound, None)),
-    });
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+        vec![Box::new(WasmFilter::new(bound.clone(), None))];
+    let scorers = vec![
+        WeightedScorer::of(Box::new(WasmScorer::new(bound.clone(), None)), 1.0),
+        WeightedScorer::of(Box::new(WasmScorer::new(neighbour.bind(), None)), 1.0),
+    ];
+    let mut profile = Profile::of("cold-init".into(), Box::new(WasmPicker::new(bound, None)));
+    profile.filters = filters;
+    profile.scorers = scorers;
+    let engine = single_engine(profile);
     cold.forget_instance();
     clock.store(steer, Ordering::Relaxed);
     let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = budget_micros;
     let decision = engine.decide(
-        &RequestFacts {
-            budget_micros,
-            ..facts(1)
-        },
+        &request_facts,
         &four(),
         &pool(4),
         &Constraints::default(),
@@ -7270,11 +7115,10 @@ fn a_lazy_init_the_host_holds_on_every_cold_slot_is_one_slow_sample_however_it_e
             plugin.forget_instance();
             clock.store(steer, Ordering::Relaxed);
             let cpu = bound_clock();
+            let mut request_facts = facts(seed);
+            request_facts.budget_micros = BUDGET_MICROS;
             let decision = engine.decide(
-                &RequestFacts {
-                    budget_micros: BUDGET_MICROS,
-                    ..facts(seed)
-                },
+                &request_facts,
                 &four(),
                 &pool(4),
                 &Constraints::default(),
@@ -7349,11 +7193,10 @@ fn a_held_init_on_a_thread_a_late_call_armed_is_no_slow_sample() {
         plugin.forget_instance();
         clock.store(1, Ordering::Relaxed);
         let cpu = bound_clock();
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = BUDGET_MICROS;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: BUDGET_MICROS,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &candidates,
             &Constraints::default(),
@@ -7401,11 +7244,10 @@ fn a_lazy_init_slow_by_its_own_fuel_on_every_cold_slot_opens_the_window() {
     let engine = plugin_engine(&plugin);
     let decide_cold = |seed: u64| {
         plugin.forget_instance();
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = init_micros / 3 * 4;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: init_micros / 3 * 4,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -7458,11 +7300,10 @@ fn a_lazy_init_is_read_against_the_init_frame_under_a_request_with_no_budget() {
     let made = plugin.stats().lazy_instantiations;
     for seed in 1..=64 {
         plugin.forget_instance();
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = u32::MAX;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: u32::MAX,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -7501,11 +7342,10 @@ fn a_lazy_inits_time_is_in_the_sample_of_the_decision_that_paid_it_alone() {
     let init_micros = u32::try_from(plugin.stats().fuel_used.div_ceil(CALIBRATION)).expect("fits");
     let engine = plugin_engine(&plugin);
     let decide_under = |seed: u64| {
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = init_micros / 3 * 4;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: init_micros / 3 * 4,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -7554,11 +7394,10 @@ fn a_lazy_inits_frame_is_in_the_frames_of_the_decision_that_paid_it_alone() {
     let made = plugin.stats().lazy_instantiations;
     plugin.forget_instance();
     for seed in 1..=65 {
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = u32::MAX;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: u32::MAX,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -7607,11 +7446,10 @@ fn an_inits_sample_is_read_over_the_init_frame_alone_behind_a_decision_that_char
     let engine = plugin_engine(&plugin);
     let decide_at = |steer: u8, seed: u64| {
         clock.store(steer, Ordering::Relaxed);
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = u32::MAX;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: u32::MAX,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -7688,11 +7526,10 @@ fn a_call_its_own_bound_ended_marks_no_later_decision() {
             let decide_cold = |seed: u64, budget_micros: u32| {
                 plugin.forget_instance();
                 let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+                let mut request_facts = facts(seed);
+                request_facts.budget_micros = budget_micros;
                 let decision = engine.decide(
-                    &RequestFacts {
-                        budget_micros,
-                        ..facts(seed)
-                    },
+                    &request_facts,
                     &four(),
                     &pool(4),
                     &Constraints::default(),
@@ -7784,11 +7621,10 @@ fn a_sample_slow_by_time_nothing_read_is_in_its_window_as_it_is() {
             plugin.forget_instance();
             clock.store(steer, Ordering::Relaxed);
             let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+            let mut request_facts = facts(seed);
+            request_facts.budget_micros = budget_micros;
             let decision = engine.decide(
-                &RequestFacts {
-                    budget_micros,
-                    ..facts(seed)
-                },
+                &request_facts,
                 &four(),
                 &pool(4),
                 &Constraints::default(),
@@ -7877,11 +7713,10 @@ fn two_clamped_inits_the_host_holds_are_one_slow_sample() {
         let plugin = loaded(&runtime, heavy);
         let engine = plugin_engine(&plugin);
         let decide = |seed: u64, budget_micros: u32| {
+            let mut request_facts = facts(seed);
+            request_facts.budget_micros = budget_micros;
             let decision = engine.decide(
-                &RequestFacts {
-                    budget_micros,
-                    ..facts(seed)
-                },
+                &request_facts,
                 &four(),
                 &pool(4),
                 &Constraints::default(),
@@ -8148,11 +7983,10 @@ fn a_rebuild_refused_after_a_counted_trap_is_no_second_failure_in_a_try(made: u3
     let plugin = loaded(&runtime, row);
     let engine = plugin_engine(&plugin);
     let decide = |seed: u64| {
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = FRAME_MICROS;
         engine.decide(
-            &RequestFacts {
-                budget_micros: FRAME_MICROS,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -8258,11 +8092,10 @@ fn an_observe_fault_leaves_no_mark_for_a_decision_that_never_touched_the_slot() 
     );
     let engine = plugin_engine(&plugin);
     let decide = |budget_micros: u32, seed: u64| {
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = budget_micros;
         engine.decide(
-            &RequestFacts {
-                budget_micros,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -8318,11 +8151,10 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
         tickers_at_rest(&born);
         let waits = ticker_waits(&born);
         let (wall, started) = (std::time::Instant::now(), bound_clock());
+        let mut request_facts = facts(1);
+        request_facts.budget_micros = 100_000;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: 100_000,
-                ..facts(1)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -8393,11 +8225,10 @@ fn an_honest_multi_stage_plugin_clamped_under_its_own_frame_is_not_charged_in_a_
     let fuel_per_micro = gauge.fuel_per_micro;
     let gauge = loaded(&runtime, gauge);
     let before = gauge.stats().fuel_used;
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = 1_000_000;
     plugin_engine(&gauge).decide(
-        &RequestFacts {
-            budget_micros: 1_000_000,
-            ..facts(1)
-        },
+        &request_facts,
         &four(),
         &pool(4),
         &Constraints::default(),
@@ -8421,20 +8252,20 @@ fn an_honest_multi_stage_plugin_clamped_under_its_own_frame_is_not_charged_in_a_
         })
         .collect();
     let bound = three_stage.bind();
-    let engine = single_engine(Profile {
-        name: "clamped".into(),
-        filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-        scorers: std::iter::once(WeightedScorer {
-            scorer: Box::new(WasmScorer::new(bound.clone(), None)),
-            weight: 1.0,
-        })
-        .chain(neighbours.iter().map(|neighbour| WeightedScorer {
-            scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
-            weight: 1.0,
-        }))
-        .collect(),
-        picker: Box::new(WasmPicker::new(bound, None)),
-    });
+    let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+        vec![Box::new(WasmFilter::new(bound.clone(), None))];
+    let scorers = std::iter::once(WeightedScorer::of(
+        Box::new(WasmScorer::new(bound.clone(), None)),
+        1.0,
+    ))
+    .chain(neighbours.iter().map(|neighbour| {
+        WeightedScorer::of(Box::new(WasmScorer::new(neighbour.bind(), None)), 1.0)
+    }))
+    .collect();
+    let mut profile = Profile::of("clamped".into(), Box::new(WasmPicker::new(bound, None)));
+    profile.filters = filters;
+    profile.scorers = scorers;
+    let engine = single_engine(profile);
     // Five burns and a half, plus the constructors: the filter, the score
     // and the neighbours' scores fit with half a burn of slack, the pick meets
     // half a burn under its frame of a burn and two thirds. The plugin's
@@ -8448,11 +8279,10 @@ fn an_honest_multi_stage_plugin_clamped_under_its_own_frame_is_not_charged_in_a_
     let mut worst = std::time::Duration::ZERO;
     for seed in 1..=65 {
         let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+        let mut record = facts(seed);
+        record.budget_micros = budget_micros;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros,
-                ..facts(seed)
-            },
+            &record,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -8510,16 +8340,13 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
     let spinner = loaded(&runtime, slow_calibration);
     // What one `init` of the spinner costs: the load made one instance.
     let init_fuel = spinner.stats().fuel_used;
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
-    let engine = single_engine(Profile {
-        name: "fuel-fast".into(),
-        filters: vec![],
-        scorers: vec![scorer(&honest), scorer(&spinner)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("fuel-fast".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&honest), scorer(&spinner)];
+    let engine = single_engine(profile);
     let (decisions, on_the_cpu) = decide_until_open(&spinner, |seed| {
         engine.decide(
             &timed(seed),
@@ -8607,21 +8434,18 @@ fn a_constructor_spinner_behind_another_constructor_opens_its_breaker_in_either_
             guest::record_guest(),
             mode::SPIN_IN_CONSTRUCTOR,
         );
-        let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-            scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-            weight: 1.0,
+        let scorer = |plugin: &Arc<Plugin>| {
+            WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
         };
         let scorers = if spinner_first {
             vec![scorer(&spinner), scorer(&honest)]
         } else {
             vec![scorer(&honest), scorer(&spinner)]
         };
-        let engine = single_engine(Profile {
-            name: "ctor".into(),
-            filters: vec![],
-            scorers,
-            picker: Box::new(Best),
-        });
+        let mut profile = Profile::of("ctor".into(), Box::new(Best));
+        profile.filters = vec![];
+        profile.scorers = scorers;
+        let engine = single_engine(profile);
         let decide = |seed: u64| {
             engine.decide(
                 &timed(seed),
@@ -8711,11 +8535,10 @@ fn a_constructor_hog_that_answers_opens_at_the_window() {
     let fuel_per_micro = gauge.fuel_per_micro;
     let gauge = loaded(&runtime, gauge);
     let before = gauge.stats().fuel_used;
+    let mut request_facts = facts(1);
+    request_facts.budget_micros = 1_000_000;
     plugin_engine(&gauge).decide(
-        &RequestFacts {
-            budget_micros: 1_000_000,
-            ..facts(1)
-        },
+        &request_facts,
         &four(),
         &pool(4),
         &Constraints::default(),
@@ -8734,25 +8557,21 @@ fn a_constructor_hog_that_answers_opens_at_the_window() {
     hog.fuel_per_micro = SLOW_CALIBRATION;
     hog.budget_micros = SLOW_FRAME_MICROS;
     let hog = loaded(&runtime, hog);
-    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
-        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
-        weight: 1.0,
+    let scorer = |plugin: &Arc<Plugin>| {
+        WeightedScorer::of(Box::new(WasmScorer::new(plugin.bind(), None)), 1.0)
     };
-    let engine = single_engine(Profile {
-        name: "hog".into(),
-        filters: vec![],
-        scorers: vec![scorer(&honest), scorer(&hog)],
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("hog".into(), Box::new(Best));
+    profile.filters = vec![];
+    profile.scorers = vec![scorer(&honest), scorer(&hog)];
+    let engine = single_engine(profile);
     // A burn and a half: the hog's constructor takes two thirds of it and
     // answers, a third of a burn of slack for its stages.
     let budget_micros = burn_micros * 3 / 2;
     for seed in 1..=64 {
+        let mut record = facts(seed);
+        record.budget_micros = budget_micros;
         engine.decide(
-            &RequestFacts {
-                budget_micros,
-                ..facts(seed)
-            },
+            &record,
             &four(),
             &pool(4),
             &Constraints::default(),
@@ -8794,25 +8613,19 @@ fn a_third_stage_spinner_behind_its_own_cheap_stages_opens_at_the_window() {
             mode::SPIN_IN_PICK,
         );
         let bound = spinner.bind();
-        let own = WeightedScorer {
-            scorer: Box::new(WasmScorer::new(bound.clone(), None)),
-            weight: 1.0,
-        };
-        let other = WeightedScorer {
-            scorer: Box::new(WasmScorer::new(honest.bind(), None)),
-            weight: 1.0,
-        };
+        let own = WeightedScorer::of(Box::new(WasmScorer::new(bound.clone(), None)), 1.0);
+        let other = WeightedScorer::of(Box::new(WasmScorer::new(honest.bind(), None)), 1.0);
         let scorers = if spinner_first {
             vec![own, other]
         } else {
             vec![other, own]
         };
-        let engine = single_engine(Profile {
-            name: "third-stage".into(),
-            filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-            scorers,
-            picker: Box::new(WasmPicker::new(bound, None)),
-        });
+        let filters: Vec<Box<dyn smg_grand_central::engine::Filter>> =
+            vec![Box::new(WasmFilter::new(bound.clone(), None))];
+        let mut profile = Profile::of("third-stage".into(), Box::new(WasmPicker::new(bound, None)));
+        profile.filters = filters;
+        profile.scorers = scorers;
+        let engine = single_engine(profile);
         let (decisions, on_the_cpu) = decide_until_open(&spinner, |seed| {
             engine.decide(
                 &timed(seed),
@@ -8967,24 +8780,16 @@ fn a_plugin_bound_as_a_filter_or_a_picker_alone_counts_in_the_profiles_needs() {
     let mut reading = spec("reader", guest::record_guest(), mode::LEAST_IN_FLIGHT);
     reading.needs.affinity = true;
     let plugin = loaded(&runtime, reading);
-    let scorers = || {
-        vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }]
-    };
-    let as_filter = Profile {
-        name: "filter".into(),
-        filters: vec![Box::new(WasmFilter::new(plugin.bind(), None))],
-        scorers: scorers(),
-        picker: Box::new(Best),
-    };
-    let as_picker = Profile {
-        name: "picker".into(),
-        filters: vec![Box::new(Healthy)],
-        scorers: scorers(),
-        picker: Box::new(WasmPicker::new(plugin.bind(), None)),
-    };
+    let scorers = || vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    let mut as_filter = Profile::of("filter".into(), Box::new(Best));
+    as_filter.filters = vec![Box::new(WasmFilter::new(plugin.bind(), None))];
+    as_filter.scorers = scorers();
+    let mut as_picker = Profile::of(
+        "picker".into(),
+        Box::new(WasmPicker::new(plugin.bind(), None)),
+    );
+    as_picker.filters = vec![Box::new(Healthy)];
+    as_picker.scorers = scorers();
     assert!(as_filter.needs().affinity, "the plugin as the filter alone");
     assert!(as_picker.needs().affinity, "the plugin as the picker alone");
 }
@@ -9644,11 +9449,10 @@ fn a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells_in_a_try(
             .spawn(|| {
                 TRY_BEGAN.set(began);
                 let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+                let mut request_facts = facts(1);
+                request_facts.budget_micros = 200;
                 let _ = engine.decide(
-                    &RequestFacts {
-                        budget_micros: 200,
-                        ..facts(1)
-                    },
+                    &request_facts,
                     &four(),
                     &pool(4),
                     &Constraints::default(),
@@ -10168,11 +9972,10 @@ fn a_named_deciders_latency_window_is_one_on_whichever_thread_acts_as_it() {
         if cold {
             plugin.forget_instance();
         }
+        let mut request_facts = facts(seed);
+        request_facts.budget_micros = init_micros / 3 * 4;
         let decision = engine.decide(
-            &RequestFacts {
-                budget_micros: init_micros / 3 * 4,
-                ..facts(seed)
-            },
+            &request_facts,
             &four(),
             &pool(4),
             &Constraints::default(),

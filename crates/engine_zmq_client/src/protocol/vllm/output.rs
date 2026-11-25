@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use bytes::Bytes;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{de::IgnoredAny, Deserialize, Serialize, Serializer};
 use serde_default::DefaultFromSerde;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
@@ -138,14 +138,31 @@ pub struct SpecDecodeMetrics {
     pub per_step_drafted: Option<Vec<u32>>,
 }
 
-/// Decode `spec_decode_metrics` without failing the frame: an explicit nil,
-/// a renamed or retyped field in a newer vLLM, or any other mismatch yields
-/// `None` for this output; nothing downstream needs the counters.
-fn lenient_spec_decode_metrics<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<Box<SpecDecodeMetrics>>, D::Error>
+/// The cause an engine names on an output it ends with
+/// [`EngineCoreFinishReason::Error`]: vLLM's `RequestError` (a dataclass, so
+/// a msgpack map), sent from 0.33 on. Informational, so the wire decodes it
+/// leniently, like [`SpecDecodeMetrics`]; a map that lacks the code or the
+/// message is not this cause and reads as absent.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RequestError {
+    /// The engine's class of the failure (`validation_error`,
+    /// `engine_paused`).
+    code: String,
+    message: String,
+    /// Whether the engine marks the request as one to send again; `false`
+    /// where the map has no mark, as the engine's own default is.
+    #[serde(default)]
+    retryable: bool,
+}
+
+/// Decode an informational column without failing the frame: an explicit
+/// nil, a renamed or retyped field in a newer vLLM, or any other mismatch
+/// yields `None` for this output; nothing downstream needs the column to
+/// serve the request.
+fn lenient<'de, D, T>(deserializer: D) -> std::result::Result<Option<Box<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
 {
     let value = Option::<OpaqueValue>::deserialize(deserializer)?;
     Ok(value.and_then(|value| rmpv::ext::from_value(value).ok()))
@@ -249,13 +266,30 @@ struct WireEngineCoreOutput {
     /// Updated sampling mask (untyped for now).
     #[serde(default)]
     new_sampling_mask: Option<Box<OpaqueValue>>,
-    #[serde(default, deserialize_with = "lenient_spec_decode_metrics")]
+    #[serde(default, deserialize_with = "lenient")]
     spec_decode_metrics: Option<Box<SpecDecodeMetrics>>,
+    /// The engine's `prompt_token_id_logprobs` tensor: not read.
+    #[serde(default)]
+    prompt_token_id_logprobs: IgnoredAny,
+    #[serde(default, deserialize_with = "lenient")]
+    error: Option<Box<RequestError>>,
 }
 
 impl WireEngineCoreOutput {
     /// Resolve the wire-format logprobs using the aux frames.
     fn resolve(self, frames: &[Bytes]) -> Result<EngineCoreOutput> {
+        // A vLLM release from 0.33 on names the cause of an error finish in
+        // this column. The request's status does not carry it, so it goes to
+        // the log.
+        if let Some(error) = &self.error {
+            tracing::warn!(
+                request_id = self.request_id.as_str(),
+                code = error.code.as_str(),
+                retryable = error.retryable,
+                "engine finished the request with an error: {}",
+                error.message
+            );
+        }
         Ok(EngineCoreOutput {
             batch_timestamp: None,
             request_id: self.request_id,
@@ -1172,6 +1206,59 @@ mod tests {
             decoded.outputs[0].mm_cache_miss_hashes,
             Some(vec!["hash-1".to_string()])
         );
+    }
+
+    /// `EngineCoreOutput("req-1", [], finish_reason=FinishReason.ERROR,
+    /// error=RequestError(code="validation_error", message=...))` as a vLLM
+    /// 0.33 or 0.34 engine writes it: the positions this client knew, a nil
+    /// for `prompt_token_id_logprobs`, and the error as a map of its three
+    /// fields (a dataclass). The cause is read; a column of another shape,
+    /// a map that lacks the code or the message among them, reads as absent
+    /// and the output still decodes.
+    #[test]
+    fn the_cause_an_engine_names_on_an_error_finish_is_read() {
+        let decode = |error: rmpv::Value| {
+            let mut output = wire_array(&EngineCoreOutput {
+                request_id: "req-1".into(),
+                finish_reason: Some(EngineCoreFinishReason::Error),
+                ..Default::default()
+            });
+            output.extend([rmpv::Value::Nil, error]);
+            let frame = Bytes::from(encode_value(&rmpv::Value::Array(output)));
+            decode_within_frame(&frame, || {
+                decode_msgpack::<TrailingTolerant<WireEngineCoreOutput>>(&frame)
+            })
+            .unwrap()
+            .0
+        };
+
+        let named = decode(rmpv::Value::Map(vec![
+            ("code".into(), "validation_error".into()),
+            ("message".into(), "the prompt is too long".into()),
+            ("retryable".into(), false.into()),
+        ]));
+        assert_eq!(named.finish_reason, Some(EngineCoreFinishReason::Error));
+        assert_eq!(
+            named.error.as_deref(),
+            Some(&RequestError {
+                code: "validation_error".to_string(),
+                message: "the prompt is too long".to_string(),
+                retryable: false,
+            })
+        );
+
+        for other_shape in [
+            rmpv::Value::from("not a map"),
+            rmpv::Value::Map(vec![
+                ("kind".into(), "validation_error".into()),
+                ("detail".into(), "too long".into()),
+            ]),
+            rmpv::Value::Map(vec![("code".into(), "validation_error".into())]),
+        ] {
+            let output = decode(other_shape);
+            assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
+            assert_eq!(output.error, None);
+        }
     }
 
     /// The engine's scheduler stats map carries more than the load (cache hit

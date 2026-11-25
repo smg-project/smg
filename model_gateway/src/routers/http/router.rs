@@ -73,7 +73,9 @@ use crate::{
     routers::{
         common::{
             attach_sized_body,
-            attempt_ledger::{is_upstream_answer, mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{
+                closes_retry_window, is_upstream_answer, mark_upstream_answer, AttemptLedger,
+            },
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
@@ -129,6 +131,11 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// recording a circuit-breaker sample for one would let slow or oversized
 /// uploaders open a healthy worker's breaker.
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
+
+/// Error code of the 502 for a worker's body over the limit
+/// ([`worker_body_too_large`]): the worker answered, and the router refused
+/// what it gave ([`worker_answered`]).
+const WORKER_BODY_TOO_LARGE: &str = "upstream_response_too_large";
 
 /// How a worker response body is relayed to the client. Re-chunking exists
 /// on this regular HTTP relay only; the PD and gRPC relays do not apply it.
@@ -585,7 +592,7 @@ impl Router {
             && (self.policy_registry.engine().is_none()
                 || cache_namespace.is_some()
                 || self.policy_registry.any_policy_needs_request_text(None)))
-        .then(|| typed_req.extract_text_for_routing());
+        .then(|| typed_req.routing_text());
         let rid_key = self
             .policy_registry
             .derive_rid_key(typed_req.rid())
@@ -999,17 +1006,21 @@ impl Router {
         let status = response.status();
         if !head_success_recorded || !status.is_success() {
             ledger.record_outcome(worker.as_ref(), status.as_u16());
-            placed.ended(status.as_u16(), || is_upstream_answer(&response));
+            placed.ended(status.as_u16(), || worker_answered(&response));
         }
         // A definitive answer closes the retry window on this worker: the next
-        // attempt goes to another available worker, or the answer stands.
-        ledger.settle(
-            &mut response,
-            [worker],
-            self.worker_registry
-                .get_routing_pool(model_id, RoutingPool::HttpRegular)
-                .iter(),
-        );
+        // attempt goes to another available worker, or the answer stands. Any
+        // other answer passes `settle` untouched, so the pool is read for an
+        // answer that closes the window alone: the test is `settle`'s own.
+        if closes_retry_window(&response) {
+            ledger.settle(
+                &mut response,
+                [worker],
+                self.worker_registry
+                    .get_routing_pool(model_id, RoutingPool::HttpRegular)
+                    .iter(),
+            );
+        }
         // A replayable failure: the retry re-selects away from this engine
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
@@ -1747,7 +1758,7 @@ impl Router {
                         "Rerank worker response exceeded the body limit"
                     );
                     return keep_worker(error::bad_gateway(
-                        "upstream_response_too_large",
+                        WORKER_BODY_TOO_LARGE,
                         format!("Rerank response from worker exceeded {max_body_bytes} bytes"),
                     ));
                 }
@@ -1831,9 +1842,19 @@ pub(super) fn worker_body_too_large(limit: usize, worker: &str) -> Response {
         limit, "Worker response exceeded the body limit"
     );
     error::bad_gateway(
-        "upstream_response_too_large",
+        WORKER_BODY_TOO_LARGE,
         format!("Response from worker exceeded {limit} bytes"),
     )
+}
+
+/// Whether the worker itself answered the request `response` ends, for
+/// Grand Central's hearing ([`placement::Placed::ended`]): the answer
+/// carries the worker's mark, or it is the router's refusal of a body the
+/// worker gave over the limit, known by its own code. That refusal carries
+/// no mark: the mark's other readers take it as before.
+fn worker_answered(response: &Response) -> bool {
+    is_upstream_answer(response)
+        || extract_error_code_from_response(response) == WORKER_BODY_TOO_LARGE
 }
 
 /// Post-dispatch inputs for the rerank response builder; the request itself
@@ -2353,9 +2374,11 @@ impl Router {
             .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
             routing_key_override: self.policy_registry.routing_key_override_enabled(),
+            // The body question: a document keyed by a request's own id
+            // keeps the body as one that reads the text does.
             policy_needs_text: self
                 .policy_registry
-                .any_policy_needs_request_text(Some(headers)),
+                .any_policy_needs_request_body(Some(headers)),
             // A worker knows a model's canonical id alone, and only a body
             // read here has an alias in it rewritten to that id.
             model_ambiguous: self.worker_registry.model_count() > 1
@@ -2498,7 +2521,7 @@ impl Router {
             // that relay's to report.
             if !head_success_recorded(&response) {
                 worker.record_outcome(status.as_u16());
-                placed.ended(status.as_u16(), || is_upstream_answer(&response));
+                placed.ended(status.as_u16(), || worker_answered(&response));
             }
             if status.is_server_error() {
                 Metrics::record_worker_error(
@@ -3093,7 +3116,7 @@ mod tests {
                     REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
                     REASON_WASM_REQUEST_HOOK,
                 },
-                placement::tests::hearing_engine_on,
+                placement::tests::{engine_on, hearing_engine_on},
                 request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
                 test_support::fast_retry_config,
             },
@@ -7763,6 +7786,82 @@ mod tests {
         );
     }
 
+    /// The limit of the cases below: under the long answer, and above the
+    /// router's own refusal, which the Decisions adapter reads whole.
+    const REFUSED_OVER: usize = 256;
+    const _: () = assert!(SIZED_DELTA_BODY.len() > REFUSED_OVER);
+
+    /// A worker whose good answer on `path` is longer than
+    /// [`REFUSED_OVER`].
+    async fn spawn_long_answer(path: &'static str) -> String {
+        spawn_cut_stub(path, "application/json", &[SIZED_DELTA_BODY], false).await
+    }
+
+    /// The router's 502 of a body over its limit, under its own code and
+    /// with no mark of the worker's.
+    fn assert_refused_over_the_limit(response: &Response) {
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(response),
+            "upstream_response_too_large"
+        );
+        assert!(!is_upstream_answer(response));
+    }
+
+    /// A body over the router's limit is the worker's answer, refused by
+    /// the router. The refusal carries no mark, and the route tells the
+    /// engine by the refusal's own code that the worker answered: the
+    /// engine hears the server's error, as it does for the Decisions
+    /// adapter's refusal, and no failed connection.
+    #[tokio::test]
+    async fn the_engine_hears_a_body_over_the_limit_as_the_servers_error() {
+        let url = spawn_long_answer("/generate").await;
+        let mut router = breaker_router(&[&url], fast_retry_config(1), 5);
+        router.max_payload_size = REFUSED_OVER;
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = generate(&router, "a prompt").await;
+
+        assert_refused_over_the_limit(&response);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 502"]
+        );
+    }
+
+    /// The Decisions adapter reads the router's refusal of a body over the
+    /// limit whole and mints it again under the same code, so the route
+    /// tells the engine the same: the server's error.
+    #[tokio::test]
+    async fn the_engine_hears_a_decisions_body_over_the_limit_as_the_servers_error() {
+        let url = spawn_long_answer(UPSTREAM_ROUTE).await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::Sglang)
+            .health_config(no_health_check())
+            .build();
+        let mut router = streaming_router(PolicyConfig::RoundRobin, REFUSED_OVER, vec![worker]);
+        router.retry_config = fast_retry_config(1);
+        let heard = hearing_engine_on(&router.policy_registry);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: DecisionsRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "The sky is blue.",
+            "questions": [{"type": "predicate", "instructions": "Is the sky blue?"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_decisions(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_refused_over_the_limit(&response);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 502"]
+        );
+    }
+
     /// Each attempt is a request of the engine's own: a first attempt its
     /// worker refused and a second one served are two leases, each with the
     /// end of its own answer.
@@ -8076,6 +8175,30 @@ mod tests {
         );
     }
 
+    /// The pass-through tells a body over the limit as the typed route
+    /// does: the worker answered, and the engine hears the server's error.
+    #[tokio::test]
+    async fn the_engine_hears_a_passed_through_body_over_the_limit_as_the_servers_error() {
+        let url = spawn_long_answer("/generate").await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            REFUSED_OVER,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_streaming_request(streamed_request(&[b"{}"]), "/generate", false)
+            .await
+            .unwrap();
+
+        assert_refused_over_the_limit(&response);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 502"]
+        );
+    }
+
     /// A client's own body fault on the pass-through is no worker's answer:
     /// the route records nothing on the worker and tells the engine no
     /// status.
@@ -8096,6 +8219,132 @@ mod tests {
             heard_of(&heard),
             ["issued", "dispatched Single", "completed Cancelled"]
         );
+    }
+
+    /// A document that takes its routing key from a request's own id keeps
+    /// the request off the content-blind dispatch. The id stands in the
+    /// body, so the dispatch hands the request back with its body unread,
+    /// and the typed route reads the id and hands it to the engine. It
+    /// renders no text for the id: the document's stages read none. Each
+    /// request reaches the worker the engine names for its id, and no
+    /// classic policy is asked. A request the engine was handed no id for
+    /// would be placed by a draw over the four workers.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub servers live for the duration of the test process"
+    )]
+    async fn a_document_keyed_by_the_request_id_takes_its_request_off_the_content_blind_dispatch() {
+        use smg_grand_central::document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec};
+
+        // Four workers that count the generate requests they receive.
+        let mut counts = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let count = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&count);
+            let app = axum::Router::new().route(
+                "/generate",
+                axum::routing::post(move || {
+                    counted.fetch_add(1, AtomicOrdering::SeqCst);
+                    async { ([(CONTENT_TYPE, "application/json")], r#"{"text":"ok"}"#) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            workers.push(plain_worker(&url));
+            counts.push((url, count));
+        }
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        let router = streaming_router_with_registry(Arc::new(policies), 1024 * 1024, workers);
+        let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
+        document.bindings[0].routing_key = Some(RoutingKeySpec {
+            sources: vec![KeySourceSpec {
+                rid: true,
+                ..KeySourceSpec::default()
+            }],
+            strip_lineage: false,
+        });
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        engine_on(&router.policy_registry, spec);
+
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_POLICY_NEEDS_TEXT)
+        );
+        let received = || -> Vec<usize> {
+            counts
+                .iter()
+                .map(|(_, count)| count.load(AtomicOrdering::SeqCst))
+                .collect()
+        };
+        for turn in 0..12 {
+            let id = format!("conversation-{}", turn % 6);
+            // The worker the engine names for the id, asked for it alone.
+            let owner = router
+                .select_worker_for_model(
+                    UNKNOWN_MODEL_ID,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&id),
+                    None,
+                    None,
+                    &[],
+                    placement::Stated::nothing,
+                )
+                .expect("a worker for the id")
+                .worker()
+                .url()
+                .to_string();
+            let owner = counts
+                .iter()
+                .position(|(url, _)| *url == owner)
+                .expect("one of the four");
+            let mut expected = received();
+            expected[owner] += 1;
+
+            let body = format!(r#"{{"text":"hello","rid":"{id}"}}"#);
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/generate")
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .header(CONTENT_LENGTH, body.len())
+                .body(Body::from(body))
+                .unwrap();
+            let dispatched = router
+                .route_streaming_request(request, "/generate", false)
+                .await;
+            let Err(handed_back) = dispatched else {
+                panic!("{id}: the dispatch sent the body on unread");
+            };
+            let (parts, body) = handed_back.into_parts();
+            let body = to_bytes(body, usize::MAX).await.unwrap();
+            let typed: GenerateRequest = serde_json::from_slice(&body).expect("the body, whole");
+            let derived = router.routing_derivatives(Some(&parts.headers), &typed);
+            assert!(derived.tokens.is_none(), "{id}: a request of text");
+            assert!(derived.text.is_none(), "{id}: a text rendered for an id");
+            let response = router
+                .route_typed_request(
+                    Some(&parts.headers),
+                    None,
+                    typed,
+                    "/generate",
+                    UNKNOWN_MODEL_ID,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{id}");
+            drop(response);
+            assert_eq!(received(), expected, "{id}: the worker of the id");
+        }
+        assert_eq!(router.policy_registry.classic_made_or_asked(), 0);
     }
 
     /// The plain path ends a cut stream with its error event too, so a sized

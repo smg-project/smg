@@ -70,23 +70,19 @@ fn decide_over(
 ) {
     let n = view.len();
     let mut scratch = Scratch::new();
-    let pool = PoolFacts {
-        pool_size: n as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = n as u32;
+    pool.generation = 1;
     let cx = Constraints::default();
     group.bench_with_input(BenchmarkId::new(form, n), &n, |b, _| {
         let mut seed = 0u64;
         b.iter(|| {
             seed += 1;
-            let facts = RequestFacts {
-                model: "m",
-                prompt_tokens: 512,
-                seed,
-                now_micros: 1_000_000,
-                ..RequestFacts::default()
-            };
+            let mut facts = RequestFacts::default();
+            facts.model = "m";
+            facts.prompt_tokens = 512;
+            facts.seed = seed;
+            facts.now_micros = 1_000_000;
             engine.decide(&facts, &pool, black_box(view), &cx, &mut scratch)
         });
     });
@@ -113,18 +109,15 @@ fn forms(c: &mut Criterion) {
     for &n in &SIZES {
         let engine = form_of(RESIDENT);
         let view = view_of(n);
-        let lease = Lease {
-            issued_micros: 1_000_000,
-            tokens: 512,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = 1_000_000;
+        lease.tokens = 512;
         for c in &view {
-            let target = Target {
-                position: c.position,
-                id: c.id,
-                dp_rank: c.dp_rank,
-                pair: None,
-            };
+            let mut target = Target::default();
+            target.position = c.position;
+            target.id = c.id;
+            target.dp_rank = c.dp_rank;
+            target.pair = None;
             engine.on_dispatched(&lease, &target, Side::Single, 0);
         }
         decide_over(&mut group, "resident_tokens_credited", &engine, &view);

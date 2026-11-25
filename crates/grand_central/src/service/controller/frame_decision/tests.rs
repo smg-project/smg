@@ -16,7 +16,10 @@ use std::{
     collections::BTreeSet,
     mem,
     panic::resume_unwind,
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Weak,
+    },
     time::{Duration, Instant},
 };
 
@@ -24,8 +27,8 @@ use parking_lot::Mutex;
 use smg_worker::load::state::{one_rank_load, LoadSnapshot};
 
 use super::{
-    decide, decide_alone, decide_decode, decide_pair, hands_reports, issue_decode, issue_pair,
-    Booked, FrameBuffers,
+    decide, decide_alone, decide_decode, decide_pair, hands_reports, issue, issue_decode,
+    issue_pair, Booked, FrameBuffers,
 };
 use crate::{
     document::spec::{AppliedSpec, Assignment, PolicySpec},
@@ -46,7 +49,7 @@ use crate::{
             decision_slots::{
                 tests::{
                     a_frame_under_the_second_files_watch, fleet, frame_for, holder, preset, ready,
-                    taken_at, KeepsReports, BUDGET, GATEWAY, MODEL,
+                    taken_at, written_ready, KeepsReports, BUDGET, GATEWAY, MODEL,
                 },
                 Part,
             },
@@ -63,7 +66,7 @@ use crate::{
     store::{
         pairing::PairingDescriptor, AtWork, DecodeIssue, DecodeMark, GatewayId, Hand, HealthSink,
         LeaseRecord, LeaseState, LeasesStore, LookOutcome, MemoryStore, PickRecord, Reachability,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        WorkerFacts, WorkerStatus,
     },
     tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, DISPATCH_TTL},
     worker_host::{stand, Members, Objects},
@@ -80,10 +83,8 @@ const BOOKED: &str = "model-http";
 
 /// The decision of `frame` as `gateway`'s, received and taken at the two
 /// instants, with the decider's `place` at the files of leases where the
-/// case lends one: what a deciding thread asks for a single request. The
-/// holder first lays the objects of the rows written since the last
-/// decision, as a decider does under a case: no task follows the store
-/// here.
+/// case lends one: what a deciding thread asks for a single request, over
+/// the objects of the rows the case wrote through the holder.
 fn served(
     store: &MemoryStore,
     objects: &Objects<Members>,
@@ -107,7 +108,6 @@ fn served_booked(
 ) -> (Decision, Booked) {
     let request = Checked::new(frame).expect("a frame the record holds");
     let taken = taken_at(&request, gateway, taken, place);
-    objects.follow(store);
     let mut frames = FrameBuffers::default();
     let own = Part::default();
     // The load monitor published nothing: the request reads no report.
@@ -116,10 +116,11 @@ fn served_booked(
     decided.expect("the engine decides")
 }
 
-/// The `i`th ready member of [`BOOKED`] in `store`, on the HTTP wire.
-fn member(store: &MemoryStore, i: usize) -> WorkerId {
+/// The `i`th ready member of [`BOOKED`] in `store`, on the HTTP wire,
+/// written through `objects`.
+fn member(store: &MemoryStore, objects: &Objects<Members>, i: usize) -> WorkerId {
     let name = format!("h{i}");
-    ready(store, &name, BOOKED, Role::Single, WireModes::HTTP)
+    ready(store, objects, &name, BOOKED, Role::Single, WireModes::HTTP)
 }
 
 /// The worker a decision names first.
@@ -186,8 +187,11 @@ fn booked(
     Instant,
 ) {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store.apply(spec).expect("above the unbound start");
-    let members: Vec<WorkerId> = (0..held.len()).map(|i| member(&store, i)).collect();
+    let members: Vec<WorkerId> = (0..held.len())
+        .map(|i| member(&store, &objects, i))
+        .collect();
     LeasesStore::set_term(&*store, 1);
     let now = Instant::now();
     let targets = members.iter().zip(held);
@@ -195,7 +199,6 @@ fn booked(
     for (target, id) in targets.zip(1..) {
         file(&store, id, target, now);
     }
-    let objects = holder(&store);
     (store, objects, members, now)
 }
 
@@ -212,17 +215,17 @@ fn by_id(members: &[WorkerId], held: &[u32]) -> Counts {
 #[test]
 fn a_served_decision_whose_stages_refuse_by_no_report_applies_nothing_at_the_other_files() {
     let store = Arc::new(MemoryStore::new().with_decision_slots(2));
+    let objects = holder(&store);
     store
         .apply(preset("random", 1))
         .expect("above the unbound start");
-    let member = member(&store, 0);
+    let member = member(&store, &objects, 0);
     LeasesStore::set_term(&*store, 1);
     let mut watch = a_frame_under_the_second_files_watch(&store, member);
     // The first file's decision, its place lent, under the preset's stages:
     // each says it refuses by no report.
     let _acting = DecisionSlot::new(0).enter();
     let place = store.at_work();
-    let objects = holder(&store);
     let now = Instant::now();
     let frame = frame_for(BOOKED, 1, 1);
     let decision = served(&store, &objects, frame, GATEWAY, (now, now), Some(&place));
@@ -258,10 +261,10 @@ fn a_served_key_under_a_capped_rule_keeps_an_owner_over_its_thresholds_below_its
     binding.routing_key = None;
     binding.sessions = Some(rule);
     let store = Arc::new(MemoryStore::with_publish_window(Duration::ZERO));
-    let (singles, _) = fleet(&store);
+    let objects = holder(&store);
+    let (singles, _) = fleet(&store, &objects);
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(spec).expect("above the unbound start");
-    let objects = holder(&store);
     let now = Instant::now();
     // The worker a request of the one key is sent to.
     let decided = |id: u8| {
@@ -353,6 +356,7 @@ impl Filter for Late {
 #[test]
 fn a_served_lease_filed_after_a_records_first_read_moves_nothing_the_decision_reads() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     let late = Arc::new(Mutex::new(Vec::new()));
     let read = Arc::new(Mutex::new(Vec::new()));
     let mut catalog = StageRegistry::builtin();
@@ -374,13 +378,12 @@ fn a_served_lease_filed_after_a_records_first_read_moves_nothing_the_decision_re
     store
         .apply(staged(&document, &catalog))
         .expect("above the unbound start");
-    let members: Vec<WorkerId> = (0..3).map(|i| member(&store, i)).collect();
+    let members: Vec<WorkerId> = (0..3).map(|i| member(&store, &objects, i)).collect();
     LeasesStore::set_term(&*store, 1);
     let now = Instant::now();
     for (target, id) in [members[0], members[2], members[2]].into_iter().zip(1..) {
         file(&store, id, target, now);
     }
-    let objects = holder(&store);
     let fewest = members[1];
     *late.lock() = vec![fewest, fewest];
     let frame = frame_for(BOOKED, 1, 1);
@@ -510,12 +513,12 @@ fn a_served_decision_is_handed_its_gateways_vetoes_its_instant_and_the_budget_le
     let profile = document.profiles.get_mut("random");
     profile.expect("the preset's profile").pick = "hands".into();
     let store = Arc::new(MemoryStore::new());
-    let (mut singles, _) = fleet(&store);
+    let objects = holder(&store);
+    let (mut singles, _) = fleet(&store, &objects);
     singles.sort_unstable();
     store
         .apply(staged(&document, &catalog))
         .expect("above the unbound start");
-    let objects = holder(&store);
     let taken = Instant::now();
     let now = taken + Duration::from_secs(3);
     // Received so long before its taking that 1,234 microseconds of the
@@ -559,6 +562,108 @@ fn a_served_decision_is_handed_its_gateways_vetoes_its_instant_and_the_budget_le
     let (nobody, asked) = handed("model-nobody-serves", GATEWAY, now);
     assert_eq!(first(&nobody), None, "no worker to name");
     assert_eq!(asked, None, "decided over no worker");
+}
+
+/// What a picker's object did, under the object's number: a pick, or the
+/// issue of a lease it heard, with the lease's generation.
+type Did = (u32, &'static str, u64);
+
+/// The `random` picker under a number of its own, keeping each pick it
+/// makes and each issue it hears.
+#[derive(Debug)]
+struct Which {
+    made: u32,
+    did: Arc<Mutex<Vec<Did>>>,
+}
+
+impl Lifecycle for Which {
+    fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+        self.did
+            .lock()
+            .push((self.made, "issued", lease.generation));
+    }
+}
+
+impl Picker for Which {
+    fn name(&self) -> &'static str {
+        "which"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        self.did.lock().push((self.made, "picked", 0));
+        Random.pick(facts, candidates, kept, scores, band, out);
+    }
+}
+
+/// A decision runs under the generation of the world it read, whatever
+/// generation the store applies meanwhile. The store keeps one engine, and
+/// that engine holds the later generation by the time this decision asks:
+/// the decision is made by its world's stage all the same, its lease is
+/// filed under its world's generation, and the stage that made the pick
+/// hears the issue. The later generation's stage is asked nothing.
+#[test]
+fn a_decision_whose_world_a_generation_replaced_is_decided_and_filed_under_its_worlds() {
+    let did = Arc::new(Mutex::new(Vec::new()));
+    let mut catalog = StageRegistry::builtin();
+    let (built, kept) = (AtomicU32::new(0), Arc::clone(&did));
+    let stage = move || -> Box<dyn Picker> {
+        let made = built.fetch_add(1, Ordering::Relaxed);
+        let did = Arc::clone(&kept);
+        Box::new(Which { made, did })
+    };
+    catalog.picker("which", stage).expect("a free name");
+    // The second generation states the profile another way, so its picker
+    // is an object of its own.
+    let spec = |generation: u64, filters: &str| {
+        let text = format!(
+            r#"{{
+              "apiVersion": "smg.policy/v1",
+              "profiles": {{ "only": {{ "filter": [{filters}], "pick": "which" }} }},
+              "bindings": [ {{ "match": {{ "model": "*" }}, "profile": "only" }} ]
+            }}"#
+        );
+        let mut document: PolicySpec = serde_json::from_str(&text).expect("a document");
+        document.generation = generation;
+        staged(&document, &catalog)
+    };
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    fleet(&store, &objects);
+    store.apply(spec(1, "")).expect("above the unbound start");
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    let request = Checked::new(frame_for(MODEL, 1, 1)).expect("a frame the record holds");
+    let taken = taken_at(&request, GATEWAY, (now, now), None);
+    let (mut frames, own) = (FrameBuffers::default(), Part::default());
+    let loads = Arc::new(LoadSnapshot::default());
+    let next = spec(2, r#""healthy""#);
+    let (decision, lease) = store.deciding(|world| {
+        // A generation starts while the decision holds its world.
+        store.apply(next).expect("a later generation");
+        let decided = decide(world, &objects, &taken, &mut frames, &loads, &own);
+        let (decision, booked) = decided.expect("the engine decides");
+        let filed = issue(&store, world, &taken, 1, &decision, booked);
+        let lease = filed.expect("the store files it");
+        (decision, lease.expect("a pick's lease"))
+    });
+    let pick = decision.pick().expect("a pick");
+    assert_eq!(pick.trace.generation, 1, "decided under its world's");
+    assert_eq!(lease.generation, 1, "and filed under it");
+    let did = did.lock();
+    let [(picker, "picked", _), (hearer, "issued", 1)] = did[..] else {
+        panic!("one pick and the issue of its lease: {did:?}");
+    };
+    assert_eq!(picker, hearer, "the stage that picked heard the issue");
+    let standing = store.deciding(|world| world.spec().generation());
+    assert_eq!(standing, 2, "the later generation stands");
 }
 
 /// A frame's request with its host's own word of what the workers hold of
@@ -606,15 +711,14 @@ fn a_served_request_decides_by_the_rows_named_under_no_cap_as_by_the_column_fill
     )
     .expect("a document of this build");
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     let cap = spec.engine().affinity_rows_cap(BOOKED, Phase::Single);
     assert_eq!(cap, u32::MAX, "a profile that takes no sample");
     store.apply(spec).expect("above the unbound start");
     for i in 0..28 {
-        member(&store, i);
+        member(&store, &objects, i);
     }
-    let objects = holder(&store);
-    objects.follow(&*store);
     // The rows by their place in the list: the first eight hold both of
     // the request's blocks, the next twelve its first.
     let depth = |row: u32| if row < 8 { 2 } else { 1 };
@@ -764,9 +868,16 @@ fn stock_pair_plan() -> AppliedSpec {
     pair_plan(&StageRegistry::builtin(), r#"["healthy"]"#, draws)
 }
 
-/// A ready member `name` of [`PAIRED`] on `role`'s side, on the HTTP wire:
-/// one `only` alone dials where it names a gateway.
-fn side_member(store: &MemoryStore, name: &str, role: Role, only: Option<GatewayId>) -> WorkerId {
+/// A ready member `name` of [`PAIRED`] on `role`'s side, on the HTTP wire,
+/// written through `objects`: one `only` alone dials where it names a
+/// gateway.
+fn side_member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    name: &str,
+    role: Role,
+    only: Option<GatewayId>,
+) -> WorkerId {
     let key = format!("http://{name}:8000");
     let facts = WorkerFacts {
         key: key.clone(),
@@ -780,12 +891,7 @@ fn side_member(store: &MemoryStore, name: &str, role: Role, only: Option<Gateway
         reachable_from: only.map_or(Reachability::Any, Reachability::Gateway),
         ..WorkerFacts::default()
     };
-    let id = store.upsert(facts).id();
-    store.publish_now();
-    let row = WorkersStore::get(store, id).expect("the row");
-    let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
-    ready.expect("the row stands");
-    id
+    written_ready(store, objects, facts)
 }
 
 /// The `n`th frame for [`PAIRED`] at its prefill, with what its gateway
@@ -803,8 +909,8 @@ fn at_prefill(n: u8, wires: WireModes, hint: Option<u32>) -> proto::DecideReques
 }
 
 /// The pair's decision of `frame` as `gateway`'s at `now`: what a deciding
-/// thread asks for a pair at its prefill, behind the holder's follow. The
-/// load monitor published nothing: the request reads no report.
+/// thread asks for a pair at its prefill. The load monitor published
+/// nothing: the request reads no report.
 fn served_pair(
     store: &MemoryStore,
     objects: &Objects<Members>,
@@ -826,7 +932,6 @@ fn served_pair_reading(
 ) -> Decision {
     let request = Checked::new(frame).expect("a frame the record holds");
     let taken = taken_at(&request, gateway, (now, now), None);
-    objects.follow(store);
     let mut frames = FrameBuffers::default();
     let own = Part::default();
     let decided =
@@ -845,7 +950,6 @@ fn leased_pair(
 ) -> (Decision, Lease, Option<Lease>) {
     let request = Checked::new(frame).expect("a frame the record holds");
     let taken = taken_at(&request, GATEWAY, (now, now), None);
-    objects.follow(store);
     let (mut frames, own) = (FrameBuffers::default(), Part::default());
     let loads = Arc::new(LoadSnapshot::default());
     store.deciding(|world| {
@@ -886,10 +990,11 @@ fn shed_of(decision: &Decision) -> Option<(ShedReason, &'static str)> {
 #[test]
 fn a_pair_at_its_prefill_takes_each_side_by_that_sides_own_places_and_vetoes() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(stock_pair_plan())
         .expect("above the unbound start");
-    let member = |name: &str, role, only| side_member(&store, name, role, only);
+    let member = |name: &str, role, only| side_member(&store, &objects, name, role, only);
     let (prefill, decode) = (Role::Prefill, Role::Decode);
     let prefills = [
         member("p0", prefill, None),
@@ -901,7 +1006,6 @@ fn a_pair_at_its_prefill_takes_each_side_by_that_sides_own_places_and_vetoes() {
         member("d1", decode, None),
         member("d2", decode, Some(OTHER)),
     ];
-    let objects = holder(&store);
     let now = Instant::now();
     let until = Some(now + Duration::from_secs(60));
     store.gateway_veto(GATEWAY, prefills[2], until);
@@ -938,9 +1042,9 @@ fn alone_at(n: u8, phase: proto::Phase) -> proto::DecideRequest {
 }
 
 /// The decision of `frame` as `gateway`'s at `now`: what a deciding
-/// thread asks for a frame that stands alone at a side's phase, behind
-/// the holder's follow. The load monitor published nothing. With it goes
-/// the decider's place at the files of leases where the case lends one.
+/// thread asks for a frame that stands alone at a side's phase. The load
+/// monitor published nothing. With it goes the decider's place at the
+/// files of leases where the case lends one.
 fn served_alone(
     store: &MemoryStore,
     objects: &Objects<Members>,
@@ -950,7 +1054,6 @@ fn served_alone(
 ) -> Decision {
     let request = Checked::new(frame).expect("a frame the record holds");
     let taken = taken_at(&request, gateway, (now, now), place);
-    objects.follow(store);
     let (mut frames, own) = (FrameBuffers::default(), Part::default());
     let loads = Arc::new(LoadSnapshot::default());
     let decided =
@@ -971,10 +1074,11 @@ fn served_alone(
 #[test]
 fn a_frame_that_stands_alone_takes_its_own_phases_list_by_that_roles_places_and_vetoes() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(preset("random", 1))
         .expect("above the unbound start");
-    let member = |name: &str, role, only| side_member(&store, name, role, only);
+    let member = |name: &str, role, only| side_member(&store, &objects, name, role, only);
     let (prefill, decode) = (Role::Prefill, Role::Decode);
     let prefills = [
         member("p0", prefill, None),
@@ -987,7 +1091,6 @@ fn a_frame_that_stands_alone_takes_its_own_phases_list_by_that_roles_places_and_
         member("d2", decode, Some(OTHER)),
     ];
     member("s0", Role::Single, None);
-    let objects = holder(&store);
     let now = Instant::now();
     let until = Some(now + Duration::from_secs(60));
     store.gateway_veto(GATEWAY, prefills[2], until);
@@ -1055,16 +1158,16 @@ fn a_frame_that_stands_alone_applies_what_waits_where_its_own_phases_binding_rea
             let document: PolicySpec =
                 serde_json::from_str(&document).expect("a document of this build");
             let store = Arc::new(MemoryStore::new().with_decision_slots(2));
+            let objects = holder(&store);
             store
                 .apply(staged(&document, &catalog))
                 .expect("above the unbound start");
-            let member = side_member(&store, "w0", role, None);
+            let member = side_member(&store, &objects, "w0", role, None);
             LeasesStore::set_term(&*store, 1);
             let mut watch = a_frame_under_the_second_files_watch(&store, member);
             // The first file's decision, its place lent.
             let _acting = DecisionSlot::new(0).enter();
             let place = store.at_work();
-            let objects = holder(&store);
             let asking = (GATEWAY, Instant::now());
             let decision = served_alone(&store, &objects, alone_at(1, phase), asking, Some(&place));
             assert_eq!(first(&decision), Some(member), "{phase:?}: {decision:?}");
@@ -1093,12 +1196,13 @@ fn a_pairs_sides_read_the_reports_of_the_snapshot_their_request_is_given() {
     }"#;
     let document: PolicySpec = serde_json::from_str(document).expect("a document of this build");
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(staged(&document, &StageRegistry::builtin()))
         .expect("above the unbound start");
-    let prefills = ["p0", "p1"].map(|name| side_member(&store, name, Role::Prefill, None));
-    let decodes = ["d0", "d1"].map(|name| side_member(&store, name, Role::Decode, None));
-    let objects = holder(&store);
+    let prefills =
+        ["p0", "p1"].map(|name| side_member(&store, &objects, name, Role::Prefill, None));
+    let decodes = ["d0", "d1"].map(|name| side_member(&store, &objects, name, Role::Decode, None));
     let now = Instant::now();
     // The second prefill and the first decode report no queue, and the
     // other two are deep in theirs.
@@ -1132,12 +1236,12 @@ fn a_pairs_sides_read_the_reports_of_the_snapshot_their_request_is_given() {
 fn a_hold_on_the_only_worker_of_either_side_sheds_a_pairs_frame_under_the_health_filter() {
     for held in [Role::Prefill, Role::Decode] {
         let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         store
             .apply(stock_pair_plan())
             .expect("above the unbound start");
-        let p = side_member(&store, "p0", Role::Prefill, None);
-        let d = side_member(&store, "d0", Role::Decode, None);
-        let objects = holder(&store);
+        let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+        let d = side_member(&store, &objects, "d0", Role::Decode, None);
         let now = Instant::now();
         let answered = |gateway| {
             let frame = at_prefill(1, WireModes::NONE, None);
@@ -1166,16 +1270,16 @@ fn a_pairs_frame_answers_a_side_with_no_worker_then_one_emptied_then_one_not_dia
     // engine's own answer over no worker for the same frame.
     let answered = |prefill: bool, decodes: &[Option<GatewayId>], wires, hint: Option<u32>| {
         let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         store
             .apply(stock_pair_plan())
             .expect("above the unbound start");
         if prefill {
-            side_member(&store, "p0", Role::Prefill, None);
+            side_member(&store, &objects, "p0", Role::Prefill, None);
         }
         for (n, &only) in decodes.iter().enumerate() {
-            side_member(&store, &format!("d{n}"), Role::Decode, only);
+            side_member(&store, &objects, &format!("d{n}"), Role::Decode, only);
         }
-        let objects = holder(&store);
         let frame = at_prefill(1, wires, hint);
         let request = Checked::new(frame.clone()).expect("a frame the record holds");
         let over_none = store.deciding(|world| {
@@ -1228,6 +1332,7 @@ fn a_pairs_frame_answers_a_side_with_no_worker_then_one_emptied_then_one_not_dia
 #[test]
 fn a_pairs_pick_is_filed_a_lease_a_side_and_a_later_decode_stands_chosen() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     let read = Arc::new(Mutex::new(Vec::new()));
     let mut catalog = StageRegistry::builtin();
     let (kept, own) = (Arc::clone(&read), Arc::downgrade(&store));
@@ -1243,10 +1348,9 @@ fn a_pairs_pick_is_filed_a_lease_a_side_and_a_later_decode_stands_chosen() {
     store
         .apply(pair_plan(&catalog, late, ["random", "random"]))
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
-    let d = side_member(&store, "d0", Role::Decode, None);
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    let d = side_member(&store, &objects, "d0", Role::Decode, None);
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let now = Instant::now();
     // The `n`th frame of one conversation, at `phase`: its key goes plain,
     // so each phase's reader makes the session of its own phase.
@@ -1324,15 +1428,15 @@ fn a_pairs_pick_is_filed_a_lease_a_side_and_a_later_decode_stands_chosen() {
 #[test]
 fn a_pairs_lease_keeps_each_targets_prefill_and_decode_for_a_dispatch_by_index() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(stock_pair_plan())
         .expect("above the unbound start");
-    side_member(&store, "p0", Role::Prefill, None);
+    side_member(&store, &objects, "p0", Role::Prefill, None);
     for name in ["d0", "d1", "d2"] {
-        side_member(&store, name, Role::Decode, None);
+        side_member(&store, &objects, name, Role::Decode, None);
     }
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let frame = at_prefill(1, WireModes::NONE, None);
     let (decision, prefill, _) = leased_pair(&store, &objects, frame, Instant::now());
     let targets = &decision.pick().expect("a pick").targets;
@@ -1398,22 +1502,21 @@ fn a_pair_either_of_whose_sides_may_refuse_by_reports_applies_what_waits_at_the_
     ];
     for (picks, waited) in cases {
         let store = Arc::new(MemoryStore::new().with_decision_slots(2));
+        let objects = holder(&store);
         store
             .apply(pair_plan(&catalog, "[]", picks))
             .expect("above the unbound start");
-        let p = side_member(&store, "p0", Role::Prefill, None);
-        side_member(&store, "d0", Role::Decode, None);
+        let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+        side_member(&store, &objects, "d0", Role::Decode, None);
         LeasesStore::set_term(&*store, 1);
         let mut watch = a_frame_under_the_second_files_watch(&store, p);
         // The first file's decision, its place lent.
         let _acting = DecisionSlot::new(0).enter();
         let place = store.at_work();
-        let objects = holder(&store);
         let now = Instant::now();
         let frame = at_prefill(1, WireModes::NONE, None);
         let request = Checked::new(frame).expect("a frame the record holds");
         let taken = taken_at(&request, GATEWAY, (now, now), Some(&place));
-        objects.follow(&*store);
         let (mut frames, own) = (FrameBuffers::default(), Part::default());
         let loads = Arc::new(LoadSnapshot::default());
         let decided =
@@ -1434,9 +1537,9 @@ fn at_call(n: u8, lease: LeaseId, wires: WireModes, hint: Option<u32>) -> proto:
 
 /// The decision of a decode call's `frame` as `gateway`'s at `now`, behind
 /// the pair `held`: what a deciding thread asks for the call once the store
-/// answered for its lease, behind the holder's follow. With it go the
-/// snapshot the load monitor published, and the decider's place at the
-/// files of leases where the case lends one.
+/// answered for its lease. With it go the snapshot the load monitor
+/// published, and the decider's place at the files of leases where the
+/// case lends one.
 fn served_call(
     store: &MemoryStore,
     objects: &Objects<Members>,
@@ -1447,7 +1550,6 @@ fn served_call(
 ) -> Decision {
     let request = Checked::new(frame).expect("a frame the record holds");
     let taken = taken_at(&request, gateway, (now, now), place);
-    objects.follow(store);
     let (mut frames, own) = (FrameBuffers::default(), Part::default());
     let decided = store
         .deciding(|world| decide_decode(world, objects, &taken, held, &mut frames, loads, &own));
@@ -1468,7 +1570,6 @@ fn leased_call(
     let request = Checked::new(frame).expect("a frame the record holds");
     let lease = request.decode_of().expect("a decode call's frame");
     let taken = taken_at(&request, GATEWAY, (now, now), None);
-    objects.follow(store);
     let (mut frames, own) = (FrameBuffers::default(), Part::default());
     let loads = Arc::new(LoadSnapshot::default());
     let held = store.held_pair(GATEWAY, lease);
@@ -1515,16 +1616,16 @@ fn held_pair_at(
 #[test]
 fn a_decode_call_takes_the_decode_side_alone_and_finds_its_prefill_under_a_hold() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(stock_pair_plan())
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
     let decodes = [
-        side_member(&store, "d0", Role::Decode, None),
-        side_member(&store, "d1", Role::Decode, None),
-        side_member(&store, "d2", Role::Decode, Some(OTHER)),
+        side_member(&store, &objects, "d0", Role::Decode, None),
+        side_member(&store, &objects, "d1", Role::Decode, None),
+        side_member(&store, &objects, "d2", Role::Decode, Some(OTHER)),
     ];
-    let objects = holder(&store);
     let now = Instant::now();
     let until = Some(now + Duration::from_secs(60));
     store.gateway_veto(GATEWAY, p, until);
@@ -1571,14 +1672,14 @@ fn a_decode_call_answers_no_decode_then_the_decodes_emptied_then_none_dialed() {
     type Fleet<'a> = (Option<GatewayId>, &'a [Option<GatewayId>]);
     let answered = |(prefill, decodes): Fleet<'_>, wires, hint: Option<u32>| {
         let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         store
             .apply(stock_pair_plan())
             .expect("above the unbound start");
-        let p = side_member(&store, "p0", Role::Prefill, prefill);
+        let p = side_member(&store, &objects, "p0", Role::Prefill, prefill);
         for (n, &only) in decodes.iter().enumerate() {
-            side_member(&store, &format!("d{n}"), Role::Decode, only);
+            side_member(&store, &objects, &format!("d{n}"), Role::Decode, only);
         }
-        let objects = holder(&store);
         let frame = at_call(1, LeaseId(1), wires, hint);
         let request = Checked::new(frame.clone()).expect("a frame the record holds");
         let (over_none, traced) = store.deciding(|world| {
@@ -1638,10 +1739,10 @@ fn a_decode_call_answers_no_decode_then_the_decodes_emptied_then_none_dialed() {
     }
     // A model nobody serves: over no worker.
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(stock_pair_plan())
         .expect("above the unbound start");
-    let objects = holder(&store);
     let frame = at_call(1, LeaseId(1), WireModes::NONE, None);
     let (asked, given) = ((GATEWAY, now), (&unread, None));
     let held = (WorkerId(7), None);
@@ -1675,12 +1776,13 @@ fn least_load_pair_plan() -> AppliedSpec {
 #[test]
 fn a_decode_calls_request_reads_the_reports_of_the_snapshot_it_is_given() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(least_load_pair_plan())
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
-    let decodes = ["d0", "d1", "d2"].map(|name| side_member(&store, name, Role::Decode, None));
-    let objects = holder(&store);
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    let decodes =
+        ["d0", "d1", "d2"].map(|name| side_member(&store, &objects, name, Role::Decode, None));
     let now = Instant::now();
     // The second decode reports no queue, and every other worker is deep
     // in its own.
@@ -1725,17 +1827,17 @@ fn a_decode_call_whose_decode_side_may_refuse_by_reports_applies_what_waits_at_t
     ];
     for (picks, waited) in cases {
         let store = Arc::new(MemoryStore::new().with_decision_slots(2));
+        let objects = holder(&store);
         store
             .apply(pair_plan(&catalog, "[]", picks))
             .expect("above the unbound start");
-        let p = side_member(&store, "p0", Role::Prefill, None);
-        side_member(&store, "d0", Role::Decode, None);
+        let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+        side_member(&store, &objects, "d0", Role::Decode, None);
         LeasesStore::set_term(&*store, 1);
         let mut watch = a_frame_under_the_second_files_watch(&store, p);
         // The first file's decision, its place lent.
         let _acting = DecisionSlot::new(0).enter();
         let place = store.at_work();
-        let objects = holder(&store);
         let frame = at_call(1, LeaseId(1), WireModes::NONE, None);
         let unread = Arc::new(LoadSnapshot::default());
         let (asked, given) = ((GATEWAY, Instant::now()), (&unread, Some(&place)));
@@ -1754,16 +1856,16 @@ fn a_decode_call_whose_decode_side_may_refuse_by_reports_applies_what_waits_at_t
 #[test]
 fn a_decode_call_starts_from_the_decode_of_the_target_its_prefills_dispatch_took() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     let turns = ["random", "round-robin"];
     store
         .apply(pair_plan(&StageRegistry::builtin(), "[]", turns))
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
     for name in ["d0", "d1", "d2"] {
-        side_member(&store, name, Role::Decode, None);
+        side_member(&store, &objects, name, Role::Decode, None);
     }
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let now = Instant::now();
     for (n, index) in [(1, 0), (2, 1)] {
         let (first, prefill) = held_pair_at(&store, &objects, (n, index), now);
@@ -1802,12 +1904,12 @@ fn a_decode_call_starts_from_the_decode_of_the_target_its_prefills_dispatch_took
 #[test]
 fn a_hold_on_the_only_decode_sheds_a_decode_call_under_the_health_filter() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(stock_pair_plan())
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
-    let d = side_member(&store, "d0", Role::Decode, None);
-    let objects = holder(&store);
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    let d = side_member(&store, &objects, "d0", Role::Decode, None);
     let now = Instant::now();
     let unread = Arc::new(LoadSnapshot::default());
     let answered = |gateway| {
@@ -1863,6 +1965,7 @@ impl Picker for Told {
 #[test]
 fn a_decode_calls_pick_is_issued_under_its_pairs_lease_and_told_dated_at_the_call() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     let told = Arc::new(Mutex::new(Vec::new()));
     let kept = Arc::clone(&told);
     let mut catalog = StageRegistry::builtin();
@@ -1871,10 +1974,9 @@ fn a_decode_calls_pick_is_issued_under_its_pairs_lease_and_told_dated_at_the_cal
     store
         .apply(pair_plan(&catalog, r#"["healthy"]"#, ["random", "told"]))
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
-    let d = side_member(&store, "d0", Role::Decode, None);
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    let d = side_member(&store, &objects, "d0", Role::Decode, None);
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let now = Instant::now();
     let (_, prefill) = held_pair_at(&store, &objects, (1, 0), now);
     assert_eq!(*told.lock(), [prefill], "the prefill side's issue alone");
@@ -2012,6 +2114,7 @@ impl Picker for Faulty {
 #[test]
 fn a_stage_that_panics_at_a_decode_calls_issue_is_held_and_the_side_stands_issued() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     let mut catalog = StageRegistry::builtin();
     catalog
         .picker("faulty", || Box::new(Faulty))
@@ -2019,10 +2122,9 @@ fn a_stage_that_panics_at_a_decode_calls_issue_is_held_and_the_side_stands_issue
     store
         .apply(pair_plan(&catalog, "[]", ["random", "faulty"]))
         .expect("above the unbound start");
-    side_member(&store, "p0", Role::Prefill, None);
-    let d = side_member(&store, "d0", Role::Decode, None);
+    side_member(&store, &objects, "p0", Role::Prefill, None);
+    let d = side_member(&store, &objects, "d0", Role::Decode, None);
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let now = Instant::now();
     let (_, prefill) = held_pair_at(&store, &objects, (1, 0), now);
     assert_eq!(store.lifecycle_faults(), 0);
@@ -2049,7 +2151,13 @@ fn a_stage_that_panics_at_a_decode_calls_issue_is_held_and_the_side_stands_issue
 
 /// A ready member `name` of [`PAIRED`] on `role`'s side, as [`side_member`]
 /// lays one, that offers a partner the KV transport `transport`.
-fn transport_member(store: &MemoryStore, name: &str, role: Role, transport: &str) -> WorkerId {
+fn transport_member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    name: &str,
+    role: Role,
+    transport: &str,
+) -> WorkerId {
     let key = format!("http://{name}:8000");
     let descriptor = PairingDescriptor {
         transport: Some(transport.to_owned()),
@@ -2067,12 +2175,7 @@ fn transport_member(store: &MemoryStore, name: &str, role: Role, transport: &str
         pairing: Some(Arc::new(descriptor)),
         ..WorkerFacts::default()
     };
-    let id = store.upsert(facts).id();
-    store.publish_now();
-    let row = WorkersStore::get(store, id).expect("the row");
-    let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
-    ready.expect("the row stands");
-    id
+    written_ready(store, objects, facts)
 }
 
 /// A pair's two sides pair by the classes of the document's own pairing, at
@@ -2108,11 +2211,11 @@ fn a_pair_and_its_decode_call_pair_by_the_classes_of_the_documents_pairing() {
     // calls name behind the one prefill.
     let named = |pairing: Option<&str>| {
         let store = Arc::new(MemoryStore::new());
-        store.apply(plan(pairing)).expect("above the unbound start");
-        let p = transport_member(&store, "p0", Role::Prefill, "a");
-        let same = transport_member(&store, "d0", Role::Decode, "a");
-        let other = transport_member(&store, "d1", Role::Decode, "b");
         let objects = holder(&store);
+        store.apply(plan(pairing)).expect("above the unbound start");
+        let p = transport_member(&store, &objects, "p0", Role::Prefill, "a");
+        let same = transport_member(&store, &objects, "d0", Role::Decode, "a");
+        let other = transport_member(&store, &objects, "d1", Role::Decode, "b");
         let mut firsts = BTreeSet::new();
         let mut calls = BTreeSet::new();
         for n in 1..=32 {
@@ -2188,6 +2291,7 @@ impl Picker for SideWords {
 #[test]
 fn a_dispatched_frame_at_an_index_its_pick_does_not_hold_leaves_a_chosen_side_as_it_stood() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     let told = Arc::new(Mutex::new(Vec::new()));
     let kept = Arc::clone(&told);
     let mut catalog = StageRegistry::builtin();
@@ -2200,10 +2304,9 @@ fn a_dispatched_frame_at_an_index_its_pick_does_not_hold_leaves_a_chosen_side_as
             ["random", "side-words"],
         ))
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
-    let d = side_member(&store, "d0", Role::Decode, None);
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    let d = side_member(&store, &objects, "d0", Role::Decode, None);
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     // The word to the engine of a frame applied to a lease, as a replica
     // gives it at the start of its deciders, and a session's hand at the
     // files: no decider is at work here, so the hand applies each frame.
@@ -2373,15 +2476,15 @@ fn sent(lease: &Lease, side: proto::Side, index: u32) -> proto::Dispatched {
 #[test]
 fn a_served_pairs_decode_dispatch_elsewhere_withdraws_the_decode_sides_own_claim() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(ruled_pair_plan())
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
     for name in ["d0", "d1"] {
-        side_member(&store, name, Role::Decode, None);
+        side_member(&store, &objects, name, Role::Decode, None);
     }
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let now = Instant::now();
     let leased = |n: u8| {
         let frame = keyed(at_prefill(n, WireModes::NONE, None), 7);
@@ -2417,15 +2520,15 @@ fn a_served_pairs_decode_dispatch_elsewhere_withdraws_the_decode_sides_own_claim
 #[test]
 fn a_served_decode_calls_side_keeps_the_calls_own_session_verdict() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(ruled_pair_plan())
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
     for name in ["d0", "d1"] {
-        side_member(&store, name, Role::Decode, None);
+        side_member(&store, &objects, name, Role::Decode, None);
     }
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let now = Instant::now();
     let mut frame = keyed(at_prefill(1, WireModes::NONE, None), 7);
     frame.decode_later = true;
@@ -2450,6 +2553,73 @@ fn a_served_decode_calls_side_keeps_the_calls_own_session_verdict() {
     assert_eq!(on_file(), (LeaseState::ISSUED, SessionVerdict::Pinned));
     assert!(store.unissue_decode(GATEWAY, prefill.id, issue));
     assert_eq!(on_file(), claimed);
+}
+
+/// A served pair whose commit refused every target keeps no claim on
+/// either side. A frame that stated the later decode leaves its decode
+/// side chosen under the claim the pair's first decision made, and no
+/// stage heard that side's issue: the release that ends the prefill takes
+/// the decode's claim back with it, and the key's next pair is placed as a
+/// key no request carried. A release that names such a decode alone takes
+/// its claim back at that word. A release for another reason takes no
+/// claim back.
+#[test]
+fn a_served_refused_pair_keeps_no_claim_on_a_decode_that_stood_chosen() {
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    store
+        .apply(ruled_pair_plan())
+        .expect("above the unbound start");
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    for name in ["d0", "d1"] {
+        side_member(&store, &objects, name, Role::Decode, None);
+    }
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    let later = |n: u8, key: u64| {
+        let mut frame = keyed(at_prefill(n, WireModes::NONE, None), key);
+        frame.decode_later = true;
+        let (decision, prefill, _) = leased_pair(&store, &objects, frame, now);
+        let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+        let decode = sides.decode.expect("a pair's lease");
+        (pairs_of(&decision), prefill, decode)
+    };
+    let (chosen, prefill, decode) = later(1, 7);
+    assert_eq!(decode.state, LeaseState::Chosen);
+    let pins = |keys: [Session; 2]| keys.map(|session| pins_of(&store, session));
+    let alone = |id| Some([id, WorkerId(0)]);
+    let none = Some([WorkerId(0); 2]);
+    let keys = [prefill.session, decode.session];
+    assert_eq!(pins(keys), [alone(p), alone(chosen[0].1)], "a claim a side");
+    let hand = open(&store, GATEWAY);
+    let release = |lease: &Lease, side: proto::Side, reason: proto::released::Reason| {
+        let word = proto::Released {
+            what: Some(proto::released::What::LeaseId(lease.id.0)),
+            reason: reason.into(),
+            side: side.into(),
+        };
+        lifecycle::released(&store, &hand, &word).expect("the frame reads");
+    };
+    let whole = proto::Side::Unspecified;
+    let refused = proto::released::Reason::CommitFailed;
+    release(&prefill, whole, refused);
+    assert_eq!(pins(keys), [none; 2], "neither claim stays");
+    // The key's next pair claims anew, over both decodes, and a release
+    // for another reason takes no claim back.
+    let (next, again, decode) = later(2, 7);
+    assert_eq!(next.len(), 2, "{next:?}");
+    assert!(matches!(decode.session_verdict, SessionVerdict::Claimed(_)));
+    release(&again, whole, proto::released::Reason::ClientGone);
+    assert_eq!(pins(keys), [alone(p), alone(next[0].1)]);
+    // A release that names the decode alone takes that side's claim back
+    // at its word, and the prefill's release then takes the prefill's.
+    let (other, prefill, decode) = later(3, 8);
+    let keys = [prefill.session, decode.session];
+    assert_eq!(pins(keys), [alone(p), alone(other[0].1)], "a claim a side");
+    release(&prefill, proto::Side::Decode, refused);
+    assert_eq!(pins(keys), [alone(p), none], "the decode's claim goes");
+    release(&prefill, whole, refused);
+    assert_eq!(pins(keys), [none; 2]);
 }
 
 /// The keys the worker objects of `names` count, in the names' order: a
@@ -2481,13 +2651,14 @@ fn keys_on<const N: usize>(objects: &Objects<Members>, names: [&str; N]) -> [usi
 #[test]
 fn a_served_pairs_keyed_lease_counts_its_key_on_each_sides_worker() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(ruled_pair_plan_of(Assignment::MinGroup))
         .expect("above the unbound start");
-    let [p0, p1] = ["p0", "p1"].map(|name| side_member(&store, name, Role::Prefill, None));
-    let [d0, d1] = ["d0", "d1"].map(|name| side_member(&store, name, Role::Decode, None));
+    let [p0, p1] =
+        ["p0", "p1"].map(|name| side_member(&store, &objects, name, Role::Prefill, None));
+    let [d0, d1] = ["d0", "d1"].map(|name| side_member(&store, &objects, name, Role::Decode, None));
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let now = Instant::now();
     // What the workers' objects count, and what the pairs that stand make:
     // the two prefills, then the two decodes.
@@ -2541,6 +2712,7 @@ fn a_served_pairs_keyed_lease_counts_its_key_on_each_sides_worker() {
 #[test]
 fn a_served_pair_hands_each_sides_key_on_at_its_rules_cap() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     // The rule places a key on the worker with the fewest requests: a
     // request placed again at the cap leaves the key's worker.
     store
@@ -2548,11 +2720,10 @@ fn a_served_pair_hands_each_sides_key_on_at_its_rules_cap() {
         .expect("above the unbound start");
     for (role, names) in [(Role::Prefill, ["p0", "p1"]), (Role::Decode, ["d0", "d1"])] {
         for name in names {
-            side_member(&store, name, role, None);
+            side_member(&store, &objects, name, role, None);
         }
     }
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let now = Instant::now();
     let leased = |n: u8| {
         let frame = keyed(at_prefill(n, WireModes::NONE, None), 7);
@@ -2609,13 +2780,13 @@ fn a_served_pair_hands_each_sides_key_on_at_its_rules_cap() {
 #[test]
 fn a_served_decode_call_hands_its_sides_key_on_at_its_rules_cap() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     store
         .apply(ruled_pair_plan_under(Assignment::MinLoad, 2))
         .expect("above the unbound start");
-    let p = side_member(&store, "p0", Role::Prefill, None);
-    let decodes = ["d0", "d1"].map(|name| side_member(&store, name, Role::Decode, None));
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    let decodes = ["d0", "d1"].map(|name| side_member(&store, &objects, name, Role::Decode, None));
     LeasesStore::set_term(&*store, 1);
-    let objects = holder(&store);
     let now = Instant::now();
     let hand = open(&store, GATEWAY);
     let leased = |n: u8, later: bool| {
@@ -2668,13 +2839,14 @@ fn a_served_decode_call_hands_its_sides_key_on_at_its_rules_cap() {
 fn a_served_pairs_later_decode_counts_its_key_from_its_calls_issue() {
     for first_key in [Some(7), None] {
         let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         store
             .apply(ruled_pair_plan())
             .expect("above the unbound start");
-        let p = side_member(&store, "p0", Role::Prefill, None);
-        let decodes = ["d0", "d1"].map(|name| side_member(&store, name, Role::Decode, None));
+        let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+        let decodes =
+            ["d0", "d1"].map(|name| side_member(&store, &objects, name, Role::Decode, None));
         LeasesStore::set_term(&*store, 1);
-        let objects = holder(&store);
         let now = Instant::now();
         let keys = || keys_on(&objects, ["p0", "d0", "d1"]);
         let frame = at_prefill(1, WireModes::NONE, None);
@@ -2706,8 +2878,15 @@ fn a_served_pairs_later_decode_counts_its_key_from_its_calls_issue() {
 }
 
 /// A ready member `name` of [`PAIRED`] on `role`'s side, on the gRPC wire,
-/// whose registration names the engine kind `kind`: none where it is empty.
-fn kind_member(store: &MemoryStore, name: &str, role: Role, kind: &str) -> WorkerId {
+/// written through `objects`, whose registration names the engine kind
+/// `kind`: none where it is empty.
+fn kind_member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    name: &str,
+    role: Role,
+    kind: &str,
+) -> WorkerId {
     let key = format!("grpc://{name}:8000");
     let facts = WorkerFacts {
         key: key.clone(),
@@ -2721,12 +2900,7 @@ fn kind_member(store: &MemoryStore, name: &str, role: Role, kind: &str) -> Worke
         max_running: Some(4),
         ..WorkerFacts::default()
     };
-    let id = store.upsert(facts).id();
-    store.publish_now();
-    let row = WorkersStore::get(store, id).expect("the row");
-    let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
-    ready.expect("the row stands");
-    id
+    written_ready(store, objects, facts)
 }
 
 /// A controller's pair classes hold a model's workers of both wires in one
@@ -2757,17 +2931,17 @@ fn kind_member(store: &MemoryStore, name: &str, role: Role, kind: &str) -> Worke
 #[test]
 fn a_served_pair_with_a_worker_of_unknown_runtime_goes_behind_every_other_pair() {
     let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
     let applied = store.apply(stock_pair_plan());
     applied.expect("above the unbound start");
-    let nameless = kind_member(&store, "p0", Role::Prefill, "");
-    let known = kind_member(&store, "p1", Role::Prefill, "runtime-a");
-    let any = kind_member(&store, "d0", Role::Decode, "");
-    let same = kind_member(&store, "d1", Role::Decode, "runtime-a");
+    let nameless = kind_member(&store, &objects, "p0", Role::Prefill, "");
+    let known = kind_member(&store, &objects, "p1", Role::Prefill, "runtime-a");
+    let any = kind_member(&store, &objects, "d0", Role::Decode, "");
+    let same = kind_member(&store, &objects, "d1", Role::Decode, "runtime-a");
     let plain = (
-        side_member(&store, "p2", Role::Prefill, None),
-        side_member(&store, "d2", Role::Decode, None),
+        side_member(&store, &objects, "p2", Role::Prefill, None),
+        side_member(&store, &objects, "d2", Role::Decode, None),
     );
-    let objects = holder(&store);
     let now = Instant::now();
     // One gateway holds the known decode back, and another the plain
     // decode too.

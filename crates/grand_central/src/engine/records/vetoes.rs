@@ -342,7 +342,10 @@ mod tests {
         };
         for seed in 0..16 {
             let shadow = engine.shadow_for(MODEL, Phase::Single);
-            let shadow = shadow.expect("the binding names a shadow");
+            let (at, rows) = shadow.expect("the binding names a shadow");
+            // The request of this case lends its shadow nothing.
+            let lends: with_shadow::Lends<'_> = &|_| None;
+            let shadow = (at, rows, lends);
             let live = Live::at(engine, &clock, Instant::now(), None, None);
             let mut facts = single(seed);
             let (decision, said) =

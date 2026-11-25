@@ -23,25 +23,21 @@ pub fn rows(group: &mut BenchmarkGroup<'_, WallTime>, preset: &str) {
         let mut view = Vec::with_capacity(n);
         build_view(&fleet, &mut view);
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            // Every row of the bench's fleet reports a rate.
-            reported: true,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
+        // Every row of the bench's fleet reports a rate.
+        pool.reported = true;
         let cx = Constraints::default();
         group.bench_with_input(BenchmarkId::new(preset, n), &n, |b, _| {
             let mut seed = 0u64;
             b.iter(|| {
                 seed += 1;
-                let facts = RequestFacts {
-                    model: "m",
-                    prompt_tokens: 512,
-                    seed,
-                    now_micros: 1_000_000,
-                    ..RequestFacts::default()
-                };
+                let mut facts = RequestFacts::default();
+                facts.model = "m";
+                facts.prompt_tokens = 512;
+                facts.seed = seed;
+                facts.now_micros = 1_000_000;
                 engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
             });
         });

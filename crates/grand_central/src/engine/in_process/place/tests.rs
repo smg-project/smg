@@ -35,6 +35,7 @@ use crate::{
         decision::{Queue, Shed, Target, Targets, Trace},
         decision_engine::{Decided, DecisionEngine},
         framework::{Filter, Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
+        in_process::single::tests::ruled_ahead,
         list_cell::PublishedList,
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
@@ -1046,6 +1047,81 @@ fn a_plain_request_is_placed_on_the_worker_at_its_place() {
     }
 }
 
+/// A picker that places the worker at place 0 of its list by itself, takes
+/// no word of a lease, and marks that worker not ready behind the read that
+/// found it eligible.
+#[derive(Debug)]
+struct Turns(Arc<dyn Worker>);
+
+impl Lifecycle for Turns {}
+
+impl Picker for Turns {
+    fn name(&self) -> &'static str {
+        "turns"
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
+    fn picks_alone(&self) -> bool {
+        true
+    }
+
+    fn pick_alone(&self, _: &PoolWord<'_>, keep: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
+        let kept = keep(0);
+        if kept {
+            self.0.set_status(WorkerStatus::NotReady);
+        }
+        kept.then_some(0)
+    }
+
+    fn pick(
+        &self,
+        _: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut Targets,
+    ) {
+        push_drawn(candidates, kept, out);
+    }
+}
+
+/// Under a document whose session table alone takes a word on a lease, the
+/// worker at a plain request's place is read a second time, as a noted
+/// pick's target is at its walk: where its picker turned it, the pick is
+/// noted, and the call's next decision places the request on a worker that
+/// is ready.
+#[test]
+fn a_place_under_a_table_that_alone_takes_a_word_is_read_ready_a_second_time() {
+    let list = pool(2);
+    let first = Arc::clone(&list[0]);
+    let mut stages = StageRegistry::builtin();
+    let added = stages.picker("turns", move || Box::new(Turns(Arc::clone(&first))));
+    added.expect("a free name");
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    let profile = document.profiles.get_mut("random");
+    profile.expect("the preset's profile").pick = "turns".into();
+    let spec = AppliedSpec::validate_in(&ruled_ahead(document), &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the picker")));
+    let hears = engine.in_force().hears.intersects(EventSet::LEASE);
+    let beside = engine.in_force().hears_beside_table;
+    assert!(
+        hears && !beside.intersects(EventSet::LEASE),
+        "the session table alone takes a word"
+    );
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
+    let placement = engine.place(&request).expect("a placement");
+    assert!(!ready(list[0].as_ref()), "the pick turned its worker");
+    assert!(
+        Arc::ptr_eq(&placement.worker, &list[1]),
+        "the worker that is ready"
+    );
+}
+
 /// A room rule that names the request's output limit reserves room for the
 /// answer its caller states through the one call: a worker whose requests
 /// in flight leave no room for the answer is passed over while another
@@ -1153,13 +1229,14 @@ fn placing_a_request_asks_the_table_of_names_for_nothing() {
 /// to ([`Placement::overlap`]): a host observes its cache series from it.
 /// A prompt's first request reads a miss of its blocks. Its next request
 /// reads every block held, by the record of sent prefixes, and a kept
-/// placement says the same. A pick states its first target alone: a request
-/// its route's rule sends to the target behind is stated nothing, though
-/// one decision placed it. Neither is a place one pick decides, nor a pair.
+/// placement says the same. A pick states its first target's worker alone:
+/// a single request its route's rule sends to the target behind goes to
+/// another worker and is stated nothing, though one decision placed it.
+/// Neither is a place one pick decides. A pair's statement stands with a
+/// pair's cases (`a_pairs_placement_states_what_its_prefill_holds`).
 ///
 /// The classic policy observes the share of the worker it chose
-/// (`model_gateway/src/policies/cache_aware.rs:2676-2688`), a pair's sides
-/// each by its own policy.
+/// (`model_gateway/src/policies/cache_aware.rs:2676-2688`).
 #[test]
 fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
     use crate::engine::decision::{Overlap, OverlapSource};
@@ -1217,22 +1294,6 @@ fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
     let plain = hosted(preset("round_robin"));
     let placed = plain.place(&request).expect("a placement");
     assert_eq!(placed.overlap, Overlap::NONE);
-
-    // A pair whose two sides read who holds the prompt: its pick states
-    // none, at the prompt's first request and at its next.
-    let sides = PolicySpec::pair_presets("cache_aware", "cache_aware");
-    let paired = hosted(engine_of(&sides.expect("the pair presets")));
-    let two = PublishedList::new(pool(2));
-    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
-    let pair = PlaceRequest {
-        prompt,
-        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&two, &classes)))
-    };
-    for _ in 0..2 {
-        let placement = paired.place(&pair).expect("a pair");
-        assert!(placement.decode.is_some());
-        assert_eq!(placement.overlap, Overlap::NONE);
-    }
 }
 
 /// A program that asks `place` states no worker id of its own: a placement
@@ -2500,6 +2561,134 @@ fn a_shadow_is_lent_the_ring_where_it_places_as_its_live_profile_does() {
     assert_eq!(another_depth, alone, "a shadow of another depth");
 }
 
+/// A shadow profile that places by a ring is lent the request's ring
+/// behind a live profile that reads none, and walks it as it would live:
+/// the live profile takes the idle worker and the shadow the ring's
+/// owner. The lender is asked there for the shadow alone, so by the
+/// shadow's rules: a request that keeps its budget for its answer asks it
+/// nothing, and a lender that panics costs its request nothing.
+#[test]
+fn a_shadow_alone_walks_the_lent_ring() {
+    // The ring preset's binding keeps its routing key: the preset's
+    // profile is its shadow, and the profile of `least_load` decides.
+    let mut document = PolicySpec::preset("consistent_hashing").expect("a built-in preset");
+    let twin = document.profiles.keys().next().cloned();
+    let live = PolicySpec::preset("least_load").expect("a built-in preset");
+    let live = live.profiles.into_values().next();
+    document
+        .profiles
+        .insert("live".into(), live.expect("the preset's profile"));
+    document.bindings[0].profile = Some("live".into());
+    document.bindings[0].shadow = twin.map(ShadowSpec::Profile);
+    document.generation = 1;
+    let engine = hosted(engine_of(&document));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let addresses = list.iter().map(|worker| worker.url().to_owned());
+    let ring = Walked(Lent(addresses.collect()), AtomicU32::new(0));
+    // The key stands at the second address: the ring's owner is the
+    // busy worker, and the live profile takes the idle one.
+    assert_eq!(ring.position("conv-1") % 2, 1, "the key's owner");
+    for _ in 0..8 {
+        list[1].increment_load();
+    }
+    let headers = [("x-smg-routing-key", "conv-1")];
+    // Agreed, another target, another outcome, skipped.
+    let counted = || engine.shadow_kinds(0);
+    let placed = |ring: &dyn LentRing, budget_micros| {
+        let request = PlaceRequest {
+            headers: &headers,
+            ring: Some(ring),
+            budget_micros,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the idle worker");
+        (counted(), engine.faults())
+    };
+    let said = placed(&ring, 0);
+    let walks = ring.1.load(atomic::Ordering::Relaxed);
+    assert_eq!((walks, said), (1, ([0, 1, 0, 0], 0)), "the lent ring");
+    // Under the shadow's floor the lender is asked nothing.
+    assert_eq!(placed(&Unasked, 500), ([0, 1, 0, 1], 0), "a short budget");
+    // A lender that panics is its shadow's fault: counted, and nothing
+    // is compared.
+    assert_eq!(placed(&Unasked, 0), ([0, 1, 0, 1], 1), "a lender's panic");
+    // A request no worker serves is refused ahead of its shadow.
+    let unserved = PlaceRequest {
+        headers: &headers,
+        ring: Some(&Unasked),
+        demands: Demands {
+            vision: true,
+            ..Demands::default()
+        },
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let refused = |emptied_by| {
+        Some(Unplaced::Shed {
+            reason: ShedReason::NoEndpoints,
+            emptied_by,
+            retry_after_secs: 1,
+        })
+    };
+    assert_eq!(engine.place(&unserved).err(), refused("vision"));
+    assert_eq!((counted(), engine.faults()), ([0, 1, 0, 1], 1), "a refusal");
+    // Over a list of nobody no row stands to be placed: the lender is
+    // asked nothing, and the two refusals are counted as agreed.
+    let nobody = PublishedList::new(pool(0));
+    let empty = PlaceRequest {
+        headers: &headers,
+        ring: Some(&Unasked),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(nobody.lent()))
+    };
+    assert_eq!(engine.place(&empty).err(), refused("none"));
+    assert_eq!((counted(), engine.faults()), ([1, 1, 0, 1], 1), "nobody");
+}
+
+/// The prefix form of the ring as a shadow behind a live profile that
+/// reads none: the shadow is stated the places of its request's heads, by
+/// its own rule, and walks the lent ring. A lender that places no head
+/// lends the shadow no ring: it is asked nothing more, and the shadow
+/// places by its own.
+#[test]
+fn a_prefix_shadow_alone_walks_the_lent_ring() {
+    let mut document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+    let twin = document.profiles.keys().next().cloned();
+    let live = PolicySpec::preset("least_load").expect("a built-in preset");
+    let live = live.profiles.into_values().next();
+    document
+        .profiles
+        .insert("live".into(), live.expect("the preset's profile"));
+    document.bindings[0].profile = Some("live".into());
+    document.bindings[0].shadow = twin.map(ShadowSpec::Profile);
+    document.generation = 1;
+    let engine = hosted(engine_of(&document));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let addresses = list.iter().map(|worker| worker.url().to_owned());
+    let ring = Walked(Lent(addresses.collect()), AtomicU32::new(0));
+    let ids: Vec<u32> = (0..64).collect();
+    // The shadow's skips and the faults, behind one more request.
+    let placed = |ring: &dyn LentRing| {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            ring: Some(ring),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        engine.place(&request).expect("a placement");
+        let [.., skipped] = engine.shadow_kinds(0);
+        (skipped, engine.faults())
+    };
+    assert_eq!(placed(&ring), (0, 0), "the shadow ran");
+    assert_eq!(ring.1.load(atomic::Ordering::Relaxed), 1, "the lent ring");
+    // A lender that places no head panics where it is asked for a key's
+    // place or walked: the shadow ran, and no fault is counted.
+    assert_eq!(placed(&Headless), (0, 0), "a lender of no head");
+}
+
 /// A ring no decision may ask.
 #[derive(Debug)]
 struct Unasked;
@@ -3058,9 +3247,10 @@ fn a_lender_that_declines_a_head_is_asked_nothing_more() {
 /// ([`RequestFacts::ring`]). The prefix form is lent it by the same rule,
 /// and states the lender's place of the routing value as a head. A side
 /// that reads no ring holds nothing back. A pair with no ring stage is
-/// lent none, and neither is a pair of two ring forms or of two depths,
-/// whose one list of places would be one side's alone: the caller's ring
-/// is asked nothing.
+/// lent none: the caller's ring is asked nothing. A pair of two ring forms
+/// or of two depths has no one list of places, and the engine's two
+/// questions answer nothing for it: each of its sides is stated its own
+/// (`pair::ring_words`).
 #[test]
 fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     let list = pool(2);
@@ -3096,16 +3286,6 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     assert_eq!(stated(pair(prefixed, plain), &ring), lent);
     let none = (false, Vec::new());
     assert_eq!(stated(pair(plain, plain), &Unasked), none);
-    assert_eq!(stated(pair(prefixed, ringed), &Unasked), none);
-    assert_eq!(stated(pair(ringed, prefixed), &Unasked), none);
-    let mut two_depths = pair(prefixed, prefixed);
-    let decode = two_depths.profiles.get_mut("decode").expect("the side");
-    decode.score[0] = ScoreStage::ConsistentHash(ConsistentHashParams {
-        prefix_tokens: Some(128),
-        ..ConsistentHashParams::default()
-    })
-    .into();
-    assert_eq!(stated(two_depths, &Unasked), none);
     // The engine's own word, phase by phase: a pair asked at its prefill
     // is answered for both its profiles, and a decode asked alone for its
     // own.
@@ -3118,6 +3298,7 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     assert_eq!(depths(pair(prefixed, plain)), [Some(256), None]);
     assert_eq!(depths(pair(plain, prefixed)), [Some(256), Some(256)]);
     assert_eq!(depths(pair(prefixed, ringed)), [None, None]);
+    assert_eq!(depths(pair(ringed, prefixed)), [None, Some(256)]);
 }
 
 /// An `epd` binding pairs its prefill and its decode as a `pd-pair`

@@ -12,10 +12,10 @@
 //!
 //! The host of the cell named `recorded` lends no tree. The engine then
 //! names a turn's holders by its own record of the prefixes it sent, and
-//! writes the record behind the pick. An engine does the same under a host
-//! that keeps an index of cache events for the model, for the workers the
-//! index does not hear: it walks a lent tree only where its host keeps no
-//! such index.
+//! writes the record behind the pick. The host of the cell named `indexed`
+//! keeps an index of cache events that holds a block (`indexed.rs`): the
+//! index then names a turn alone, and the record is neither read nor
+//! written.
 //!
 //! A caller makes its prompts before its first turn, about half a kilobyte
 //! a decision, so such a cell is run with a stated `--decisions`, and stops
@@ -39,8 +39,8 @@ use std::{
 
 use kv_index::TokenTree;
 use smg_grand_central::engine::{
-    CacheIndex, CacheIndexes, DecisionEngine, HashSeeds, InProcess, Phase, PromptHashes,
-    TokenEntry, TokenKey,
+    CacheIndex, CacheIndexes, DecisionEngine, HashSeeds, InProcess, Phase, PromptEntry,
+    PromptHashes, TokenKey,
 };
 
 use super::{mix, place, ruled, stretch, Host, Run, CALLER_WARM, MODEL};
@@ -70,12 +70,9 @@ pub(super) struct Turn<'a> {
 
 /// A turn's entry in its host's token tree: its token ids, under no cache
 /// partition. The runner's maker and the one call's request state the same.
-impl TokenEntry for Turn<'_> {
+impl PromptEntry for Turn<'_> {
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
-        Some(TokenKey {
-            tokens: Cow::Borrowed(self.tokens),
-            marker: 0,
-        })
+        Some(TokenKey::of(Cow::Borrowed(self.tokens), 0))
     }
 }
 

@@ -35,7 +35,6 @@
 
 use std::{
     fmt, io,
-    net::{IpAddr, SocketAddr},
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Weak},
@@ -46,7 +45,6 @@ use std::{
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, warn};
 
-use super::config::ConfigError;
 #[cfg(feature = "kubernetes")]
 use crate::service::elector::KubernetesLease;
 use crate::{
@@ -120,152 +118,6 @@ pub struct ElectionConfig {
     pub advertise: Option<String>,
 }
 
-impl ElectionConfig {
-    /// Refuses what no bind could cure: settings out of order, a lease with
-    /// no name or an empty namespace, and an advertised address that is
-    /// malformed, that is the wildcard in any spelling (a client that dials
-    /// it reaches its own host), or that ends in a number and is no address
-    /// in its standard form (a resolver reads such a host as an address).
-    ///
-    /// A multicast or broadcast address, like a name nobody holds, is left
-    /// to the dial; a loopback address is taken as written, right where a
-    /// client shares the host.
-    pub(crate) fn validate(&self, gateway: SocketAddr) -> Result<(), ConfigError> {
-        if let Err(ElectError::Settings(why)) = self.settings.validate() {
-            return Err(ConfigError::ElectionSettings(why));
-        }
-        match &self.advertise {
-            // The port is a stand-in: the form alone is judged before the
-            // bind names the real one.
-            Some(advertise) => {
-                dialable(advertise, 1)?;
-            }
-            None if self.lease.is_shared() && is_wildcard(gateway.ip()) => {
-                return Err(ConfigError::AdvertiseAddressRequired);
-            }
-            None => {}
-        }
-        match &self.lease {
-            LeasePlace::Process => {}
-            LeasePlace::File(path) => {
-                if path.as_os_str().is_empty() {
-                    return Err(ConfigError::EmptyLeaseName);
-                }
-            }
-            #[cfg(feature = "kubernetes")]
-            LeasePlace::Kubernetes { namespace, name } => {
-                if name.is_empty() {
-                    return Err(ConfigError::EmptyLeaseName);
-                }
-                if namespace.as_ref().is_some_and(String::is_empty) {
-                    return Err(ConfigError::EmptyLeaseNamespace);
-                }
-                // The object stores whole seconds: a fraction would be
-                // refused at the first write, after the listeners serve.
-                if self.settings.duration.subsec_nanos() != 0 {
-                    return Err(ConfigError::LeaseDurationNotWholeSeconds(
-                        self.settings.duration,
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// This replica's dialable address once the gateway listener is bound
-    /// at `gateway`; `None` when no client could be told one (a lone
-    /// controller behind a wildcard listener).
-    pub(crate) fn address(&self, gateway: SocketAddr) -> Result<Option<String>, ConfigError> {
-        match &self.advertise {
-            Some(advertise) => dialable(advertise, gateway.port()).map(Some),
-            None if is_wildcard(gateway.ip()) => Ok(None),
-            None => Ok(Some(gateway.to_string())),
-        }
-    }
-}
-
-/// The dialable `host:port` of an advertised address: an address or a name,
-/// alone (it takes `port`) or with its own port. An IPv6 address alone is
-/// bracketed here, so a deployment passes a pod's address as it reads it.
-/// An address has one spelling here, the standard one: the wildcard is
-/// refused by name, and so is any other host that ends in a number, which a
-/// resolver would read as an address of its own making. Every other name is
-/// taken as given.
-fn dialable(advertise: &str, port: u16) -> Result<String, ConfigError> {
-    let malformed = || ConfigError::MalformedAdvertiseAddress(advertise.to_owned());
-    let dialed = |ip: IpAddr| {
-        if is_wildcard(ip) {
-            Err(ConfigError::WildcardAdvertiseAddress(advertise.to_owned()))
-        } else {
-            Ok(ip)
-        }
-    };
-    let bare = advertise
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(advertise);
-    if let Ok(ip) = bare.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(dialed(ip)?, port).to_string());
-    }
-    if let Ok(addr) = advertise.parse::<SocketAddr>() {
-        dialed(addr.ip())?;
-        return if addr.port() == 0 {
-            Err(malformed())
-        } else {
-            Ok(addr.to_string())
-        };
-    }
-    let (host, port) = match advertise.rsplit_once(':') {
-        Some((host, given)) => (
-            host,
-            given
-                .parse::<u16>()
-                .ok()
-                .filter(|port| *port != 0)
-                .ok_or_else(malformed)?,
-        ),
-        None => (advertise, port),
-    };
-    let named = !host.is_empty()
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
-    if !named {
-        return Err(malformed());
-    }
-    if ends_in_a_number(host) {
-        return Err(ConfigError::NumericAdvertiseHost(advertise.to_owned()));
-    }
-    Ok(format!("{host}:{port}"))
-}
-
-/// Whether `ip` is the wildcard: the unspecified address of either family,
-/// or the IPv4 one written mapped into IPv6, which a listener binds as the
-/// wildcard too. A client that dials it reaches its own host.
-fn is_wildcard(ip: IpAddr) -> bool {
-    ip.to_canonical().is_unspecified()
-}
-
-/// Whether a host's last label is a number: digits alone, or `0x` in either
-/// case and then hexadecimal digits, none included; one closing dot is
-/// dropped first. This is the URL standard's check of a host that ends in a
-/// number. A resolver reads such a host as an address, whatever the labels
-/// before it, and not always the one that was meant: `0` is the wildcard,
-/// `010.0.0.1` is `8.0.0.1`, `8080` is `0.0.31.144`.
-fn ends_in_a_number(host: &str) -> bool {
-    let last = host
-        .strip_suffix('.')
-        .unwrap_or(host)
-        .rsplit('.')
-        .next()
-        .unwrap_or_default();
-    let hexadecimal = last
-        .strip_prefix("0x")
-        .or_else(|| last.strip_prefix("0X"))
-        .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()));
-    hexadecimal || (!last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
-}
-
 /// The holder identity (design 5.3): `controller-id@host:port`, dialable
 /// without a Service and unique per instance; the id alone when no address
 /// is known.
@@ -337,30 +189,56 @@ pub(crate) async fn elector(
         }
         #[cfg(feature = "kubernetes")]
         LeasePlace::Kubernetes { namespace, name } => {
-            let mut config = kube::Config::infer()
+            let inferred = kube::Config::infer()
                 .await
                 .map_err(|error| LeaseError::Client(error.to_string()))?;
-            // A stalled round trip returns before the fence it could have
-            // renewed closes, so the thread's next step is never behind a
-            // call that outlives the lease.
-            let deadline = election.settings.renew_deadline;
-            config.connect_timeout = Some(deadline);
-            config.read_timeout = Some(deadline);
-            config.write_timeout = Some(deadline);
-            let namespace = namespace
-                .clone()
-                .unwrap_or_else(|| config.default_namespace.clone());
-            let client = kube::Client::try_from(config)
-                .map_err(|error| LeaseError::Client(error.to_string()))?;
-            Box::new(KubernetesLease::new(
-                client,
-                &namespace,
+            Box::new(kubernetes_lease(
+                inferred,
+                namespace.as_deref(),
                 name,
-                tokio::runtime::Handle::current(),
-            ))
+                election.settings.renew_deadline,
+            )?)
         }
     };
     Ok(Elector::new(backend, identity, election.settings)?)
+}
+
+/// The `Lease` object `name` as a lease's backend, on the client
+/// configuration `inferred` for this process; with no `namespace`, in the
+/// configuration's own. Its calls block on the runtime this runs on.
+#[cfg(feature = "kubernetes")]
+fn kubernetes_lease(
+    inferred: kube::Config,
+    namespace: Option<&str>,
+    name: &str,
+    deadline: std::time::Duration,
+) -> Result<KubernetesLease, LeaseError> {
+    let namespace = namespace.map_or_else(|| inferred.default_namespace.clone(), str::to_owned);
+    let client = kube::Client::try_from(lease_config(inferred, deadline))
+        .map_err(|error| LeaseError::Client(error.to_string()))?;
+    Ok(KubernetesLease::new(
+        client,
+        &namespace,
+        name,
+        tokio::runtime::Handle::current(),
+    ))
+}
+
+/// `inferred` as a lease's client takes it: every round trip is bounded by
+/// the renew `deadline` and made once.
+///
+/// A stalled round trip returns before the fence it could have renewed
+/// closes, so the thread's next step is never behind a call that outlives
+/// the lease. The client library's own retry of an answer that says try
+/// later (429, 503, 504) would hold one call past that bound, so it is off:
+/// the thread's next step is the retry.
+#[cfg(feature = "kubernetes")]
+fn lease_config(mut inferred: kube::Config, deadline: std::time::Duration) -> kube::Config {
+    inferred.connect_timeout = Some(deadline);
+    inferred.read_timeout = Some(deadline);
+    inferred.write_timeout = Some(deadline);
+    inferred.default_retry = false;
+    inferred
 }
 
 /// What the election's last step saw of the lease.
@@ -1001,7 +879,6 @@ mod tests {
     use std::{
         collections::VecDeque,
         io::Write,
-        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
         path::PathBuf,
         sync::{
             atomic::{AtomicBool, AtomicU32, Ordering},
@@ -1015,12 +892,12 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        dialable, elector, identity, run, split_identity, start, ElectionConfig,
-        ElectionObservation, LeaseError, LeasePlace, Running, Said, Word,
+        elector, identity, run, split_identity, start, ElectionConfig, ElectionObservation,
+        LeaseError, LeasePlace, Running, Said, Word,
     };
     use crate::{
         service::{
-            controller::{config::ConfigError, replication::journaled_from},
+            controller::replication::journaled_from,
             elector::{
                 ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, Fence,
                 LeaseBackend, LeaseRecord, MemoryLease, TickOutcome, TERM_CEILING,
@@ -1028,171 +905,6 @@ mod tests {
         },
         store::{LeasesStore, MemoryStore, Position},
     };
-
-    #[test]
-    fn an_advertised_host_takes_the_listeners_port_and_a_host_with_a_port_keeps_its_own() {
-        for (advertise, dialed) in [
-            ("10.0.0.7", "10.0.0.7:30100"),
-            ("10.0.0.7:31000", "10.0.0.7:31000"),
-            ("fd00::7", "[fd00::7]:30100"),
-            ("[fd00::7]", "[fd00::7]:30100"),
-            ("[fd00::7]:31000", "[fd00::7]:31000"),
-            ("controller-0.policy.svc", "controller-0.policy.svc:30100"),
-            (
-                "controller-0.policy.svc:31000",
-                "controller-0.policy.svc:31000",
-            ),
-        ] {
-            assert_eq!(
-                dialable(advertise, 30100).as_deref(),
-                Ok(dialed),
-                "{advertise}"
-            );
-        }
-        assert_eq!(
-            dialable("10.0.0.7:0", 30100),
-            Err(ConfigError::MalformedAdvertiseAddress(
-                "10.0.0.7:0".to_owned()
-            ))
-        );
-    }
-
-    #[test]
-    fn the_wildcard_is_refused_in_every_spelling() {
-        // A client that dials the wildcard reaches its own host: alone or
-        // with a port, in either family, bracketed or bare, and as the IPv4
-        // one mapped into IPv6.
-        for wildcard in [
-            "0.0.0.0",
-            "0.0.0.0:31000",
-            "::",
-            "[::]",
-            "[::]:31000",
-            "::ffff:0.0.0.0",
-            "[::ffff:0.0.0.0]",
-            "[::ffff:0.0.0.0]:31000",
-        ] {
-            assert_eq!(
-                dialable(wildcard, 30100),
-                Err(ConfigError::WildcardAdvertiseAddress(wildcard.to_owned())),
-                "{wildcard}"
-            );
-        }
-        // Every other address is taken as written: a loopback one, a mapped
-        // one, and a multicast or the broadcast one, the dial's to fail.
-        for (advertise, dialed) in [
-            ("0.0.0.1", "0.0.0.1:30100"),
-            ("127.0.0.1", "127.0.0.1:30100"),
-            ("127.0.0.1:31000", "127.0.0.1:31000"),
-            ("::1", "[::1]:30100"),
-            ("::ffff:10.0.0.7", "[::ffff:10.0.0.7]:30100"),
-            ("224.0.0.1", "224.0.0.1:30100"),
-            ("224.0.0.1:31000", "224.0.0.1:31000"),
-            ("255.255.255.255", "255.255.255.255:30100"),
-            ("[ff02::1]:31000", "[ff02::1]:31000"),
-        ] {
-            assert_eq!(
-                dialable(advertise, 30100).as_deref(),
-                Ok(dialed),
-                "{advertise}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_host_that_ends_in_a_number_is_refused_alone_and_with_a_port() {
-        // What a resolver reads as an address though the standard parser
-        // does not, and not always the one that was meant: `0` and `0x0`
-        // are the wildcard, `010.0.0.1` is `8.0.0.1`, `8080` is
-        // `0.0.31.144`.
-        for numeric in [
-            "0",
-            "00",
-            "0.0",
-            "0.0.0",
-            "0x0",
-            "0X0",
-            "0x0.0",
-            "00.0.0.0",
-            "000.000.000.000",
-            "4294967295",
-            "0xffffffff",
-            "0xe0000001",
-            "8080",
-            "1.2.3",
-            "010.0.0.1",
-            "0.",
-            "0x",
-            "1.",
-            "999.1.1.1",
-            "example.123",
-            "0xcafe",
-        ] {
-            for advertise in [numeric.to_owned(), format!("{numeric}:31000")] {
-                assert_eq!(
-                    dialable(&advertise, 30100),
-                    Err(ConfigError::NumericAdvertiseHost(advertise.clone())),
-                    "{advertise}"
-                );
-            }
-        }
-        // A number inside a name, or a last label that only opens like one,
-        // is a name's and taken as given; two closing dots leave an empty
-        // last label, which is no number.
-        for name in [
-            "pod-0",
-            "a1",
-            "10.example",
-            "0xcafe.example",
-            "0xzz",
-            "node7.cluster.local",
-            "host.example.",
-            "1..",
-        ] {
-            assert_eq!(dialable(name, 30100), Ok(format!("{name}:30100")), "{name}");
-            let with_a_port = format!("{name}:31000");
-            assert_eq!(
-                dialable(&with_a_port, 30100).as_deref(),
-                Ok(with_a_port.as_str()),
-                "{with_a_port}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_address_defaults_to_a_listener_that_binds_one() {
-        let bound = |ip: std::net::IpAddr| SocketAddr::new(ip, 40123);
-        let mut election = ElectionConfig::default();
-        assert_eq!(
-            election.address(bound(Ipv4Addr::LOCALHOST.into())),
-            Ok(Some("127.0.0.1:40123".to_owned()))
-        );
-        assert_eq!(
-            election.address(bound(Ipv6Addr::LOCALHOST.into())),
-            Ok(Some("[::1]:40123".to_owned()))
-        );
-        // Behind a wildcard listener no client could be told an address:
-        // either family's, and the IPv4 one mapped into IPv6.
-        for wildcard in [
-            Ipv4Addr::UNSPECIFIED.into(),
-            Ipv6Addr::UNSPECIFIED.into(),
-            Ipv4Addr::UNSPECIFIED.to_ipv6_mapped().into(),
-        ] {
-            assert_eq!(election.address(bound(wildcard)), Ok(None), "{wildcard}");
-        }
-        // A mapped address that is bound is told as the listener reads it.
-        assert_eq!(
-            election.address(bound(Ipv4Addr::LOCALHOST.to_ipv6_mapped().into())),
-            Ok(Some("[::ffff:127.0.0.1]:40123".to_owned()))
-        );
-
-        // An advertised host takes the port the listener bound.
-        election.advertise = Some("10.0.0.7".to_owned());
-        assert_eq!(
-            election.address(bound(Ipv4Addr::UNSPECIFIED.into())),
-            Ok(Some("10.0.0.7:40123".to_owned()))
-        );
-    }
 
     #[test]
     fn the_identity_is_the_id_at_the_address_and_splits_back() {
@@ -1242,6 +954,73 @@ mod tests {
         let now = Instant::now();
         alone.tick(now).expect("the take");
         assert_eq!(alone.fence().leader_term(now), Some(1));
+    }
+
+    /// What the client library gives a client by itself is read first, so a
+    /// release that moves its retry's default again fails here.
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn a_lease_clients_round_trip_is_bounded_by_the_renew_deadline_and_made_once() {
+        let inferred = kube::Config::new("https://api.invalid".parse().expect("a url"));
+        assert!(inferred.default_retry, "the library's own default");
+        let deadline = Duration::from_millis(1_500);
+
+        let lease = super::lease_config(inferred, deadline);
+
+        assert_eq!(lease.connect_timeout, Some(deadline));
+        assert_eq!(lease.read_timeout, Some(deadline));
+        assert_eq!(lease.write_timeout, Some(deadline));
+        assert!(!lease.default_retry);
+    }
+
+    /// The API server here refuses every call with 503 and names an hour to
+    /// wait. The refusal comes back inside the renew deadline, after one
+    /// call: the client library's own retry would hold the election thread
+    /// behind that call for the hour.
+    #[cfg(feature = "kubernetes")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_call_the_api_server_refuses_comes_back_inside_the_renew_deadline() {
+        use axum::http::{header, StatusCode};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port of this host");
+        let address = listener.local_addr().expect("the listener's address");
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&calls);
+        let refuses = axum::Router::new().fallback(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::future::ready((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "3600")],
+                "the server is currently unable to handle the request",
+            ))
+        });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the case holds the task's handle and ends the task"
+        )]
+        let server = tokio::spawn(async move { axum::serve(listener, refuses).await });
+
+        let deadline = Duration::from_secs(5);
+        let inferred = kube::Config::new(
+            format!("http://{address}")
+                .parse()
+                .expect("the server's url"),
+        );
+        let mut lease = super::kubernetes_lease(inferred, Some("policy"), "smg-policy", deadline)
+            .expect("a client of the server");
+        // The election's thread is no runtime worker: a call blocks its
+        // thread on the runtime.
+        let read = tokio::task::spawn_blocking(move || lease.read());
+        let refused = tokio::time::timeout(deadline, read)
+            .await
+            .expect("the refusal comes back inside the renew deadline")
+            .expect("the read ran");
+
+        assert!(refused.is_err(), "a refused read is an error: {refused:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the call was made once");
+        server.abort();
     }
 
     #[tokio::test]

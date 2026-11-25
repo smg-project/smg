@@ -575,10 +575,11 @@ impl Checked {
             // candidates of the program that decides.
             signal_cells: None,
             client_key: facts.client_key,
-            // No frame carries a ring: the ring stage places by its own,
-            // as it learns it from the rows.
+            // No frame carries a ring, nor a side's places on one: the
+            // ring stage places by its own, as it learns it from the rows.
             ring: None,
             ring_positions: &[],
+            decode_ring_positions: None,
             // The frame states who handed the key. A host older than the
             // field states nothing: its frame reads false, and a prefix
             // ring places it by its key, as before the field.
@@ -610,6 +611,9 @@ impl Checked {
             held: &[],
             // No frame holds a request to places.
             places: None,
+            // The number a pair's decision counts is its maker's to state
+            // ([`FrameRequest::naming_decode`]): this reader states none.
+            target_worker: None,
         }
     }
 }

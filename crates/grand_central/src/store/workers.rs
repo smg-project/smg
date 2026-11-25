@@ -95,7 +95,7 @@ pub struct Overload {
     pub waiting_requests: Option<u32>,
 }
 
-/// How a worker's signals reach the store (the row's `signals`).
+/// How a worker's signals reach its host (the row's `signals`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Signals {
     /// KV events into the index (an events subscription).
@@ -143,10 +143,9 @@ pub struct WorkerFacts {
     pub labels: BTreeMap<String, String>,
     pub zone: Option<String>,
     /// What the worker offers a prefill-decode partner, when the handshake
-    /// learned any of it. The store derives the pair classes from it, with
-    /// the engine kind as the runtime, where a membership write moves a
-    /// member or an offer and where a generation moves the pairing mode
-    /// ([`pairing`](super::pairing)): a registration hands no class in. The
+    /// learned any of it. A worker host derives its pair classes from it,
+    /// with the engine kind as the runtime ([`pairing`](super::pairing)): a
+    /// registration hands no class in, and the store derives none. The
     /// door drops a blank value and reads a name past its blanks. Behind a
     /// shared pointer: a worker that reports none holds one word for it,
     /// and every copy of a row shares the one its worker reported.
@@ -334,7 +333,7 @@ pub struct WorkerRow {
     pub status: WorkerStatus,
     /// Counts the row's stated facts: it moves on every write of them (a
     /// registration's refresh, a patch) and on no status change. The guard
-    /// a racing write names. The world's writer carries a member's fields
+    /// a racing write names. The world's writer carries what a member reads
     /// under the view's lists while it stands, so a write of the facts must
     /// move it.
     pub revision: u64,
@@ -446,8 +445,9 @@ pub enum MembershipTail {
 /// ([`crate::store::MemoryStore::publish_now`]). A removal and a replaced
 /// incarnation pay the build before they answer, and so does a
 /// registration that takes its worker off a model, for the pools it
-/// leaves. A status change is published with its answer: no decision made
-/// after it is handed the worker.
+/// leaves. A status change builds no pool and publishes nothing: a
+/// decision reads a worker's status on its worker object, which the holder
+/// of the objects moves with the row's.
 pub trait WorkersStore: Send + Sync {
     /// A registration or its refresh. A new key is `Registered`; the same key
     /// with another incarnation is `Replaced` (the old id leaves with its

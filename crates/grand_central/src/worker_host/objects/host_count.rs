@@ -89,8 +89,8 @@ mod tests {
     use crate::{
         engine::view::{Identity, RequestFacts, SessionCountedUnder},
         store::{
-            GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord, WorkerFacts,
-            WorkerPatch,
+            GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord, Registrant,
+            WorkerFacts, WorkerPatch,
         },
         tracking::lease::{Lease, LeaseId, Outcome, TransportClass},
         worker_host::Members,
@@ -119,32 +119,36 @@ mod tests {
             self.objects.follow(self.store.as_ref());
         }
 
-        /// Write the first life of the row at `url` and have the holder
-        /// follow: the row's id.
+        /// Write the first life of the row at `url` through the holder: the
+        /// row's id.
         fn write(&self, url: &str) -> WorkerId {
             self.life(url, 1)
         }
 
-        /// Write the life `incarnation` of the row at `url` and have the
-        /// holder follow: the row's id.
+        /// Write the life `incarnation` of the row at `url` through the
+        /// holder: the row's id.
         fn life(&self, url: &str, incarnation: u64) -> WorkerId {
-            let row = self.row(url, incarnation);
-            self.follow();
-            row
+            let facts = Self::facts(url, incarnation);
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write").id()
         }
 
-        /// Write the life `incarnation` of the row at `url`, which the
-        /// holder has not read yet: the row's id.
+        /// Write the life `incarnation` of the row at `url` around the
+        /// holder, which has not read it yet: the row's id.
         fn row(&self, url: &str, incarnation: u64) -> WorkerId {
-            let facts = WorkerFacts {
+            self.store.upsert(Self::facts(url, incarnation)).id()
+        }
+
+        /// The facts of the life `incarnation` of the row at `url`.
+        fn facts(url: &str, incarnation: u64) -> WorkerFacts {
+            WorkerFacts {
                 key: url.to_string(),
                 engine: url.to_string(),
                 incarnation,
                 models: vec!["m".to_string()],
                 dp_size: 1,
                 ..WorkerFacts::default()
-            };
-            self.store.upsert(facts).id()
+            }
         }
 
         /// The object the registry holds under `url`.
@@ -187,7 +191,8 @@ mod tests {
             assert!(self.store.completed(GATEWAY, LeaseId(id), &outcome));
         }
 
-        /// Move the facts of the row at `url`: one label more.
+        /// Move the facts of the row at `url` through the holder: one label
+        /// more.
         fn relabel(&self, url: &str) {
             let row = self.store.by_key(url).expect("a row");
             let labels = [("tier".to_string(), "gold".to_string())];
@@ -195,7 +200,8 @@ mod tests {
                 labels: Some(labels.into_iter().collect()),
                 ..WorkerPatch::default()
             };
-            assert!(self.store.patch(row.id, patch, row.revision).is_some());
+            let (store, objects) = (&self.store, &self.objects);
+            assert!(objects.patch(store, row.id, patch, row.revision).is_some());
         }
     }
 
@@ -279,7 +285,6 @@ mod tests {
 
         // The row's facts move: the holder builds another object for it.
         replica.relabel(A);
-        replica.follow();
         let after = replica.at(A);
         assert!(!Arc::ptr_eq(&before, &after), "another object");
         assert_eq!(keyed(&after), (2, 1, 2), "the sessions that stand");
@@ -365,7 +370,6 @@ mod tests {
 
         // The row's facts move: the holder builds another object for it.
         replica.relabel(A);
-        replica.follow();
         let after = replica.at(A);
         assert!(!Arc::ptr_eq(&before, &after), "another object");
         assert_eq!(after.load(), 2, "the leases that stand");
@@ -527,7 +531,6 @@ mod tests {
                 Constraints, Decided, InProcess, LentList, Request, RequestFacts, RequestMaker,
                 Role, WorkerLists,
             },
-            store::WorkerStatus,
         };
 
         /// A single request with the list its host hands for it.
@@ -547,18 +550,14 @@ mod tests {
             }
         }
 
-        let mut replica = Replica::new();
-        replica.objects = replica.objects.with_status_followed();
+        let replica = Replica::new();
         let rows = [replica.write(A), replica.write(B)];
         for url in [A, B] {
             let row = replica.store.by_key(url).expect("a row");
-            let ready = WorkerStatus::Ready;
-            assert!(replica
-                .store
-                .set_status(row.id, ready, row.revision)
-                .is_some());
+            replica
+                .objects
+                .connect_row(&replica.store, row.id, row.revision);
         }
-        replica.follow();
         let registry = replica.objects.registry();
         let generation = registry.model_generation("m").expect("a generation");
         let list = replica.objects.lent(&generation, Role::Single);

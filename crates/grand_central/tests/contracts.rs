@@ -27,19 +27,14 @@ use prost_types::{
 use smg_grand_central::{
     cases,
     document::{PolicySpec, DENIED_HEADERS},
-    engine::{
-        fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Health, Identity, LiftedVeto,
-        LoadRow, MediaCounts, OverloadRegime, Pair, Phase, PoolFacts, Queue, RequestFacts, Role,
-        Shed, ShedReason, SignalSource, Target, Trace, ZoneCapacity,
-    },
-    mirrored, record,
-    tracking::{Lease, LeaseKind, Side},
+    engine::{fingerprint, Identity, Phase, RequestFacts, Role, ShedReason},
+    mirrored,
+    tracking::Side,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
 const PLUGIN_PROTO: &str = "policy_plugin.proto";
 const CONTROLLER_PROTO: &str = "grand_central.proto";
-const ENGINE_WIRE_PROTO: &str = "common.proto";
 const WORLD_WIT: &str = "smg-policy.wit";
 const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
@@ -72,271 +67,73 @@ fn the_header_deny_list_holds_its_seven_names() {
 // a pattern that names every field without `..` and a match without a
 // wildcard arm, so a type cannot gain, lose or rename one without this file
 // failing to compile. No such pattern of a type marked non-exhaustive
-// builds outside the library: the lists of those five are stated there, by
+// builds outside the library: the lists of those types are stated there, by
 // the same macros, and read here (`mirrored::outcome` and its like).
 
 fn candidate_record() -> &'static [&'static str] {
-    record!(
-        Candidate,
-        Candidate {
-            position,
-            id,
-            role,
-            dp_rank,
-            dp_size,
-            health,
-            wire_modes,
-            engine_kind,
-            connector,
-            in_flight,
-            load,
-            load_sampled_at_micros,
-            session_hit,
-            session_in_flight,
-            pair_class,
-            has_capacity,
-            has_room,
-            zone,
-            labels,
-            ec_compatible,
-            vision,
-            host_local,
-            active_sessions,
-            key,
-            engine,
-        }
-    )
+    mirrored::candidate()
 }
 
 /// A candidate's affinity facts: a column beside the rows in the crate, five
 /// fields of the candidate's own record on both wires, at the numbers they
 /// were given as fields of the row.
 fn affinity_record() -> &'static [&'static str] {
-    record!(
-        AffinityFacts,
-        AffinityFacts {
-            overlap_blocks,
-            predicted_blocks,
-            admitted_age_ms,
-            indexed_growth,
-            indexed_blocks,
-        }
-    )
+    mirrored::affinity_facts()
 }
 
 fn request_record() -> &'static [&'static str] {
-    record!(
-        RequestFacts<'_>,
-        RequestFacts {
-            model,
-            namespace_seed,
-            tenant,
-            priority,
-            streaming,
-            max_output_tokens,
-            prompt_tokens,
-            block_hashes,
-            hash_kind,
-            session_key,
-            phase,
-            attempt,
-            tried,
-            budget_micros,
-            headers,
-            media,
-            seed,
-            block_size,
-            prompt_chars,
-            prompt_bytes,
-            now_micros,
-            session_counted,
-            affinity,
-            named,
-            model_fingerprint,
-            signal_cells,
-            client_key,
-            ring,
-            ring_positions,
-            session_key_from_rid,
-        }
-    )
+    mirrored::request_facts()
 }
 
 fn load_row_record() -> &'static [&'static str] {
-    record!(
-        LoadRow,
-        LoadRow {
-            running,
-            queued,
-            waiting_uncached_tokens,
-            kv_usage_permille,
-            active_kv_permille,
-            live_rate,
-            resident_tokens,
-            resident_counted,
-            report_age_ms,
-            source,
-            max_running,
-        }
-    )
+    mirrored::load_row()
 }
 
 fn constraints_record() -> &'static [&'static str] {
-    record!(
-        Constraints<'_>,
-        Constraints {
-            excluded,
-            wire_modes,
-            overload_lifted,
-            decode_later,
-            counted_on_decode,
-            subset_hint,
-            demands,
-            stalled,
-            held,
-            places
-        }
-    )
+    mirrored::constraints()
 }
 
 fn pool_record() -> &'static [&'static str] {
-    record!(
-        PoolFacts<'_>,
-        PoolFacts {
-            pool_size,
-            membership_epoch,
-            ring_epoch,
-            regime,
-            generation,
-            zones,
-            reach,
-            reported,
-            engines,
-            word,
-        }
-    )
+    mirrored::pool_facts()
 }
 
 fn zone_record() -> &'static [&'static str] {
-    record!(
-        ZoneCapacity,
-        ZoneCapacity {
-            zone,
-            healthy,
-            total
-        }
-    )
+    mirrored::zone_capacity()
 }
 
 fn media_record() -> &'static [&'static str] {
-    record!(
-        MediaCounts,
-        MediaCounts {
-            images,
-            audio,
-            video,
-            bytes
-        }
-    )
+    mirrored::media_counts()
 }
 
 fn health_record() -> &'static [&'static str] {
-    record!(
-        Health,
-        Health {
-            healthy,
-            breaker_open,
-            stalled,
-            draining,
-            overloaded
-        }
-    )
+    mirrored::health()
 }
 
 fn target_record() -> &'static [&'static str] {
-    record!(
-        Target,
-        Target {
-            position,
-            id,
-            dp_rank,
-            pair
-        }
-    )
+    mirrored::target()
 }
 
 fn pair_record() -> &'static [&'static str] {
-    record!(
-        Pair,
-        Pair {
-            decode_position,
-            decode_id,
-            decode_dp_rank,
-            decode_verdict
-        }
-    )
+    mirrored::pair()
 }
 
 fn shed_record() -> &'static [&'static str] {
-    record!(
-        Shed,
-        Shed {
-            reason,
-            emptied_by,
-            retry_after_secs,
-            wait_allowed,
-            trace
-        }
-    )
+    mirrored::shed()
 }
 
 fn queue_record() -> &'static [&'static str] {
-    record!(
-        Queue,
-        Queue {
-            ticket,
-            max_wait_micros,
-            trace
-        }
-    )
+    mirrored::queue()
 }
 
 fn trace_record() -> &'static [&'static str] {
-    record!(
-        Trace,
-        Trace {
-            profile,
-            survivors,
-            top,
-            top_len,
-            seed,
-            generation,
-            lifted
-        }
-    )
+    mirrored::trace()
 }
 
 /// The lease's session crosses under the name both contracts still spell,
 /// `session_key`. A gateway's client reads it under that name. A change that
 /// renames the field renames it in both contracts and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
-    record!(
-        Lease,
-        Lease {
-            id,
-            kind,
-            side,
-            target_index,
-            booked,
-            generation,
-            session as "session_key",
-            session_verdict,
-            issued_micros,
-            tokens,
-            chars,
-            bytes,
-        }
-    )
+    mirrored::lease()
 }
 
 fn outcome_record() -> &'static [&'static str] {
@@ -395,51 +192,24 @@ fn enum_mirrors() -> Vec<(
                 }
             ),
         ),
-        (
-            "HashKind",
-            "HASH_KIND",
-            "hash-kind",
-            cases!(HashKind, HashKind { Token, Text }),
-        ),
+        ("HashKind", "HASH_KIND", "hash-kind", mirrored::hash_kind()),
         (
             "SignalSource",
             "SIGNAL_SOURCE",
             "signal-source",
-            cases!(
-                SignalSource,
-                SignalSource {
-                    None,
-                    Events,
-                    Scrape,
-                    Relay,
-                    Poll
-                }
-            ),
+            mirrored::signal_source(),
         ),
         (
             "OverloadRegime",
             "OVERLOAD_REGIME",
             "overload-regime",
-            cases!(
-                OverloadRegime,
-                OverloadRegime {
-                    None,
-                    Partial,
-                    Saturated
-                }
-            ),
+            mirrored::overload_regime(),
         ),
         (
             "LeaseKind",
             "LEASE_KIND",
             "lease-kind",
-            cases!(
-                LeaseKind,
-                LeaseKind {
-                    Credit,
-                    Reservation
-                }
-            ),
+            mirrored::lease_kind(),
         ),
         (
             "Completed.Class",
@@ -597,6 +367,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "signal_cells",
                 "ring",
                 "ring_positions",
+                "decode_ring_positions",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -635,6 +406,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "stalled",
                 "held",
                 "places",
+                "target_worker",
             ],
             wire_only: &[],
             wire: &[
@@ -691,7 +463,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Pair",
             record: pair_record(),
-            host_only: &["decode_position", "decode_verdict"],
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
             wire_only: &[],
             wire: &[
                 ("decode_id", Type::Fixed64),
@@ -857,6 +629,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "client_key",
                 "ring",
                 "ring_positions",
+                "decode_ring_positions",
                 "session_key_from_rid",
             ],
             before: &[],
@@ -892,7 +665,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
-            host_only: &["decode_position", "decode_verdict"],
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
             before: &[],
             beside: &[],
         },
@@ -933,8 +706,6 @@ const CONTROLLER_RPCS: &[Rpc] = &[
         false,
         true,
     ),
-    ("PushLoad", "LoadReport", "Ack", true, false),
-    ("PushKvEvents", "RelayKvFrame", "Ack", true, false),
     (
         "RegisterWorker",
         "RegisterWorkerRequest",
@@ -1080,12 +851,6 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
         "made",
         &["registered", "replaced", "removed", "relabelled"],
     ),
-    (
-        CONTROLLER_PROTO,
-        "RelayKvFrame",
-        "frame",
-        &["batch", "subscribed", "resync", "ended"],
-    ),
     (CONTROLLER_PROTO, "ReplicaFrame", "frame", &["hello", "ack"]),
     (
         CONTROLLER_PROTO,
@@ -1139,12 +904,6 @@ fn contracts_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts")
 }
 
-/// The engine wire's protos (`smg.grpc.common`): the controller protocol
-/// imports the load record and the event batch a relay forwards unchanged.
-fn engine_wire_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../worker/proto")
-}
-
 fn compile_protocol() -> io::Result<FileDescriptorSet> {
     let dir = contracts_dir();
     let mut config = prost_build::Config::new();
@@ -1153,7 +912,7 @@ fn compile_protocol() -> io::Result<FileDescriptorSet> {
     config.protoc_arg("--experimental_allow_proto3_optional");
     config.load_fds(
         &[dir.join(PLUGIN_PROTO), dir.join(CONTROLLER_PROTO)],
-        &[dir, engine_wire_dir()],
+        &[dir],
     )
 }
 
@@ -1424,8 +1183,8 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     assert_eq!(controller.package(), PACKAGE);
     assert_eq!(
         controller.dependency,
-        strings(&[PLUGIN_PROTO, ENGINE_WIRE_PROTO]),
-        "the controller protocol imports the plugin vocabulary and the engine wire"
+        strings(&[PLUGIN_PROTO]),
+        "the controller protocol imports the plugin vocabulary alone"
     );
 
     for mirror in proto_mirrors() {
@@ -1494,21 +1253,14 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     // The lifted veto: the mark's variants in order, numbered from zero.
     // Its zero is none, a case, on purpose: the enum's comment says why.
     let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
-    let expected: Vec<(String, i32)> = cases!(
-        LiftedVeto,
-        LiftedVeto {
-            None,
-            Overload,
-            Liveness
-        }
-    )
-    .iter()
-    .enumerate()
-    .map(|(i, case)| {
-        let number = i32::try_from(i).unwrap_or(i32::MAX);
-        (format!("LIFTED_VETO_{}", screaming_case(case)), number)
-    })
-    .collect();
+    let expected: Vec<(String, i32)> = mirrored::lifted_veto()
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let number = i32::try_from(i).unwrap_or(i32::MAX);
+            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+        })
+        .collect();
     assert_eq!(
         found, expected,
         "the lifted vetoes are the mark's, from none"
@@ -1984,6 +1736,67 @@ fn the_membership_fields_are_pinned() {
     );
 }
 
+/// The ingestion scope left the principal's scopes with its two relay calls:
+/// its number and its name stay reserved, so a later scope takes neither.
+#[test]
+fn the_principals_scopes_keep_the_ingestion_scopes_number_and_name_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    assert_eq!(
+        enum_values(controller, "Principal.Scope"),
+        Some(vec![
+            ("SCOPE_UNSPECIFIED".to_owned(), 0),
+            ("SCOPE_GATEWAY".to_owned(), 1),
+            ("SCOPE_CONTROL".to_owned(), 3),
+            ("SCOPE_REPLICATION".to_owned(), 4),
+        ])
+    );
+    let scopes = message(controller, "Principal")
+        .and_then(|principal| principal.enum_type.iter().find(|e| e.name() == "Scope"))
+        .expect("Principal.Scope is in the controller file");
+    let reserved: Vec<i32> = scopes
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..=range.end())
+        .collect();
+    assert_eq!(reserved, [2], "the reserved number");
+    assert_eq!(scopes.reserved_name, strings(&["SCOPE_INGESTION"]));
+}
+
+/// A pair's class left the pairing descriptor, and a snapshot's pair rows
+/// left with their message: no writer filled either. The two numbers and
+/// names stay reserved, so a later field takes neither, and no message
+/// takes the name of the one that left.
+#[test]
+fn the_pair_class_and_the_pair_rows_keep_their_numbers_and_names_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, number, name) in [
+        ("PairingDescriptor", 8, "pair_class"),
+        ("Snapshot", 9, "pairs"),
+    ] {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let reserved: Vec<i32> = compiled
+            .reserved_range
+            .iter()
+            .flat_map(|range| range.start()..range.end())
+            .collect();
+        assert_eq!(reserved, [number], "{message_name}: the reserved number");
+        assert_eq!(
+            compiled.reserved_name,
+            strings(&[name]),
+            "{message_name}: the reserved name"
+        );
+    }
+    assert!(
+        message(controller, "PairRow").is_none(),
+        "no message takes the name of the pair row that left"
+    );
+}
+
 /// The packed request block's layout as the world's comment states it: an
 /// 80-byte header, the model bytes, zero bytes to the next multiple of 8,
 /// then the u64 sections. The arithmetic is mirrored here so the alignment
@@ -2281,11 +2094,12 @@ fn the_published_session_example_is_what_the_crate_makes() {
         ("decode", Phase::Decode),
         ("encode", Phase::Encode),
     ] {
-        let session = RequestFacts {
-            model: "model-a",
-            session_key: Identity::plain("conversation-7"),
-            phase,
-            ..RequestFacts::default()
+        let session = {
+            let mut facts = RequestFacts::default();
+            facts.model = "model-a";
+            facts.session_key = Identity::plain("conversation-7");
+            facts.phase = phase;
+            facts
         }
         .session();
         stated.push((name, session.get()));

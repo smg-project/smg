@@ -22,8 +22,9 @@
 //!
 //! A frame whose lease is on file tells the engine that issued it, the
 //! generation's own, what became of the decision: its dispatch, its
-//! completion or its release. A generation that no longer stands is told
-//! nothing: the stages of a later one never saw the issue. A dispatch
+//! completion or its release. Behind a later generation's start the
+//! stages that one kept are told, and no stage it built new: such a stage
+//! never saw the issue. A dispatch
 //! alone goes further: it feeds the standing generation's counts of
 //! sends, whichever generation issued the lease, where the replica's
 //! worker objects still list the worker at the rank the dispatch names.
@@ -255,6 +256,9 @@ fn past(field: &'static str, number: u32, most: u32) -> Status {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    // What an applied document keeps of the stages, and who hears a lease
+    // of the document before it.
+    mod kept_stages;
     // The rule a guard's lease is told by.
     mod lease_on_file;
     mod pair_on_file;
@@ -295,8 +299,8 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            DecodeSide, GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, MemoryStore,
-            PickRecord, WorkerFacts, WorkersStore,
+            memory::seam, DecodeSide, GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore,
+            MemoryStore, PickRecord, Registrant, WorkerFacts, WorkersStore,
         },
         tracking::{
             lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
@@ -329,20 +333,22 @@ pub(crate) mod tests {
         Hand::new(gateway)
     }
 
-    /// A worker the store holds a row for.
+    /// What a worker of the cases states under `key`.
+    fn stated(key: &str) -> WorkerFacts {
+        WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            models: vec!["m".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        }
+    }
+
+    /// A worker the store holds a row for, in a store no holder of worker
+    /// objects stands over.
     pub(crate) fn worker(store: &MemoryStore, key: &str) -> WorkerId {
-        WorkersStore::upsert(
-            store,
-            WorkerFacts {
-                key: key.to_owned(),
-                engine: key.to_owned(),
-                incarnation: 1,
-                models: vec!["m".to_owned()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            },
-        )
-        .id()
+        WorkersStore::upsert(store, stated(key)).id()
     }
 
     pub(crate) fn a_dispatched(lease: u64) -> proto::Dispatched {
@@ -700,14 +706,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// Two frames of one take are told under one world, the take's: a
+    /// Two frames of one take are handed one world, the take's: a
     /// generation that starts inside the first frame's call starts behind
-    /// that load, and the second frame still reaches the engine that issued
-    /// its lease. The next take's frame is told under the world of its own
-    /// tell: the later generation stands there, and its stages never saw
-    /// the issue.
+    /// that load. The second frame is told by the generation that stands
+    /// at its word all the same, and so is the next take's frame. The
+    /// stage that left with the generation before hears neither, and the
+    /// stage built for the later one never saw the issues.
     #[test]
-    fn a_takes_second_frame_reaches_its_leases_engine_behind_a_later_generations_start() {
+    fn a_takes_second_frame_is_told_by_the_generation_that_started_inside_its_first() {
         let store = Arc::new(MemoryStore::new());
         let t0 = Instant::now();
         let first = hearing(&store, 1);
@@ -726,13 +732,19 @@ pub(crate) mod tests {
             released(&store, &hand, &a_released(id)).expect("the frame reads");
         }
         at_work.apply();
-        let told = [1, 2].map(|lease| ("released", lease, WorkerId(0)));
+        // The first frame's word was under way when the generation started.
+        let told = [("released", 1, WorkerId(0))];
         assert_eq!(*first.lock(), told);
         released(&store, &hand, &a_released(3)).expect("the frame reads");
         at_work.apply();
         let second = second.lock().take();
         let second = second.expect("the first release applied generation 2");
-        assert_eq!((first.lock().len(), second.lock().len()), (2, 0));
+        assert_eq!((first.lock().len(), second.lock().len()), (1, 0));
+        assert_eq!(
+            state(&store, A, 2),
+            None,
+            "the file is written all the same"
+        );
     }
 
     #[test]
@@ -934,18 +946,24 @@ pub(crate) mod tests {
         store.issue(record).expect("a lease");
     }
 
-    /// A lease whose generation left tells no engine of its dispatch: the
-    /// table of the generation that stands holds no key behind it.
+    /// A lease whose generation left tells its dispatch to the session
+    /// table, which the generation that stands reads though it kept none
+    /// of that generation's stages: the key is pinned there on the worker
+    /// the request went to. The table is the store's engine's, one for
+    /// every generation. The lease here is filed by hand, so no decision
+    /// claimed its key: the dispatch's pin is the key's first.
     #[test]
-    fn a_lease_of_a_generation_that_left_tells_no_engine_of_its_dispatch() {
+    fn a_dispatch_of_a_lease_whose_generation_left_pins_its_key_in_the_standing_table() {
         let store = MemoryStore::new();
         let t0 = Instant::now();
-        let _first = hearing(&store, 1);
+        let first = hearing(&store, 1);
         keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
-        let _second = hearing(&store, 2);
+        let second = hearing(&store, 2);
+        let pins = || store.with_snapshot(|world| world.spec().engine().sessions().pins(KEY));
+        assert_eq!(pins(), None, "no decision claimed the key");
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
-        let table = store.with_snapshot(|world| world.spec().engine().sessions().len());
-        assert_eq!(table, 0);
+        assert_eq!(pins(), Some([WorkerId(7), WorkerId(0)]));
+        assert!(first.lock().is_empty() && second.lock().is_empty());
     }
 
     #[test]
@@ -1231,8 +1249,17 @@ pub(crate) mod tests {
     /// `generation` of the least-load preset, whose scorer reads its
     /// profile's count of sends.
     fn counted(generation: u64) -> AppliedSpec {
+        counted_under(generation, None)
+    }
+
+    /// [`counted`] with `limit` as its profile's time limit on a send. A
+    /// document that states another limit than the standing one builds the
+    /// profile and its count anew.
+    fn counted_under(generation: u64, limit: Option<u32>) -> AppliedSpec {
         let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
         document.generation = generation;
+        let profile = document.profiles.get_mut("least_load");
+        profile.expect("the preset's profile").sent_ttl_ms = limit;
         let digest = document.digest().expect("the document digests");
         AppliedSpec::validate_digested(&document, digest, &StageRegistry::builtin(), &[])
             .expect("a preset of this build validates")
@@ -1241,8 +1268,17 @@ pub(crate) mod tests {
     /// Applies [`counted`] of `generation` and hands back that generation's
     /// count of sends.
     fn counting(store: &MemoryStore, generation: u64) -> Arc<DispatchCredit> {
+        counting_under(store, generation, None)
+    }
+
+    /// [`counting`] for [`counted_under`].
+    fn counting_under(
+        store: &MemoryStore,
+        generation: u64,
+        limit: Option<u32>,
+    ) -> Arc<DispatchCredit> {
         store
-            .apply(counted(generation))
+            .apply(counted_under(generation, limit))
             .expect("a later generation");
         store.deciding(|world| Arc::clone(&world.spec().engine().sent_credits[0]))
     }
@@ -1268,17 +1304,180 @@ pub(crate) mod tests {
     /// A dispatch enters the count of sends of the generation that stands,
     /// whichever generation issued its lease: the store tells the standing
     /// engine of every send, and a generation that left counts no more.
+    /// The standing generation states another limit, so its count is built
+    /// new.
     #[test]
     fn a_dispatch_of_an_older_generations_lease_enters_the_standing_generations_sends() {
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         let t0 = Instant::now();
-        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let first = counting(&store, 1);
         issued_on(&store, 1, 1, served, t0);
-        let standing = counting(&store, 2);
+        let standing = counting_under(&store, 2, Some(60_000));
+        assert!(!Arc::ptr_eq(&first, &standing), "a count built new");
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
         assert_eq!(sends(&standing, served), 1);
         assert_eq!(sends(&first, served), 0, "the generation that left");
+    }
+
+    /// A generation that states the profile as it stood keeps the
+    /// profile's count of sends: the standing count is the one object, with
+    /// the sends it holds. A dispatch of an older generation's lease is
+    /// counted in it once.
+    #[test]
+    fn an_apply_keeps_the_count_of_an_unchanged_profile_with_its_sends() {
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        let t0 = Instant::now();
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
+        let first = counting(&store, 1);
+        for id in 1..=2 {
+            issued_on(&store, id, 1, served, t0);
+        }
+        dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
+        let kept = counting(&store, 2);
+        assert!(Arc::ptr_eq(&first, &kept), "the count stands as one object");
+        assert_eq!(sends(&kept, served), 1);
+        dispatched(&store, &open(&store, A), &a_dispatched(2), t0).expect("the frame reads");
+        assert_eq!(sends(&kept, served), 2);
+    }
+
+    /// Applies `generation` of the least-load preset under the picker that
+    /// keeps what it hears: that generation's count of sends, and what its
+    /// stage heard.
+    fn counting_and_hearing(
+        store: &MemoryStore,
+        generation: u64,
+    ) -> (Arc<DispatchCredit>, Arc<Mutex<Heard>>) {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&heard);
+        let mut catalog = StageRegistry::builtin();
+        let stage =
+            move || -> Box<dyn Picker> { Box::new(Hears(Arc::clone(&kept), Indexes::default())) };
+        catalog.picker("hears", stage).expect("a free name");
+        let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
+        document.generation = generation;
+        let profile = document.profiles.get_mut("least_load");
+        profile.expect("the preset's profile").pick = "hears".into();
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+            .expect("the catalog holds the stage");
+        store.apply(spec).expect("a later generation");
+        let count = store.deciding(|world| Arc::clone(&world.spec().engine().sent_credits[0]));
+        (count, heard)
+    }
+
+    /// A lease of a generation above the one in force tells no stage and
+    /// moves no pin: no stage of this replica booked it. Its dispatch is a
+    /// send of the host's all the same, and the counts of sends in force
+    /// take it. No decision files such a lease on one replica: a decision
+    /// reads its generation off a published world, and the generations
+    /// only rise. The case files one by hand.
+    #[test]
+    fn a_lease_above_the_generation_in_force_tells_no_stage_and_its_send_is_counted() {
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        let t0 = Instant::now();
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
+        let (count, heard) = counting_and_hearing(&store, 1);
+        let mut record = lease(A, 1, t0);
+        record.lease.generation = 2;
+        record.lease.session = KEY;
+        record.lease.session_verdict = SessionVerdict::Claimed(served);
+        record.target = served;
+        store.issue(record).expect("a lease");
+        let hand = open(&store, A);
+        dispatched(&store, &hand, &a_dispatched(1), t0).expect("the frame reads");
+        assert_eq!(sends(&count, served), 1, "a send of the host's");
+        completed(&store, &hand, &a_completed(1, served)).expect("the frame reads");
+        assert_eq!(state(&store, A, 1), None, "the lease ended on file");
+        assert!(heard.lock().is_empty(), "no stage booked the lease");
+        let pins = store.with_snapshot(|world| world.spec().engine().sessions().pins(KEY));
+        assert_eq!(pins, None, "and the session table took no pin");
+        assert_eq!(store.lifecycle_faults(), 0);
+    }
+
+    /// A send said inside an apply, between the engine's turn and the
+    /// publication of the generation's world, enters the count of the
+    /// generation the standing world holds. The count built for the new
+    /// generation took that count's entries over at the engine's turn and
+    /// shares them: it reads a send to a rank that stood there, as it
+    /// reads the sends said before the apply. A rank first heard in the
+    /// window stands in the count before alone, which no decision reads
+    /// behind the publication: the new count is one send short on it. No
+    /// word of a lease takes a send out of a count, so the ends said
+    /// behind the publication leave both counts as they stood.
+    #[test]
+    fn a_send_said_inside_an_apply_is_read_by_the_count_built_for_its_generation() {
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        let t0 = Instant::now();
+        let known = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
+        let fresh = ready(
+            &store,
+            &objects,
+            "b",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
+        let first = counting(&store, 1);
+        for (id, target) in [(1, known), (2, known), (3, fresh)] {
+            issued_on(&store, id, 1, target, t0);
+        }
+        // A send before the apply: the count holds an entry of the rank.
+        dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");
+        let inside = Arc::clone(&store);
+        seam::on_turn(move || {
+            let turned = inside.deciding(|world| !world.front().still_in_force());
+            assert!(
+                turned,
+                "the engine holds the generation, the world does not"
+            );
+            for id in 2..=3 {
+                let said = dispatched(&inside, &open(&inside, A), &a_dispatched(id), t0);
+                said.expect("the frame reads");
+            }
+        });
+        let standing = counting_under(&store, 2, Some(60_000));
+        assert!(!Arc::ptr_eq(&first, &standing), "a count built new");
+        let reads = |count: &DispatchCredit| [sends(count, known), sends(count, fresh)];
+        assert_eq!(reads(&standing), [2, 0]);
+        assert_eq!(reads(&first), [2, 1]);
+        for (id, served) in [(2, known), (3, fresh)] {
+            completed(&store, &open(&store, A), &a_completed(id, served)).expect("the frame reads");
+        }
+        assert_eq!(reads(&standing), [2, 0], "an end takes no send out");
+        assert_eq!(reads(&first), [2, 1]);
     }
 
     /// The `random` picker, whose call at a dispatch panics.
@@ -1315,9 +1514,17 @@ pub(crate) mod tests {
     /// the session's pin moved all the same.
     #[test]
     fn a_stage_that_panics_at_a_dispatch_leaves_the_send_counted_and_the_pin_moved() {
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         let t0 = Instant::now();
-        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let mut catalog = StageRegistry::builtin();
         catalog
             .picker("bursts", || Box::new(Bursts))
@@ -1355,12 +1562,25 @@ pub(crate) mod tests {
         let objects = holder(&store);
         tells(&store, &objects);
         let t0 = Instant::now();
-        let left = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
-        let stays = ready(&store, "b", COUNTED, Role::Single, WireModes::HTTP);
+        let left = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
+        let stays = ready(
+            &store,
+            &objects,
+            "b",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let count = counting(&store, 1);
         issued_on(&store, 1, 1, left, t0);
         issued_on(&store, 2, 1, stays, t0);
-        objects.follow(&*store);
         let row = WorkersStore::get(&*store, left).expect("the row");
         let removed = objects.remove(&store, left, row.revision);
         assert!(removed.is_some(), "the row leaves");
@@ -1377,22 +1597,31 @@ pub(crate) mod tests {
 
     /// A pair's dispatch is counted as a single's is: on the side's own
     /// worker, by the generation that stands, whichever issued the lease,
-    /// and at no rank of a worker that left.
+    /// and at no rank of a worker that left. The standing generation states
+    /// another limit, so its count is built new.
     #[test]
     fn a_pairs_dispatch_is_counted_by_the_standing_generation_where_its_worker_stands() {
         let store = Arc::new(MemoryStore::new());
         let objects = holder(&store);
         tells(&store, &objects);
         let t0 = Instant::now();
-        let [prefill, stays, left] =
-            ["p", "a", "b"].map(|key| ready(&store, key, COUNTED, Role::Single, WireModes::HTTP));
+        let [prefill, stays, left] = ["p", "a", "b"].map(|key| {
+            ready(
+                &store,
+                &objects,
+                key,
+                COUNTED,
+                Role::Single,
+                WireModes::HTTP,
+            )
+        });
         let first = counting(&store, 1);
         // Two pairs of the first generation, each on a decode of its own.
         for (id, decode) in [(1, stays), (2, left)] {
             issued_pair(&store, (id, 1), (prefill, decode), LeaseState::ISSUED, t0);
         }
-        let standing = counting(&store, 2);
-        objects.follow(&*store);
+        let standing = counting_under(&store, 2, Some(60_000));
+        assert!(!Arc::ptr_eq(&first, &standing), "a count built new");
         let row = WorkersStore::get(&*store, left).expect("the row");
         let removed = objects.remove(&store, left, row.revision);
         assert!(removed.is_some(), "the row leaves");
@@ -1412,7 +1641,7 @@ pub(crate) mod tests {
 
     /// A dispatch on a worker whose object stands is counted while the
     /// store's world lists the worker not yet: a registration's object
-    /// stands from its write, and the world lists its row at the build
+    /// stands from its write, and the world lists the worker at the build
     /// its publication window ends with. The decision that sent the
     /// request read the worker objects, and so does its count.
     #[test]
@@ -1422,8 +1651,8 @@ pub(crate) mod tests {
         tells(&store, &objects);
         let t0 = Instant::now();
         let count = counting(&store, 1);
-        let joined = worker(&store, "late");
-        objects.follow(&*store);
+        let written = objects.upsert(&store, stated("late"), Registrant::Control);
+        let joined = written.expect("the store takes the write").id();
         issued_on(&store, 1, 1, joined, t0);
         let listed = store.deciding(|world| world.booked_of(joined).is_some());
         assert!(!listed, "the world lists the worker inside its window");
@@ -1436,9 +1665,17 @@ pub(crate) mod tests {
     /// takes none.
     #[test]
     fn an_apply_hands_the_standing_sends_to_the_generation_it_takes() {
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
         let t0 = Instant::now();
-        let served = ready(&store, "a", COUNTED, Role::Single, WireModes::HTTP);
+        let served = ready(
+            &store,
+            &objects,
+            "a",
+            COUNTED,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let first = counting(&store, 1);
         issued_on(&store, 1, 1, served, t0);
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("the frame reads");

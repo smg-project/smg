@@ -532,6 +532,36 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     assert!(unshadowed.in_force().shadow_counts.get().is_none());
 }
 
+/// A shadow's word is counted in the tables of the document its decision
+/// ran under, also where another document was put in force between the
+/// decision and its caller's filing: the caller counts through the value
+/// its decision ran under, as a store's world hands it. The document in
+/// force by then holds another binding's tables, and no word of this
+/// decision lands there.
+#[test]
+fn a_shadows_word_is_counted_under_the_document_its_decision_ran_under() {
+    let list = pool(3);
+    let rules = (Rule::Place(0), Some(Rule::Place(1)));
+    let (document, stages, _) = bed_document("random", rules.0, rules.1, |_| {});
+    let engine = engine_of(document.clone(), &stages);
+    let members = PublishedList::new(Arc::clone(&list));
+    let asks = Asks::of(request(7), Some(&members));
+    // The decision's own hold of its document, as a world keeps one.
+    let held = engine.spec();
+    let own = held.under(&engine);
+    let answer = own.decide_without_lease(&asks, Instant::now());
+    let (_, said) = answer.expect("a decision");
+    assert!(said.is_some(), "the shadow's word");
+    let next = spec_at(2, document, &stages);
+    engine.apply(next).expect("a later document");
+    own.count_shadow(said);
+    assert_eq!(kinds(&engine), [0; 4], "the document in force said no word");
+    let counts = held.0.shadow_counts.get();
+    let counts = counts.expect("the decision's document counted its word");
+    let other_target = counts.of(0, ShadowSide::Single, ShadowKind::OtherTarget);
+    assert_eq!(other_target.load(Ordering::Relaxed), 1);
+}
+
 /// A live decision that sheds files no lease, and the entry still answers
 /// what its shadow said beside the shed: another outcome, with the shadow's
 /// own first target. Its caller counts that all the same, as the leasing
@@ -591,8 +621,16 @@ fn what_a_shadow_said_names_its_binding_its_kind_and_its_first_target() {
     let maker = Asks::of(asked, Some(&members));
     let now = Instant::now();
     let made = engine.members_of(members.lent());
-    let (decision, said) =
-        super::decide(engine.loaded(), &mut asked, made, &maker, None, now, word);
+    let (decision, said) = super::decide(
+        engine.loaded(),
+        &mut asked,
+        made,
+        &maker,
+        None,
+        None,
+        now,
+        word,
+    );
     // The shadow's picker takes the row behind the live pick's: the live
     // pick's alternate.
     let pick = decision.pick().expect("a pick");
