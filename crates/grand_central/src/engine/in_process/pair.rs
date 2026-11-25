@@ -69,7 +69,10 @@
 //! worker of the side holds of the request, by the host's index of cache
 //! events and by the record of sent prefixes, read at the side's phase.
 //! Behind a pick its profile is told of, each side's record keeps where
-//! the prompt went ([`overlap::record_by_column`]). The decode asked again
+//! the prompt went ([`overlap::record_by_column`]). A pair's first pick
+//! states what its prefill holds of the request, by the prefills' column
+//! ([`overlap::state`]): a host observes its cache series from it. Nothing
+//! is stated of the decode. The decode asked again
 //! reads the decodes' column alone. The two sides write into the model's
 //! one record under its one bound: a pair's request spends a placement a
 //! block for each side, where a single's spends one.
@@ -125,8 +128,8 @@ use crate::{
         records::{vetoes, HeldCells, Live, PoolRecords},
         shadow::{budget_left, ShadowSide, Shadowed, SHADOW_FLOOR},
         view::{
-            AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, Session,
-            SessionCountedUnder, WorkerId,
+            AffinityFacts, Candidate, Constraints, Feed, Phase, PoolFacts, RequestFacts, Role,
+            Session, SessionCountedUnder, WorkerId,
         },
     },
     stages::Lifecycle,
@@ -453,6 +456,11 @@ impl<'a> PairLists<'a> {
     /// side's ([`decide_decode_shadowed`]). A decision lent none asks no
     /// shadow and pays one test of its room.
     ///
+    /// A first decision's pick states what its prefill holds of the request
+    /// ([`overlap::state`]), where the request's own profile reads who
+    /// holds the prompt at the prefill phase. The decode decided again
+    /// states nothing.
+    ///
     /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
     /// [`RequestMaker::session_counted_under`]: crate::engine::RequestMaker::session_counted_under
     #[expect(
@@ -632,7 +640,7 @@ impl<'a> PairLists<'a> {
                 table: self.classes.table(),
                 first: self.classes.first(),
             };
-            let decision = match (held, said) {
+            let mut decision = match (held, said) {
                 (None, None) => {
                     let sides = (cx, [prefill_side, decode_side]);
                     decide_records(engine, facts, sides, &prefill_facts, pools, scratch)
@@ -653,6 +661,19 @@ impl<'a> PairLists<'a> {
                     decide_decode_shadowed(loaded, facts, side, pool, pools, held, scratch, said)
                 }
             };
+            // A pair states what its prefill holds of the request: its first
+            // target is that prefill, and the prefills' column is the one
+            // this decision was given. Stated at a first decision alone,
+            // where the request's own profile reads who holds the prompt at
+            // the prefill phase: the decode asked again has no prefill to
+            // state of, and a shadow's rows say nothing of the live pick.
+            if held.is_none()
+                && engine.needs_for_phase(Phase::Prefill).affinity
+                && engine.profile_reads_affinity(facts.model, Phase::Prefill)
+            {
+                let column = Feed::Column(prefill_column);
+                overlap::state(&mut decision, column, facts, spec.block_size());
+            }
             record_sides(
                 &decision,
                 facts,
@@ -2859,6 +2880,46 @@ mod tests {
                 host.decide_among(&OPEN, seed, Some(&held), Constraints::default(), outside);
             assert_eq!(host.picked(&again).1, other as usize, "seed {seed}");
         }
+    }
+
+    /// A pair's first pick states what its prefill holds of the request
+    /// ([`Pick::overlap`](crate::engine::Pick::overlap)), where the
+    /// request's own profile reads who holds the prompt at the prefill
+    /// phase: with no prompt sent before, a miss of the request's blocks.
+    /// The decode asked again states nothing: its prefill ran, and no
+    /// column of the prefills is read for it. Neither does a pair whose
+    /// prefill side reads no holder, whatever its decode side reads.
+    #[test]
+    fn a_pairs_first_pick_states_what_its_prefill_holds() {
+        use crate::engine::decision::Overlap;
+
+        let under = |prefill: &str, decode: &str| {
+            let document = PolicySpec::pair_presets(prefill, decode).expect("the pair presets");
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            Host::under((spec, Arc::default()), 2, 2)
+        };
+        let stated = |decision: &Decision| decision.pick().expect("a pick").overlap();
+
+        let host = under("cache_aware", "cache_aware");
+        let first = host.decide(&OPEN, 3, None);
+        let miss = stated(&first);
+        assert_ne!(miss.of, 0, "a miss is stated of the request's blocks");
+        let nothing_held = Overlap {
+            of: miss.of,
+            ..Overlap::NONE
+        };
+        assert_eq!(miss, nothing_held);
+        let held = first_target(&first);
+        let again = host.decide(&OPEN, 4, Some(held.id));
+        assert_eq!(stated(&again), Overlap::NONE, "the decode asked again");
+
+        let decode_alone = under("round_robin", "cache_aware");
+        let first = decode_alone.decide(&OPEN, 3, None);
+        assert_eq!(
+            stated(&first),
+            Overlap::NONE,
+            "a prefill side that reads none"
+        );
     }
 
     /// The decode asked again reads both lists at its own call, and keeps

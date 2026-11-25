@@ -158,12 +158,16 @@ pub struct Placement<'a> {
     /// What the pick states of the worker the request goes to
     /// ([`Overlap`]): how many leading blocks of the request that worker
     /// holds, of how many. A host observes its cache series from it, once
-    /// a placement that states one. A pick states it of its first target
-    /// alone ([`Pick::overlap`](crate::engine::Pick::overlap)), so it
-    /// stands here where the request goes to that target.
-    /// [`Overlap::NONE`], which states nothing, where the pick states none,
-    /// as a pair's does. So too for a place of which nothing is owed, and
-    /// for a request that goes to a later target of its pick.
+    /// a placement that states one. A pick states it of its first target's
+    /// worker alone ([`Pick::overlap`](crate::engine::Pick::overlap)), so
+    /// it stands here where the request goes to that worker. A single
+    /// request's first target is the one such. A pair's pick states what
+    /// its prefill holds and nothing of its decode, and every target of a
+    /// pair names that prefill: a pair sent to a later one is stated the
+    /// same, and a decode decided again leaves it as it stood.
+    /// [`Overlap::NONE`], which states nothing, where the pick states none.
+    /// So too for a place of which nothing is owed, and for a single request
+    /// that goes to a later target of its pick.
     pub overlap: Overlap,
     /// The pick's lease: a pair's always, a single request's where a stage
     /// of the document takes a word of a request. `None` for an answer of
@@ -228,10 +232,13 @@ impl Placement<'_> {
         // position in the document that decided.
         let profile = pick.map(|pick| engine.label_at(pick.trace.profile));
         let target = pick.and_then(|pick| pick.targets.as_slice().get(index).copied());
-        // A pick states what its first target holds, and nothing of the
-        // others: a request that goes to a later one is stated nothing.
-        let overlap = match pick {
-            Some(pick) if index == 0 => pick.overlap(),
+        // A pick states what its first target's worker holds: the request
+        // is stated it where it goes to that worker. A single request's
+        // later target is another worker and is stated nothing. A pair's
+        // targets share their prefill, so each is stated what the first is.
+        let first = pick.and_then(|pick| pick.targets.first());
+        let overlap = match (pick, first, target) {
+            (Some(pick), Some(first), Some(target)) if target.id == first.id => pick.overlap(),
             _ => Overlap::NONE,
         };
         // Held ahead of every refusal below: a lease ends at this guard's

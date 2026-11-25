@@ -1209,6 +1209,18 @@ fn row_name(policies: &PolicyRegistry, side: Option<RowSide>, label: &'static st
     )
 }
 
+/// Observes the match ratio a classic cache-aware selection observes of the
+/// worker it chose ([`Metrics::record_cache_aware_match_ratio`]): the share
+/// of the request's blocks a placement states its worker holds
+/// ([`Placement::overlap`]), a miss as zero. `blocks` of `of` are that
+/// statement's two numbers. One that states nothing, `of` at zero, observes
+/// nothing.
+fn observe_match_ratio(blocks: u16, of: u16) {
+    if of != 0 {
+        Metrics::record_cache_aware_match_ratio(f64::from(blocks) / f64::from(of));
+    }
+}
+
 /// Grand Central's answer for a single request over `lent`, the
 /// request's list with its cell: what `inputs` state of the request
 /// is handed as the engine reads it ([`place_request`]), with `ring`, the
@@ -1225,14 +1237,12 @@ fn row_name(policies: &PolicyRegistry, side: Option<RowSide>, label: &'static st
 /// counts a request under. The name is read off the settings: no policy
 /// object is asked.
 ///
-/// Observes the match ratio a classic cache-aware selection observes of the
-/// worker it chose ([`Metrics::record_cache_aware_match_ratio`]): the share
-/// of the request's blocks the placement states its worker holds
-/// ([`Placement::overlap`]), a miss as zero. One observation a placement
-/// that states one, under any profile whose stages read who holds the
-/// prompt. A placement that states nothing observes nothing: a profile that
-/// reads no such row, a request the sessions rule placed and keeps from the
-/// profile, and a request that goes to a later target of its pick.
+/// Observes the match ratio of the worker the request goes to
+/// ([`observe_match_ratio`]). One observation a placement that states one,
+/// under any profile whose stages read who holds the prompt. A placement
+/// that states nothing observes nothing: a profile that reads no such row,
+/// a request the sessions rule placed and keeps from the profile, and a
+/// request that goes to a later target of its pick, which is another worker.
 ///
 /// A traced request's decision record takes one row, as a classic
 /// selection's does ([`PolicyRegistry::select_worker_for_model`]): the
@@ -1285,10 +1295,7 @@ fn placed_by_engine(
         model_id,
         counted_under,
     );
-    let (blocks, of) = (placement.overlap.blocks, placement.overlap.of);
-    if of != 0 {
-        Metrics::record_cache_aware_match_ratio(f64::from(blocks) / f64::from(of));
-    }
+    observe_match_ratio(placement.overlap.blocks, placement.overlap.of);
     let named = || row_name(policies, None, placement.profile);
     engine_row(seen, named, Some(&placement.worker));
     // A placement is moved whole only where the engine is owed the request's
@@ -2560,6 +2567,13 @@ fn with_pair_request<R>(
 /// name the settings give the side's policy where the engine names none
 /// ([`PolicyRegistry::side_policy_name`]): no policy object is asked.
 ///
+/// Observes the match ratio once a pair ([`observe_match_ratio`]): the
+/// share of the request's blocks the placement states its prefill holds,
+/// where the prefill side's profile reads who holds the prompt. A classic
+/// pair observes each cache-aware side by that side's own policy, so twice
+/// where both sides run one: the engine's pick states nothing of its
+/// decode. A decode decided again ([`decode_again`]) observes nothing more.
+///
 /// The route's call that states the request ([`Stated`]) is made here,
 /// for a pair that can be placed.
 ///
@@ -2618,11 +2632,12 @@ fn pair_by_engine(
                     placement.profile,
                     placement.decode_profile.unwrap_or(placement.profile),
                 );
-                (labels, PlacedPair::by_engine(placement, stated))
+                let share = (placement.overlap.blocks, placement.overlap.of);
+                (labels, share, PlacedPair::by_engine(placement, stated))
             })
         },
     );
-    let (labels, pair) = match placed {
+    let (labels, (blocks, of), pair) = match placed {
         Ok(placed) => placed,
         Err(Unplaced::PrefillsFull) => {
             return Err(fail(
@@ -2683,6 +2698,8 @@ fn pair_by_engine(
         let seen = seen.filter(|_| side != DECODE_ROW || !later());
         engine_row(seen, || side_row(side, label), Some(worker.worker()));
     }
+    // What the placement states of its prefill: one observation a pair.
+    observe_match_ratio(blocks, of);
     debug!(
         prefill = %pair.prefill.redacted_url(),
         decode = %pair.decode.redacted_url(),
@@ -8927,6 +8944,89 @@ pub(crate) mod tests {
         let (went_back, round_robin) = observed(PolicyConfig::RoundRobin, as_text);
         assert!(!went_back, "the list's turn moves on");
         assert_eq!(round_robin, Vec::<String>::new());
+    }
+
+    /// While Grand Central decides, a pair observes the match ratio
+    /// once: the share of the request's blocks the engine's placement
+    /// states its prefill holds. A prompt's first pair reads a miss, and
+    /// its next pair, which goes back to its prefill, reads every block.
+    /// Both sides read who holds the prompt here, and each pair is one
+    /// sample: a classic pair observes each cache-aware side by that side's
+    /// own policy, so two samples a pair. Under a document whose prefill
+    /// side reads no prompt's holder the series stays silent, whatever its
+    /// decode side reads.
+    #[test]
+    fn a_pair_the_engine_places_observes_its_prefills_match_ratio_once() {
+        use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
+        use crate::observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS;
+
+        const SERIES: &str = "smg_cache_aware_match_ratio";
+        let observed = |prefill: &str, decode: &str| {
+            let recorder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full(String::from(SERIES)),
+                    CACHE_AWARE_MATCH_RATIO_BUCKETS,
+                )
+                .expect("the series' buckets")
+                .build_recorder();
+            let handle = recorder.handle();
+            let registry = pd_registry(&[
+                ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+            ]);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let document = PolicySpec::pair_presets(prefill, decode);
+            let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+            engine_on(&policies, spec.expect("a valid document"));
+            let pairs = pairs_of(&registry, &policies);
+            let tokens: Vec<u32> = (0..512).collect();
+            let inputs = PlacementInputs {
+                tokens: Some(&tokens),
+                ..Default::default()
+            };
+            // One pair placed, and the prefill it went to: its guards end
+            // with the statement.
+            let prefill_of_a_pair = || {
+                let pair = select_pair(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    None,
+                    inputs,
+                    Stated::nothing,
+                );
+                let pair = pair.expect("the engine places the pair");
+                pair.prefill.url().to_owned()
+            };
+            let went_back = metrics::with_local_recorder(&recorder, || {
+                let first = prefill_of_a_pair();
+                prefill_of_a_pair() == first
+            });
+            let rendered = handle.render();
+            let lines = rendered.lines().filter(|line| line.starts_with(SERIES));
+            (went_back, lines.map(str::to_owned).collect::<Vec<_>>())
+        };
+        let (went_back, both) = observed("cache_aware", "cache_aware");
+        assert!(went_back, "the prompt's next pair goes to its prefill");
+        for series in [
+            "smg_cache_aware_match_ratio_bucket{le=\"0\"} 1",
+            "smg_cache_aware_match_ratio_bucket{le=\"0.9\"} 1",
+            "smg_cache_aware_match_ratio_bucket{le=\"1\"} 2",
+            "smg_cache_aware_match_ratio_sum 1",
+            "smg_cache_aware_match_ratio_count 2",
+        ] {
+            assert!(
+                both.iter().any(|line| line == series),
+                "missing {series} in {both:#?}"
+            );
+        }
+        let (_, decode_alone) = observed("round_robin", "cache_aware");
+        assert_eq!(decode_alone, Vec::<String>::new());
     }
 
     // ---- a traced request under Grand Central ------------------------------------------------

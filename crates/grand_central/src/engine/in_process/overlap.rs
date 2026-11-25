@@ -15,7 +15,9 @@
 //! the request ([`Overlap`]): the worker's entry of the rows the decision was
 //! given, whoever named them. No stage is asked for it. It is stated where
 //! the request's own profile reads affinity: rows named for a binding's
-//! shadow alone state nothing of the live pick.
+//! shadow alone state nothing of the live pick. A pair's first decision
+//! states the same of its prefill, the first target's worker, from the
+//! prefills' column, and nothing of its decode (`state`).
 //!
 //! A request whose host names its entry in a token tree ([`TokenKey`]) is
 //! decided another way where the host lends the tree of the request's place
@@ -2084,9 +2086,10 @@ pub fn column(
 /// States in a decision's pick what its first target holds of the request
 /// ([`Overlap`]): that worker's entry of `feed`, the rows the decision was
 /// given. They are the rows named or the column filled here, a column the
-/// request's host filled, or the rows that host named
-/// ([`RequestFacts::feed`]): whoever named them, the entry is read the same
-/// way, and no stage is asked. A worker the rows do not name holds nothing,
+/// request's host filled, the rows that host named
+/// ([`RequestFacts::feed`]), or the prefills' column of a pair's first
+/// decision: whoever named them, the entry is read the same way, and no
+/// stage is asked. A worker the rows do not name holds nothing,
 /// as it did to the stages: the pick then states a miss of the request's
 /// blocks. `facts` are the request's own, which say its size, and `block`
 /// is the document's block size, by which the request is counted where its
@@ -2096,13 +2099,17 @@ pub fn column(
 /// over: a decision that reads no fact, as a pin's answer handed through
 /// here, then makes no copy of them for this statement.
 ///
+/// A pair's first target is its prefill, with its decode beside it: handed
+/// the prefills' column, a pair's pick states what its prefill holds. A
+/// pick has room for one statement, so nothing is stated of the decode.
+///
 /// Nothing is stated where the decision picked nobody, and for a pick the
 /// binding's sessions rule placed alone and keeps from the profile
 /// ([`told_target`]): such a request is none of the profile's, as a
 /// gateway's sticky map hands a request it places to no policy. The one
 /// place a pick's overlap is stated. Its callers ask it where the
 /// request's own profile reads affinity, and not for a shadow's rows.
-fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFacts<'_>, block: u32) {
+pub(super) fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFacts<'_>, block: u32) {
     let Some(row) = told_target(decision).map(|target| target.position) else {
         return;
     };
