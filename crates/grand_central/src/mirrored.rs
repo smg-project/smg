@@ -390,7 +390,8 @@ pub fn pair() -> &'static [&'static str] {
             decode_position,
             decode_id,
             decode_dp_rank,
-            decode_verdict
+            decode_verdict,
+            decode_placing
         }
     )
 }

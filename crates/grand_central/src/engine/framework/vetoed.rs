@@ -51,7 +51,7 @@ use super::{
 };
 use crate::{
     engine::{
-        decision::{Decision, LiftedVeto, Pick, Survivors, Targets, Trace},
+        decision::{Decision, LiftedVeto, Pick, Placing, Survivors, Targets, Trace},
         sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Health, PoolFacts, RequestFacts, Role},
     },
@@ -902,7 +902,8 @@ pub(super) fn paired(
             .retain(|&at| classed(classes, decode.rows[at as usize].pair_class));
         let mut pair = steered(decode.index, decode.facts, pool, decode.rows, buf);
         if let Decision::Pick(pick) = &mut pair {
-            pick.targets.pair_under(&first, SessionVerdict::None);
+            pick.targets
+                .pair_under(&first, SessionVerdict::None, Placing::Stages);
             pick.trace = taken.trace;
         }
         return Some(pair);

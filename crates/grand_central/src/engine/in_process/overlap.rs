@@ -99,7 +99,7 @@ use crate::{
         },
         warm_up::WarmUpState,
     },
-    tracking::prefix_predictor::PrefixPredictor,
+    tracking::{lease::Side, prefix_predictor::PrefixPredictor},
     Draw,
 };
 
@@ -2226,16 +2226,21 @@ pub(super) fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFact
 /// the request goes to ([`sent_target`]), which may be a later target.
 ///
 /// The rule's word is read through that one function at five places: the
-/// words of a single's lease, the record's two writes here, the store of a
+/// words of a lease, the record's two writes here, the store of a
 /// prompt in a lent tree ([`sent_address`]), the hand-over of a pin
 /// the keyed entry followed to this lookup, and a pair's two writes behind
-/// its pick, a side at a time. Under the rule's default word a request it
+/// its pick. Those two ask it a side at a time, each of its own side
+/// (`pair::record_sides`), and then name the target the request goes to
+/// ([`sent_to`]). A pair's first pick states what its prefill holds
+/// through here too ([`state`]): its first target is its prefill, and the
+/// word asked is the pick's own, which is the prefill side's, whatever
+/// placed its decode. Under the rule's default word a request it
 /// places is the profile's own, and its prompt is kept as any pick's. Under
 /// the other the rule keeps the request from the profile, as a gateway's
 /// sticky map hands a request it places to no policy: the policy's record
 /// never sees that request's prompt.
 pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
-    if !lease_events::stages_hear(decision) {
+    if !lease_events::stages_hear(decision, Side::Single) {
         return None;
     }
     decision.pick()?.targets.first()
@@ -2339,18 +2344,27 @@ impl PoolAffinity {
     }
 }
 
-/// The target a decision's request goes to: the first target of a pick the
-/// profile is told of ([`told_target`]) that the request's caller sends to
-/// (`sends_to`), asked best first. It is the worker a tree's match, the
-/// record's two writes and a pair's two writes behind its first pick keep
-/// the request's prefix for. `None` where the decision picked nobody, the
-/// binding's sessions rule keeps the request from the profile, or the
-/// caller sends to none of the pick's targets: nothing is stored.
+/// The target a single decision's request goes to: the first target of a
+/// pick the profile is told of ([`told_target`]) that the request's caller
+/// sends to (`sends_to`), asked best first. It is the worker a tree's
+/// match and the record's two writes keep the request's prefix for. `None`
+/// where the decision picked nobody, the binding's sessions rule keeps the
+/// request from the profile, or the caller sends to none of the pick's
+/// targets: nothing is stored.
 pub(super) fn sent_target(
     decision: &Decision,
     sends_to: impl Fn(&Target) -> bool,
 ) -> Option<&Target> {
     told_target(decision)?;
+    sent_to(decision, sends_to)
+}
+
+/// The first target of a decision's pick that the request's caller sends
+/// to (`sends_to`), asked best first, whatever the sessions rule says of
+/// the pick: a pair's two writes ask the rule's word of each side first
+/// (`pair::record_sides`). `None` where the decision picked nobody or the
+/// caller sends to none of the pick's targets.
+pub(super) fn sent_to(decision: &Decision, sends_to: impl Fn(&Target) -> bool) -> Option<&Target> {
     let mut targets = decision.pick()?.targets.iter();
     targets.find(|target| sends_to(target))
 }

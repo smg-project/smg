@@ -463,7 +463,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Pair",
             record: pair_record(),
-            host_only: &["decode_position", "decode_verdict"],
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
             wire_only: &[],
             wire: &[
                 ("decode_id", Type::Fixed64),
@@ -665,7 +665,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
-            host_only: &["decode_position", "decode_verdict"],
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
             before: &[],
             beside: &[],
         },
