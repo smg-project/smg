@@ -52,7 +52,8 @@
 //! - **Once a thread**: the buffers a naming writes into, and the writes
 //!   of a record that met a held lock, eight at most. A decision allocates
 //!   nothing once they have grown, but what a tree's own match and write
-//!   allocate.
+//!   allocate, and the list of a prompt that is hashed on a road that reads
+//!   it.
 //!
 //! No decision holds a lock across its stages: the naming ends before the
 //! decision runs, and the record is written after it answered. A decision
@@ -87,6 +88,7 @@ use crate::{
         decision::{Decision, Overlap, Target},
         decision_engine::{TextKey, TokenKey},
         lease_events,
+        prompt_hashes::PromptHashes,
         view::{
             blocks_within, fingerprint, AffinityFacts, AffinityHolder, AffinityRows, Feed,
             HashKind, Phase, RequestFacts, WorkerId,
@@ -1886,6 +1888,40 @@ pub fn decide<'p>(
     token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
     text_key: impl FnOnce() -> Option<TextKey<'p>>,
     sends_to: impl Fn(&Target) -> bool,
+    decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
+) -> Decision {
+    let hashed = || None;
+    decide_hashed(
+        affinity, pool, spec, workers, ids, facts, places, token_key, text_key, sends_to, hashed,
+        decide,
+    )
+}
+
+/// [`decide`] for a request whose making may have left its prompt's block
+/// hashes out of `facts`. `hashed` answers the whole list where it did
+/// ([`Made::hashed_whole`]) and `None` where the facts hold it. It is asked
+/// on the roads that read the list, by an index of cache events and by the
+/// record of sent prefixes, once, and those roads decide by a copy of the
+/// facts that holds it. A request decided inside a lent tree's match reads
+/// none of the list, and asks nothing.
+///
+/// [`Made::hashed_whole`]: super::place::Made::hashed_whole
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what `decide` takes, and the prompt's hashes where the request's making left them out"
+)]
+pub(super) fn decide_hashed<'p, 'h>(
+    affinity: &Affinity,
+    pool: &PoolAffinity,
+    spec: &AppliedSpec,
+    workers: &[Arc<dyn Worker>],
+    ids: &[WorkerId],
+    facts: &mut RequestFacts<'_>,
+    places: Option<&[u32]>,
+    token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+    text_key: impl FnOnce() -> Option<TextKey<'p>>,
+    sends_to: impl Fn(&Target) -> bool,
+    hashed: impl FnOnce() -> Option<&'h PromptHashes>,
     mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
 ) -> Decision {
     // No binding of the phase reads affinity: one test, and no table.
@@ -1922,7 +1958,9 @@ pub fn decide<'p>(
     with_buffers(|buffers| {
         pool.with_table(&asked, |table| {
             let keys = (token_key, text_key);
-            table.decide(workers, facts, places, buffers, keys, sends_to, decide)
+            table.decide(
+                workers, facts, places, buffers, keys, sends_to, hashed, decide,
+            )
         })
     })
 }
@@ -1933,9 +1971,9 @@ pub fn decide<'p>(
 /// one that left, and its prompt is stored for no target.
 #[expect(
     clippy::too_many_arguments,
-    reason = "what `decide` takes but a request's places, the count of leaves read ahead of the answer, and the answer"
+    reason = "what `decide_hashed` takes but a request's places, the count of leaves read ahead of the answer, and the answer"
 )]
-pub(super) fn decide_behind<'p>(
+pub(super) fn decide_behind<'p, 'h>(
     affinity: &Affinity,
     pool: &PoolAffinity,
     spec: &AppliedSpec,
@@ -1945,10 +1983,11 @@ pub(super) fn decide_behind<'p>(
     token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
     text_key: impl FnOnce() -> Option<TextKey<'p>>,
     sends_to: impl Fn(&Target) -> bool,
+    hashed: impl FnOnce() -> Option<&'h PromptHashes>,
     leaves: u64,
     made: Decision,
 ) -> Decision {
-    decide(
+    decide_hashed(
         affinity,
         pool,
         spec,
@@ -1962,6 +2001,7 @@ pub(super) fn decide_behind<'p>(
         token_key,
         text_key,
         |target| affinity.leaves() == leaves && sends_to(target),
+        hashed,
         |_| made,
     )
 }
@@ -2212,9 +2252,9 @@ impl Table {
     /// a request hashed by its text in the string tree.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the list, the request's facts and its places, the buffers, its entry in each tree and the target its caller takes, and the decision"
+        reason = "the list, the request's facts and its places, the buffers, its entry in each tree and the target its caller takes, its hashes where its making left them out, and the decision"
     )]
-    fn decide<'p>(
+    fn decide<'p, 'h>(
         &self,
         workers: &[Arc<dyn Worker>],
         facts: &mut RequestFacts<'_>,
@@ -2225,12 +2265,16 @@ impl Table {
             impl FnOnce() -> Option<TextKey<'p>>,
         ),
         sends_to: impl Fn(&Target) -> bool,
+        hashed: impl FnOnce() -> Option<&'h PromptHashes>,
         mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         if !self.reads {
             return decide(facts);
         }
         if self.cap == 0 {
+            // The fill reads the prompt's hashes: the list is asked for.
+            let whole = hashed().map(|hashes| hashes.over(facts));
+            let facts = whole.as_ref().unwrap_or(facts);
             return self.decide_by_column(facts, buffers, sends_to, decide);
         }
         // The entry is asked for where the host lends the place a tree,
@@ -2269,6 +2313,9 @@ impl Table {
             };
             return self.decide_in_tree(walk, sends_to, workers, facts, places, buffers, decide);
         }
+        // The naming reads the prompt's hashes: the list is asked for.
+        let whole = hashed().map(|hashes| hashes.over(facts));
+        let facts = whole.as_ref().unwrap_or(facts);
         let read = self.name(facts, places, buffers);
         let named = self.named_rows(buffers);
         let mut decision = decide(&mut RequestFacts {

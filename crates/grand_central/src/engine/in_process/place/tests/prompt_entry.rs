@@ -487,3 +487,67 @@ fn a_rule_that_panics_inside_the_lookup_leaves_no_lease_behind() {
     assert!(tree.get_tenant_token_counts().is_empty());
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
+
+/// A prompt is hashed where a lookup reads its hashes. A call's request of
+/// token ids that states its entry in a token tree is made with no block
+/// hashed, at its size in blocks: inside a lent tree's match no stage of
+/// the preset reads a hash. The host here lends its tree while the request
+/// is made and none behind that, so the call's ask is named by the record
+/// of sent prefixes: the list is hashed for it there, and the prompt sent
+/// again goes back to the worker that ask picked. A list whose lookup is
+/// first read while the host lends again is decided inside the tree's
+/// match, and no block is hashed for it.
+#[test]
+fn a_prompt_is_hashed_where_a_lookup_reads_its_hashes() {
+    /// A host that lends its token tree until it is told to stop.
+    struct Lends(Arc<TokenTree>, atomic::AtomicBool);
+    impl CacheIndexes for Lends {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            None
+        }
+
+        fn token_tree(&self, _: &str, _: Phase) -> Option<Arc<TokenTree>> {
+            (!self.1.load(atomic::Ordering::Relaxed)).then(|| Arc::clone(&self.0))
+        }
+    }
+    let tree = Arc::new(TokenTree::with_config(16, Default::default()));
+    let host = Arc::new(Lends(tree, atomic::AtomicBool::new(false)));
+    let engine = preset("cache_aware");
+    engine
+        .affinity
+        .set_indexes(Arc::clone(&host) as Arc<dyn CacheIndexes>);
+    let engine = hosted(engine);
+    let members = PublishedList::new(pool(8));
+    let tokens: Vec<u32> = (0..1_600).collect();
+    let entry = Entry::of(&tokens);
+    let request = stating(&members, &entry, None);
+    let mut call = Call::default();
+    {
+        let made = Made::asked(engine.loaded(), &request, &call);
+        let facts = made.make(engine.standing_spec()).facts;
+        assert!(facts.block_hashes.is_empty(), "no block is hashed there");
+        assert_eq!(facts.blocks(1) * facts.block_size, 1_600, "its size stays");
+    }
+    host.1.store(true, atomic::Ordering::Relaxed);
+    let asked = single(engine.loaded(), &request, Some(members.lent()), &mut call);
+    let first = asked.expect("a placement").id();
+    let hashed = matches!(call.whole.get(), Some(Some(_)));
+    assert!(hashed, "the record's lookup hashed them");
+    for turn in 0..16 {
+        let again = engine.place(&request).expect("a placement");
+        assert_eq!(again.id(), first, "turn {turn}");
+    }
+    assert_eq!(entry.asked.get(), 0, "no decision read a tree");
+    host.1.store(false, atomic::Ordering::Relaxed);
+    let lent = PublishedList::new(pool(8));
+    let request = stating(&lent, &entry, None);
+    let mut inside = Call::default();
+    let asked = single(engine.loaded(), &request, Some(lent.lent()), &mut inside);
+    asked.expect("a placement");
+    assert!(entry.asked.get() > 0, "that ask read the tree");
+    assert!(inside.whole.get().is_none(), "and hashed no block");
+}

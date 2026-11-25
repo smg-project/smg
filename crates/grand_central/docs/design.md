@@ -1772,7 +1772,7 @@ pub enum Unplaced {
 }
 ```
 
-Inside `place` the crate derives the routing key, hashes the prompt, decides, and tries the
+Inside `place` the crate derives the routing key, hashes the prompt where a decision reads its hashes, decides, and tries the
 targets best first: health and circuit breaker are read again, and the route's rule is asked of
 the picked worker. If none holds, it decides again over what is left. The host sees a worker or a
 reason.

@@ -48,6 +48,7 @@ use std::{
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 
 use super::{
+    place::Made,
     single::{self, WholeDecision},
     InProcess, Loaded, PoolMembers,
 };
@@ -201,11 +202,16 @@ impl InProcess {
 ///
 /// Out of line, as [`issued`] is.
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what the whole decision takes, and the binding's shadow"
+)]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
     request: &mut Request<'_>,
     members: &PoolMembers,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     binding: (u32, ShadowRows),
@@ -215,7 +221,7 @@ pub(super) fn decide(
         binding,
         outcome: &mut outcome,
     };
-    let decision = single::decide(own, request, members, maker, loads, now, whole);
+    let decision = single::decide(own, request, members, maker, late, loads, now, whole);
     let said = match outcome {
         Shadow::Said(said) => Some(said),
         Shadow::NotDue => None,
