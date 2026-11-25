@@ -302,8 +302,8 @@ impl MappedGenerateStream for VllmGenerateStream {
 
         // An engine-side request failure (e.g. grammar compilation) must
         // surface as an error, not as a normal completion with empty output —
-        // that would produce a 200 with no content. The engine names no cause
-        // on this wire: the same `Error` ends a request whose grammar rejected
+        // that would produce a 200 with no content. The status names no cause:
+        // the same `Error` ends a request whose grammar rejected
         // a token, a decode side whose KV load failed, an encoder-cache miss
         // and a pre-processing fault, and an `Abort` the frontend did not ask
         // for is a pause or a shutdown aborting every request; so a
@@ -311,6 +311,9 @@ impl MappedGenerateStream for VllmGenerateStream {
         // router retries, charges and probes it as such) and its `Abort` keeps
         // its shape. The constraint-failure status is raised only by a wire
         // whose engine attributes the failure (see the SGLang stream).
+        // A vLLM release from 0.33 on names its cause in a column of the
+        // output, which the reader logs. The gateway tells the engine's own
+        // report by the words of this status, so they stay.
         if matches!(output.finish_reason, Some(EngineCoreFinishReason::Error)) {
             return Err(tonic::Status::internal(
                 "engine finished the request with an error (see engine logs)",
