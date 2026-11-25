@@ -1027,10 +1027,21 @@ impl VisionPreProcessor for NemotronOmniProcessor {
         )
     }
 
+    /// Refused in the reference layout, as
+    /// [`preprocess_video_rgb`](Self::preprocess_video_rgb) is.
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
         clip: &VideoClipOptions,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.preprocess_video_sampled(frames, clip, None)
+    }
+
+    fn preprocess_video_sampled(
+        &self,
+        frames: &[DynamicImage],
+        clip: &VideoClipOptions,
+        sampling: Option<&VideoSamplingInfo>,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let rgb: Vec<_> = frames.iter().map(rgb_bytes).collect();
         let refs: Vec<_> = rgb
@@ -1041,7 +1052,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
                 data: raw,
             })
             .collect();
-        self.preprocess_video_rgb(&refs, clip)
+        self.preprocess_video_rgb_sampled(&refs, clip, sampling)
     }
 
     /// Refused in the reference layout: its outputs need the frames' source
@@ -1603,14 +1614,41 @@ mod tests {
         // is padded by the engine) of 256 tokens.
         assert_eq!(omni.encoder_input.shape(), &[3, 3, 512, 512]);
         assert_eq!(omni.feature_token_counts, [2 * 256]);
+        // The engine reads each tensor's leading axis as the clip.
+        let tensor = |inputs: &PreprocessedEncoderInputs, key: &str| match inputs
+            .model_specific
+            .get(key)
+        {
+            Some(ModelSpecificValue::IntTensor { data, shape }) => (data.clone(), shape.clone()),
+            other => panic!("{key}: {other:?}"),
+        };
+        let side_tensors = |inputs: &PreprocessedEncoderInputs| {
+            ["video_num_patches", "frames_indices", "frame_duration_ms"]
+                .map(|key| tensor(inputs, key))
+        };
         assert_eq!(
-            ints(omni.model_specific.get("frames_indices")),
-            vec![0, 15, 29]
+            side_tensors(&omni),
+            [
+                (vec![3], vec![1]),
+                (vec![0, 15, 29], vec![1, 3]),
+                (vec![33], vec![1]),
+            ]
         );
-        assert_eq!(ints(omni.model_specific.get("frame_duration_ms")), vec![33]);
         let values = omni.encoder_input.as_f32();
         let first = |frame: usize| values[[frame, 0, 0, 0]];
         assert!(first(0) < first(1) && first(1) < first(2));
+        // The same clip as image frames keeps its sampling.
+        let images: Vec<_> = frames
+            .iter()
+            .map(|data| image::RgbImage::from_raw(32, 32, data.clone()).unwrap())
+            .map(DynamicImage::from)
+            .collect();
+        let from_images = processor("omni")
+            .preprocess_video_sampled(&images, &clip, Some(&sampling))
+            .unwrap();
+        assert_eq!(from_images.encoder_input.as_f32(), values);
+        assert_eq!(from_images.feature_token_counts, omni.feature_token_counts);
+        assert_eq!(side_tensors(&from_images), side_tensors(&omni));
         // One frame per tubelet on V2.
         assert_eq!(
             processor("v2")
@@ -1623,6 +1661,7 @@ mod tests {
         assert!(processor("omni")
             .preprocess_video_rgb(&refs, &clip)
             .is_err());
+        assert!(processor("omni").preprocess_video(&images, &clip).is_err());
         // A frame already at the target size still has its buffer checked.
         let short = vec![0u8; 512 * 512 * 3 - 1];
         let frame = [RgbFrameRef {
