@@ -73,7 +73,9 @@ use crate::{
     routers::{
         common::{
             attach_sized_body,
-            attempt_ledger::{is_upstream_answer, mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{
+                closes_retry_window, is_upstream_answer, mark_upstream_answer, AttemptLedger,
+            },
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
@@ -1007,14 +1009,18 @@ impl Router {
             placed.ended(status.as_u16(), || worker_answered(&response));
         }
         // A definitive answer closes the retry window on this worker: the next
-        // attempt goes to another available worker, or the answer stands.
-        ledger.settle(
-            &mut response,
-            [worker],
-            self.worker_registry
-                .get_routing_pool(model_id, RoutingPool::HttpRegular)
-                .iter(),
-        );
+        // attempt goes to another available worker, or the answer stands. Any
+        // other answer passes `settle` untouched, so the pool is read for an
+        // answer that closes the window alone: the test is `settle`'s own.
+        if closes_retry_window(&response) {
+            ledger.settle(
+                &mut response,
+                [worker],
+                self.worker_registry
+                    .get_routing_pool(model_id, RoutingPool::HttpRegular)
+                    .iter(),
+            );
+        }
         // A replayable failure: the retry re-selects away from this engine
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
