@@ -240,7 +240,7 @@ def _strict_owned(
         if group_exited(pid):
             return None
         raise ValueError(f"thread group exit is not established: {pid}")
-    if not environ:
+    if not environ.strip(b"\0"):
         # An exec/exit can release the address space after environ was opened.
         # Empty bytes cannot establish that a live process lacks our marker.
         raise ValueError(f"empty environment observation for live pid {pid}")
@@ -337,6 +337,7 @@ def reap_strict(
     sent: set[tuple[int, int, int]] = set()
     term_sent_at: dict[tuple[int, int], float] = {}
     clean = False
+    reported_unresolved: set[int] = set()
 
     def retire(pid: int) -> None:
         _, fd = handles.pop(pid)
@@ -393,11 +394,12 @@ def reap_strict(
                     process = _strict_owned(
                         proc_root, pid, owner_uid, entry, group_exited=group_exited
                     )
-                except (OSError, ValueError):
-                    if not handles:
-                        raise
-                    # Do not abandon independently verified handles because
-                    # one process is transiently unobservable. This pass can
+                except (OSError, ValueError) as error:
+                    if pid not in reported_unresolved:
+                        log(f"strict unresolved pid {pid}: {type(error).__name__}: {error}")
+                        reported_unresolved.add(pid)
+                    # Complete the scan and bind independently verified peers,
+                    # even before the first handle exists. This pass can
                     # never count as quiet, even for an unbound process.
                     unresolved_observation = True
                     continue
