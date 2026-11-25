@@ -59,7 +59,8 @@
 //! [`LEAST_POLL_INTERVAL`]. A tick ends at the next one at the latest. A
 //! fetch still open then is kept: its answer is a batch when it comes, and
 //! its engine is asked again behind it, at once where the tick it comes in
-//! has not ended.
+//! has not ended. An answer for a worker whose URL another worker holds by
+//! then is no part of the batch.
 //!
 //! ## The port
 //!
@@ -3238,14 +3239,20 @@ async fn poll_group<G: Generation>(
         for (asked_at, mut engine) in engines {
             // An answer for a worker whose URL another worker holds by now
             // says nothing at that URL: the report on file, the rank counts
-            // and the row there are the other worker's, and its own poll
-            // writes them.
+            // and the row there are the other worker's once its own poll
+            // wrote them, and what the worker that left still has there
+            // goes with its eviction.
             engine.retain(|(worker, _)| {
                 monitor
                     .worker_registry
                     .get_by_url(worker.url())
                     .is_none_or(|holder| Arc::ptr_eq(&holder, worker))
             });
+            // With no member left there is nothing to tell the sink, where
+            // an engine with no answer reads as a fetch that failed.
+            if engine.is_empty() {
+                continue;
+            }
             let carries_rank_capacity = monitor.reconcile_engine(&mut engine, asked_at);
             for ((worker, response), carries_rank_capacity) in
                 engine.into_iter().zip(carries_rank_capacity)
@@ -5560,9 +5567,10 @@ mod native_loads_tests {
         }
     }
 
-    /// An engine can answer after its worker left and a worker of another
-    /// model took the URL. The answer says nothing at that URL: the worker
-    /// that came keeps the row and the rank counts its own poll wrote.
+    /// An engine can answer, or fail, after its worker left and another
+    /// worker took the URL, of another model or of the same. What comes late
+    /// says nothing at that URL: the worker that came keeps the row and the
+    /// rank counts its own poll wrote.
     #[tokio::test]
     async fn an_answer_for_a_worker_that_left_says_nothing_at_the_url_another_took() {
         const LEFT: &str = r#"{"dp_rank_count":2,"loads":[
@@ -5571,80 +5579,86 @@ mod native_loads_tests {
         const CAME: &str = r#"{"dp_rank_count":2,"loads":[
             {"dp_rank":0,"num_used_tokens":100,"max_total_num_tokens":1000},
             {"dp_rank":1,"num_used_tokens":900,"max_total_num_tokens":1000}]}"#;
-        // The engine holds its first answer until it is let go and gives
-        // every later one at once.
-        let let_go = Arc::new(Notify::new());
-        let asked = Arc::new(AtomicUsize::new(0));
-        let app = axum::Router::new().route(
-            "/v1/loads",
-            axum::routing::get({
-                let (let_go, asked) = (Arc::clone(&let_go), Arc::clone(&asked));
-                move || {
-                    let first = asked.fetch_add(1, Ordering::SeqCst) == 0;
-                    let let_go = Arc::clone(&let_go);
-                    async move {
-                        if first {
-                            let_go.notified().await;
-                            LEFT
-                        } else {
-                            CAME
-                        }
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test stub server lives for the duration of the test process"
-        )]
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("stub serve");
-        });
-
-        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
         let group = |model: &str| WorkerGroupKey {
             model_id: model.to_string(),
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
         };
-        let worker = gauge_worker(&url);
-        worker.set_status(WorkerStatus::Ready);
-        let left = registry.register(worker).unwrap();
-        let (of_left, of_came) = (group("a"), group("b"));
-        let tick = poll_group_once(&monitor, &of_left, Duration::from_secs(10), Instant::now());
-        tokio::pin!(tick);
-        tokio::select! {
-            () = &mut tick => panic!("the tick ended ahead of its engine's answer"),
-            () = wait_until("the tick's fetch", || asked.load(Ordering::SeqCst) == 1) => {}
+        for late in [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE] {
+            for model_of_came in ["b", "a"] {
+                let case = format!("{late} behind a worker of model {model_of_came}");
+                // The engine holds its first answer until it is let go, gives
+                // it with the status `late`, and gives every later one at once.
+                let let_go = Arc::new(Notify::new());
+                let asked = Arc::new(AtomicUsize::new(0));
+                let app = axum::Router::new().route(
+                    "/v1/loads",
+                    axum::routing::get({
+                        let (let_go, asked) = (Arc::clone(&let_go), Arc::clone(&asked));
+                        move || {
+                            let first = asked.fetch_add(1, Ordering::SeqCst) == 0;
+                            let let_go = Arc::clone(&let_go);
+                            async move {
+                                if first {
+                                    let_go.notified().await;
+                                    (late, LEFT)
+                                } else {
+                                    (StatusCode::OK, CAME)
+                                }
+                            }
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test stub server lives for the duration of the test process"
+                )]
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.expect("stub serve");
+                });
+
+                let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+                let worker = gauge_worker(&url);
+                worker.set_status(WorkerStatus::Ready);
+                let left = registry.register(worker).unwrap();
+                let (of_left, of_came) = (group("a"), group(model_of_came));
+                let tick =
+                    poll_group_once(&monitor, &of_left, Duration::from_secs(10), Instant::now());
+                tokio::pin!(tick);
+                tokio::select! {
+                    () = &mut tick => panic!("the tick ended ahead of its engine's answer"),
+                    () = wait_until("the tick's fetch", || asked.load(Ordering::SeqCst) == 1) => {}
+                }
+
+                assert!(registry.remove(&left).is_some());
+                let came = gauge_worker_with_model(&url, model_of_came);
+                came.set_status(WorkerStatus::Ready);
+                registry.register(Arc::clone(&came)).unwrap();
+                poll_group_once(&monitor, &of_came, Duration::from_secs(10), Instant::now()).await;
+                let lighter_rank = || {
+                    monitor
+                        .worker_load_manager
+                        .select_and_increment_lowest_dp_load(came.as_ref(), 0)
+                };
+                let used_tokens = || {
+                    monitor.load_state.snapshot().get(&url).map(|row| {
+                        row.loads
+                            .iter()
+                            .map(|rank| rank.num_used_tokens)
+                            .collect::<Vec<_>>()
+                    })
+                };
+                assert_eq!(used_tokens(), Some(vec![100, 900]), "{case}");
+                assert_eq!(lighter_rank(), Some(0), "{case}");
+
+                let_go.notify_one();
+                tick.await;
+                assert_eq!(used_tokens(), Some(vec![100, 900]), "{case}");
+                assert_eq!(lighter_rank(), Some(0), "{case}");
+            }
         }
-
-        assert!(registry.remove(&left).is_some());
-        let came = gauge_worker_with_model(&url, "b");
-        came.set_status(WorkerStatus::Ready);
-        registry.register(Arc::clone(&came)).unwrap();
-        poll_group_once(&monitor, &of_came, Duration::from_secs(10), Instant::now()).await;
-        let lighter_rank = || {
-            monitor
-                .worker_load_manager
-                .select_and_increment_lowest_dp_load(came.as_ref(), 0)
-        };
-        let used_tokens = || {
-            monitor.load_state.snapshot().get(&url).map(|row| {
-                row.loads
-                    .iter()
-                    .map(|rank| rank.num_used_tokens)
-                    .collect::<Vec<_>>()
-            })
-        };
-        assert_eq!(used_tokens(), Some(vec![100, 900]));
-        assert_eq!(lighter_rank(), Some(0));
-
-        let_go.notify_one();
-        tick.await;
-        assert_eq!(used_tokens(), Some(vec![100, 900]));
-        assert_eq!(lighter_rank(), Some(0));
     }
 
     /// Empty polls retract old ranks without discarding concurrent stream records.
