@@ -306,6 +306,7 @@ fn apply_stored<I: BlockIndex>(
                 Ok(()) => Some((None, blocks.len())),
                 Err(ApplyError::ArenaCapReached { placed }) => {
                     note_cap_refusal(worker_blocks, worker_id, blocks.len() - placed);
+                    worker_blocks.note_declined(&blocks, placed, tier);
                     Some((None, placed))
                 }
                 Err(e) => {
@@ -320,6 +321,7 @@ fn apply_stored<I: BlockIndex>(
         }
         Err(ApplyError::ArenaCapReached { placed }) => {
             note_cap_refusal(worker_blocks, worker_id, blocks.len() - placed);
+            worker_blocks.note_declined(&blocks, placed, tier);
             Some((parent_seq_hash, placed))
         }
     };
@@ -1180,6 +1182,27 @@ impl<H: HeldBlocks> WorkerIndexState<H> {
                 *count += 1;
             } else {
                 self.counters.capped_copies += 1;
+            }
+        }
+    }
+
+    /// Take back the copy [`Self::note_stored`] counted on `tier` for each
+    /// block the index left out of a store, the ones past the `placed` it
+    /// took: such a block stands in no index and counts no copy, and an
+    /// entry with no copy left goes. One copy goes a listing, also where
+    /// the count stood at its cap and took none. A block the worker holds
+    /// from an earlier store keeps the copy the store announces.
+    fn note_declined(&mut self, blocks: &[StoredBlock], placed: usize, tier: IndexedTier) {
+        for block in blocks.iter().skip(placed) {
+            if self.blocks.contains_key(block.seq_hash) {
+                continue;
+            }
+            if let Entry::Occupied(mut entry) = self.copies.entry(block.seq_hash) {
+                let count = entry.get_mut().on(tier);
+                *count = count.saturating_sub(1);
+                if entry.get().none() {
+                    entry.remove();
+                }
             }
         }
     }

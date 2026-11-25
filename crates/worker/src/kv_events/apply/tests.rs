@@ -666,6 +666,106 @@ fn clearing_forgets_copy_counts() {
     );
 }
 
+/// A store the index declines at a cap counts copies for the blocks the
+/// index took alone: the blocks it left out stand in no index and open no
+/// entry, under a parent the worker holds and on the retry from the root.
+#[test]
+fn a_store_the_index_declines_counts_no_copy_of_the_blocks_it_left_out() {
+    // The first child lengthens the first block's own run; the table
+    // behind that run holds 196,608 more at the most.
+    const CHILDREN: u32 = 196_609;
+    let indexer = KvIndex::chain();
+    let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+    let mut wb = WorkerIndexState::default();
+    // A store of one child of the first block, named after its number.
+    let child = |number: u32| KvBlocksStored {
+        blocks: vec![block(i64::from(number) + 2, &[number, 0, 0, 1])],
+        parent_block_hash: Some(1),
+        ..Default::default()
+    };
+    apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+    for number in 0..CHILDREN {
+        apply_stored(&child(number), w1, &indexer, &mut wb);
+    }
+    assert_eq!(wb.counters.cap_refused_stores, 0);
+    assert!(wb.copies.is_empty());
+
+    // One child more on the host, under the parent the worker holds.
+    let mut over = child(CHILDREN);
+    over.tier = Some(KvCacheTier::Host as i32);
+    apply_stored(&over, w1, &indexer, &mut wb);
+    assert_eq!(wb.counters.cap_refused_blocks, 1);
+    assert_eq!(wb.copies.len(), 0);
+
+    // On the retry from the root the first block is taken and its host
+    // copy counted; the child behind it is left out again.
+    let mut orphan = child(CHILDREN + 1);
+    orphan.blocks.insert(0, block(1, &TOKENS));
+    orphan.parent_block_hash = Some(-1);
+    orphan.tier = Some(KvCacheTier::Host as i32);
+    apply_stored(&orphan, w1, &indexer, &mut wb);
+    assert_eq!(wb.counters.cap_refused_blocks, 2);
+    assert_eq!(wb.copies.len(), 1);
+    assert_eq!(
+        wb.copies[&SequenceHash::from(1i64)],
+        Copies { device: 1, host: 1 }
+    );
+}
+
+/// A block the worker holds from an earlier store keeps the copy a store
+/// announces where the index declines the block listed before it: the
+/// host copy keeps it in the index when its device copy goes.
+#[test]
+fn a_block_the_worker_holds_keeps_the_copy_a_declined_store_announces() {
+    // As in the test above: the table behind the first block's run is full.
+    const CHILDREN: u32 = 196_609;
+    const HELD: i64 = 900_000;
+    let indexer = KvIndex::chain();
+    let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+    let mut wb = WorkerIndexState::default();
+    let child = |number: u32| KvBlocksStored {
+        blocks: vec![block(i64::from(number) + 2, &[number, 0, 0, 1])],
+        parent_block_hash: Some(1),
+        ..Default::default()
+    };
+    apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
+    for number in 0..CHILDREN {
+        apply_stored(&child(number), w1, &indexer, &mut wb);
+    }
+    assert_eq!(wb.counters.cap_refused_stores, 0);
+
+    // A block stored before its parent starts a chain of its own.
+    let held = block(HELD, &[7, 7, 7, 7]);
+    let early = KvBlocksStored {
+        blocks: vec![held.clone()],
+        parent_block_hash: Some(i64::from(CHILDREN) + 2),
+        ..Default::default()
+    };
+    apply_stored(&early, w1, &indexer, &mut wb);
+    assert!(wb.blocks.contains_key(SequenceHash::from(HELD)));
+    assert!(wb.copies.is_empty());
+
+    // The host store of that parent and of the block: the index leaves the
+    // parent out, and the block listed behind it is one the worker holds.
+    let mut over = child(CHILDREN);
+    over.blocks.push(held);
+    over.tier = Some(KvCacheTier::Host as i32);
+    apply_stored(&over, w1, &indexer, &mut wb);
+    assert_eq!(wb.counters.cap_refused_blocks, 2);
+    assert_eq!(
+        wb.copies[&SequenceHash::from(HELD)],
+        Copies { device: 1, host: 1 }
+    );
+
+    // The device copy goes; the host copy keeps the block in the index.
+    apply_removed(&removed_event(HELD), w1, &indexer, &mut wb);
+    assert!(wb.blocks.contains_key(SequenceHash::from(HELD)));
+    assert_eq!(
+        wb.copies[&SequenceHash::from(HELD)],
+        Copies { device: 0, host: 1 }
+    );
+}
+
 #[test]
 fn copy_counts_are_capped() {
     let indexer = KvIndex::chain();
