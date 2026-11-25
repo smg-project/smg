@@ -23,7 +23,10 @@ use std::{
 
 use http::{HeaderMap, HeaderValue};
 use smg_grand_central::{
-    document::{AppliedSpec, PolicySettings, ScoreSpec},
+    document::{
+        AppliedSpec, DecodePick, LoadMetricSetting, ModeSettings, PolicySettings, RoutingSettings,
+        ScoreSpec,
+    },
     engine::{Identity, ShedReason, Unplaced},
     stages::StageRegistry,
 };
@@ -35,7 +38,7 @@ use tokio::time::sleep;
 
 use crate::{
     pair::{self, decode, prefill, sends, typed, PLAIN},
-    program::{encode_settings, Answer, Asked, Plan},
+    program::{encode_settings, settings, Answer, Asked, Plan},
     served,
     single::{taken, Heard, Hears},
     started_as, under, under_encode, under_pairs, url, workers, MODEL,
@@ -190,6 +193,9 @@ fn an_encoder_that_cannot_be_sent_to_takes_no_item() {
 /// (`model_gateway/src/routers/grpc/common/stages/request_execution.rs:295-299`).
 /// Where its encoder answers ahead of the pair (`:882-883`), a dispatch
 /// that failed is marked as one that is not asked again (`:461-466`).
+/// Where its items launch beside the pair, a failed encode dispatch is
+/// answered a 502 that is final for the retry layer
+/// (`encode_dispatch_failure_response`, `:2593-2608`).
 #[test]
 fn an_encoder_that_fails_is_the_requests_answer_and_no_side_is_sent() {
     let fleet = fleet(2, 2, 3);
@@ -262,7 +268,7 @@ fn an_encoder_that_fails_is_the_requests_answer_and_no_side_is_sent() {
 /// (`model_gateway/src/routers/grpc/common/stages/request_execution.rs:929-932`).
 /// It names the addresses of the prefill and of the decode as tried, and no
 /// encoder's (`model_gateway/src/routers/grpc/context.rs:1665-1669`, read at
-/// `model_gateway/src/routers/grpc/pipeline.rs:848-861`).
+/// `model_gateway/src/routers/grpc/pipeline.rs:849-861`).
 #[test]
 fn a_retry_behind_a_failed_side_states_no_item_and_sends_none() {
     let fleet = fleet(1, 2, 2);
@@ -535,4 +541,56 @@ fn an_encode_request_is_placed_over_the_generation_that_stands() {
         })
         .collect();
     assert!(both.contains(&joined), "the encoder that joined: {both:?}");
+}
+
+/// An encode request served in turn: its item goes out first, then the
+/// prefill, and behind the prefill's answer the program asks the placement
+/// for the decode again. The second ask states the request as the first
+/// call stated it, with its item, over the three lists, and the engine
+/// reads the pair's two of them. The first decision names the decode that
+/// holds no request. While the prefill runs that decode takes three
+/// requests, and the second ask names the other one: the item is sent once.
+///
+/// The classic router has no case of its own here: the gateway asks the
+/// engine for no item yet.
+#[test]
+fn an_encode_requests_decode_is_asked_again_behind_its_prefills_answer() {
+    let fewest = PolicySettings::PowerOfTwo {
+        load_metric: LoadMetricSetting::LeastRequests,
+    };
+    let settings = RoutingSettings {
+        mode: ModeSettings::EncodePrefillDecode {
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: Some(fewest),
+        },
+        ..settings(PolicySettings::RoundRobin)
+    };
+    let document = settings.policy_document();
+    let mut document = document.expect("the settings have a document");
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    // The prefill, the two decodes, the encoder.
+    let fleet = fleet(1, 2, 1);
+    let (idle, busy) = (Arc::clone(&fleet[1]), &fleet[2]);
+    busy.increment_load();
+    let sends = move |worker: &dyn Worker| {
+        if *worker.worker_type() == WorkerType::Prefill {
+            (0..3).for_each(|_| idle.increment_load());
+        }
+        200
+    };
+    let (program, _loads, _task) = started_as(Plan::Encode, spec, &fleet, sends);
+    let program = program.in_turn();
+    let keys = [Identity::plain("item-a")];
+    let answer = program.serve(&carrying(&keys));
+    assert_eq!(
+        answer,
+        Answer {
+            sent: vec![encoder(0), prefill(0), decode(1)],
+            status: 200,
+            unplaced: None,
+        },
+        "the item once, the prefill, and the decode the second ask names"
+    );
 }
