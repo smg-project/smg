@@ -19,9 +19,10 @@
 //! workers' caches ([`EngineCaches`]): the cache-event monitor's indexes and
 //! these trees.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use kv_index::{ModelTrees, TenantId, TokenTree};
+use openai_protocol::worker::WorkerStatus;
 use parking_lot::Mutex;
 use smg_grand_central::{
     document::{IndexSpec, PolicySpec},
@@ -31,6 +32,7 @@ use smg_worker::registry::event::WorkerEvent;
 use tokio::{
     runtime::Handle,
     sync::broadcast::error::{RecvError, TryRecvError},
+    time::{timeout_at, Instant},
 };
 use tracing::{error, warn};
 
@@ -39,6 +41,10 @@ use super::{
     utils::PeriodicTask,
 };
 use crate::routers::common::snapshot::WorkerRegistry;
+
+/// The settle window of a worker that states none: how long behind its
+/// purge a worker that left with no drain is purged once more.
+const SETTLE_WHERE_NONE_IS_STATED: Duration = Duration::from_secs(5);
 
 /// The owner of the token trees Grand Central is lent, one a model.
 #[derive(Debug)]
@@ -137,46 +143,20 @@ impl LentTrees {
     /// too, of every address. A registration, a replacement and a status
     /// change purge nothing. A purge walks a tree for each worker that
     /// left, so it runs off the runtime's own threads, and the task reads
-    /// no event until it ends.
+    /// no event until it ends. A worker that left with no drain is purged
+    /// once more a settle window later ([`follow_removals`]).
     ///
     /// The task holds the trees weakly, and of the registry its events
-    /// alone. It ends with the registry, at the first event after the
+    /// alone. It ends with the registry, at the first wake after the
     /// trees are gone, or with its runtime.
     pub(crate) fn follow_removals(self: &Arc<Self>, registry: &WorkerRegistry, runtime: &Handle) {
-        let mut events = registry.subscribe_events();
-        let trees = Arc::downgrade(self);
-        runtime.spawn(async move {
-            loop {
-                let mut left = Left::default();
-                match events.recv().await {
-                    Ok(event) => left.note(&event),
-                    Err(RecvError::Lagged(lost)) => left.unheard += lost,
-                    Err(RecvError::Closed) => return,
-                }
-                loop {
-                    match events.try_recv() {
-                        Ok(event) => left.note(&event),
-                        Err(TryRecvError::Lagged(lost)) => left.unheard += lost,
-                        Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-                    }
-                }
-                let Some(trees) = trees.upgrade() else {
-                    return;
-                };
-                if !left.asks_for_a_purge() {
-                    continue;
-                }
-                let purge = tokio::task::spawn_blocking(move || trees.forget_the_removed(&left));
-                // A purge that panicked is this task's last: the size pass
-                // alone bounds the trees from here on.
-                if let Err(ended) = purge.await {
-                    if ended.is_panic() {
-                        error!("A purge of the lent token trees panicked: no worker that leaves is taken out of them from here on");
-                    }
-                    return;
-                }
-            }
-        });
+        follow_removals(
+            self,
+            "the lent token trees",
+            Self::forget_the_removed,
+            registry,
+            runtime,
+        );
     }
 
     /// Takes the workers `left` says left out of every tree. A worker that
@@ -231,36 +211,153 @@ impl LentTrees {
             }
             // Behind an eviction a named address's count reads zero, and
             // the purge drops its entries alone.
-            for address in &left.addresses {
-                tree.remove_tenant_all(&TenantId::from(address.as_str()));
+            for address in left.purged() {
+                tree.remove_tenant_all(&TenantId::from(address));
             }
         }
     }
 }
 
-/// What the registry's events of one wake ask of the trees.
+/// Starts the task that takes a worker the registry lost out of `stores`,
+/// named `what` in its one log line, on `runtime`. It wakes on the
+/// registry's events and hands `forget` what they ask of the stores
+/// ([`Left`]), off the runtime's own threads, and reads no event until
+/// `forget` ends.
+///
+/// A decision that read a worker ahead of its removal may write a prompt
+/// under the worker's address behind the purge. A worker that was being
+/// drained when it left took no new request for its settle window, so no
+/// such decision is under way.
+/// Any other worker's address is purged once more one settle window behind
+/// its purge, the worker's own window or five seconds where it states none,
+/// at an event or with none. An address a worker was registered under
+/// meanwhile is left alone: what stands under it is that worker's own.
+///
+/// The task holds `stores` weakly, and of the registry its events alone. It
+/// ends with the registry, at the first wake after `stores` are gone, or
+/// with its runtime.
+pub(super) fn follow_removals<S: Send + Sync + 'static>(
+    stores: &Arc<S>,
+    what: &'static str,
+    forget: fn(&S, &Left),
+    registry: &WorkerRegistry,
+    runtime: &Handle,
+) {
+    let mut events = registry.subscribe_events();
+    let stores = Arc::downgrade(stores);
+    runtime.spawn(async move {
+        // The addresses owed a second purge, each with the instant it is
+        // due.
+        let mut owed: Vec<(Instant, String)> = Vec::new();
+        loop {
+            let mut left = Left::default();
+            let heard = match owed.iter().map(|(due, _)| *due).min() {
+                Some(due) => timeout_at(due, events.recv()).await.ok(),
+                None => Some(events.recv().await),
+            };
+            match heard {
+                Some(Ok(event)) => left.note(&event),
+                Some(Err(RecvError::Lagged(lost))) => left.unheard += lost,
+                Some(Err(RecvError::Closed)) => return,
+                // A second purge is due.
+                None => {}
+            }
+            loop {
+                match events.try_recv() {
+                    Ok(event) => left.note(&event),
+                    Err(TryRecvError::Lagged(lost)) => left.unheard += lost,
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                }
+            }
+            let now = Instant::now();
+            owed.retain(|(due, address)| {
+                if left.listed.contains(address) {
+                    return false;
+                }
+                if *due <= now {
+                    left.again.push(address.clone());
+                }
+                *due > now
+            });
+            // A window that ends past what the clock can say never ends: its
+            // address is owed nothing.
+            owed.extend(
+                left.settles
+                    .drain(..)
+                    .filter_map(|(address, settle)| Some((now.checked_add(settle)?, address))),
+            );
+            let Some(stores) = stores.upgrade() else {
+                return;
+            };
+            if !left.asks_for_a_purge() {
+                continue;
+            }
+            let purge = tokio::task::spawn_blocking(move || forget(&stores, &left));
+            // A purge that panicked is this task's last: nothing but a
+            // store's own size pass bounds it from here on.
+            if let Err(ended) = purge.await {
+                if ended.is_panic() {
+                    error!("A purge of {what} panicked: no worker that leaves is taken out of them from here on");
+                }
+                return;
+            }
+        }
+    });
+}
+
+/// What the registry's events of one wake ask of the stores.
 #[derive(Debug, Default)]
-struct Left {
+pub(super) struct Left {
     /// The addresses of the workers a removal took away.
     addresses: Vec<String>,
+    /// Of those, the ones whose worker was not being drained when it left,
+    /// each with its settle window: purged once more behind it.
+    settles: Vec<(String, Duration)>,
+    /// The addresses a worker was registered under.
+    listed: Vec<String>,
+    /// The addresses whose second purge is due.
+    again: Vec<String>,
     /// How many events went unheard: a removal may be among them.
     unheard: u64,
 }
 
 impl Left {
-    /// Notes `event`: a removal names the address that left. A
-    /// registration, a replacement and a status change take no worker
-    /// away.
+    /// Notes `event`: a removal names the address that left, and its
+    /// settle window where the worker was not being drained. A
+    /// registration and a replacement take no worker away: they name an
+    /// address a worker stands under again, which is owed no second purge.
+    /// A status change says nothing.
     fn note(&mut self, event: &WorkerEvent) {
-        if let WorkerEvent::Removed { worker, .. } = event {
-            self.addresses.push(worker.url().to_owned());
+        match event {
+            WorkerEvent::Removed { worker, .. } => {
+                let address = worker.url().to_owned();
+                if worker.status() != WorkerStatus::Draining {
+                    let settle = match worker.metadata().health_config.drain_settle_secs {
+                        0 => SETTLE_WHERE_NONE_IS_STATED,
+                        secs => Duration::from_secs(secs),
+                    };
+                    self.settles.push((address.clone(), settle));
+                }
+                self.addresses.push(address);
+            }
+            WorkerEvent::Registered { worker, .. } | WorkerEvent::Replaced { new: worker, .. } => {
+                self.settles.retain(|(address, _)| address != worker.url());
+                self.listed.push(worker.url().to_owned());
+            }
+            WorkerEvent::StatusChanged { .. } => {}
         }
     }
 
-    /// Whether the events ask for a purge: a removal was heard, or events
-    /// went unheard.
+    /// The addresses to purge at this wake: those a removal named, then
+    /// those whose second purge is due.
+    pub(super) fn purged(&self) -> impl Iterator<Item = &str> {
+        self.addresses.iter().chain(&self.again).map(String::as_str)
+    }
+
+    /// Whether the events ask for a purge: a removal was heard, a second
+    /// purge is due, or events went unheard.
     fn asks_for_a_purge(&self) -> bool {
-        self.unheard > 0 || !self.addresses.is_empty()
+        self.unheard > 0 || !self.addresses.is_empty() || !self.again.is_empty()
     }
 }
 

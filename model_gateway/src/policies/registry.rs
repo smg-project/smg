@@ -35,6 +35,7 @@ use super::{
     as_bucket, as_cache_aware, get_healthy_worker_indices,
     hash_ring::HashRing,
     kept_rings::KeptRings,
+    lent_trees::{self, Left},
     manual::{ExecutionBranch, PinState},
     normalize_model_key, DPRankLoadPolicy, LentTrees, LoadBalancingPolicy, ManualConfig,
     ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
@@ -943,6 +944,39 @@ impl PolicyRegistry {
             trees
         };
         Arc::clone(self.lent_trees.get_or_init(made))
+    }
+
+    /// Starts the task that takes a worker `workers` lost out of what the
+    /// classic `cache_aware` policies remember of it, on `runtime`
+    /// ([`lent_trees::follow_removals`]). The registry sends an event for
+    /// every removal, so a worker a mesh peer's word took away, which runs
+    /// no step of a removal here, leaves them as one this process removed
+    /// does. A worker leaves by its address, whichever models it lists.
+    pub(crate) fn follow_removals(
+        self: &Arc<Self>,
+        workers: &WorkerRegistry,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        lent_trees::follow_removals(
+            self,
+            "the cache_aware policies' stores",
+            Self::forget_the_removed,
+            workers,
+            runtime,
+        );
+    }
+
+    /// Takes the addresses `left` names out of every `cache_aware` policy
+    /// the registry holds, each policy once: every model's string tree,
+    /// token tree and hash placements of it.
+    fn forget_the_removed(&self, left: &Left) {
+        self.each_policy(|policy| {
+            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+                for address in left.purged() {
+                    cache_aware.remove_worker_by_url(address);
+                }
+            }
+        });
     }
 
     /// The token trees Grand Central is lent, where its start asked
@@ -3696,6 +3730,43 @@ mod tests {
         let urls: HashSet<String> = workers.iter().map(|w| w.url().to_string()).collect();
         registry.remove_workers_from_cache_aware("llama-3", &urls);
         assert!(tree_of(&policy, "llama-3").is_empty());
+    }
+
+    /// A worker the worker registry lost leaves every cache-aware policy by
+    /// its address, whichever way it left: here by a removal that runs no
+    /// step of a workflow. A prompt a decision under way writes behind that
+    /// purge leaves one settle window later, the worker having left with no
+    /// drain.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_the_registry_lost_leaves_the_cache_aware_policies() {
+        let (registry, policy, workers) = cache_aware_model();
+        let registry = Arc::new(registry);
+        let listed = WorkerRegistry::new();
+        for worker in &workers {
+            listed.register(Arc::clone(worker)).expect("a worker");
+        }
+        registry.follow_removals(&listed, &tokio::runtime::Handle::current());
+        let gone = || async {
+            let left = async {
+                while tree_of(&policy, "llama-3") != ["http://w2:8000"] {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(60), left).await
+        };
+
+        listed.remove_by_url("http://w1:8000").expect("the removal");
+        gone().await.expect("the purge behind the removal");
+
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("a cache-aware policy");
+        cache_aware.add_worker(workers[0].as_ref());
+        assert_eq!(
+            tree_of(&policy, "llama-3"),
+            ["http://w1:8000", "http://w2:8000"],
+            "written behind the purge"
+        );
+        gone().await.expect("the purge one settle window later");
+        drop(registry);
     }
 
     /// A registry made for Grand Central keeps the token trees the
