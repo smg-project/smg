@@ -105,7 +105,6 @@ fn engine_under(spec: PluginSpec) -> (Arc<Plugin>, Engine) {
             shadow: None,
             decode_shadow: None,
             sessions: None,
-            overload: None,
         }],
         1,
         Needs::default(),

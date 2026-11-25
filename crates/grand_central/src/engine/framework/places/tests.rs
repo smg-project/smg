@@ -120,7 +120,6 @@ fn single(shadow: Option<u16>) -> Binding {
         shadow,
         decode_shadow: None,
         sessions: None,
-        overload: None,
     }
 }
 
@@ -198,7 +197,6 @@ fn the_filter_half_opens_with_the_places_under_a_profile_of_no_filter() {
         shadow: None,
         decode_shadow: None,
         sessions: None,
-        overload: None,
     };
     let engine = Engine::new(vec![profile], vec![binding], 1, Needs::default());
     let rows = pool(8);

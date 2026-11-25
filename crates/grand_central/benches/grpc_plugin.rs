@@ -137,7 +137,6 @@ fn engine_of(profile: Profile) -> Engine {
             shadow: None,
             decode_shadow: None,
             sessions: None,
-            overload: None,
         }],
         1,
         Needs::default(),

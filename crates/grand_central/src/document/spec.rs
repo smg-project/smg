@@ -45,12 +45,9 @@ use crate::engine::sticky_sessions::SessionTable;
 use crate::{
     document::routing_key::KeySources,
     engine::{
-        framework::{
-            Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer,
-            WeightedScorer,
-        },
+        framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, WeightedScorer},
         sticky_sessions::SessionRule,
-        view::{blocks_within, threshold_permille, HashKind, Phase, MAX_LOAD_REPORT_AGE_MS},
+        view::{blocks_within, HashKind, Phase, MAX_LOAD_REPORT_AGE_MS},
     },
     load::{
         load_report_reader::LoadReportReader,
@@ -4549,21 +4546,6 @@ fn check_matcher(
     Ok(())
 }
 
-/// The thresholds a binding hands its pools: the crate's two defaults, and
-/// none when the block is switched off. A binding with no block has the
-/// default block. A block names no number of its own ([`check_overload`]):
-/// a worker's registration states its two over these. The usage goes to
-/// permille by the one conversion of a threshold ([`threshold_permille`]):
-/// the rounding a report's usage takes, so one rank's usage at or above the
-/// threshold as a ratio is never read as under it.
-fn overload_thresholds(block: Option<&OverloadSpec>) -> Option<OverloadThresholds> {
-    let enabled = block.is_none_or(|block| block.enabled);
-    enabled.then(|| OverloadThresholds {
-        waiting_requests: OVERLOAD_WAITING_REQUESTS,
-        kv_usage_permille: threshold_permille(f64::from(OVERLOAD_TOKEN_USAGE)),
-    })
-}
-
 /// A binding's overload block names no number, with its switch on or off:
 /// a block that names one is refused by the number's path. One set of
 /// thresholds stands for each worker, its registration's own over its
@@ -4951,7 +4933,6 @@ fn resolve_plan(
         shadow,
         decode_shadow,
         sessions: None,
-        overload: overload_thresholds(b.overload.as_ref()),
     };
     if plan == PlanName::Single {
         if b.profile.is_some() && !b.profiles.is_empty() {
@@ -5418,7 +5399,6 @@ impl PolicySpec {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: overload_thresholds(None),
             });
         }
         needs.headers |= !self.view.headers.is_empty();
@@ -9164,37 +9144,18 @@ mod tests {
 
     #[test]
     fn the_binding_rules_are_checked_in_shape_then_by_the_build() {
-        let thresholds = |spec: &PolicySpec| {
-            spec.validate()
-                .expect("the binding validates")
-                .binding("m", Phase::Single)
-                .and_then(|binding| binding.overload)
-        };
-        // A block names no number. Switched on, a binding hands its pools
-        // the crate's two, the usage in permille, whatever its shed word
-        // says. So does a binding with no block, and the binding of a
-        // document that writes none.
-        let defaults = OverloadThresholds {
-            waiting_requests: OVERLOAD_WAITING_REQUESTS,
-            kv_usage_permille: 800,
-        };
-        for on in [
+        // A block names no number, and a null is no number. Switched on or
+        // off, with a shed word or none, the binding validates, and so
+        // does a binding with no block.
+        for block in [
             r#"{"profile":"p"}"#,
             r#"{"profile":"p","overload":{}}"#,
             r#"{"profile":"p","overload":{"enabled":true,"shed_when_all_vetoed":true}}"#,
             r#"{"profile":"p","overload":{"waiting_requests":null,"token_usage":null}}"#,
+            r#"{"profile":"p","overload":{"enabled":false,"shed_when_all_vetoed":true}}"#,
         ] {
-            assert_eq!(thresholds(&spec_with_binding(on)), Some(defaults), "{on}");
+            assert!(spec_with_binding(block).validate().is_ok(), "{block}");
         }
-        assert_eq!(
-            thresholds(&doc(
-                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["kv-pressure"],"pick":"best"}}}"#
-            )),
-            Some(defaults)
-        );
-        // Off is the block's switch alone: the binding hands no threshold.
-        let off = r#"{"profile":"p","overload":{"enabled":false,"shed_when_all_vetoed":true}}"#;
-        assert_eq!(thresholds(&spec_with_binding(off)), None);
 
         let sessions = spec_with_binding(
             r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","ttl_s":600,"assignment":"min_load"}}"#,

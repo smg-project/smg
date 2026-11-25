@@ -209,7 +209,6 @@ fn binding(plan: Plan, decode_profile: Option<u16>) -> Binding {
         shadow: None,
         decode_shadow: None,
         sessions: None,
-        overload: None,
     }
 }
 

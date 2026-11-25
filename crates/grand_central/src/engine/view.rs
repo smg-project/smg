@@ -300,9 +300,11 @@ pub fn permille(ratio: f64) -> u16 {
 
 /// A usage threshold as a permille field: [`permille`]'s rounding with a
 /// floor of one, the one conversion every threshold stated as a ratio
-/// takes. At no permille the store reads every engine with a rank on file
-/// as over the threshold, an idle one too, so a valid threshold that would
-/// round to none is held as one.
+/// takes. At no permille a host's load monitor reads every worker with a
+/// report as over the threshold, an idle one too, so a valid threshold
+/// that would round to none is held as one. A worker's registration is
+/// its one caller.
+#[cfg(feature = "worker-host")]
 pub(crate) fn threshold_permille(usage: f64) -> u16 {
     permille(usage).max(1)
 }
