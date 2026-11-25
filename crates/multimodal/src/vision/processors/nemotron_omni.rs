@@ -193,8 +193,11 @@ impl NemotronGeometry {
         if !(downsample_ratio > 0.0 && downsample_ratio <= 1.0) {
             return Err(Invalid("/downsample_ratio"));
         }
-        let dynamic = match field("/vision_config/args/min_num_patches") {
+        // The engine picks dynamic resolution by the key's presence, and its
+        // tiler takes no other shuffle than 2x2.
+        let dynamic = match config.pointer("/vision_config/args/min_num_patches") {
             None => None,
+            Some(_) if downsample_ratio != 0.5 => return Err(Invalid("/downsample_ratio")),
             Some(_) => {
                 let max = match number("/vision_config/args/max_num_patches")? {
                     max if max <= 0.0 => usize::MAX,
@@ -209,7 +212,11 @@ impl NemotronGeometry {
         let video_frame_size = match (target_patches, target_size) {
             (Some(_), Some(_)) => return Err(Invalid("/vision_config/video_target_img_size")),
             (Some(patches), None) => Some(patches),
-            (None, Some(size)) => Some(size.div_ceil(patch_size).pow(2)),
+            (None, Some(size)) => Some(
+                size.div_ceil(patch_size)
+                    .checked_pow(2)
+                    .ok_or(Invalid("/vision_config/video_target_img_size"))?,
+            ),
             (None, None) => None,
         }
         .map_or(VideoFrameSize::Square, |patches| VideoFrameSize::Patches {
@@ -1500,6 +1507,31 @@ mod tests {
             NemotronGeometry::from_model_config(&fractional),
             Err(NemotronConfigError::Invalid(
                 "/vision_config/args/max_num_patches"
+            ))
+        );
+        // The engine's dynamic tiler takes no shuffle but 2x2, and a null
+        // minimum still names dynamic resolution.
+        let mut fourfold = config("omni");
+        fourfold["downsample_ratio"] = json!(0.25);
+        assert_eq!(
+            NemotronGeometry::from_model_config(&fourfold),
+            Err(NemotronConfigError::Invalid("/downsample_ratio"))
+        );
+        let mut unset = config("omni");
+        unset["vision_config"]["args"]["min_num_patches"] = Value::Null;
+        assert_eq!(
+            NemotronGeometry::from_model_config(&unset),
+            Err(NemotronConfigError::Missing(
+                "/vision_config/args/min_num_patches"
+            ))
+        );
+        // A frame side whose patch count does not fit is refused, not wrapped.
+        let mut huge = config("v2");
+        huge["vision_config"]["video_target_img_size"] = json!(1_u64 << 36);
+        assert_eq!(
+            NemotronGeometry::from_model_config(&huge),
+            Err(NemotronConfigError::Invalid(
+                "/vision_config/video_target_img_size"
             ))
         );
     }

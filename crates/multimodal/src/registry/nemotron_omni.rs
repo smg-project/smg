@@ -385,7 +385,7 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         family
             && config
                 .pointer("/vision_config/args/min_num_patches")
-                .is_some_and(|v| !v.is_null())
+                .is_some()
                 == (*self == Self::Reference)
     }
 
@@ -975,6 +975,11 @@ mod tests {
             dynamic.modality_limits(&metadata(&tokenizer, &broken)),
             Err(ModelRegistryError::InvalidConfigField { field, .. }) if field == "downsample_ratio"
         ));
+        // A null minimum names dynamic resolution, as the engine reads it.
+        let mut unset = omni_config();
+        unset["vision_config"]["args"]["min_num_patches"] = Value::Null;
+        assert!(dynamic.matches(&metadata(&tokenizer, &unset)));
+        assert!(!tiled.matches(&metadata(&tokenizer, &unset)));
     }
 
     #[test]
