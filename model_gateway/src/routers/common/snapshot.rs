@@ -10,7 +10,7 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
-use smg_policy_controller::engine::{FixedFacts, LentList, ListCell};
+use smg_grand_central::engine::{LentList, PublishedList};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -62,16 +62,6 @@ pub(crate) enum RoutingPool {
 
 type WorkerSnapshot = Arc<[Arc<dyn Worker>]>;
 type LazyRoutingPool = OnceLock<WorkerSnapshot>;
-
-/// A pool's list as the policy engine is lent it ([`ModelWorkerSnapshot::lent`]):
-/// the list, the cell the engine keeps its value of the list in, and what
-/// this gateway states of each worker beside its object.
-#[derive(Debug)]
-struct Lent {
-    workers: WorkerSnapshot,
-    cell: ListCell,
-    facts: Box<[FixedFacts]>,
-}
 
 impl RoutingPool {
     const COUNT: usize = 8;
@@ -188,10 +178,12 @@ pub(crate) struct ModelLabels {
 pub struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
-    /// What stands beside each pool's list for the policy engine, made
-    /// where the engine is first asked over that list (see [`Self::lent`]).
-    /// A gateway that starts no engine makes none.
-    lent: [OnceLock<Lent>; RoutingPool::COUNT],
+    /// Each pool's list as Grand Central is lent it: the list, the cell
+    /// the engine keeps its value of the list in, and what this gateway
+    /// states of each worker beside its object. Made where the engine is
+    /// first asked over that list (see [`Self::lent`]). A gateway that
+    /// starts no engine makes none.
+    lent: [OnceLock<PublishedList>; RoutingPool::COUNT],
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
     pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
@@ -406,31 +398,24 @@ impl ModelWorkerSnapshot {
         })
     }
 
-    /// The list of `pool` as the policy engine is lent it: the pool's own
+    /// The list of `pool` as Grand Central is lent it: the pool's own
     /// list ([`Self::pool`]) with the cell that stands beside it and what
     /// the gateway states of each worker ([`stated_facts`]). The engine
     /// keeps its value of the list in that cell from the list's first
     /// request on, and the value falls with this snapshot, as the list
     /// does: a membership change publishes the next one with none.
     ///
-    /// The three are made together at the list's first lending and read
-    /// from one place at every later one: a lending reads no more than it
-    /// did while the gateway stated no fact.
+    /// The three are one [`PublishedList`], made at the list's first
+    /// lending and read from one place at every later one: a lending reads
+    /// no more than it did while the gateway stated no fact.
     pub(crate) fn lent(&self, pool: RoutingPool) -> LentList<'_> {
-        let lent = self.lent[pool.index()].get_or_init(|| {
-            let workers = Arc::clone(self.pool(pool));
-            let facts = stated_facts(&workers);
-            Lent {
-                workers,
-                cell: ListCell::default(),
-                facts,
-            }
-        });
-        LentList {
-            workers: &lent.workers,
-            cell: &lent.cell,
-            facts: Some(&lent.facts),
-        }
+        self.lent[pool.index()]
+            .get_or_init(|| {
+                let workers = Arc::clone(self.pool(pool));
+                let facts = stated_facts(&workers);
+                PublishedList::stating(workers, facts)
+            })
+            .lent()
     }
 }
 

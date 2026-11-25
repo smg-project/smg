@@ -31,7 +31,7 @@ use crate::{
                     utils::{generation_failure_error, response_status},
                 },
             },
-            context::{DispatchMetadata, ExecutionResult},
+            context::{self, DispatchMetadata, ExecutionResult},
             proto_wrapper::ProtoGenerateComplete,
             regular::processor::generation_start,
         },
@@ -235,14 +235,16 @@ impl HarmonyResponseProcessor {
             .maybe_system_fingerprint(dispatch.weight_version.as_deref())
             .build();
         // The records the streamed answer makes at its end; a collected
-        // answer shows no first token.
+        // answer shows no first token. Its dispatch wait needs none: it is
+        // read here, inside the request's future, against the dispatch the
+        // generation clock starts at.
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &chat_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: None,
-            dispatch_wait: None,
+            dispatch_wait: context::dispatch_wait(started),
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),

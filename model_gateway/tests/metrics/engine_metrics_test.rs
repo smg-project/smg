@@ -24,7 +24,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
     // The binary's recorder, installed once; port 0 binds an ephemeral port
     // with no reservation race.
     let handle = recorder();
-    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
 

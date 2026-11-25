@@ -1,6 +1,6 @@
-//! The token trees a gateway lends the policy engine.
+//! The token trees a gateway lends Grand Central.
 //!
-//! Where the policy engine places every request no classic policy object is
+//! Where Grand Central places every request no classic policy object is
 //! made, so no policy keeps the trees of the prompts this process sent. The
 //! engine's start makes an owner of them in a policy's place
 //! ([`LentTrees`]), and only where the document in force reads the prefixes
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use kv_index::{ModelTrees, TenantId, TokenTree};
 use parking_lot::Mutex;
-use smg_policy_controller::{
+use smg_grand_central::{
     document::{IndexSpec, PolicySpec},
     engine::{CacheIndex, CacheIndexes, Phase},
 };
@@ -40,7 +40,7 @@ use super::{
 };
 use crate::routers::common::snapshot::WorkerRegistry;
 
-/// The owner of the token trees the policy engine is lent, one a model.
+/// The owner of the token trees Grand Central is lent, one a model.
 #[derive(Debug)]
 pub(crate) struct LentTrees {
     /// The document the engine runs: a model's `index` entry sizes its
@@ -264,7 +264,7 @@ impl Left {
     }
 }
 
-/// What a gateway answers the policy engine of its workers' caches, as one
+/// What a gateway answers Grand Central of its workers' caches, as one
 /// object: the indexes of the cache-event monitor, and the token trees it
 /// lends.
 pub(crate) struct EngineCaches {
@@ -313,13 +313,14 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use kv_index::{ContentHash, SequenceHash, StoredBlock};
     use openai_protocol::{worker::WorkerStatus, UNKNOWN_MODEL_ID};
     use smg_worker::{registry::RemoteWorkerState, test_support::ready_worker};
 
     use super::*;
     use crate::{
         config::{types::PolicyConfig, RouterConfig},
-        policies::kv_index::index_backend::KvIndex,
+        policies::kv_index::index_backend::{KvIndex, WorkerBlocks},
     };
 
     const MODEL: &str = "llama";
@@ -780,7 +781,8 @@ mod tests {
     }
 
     /// The object answers a model's index and its block size as the
-    /// cache-event monitor behind it does.
+    /// cache-event monitor behind it does: no index while the model's holds
+    /// no block, and the monitor's own once it holds one.
     #[test]
     fn the_monitors_index_and_block_size_are_read_through_the_one_object() {
         let monitor = Arc::new(KvEventMonitor::new());
@@ -790,6 +792,14 @@ mod tests {
         let trees = Arc::new(owner(document(1_000, 0)));
         let caches = EngineCaches::of(Some(monitor), Some(trees)).expect("both");
         assert_eq!(caches.block_size(MODEL), Some(4));
+        assert!(caches.index(MODEL).is_none(), "no block yet");
+        let worker = index.intern_worker("grpc://w1:9000").expect("a number");
+        let block = StoredBlock {
+            seq_hash: SequenceHash(1),
+            content_hash: ContentHash(101),
+        };
+        let stored = index.apply_stored(worker, &[block], None, &mut WorkerBlocks::default());
+        stored.expect("a block stored");
         let lent = caches.index(MODEL).expect("the model's index");
         assert!(std::ptr::addr_eq(Arc::as_ptr(&lent), Arc::as_ptr(&index)));
         assert!(caches.index("another").is_none());

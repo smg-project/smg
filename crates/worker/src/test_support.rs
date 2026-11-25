@@ -34,7 +34,9 @@ use tokio::net::{TcpListener, TcpSocket};
 
 use crate::{
     common_proto::KvEventBatch,
-    connection::engine::{AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, ZmqLink},
+    connection::engine::{
+        AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, LoadSource, ZmqLink,
+    },
     identity::{
         basic::{ConnectionMode, Worker},
         builder,
@@ -662,12 +664,24 @@ impl EngineConnection for ScriptedAnswers {
 /// connect as a runtime it was given an engine for is answered by that
 /// engine. A connect as any other runtime gets a connection that refuses its
 /// health call as unimplemented, as an engine refuses a service it does not
-/// serve. It counts the connects it was asked for.
+/// serve. It counts the connects it was asked for. It keeps a load source
+/// for an HTTP worker where a case says so, and none otherwise.
 #[derive(Debug, Default)]
 pub struct ScriptedConnector {
     dial_refusal: Option<String>,
     engines: Vec<(RuntimeType, Arc<ScriptedAnswers>)>,
     connects: AtomicUsize,
+    keeps_load_source: bool,
+}
+
+/// The load source of a host whose load service is down: every call fails.
+struct DownLoadSource;
+
+#[async_trait]
+impl LoadSource for DownLoadSource {
+    async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        Err(tonic::Status::unavailable("the load service is down"))
+    }
 }
 
 impl ScriptedConnector {
@@ -682,6 +696,15 @@ impl ScriptedConnector {
     #[must_use]
     pub fn with_engine(mut self, runtime: RuntimeType, engine: Arc<ScriptedAnswers>) -> Self {
         self.engines.push((runtime, engine));
+        self
+    }
+
+    /// The same connector keeping a load source for every HTTP worker, as
+    /// a host with its own load service does. Its calls fail: that service
+    /// is down.
+    #[must_use]
+    pub fn keeping_a_load_source(mut self) -> Self {
+        self.keeps_load_source = true;
         self
     }
 
@@ -723,5 +746,14 @@ impl EngineConnector for ScriptedConnector {
             Some(reason) => Err(reason.clone()),
             None => Ok(()),
         }
+    }
+
+    async fn http_load_source(
+        &self,
+        _base_url: &str,
+        _runtime: RuntimeType,
+    ) -> Option<Arc<dyn LoadSource>> {
+        self.keeps_load_source
+            .then(|| Arc::new(DownLoadSource) as Arc<dyn LoadSource>)
     }
 }

@@ -316,8 +316,13 @@ fn unreplayed_kind(item: &ResponseInputOutputItem) -> Option<&'static str> {
         ResponseInputOutputItem::ApplyPatchCallOutput { .. } => Some("apply_patch_call_output"),
         ResponseInputOutputItem::LocalShellCall { .. } => Some("local_shell_call"),
         ResponseInputOutputItem::LocalShellCallOutput { .. } => Some("local_shell_call_output"),
+        ResponseInputOutputItem::Program { .. } => Some("program"),
+        ResponseInputOutputItem::ProgramOutput { .. } => Some("program_output"),
         ResponseInputOutputItem::AdditionalTools { .. }
         | ResponseInputOutputItem::AgentMessage { .. }
+        | ResponseInputOutputItem::ToolSearchCall { .. }
+        | ResponseInputOutputItem::ToolSearchOutput { .. }
+        | ResponseInputOutputItem::WebSearchCall { .. }
         | ResponseInputOutputItem::Message { .. }
         | ResponseInputOutputItem::SimpleInputMessage { .. }
         | ResponseInputOutputItem::Reasoning { .. }
@@ -656,15 +661,20 @@ fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
     match item {
         ResponseInputOutputItem::Message { id, .. }
         | ResponseInputOutputItem::McpApprovalRequest { id, .. }
-        | ResponseInputOutputItem::ImageGenerationCall { id, .. }
         | ResponseInputOutputItem::ComputerCall { id, .. }
-        | ResponseInputOutputItem::LocalShellCall { id, .. }
         | ResponseInputOutputItem::LocalShellCallOutput { id, .. }
         | ResponseInputOutputItem::McpCall { id, .. }
         | ResponseInputOutputItem::McpListTools { id, .. } => Some(id.as_str()),
         ResponseInputOutputItem::Reasoning { id, .. }
         | ResponseInputOutputItem::AdditionalTools { id, .. }
         | ResponseInputOutputItem::AgentMessage { id, .. }
+        | ResponseInputOutputItem::ToolSearchCall { id, .. }
+        | ResponseInputOutputItem::ToolSearchOutput { id, .. }
+        | ResponseInputOutputItem::WebSearchCall { id, .. }
+        | ResponseInputOutputItem::Program { id, .. }
+        | ResponseInputOutputItem::ProgramOutput { id, .. }
+        | ResponseInputOutputItem::ImageGenerationCall { id, .. }
+        | ResponseInputOutputItem::LocalShellCall { id, .. }
         | ResponseInputOutputItem::FunctionToolCall { id, .. }
         | ResponseInputOutputItem::FunctionCallOutput { id, .. }
         | ResponseInputOutputItem::McpApprovalResponse { id, .. }
@@ -772,7 +782,10 @@ pub(crate) mod tests {
     pub(crate) fn function_call_output_input() -> ResponseInput {
         ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
             id: None,
-            call_id: "call_A".to_string(),
+            call_id: Some("call_A".to_string()),
+            caller: None,
+            name: None,
+            namespace: None,
             output: StringOrContentParts::String("42".to_string()),
             status: None,
         }])
@@ -792,7 +805,7 @@ pub(crate) mod tests {
                     if output.is_some() { "+output" } else { "" }
                 ),
                 ResponseInputOutputItem::FunctionCallOutput { call_id, .. } => {
-                    format!("function_call_output:{call_id}")
+                    format!("function_call_output:{}", call_id.as_deref().unwrap_or(""))
                 }
                 ResponseInputOutputItem::Reasoning { .. } => "reasoning".to_string(),
                 other => serde_json::to_value(other).expect("an item serializes")["type"]
@@ -1597,9 +1610,9 @@ pub(crate) mod tests {
 
         // a row with no input form is left out, not an error
         assert!(conversation_item_as_input(row(
-            "web_search_call",
+            "file_search_call",
             None,
-            json!({"type": "web_search_call", "status": "completed"})
+            json!({"type": "file_search_call", "status": "completed"})
         ))
         .is_none());
     }
@@ -1699,11 +1712,11 @@ pub(crate) mod tests {
         let mut stored = StoredResponse::new(None);
         stored.raw_response = json!({
             "id": "resp_stored",
-            "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}]
+            "output": [{"type": "file_search_call", "id": "fs_1", "status": "completed"}]
         });
         storage.store_response(stored).await.unwrap();
 
-        let response = resolve_item_references(&storage, vec![reference("ws_1")], None)
+        let response = resolve_item_references(&storage, vec![reference("fs_1")], None)
             .await
             .expect_err("a stored item without an input form is refused");
 

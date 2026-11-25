@@ -9,6 +9,7 @@ use std::{
 };
 
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+use smg_grand_central::engine::FixedFacts;
 use smg_worker::{
     identity::basic::BasicWorker,
     test_support::{no_health_check, worker_with_model_aliases},
@@ -347,7 +348,7 @@ fn a_refresh_keeps_the_list_its_order_and_its_handles() {
         .all(|(listed, registered)| Arc::ptr_eq(listed, registered)));
 }
 
-/// A pool's list is lent to the policy engine with what the gateway states
+/// A pool's list is lent to Grand Central with what the gateway states
 /// of each worker: the number of its runtime and transport and nothing
 /// else, in the list's order. The list, its cell and its facts are made at
 /// the pool's first lending and handed again at every later one, and each

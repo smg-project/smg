@@ -1,8 +1,8 @@
 //! The recorder of the gateway's bucket policy: each row is a pool of
 //! prefill workers the policy lists, its configuration, requests of given
-//! sizes on a clock, and the worker each one was placed on. The policy
-//! controller crate replays the rows through its own decision
-//! (`crates/policy_controller/tests/classic/bucket.rs`).
+//! sizes on a clock, and the worker each one was placed on. The Grand
+//! Central crate replays the rows through its own decision
+//! (`crates/grand_central/tests/classic/bucket.rs`).
 //!
 //! A request's size is what the policy reads: the count of its token ids
 //! when it carries them (`tokens`), else the characters of its text

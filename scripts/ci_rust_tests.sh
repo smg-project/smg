@@ -78,7 +78,7 @@ packages_of() {
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
         protocols)  echo openai-protocol smg-worker smg-external-router smg-service-discovery smg-auth smg-rl smg-client openapi-gen ;;
         engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker gateway-perf ;;
-        kv)         echo kv-index smg-mesh smg-mm-rdma smg-policy-controller policy-controller-example smg-radix-tree ;;
+        kv)         echo kv-index smg-mesh smg-mm-rdma smg-grand-central grand-central-example smg-radix-tree ;;
         radix-fuzz) echo smg-radix-tree ;;
         *) shard_row "$1" >/dev/null ;;
     esac
@@ -183,21 +183,21 @@ commands_of() {
             echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine,smg-grpc-client/engine-port" ;;
         kv)
             local selectors
-            # The example controller rides the policy crate's invocation: it asks for the crate's
+            # The example controller rides the Grand Central crate's invocation: it asks for the crate's
             # `controller` feature, which this line turns on already, so nothing is built twice.
             # `worker-host` is on for the cases of the crate's worker objects and for the test targets that
             # run the stock binary, which require it.
-            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller -p policy-controller-example --features smg-policy-controller/client,smg-policy-controller/kubernetes,smg-policy-controller/worker-host"
-            # The policy crate's library once more, under `discovery`: no package of the shard asks for
+            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-grand-central -p grand-central-example --features smg-grand-central/client,smg-grand-central/kubernetes,smg-grand-central/worker-host"
+            # The Grand Central crate's library once more, under `discovery`: no package of the shard asks for
             # that feature, so nothing else would run the cases behind it. The line above stays as it
             # is: it runs the case of a build without the feature.
-            echo "-p smg-policy-controller --lib --features smg-policy-controller/discovery"
-            # The policy crate's case for a host that builds the `operator` feature alone. The shard's
+            echo "-p smg-grand-central --lib --features smg-grand-central/discovery"
+            # The Grand Central crate's case for a host that builds the `operator` feature alone. The shard's
             # first line turns the controller on, so that case would never run as such a host builds it.
-            echo "-p smg-policy-controller --no-default-features --features operator --test operator_door"
-            # The policy crate's library as a host in process builds it: `worker-host` without the
+            echo "-p smg-grand-central --no-default-features --features operator --test operator_door"
+            # The Grand Central crate's library as a host in process builds it: `worker-host` without the
             # controller. The shard's first line turns the controller on, so that build would never be made.
-            echo "-p smg-policy-controller --lib --no-default-features --features worker-host"
+            echo "-p smg-grand-central --lib --no-default-features --features worker-host"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"
@@ -281,9 +281,9 @@ lint() {
             for features in $(discovery_feature_sets) test-util; do
                 (set -x; cargo clippy -p smg-service-discovery --features "$features" --all-targets -- -D warnings)
             done
-            # The policy crate's `operator` feature is what a host calls in its own process. It
+            # The Grand Central crate's `operator` feature is what a host calls in its own process. It
             # builds with no controller behind it, and nothing of it is left unused there.
-            (set -x; cargo clippy -p smg-policy-controller --no-default-features --features operator --all-targets -- -D warnings)
+            (set -x; cargo clippy -p smg-grand-central --no-default-features --features operator --all-targets -- -D warnings)
             (set -x; cargo check --manifest-path bindings/python/Cargo.toml)
             (set -x; cargo check --manifest-path bindings/golang/Cargo.toml) ;;
         *) echo "ci_rust_tests.sh: unknown lint leg '$1' (all-features, self-hosted, anthropic-only, default-build)" >&2; exit 2 ;;

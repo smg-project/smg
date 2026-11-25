@@ -1,4 +1,4 @@
-# Regression gate for `cargo bench -p smg-policy-controller --bench store_view`, run by
+# Regression gate for `cargo bench -p smg-grand-central --bench store_view`, run by
 # .github/workflows/benchmark-policy-store.yml on pull requests through scripts/bench_gate.py.
 #
 # The gate runs sixteen single-threaded rows of the store's bench and holds each of them to a threshold.
@@ -84,7 +84,7 @@
 # base run is what held that row. A publication now writes over rows the store holds, so those readings are of
 # the allocating publication and the row's threshold stands until its spread is read again.
 #
-# Placement, as policy-engine.toml records it: the workflow builds both binaries with every function on a 64-byte
+# Placement, as grand-central-engine.toml records it: the workflow builds both binaries with every function on a 64-byte
 # boundary, and the reference cell writes into a buffer that starts on a page's start (benches/common/placed.rs).
 # The gate caught an inserted regression when it ran twenty-one rows, twelve of them of a decision's build that
 # has left the bench since. The regression stood in that build (20 dependent multiply-adds plus 2 per candidate
@@ -92,7 +92,7 @@
 # the twelve build rows at +27 to +112 % (the eight-worker rows +27 to +35 %), each confirmed by the re-measure
 # round; the floor, write and publish rows, which the mutant does not touch, passed at -0.8 to +0.5 %.
 #
-# Count: `count = true`, as policy-engine.toml records it. A pull request's job failed `policy_store/floor/8`
+# Count: `count = true`, as grand-central-engine.toml records it. A pull request's job failed `policy_store/floor/8`
 # by time on a change that does not touch the cell: 26.2 against 29.0 ns, +10.6 % against 10 %, re-measured
 # +43.5 %. Its two binaries, built again, run the cell in the same count in every batch after the first, 290.0
 # instructions an iteration, with the cell's measured function at 0x180 of its page in the base's binary and at
@@ -120,9 +120,9 @@ filter = "^policy_store/|^policy_store_pairs/(kept|moved)/512$|^policy_store_mod
 # measures, only when it calls nothing the base branch's crate lacks: both sides are then built from these
 # sources and the row reads the change. Any other row goes to a bench target of its own.
 sources = [
-    "crates/policy_controller/benches/store_view.rs",
-    "crates/policy_controller/benches/common/mod.rs",
-    "crates/policy_controller/benches/common/placed.rs",
+    "crates/grand_central/benches/store_view.rs",
+    "crates/grand_central/benches/common/mod.rs",
+    "crates/grand_central/benches/common/placed.rs",
 ]
 
 # The first gate whose pattern matches an id decides its threshold.
