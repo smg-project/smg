@@ -121,6 +121,7 @@ async fn glm53_media_returns_normal_completion_and_stream_without_media_processi
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         assert_eq!(response.status(), http::StatusCode::OK);

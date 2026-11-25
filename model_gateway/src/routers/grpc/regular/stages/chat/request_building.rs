@@ -238,6 +238,7 @@ impl ChatRequestBuildingStage {
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.symphony = assignment;
         spec.parser_names.clone_from(&ctx.state.parser_names);
+        spec.text_values = ctx.state.text_values;
 
         Ok(BuildOutput {
             plan,

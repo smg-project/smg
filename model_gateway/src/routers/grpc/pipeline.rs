@@ -44,6 +44,7 @@ use super::{
     mode::Mode,
     regular::{
         processor,
+        responses::TextValueReader,
         stages::{
             classify::ClassifyResponseProcessingStage,
             completion::{
@@ -1167,6 +1168,7 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
         stream_start: Option<StreamStartupSender>,
+        text_values: Option<TextValueReader>,
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CHAT;
         let run = {
@@ -1175,6 +1177,7 @@ impl RequestPipeline {
             ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
+            ctx.state.text_values = text_values;
             self.run_signalling(ctx, Some(ENDPOINT), retry_config, stream_start)
         };
         match run.await {

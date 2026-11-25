@@ -20,3 +20,4 @@ mod streaming;
 pub(crate) use handlers::{
     route_responses, route_responses_background, route_responses_background_stream,
 };
+pub(crate) use streaming::TextValueReader;

@@ -800,6 +800,7 @@ async fn chat_response(
             None,
             None,
             None,
+            None,
         ),
     )
     .await
@@ -3299,6 +3300,7 @@ async fn v41_run_chat_on(
             None,
             MODEL.to_string(),
             components,
+            None,
             None,
             None,
             None,

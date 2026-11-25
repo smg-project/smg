@@ -405,6 +405,7 @@ impl GrpcRouter {
                         Some(rate_limit_cell),
                         Some(&retry_config),
                         None,
+                        None,
                     )
                     .await
             },

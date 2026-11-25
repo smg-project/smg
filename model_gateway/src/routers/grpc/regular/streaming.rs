@@ -3682,7 +3682,8 @@ impl<'a> ChatStream<'a> {
             model,
             dispatch.created,
             dispatch.weight_version.as_deref(),
-        );
+        )
+        .with_text_values(spec.text_values, spec.wire);
 
         Self {
             processor,
