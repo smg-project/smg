@@ -4000,6 +4000,71 @@ mod tests {
         assert!(!logs_contain("No bucket found for model"));
     }
 
+    /// Every kind the factory builds by name, set on both sides of a pair:
+    /// the sides [`PolicyRegistry::pd_lists_read`] names are the sides the
+    /// two init calls hand their workers, so a registration lists a side's
+    /// workers for every kind that reads them. A kind the factory learns is
+    /// added to the list here.
+    #[traced_test]
+    #[test]
+    fn pd_lists_read_names_the_sides_the_init_calls_hand_their_workers() {
+        const KINDS: [&str; 10] = [
+            "random",
+            "round_robin",
+            "passthrough",
+            "power_of_two",
+            "least_load",
+            "cache_aware",
+            "bucket",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash",
+        ];
+        for (at, kind) in KINDS.into_iter().enumerate() {
+            let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            for set in [
+                PolicyRegistry::set_prefill_policy,
+                PolicyRegistry::set_decode_policy,
+            ] {
+                let policy = PolicyFactory::create_by_name(kind)
+                    .unwrap_or_else(|| panic!("the factory builds no {kind} policy"));
+                set(&registry, policy);
+            }
+            // A list length of the kind's own tells its debug lines from the
+            // lines of the kinds before it.
+            let count = at + 2;
+            let side = |role: &str, worker_type: WorkerType| -> Vec<Arc<dyn Worker>> {
+                (0..count)
+                    .map(|i| worker_of(&format!("http://{role}-{i}:8000"), worker_type))
+                    .collect()
+            };
+            let prefill = side("prefill", WorkerType::Prefill);
+            let decode = side("decode", WorkerType::Decode);
+
+            registry.init_pd_cache_aware_policies(&prefill, &decode);
+            registry.init_pd_bucket_policies(&prefill);
+
+            let read = registry.pd_lists_read();
+            logs_assert(|lines: &[&str]| {
+                let handed = |role: &str| {
+                    let start = format!("Initializing {role} ");
+                    let end = format!("policy with {count} workers");
+                    lines
+                        .iter()
+                        .any(|line| line.contains(&start) && line.contains(&end))
+                };
+                let handed = (handed("prefill"), handed("decode"));
+                if handed == read {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{kind}: the init calls hand the sides {handed:?} and pd_lists_read says {read:?}"
+                    ))
+                }
+            });
+        }
+    }
+
     /// A prefill worker's removal reaches the bucket policy, which keeps the
     /// prefill workers' size partition without consuming load reports: every
     /// request size still selects one of the workers left.
