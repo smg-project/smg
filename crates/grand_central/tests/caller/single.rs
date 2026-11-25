@@ -282,16 +282,25 @@ fn the_requests_of_one_key_stay_on_its_worker() {
 }
 
 /// What a stage heard of the leases of its requests, in order.
-type Heard = Arc<Mutex<Vec<String>>>;
+pub(crate) type Heard = Arc<Mutex<Vec<String>>>;
 
 /// A scorer added in code that scores every worker alike and takes every
 /// word of a lease.
 #[derive(Debug)]
-struct Hears(Heard);
+pub(crate) struct Hears(pub(crate) Heard);
 
 impl Hears {
     fn heard(&self, word: String) {
         self.0.lock().expect("no case panicked").push(word);
+    }
+
+    /// `word` as it is kept of `side`: bare for a single request's one
+    /// side, and with the side's name behind it for a side of a pair.
+    fn of(word: &str, side: Side) -> String {
+        match side {
+            Side::Single => word.to_owned(),
+            side => format!("{word} {side:?}"),
+        }
     }
 }
 
@@ -300,20 +309,25 @@ impl Lifecycle for Hears {
         EventSet::LEASE
     }
 
-    fn on_decision_issued(&self, _: &Lease, _: &Decision) {
-        self.heard("issued".to_owned());
+    fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+        self.heard(Self::of("issued", lease.side));
     }
 
-    fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
-        self.heard("dispatched".to_owned());
+    fn on_dispatched(&self, _: &Lease, _: &Target, side: Side, _: u32) {
+        self.heard(Self::of("dispatched", side));
     }
 
-    fn on_completed(&self, _: &Lease, outcome: &Outcome) {
-        self.heard(format!("completed {} {:?}", outcome.status, outcome.class));
+    fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+        let completed = Self::of("completed", lease.side);
+        self.heard(format!(
+            "{completed} {} {:?}",
+            outcome.status, outcome.class
+        ));
     }
 
-    fn on_released(&self, _: &Lease, reason: ReleaseReason) {
-        self.heard(format!("released {reason:?}"));
+    fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+        let released = Self::of("released", lease.side);
+        self.heard(format!("{released} {reason:?}"));
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
@@ -397,7 +411,7 @@ async fn hearing() -> (Program, Heard, Arc<AtomicBool>, JoinHandle<()>) {
 }
 
 /// The words `heard` holds, taken out of it.
-fn taken(heard: &Heard) -> Vec<String> {
+pub(crate) fn taken(heard: &Heard) -> Vec<String> {
     std::mem::take(&mut *heard.lock().expect("no case panicked"))
 }
 
@@ -443,14 +457,14 @@ async fn the_engine_hears_each_requests_end() {
 
     let mut streamed = program.place(&PLAIN, &[]).expect("a placement");
     streamed.sent();
-    let ended = thread::spawn(move || streamed.ended(200));
+    let ended = thread::spawn(move || streamed.ended(Side::Single, 200));
     ended.join().expect("the stream's thread ends");
     assert_eq!(taken(&heard), ["issued", "dispatched", "completed 200 Ok"]);
 
     for (status, class) in [(404, "ClientError"), (408, "Timeout"), (504, "Timeout")] {
         let mut ended = program.place(&PLAIN, &[]).expect("a placement");
         ended.sent();
-        ended.ended(status);
+        ended.ended(Side::Single, status);
         let completed = format!("completed {status} {class}");
         assert_eq!(taken(&heard), ["issued", "dispatched", completed.as_str()]);
     }
@@ -575,7 +589,7 @@ fn a_request_is_placed_over_the_generation_that_stands() {
     let (first, last) = (url(0), url(2));
     let expected = BTreeMap::from([(first.as_str(), 3), (last.as_str(), 3)]);
     assert_eq!(sends(&answers), expected, "the worker that left takes none");
-    under_way.ended(200);
+    under_way.ended(Side::Single, 200);
     drop(under_way);
     assert_eq!(fleet[1].load(), 0, "its request ended");
 

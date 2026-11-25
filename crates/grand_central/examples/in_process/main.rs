@@ -8,10 +8,13 @@
 //! ([`InProcess::place`]): it keeps the placement to the request's end
 //! and says when the request went out and how it ended.
 //!
-//! `program.rs` is the program. This file runs it over three workers that
-//! serve nothing: a send is a line on the output, and one worker answers
-//! every send with a server error, so a request that meets it is asked
-//! again past it.
+//! `program.rs` is the program. This file runs it twice, over workers that
+//! serve nothing: a send is a line on the output. The first run is over
+//! three single workers, one of which answers every send with a server
+//! error, so a request that meets it is asked again past it. The second is
+//! over pairs of a prefill worker and a decode worker: the settings' mode
+//! says so, a request lends the two lists, and the same one call names both
+//! of its workers.
 //!
 //! `engine_load.rs` is a stage of the program's own, a scorer added in
 //! code. This file shows it once over records made by hand, as a program
@@ -31,7 +34,7 @@
 use std::{error::Error, sync::Arc};
 
 use engine_load::{decided_by_engine_load, stages};
-use program::{settings, Asked, Program};
+use program::{pair_settings, settings, Asked, Plan, Program};
 use smg_grand_central::{
     document::{AppliedSpec, PolicySettings, PolicySpec},
     engine::{Candidate, Constraints, PoolFacts, RequestFacts, Role, Scratch, Target, WorkerId},
@@ -39,7 +42,7 @@ use smg_grand_central::{
 use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
     model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerStatus},
+    worker::{HealthCheckConfig, WorkerStatus, WorkerType},
 };
 
 mod engine_load;
@@ -51,15 +54,16 @@ const MODEL: &str = "model-a";
 /// The worker that answers every send with a server error.
 const FAILING: &str = "http://worker-1:8000";
 
-/// A ready worker at `address` that serves [`MODEL`], with no health
-/// checker behind it.
-fn worker(address: &str) -> Arc<dyn Worker> {
+/// A ready worker of `kind` at `address` that serves [`MODEL`], with no
+/// health checker behind it.
+fn worker(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
     let health = HealthCheckConfig {
         disable_health_check: true,
         ..HealthCheckConfig::default()
     };
     let worker = <BasicWorkerBuilder>::new(address)
         .model(ModelCard::new(MODEL))
+        .worker_type(kind)
         .health_config(health)
         .build();
     worker.set_status(WorkerStatus::Ready);
@@ -113,11 +117,13 @@ fn own_stage() -> Result<(), Box<dyn Error>> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // The document a configuration's `policy: round_robin` means.
-    let document = settings(PolicySettings::RoundRobin).policy_document()?;
-    let spec = AppliedSpec::validate(&document)?;
+    // The document a configuration's `policy: round_robin` means, and the
+    // kinds of worker its mode routes to: single workers.
+    let settings = settings(PolicySettings::RoundRobin);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
     // This program has no load monitor, so it hands the engine no channel.
-    let (program, task) = Program::start(spec, None, send);
+    let (program, task) = Program::start(plan, spec, None, send);
     #[expect(
         clippy::disallowed_methods,
         reason = "the engine's task runs for the life of the process"
@@ -126,7 +132,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let addresses = ["http://worker-0:8000", FAILING, "http://worker-2:8000"];
     for address in addresses {
-        assert!(program.join(worker(address)), "a free address joins");
+        let single = worker(address, WorkerType::Regular);
+        assert!(program.join(single), "a free address joins");
     }
     // The yield hands the engine's task its first poll: there it reads the
     // registry whole and tells the document's stages each worker.
@@ -154,5 +161,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
         answer.sent.len(),
         answer.unplaced
     );
+    pairs(&asked).await?;
     own_stage()
+}
+
+/// The program over pairs: the same settings under the mode of a gateway
+/// that routes to a prefill worker and a decode worker, two of each. A
+/// request lends the two lists, and its one call names a prefill and a
+/// decode: both are sent, the prefill first.
+async fn pairs(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let settings = pair_settings(PolicySettings::RoundRobin);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let prefills = ["http://prefill-0:8000", "http://prefill-1:8000"];
+    let decodes = ["http://decode-0:8000", "http://decode-1:8000"];
+    for address in prefills {
+        let prefill = worker(address, WorkerType::Prefill);
+        assert!(program.join(prefill), "a free address joins");
+    }
+    for address in decodes {
+        let decode = worker(address, WorkerType::Decode);
+        assert!(program.join(decode), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    for request in 1..=2 {
+        println!("a pair's request {request}:");
+        let answer = program.serve(asked);
+        println!("  the client reads {}", answer.status);
+    }
+    Ok(())
 }
