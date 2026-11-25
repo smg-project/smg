@@ -212,6 +212,12 @@ fn lending_both() -> (Affinity, Arc<TokenTree>, Arc<StringTree>) {
 /// Stores `hashes`, a prompt's blocks from its first, for the worker at
 /// `at`, as its event stream would.
 fn store(index: &ChainIndex, at: usize, hashes: &[u64]) {
+    stored(index, at, hashes);
+}
+
+/// [`store`], handing back the worker's number and the map of its blocks,
+/// which the end of its stream takes ([`ChainIndex::remove_worker`]).
+fn stored(index: &ChainIndex, at: usize, hashes: &[u64]) -> (u32, ChainBlockMap) {
     let number = index.intern_worker(&address(at)).expect("a number");
     let contents: Vec<ContentHash> = hashes.iter().map(|&hash| ContentHash(hash)).collect();
     let blocks: Vec<StoredBlock> = contents
@@ -222,9 +228,11 @@ fn store(index: &ChainIndex, at: usize, hashes: &[u64]) {
             content_hash,
         })
         .collect();
+    let mut map = ChainBlockMap::new();
     index
-        .apply_stored(number, &blocks, None, &mut ChainBlockMap::new())
+        .apply_stored(number, &blocks, None, &mut map)
         .expect("the blocks are stored");
+    (number, map)
 }
 
 /// The token ids of a prompt of `blocks` whole blocks, counted from `first`.
@@ -2372,6 +2380,122 @@ fn a_lists_table_stands_for_a_second() {
     store(index, 2, &hashes_of(&asked));
     assert!(bed.holders(&asked, NOW + SECOND + 1).is_empty());
     assert_eq!(bed.holders(&asked, NOW + 2 * SECOND), [(2, 4, 0)]);
+}
+
+/// A number of the index that one worker handed back and the next worker
+/// took names the new worker to the next decision: the list's table, which
+/// kept the number for the first, is read again before its second is up.
+#[test]
+fn a_number_that_changed_hands_names_its_new_worker() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("an index");
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = prompt(1_000, 4);
+    // Worker 0 holds another prompt under its number when the table is read.
+    let (number, map) = stored(&index, 0, &hashes_of(&prompt(5_000, 2)));
+    assert!(bed.holders(&asked, NOW).is_empty());
+    // Its stream ends and worker 1's opens: worker 1 takes the number and
+    // alone holds the asked prompt.
+    index.remove_worker(number, map);
+    store(&index, 1, &hashes_of(&asked));
+    assert_eq!(index.worker_id(&address(1)), Some(number));
+    assert_eq!(bed.holders(&asked, NOW), [(1, 4, 0)]);
+}
+
+/// A number that changes hands under a decision's own lookup names nobody
+/// to it: the table read the number for its former worker, and the lookup
+/// finds the blocks of its new one. The next decision reads the table again
+/// and names the new worker. A side's column holds nothing of the request
+/// under such a lookup, and the next column holds the new worker's blocks.
+#[test]
+fn a_number_handed_on_under_a_lookup_names_nobody() {
+    /// A chain index whose first lookup is met by a handoff: the stream of
+    /// worker 0 ends and worker 1 stores the asked prompt under its number.
+    struct HandedOn {
+        index: ChainIndex,
+        handoff: Mutex<Option<(u32, ChainBlockMap, Vec<u64>)>>,
+    }
+
+    impl CacheIndex for HandedOn {
+        fn worker_number(&self, address: &str) -> Option<u32> {
+            self.index.worker_id(address)
+        }
+
+        fn numbers_reused(&self) -> u64 {
+            self.index.ids_reused()
+        }
+
+        fn worker_blocks(&self, number: u32) -> usize {
+            self.index.worker_block_count(number)
+        }
+
+        fn deepest_into(
+            &self,
+            block_hashes: &[u64],
+            block_size: u32,
+            within: &[u64],
+            cap: usize,
+            below: &mut dyn FnMut(u32) -> u32,
+            kept: &mut Vec<(u32, u32)>,
+        ) {
+            if let Some((number, map, hashes)) = self.handoff.lock().take() {
+                self.index.remove_worker(number, map);
+                store(&self.index, 1, &hashes);
+            }
+            CacheIndex::deepest_into(
+                &self.index,
+                block_hashes,
+                block_size,
+                within,
+                cap,
+                below,
+                kept,
+            );
+        }
+    }
+
+    struct Lends(Arc<HandedOn>);
+
+    impl CacheIndexes for Lends {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            Some(Arc::clone(&self.0) as Arc<dyn CacheIndex>)
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            Some(BLOCK)
+        }
+    }
+
+    let asked = prompt(1_000, 4);
+    let handed_on = |spec: AppliedSpec| {
+        let index = ChainIndex::new();
+        // Worker 0 holds another prompt under its number when the table is
+        // read.
+        let (number, map) = stored(&index, 0, &hashes_of(&prompt(5_000, 2)));
+        let handed = Arc::new(HandedOn {
+            index,
+            handoff: Mutex::new(Some((number, map, hashes_of(&asked)))),
+        });
+        let bed = Bed::new(Affinity::default(), spec, 4);
+        bed.affinity
+            .set_indexes(Arc::new(Lends(Arc::clone(&handed))) as Arc<dyn CacheIndexes>);
+        (bed, handed, number)
+    };
+
+    let (bed, handed, number) = handed_on(preset("cache_aware"));
+    assert!(bed.holders(&asked, NOW).is_empty());
+    assert_eq!(handed.index.worker_id(&address(1)), Some(number));
+    assert_eq!(bed.holders(&asked, NOW), [(1, 4, 0)]);
+
+    // A side's column is filled by a lookup of its own.
+    let (bed, handed, number) = handed_on(paired());
+    let facts = request(&asked, 7, NOW);
+    assert_eq!(held(&bed.column(&facts, Phase::Prefill).0), [(0, 0); 4]);
+    assert_eq!(handed.index.worker_id(&address(1)), Some(number));
+    assert_eq!(
+        held(&bed.column(&facts, Phase::Prefill).0),
+        [(0, 0), (4, 0), (0, 0), (0, 0)]
+    );
 }
 
 /// A profile whose stages read no affinity is named no row: its decision
