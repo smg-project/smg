@@ -70,6 +70,86 @@ fn the_exposure_withholds_what_the_row_does_not_reveal() {
     );
 }
 
+/// A plugin's picker stands across a later document that changes the
+/// view's header list alone. Its row exposes the first place, so behind
+/// the new list the picker is shown the header that stands first there. A
+/// picker built anew from the later document is shown the same.
+#[test]
+fn a_picker_kept_across_a_new_header_list_is_shown_its_rows_place() {
+    use std::sync::Arc;
+
+    use smg_grand_central::{
+        document::{AppliedSpec, PolicySpec},
+        engine::{InProcess, Picker},
+        plugins::grpc::GrpcPicker,
+        stages::{Best, StageRegistry},
+    };
+
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let mut row = spec(&served, "first-place");
+    row.view = Exposure {
+        tenant: Reveal::None,
+        session_key: Reveal::None,
+        headers: HeaderSet::of([0]),
+    };
+    let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
+    let mut stages = StageRegistry::builtin();
+    let make = move || -> Box<dyn Picker> {
+        Box::new(GrpcPicker::new(plugin.bind(), Some(Box::new(Best))))
+    };
+    stages.picker("first-place", make).expect("a free name");
+    let listing = |generation: u64, headers: &[&str]| {
+        let mut document = PolicySpec::preset("random").expect("a built-in preset");
+        document.generation = generation;
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "first-place".into();
+        document.view.headers = headers.iter().map(|name| (*name).to_owned()).collect();
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        spec.expect("the stages hold the picker")
+    };
+    let candidates = pool(4);
+    // What the plugin is shown of a request that carries two headers, each
+    // stated by its place in the list of the document it is decided under.
+    let shown = |spec: &AppliedSpec| {
+        let carried = [("x-a", "one"), ("x-b", "two")];
+        let stated = |(name, at): (&str, u8)| {
+            let &(_, value) = carried.iter().find(|(listed, _)| *listed == name)?;
+            let mut header = Header::default();
+            header.name = at;
+            header.value = value;
+            Some(header)
+        };
+        let listed = spec.view_headers().zip(0..=u8::MAX);
+        let headers: Vec<Header<'_>> = listed.filter_map(stated).collect();
+        let mut request = facts(1);
+        request.headers = &headers;
+        let decision = decide_with(spec.engine(), &request, &candidates);
+        assert!(lead(&decision).is_some(), "a pick");
+        let seen = served.seen();
+        let frame = seen.frames.last().expect("a frame");
+        let sent = frame.request.as_ref().expect("the request");
+        sent.headers.clone()
+    };
+    let first = |value: &str| {
+        [proto::Header {
+            name: 0,
+            value: value.to_owned(),
+        }]
+    };
+    let host = InProcess::new(listing(1, &["x-a"]));
+    let stood = host.spec();
+    assert_eq!(shown(&stood), first("one"));
+    let applied = host.apply(listing(2, &["x-b", "x-a"]));
+    applied.expect("a number above the standing one");
+    let stands = host.spec();
+    let (new, old) = (stands.engine().profiles(), stood.engine().profiles());
+    assert!(Arc::ptr_eq(&new[0], &old[0]), "the picker stands");
+    assert_eq!(shown(&stands), first("two"), "the picker kept");
+    let anew = listing(2, &["x-b", "x-a"]);
+    assert_eq!(shown(&anew), first("two"), "a picker built anew");
+}
+
 /// A frame carries the request's block hashes to a plugin whose row
 /// declares them, in either form, and none to one whose row declares
 /// neither: a prompt's length sizes no frame of a plugin that reads none.

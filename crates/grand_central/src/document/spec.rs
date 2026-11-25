@@ -528,6 +528,34 @@ impl Default for ViewSpec {
     }
 }
 
+impl ViewSpec {
+    /// Whether this view and `other` are equal but for their header lists.
+    /// Two equal views are such a pair.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn same_but_for_headers(&self, other: &Self) -> bool {
+        // Every field stands here by its name, with no `..`. So a field
+        // added to the view does not build until this function compares it
+        // or names it as left out.
+        let Self {
+            headers: _,
+            block_size,
+            boundaries,
+            max_block_hashes,
+            max_report_age_ms,
+            labels,
+            zones,
+            engines,
+        } = self;
+        *block_size == other.block_size
+            && *boundaries == other.boundaries
+            && *max_block_hashes == other.max_block_hashes
+            && *max_report_age_ms == other.max_report_age_ms
+            && *labels == other.labels
+            && *zones == other.zones
+            && *engines == other.engines
+    }
+}
+
 /// The under-layer of a model's prefix index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -4321,6 +4349,11 @@ impl HashDepths {
 /// and whether the profile keeps a session key on its worker over the
 /// overload veto: the plain ring alone decides its pick. `depth` is
 /// deepened to what the built stages read of a request's block hashes.
+///
+/// The build reads four values of `view` and no header: the block size, the
+/// boundaries, the bound of block hashes and the age limit of load reports.
+/// The keep of a profile across a new header list rests on that
+/// (`AppliedSpec::keep_from`).
 fn check_profile(
     name: &str,
     p: &ProfileSpec,
@@ -7868,8 +7901,9 @@ mod tests {
     /// A later spec keeps the stage objects of each profile whose name and
     /// text did not change, and builds every other profile's anew. A count
     /// of sends stands where a profile that reads it is kept, whichever of
-    /// its other readers changed, left or came. A spec that changes `view`
-    /// or `signals` builds every profile anew.
+    /// its other readers changed, left or came. A spec that changes
+    /// `signals` builds every profile anew, and so does one that changes
+    /// the view's age limit of load reports.
     #[cfg(feature = "in-process")]
     #[test]
     fn a_later_spec_keeps_the_stages_of_a_profile_whose_text_did_not_change() {
@@ -7930,6 +7964,61 @@ mod tests {
             let mut next = AppliedSpec::validate(&later).expect("a valid document");
             next.keep_from(&standing);
             assert_eq!(kept(&next, &standing), (profiles, count), "case {at}");
+        }
+    }
+
+    /// A later spec whose view differs in its header list alone keeps its
+    /// profiles, however the list changed: it grew, it shrank, or it
+    /// changed inside. Each other field of the view, changed alone, builds
+    /// every profile anew, beside the same header list and beside another.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_view_that_differs_in_its_header_list_alone_keeps_every_profile() {
+        let listing = |headers: &[&str]| {
+            let mut spec = doc(KEPT);
+            spec.view.headers = headers.iter().map(|name| (*name).to_owned()).collect();
+            spec
+        };
+        let applied = |spec: &PolicySpec| AppliedSpec::validate(spec).expect("a valid document");
+        // The standing list and the later one.
+        let lists: [(&[&str], &[&str]); 9] = [
+            (&["x-a"], &["x-a"]),
+            (&["x-a"], &["x-a", "x-b"]),
+            (&["x-a", "x-b"], &["x-a"]),
+            (&[], &["x-a"]),
+            (&["x-a"], &[]),
+            (&["x-a", "x-b"], &["x-b", "x-a"]),
+            (&["x-a", "x-b"], &["x-b"]),
+            (&["x-b"], &["x-a", "x-b"]),
+            (&["x-a", "x-b"], &["x-a", "x-c"]),
+        ];
+        for (at, (stood, later)) in lists.into_iter().enumerate() {
+            let standing = applied(&listing(stood));
+            let mut next = applied(&listing(later));
+            next.keep_from(&standing);
+            assert_eq!(kept(&next, &standing), ([true; 3], true), "lists {at}");
+        }
+        // Each other field of the view, changed alone.
+        type Edit = fn(&mut ViewSpec);
+        let fields: [Edit; 7] = [
+            |view| view.block_size = Some(32),
+            |view| view.boundaries = vec![64],
+            |view| view.max_block_hashes = 512,
+            |view| view.max_report_age_ms = Some(900),
+            |view| view.labels = vec!["tier".to_owned()],
+            |view| view.zones = vec!["east".to_owned()],
+            |view| view.engines = vec!["alpha".to_owned()],
+        ];
+        let standing = applied(&listing(&["x-a"]));
+        for (at, edit) in fields.into_iter().enumerate() {
+            for later in [&["x-a"][..], &["x-b", "x-a"]] {
+                let mut other = listing(later);
+                edit(&mut other.view);
+                let mut next = applied(&other);
+                next.keep_from(&standing);
+                let none = ([false; 3], false);
+                assert_eq!(kept(&next, &standing), none, "field {at} beside {later:?}");
+            }
         }
     }
 
