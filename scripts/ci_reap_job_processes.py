@@ -27,6 +27,7 @@ import argparse
 import dataclasses
 import math
 import os
+import select
 import signal
 import sys
 import time
@@ -183,27 +184,30 @@ class OwnedProcess:
 
 def _strict_stat(proc_root: str, pid: int) -> tuple[str, int, int] | None:
     try:
-        with open(os.path.join(proc_root, str(pid), "stat"), encoding="utf-8") as stream:
+        with open(os.path.join(proc_root, str(pid), "stat"), "rb") as stream:
             text = stream.read(8193)
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
-    fields = text.rpartition(")")[2].split()
-    if len(text) > 8192 or text.partition("(")[0].strip() != str(pid) or len(fields) < 20:
+    # comm is raw kernel bytes, including possible non-UTF-8 characters.
+    fields = text.rpartition(b")")[2].split()
+    if len(text) > 8192 or text.partition(b"(")[0].strip() != str(pid).encode() or len(fields) < 20:
         raise ValueError(f"cannot establish stat identity for pid {pid}")
     ppid, starttime = int(fields[1]), int(fields[19])
     if ppid < 0 or starttime < 0:
         raise ValueError(f"invalid stat identity for pid {pid}")
-    return fields[0], ppid, starttime
+    return fields[0].decode("ascii"), ppid, starttime
 
 
-def _strict_owned(proc_root: str, pid: int, uid: int, entry: bytes) -> OwnedProcess | None:
+def _strict_owned(
+    proc_root: str, pid: int, uid: int, entry: bytes, *, group_exited
+) -> OwnedProcess | None:
     before = _strict_stat(proc_root, pid)
-    if before is None or before[0] == "Z":
+    if before is None:
         return None
     try:
-        with open(os.path.join(proc_root, str(pid), "status"), encoding="utf-8") as stream:
+        with open(os.path.join(proc_root, str(pid), "status"), "rb") as stream:
             status = stream.read(65537)
-        rows = [line.split()[1:] for line in status.splitlines() if line.startswith("Uid:")]
+        rows = [line.split()[1:] for line in status.splitlines() if line.startswith(b"Uid:")]
         if len(status) > 65536 or len(rows) != 1 or len(rows[0]) != 4:
             raise ValueError(f"cannot establish UID for pid {pid}")
         uids = tuple(int(value) for value in rows[0])
@@ -213,25 +217,60 @@ def _strict_owned(proc_root: str, pid: int, uid: int, entry: bytes) -> OwnedProc
             if uid not in uids:
                 return None  # Clearly foreign UID: never read its environment or signal it.
             raise ValueError(f"mixed UID ownership for pid {pid}")
+        if before[0] == "Z":
+            # pthread_exit can leave a zombie leader with live worker threads.
+            # A flags=0 pidfd becomes readable only after the entire group exits.
+            if group_exited(pid):
+                return None
+            raise ValueError(f"live thread group behind zombie leader: {pid}")
         with open(os.path.join(proc_root, str(pid), "environ"), "rb") as stream:
             environ = stream.read(1048577)
         if len(environ) > 1048576:
             raise ValueError(f"incomplete environment observation for pid {pid}")
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         if _strict_stat(proc_root, pid) is None:
             return None
         raise ValueError(f"ownership files disappeared for live pid {pid}") from None
     after = _strict_stat(proc_root, pid)
-    if after is None or after[0] == "Z":
+    if after is None:
         return None
     if before[2] != after[2]:
         raise ValueError(f"PID birth changed during observation: {pid}")
+    if after[0] == "Z":
+        if group_exited(pid):
+            return None
+        raise ValueError(f"thread group exit is not established: {pid}")
     markers = [value for value in environ.split(b"\0") if value.startswith(b"E2E_JOB_MARKER=")]
     if entry not in markers:
         return None
     if markers != [entry]:
         raise ValueError(f"ambiguous marker for pid {pid}")
     return OwnedProcess(pid, after[1], uid, after[2])
+
+
+def _strict_census(proc_root: str) -> tuple[dict[int, int], bool]:
+    """Record all listed PID births; a vanished entry makes this pass incomplete."""
+    found: dict[int, int] = {}
+    complete = True
+    for name in sorted(os.listdir(proc_root)):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        observed = _strict_stat(proc_root, pid)
+        if observed is None:
+            complete = False
+        else:
+            found[pid] = observed[2]
+    return found, complete
+
+
+def _pidfd_exited(fd: int) -> bool:
+    poll = select.poll()
+    poll.register(fd, select.POLLIN | select.POLLHUP)
+    events = poll.poll(0)
+    if any(mask & (select.POLLERR | select.POLLNVAL) for _, mask in events):
+        raise ValueError("cannot establish pidfd exit readiness")
+    return any(mask & (select.POLLIN | select.POLLHUP) for _, mask in events)
 
 
 def _strict_ancestors(proc_root: str, pid: int) -> dict[int, tuple[int, int]]:
@@ -255,6 +294,7 @@ def reap_strict(
     grace: float = DEFAULT_GRACE_SECS,
     pidfd_open=None,
     pidfd_send_signal=None,
+    pidfd_exited=None,
     close: Callable[[int], None] = os.close,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
@@ -265,8 +305,10 @@ def reap_strict(
     """Signal only verified marker/UID/birth identities through bound pidfds.
 
     Injectable APIs and proc_root are for CPU fixtures. The production strict
-    CLI permits only /proc. True means two complete empty observations in this
-    ownership domain; it does not prove GPU/container/service release.
+    CLI permits only /proc. Quiet observations require complete, unchanged PID
+    birth censuses around each scan. This is not an atomic barrier against future
+    spawns and does not prove GPU/container/service release. Each identity gets
+    its own TERM grace; all work still ends at the fixed grace+20 second deadline.
     """
     opener = getattr(os, "pidfd_open", None) if pidfd_open is None else pidfd_open
     sender = (
@@ -274,7 +316,8 @@ def reap_strict(
         if pidfd_send_signal is None
         else pidfd_send_signal
     )
-    if not callable(opener) or not callable(sender):
+    exited = _pidfd_exited if pidfd_exited is None else pidfd_exited
+    if not callable(opener) or not callable(sender) or not callable(exited):
         log("::error::strict cleanup requires pidfd_open and pidfd_send_signal")
         return False
     if not marker.strip() or not math.isfinite(grace) or grace < 0:
@@ -283,23 +326,37 @@ def reap_strict(
     me = os.getpid() if self_pid is None else self_pid
     owner_uid = os.getuid() if uid is None else uid
     entry = f"{MARKER_ENV}={marker}".encode()
-    term_deadline = clock() + grace
-    deadline = term_deadline + 20.0
+    deadline = clock() + grace + 20.0
     max_scans = max(2, math.ceil((grace + 20.0) / POLL_SECS) + 2)
     handles: dict[int, tuple[OwnedProcess, int]] = {}
     seen: dict[int, int] = {}
     sent: set[tuple[int, int, int]] = set()
+    term_sent_at: dict[tuple[int, int], float] = {}
     clean = False
 
     def retire(pid: int) -> None:
         _, fd = handles.pop(pid)
         close(fd)
 
+    def group_exited(pid: int) -> bool:
+        if pid in handles:
+            return exited(handles[pid][1])
+        try:
+            fd = opener(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            return exited(fd)
+        finally:
+            close(fd)
+
     def still_owned(process: OwnedProcess) -> bool:
-        current = _strict_owned(proc_root, process.pid, owner_uid, entry)
+        if group_exited(process.pid):
+            return False
+        current = _strict_owned(proc_root, process.pid, owner_uid, entry, group_exited=group_exited)
         if current is None:
             stat = _strict_stat(proc_root, process.pid)
-            if stat is None or stat[0] == "Z":
+            if stat is None:
                 return False
             raise ValueError(f"tracked ownership changed or is unobservable: {process.pid}")
         if (current.uid, current.starttime) != (process.uid, process.starttime):
@@ -312,11 +369,12 @@ def reap_strict(
         for _ in range(max_scans):
             if _strict_ancestors(proc_root, me) != protected:
                 raise ValueError("cleanup process ancestor chain changed")
+            census_before, before_complete = _strict_census(proc_root)
             observed: list[OwnedProcess] = []
-            for name in sorted(os.listdir(proc_root)):
-                if not name.isdigit() or int(name) in protected or int(name) <= 1:
+            for pid in sorted(census_before):
+                if pid in protected or pid <= 1:
                     continue
-                process = _strict_owned(proc_root, int(name), owner_uid, entry)
+                process = _strict_owned(proc_root, pid, owner_uid, entry, group_exited=group_exited)
                 if process is not None:
                     observed.append(process)
             for process in observed:
@@ -340,7 +398,8 @@ def reap_strict(
                     retire(pid)
                     continue
                 signals = [signal.SIGTERM]
-                if clock() >= term_deadline:
+                identity = (pid, process.starttime)
+                if identity in term_sent_at and clock() - term_sent_at[identity] >= grace:
                     signals.append(signal.SIGKILL)
                 for sig in signals:
                     key = (pid, process.starttime, sig)
@@ -357,10 +416,16 @@ def reap_strict(
                         retire(pid)
                         break
                     sent.add(key)
+                    if sig == signal.SIGTERM:
+                        term_sent_at[identity] = clock()
                     log(f"strict signal {sig} pid {pid} uid {owner_uid} birth {process.starttime}")
             if clock() > deadline:
                 raise TimeoutError("strict cleanup observation deadline reached")
-            quiet = quiet + 1 if not observed and not handles else 0
+            census_after, after_complete = _strict_census(proc_root)
+            if clock() > deadline:
+                raise TimeoutError("strict cleanup final census exceeded deadline")
+            stable = before_complete and after_complete and census_before == census_after
+            quiet = quiet + 1 if stable and not observed and not handles else 0
             if quiet == 2:
                 clean = True
                 break
