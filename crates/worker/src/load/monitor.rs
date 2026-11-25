@@ -59,8 +59,9 @@
 //! [`LEAST_POLL_INTERVAL`]. A tick ends at the next one at the latest. A
 //! fetch still open then is kept: its answer is a batch when it comes, and
 //! its engine is asked again behind it, at once where the tick it comes in
-//! has not ended. An answer for a worker whose URL another worker holds by
-//! then is no part of the batch.
+//! has not ended. Where another worker holds the worker's URL by then, an
+//! answer is not told to the sink and nothing of it is published; a fetch
+//! that failed is said as one, as at any tick.
 //!
 //! ## The port
 //!
@@ -3237,23 +3238,35 @@ async fn poll_group<G: Generation>(
         // beside the entries.
         let mut failed: Vec<Arc<dyn Worker>> = Vec::new();
         for (asked_at, mut engine) in engines {
+            // A fetch that failed is said to the sink for the workers it
+            // was asked for, as at any tick: that word names workers and
+            // lays nothing at a URL.
+            let failed_fetch = engine.iter().all(|(_, response)| response.is_none());
+            if failed_fetch {
+                monitor.reconcile_engine(&mut engine, asked_at);
+            }
             // An answer for a worker whose URL another worker holds by now
-            // says nothing at that URL: the report on file, the rank counts
-            // and the row there are the other worker's once its own poll
-            // wrote them, and what the worker that left still has there
-            // goes with its eviction.
+            // says nothing at that URL: the rank counts and the row there
+            // are the other worker's once its own poll wrote them, and what
+            // the worker that left still has there goes with its eviction.
             engine.retain(|(worker, _)| {
                 monitor
                     .worker_registry
                     .get_by_url(worker.url())
                     .is_none_or(|holder| Arc::ptr_eq(&holder, worker))
             });
-            // With no member left there is nothing to tell the sink, where
-            // an engine with no answer reads as a fetch that failed.
+            // With no member left nothing is published, and an answer that
+            // came is not told to the sink, where an engine with no answer
+            // reads as a fetch that failed.
             if engine.is_empty() {
                 continue;
             }
-            let carries_rank_capacity = monitor.reconcile_engine(&mut engine, asked_at);
+            // No member of a fetch that failed carries rank capacity.
+            let carries_rank_capacity = if failed_fetch {
+                vec![false; engine.len()]
+            } else {
+                monitor.reconcile_engine(&mut engine, asked_at)
+            };
             for ((worker, response), carries_rank_capacity) in
                 engine.into_iter().zip(carries_rank_capacity)
             {
