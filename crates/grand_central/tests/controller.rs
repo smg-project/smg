@@ -1973,3 +1973,95 @@ async fn a_start_states_the_overload_thresholds_a_worker_with_none_is_judged_by(
         served.expect("a clean stop");
     }
 }
+
+/// A standalone controller reads the policy spec's overload switch at each
+/// document that takes force. One worker's page reads 5 queued requests,
+/// and its row states no threshold. A controller started with a count of 4
+/// vetoes it under a spec file whose binding leaves the switch on. The file
+/// is written again with the switch off while the controller runs: the
+/// verdict leaves when the file's watch applies the document, and no later
+/// read of the worker's page sets it again. Written again with the switch
+/// on, the verdict returns at the next report.
+#[tokio::test]
+async fn a_document_that_switches_the_default_off_lifts_a_served_controllers_verdict() {
+    use smg_grand_central::document::API_VERSION;
+
+    const PATIENCE: Duration = Duration::from_secs(30);
+
+    /// The admin page's two counts once `holds` says so of them: the reads
+    /// of the worker's page, and the overload verdicts that moved.
+    async fn counts(admin: SocketAddr, what: &str, holds: impl Fn(u64, u64) -> bool) -> (u64, u64) {
+        let started = Instant::now();
+        loop {
+            let read = timeout(PATIENCE, http_get(admin, "/metrics"));
+            let (status, page) = read
+                .await
+                .expect("the page answers inside the patience")
+                .expect("the metrics page");
+            assert_eq!(status, 200);
+            let scrapes = series(&page, "load_scrapes_total").unwrap_or(0);
+            let flips = series(&page, "overload_flips_total").unwrap_or(0);
+            if holds(scrapes, flips) {
+                return (scrapes, flips);
+            }
+            assert!(started.elapsed() < PATIENCE, "{what}: {page}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    let (worker, _worker) = metrics_server(METRICS_TEXT)
+        .await
+        .expect("a metrics server");
+    // The controller's source is a file: each document enters through its
+    // door, as an operator's does.
+    let switched = |enabled: bool| {
+        format!(
+            "apiVersion: {API_VERSION}\nprofiles:\n  p:\n    pick: random\nbindings:\n  - profile: p\n    overload:\n      enabled: {enabled}\n"
+        )
+    };
+    let file = tempfile::NamedTempFile::new().expect("a policy file");
+    std::fs::write(file.path(), switched(true)).expect("the document is written");
+    let mut controller = Controller::bind(Config {
+        load_poll_interval: Duration::from_secs(1),
+        worker_overload: OverloadThresholds {
+            waiting_requests: Some(4),
+            token_usage: None,
+        },
+        ..config()
+    })
+    .await
+    .expect("the controller binds");
+    controller
+        .spec_file(file.path())
+        .await
+        .expect("the document validates");
+    let admin = controller.addresses().admin;
+    let (store, holder) = (controller.store(), controller.workers());
+    ready_row(&holder, &store, &worker, WireModes::HTTP, None).expect("the read row");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        // A verdict that stands has moved an odd number of times, and one
+        // that is off an even number: a failed read of the worker's page
+        // lifts a verdict and the next good one sets it again.
+        let stands = |_: u64, flips: u64| flips % 2 == 1;
+        let (_, stood) = counts(admin, "the start's count vetoes the worker", stands).await;
+        std::fs::write(file.path(), switched(false)).expect("the file is written again");
+        let off = |_: u64, flips: u64| flips.is_multiple_of(2);
+        let (read, lifted) = counts(admin, "the switch off lifts the verdict", off).await;
+        assert!(lifted > stood, "the verdict moved: {stood} then {lifted}");
+        // Two more reads of the worker's page: the object states no
+        // threshold, so no report sets a verdict.
+        let twice = |scrapes: u64, _: u64| scrapes >= read + 2;
+        let (_, still) = counts(admin, "two more reads of the worker's page", twice).await;
+        assert_eq!(still, lifted, "no read of the page set a verdict");
+        std::fs::write(file.path(), switched(true)).expect("the file is written again");
+        let (_, back) = counts(admin, "the switch on brings the verdict back", stands).await;
+        assert!(back > still, "the verdict moved: {still} then {back}");
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+}

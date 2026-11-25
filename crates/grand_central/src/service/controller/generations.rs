@@ -79,11 +79,12 @@ use crate::{
             above, over_bound, Checked, DocumentManager, DryRun, EnforceOutcome, EnforceRefused,
             Held, Line,
         },
-        spec::{AppliedSpec, Digest},
+        spec::{AppliedSpec, Digest, OverloadSwitch},
     },
     service::{elector::Fence, proto},
     stages::registry::StageRegistry,
     store::{MemoryStore, Position},
+    worker_host::{Members, Objects},
 };
 
 /// The lead a source read its bytes under ([`Generations::lead`]): its
@@ -94,6 +95,16 @@ pub(crate) enum Leading {
     Alone,
     /// A replica under a shared lease, whose fence showed this term.
     Term(u64),
+}
+
+/// The lead a replica writes under now, by the cell of its fence: alone
+/// where the cell holds none, else the term the fence shows by the clock
+/// ([`Generations::lead`]). One read of the fence, and no wait.
+fn lead_under(fence: &OnceLock<Arc<Fence>>) -> Option<Leading> {
+    match fence.get() {
+        None => Some(Leading::Alone),
+        Some(fence) => fence.leader_term(Instant::now()).map(Leading::Term),
+    }
 }
 
 /// What became of the document a door's source handed last: its file at
@@ -166,8 +177,9 @@ pub(crate) struct Generations {
     /// The fence of a replica under a shared lease
     /// ([`Generations::under`]): the source's entry is admitted while it
     /// shows the term the entry's bytes were read under. None for a
-    /// replica alone over its lease, whose source writes always.
-    fence: OnceLock<Arc<Fence>>,
+    /// replica alone over its lease, whose source writes always. The
+    /// door's hook reads the same cell ([`Generations::stating`]).
+    fence: Arc<OnceLock<Arc<Fence>>>,
     /// The takes this replica made ([`Generations::at_take`]): behind one
     /// the file's watch reads its file as a start does, while the file's
     /// document has not stood here since the file took it.
@@ -192,8 +204,49 @@ impl Deref for Generations {
 }
 
 impl Generations {
+    /// The door of a replica that keeps worker objects. Each generation
+    /// that enters states its overload switch on `holder`, the word that
+    /// stands in `store` by then ([`Objects::state_overload_switch`]): on
+    /// where every binding leaves it on and where the bindings differ, off
+    /// where every binding switches it off. The door's hook does it, once
+    /// a generation, behind the store's entry and outside the document
+    /// lock ([`DocumentManager::enter`]). It runs under the door's lock,
+    /// which comes ahead of the holder's turn: the holder says the order
+    /// of the locks once, at its turn ([`Objects`]). So an apply returns
+    /// behind the rows its word changed, and two entries in a row leave
+    /// the rows of the last word. A panic inside the hook leaves the
+    /// generation in force and the rows it had not laid under the old
+    /// word. A document that a host applies through the store's own entry
+    /// passes no door, and no word is stated for it.
+    ///
+    /// An object the word lays again took its standing object's status,
+    /// and the holder settles that status with the table's behind each
+    /// lay, under this replica's own word of its lead
+    /// ([`Generations::lead`]): a leader's table is told the object's
+    /// status, and a replica that does not lead writes no row.
+    pub(crate) fn stating(
+        store: Arc<MemoryStore>,
+        catalog: Arc<StageRegistry>,
+        holder: Arc<Objects<Members>>,
+    ) -> Self {
+        let fence = Arc::new(OnceLock::new());
+        let under = Arc::clone(&fence);
+        let entered = move |store: &MemoryStore| {
+            let switch = store.with_snapshot(|world| world.spec().overload_switch());
+            let leads = || lead_under(&under).is_some();
+            holder.state_overload_switch(store, switch != OverloadSwitch::Off, &leads);
+        };
+        let door = DocumentManager::new(store, catalog, Vec::new()).telling(Box::new(entered));
+        Self::over(door, fence)
+    }
+
+    /// A door that states nothing on a holder, for a case.
+    #[cfg(test)]
     pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<StageRegistry>) -> Self {
-        Self::over(DocumentManager::new(store, catalog, Vec::new()))
+        Self::over(
+            DocumentManager::new(store, catalog, Vec::new()),
+            Arc::default(),
+        )
     }
 
     /// [`Generations::new`] with the validator as its argument: a case
@@ -204,20 +257,16 @@ impl Generations {
         catalog: Arc<StageRegistry>,
         validate: Validate,
     ) -> Self {
-        Self::over(DocumentManager::validating(
-            store,
-            catalog,
-            Vec::new(),
-            validate,
-        ))
+        let door = DocumentManager::validating(store, catalog, Vec::new(), validate);
+        Self::over(door, Arc::default())
     }
 
-    fn over(door: DocumentManager) -> Self {
+    fn over(door: DocumentManager, fence: Arc<OnceLock<Arc<Fence>>>) -> Self {
         Self {
             door,
             deferred: Mutex::new(None),
             file_sourced: AtomicBool::new(false),
-            fence: OnceLock::new(),
+            fence,
             takes: AtomicU64::new(0),
             handed: Mutex::new(Handed::Stood),
             unfollowed: Mutex::new(None),
@@ -522,7 +571,9 @@ impl Generations {
     /// ([`Generations::apply_under`]). A replica that has not led yet, one
     /// that follows a leader, and one whose lead ended apply nothing of
     /// their own, whatever their file's watch read ahead of a look. The
-    /// first fence handed stands.
+    /// door's hook reads the replica's lead by the same fence
+    /// ([`Generations::stating`]), so the bind hands it with a spec source
+    /// or with none. The first fence handed stands.
     pub(crate) fn under(&self, fence: Arc<Fence>) {
         let _ = self.fence.set(fence);
     }
@@ -541,10 +592,7 @@ impl Generations {
     /// ([`Generations::apply_under`]). None where the replica is under a
     /// shared lease and its fence shows no term.
     pub(crate) fn lead(&self) -> Option<Leading> {
-        match self.fence.get() {
-            None => Some(Leading::Alone),
-            Some(fence) => fence.leader_term(Instant::now()).map(Leading::Term),
-        }
+        lead_under(&self.fence)
     }
 
     /// This replica took the lease: the elector calls this at each take,
@@ -940,6 +988,10 @@ pub(crate) mod tests {
         time::{Duration, Instant},
     };
 
+    use smg_worker::{
+        health::overload::OverloadThresholds, identity::basic::Worker, registry::WorkerRegistry,
+        worker::WorkerStatus as ObjectStatus,
+    };
     use tokio::task::JoinSet;
 
     use super::*;
@@ -955,6 +1007,7 @@ pub(crate) mod tests {
             },
             spec::{PolicySpec, SpecError},
         },
+        engine::view::WorkerId,
         service::{
             controller::{
                 spec_store::tests::{name_of, names},
@@ -962,6 +1015,7 @@ pub(crate) mod tests {
             },
             elector::{ElectionSettings, Elector, MemoryLease},
         },
+        store::{Registrant, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
     thread_local! {
@@ -2754,5 +2808,203 @@ pub(crate) mod tests {
         // Read again under the term that shows now, the bytes are applied.
         assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Generation(1)));
         assert_eq!(door.apply_counts(), applied(1, 0));
+    }
+
+    /// The thresholds a start states, as the holder of these cases is
+    /// handed them.
+    const START: OverloadThresholds = OverloadThresholds {
+        waiting_requests: Some(8),
+        token_usage: Some(0.8),
+    };
+
+    /// A document of two bindings over one profile that picks by `pick`,
+    /// the first for the chat models and the second for the rest, each
+    /// with the word of its `overload` block or with no block.
+    fn switched_by(pick: &str, first: Option<bool>, second: Option<bool>) -> String {
+        let block = |word: Option<bool>| {
+            word.map_or_else(String::new, |enabled| {
+                format!("    overload:\n      enabled: {enabled}\n")
+            })
+        };
+        let head =
+            format!("apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: {pick}\nbindings:\n");
+        let (first, second) = (block(first), block(second));
+        format!("{head}  - match:\n      model: chat/*\n    profile: p\n{first}  - profile: p\n{second}")
+    }
+
+    /// [`switched_by`] the random pick.
+    pub(crate) fn switched(first: Option<bool>, second: Option<bool>) -> String {
+        switched_by("random", first, second)
+    }
+
+    /// A door that states its generations' overload switch on a holder
+    /// handed [`START`]: the store, the holder and the door.
+    fn stating() -> (Arc<MemoryStore>, Arc<Objects<Members>>, Generations) {
+        let store = Arc::new(MemoryStore::new());
+        let holder = Objects::new(Arc::new(WorkerRegistry::new())).with_overload_thresholds(START);
+        let holder = Arc::new(holder);
+        let door = Generations::stating(Arc::clone(&store), stock(), Arc::clone(&holder));
+        (store, holder, door)
+    }
+
+    /// An engine's worker that names no threshold, registered through the
+    /// holder as a control call registers one: its row.
+    fn register(store: &MemoryStore, holder: &Objects<Members>, url: &str) -> WorkerId {
+        let facts = WorkerFacts {
+            key: url.to_owned(),
+            engine: url.to_owned(),
+            models: vec!["m".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        };
+        let written = holder.upsert(store, facts, Registrant::Control);
+        written.expect("the store takes the registration").id()
+    }
+
+    /// The status the table holds for `row`.
+    fn told(store: &MemoryStore, row: WorkerId) -> WorkerStatus {
+        store.get(row).expect("the row").status
+    }
+
+    /// The object that stands under `url`.
+    fn object(holder: &Objects<Members>, url: &str) -> Arc<dyn Worker> {
+        holder.registry().get_by_url(url).expect("an object")
+    }
+
+    /// The thresholds the object under `url` states.
+    fn stated(holder: &Objects<Members>, url: &str) -> OverloadThresholds {
+        object(holder, url).metadata().overload
+    }
+
+    /// A generation that enters by an apply states its overload switch on
+    /// the holder before the apply returns. Every binding off leaves a
+    /// worker that names no threshold none, and on again the start's. The
+    /// same word under another document lays no object again. Bindings
+    /// that differ keep the start's, either one first. Two entries in a
+    /// row leave the rows of the last word, and a row that comes behind
+    /// them is built by it. A status that moved on the standing object
+    /// with no word to the table stands in the table when the apply
+    /// returns: this replica leads, and the lay settles the two.
+    #[test]
+    fn an_applied_document_states_its_overload_switch_on_the_holder() {
+        let (a, b) = ("http://a:8000", "http://b:8000");
+        let none = OverloadThresholds::default();
+        let (store, holder, door) = stating();
+        let row = register(&store, &holder, a);
+        assert_eq!(stated(&holder, a), START, "the unbound start says on");
+        let unbound = object(&holder, a);
+        // On, by a block and by none: the word stands and nothing is laid.
+        yaml(&door, switched(Some(true), None)).expect("one word");
+        assert!(Arc::ptr_eq(&object(&holder, a), &unbound));
+
+        // A health driver's move whose telling finds the object replaced.
+        unbound.set_status(ObjectStatus::Ready);
+        assert_eq!(told(&store, row), WorkerStatus::Pending);
+        yaml(&door, switched(Some(false), Some(false))).expect("every binding off");
+        assert_eq!(stated(&holder, a), none, "stated when the apply returns");
+        assert_eq!(told(&store, row), WorkerStatus::Ready, "and settled");
+        let off = object(&holder, a);
+        assert_eq!(off.status(), ObjectStatus::Ready);
+        // The same word under another document lays nothing.
+        let other = switched_by("round-robin", Some(false), Some(false));
+        yaml(&door, other).expect("off again");
+        assert!(Arc::ptr_eq(&object(&holder, a), &off));
+
+        // Bindings that differ keep the start's, either one first.
+        yaml(&door, switched(Some(false), None)).expect("a controller refuses none");
+        assert_eq!(stated(&holder, a), START);
+        let differ = object(&holder, a);
+        yaml(&door, switched(None, Some(false))).expect("the other one first");
+        assert!(Arc::ptr_eq(&object(&holder, a), &differ), "on stands");
+
+        // Two entries in a row: the rows of the last word.
+        yaml(&door, switched(Some(false), Some(false))).expect("off");
+        yaml(&door, switched(None, None)).expect("on");
+        assert_eq!(stated(&holder, a), START);
+        register(&store, &holder, b);
+        assert_eq!(stated(&holder, b), START, "built by the word that stands");
+        assert_eq!(standing(&store).0, 7);
+    }
+
+    /// A spec store's bind, an enforce and a rollback each enter a
+    /// generation, and each states its overload switch on the holder. A
+    /// start over a store whose newest generation switches the default off
+    /// states the word at the bind: a worker that stood is laid again, and
+    /// one registered behind the bind is built once, with none.
+    #[test]
+    fn a_spec_stores_bind_and_its_writes_state_the_overload_switch_on_the_holder() {
+        let (a, b) = ("http://a:8000", "http://b:8000");
+        let none = OverloadThresholds::default();
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // An earlier run left generation 1 on file: every binding off.
+        {
+            let (_, earlier) = generations();
+            bind(&earlier, dir.path());
+            enforce(&earlier, switched(Some(false), Some(false))).expect("on file");
+        }
+        let (store, holder, door) = stating();
+        register(&store, &holder, a);
+        assert_eq!(stated(&holder, a), START);
+        bind(&door, dir.path());
+        assert_eq!(standing(&store).0, 1, "the newest generation on file");
+        assert_eq!(stated(&holder, a), none, "stated at the bind");
+        register(&store, &holder, b);
+        assert_eq!(stated(&holder, b), none, "built once, by the word");
+        // An enforce's write: every binding on.
+        enforce(&door, switched(None, None)).expect("a changed document");
+        assert_eq!((stated(&holder, a), stated(&holder, b)), (START, START));
+        // A rollback to the generation on file that switches off.
+        roll_back(&door, 1).expect("on file");
+        assert_eq!((stated(&holder, a), stated(&holder, b)), (none, none));
+    }
+
+    /// A standby's followed generation enters through the same door: its
+    /// leader's word is stated on the standby's holder when it lands. A
+    /// worker laid again keeps its id and its count in flight. The standby
+    /// is under a shared lease and has not led, so it writes no row: a
+    /// status that moved on its object with no word to the table gives way
+    /// to the one its row holds.
+    #[test]
+    fn a_followed_generation_states_its_overload_switch_on_the_holder() {
+        let a = "http://a:8000";
+        let none = OverloadThresholds::default();
+        let (_, leader) = generations();
+        yaml(&leader, switched(Some(false), Some(false))).expect("every binding off");
+        let (store, holder, standby) = stating();
+        let elector = election();
+        standby.under(elector.fence());
+        let row = register(&store, &holder, a);
+        let revision = store.get(row).expect("the row").revision;
+        holder.connect_row(&store, row, revision);
+        assert_eq!(told(&store, row), WorkerStatus::Ready);
+        let before = object(&holder, a);
+        before.increment_load();
+        before.set_status(ObjectStatus::NotReady);
+        let id = holder.registry().get_id_by_url(a);
+        followed(&standby, &sent(&leader)).expect("above the unbound one");
+        let after = object(&holder, a);
+        assert!(!Arc::ptr_eq(&before, &after), "laid again");
+        assert_eq!(stated(&holder, a), none);
+        assert_eq!(holder.registry().get_id_by_url(a), id, "the same id");
+        assert_eq!(told(&store, row), WorkerStatus::Ready, "no row is written");
+        assert_eq!((after.status(), after.load()), (ObjectStatus::Ready, 1));
+        // Its leader's next generation says on again.
+        yaml(&leader, switched(None, None)).expect("a changed document");
+        followed(&standby, &sent(&leader)).expect("above the first");
+        assert_eq!(stated(&holder, a), START);
+    }
+
+    /// A door that was handed no hook states nothing: its generation
+    /// enters, and a holder beside its store keeps the word it had.
+    #[test]
+    fn a_door_with_no_hook_states_no_word_on_a_holder() {
+        let a = "http://a:8000";
+        let (store, door) = generations();
+        let holder: Objects<Members> =
+            Objects::new(Arc::new(WorkerRegistry::new())).with_overload_thresholds(START);
+        register(&store, &holder, a);
+        yaml(&door, switched(Some(false), Some(false))).expect("every binding off");
+        assert_eq!(standing(&store).0, 1);
+        assert_eq!(stated(&holder, a), START, "nobody stated the word");
     }
 }

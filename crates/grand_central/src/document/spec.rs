@@ -2201,7 +2201,9 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// thresholds, and its routes read one shed word, both from that document:
 /// it refuses one whose bindings differ on either word. With no document
 /// supplied it reads its own two settings. A controller that judges on its
-/// worker objects does not read the switch yet.
+/// worker objects reads the switch there too, at each document that takes
+/// force: its default is off where every binding switches it off, and
+/// bindings that differ keep it on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
@@ -2251,6 +2253,40 @@ impl Default for OverloadSpec {
             waiting_requests: None,
             token_usage: None,
             shed_when_all_vetoed: false,
+        }
+    }
+}
+
+/// What a document's bindings say of the overload switch, taken together
+/// ([`OverloadSpec::enabled`]). A host builds its workers with one default
+/// set of thresholds, so it reads the bindings' words as one
+/// ([`AppliedSpec::overload_switch`]). A binding with no block says the
+/// block's default, which is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OverloadSwitch {
+    /// Every binding says on, or the document has no binding.
+    #[default]
+    On,
+    /// Every binding says off.
+    Off,
+    /// The bindings differ. What becomes of the default then is the rule
+    /// of the host that reads the word.
+    Differ,
+}
+
+impl OverloadSwitch {
+    /// The word `bindings` say, taken together.
+    fn of(bindings: &[BindingSpec]) -> Self {
+        let on =
+            |binding: &&BindingSpec| binding.overload.as_ref().is_none_or(|block| block.enabled);
+        let ons = bindings.iter().filter(on).count();
+        if ons == bindings.len() {
+            Self::On
+        } else if ons == 0 {
+            Self::Off
+        } else {
+            Self::Differ
         }
     }
 }
@@ -5639,6 +5675,9 @@ pub struct AppliedSpec {
     /// Whether a binding names a target source
     /// ([`AppliedSpec::names_target`]).
     names_target: bool,
+    /// What the bindings say of the overload switch, taken together
+    /// ([`AppliedSpec::overload_switch`]).
+    overload_switch: OverloadSwitch,
     /// The document's signals, resolved, in column order
     /// ([`AppliedSpec::signal_columns`]).
     signal_columns: Arc<[SignalColumn]>,
@@ -5729,6 +5768,7 @@ impl AppliedSpec {
                 .map(|name| name.as_str().into())
                 .collect(),
             names_target: key_sources.iter().flatten().any(KeySources::names_target),
+            overload_switch: OverloadSwitch::of(&document.bindings),
             key_sources,
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
@@ -5759,6 +5799,7 @@ impl AppliedSpec {
             view_headers: Box::default(),
             key_sources: Box::default(),
             names_target: false,
+            overload_switch: OverloadSwitch::On,
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
@@ -5961,6 +6002,16 @@ impl AppliedSpec {
     #[must_use]
     pub fn names_target(&self) -> bool {
         self.names_target
+    }
+
+    /// What the bindings of this generation say of the overload switch,
+    /// taken together ([`OverloadSwitch`]), decided when the document was
+    /// applied. A host that builds its workers with a default set of
+    /// thresholds reads it where it builds that default. The unbound start
+    /// says on, as a document with no binding does.
+    #[must_use]
+    pub fn overload_switch(&self) -> OverloadSwitch {
+        self.overload_switch
     }
 
     /// The mode a model's pair classes are derived under while this
@@ -9614,6 +9665,46 @@ mod tests {
             "no key's source"
         );
         assert!(!AppliedSpec::unbound().names_target());
+    }
+
+    /// What the bindings say of the overload switch, taken together, is
+    /// decided when the document is applied. A binding with no block, or a
+    /// block that names no switch, says on. Every binding off says off, and
+    /// one word against another says that they differ, whichever comes
+    /// first. A document with no binding says on, as the generation no
+    /// document was applied to does. The shed word is not the switch.
+    #[test]
+    fn the_applied_document_says_its_bindings_overload_switch_as_one_word() {
+        let said = |first: &str, second: &str| {
+            AppliedSpec::validate(&doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"pick":"best"}}}},"bindings":[
+                {{"match":{{"model":"chat/*"}},"profile":"p"{first}}},
+                {{"profile":"p"{second}}}]}}"#
+            )))
+            .expect("the document validates")
+            .overload_switch()
+        };
+        let off = r#","overload":{"enabled":false}"#;
+        let on = r#","overload":{"enabled":true}"#;
+        let sheds = r#","overload":{"shed_when_all_vetoed":true}"#;
+        let empty = r#","overload":{}"#;
+        for (first, second) in [("", ""), (on, ""), ("", empty), (sheds, on)] {
+            assert_eq!(said(first, second), OverloadSwitch::On, "{first} {second}");
+        }
+        assert_eq!(said(off, off), OverloadSwitch::Off);
+        let off_and_sheds = r#","overload":{"enabled":false,"shed_when_all_vetoed":true}"#;
+        assert_eq!(said(off, off_and_sheds), OverloadSwitch::Off);
+        for (first, second) in [(off, ""), ("", off), (off, on), (sheds, off)] {
+            assert_eq!(
+                said(first, second),
+                OverloadSwitch::Differ,
+                "{first} {second}"
+            );
+        }
+        let unbound = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}}}"#);
+        let no_binding = AppliedSpec::validate(&unbound).expect("the document validates");
+        assert_eq!(no_binding.overload_switch(), OverloadSwitch::On);
+        assert_eq!(AppliedSpec::unbound().overload_switch(), OverloadSwitch::On);
     }
 
     #[test]
