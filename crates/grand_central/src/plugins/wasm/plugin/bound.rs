@@ -872,7 +872,21 @@ impl DecisionScope for PluginBinding {
     }
 }
 
-pub(super) fn bit(mask: &[u64], position: u32) -> bool {
+fn bit(mask: &[u64], position: u32) -> bool {
     mask.get((position / 64) as usize)
         .is_some_and(|word| word & (1 << (position % 64)) != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bit;
+
+    #[test]
+    fn a_mask_reads_its_bits_and_nothing_past_its_end() {
+        let mask = [1u64 << 3, 1];
+        assert!(bit(&mask, 3));
+        assert!(bit(&mask, 64));
+        assert!(!bit(&mask, 4));
+        assert!(!bit(&mask, 200));
+    }
 }

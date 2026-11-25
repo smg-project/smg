@@ -24,22 +24,17 @@ use wasmtime::{
     Config, Engine, OptLevel, Store, StoreLimitsBuilder, Trap, UpdateDeadline,
 };
 
-#[cfg(test)]
-use self::bound::bit;
 pub use self::bound::{Binder, PluginBinding};
 use super::{
     bindings::{packed, record, wit, HostState, LogGate, Watch},
     config::{Abi, EventKind, EventSet, Exposure, Failure, FrameBudget, PluginSpec},
     view::{self as marshal, Packed, Records},
 };
-// The request's facts are named only by a doc link of this module.
-#[cfg(doc)]
-use crate::engine::view::RequestFacts;
 use crate::{
     document::spec::Needs,
     engine::{decision_slot::DecisionSlot, view::WorkerId},
     plugins::shared::{
-        breaker::{Breaker, Latency},
+        breaker::{Breaker, Latency, Recorded},
         intern, own_bound, Counters, OpenDecisions, Part,
     },
     tracking::lease::Membership,
@@ -257,10 +252,11 @@ impl ThreadRing {
     /// short of, both under a frame of `frame_micros`. The second is the
     /// same decision at the low end of the time nothing read, so such a
     /// sample is slow by that time alone: no reading covers it. A sample
-    /// slow by both ends is not one, nor is a call that is no sample.
+    /// slow by both ends is not one, nor is a call that is no sample. The
+    /// ring holds its marks: it says whether one stands between the two
+    /// ([`Latency::mark_between`]).
     fn uncovered(micros: u32, low_micros: u32, frame_micros: u32) -> bool {
-        Latency::share(micros, frame_micros).map(Latency::marks)
-            != Latency::share(low_micros, frame_micros).map(Latency::marks)
+        Latency::mark_between(micros, low_micros, frame_micros)
     }
 
     /// Takes one decision's sample of `micros`, whose low end is
@@ -291,12 +287,13 @@ impl ThreadRing {
     /// Records one call in the ring ([`Latency::record`]); `true` when a
     /// window it completed reads slow. The arm falls by one where a sample
     /// is written, so it is counted in the ring's own unit, and the ring
-    /// says what a sample is ([`Latency::share`]).
+    /// says whether it took one ([`Recorded`]).
     fn record(&mut self, micros: u32, frame_micros: u32) -> bool {
-        if Latency::share(micros, frame_micros).is_some() {
+        let recorded = self.ring.record(micros, frame_micros);
+        if recorded != Recorded::Nothing {
             self.armed = self.armed.saturating_sub(1);
         }
-        self.ring.record(micros, frame_micros)
+        recorded == Recorded::SlowWindow
     }
 }
 
@@ -471,7 +468,7 @@ impl Runtime {
 
     /// A runtime over `decisions` on the host's clock: `clock` returns
     /// microseconds since the host's origin, the clock of
-    /// [`RequestFacts::now_micros`].
+    /// [`RequestFacts::now_micros`](crate::engine::RequestFacts::now_micros).
     pub fn with_clock(
         decisions: &Arc<OpenDecisions>,
         clock: impl Fn() -> u64 + Send + Sync + 'static,
@@ -2207,7 +2204,7 @@ mod tests {
     use wasmtime::{Trap, UpdateDeadline};
 
     use super::{
-        bit, deadline_ticks, first_deadline, import_version, judge, thread_cpu_micros, tick, End,
+        deadline_ticks, first_deadline, import_version, judge, thread_cpu_micros, tick, End,
         Latency, ThreadRing, Verdict, Watch, EPOCH_TICK_MICROS,
     };
 
@@ -2656,15 +2653,6 @@ mod tests {
             None
         );
         assert_eq!(import_version("smg:policy/host", "smg:policy/host"), None);
-    }
-
-    #[test]
-    fn a_mask_reads_its_bits_and_nothing_past_its_end() {
-        let mask = [1u64 << 3, 1];
-        assert!(bit(&mask, 3));
-        assert!(bit(&mask, 64));
-        assert!(!bit(&mask, 4));
-        assert!(!bit(&mask, 200));
     }
 
     /// A sample is uncovered where it is past a mark of the ring that its
