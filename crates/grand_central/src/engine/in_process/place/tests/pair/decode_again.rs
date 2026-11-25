@@ -41,13 +41,14 @@ fn asked_again() -> (&'static InProcess, HeardBy) {
 
 /// A decode call that takes no decode, answered. What its caller reads of
 /// the placement is read ahead of the call and behind it, and stands: its
-/// two workers, their ids, whether an event is owed, and all the placement
-/// shows of the decision it holds.
+/// two workers, their ids, whether an event is owed, whether its decode
+/// stands chosen, and all the placement shows of the decision it holds.
 fn untaken(lists: &Lists, placement: &mut Placement<'_>, request: &PlaceRequest<'_>) -> Unplaced {
     let read = |placement: &Placement<'_>| {
         let ids = (placement.id(), placement.decode_id());
+        let says = (placement.owes_events(), placement.decode_chosen());
         let shown = format!("{placement:?}");
-        (lists.places(placement), ids, placement.owes_events(), shown)
+        (lists.places(placement), ids, says, shown)
     };
     let before = read(placement);
     let answer = placement.decode_again(request);
@@ -555,7 +556,10 @@ fn a_decode_call_that_sheds_is_answered_by_name_and_leaves_the_first_decode_chos
 /// nothing said: ahead of the prefill's send, behind a call that took a
 /// decode, behind that decode's end beside a prefill still owed, behind the
 /// end of both sides, behind the send of the first decision's decode, and
-/// behind a prefill's end said with the decode still chosen.
+/// behind a prefill's end said with the decode still chosen. The placement
+/// says its decode stands chosen ([`Placement::decode_chosen`]) ahead of
+/// the first of them alone, where the call waits for the prefill's send: a
+/// host that asks it first makes none of the others.
 #[test]
 fn a_decode_call_out_of_turn_is_refused_by_name_and_says_nothing() {
     let (engine, heard) = asked_again();
@@ -564,6 +568,8 @@ fn a_decode_call_out_of_turn_is_refused_by_name_and_says_nothing() {
     let request = later(lists.under(&classes, &Open));
     let refused = |placement: &mut Placement<'_>, why: DecodeRefused| {
         let before = said(&heard);
+        let waits = why == DecodeRefused::PrefillNotHeld;
+        assert_eq!(placement.decode_chosen(), waits, "{why:?}");
         let answer = untaken(&lists, placement, &request);
         assert_eq!(answer, Unplaced::Refused(DecisionRefused::Decode(why)));
         assert_eq!(said(&heard), before, "{why:?}");
@@ -572,6 +578,7 @@ fn a_decode_call_out_of_turn_is_refused_by_name_and_says_nothing() {
     let mut placement = engine.place(&request).expect("a placement");
     refused(&mut placement, DecodeRefused::PrefillNotHeld);
     placement.sent(Side::Prefill);
+    assert!(placement.decode_chosen(), "across the prefill's send");
     assert_eq!(placement.decode_again(&request), Ok(()));
     refused(&mut placement, DecodeRefused::DecodeStands);
     placement.sent(Side::Decode);
@@ -669,7 +676,8 @@ fn the_stages_hear_a_decode_decided_again_at_its_call_its_send_and_its_end() {
 /// first call asked no decode again, a pair under a document that picks
 /// both sides at once, and a single request, placed under a lease or under
 /// none. Each is refused as not chosen, and the decode the first decision
-/// booked is sent as it stands.
+/// booked is sent as it stands. The placement says of each that its decode
+/// does not stand chosen, so a host that asks it first makes no such call.
 #[test]
 fn a_decode_that_never_stood_chosen_takes_no_decode_call() {
     let not_chosen = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
@@ -686,6 +694,7 @@ fn a_decode_that_never_stood_chosen_takes_no_decode_call() {
             ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
         };
         let mut placement = engine.place(&first).expect("a placement");
+        assert!(!placement.decode_chosen(), "{pick:?}");
         placement.sent(Side::Prefill);
         let answer = untaken(&lists, &mut placement, &later(pair));
         assert_eq!(answer, not_chosen, "{pick:?}");
@@ -717,6 +726,7 @@ fn a_decode_that_never_stood_chosen_takes_no_decode_call() {
         let mut placement = engine.place(&single).expect("a placement");
         placement.sent(Side::Single);
         assert_eq!(placement.owes_events(), leased);
+        assert!(!placement.decode_chosen());
         assert_eq!(placement.decode_again(&single).err(), Some(not_chosen));
         assert_eq!(placement.owes_events(), leased);
         assert!(placement.decode.is_none());
