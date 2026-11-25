@@ -3,8 +3,8 @@
 //!
 //! A standby's applier hands the holder what it would have handed the
 //! store: a membership event at its place in the leader's log, or the
-//! leader's snapshot whole. The holder takes its turn and reads the store
-//! to its end, as at a write of its own ([`mod@super::write`]). The leader
+//! leader's snapshot whole. The holder takes its turn,
+//! as at a write of its own ([`mod@super::write`]). The leader
 //! decided the change, so nothing is decided here. The holder builds the
 //! object of the row the event tells, hands the store the event
 //! ([`MemoryStore::follow_landed`]), and puts the object in the registry
@@ -76,8 +76,7 @@ impl<G: Generation> Objects<G> {
         change: MembershipChange,
         row: Option<WorkerRow>,
     ) -> bool {
-        let mut place = self.read_to.lock();
-        self.follow_from(store, &mut place);
+        let _turn = self.read_to.lock();
         match (change, row) {
             // The object leaves the registry, then the store is told.
             (MembershipChange::Removed { id }, None) => {
@@ -416,7 +415,7 @@ mod tests {
         assert_eq!(table.status, WorkerStatus::Ready);
         let object = standby.object(A).expect("the row's object");
         assert_eq!(standby.objects.row_of(&object), Some(table));
-        assert_eq!(standby.objects.read_to(), Some(1), "no follow read it");
+        assert_eq!(standby.objects.read_to(), None, "no follow read it");
     }
 
     /// A tell the store takes no word of leaves the object at the status

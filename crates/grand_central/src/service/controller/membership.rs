@@ -25,8 +25,8 @@
 //!
 //! **A call reads the record that stands off the worker objects.** The row
 //! under a URL, the row under an id and an engine's rows are read back from
-//! the objects in their holder's turn, behind its read of the store to its
-//! end ([`Objects::record`]). A worker object's status leads its row's, so
+//! the objects in their holder's turn
+//! ([`Objects::record`]). A worker object's status leads its row's, so
 //! a record read carries the status its object states.
 //!
 //! **A call writes under the term it reads once it holds the door's turn.**
@@ -234,18 +234,18 @@ impl MembershipCalls {
     /// back from the worker object that stands, with the status that
     /// object states ([`Objects::record`]).
     fn row(&self, id: WorkerId) -> Option<WorkerRow> {
-        self.objects.record(&self.store, id)
+        self.objects.record(id)
     }
 
     /// The door's read of the row under `url`, as [`Self::row`] reads one.
     fn row_under(&self, url: &str) -> Option<WorkerRow> {
-        self.objects.record_under(&self.store, url)
+        self.objects.record_under(url)
     }
 
     /// The door's read of the rows that name `engine`, as [`Self::row`]
     /// reads one.
     fn rows_of(&self, engine: &str) -> Vec<WorkerRow> {
-        self.objects.records_of(&self.store, engine)
+        self.objects.records_of(engine)
     }
 
     /// The log's place: read after a call's write, that write's own or one
@@ -1370,8 +1370,8 @@ pub(crate) mod tests {
         };
         door.register(&operator(), under(TERM), &ask(ranks, Mode::Add))
             .expect("two ranks");
-        // Each write reads the store to its end first: the first rank's
-        // status reaches its object ahead of the second rank's write.
+        // A rank's connect signal is written behind its own row: the first
+        // rank's status reaches its object ahead of the second rank's write.
         assert_eq!(told(), ["registered", "status", "registered", "status"]);
         let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
         let own = "grpc://own:8000";
@@ -1519,12 +1519,14 @@ pub(crate) mod tests {
         assert_eq!(store.epoch(), 1);
     }
 
-    /// A call reads the row that stands off the worker objects, behind
-    /// their holder's read of the store to its end. An add over a row that
-    /// a writer outside the holder left in the table is refused as an add
-    /// over any row that stands, and writes nothing.
+    /// A call reads the row that stands off the worker objects, and no
+    /// row of the table. An add over a row that a writer outside the
+    /// holder left in the table is decided over no object. The store
+    /// refuses it, the holder reads the store before it answers, and the
+    /// call is answered as a row that moved. The add again is refused as
+    /// an add over any row that stands. Neither writes.
     #[test]
-    fn an_add_over_a_row_written_around_the_holder_is_refused() {
+    fn an_add_over_a_row_written_around_the_holder_is_refused_and_lays_it() {
         // A row that names its engine, as every writer of the crate lays
         // one, and a row that names none: its ranks are asked under its
         // key, and it has none.
@@ -1540,17 +1542,25 @@ pub(crate) mod tests {
             };
             store.upsert_by(facts, Registrant::Control);
             let stood = (store.epoch(), store.by_key(URL));
-            let refused = door
-                .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
-                .expect_err("the URL stands");
-            assert_eq!(refused.code(), Code::AlreadyExists, "engine {engine:?}");
-            assert_eq!((store.epoch(), store.by_key(URL)), stood);
+            assert!(door.objects.is_empty(), "no object yet");
+            for (code, why) in [
+                (Code::Aborted, "decided over no object"),
+                (Code::AlreadyExists, "the URL stands"),
+            ] {
+                let refused = door
+                    .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+                    .expect_err(why);
+                assert_eq!(refused.code(), code, "engine {engine:?}: {why}");
+                assert_eq!((store.epoch(), store.by_key(URL)), stood);
+                assert_eq!(door.objects.len(), 1, "the refusal's read laid it");
+            }
         }
     }
 
     /// A row that names no engine dials its key, and its engine's ranks
     /// are asked under that key. Here such a row stands beside a rank that
-    /// names the key as its engine, both written around the holder: a
+    /// names the key as its engine, both written through the holder's own
+    /// calls with facts no call of the door states: a
     /// plain registration of the URL is refused as over any engine that
     /// stands as ranks.
     #[test]
@@ -1571,8 +1581,10 @@ pub(crate) mod tests {
             dp_size: 2,
             ..plain.clone()
         };
-        store.upsert_by(plain, Registrant::Control);
-        store.upsert_by(rank, Registrant::Control);
+        for facts in [plain, rank] {
+            let laid = door.objects.upsert(&store, facts, Registrant::Control);
+            laid.expect("a row through the holder");
+        }
         let refused = door
             .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
             .expect_err("its engine stands as ranks");

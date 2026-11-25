@@ -2,14 +2,14 @@
 //! worker objects.
 //!
 //! A door reads a record before it writes one: the row under a URL, the
-//! row under an id, an engine's rows. The holder takes its turn, reads the
-//! store to its end, and reads the record back from the object that stands
+//! row under an id, an engine's rows. The holder takes its turn
+//! and reads the record back from the object that stands
 //! ([`Objects::row_of`]). That is the record the holder's write decides
 //! over ([`mod@super::write`]), so a door's test and the write behind it
 //! read one record. The two lookups stand here once: the write side asks
 //! them inside the turn it holds.
 //!
-//! The turn and the read to the store's end make a door's read exact. A
+//! The turn makes a door's read exact. A
 //! writer of a row holds the turn from its read to its put, so a door that
 //! waited behind it reads the object that writer left, and never the
 //! registry one write behind the table.
@@ -31,9 +31,9 @@
 //! ([`MemoryStore::told`]), not its object's: an object stands in a
 //! status its log has not told yet between a driver's move and the tell,
 //! and a copy holds the log's word at the copy's place. A cut takes no
-//! object's mutation lock. A writer that takes no turn of the holder is
-//! read again where its write landed beside the cut
-//! ([`Objects::told_turn`]).
+//! object's mutation lock. A row a writer left with no turn of the holder
+//! is in no cut until its host has the holder follow the store
+//! ([`Objects::follow`]).
 
 use parking_lot::MutexGuard;
 use smg_worker::registry::Generation;
@@ -58,25 +58,25 @@ fn told_row(laid: &Laid, told: &Told) -> Option<WorkerRow> {
 )]
 impl<G: Generation> Objects<G> {
     /// The record under the row id `id`, as a door reads it: in the
-    /// holder's turn, behind a read of `store` to its end. `None` where no
-    /// object stands for the row.
-    pub(crate) fn record(&self, store: &MemoryStore, id: WorkerId) -> Option<WorkerRow> {
-        let _turn = self.turn(store);
+    /// holder's turn, off the object. `None` where no object stands for
+    /// the row.
+    pub(crate) fn record(&self, id: WorkerId) -> Option<WorkerRow> {
+        let _turn = self.read_to.lock();
         self.row(id)
     }
 
     /// The record under the registration key `key`, as [`Self::record`]
     /// reads one.
-    pub(crate) fn record_under(&self, store: &MemoryStore, key: &str) -> Option<WorkerRow> {
-        let _turn = self.turn(store);
+    pub(crate) fn record_under(&self, key: &str) -> Option<WorkerRow> {
+        let _turn = self.read_to.lock();
         self.row_under(key)
     }
 
     /// Every record whose facts name `engine`, as [`Self::record`] reads
     /// one: its plain row, or each rank that stands. In no order. Asked
     /// once a registration at a door: no decision reads it.
-    pub(crate) fn records_of(&self, store: &MemoryStore, engine: &str) -> Vec<WorkerRow> {
-        let _turn = self.turn(store);
+    pub(crate) fn records_of(&self, engine: &str) -> Vec<WorkerRow> {
+        let _turn = self.read_to.lock();
         let dialing: Vec<WorkerId> = {
             let held = self.held.read();
             let ranked = held.ranks.get(engine).into_iter().flatten();
@@ -93,7 +93,7 @@ impl<G: Generation> Objects<G> {
     /// what a watch starts from, what a standby is restored from and what
     /// an operator reads whole. The rows come by registration key.
     ///
-    /// In the holder's turn, behind a read of `store` to its end. Every
+    /// In the holder's turn. Every
     /// writer of a row's facts holds that turn from its decision to the
     /// journal's telling, so the objects state each row the journal told
     /// and none it did not. A row's status is the one the journal told,
@@ -165,45 +165,20 @@ impl<G: Generation> Objects<G> {
         (rows, count)
     }
 
-    /// The holder's turn, with `store` read to its end: where a door's
-    /// read starts, as the holder's write does.
-    fn turn(&self, store: &MemoryStore) -> MutexGuard<'_, Place> {
-        let mut place = self.read_to.lock();
-        self.follow_from(store, &mut place);
-        place
-    }
-
     /// The holder's turn for a first copy, with the statuses the journal
-    /// told at a place the objects are read to. A write that takes no
-    /// turn of the holder can land between the read of the store and the
-    /// told read: a status tell, the store's own entry for a row, a
-    /// restore around the holder. The told read carries the store's
-    /// epoch and history. Every write of a row moves the one and a
-    /// restore the other, so where either moved since the holder's own
-    /// read ended, the store is read again. The objects then state each
-    /// row the journal told at the copy's place, beside any writer. The
-    /// journal's place is not compared: a generation's apply and a term's
-    /// start move it and change no row, and the told read takes the
-    /// place in the hold that takes the epoch.
-    ///
-    /// A pass ends where nothing moved between its two reads. No product
-    /// code writes a row around the holder: the store's own entries are
-    /// called by cases alone, and a restore holds this turn. So in the
-    /// product one more pass follows a status tell that landed between
-    /// the two reads, and no other. A writer around the holder that
-    /// never paused would hold a copy off, and the holder's turn with
-    /// it.
+    /// told: one read of `store`, inside the turn. Every writer of a row's
+    /// facts holds the turn, so the objects state each row the journal
+    /// told at the place this read takes, and no row of the store's table
+    /// is read. A status tell, a generation's apply and a term's start
+    /// take no turn: none changes a row's facts, and the told read takes
+    /// the place in the hold that takes the statuses. A caller of the
+    /// store's own entries for a row takes none either: no product code
+    /// calls them, and a row written so is in no copy until its host has
+    /// the holder follow the store ([`Self::follow`]).
     fn told_turn(&self, store: &MemoryStore) -> (MutexGuard<'_, Place>, Told) {
-        let mut place = self.read_to.lock();
-        loop {
-            self.follow_from(store, &mut place);
-            #[cfg(test)]
-            seam::read(store);
-            let told = store.told();
-            if place.epoch == Some(told.epoch) && place.history == told.history {
-                return (place, told);
-            }
-        }
+        let turn = self.read_to.lock();
+        let told = store.told();
+        (turn, told)
     }
 
     /// The row `id` as its object and what stands beside it state it. It
@@ -220,36 +195,6 @@ impl<G: Generation> Objects<G> {
     pub(super) fn row_under(&self, key: &str) -> Option<WorkerRow> {
         let object = self.registry.get_id_by_url_or_reservation(key)?;
         self.row_of(&object)
-    }
-}
-
-/// A seam for the cases: a hook the reading thread runs once, behind a
-/// first copy's read of the store and ahead of its told read, where a write
-/// that takes no turn of the holder can land. In no build but the cases'.
-#[cfg(test)]
-mod seam {
-    use std::cell::RefCell;
-
-    use crate::store::MemoryStore;
-
-    type Hook = Box<dyn FnOnce(&MemoryStore)>;
-
-    thread_local! {
-        static READ: RefCell<Option<Hook>> = const { RefCell::new(None) };
-    }
-
-    /// `hook` runs once, on the store of this thread's next first copy.
-    pub(super) fn on_read(hook: impl FnOnce(&MemoryStore) + 'static) {
-        READ.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
-    }
-
-    /// The hook runs. It is taken out first: the copy's next round of reads
-    /// meets none.
-    pub(super) fn read(store: &MemoryStore) {
-        let hook = READ.with(|held| held.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook(store);
-        }
     }
 }
 
@@ -272,9 +217,9 @@ mod tests {
     /// by key.
     fn read(replica: &Replica, id: WorkerId) -> Option<WorkerRow> {
         let (store, objects) = (&replica.store, &replica.objects);
-        let by_id = objects.record(store, id);
+        let by_id = objects.record(id);
         assert_eq!(by_id, store.get(id), "by id against the table");
-        let by_key = objects.record_under(store, A);
+        let by_key = objects.record_under(A);
         assert_eq!(by_key, store.by_key(A), "by key against the table");
         by_id
     }
@@ -304,12 +249,12 @@ mod tests {
         assert_eq!(read(&replica, second), None);
     }
 
-    /// Each read takes the holder's turn and reads the store to its end
-    /// first: a row a writer outside the holder left in the table is read
-    /// by id, by key, among its engine's rows, in a first copy and in a
-    /// lone read, with no follow of the case's own.
+    /// No read starts with a read of the store. A row a writer outside the
+    /// holder left in the table is in no read until its host has the holder
+    /// follow the store, and in each read behind that: by id, by key, among
+    /// its engine's rows, in a first copy and in a lone read.
     #[test]
-    fn each_read_follows_a_writer_outside_the_holder() {
+    fn a_row_written_around_the_holder_is_read_once_its_host_follows() {
         type Read = fn(&Replica) -> Option<WorkerRow>;
         let reads: [(&str, Read); 5] = [
             ("a first copy", |replica| {
@@ -319,16 +264,9 @@ mod tests {
                 let (store, objects) = (&replica.store, &replica.objects);
                 objects.rows_serving(store, &[], 1).0.pop()
             }),
-            ("by id", |replica| {
-                let id = identity(A, 1);
-                replica.objects.record(&replica.store, id)
-            }),
-            ("by key", |replica| {
-                replica.objects.record_under(&replica.store, A)
-            }),
-            ("by engine", |replica| {
-                replica.objects.records_of(&replica.store, A).pop()
-            }),
+            ("by id", |replica| replica.objects.record(identity(A, 1))),
+            ("by key", |replica| replica.objects.record_under(A)),
+            ("by engine", |replica| replica.objects.records_of(A).pop()),
         ];
         for (name, read) in reads {
             let replica = Replica::new();
@@ -336,7 +274,9 @@ mod tests {
             replica
                 .store
                 .upsert_by(facts(1, "gold"), Registrant::Control);
-            assert!(replica.objects.is_empty(), "{name}: no object yet");
+            assert_eq!(read(&replica), None, "{name}: no object, so no row");
+            // The host's own follow, as a host that writes its store calls it.
+            replica.objects.follow(&replica.store);
             let row = read(&replica);
             assert!(row.is_some(), "{name}");
             assert_eq!(row, replica.store.by_key(A), "{name}");
@@ -374,7 +314,7 @@ mod tests {
             rows.retain(|row| row.facts.engine == engine);
             by_key(rows)
         };
-        let read = |engine: &str| by_key(objects.records_of(store, engine));
+        let read = |engine: &str| by_key(objects.records_of(engine));
         assert_eq!(read(E), pass(E));
         assert_eq!(read(E).len(), 3, "the plain row and two ranks");
         assert_eq!(read(A), pass(A));
@@ -393,9 +333,9 @@ mod tests {
         let id = change.expect("registered").id();
         objects.connect_row(&store, id, 1);
         let read = || {
-            let by_id = objects.record(&store, id);
-            let by_key = objects.record_under(&store, A);
-            let by_engine = objects.records_of(&store, A).pop();
+            let by_id = objects.record(id);
+            let by_key = objects.record_under(A);
+            let by_engine = objects.records_of(A).pop();
             [by_id, by_key, by_engine].map(|row| row.map(|row| row.status))
         };
         assert_eq!(read(), [Some(WorkerStatus::Ready); 3]);
@@ -471,67 +411,9 @@ mod tests {
         let object = replica.object(A).expect("the row's object");
         let object = objects.registry().get(&object).expect("it stands");
         object.set_status(ObjectStatus::NotReady);
-        let door = objects.record(store, id).map(|row| row.status);
+        let door = objects.record(id).map(|row| row.status);
         assert_eq!(door, Some(WorkerStatus::NotReady), "the object's");
         assert_eq!(copies(), [Some(WorkerStatus::Ready); 2], "the journal's");
-    }
-
-    /// A write that takes no turn of the holder can land between a first
-    /// copy's read of the store and its told read. The store's own
-    /// registration of a second row moves the epoch. A restore of another
-    /// store's rows can leave the epoch as it was and moves the history.
-    /// The told read says either, the store is read again, and the copy
-    /// states what the table holds at its place: a cut and a lone read
-    /// alike.
-    #[test]
-    fn a_first_copy_holds_a_write_that_landed_between_its_two_reads() {
-        const B: &str = "http://b:8000";
-        fn second() -> WorkerFacts {
-            WorkerFacts {
-                key: B.to_owned(),
-                engine: B.to_owned(),
-                ..facts(1, "gold")
-            }
-        }
-        type Write = fn(&MemoryStore);
-        let writes: [(&str, Write, usize); 2] = [
-            (
-                "a registration",
-                |store| {
-                    store.upsert_by(second(), Registrant::Control);
-                },
-                2,
-            ),
-            (
-                "a restore",
-                |store| {
-                    let other = MemoryStore::new();
-                    other.upsert_by(second(), Registrant::Control);
-                    let cut = other.checkpoint();
-                    assert_eq!(cut.epoch, store.epoch(), "the epoch stands");
-                    assert!(store.restore_from(cut), "the store takes the cut");
-                },
-                1,
-            ),
-        ];
-        for (name, write, rows) in writes {
-            for lone in [false, true] {
-                let replica = Replica::new();
-                let (store, objects) = (&replica.store, &replica.objects);
-                replica.upsert(facts(1, "gold"));
-                seam::on_read(write);
-                let copy = if lone {
-                    objects.rows_serving(store, &[], usize::MAX).0
-                } else {
-                    let cut = objects.checkpoint(store);
-                    let table = store.checkpoint();
-                    assert_eq!((cut.at, cut.epoch), (table.at, table.epoch), "{name}");
-                    cut.rows
-                };
-                assert_eq!(copy, store.checkpoint().rows, "{name}, lone: {lone}");
-                assert_eq!(copy.len(), rows, "{name}, lone: {lone}");
-            }
-        }
     }
 
     /// The two holds of a first copy, measured over 512 rows. The store's
