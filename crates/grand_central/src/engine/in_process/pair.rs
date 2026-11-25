@@ -211,10 +211,14 @@ pub struct PairLists<'a> {
     /// The places of the prefill list the request may take, ascending,
     /// each once; `None` for every place. The request's own fact and no
     /// veto of a worker: the prefill side's set opens with them under any
-    /// document ([`Constraints::places`]).
+    /// document ([`Constraints::places`]). Places are judged as stated,
+    /// with no fallback to the list whole: a shed is made over the
+    /// workers at them. A host that wants the gateway's own selection's
+    /// filter, with its fallback, states it as the route's rule.
     pub prefill_places: Option<&'a [u32]>,
-    /// The places of the decode list the request may take, stated as the
-    /// prefills' are. The two stand apart: a host may hold one side alone.
+    /// The places of the decode list the request may take, stated and
+    /// judged as the prefills' are. The two stand apart: a host may hold
+    /// one side alone.
     /// The decode asked again behind a held prefill is held to them too,
     /// and its held prefill is found wherever it stands in its list.
     pub decode_places: Option<&'a [u32]>,
@@ -663,6 +667,8 @@ impl<'a> PairLists<'a> {
                 decode_signal_cells,
                 table: self.classes.table(),
                 first: self.classes.first(),
+                // A demand left each side the workers that meet it.
+                part: demanded,
             };
             let mut decision = match (held, said) {
                 (None, None) => {

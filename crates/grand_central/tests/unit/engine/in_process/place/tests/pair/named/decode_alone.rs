@@ -5,6 +5,8 @@
 //! `P` and `CH` are the classic router's files, as in the parent's cases,
 //! on main `4b41f39a7`.
 
+use smg_worker::runtime::StallReason;
+
 use super::*;
 
 /// The stock pair of a round robin prefill beside a hash ring decode: the
@@ -499,14 +501,18 @@ fn where_no_prefill_opens_the_pair_the_decodes_number_is_not_read() {
 
 /// A prefill opens the pair by a partner the call counts, and by no other
 /// decode. Here the first prefill can be sent to and its one partner is
-/// over its thresholds, and the decode that can be sent to pairs with the
-/// second prefill alone, which is not ready. No prefill opens the pair:
-/// the header is not read, and the request is answered as one that names
-/// nobody is, whatever the header's text. That answer is the pair's shed
-/// as saturated: a decode pool that is not over its thresholds whole is
-/// steered nowhere. Lent the one counted decode's place, a decision would
-/// find the first prefill no partner there, and shed the pair with no
-/// endpoint under `partnered`.
+/// over its thresholds. The second prefill is not ready, and of its two
+/// partners the first is under a liveness doubt and the second can be
+/// sent to. No prefill opens the pair: the header's number is not acted
+/// on, and the
+/// request is answered as one that names nobody is, whatever the header's
+/// text. That answer is the pair's shed with no endpoint under `healthy`:
+/// a decode pool that is not over its thresholds whole is steered nowhere
+/// and shed over by nobody, and the pool's first decode with room is the
+/// one under the doubt, which the health stage refuses. Lent the one
+/// counted decode's place, a decision would find the first prefill no
+/// partner there, and shed the pair under `partnered`: the stage tells a
+/// number that was acted on from one that was not.
 ///
 /// The classic router counts a prefill as open by an open partner of its
 /// own (`P:2723-2728`, `P:2756-2771`). With none open it never asks its
@@ -516,10 +522,11 @@ fn where_no_prefill_opens_the_pair_the_decodes_number_is_not_read() {
 #[test]
 fn a_prefill_with_no_counted_partner_opens_no_pair() {
     let engine = ring_decode();
-    let lists = Lists::of(2, 2);
-    // Prefill 0 pairs with decode 0 alone, prefill 1 with decode 1 alone.
-    let classes = PartnerClasses::number(2, [&[0_u32][..], &[1][..]]);
+    let lists = Lists::of(2, 3);
+    // Prefill 0 pairs with decode 0 alone, prefill 1 with the two others.
+    let classes = PartnerClasses::number(3, [&[0_u32][..], &[1, 2][..]]);
     lists.decodes[0].set_overloaded(true);
+    lists.decodes[1].set_stall(Some(StallReason::Wedged));
     lists.prefills[1].set_status(WorkerStatus::NotReady);
     let pair = lists.under(&classes, &Open);
     let unnamed = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
@@ -528,13 +535,13 @@ fn a_prefill_with_no_counted_partner_opens_no_pair() {
     // left. The classic router refuses for the decode's role where an
     // available prefill has no open partner (`P:2943-2952`, on main
     // `d43c7b2a9`).
-    let saturated = Err(Unplaced::Shed {
-        reason: ShedReason::Saturated,
-        emptied_by: "not-overloaded",
+    let doubted = Err(Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "healthy",
         retry_after_secs: 1,
         side: Some(PairSide::Decode),
     });
-    assert_eq!(nobody, saturated, "a request that names nobody");
+    assert_eq!(nobody, doubted, "a request that names nobody");
     for number in ["0", "1", "one"] {
         assert_eq!(named(engine, &lists, pair, number), nobody, "{number}");
     }
@@ -602,15 +609,20 @@ fn a_prefill_over_its_thresholds_opens_no_pair_under_a_profile_that_does_not_wei
 
 /// Under a binding that sheds a pool its overload veto empties, a prefill
 /// over its thresholds opens no pair, whatever its profile. Here the
-/// profile weighs load itself. The second prefill is over its thresholds
-/// beside the one decode that can be sent to, and the first prefill can
-/// be sent to beside a partner that is over its thresholds. No prefill
-/// opens the pair: the header is not read, and the request is answered as
-/// one that names nobody is, whatever the header's text. Read by the
-/// second prefill's leave, the call would lend the one counted decode's
-/// place: the decision would show its prefill profile the second prefill
-/// alone, refuse it over its thresholds, and name that refusal by the
-/// first prefill's partners there, with no endpoint under `partnered`.
+/// profile weighs load itself. The first prefill can be sent to beside a
+/// partner that is over its thresholds. The second prefill is over its
+/// thresholds, and of its two partners the first is under a liveness
+/// doubt and the second can be sent to. No prefill opens the pair: the
+/// header's number is not acted on, and the request is answered as one
+/// that names
+/// nobody is, whatever the header's text: by the pair's shed with no
+/// endpoint under `healthy`, since the decode pool is not over its
+/// thresholds whole, and its first decode with room is the one under the
+/// doubt. Read by the second prefill's leave, the call would lend the one
+/// counted decode's place: the decision would show its prefill profile
+/// the second prefill alone, refuse it over its thresholds, and find the
+/// first prefill no partner there, under `partnered`. The stage tells a
+/// number that was acted on from one that was not.
 ///
 /// The classic router lifts no veto with its shedding on (`P:2672`,
 /// `P:2653-2655`): no prefill is open, and it refuses the pair, whose
@@ -625,10 +637,11 @@ fn under_a_binding_that_sheds_a_prefill_over_its_thresholds_opens_no_pair() {
         ..OverloadSpec::default()
     });
     let shedding = hosted(engine_of(&document));
-    let lists = Lists::of(2, 2);
-    // Prefill 0 pairs with decode 0 alone, prefill 1 with decode 1 alone.
-    let classes = PartnerClasses::number(2, [&[0_u32][..], &[1][..]]);
+    let lists = Lists::of(2, 3);
+    // Prefill 0 pairs with decode 0 alone, prefill 1 with the two others.
+    let classes = PartnerClasses::number(3, [&[0_u32][..], &[1, 2][..]]);
     lists.decodes[0].set_overloaded(true);
+    lists.decodes[1].set_stall(Some(StallReason::Wedged));
     lists.prefills[1].set_overloaded(true);
     let pair = lists.under(&classes, &Open);
     let unnamed = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
@@ -636,13 +649,13 @@ fn under_a_binding_that_sheds_a_prefill_over_its_thresholds_opens_no_pair() {
     // The decode side, as above: with its shedding on the classic router
     // lifts no veto, so the first prefill is its one available prefill and
     // has no open partner (`P:2943-2952`, on main `d43c7b2a9`).
-    let saturated = Err(Unplaced::Shed {
-        reason: ShedReason::Saturated,
-        emptied_by: "not-overloaded",
+    let doubted = Err(Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "healthy",
         retry_after_secs: 1,
         side: Some(PairSide::Decode),
     });
-    assert_eq!(nobody, saturated, "a request that names nobody");
+    assert_eq!(nobody, doubted, "a request that names nobody");
     for number in ["0", "1", "one"] {
         assert_eq!(named(shedding, &lists, pair, number), nobody, "{number}");
     }

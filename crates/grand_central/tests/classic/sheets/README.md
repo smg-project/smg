@@ -487,16 +487,17 @@ fails once the reason no longer holds.
 - `encode_pair.json`: all 52 rows replay. In the nine that place items by consistent hashing a key's encoder is
   not held to the recorded one: two rings place no key alike. The replay holds each key to the encoders it was
   offered and equal keys to one encoder.
-- `pair_select.json`: two rows are decided apart, each named by the replay with the answer the pair's decision
-  gives. The other 38 rows replay, a refusal by its reason and its role.
-  - One is a refusal's reason. The only ready prefill's partners are all over their thresholds beside a free
-    decode of another transport. The gateway answers unavailable, and the pair's decision names the overload veto.
-  - The other is a refusal's role. Every prefill is over its thresholds under a policy that weighs load against
-    cache affinity itself (`cache_aware`), and every decode is down. The gateway refuses for the prefill's role,
-    and the pair's decision names the decode side.
-  - Three of the 38 are of such a policy. The gateway lifts the overload veto for such a policy and lets it
-    place. A prefill profile one of whose scorers says the same of itself runs with that veto lifted under a
-    binding that steers.
+- `pair_select.json`: none. All 40 rows replay, a refusal by its reason and its role. The pair's decision judges
+  one list for its refusal, as the gateway's selection does.
+
+  Two rows are named in the replay. In one the only ready prefill's partners are all over their thresholds,
+  beside a free decode of another transport: the gateway answers unavailable. In the other every prefill is over
+  its thresholds under a policy that weighs load against cache affinity itself (`cache_aware`), and every decode
+  is down. There the gateway refuses for the prefill's role.
+
+  The seven rows of such a policy replay. Where it does not shed, the gateway lifts the overload veto for such
+  a policy and lets it place. A prefill profile one of whose scorers says the same of itself runs with that
+  veto lifted, under a binding that steers.
 - `pair_bound.json`: none. All 8 rows replay.
 - `pair_runtime.json`: none. All 10 rows replay.
 - `pair_named.json`: none. All 23 rows replay, through the one call of a host in process. Of a refusal the replay

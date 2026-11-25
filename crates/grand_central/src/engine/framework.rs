@@ -27,7 +27,7 @@ use crate::{
     load::signals::SignalCells,
     policies::{consistent_hashing::LentRing, prefix_hash::HeadRule, random::Random},
     stages::{
-        filters::{HasCapacity, RowTests},
+        filters::{HasCapacity, NotOverloaded, RowTests},
         lifecycle::Lifecycle,
         pickers::{target_of, Best},
         scorers::{FewestSessions, LeastRequests},
@@ -50,7 +50,7 @@ pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
 pub use keyed::PoolRows;
-use vetoed::{AllVetoed, Half};
+use vetoed::{AllVetoed, Count, Half};
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
 /// leave nothing: the engines a retry already tried step aside while another
@@ -1240,27 +1240,33 @@ pub struct Scratch {
 /// decodes carries the prefill's trace, as one made over its prefills
 /// does.
 ///
-/// A pair's decision says a list of its two where the gateway's own pair
-/// selection would read that list as wholly over its thresholds too
-/// ([`vetoed::wholly_over`]), and says none where the two counts part: the
-/// decision's own passes leave out a worker under a liveness doubt, and
-/// that selection counts it.
+/// A pair's decision that sheds behind its prefill side's shed is
+/// saturated exactly where the list the gateway's own pair selection
+/// judges is wholly over its thresholds, by that selection's own count
+/// (`vetoed::Half::count`), and it says that list: no such shed is
+/// saturated with no word, and none says a word the count does not bear.
+///
+/// That holds over whole lists. Behind a part of a list
+/// ([`PairPools::part`]) the question is not asked, and the stage that
+/// ended the pass names the shed. A shed the overload veto named says
+/// its list there as it did before the question stood: the prefills
+/// that pair where no prefill stands, and else the decode list whole,
+/// each where wholly over its thresholds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShedOver {
     /// An encode request's encoders: the overload veto left none of them
     /// open ([`Engine::decide_encode_pair`]).
     Encoders,
-    /// A pair's prefills: no prefill at the request's places stands but for
-    /// a veto, the overload veto took the last of them, and the prefills
-    /// at those places that pair with a decode of the pool are wholly over
-    /// their thresholds. A prefill that pairs with no decode is no part of
-    /// that count: the gateway's own selection holds no such prefill
-    /// ([`vetoed::pairs_in`]).
+    /// A pair's prefills: of the prefills at the request's places that
+    /// pair with a decode of the pool none stands as it is, its limit
+    /// aside, and they are wholly over their thresholds. A prefill that
+    /// pairs with no decode is no part of that list: the gateway's own
+    /// selection holds no such prefill ([`vetoed::pairs_in`]).
     Prefills,
-    /// A pair's decodes, beside a prefill that stands: the overload veto
-    /// took the last of that prefill's partners, and the whole decode list
-    /// at the request's places is wholly over its thresholds, a decode that
-    /// pairs with no prefill too.
+    /// A pair's decodes, beside a prefill that pairs with a decode of the
+    /// pool and stands: the whole decode list at the request's places is
+    /// wholly over its thresholds, a decode that pairs with no prefill
+    /// too.
     Decodes,
 }
 
@@ -1415,7 +1421,8 @@ impl Scratch {
     /// word is that decision's alone: `None` behind its every other
     /// answer. An encode decision that hands its pair's decision a part
     /// of a list says none of the pair's two: that decision judged the
-    /// part. A caller reads the word behind a decision's shed as
+    /// part, or asked no question behind it ([`PairPools::part`]). A
+    /// caller reads the word behind a decision's shed as
     /// saturated, and behind nothing else: a request that is answered
     /// ahead of both decisions leaves the word of the one before.
     #[cfg_attr(
@@ -2111,7 +2118,7 @@ fn filter(
             None => kept.retain(|&i| classed(p, candidates[i as usize].pair_class)),
         }
         if kept.is_empty() {
-            return Some("partnered");
+            return Some(PARTNERED);
         }
     }
     if encode {
@@ -4597,6 +4604,25 @@ pub struct PairPools<'a> {
     /// The partners each prefill class is paired with first. Left at its
     /// default, no partner goes first.
     pub first: FirstPartners<'a>,
+    /// Whether the pools are a part of the lists the request's caller
+    /// lent. Two things make a part. A hard demand its door judged left
+    /// each side the workers that meet it. Or the encode pass is laid for
+    /// the request, which states an item or holds its decode to the ones
+    /// that take images: the pass hands the pair the workers its
+    /// encoders and its images leave. Three writers say so, each from
+    /// the test it already makes: the pair's door and the encode door
+    /// where the request states a demand, and the encode pass where it
+    /// is laid.
+    ///
+    /// Nothing else makes a part. The places a host states for a side are
+    /// its own word of its list. The workers a route's rule takes are the
+    /// call's places for its later decisions. Under both the pools are
+    /// whole.
+    ///
+    /// Behind a part a pair's decision does not ask its one question of a
+    /// shed ([`Engine::decide_pair`]). Private to the crate: a host of its
+    /// own builds the pools from their default, which says whole.
+    pub(crate) part: bool,
 }
 
 /// Which pair classes pair: for each prefill class, the decode classes it
@@ -5092,6 +5118,13 @@ impl<'a> PairPools<'a> {
 /// The stage a decision names when it is refused for its affinity column:
 /// what a host counts its sheds under.
 const AFFINITY_COLUMN: &str = "affinity-column";
+
+/// The stage a pair's decision names where the workers left pair with
+/// nobody that stands: a prefill side narrowed to the classes with an open
+/// partner that keeps no row ([`filter`]), prefills that stand and pair
+/// with no decode, and a shed with no endpoint whose worker with room
+/// pairs with nobody ([`Half::refused_room`]).
+const PARTNERED: &str = "partnered";
 
 /// Whether the request carries a column of its own or names rows. A pair
 /// reads neither: its columns ride its two pools ([`PairPools`]), and
@@ -8216,7 +8249,8 @@ impl Engine {
     /// fewest requests, and the pair's trace says the lifted veto
     /// ([`LiftedVeto::Overload`]). On a retry the profile's soft filter keeps
     /// that pick to the partners the request has not tried while one is
-    /// left. Under a binding that sheds, such a pool is shed as saturated.
+    /// left. Under a binding that sheds, such a pool opens no prefill, and
+    /// the request is shed by the one question of a pair's shed, below.
     /// The prefill side's own run is put to no rule. Under a binding that
     /// steers, a prefill profile that weighs load against affinity runs with
     /// the overload veto lifted (`Engine::weighing_lift`), and a pair no
@@ -8237,6 +8271,52 @@ impl Engine {
     /// pair's default, a prefill at its limit with no open partner makes no
     /// request wait: its refusal is named by what its partners' own stages
     /// say, as the refusal of a prefill under its limit is.
+    ///
+    /// Where the prefill side's run sheds, no default pairs and no prefill
+    /// waits on its limit alone, one question says whether the request is
+    /// shed as saturated: the count of the one list the gateway's own pair
+    /// selection judges (`vetoed::Half::count`). That list is every decode
+    /// at the request's places, a decode that pairs with no prefill too,
+    /// where a prefill at those places that pairs with a decode of the pool
+    /// stands as it is, its limit aside and with no lift. Else it is those
+    /// prefills. Under a binding that sheds, the shed is saturated exactly
+    /// where that list is wholly over its thresholds, and the decision
+    /// says the list (`ShedOver`). Under a binding that steers no such
+    /// shed is saturated. A picker that declines keeps its own reason.
+    /// Every other shed there has no endpoint, under
+    /// the name of the stage that left a pass nobody. Where that stage is
+    /// the overload veto, whose name is the word for saturation, the shed
+    /// takes the name of the stage that refused a worker with room of the
+    /// list judged (`vetoed::Half::refused_room`): the health stage for a
+    /// worker under a liveness doubt, and `partnered` for one that stands
+    /// and pairs with nobody that stands. The gateway's own pair selection
+    /// judges so (`pair_pass` and `failure_from` in
+    /// `model_gateway/src/routers/common/placement.rs`: the pass's two
+    /// branches, where no prefill is eligible and where none is open).
+    ///
+    /// The question is asked over whole lists alone. Behind a part of a
+    /// list (`PairPools::part`: a hard demand its door judged, or a
+    /// request the encode pass is laid for) it is not asked. The shed
+    /// keeps the name of the stage that left a pass nobody: it is
+    /// saturated where that stage is the overload veto. It says its list
+    /// there as it did before the question stood: the prefills that pair
+    /// where no prefill stands, and else the decode list whole, each
+    /// where wholly over its thresholds. That selection judges another
+    /// list there than this decision is handed (`admitted_pool` in the
+    /// same file), so the question over the part would answer for
+    /// another list.
+    ///
+    /// Each shed of that question names the side that selection refuses
+    /// for ([`Shed::side`](crate::engine::decision::Shed::side)). Three
+    /// tests of the lists whole stand ahead of its question in
+    /// `pair_pass`, in this order. A prefill pool that holds no worker is
+    /// refused for the prefill side. A decode pool that holds none is
+    /// refused for the decode side. So is a pool no prefill of which
+    /// pairs with any decode, by its index's refusal (`PairingRefusal` in
+    /// `model_gateway/src/routers/common/pair_index.rs`). Else the side is
+    /// the list the question judges. Behind a part the same tests name
+    /// the side over the part, and it may be another than that
+    /// selection's role: that selection tests its lists whole.
     ///
     /// Where the host states first partners ([`PairPools::first`]), the
     /// pair is made among the prefills with a first partner open and those
@@ -8533,15 +8613,18 @@ impl Engine {
         // The prefill's pick is read where its decision stands: a pick is
         // 256 bytes, and taking it out copies them.
         let Decision::Pick(prefill_pick) = &prefill else {
-            // A prefill pool its filters emptied says what the decode pool's
-            // own stages say about the partners of the prefills that stand
-            // but for their admission limit (those were dropped by the
-            // partnered test alone): a saturated decode fleet is saturation,
-            // not a missing endpoint, and a class with no decode at all is
-            // "partnered", as is a routable prefill of class 0. When no
-            // prefill stands so, the prefill side's stage is named instead.
-            // The limit names the shed for a prefill with an open partner
-            // alone. A picker's decline passes through.
+            // A prefill pool its filters emptied goes to the pair's default,
+            // then to the admission limit's shed, for a prefill with an open
+            // partner alone, and then to the one question that says whether
+            // the request is shed as saturated: the count of the list the
+            // gateway's own pair selection judges. Every other shed has no
+            // endpoint, and is named by the stage that left a pass nobody:
+            // the prefill side's where no prefill stands but for its
+            // admission limit, "partnered" for a class with no decode at all
+            // and for a routable prefill of class 0, and else what the
+            // decode pool's own stages say about the partners of the
+            // prefills that stand so (those were dropped by the partnered
+            // test alone). A picker's decline passes through.
             if let Decision::Shed(prefill_shed) = &prefill {
                 if prefill_shed.reason != ShedReason::PolicyDeclined {
                     // A refused pool vetoed on every usable worker goes to
@@ -8574,103 +8657,159 @@ impl Engine {
                         return shed(reason_of(limit), limit, prefill_shed.trace)
                             .of_side(PairSide::Prefill);
                     }
-                    let mut routable = 0usize;
+                    // No stage placed the pair, no default paired it and no
+                    // prefill waits on its limit alone. The prefills the
+                    // request may take that stand, the limit set aside: one
+                    // outside its side's places is no routable prefill of
+                    // it, and one at its limit with no open partner is named
+                    // by its partners' stage as any other. A prefill is
+                    // routable under the constraints the run itself read.
+                    // Their classes are written over the classes with an
+                    // open partner, which nothing below reads.
+                    let has_partner = |c: &Candidate| vetoed::pairs_in(c, &pools.table, decodes);
+                    // Whether a prefill of the pool pairs with a decode of
+                    // it at all, in whatever state, asked once: where none
+                    // does, nothing below looks for a prefill's partner
+                    // again.
+                    let any_pairs = prefills.iter().any(&has_partner);
+                    let pairs = |c: &Candidate| any_pairs && has_partner(c);
+                    // Whether one of them that pairs with a decode of the
+                    // pool stands in the pool as it is with no lift: behind
+                    // a weighing profile's lifted run the stated
+                    // constraints are asked of it once more, as the default
+                    // above read them.
+                    let unlifted =
+                        |c: &Candidate| lifted_run.is_none() || sides[0].but_for_the_limit(c);
+                    let (mut routable, mut pair_stands) = (0usize, false);
                     scratch.classes.clear();
-                    // Of the prefills the request may take, the limit set
-                    // aside: one outside its side's places is no routable
-                    // prefill of it, and one at its limit with no open
-                    // partner is named by its partners' stage as any other.
-                    // A prefill is routable under the constraints the run
-                    // itself read.
                     for c in takes.places().filter(|c| takes.but_for_the_limit(c)) {
                         routable += 1;
                         if c.pair_class != 0 {
                             scratch.classes.push(c.pair_class);
                         }
+                        pair_stands = pair_stands || (pairs(c) && unlifted(c));
                     }
                     scratch.classes.sort_unstable();
                     scratch.classes.dedup();
-                    if routable == 0 {
-                        let stage = filter(
-                            prefill_profile,
-                            &prefill_facts,
-                            run_cx,
-                            &mut scratch.single,
-                            Set::side(prefills, None, None),
-                        )
-                        .unwrap_or("none");
-                        // No prefill of the request's stands but for a
-                        // veto. The overload veto's shed is made over the
-                        // prefills, and the decision says so where the
-                        // prefills that pair with a decode of the pool are
-                        // wholly over their thresholds
-                        // ([`vetoed::wholly_over`]): the pool the pair's
-                        // default above judged. The rows are read once
-                        // more, behind such a shed alone: for each prefill
-                        // at the request's places a decode that pairs with
-                        // it is looked for, at worst every decode once a
-                        // prefill, and no filter of the profile runs again.
-                        if says && reason_of(stage) == ShedReason::Saturated {
-                            let pairs = |c: &&Candidate| vetoed::pairs_in(c, &pools.table, decodes);
-                            let paired = takes.places().filter(pairs);
-                            if vetoed::wholly_over(paired, &prefill_facts, run_cx) {
-                                scratch.shed_over = Some(ShedOver::Prefills);
-                            }
+                    // One question says whether the shed is saturation, the
+                    // gateway's own pair selection's (`pair_pass`,
+                    // `model_gateway/src/routers/common/placement.rs`,
+                    // where no prefill is eligible or open). It judges one
+                    // list: every decode at the request's places, a decode
+                    // that pairs with no prefill too, where a prefill at
+                    // those places that pairs with a decode of the pool
+                    // stands; and else those prefills. Under a binding that
+                    // sheds, the shed is saturated exactly where that list
+                    // is wholly over its thresholds ([`Half::count`]), and
+                    // the decision says the list. Under a binding that
+                    // steers no shed here is saturated: that selection
+                    // sheds for overload under its shed option alone
+                    // (`failure_from` there). The count reads the
+                    // list's rows once more, by the health stage's and the
+                    // overload veto's tests, behind a shed alone. For the
+                    // prefills a decode that pairs with each is looked for
+                    // too, at worst every decode once a prefill.
+                    let judged = || {
+                        if pair_stands {
+                            (sides[1].count(sides[1].places()), ShedOver::Decodes)
+                        } else {
+                            let paired = sides[0].places().filter(|&c| pairs(c));
+                            (sides[0].count(paired), ShedOver::Prefills)
                         }
-                        // No prefill of the request's stands: the prefill
-                        // side is the one left with nobody, and where the
-                        // decision says the list it shed over, that list
-                        // is the prefills'.
-                        return shed(reason_of(stage), stage, prefill_shed.trace)
-                            .of_side(PairSide::Prefill);
+                    };
+                    // Every shed below names one side, the role that
+                    // selection refuses for. It asks three tests of its
+                    // lists whole ahead of its question, in this order: a
+                    // prefill pool that holds no worker is refused for the
+                    // prefill's role, a decode pool that holds none for the
+                    // decode's, and a pool no prefill of which pairs with
+                    // any decode for the decode's too. Else the side is the
+                    // list the question judges.
+                    let side = if pair_stands {
+                        PairSide::Decode
+                    } else if prefills.is_empty() || any_pairs {
+                        PairSide::Prefill
+                    } else {
+                        PairSide::Decode
+                    };
+                    // The question is asked over whole lists alone. Behind a
+                    // part ([`PairPools::part`]) that selection judges a
+                    // wider list than this decision is handed: the
+                    // workers on the request's wire, and every worker
+                    // where none is on it (`admitted_pool` there). So no
+                    // shed behind a part is made saturated by the count,
+                    // and a pass the overload veto ended keeps its name
+                    // below.
+                    let part = pools.part;
+                    let asked = (says && !part).then(&judged);
+                    if let Some((Count::WhollyOver(_), over)) = asked {
+                        let veto = NotOverloaded.name();
+                        scratch.shed_over = Some(over);
+                        return shed(reason_of(veto), veto, prefill_shed.trace).of_side(side);
                     }
-                    // From here a prefill stands but for its limit: where
-                    // its partners are missing or refused, the decode side
-                    // is the one left with nobody.
-                    if scratch.classes.is_empty() {
-                        return shed(ShedReason::NoEndpoints, "partnered", prefill_shed.trace)
-                            .of_side(PairSide::Decode);
-                    }
-                    // Their partners are the decodes of the classes they
-                    // pair with.
-                    pools.table.listed(&mut scratch.classes, &mut scratch.marks);
-                    // An empty decode pool is that class for every prefill:
-                    // its "none" leaves the prefill's shed standing, as the
-                    // decode side's.
-                    let refused = filter(
-                        decode_profile,
-                        &decode_facts,
-                        decode_cx,
-                        &mut scratch.decode,
-                        Set::side(decodes, None, Some(&scratch.classes)),
-                    );
-                    if refused == Some("none") {
-                        return prefill.of_side(PairSide::Decode);
-                    }
-                    if let Some(stage) = refused {
-                        // The partners of the prefills that stand are
-                        // refused whole. The overload veto's shed is made
-                        // over the decodes where the whole decode list is
-                        // wholly over its thresholds, a decode that pairs
-                        // with no prefill too ([`vetoed::wholly_over`]):
-                        // the decision says so there, and nowhere else.
-                        // The rows are read once more, behind such a shed
-                        // alone, and no filter of the profile runs again.
-                        if says && reason_of(stage) == ShedReason::Saturated {
-                            let listed = places::rows(decodes, decode_cx);
-                            if vetoed::wholly_over(listed, &decode_facts, decode_cx) {
-                                scratch.shed_over = Some(ShedOver::Decodes);
-                            }
+                    // Else the request has no endpoint, and the stage that
+                    // left a pass nobody names the shed: the prefill side's
+                    // where no prefill of the request's stands but for its
+                    // limit, `partnered` where those that stand pair with no
+                    // decode, and else what the decode pool's own stages say
+                    // about the partners of the prefills that stand.
+                    let named = if routable == 0 {
+                        let whole = Set::side(prefills, None, None);
+                        let buf = &mut scratch.single;
+                        let stage = filter(prefill_profile, &prefill_facts, run_cx, buf, whole);
+                        Some(stage.unwrap_or("none"))
+                    } else if scratch.classes.is_empty() {
+                        Some(PARTNERED)
+                    } else {
+                        // Their partners are the decodes of the classes they
+                        // pair with. An empty decode pool is that class for
+                        // every prefill: its "none" leaves the prefill's own
+                        // shed standing.
+                        pools.table.listed(&mut scratch.classes, &mut scratch.marks);
+                        let partners = Set::side(decodes, None, Some(&scratch.classes));
+                        let buf = &mut scratch.decode;
+                        filter(decode_profile, &decode_facts, decode_cx, buf, partners)
+                            .filter(|&stage| stage != "none")
+                    };
+                    let reason = named.map_or(prefill_shed.reason, reason_of);
+                    // A pass the overload veto ended names that veto, the
+                    // engine's word for saturation, which the count did not
+                    // bear. The shed has no endpoint, under the stage that
+                    // refused a worker with room of the list judged
+                    // ([`Half::refused_room`]). Behind a part no list was
+                    // judged, and the pass's name stands. The decision
+                    // says its list there as it did before the question
+                    // stood, where a stage named the shed: the prefills
+                    // that pair where no prefill stands, and else the
+                    // decode list whole, each where wholly over its
+                    // thresholds.
+                    if reason == ShedReason::Saturated && part && says && named.is_some() {
+                        let (read, over) = if routable == 0 {
+                            let paired = takes.places().filter(|&c| pairs(c));
+                            (takes.count(paired), ShedOver::Prefills)
+                        } else {
+                            (sides[1].count(sides[1].places()), ShedOver::Decodes)
+                        };
+                        if let Count::WhollyOver(_) = read {
+                            scratch.shed_over = Some(over);
                         }
-                        // Where the decision says the list it shed over,
-                        // that list is the decodes'.
-                        return shed(reason_of(stage), stage, prefill_shed.trace)
-                            .of_side(PairSide::Decode);
                     }
+                    if reason == ShedReason::Saturated && !part {
+                        let (read, over) = asked.unwrap_or_else(&judged);
+                        let judged = &sides[usize::from(over == ShedOver::Decodes)];
+                        let stage = judged.refused_room(read);
+                        return shed(ShedReason::NoEndpoints, stage, prefill_shed.trace)
+                            .of_side(side);
+                    }
+                    if let Some(stage) = named {
+                        return shed(reason, stage, prefill_shed.trace).of_side(side);
+                    }
+                    // The prefill's own shed stands, where the decodes at
+                    // the request's places hold nobody or keep a partner.
+                    return prefill.of_side(side);
                 }
             }
-            // The prefill's own refusal stands: its picker's decline, or
-            // its stage where the decode side keeps a partner.
+            // A picker's decline passes through, as the prefill side's.
             return prefill.of_side(PairSide::Prefill);
         };
         // A pick the weighing lift alone made possible says so, as a kept
