@@ -1,7 +1,7 @@
-//! The configuration a command line assembles, as a policy document: the
-//! policy controller's corpus through the command-line parser.
+//! The configuration a command line assembles, as a policy document:
+//! Grand Central's corpus through the command-line parser.
 //!
-//! The corpus (`crates/policy_controller/tests/corpus`) holds one item a
+//! The corpus (`crates/grand_central/tests/corpus`) holds one item a
 //! routing configuration of the gateway: its input, and under `## Expected
 //! spec` the document that says the same. An item is read as the binary
 //! reads a command line, assembled into a `RouterConfig` and converted.
@@ -9,7 +9,7 @@
 use std::{borrow::Cow, fs, path::Path};
 
 use clap::Parser;
-use smg_policy_controller::document::{PolicySpec, RoutingSettingsError, SpecError, PRESETS};
+use smg_grand_central::document::{PolicySpec, RoutingSettingsError, SpecError, PRESETS};
 
 use super::{
     super::{url_port::CommandLine, Cli, CliArgs, Commands},
@@ -151,8 +151,7 @@ fn one_routing_part(argv: &[String], whole: &Converted) -> Result<(), String> {
 
 /// The corpus's items by file name, in order.
 fn corpus() -> Vec<(String, String)> {
-    let dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/policy_controller/tests/corpus");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/grand_central/tests/corpus");
     let mut items: Vec<(String, String)> = fs::read_dir(&dir)
         .expect("the corpus directory is readable")
         .map(|entry| entry.expect("a corpus entry").path())
@@ -246,7 +245,7 @@ const OTHERS: &[(&str, Verdict)] = &[
         Verdict::LauncherSpelling(Cow::Borrowed("--eviction-interval-secs")),
     ),
     // The conversion writes the sticky override's rule in another form than
-    // this item's block. The corpus is the policy crate's. Where the block
+    // this item's block. The corpus is the Grand Central crate's. Where the block
     // comes to say the conversion's document this entry fails, and leaves.
     (
         "22-cli-least-load-sticky-custom-headers.md",
@@ -575,7 +574,7 @@ const ROUTING_FLAGS: &[Row] = &[
     lands("worker-warmup-thin-ratio", &[], &["0.25"]),
     lands("worker-warmup-divert-every", &[], &["4"]),
     kept(
-        "policy-controller",
+        "grand-central",
         &[],
         &["on"],
         "it chooses who runs the policy document and leaves the flags' meaning alone",
@@ -750,7 +749,7 @@ fn is_one_sentence_headed(sentence: &str, head: &str) -> bool {
 fn the_print_option_says_a_refusal_in_one_sentence() {
     // A setting no document says: no document, and one sentence with the
     // setting by its name at the head. The words behind the head are the
-    // policy crate's, and no case of the gateway holds them. The sticky
+    // Grand Central crate's, and no case of the gateway holds them. The sticky
     // override's rule places single requests alone, and this line plans a
     // pair.
     let mut line = vec!["smg"];

@@ -33,7 +33,7 @@
 //!   with no row. Where that entry states a running or waiting request it
 //!   is kept in a side table, with its own sample instant, until the worker
 //!   answers again or leaves, and no further than the first tick of its
-//!   group that finds the sample 30 seconds old: the policy controller's
+//!   group that finds the sample 30 seconds old: Grand Central's
 //!   read ([`LoadSnapshot::report_or_kept`]) and no other reaches it.
 
 use std::{
@@ -120,8 +120,8 @@ impl LoadSnapshot {
     /// keeps such a report while it states a running or waiting request,
     /// until the worker answers again or leaves, and no further than the
     /// first poll tick of its group that finds the sample 30 seconds old:
-    /// the age is judged at the ticks, not at this read. The policy
-    /// controller's read: its stages age a report by its sample.
+    /// the age is judged at the ticks, not at this read. Grand
+    /// Central's read: its stages age a report by its sample.
     /// [`Self::report`] and [`Self::get`] give no kept report.
     pub fn report_or_kept(&self, url: &str) -> Option<(&WorkerLoadResponse, Instant)> {
         self.entries

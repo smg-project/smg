@@ -18,8 +18,8 @@ use super::*;
 use crate::{middleware::scheduler, policies::cost as selection_cost, tenant::MAX_TENANT_ID_LEN};
 
 /// The credential header names `routing_key_override.headers` may not carry
-/// (see [`ConfigValidator::validate_routing_key_headers`]). The policy
-/// controller crate refuses the same names in a specification's header
+/// (see [`ConfigValidator::validate_routing_key_headers`]). The Grand
+/// Central crate refuses the same names in a specification's header
 /// lists.
 const DENIED_HEADERS: [&str; 7] = [
     "authorization",
@@ -1958,7 +1958,7 @@ impl ConfigValidator {
         // A launcher gives the document's path, and a host may hand the
         // document itself. Either one, with the switch off, would be dropped
         // and the classic policies would serve.
-        if !config.policy_engine_decides()
+        if !config.engine_decides()
             && (config.policy_spec_path.is_some() || config.policy_spec.is_some())
         {
             return Err(ConfigError::invalid_value(
@@ -1967,7 +1967,7 @@ impl ConfigValidator {
                     .policy_spec_path
                     .as_deref()
                     .unwrap_or("the given document"),
-                "a policy document is run by the policy controller: set --policy-controller on",
+                "a policy document is run by Grand Central: set --grand-central on",
             ));
         }
         // The path is written with the configuration and the document is

@@ -119,6 +119,12 @@ pub struct Config {
     /// a few megabytes; tonic's own default (4 MiB) refuses that, while the
     /// engine servicers run without a limit, so none is the default.
     pub grpc_max_message_bytes: usize,
+    /// Whether the gRPC wires serve the subscription to KV-cache events
+    /// (`--grpc-kv-events`). With false it is refused as by an engine
+    /// without the call, so a gateway hears no KV event from this process
+    /// over gRPC, while the engines keep their prefix cache and the load
+    /// records alone stay served. The ZMQ publishers are not touched.
+    pub grpc_kv_events: bool,
     /// vLLM-wire ZMQ KV-event publishers (realistic engines only): the first
     /// PUB port; worker `i` publishes on `base + 2i` and answers replay on
     /// `base + 2i + 1`. Off when `None`.
@@ -402,6 +408,7 @@ impl Default for Config {
             drain_timeout: Duration::from_secs(5),
             context_length: 32768,
             grpc_max_message_bytes: usize::MAX,
+            grpc_kv_events: true,
             kv_events_zmq_base_port: None,
             kv_events_replay: true,
             kv_events_topic: String::new(),
@@ -545,6 +552,9 @@ impl Config {
                 }
                 "--grpc-max-message-bytes" => {
                     cfg.grpc_max_message_bytes = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--grpc-kv-events" => {
+                    cfg.grpc_kv_events = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--kv-events-zmq-base-port" => {
                     cfg.kv_events_zmq_base_port = Some(parse(value(&mut args, &flag)?, &flag)?);
@@ -1145,6 +1155,9 @@ pub fn usage() -> String {
                                 the gateway detects the runtime from it (--capture: tokenspeed only)\n\
        --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
                                 (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
+       --grpc-kv-events <bool>  serve the gRPC subscription to KV-cache events (default true);\n\
+                                false refuses it as an engine without the call does, while the\n\
+                                engines keep their prefix cache and the load records stay served\n\
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
        --zmq-count <n>          number of ZMQ mock EngineCore ranks (default 0)\n\
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\

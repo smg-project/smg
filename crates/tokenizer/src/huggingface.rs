@@ -482,6 +482,14 @@ struct EncoderCore {
     /// Whether the pipeline matches an added token after normalization,
     /// read on first use (see [`Self::matches_after_normalization`]).
     matches_after_normalization: OnceLock<bool>,
+    /// The largest id of the vocabulary, added tokens included, read on
+    /// first use (see `max_token_id`): the model's part from
+    /// [`Self::model_max_id`] where the load read it, else a walk of the
+    /// whole vocabulary.
+    max_token_id: OnceLock<Option<TokenIdType>>,
+    /// The model's largest id as the load's one-pass read of the file saw
+    /// it (`ReadBpe::max_id`); `None` for a tokenizer built elsewhere.
+    model_max_id: Option<TokenIdType>,
     /// What answers for the model of `tokenizer` where the load built none:
     /// that model is then empty.
     vocabulary: Option<Vocabulary>,
@@ -511,6 +519,7 @@ impl EncoderCore {
         wordpiece: Option<WordPieceEncoder>,
         unigram: Option<UnigramEncoder>,
         vocabulary: Option<Vocabulary>,
+        model_max_id: Option<TokenIdType>,
     ) -> Self {
         Self {
             tokenizer,
@@ -521,6 +530,8 @@ impl EncoderCore {
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
             matches_after_normalization: OnceLock::new(),
+            max_token_id: OnceLock::new(),
+            model_max_id,
             vocabulary,
             whole: OnceLock::new(),
         }
@@ -1341,6 +1352,7 @@ impl HuggingFaceTokenizer {
             encoders.wordpiece,
             encoders.unigram,
             vocabulary,
+            model_max_id,
         ));
         let structural_controls = tokenizer_path
             .parent()
@@ -1724,6 +1736,7 @@ impl HuggingFaceTokenizer {
             encoders.native,
             encoders.wordpiece,
             encoders.unigram,
+            None,
             None,
         );
         if let Some(native) = &core.native {
@@ -2980,6 +2993,26 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     /// the model's piece), which `token_to_id` maps back to the id.
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
         self.token_text(id)
+    }
+
+    /// The largest id of the vocabulary, the model's and the added tokens'
+    /// alike, as vLLM reads it (the maximum over `get_vocab()`, and at least
+    /// `vocab_size - 1`): [`Self::vocab_size`] counts the model's entries
+    /// and leaves the added tokens out, and a multimodal placeholder is often
+    /// one of them, or an id far past a sparse vocabulary's count. Read once,
+    /// on first use. The model's part is the largest id the load's read of
+    /// the file saw, where it read one (a byte-fallback BPE whose model the
+    /// load did not build included); only a tokenizer built elsewhere walks
+    /// the whole vocabulary for it.
+    fn max_token_id(&self) -> Option<TokenIdType> {
+        *self.core.max_token_id.get_or_init(|| {
+            let counted = self
+                .vocab_size()
+                .checked_sub(1)
+                .map(|id| TokenIdType::try_from(id).unwrap_or(TokenIdType::MAX));
+            crate::byte_level::max_token_id(&self.core.tokenizer, self.core.model_max_id)
+                .max(counted)
+        })
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

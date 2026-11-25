@@ -206,6 +206,12 @@ impl Bed {
     }
 
     async fn over(endpoint: Endpoint, stub: EmbedStub) -> Self {
+        let policies = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        Self::placed_by(endpoint, stub, policies).await
+    }
+
+    /// [`Self::over`] with the registry that places the bed's requests.
+    async fn placed_by(endpoint: Endpoint, stub: EmbedStub, policies: Arc<PolicyRegistry>) -> Self {
         let router = Server::builder().add_service(VllmEngineServer::new(stub.clone()));
         let port = serve_on_loopback(router).await.0.port();
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -218,7 +224,7 @@ impl Bed {
         );
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            policies,
             None,
             None,
             Duration::from_secs(60),
@@ -652,6 +658,46 @@ async fn a_mixed_batch_is_one_breaker_sample_and_it_is_the_worker_failure() {
             bed.breaker_counts(),
             (1, 0),
             "{input}: one failure sample for the request, no success credited: {body}"
+        );
+    }
+}
+
+/// An embeddings request opens no stream, so the execution stage tells
+/// Grand Central the request's one sample: a good answer as the worker's
+/// 200, and a batch the worker failed one input of by that failure's
+/// status, whatever its place in the batch. A batch of inputs is one
+/// placement, and the engine hears one end.
+#[tokio::test]
+async fn the_engine_hears_an_embedding_by_its_one_sample() {
+    use crate::routers::common::placement::tests::hearing_engine_on;
+
+    for (stub, input, end) in [
+        (
+            EmbedStub::default(),
+            json!([[1, 2], [3]]),
+            "completed Ok 200",
+        ),
+        (
+            EmbedStub {
+                reject_ids: Some(vec![1]),
+                fail_ids: Some(vec![3]),
+                ..EmbedStub::default()
+            },
+            json!([[1], [3], [5]]),
+            "completed ServerError 503",
+        ),
+    ] {
+        let policies = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let heard = hearing_engine_on(&policies);
+        let bed = Bed::placed_by(Endpoint::Embeddings, stub, policies).await;
+
+        let (status, body) = bed.embed(json!({"model": MODEL, "input": input})).await;
+
+        assert_eq!(status.is_success(), end == "completed Ok 200", "{body}");
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            ["issued", "dispatched Single", end],
+            "{input}"
         );
     }
 }

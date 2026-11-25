@@ -41,7 +41,7 @@
 
 use std::{cell::Cell, sync::Arc};
 
-use smg_policy_controller::policies::consistent_hashing::Head;
+use smg_grand_central::policies::consistent_hashing::Head;
 use smg_worker::identity::basic::Worker;
 use tracing::debug;
 
@@ -235,9 +235,9 @@ impl PrefixHashPolicy {
         std::str::from_utf8(buf).expect("hex digits are ASCII")
     }
 
-    /// Where a head of a request stands on the model's ring, as the policy
-    /// engine asks a ring it is lent
-    /// ([`LentRing::head_position`](smg_policy_controller::policies::consistent_hashing::LentRing::head_position)):
+    /// Where a head of a request stands on the model's ring, as Grand
+    /// Central asks a ring it is lent
+    /// ([`LentRing::head_position`](smg_grand_central::policies::consistent_hashing::LentRing::head_position)):
     /// the position of the ring key this policy finds the head's worker by.
     /// A head's bytes are the ones this policy hashes: token ids cast in
     /// place, a text's own, a routing key's among them. They are hashed
@@ -450,7 +450,7 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerStatus;
-    use smg_policy_controller::policies::consistent_hashing::LentRing;
+    use smg_grand_central::policies::consistent_hashing::LentRing;
     use smg_worker::identity::basic::WorkerLoadGuard;
 
     use super::*;
@@ -1194,7 +1194,7 @@ mod tests {
         );
     }
 
-    /// A head's place on the ring the policy engine is lent is where this
+    /// A head's place on the ring Grand Central is lent is where this
     /// policy's own lookup of the head starts. The policy places a request
     /// whose one head it is, and the walk from the head's lent place asks
     /// that worker first. Token ids short of the depth and cut at it, a

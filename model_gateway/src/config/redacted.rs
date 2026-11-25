@@ -135,7 +135,7 @@ const PLAIN: &[&str] = &[
     "upstream_http2",
     "enable_wasm",
     "storage_hook_wasm_path",
-    "policy_controller",
+    "grand_central",
     "policy_spec_path",
 ];
 

@@ -264,7 +264,7 @@ capture on, and they are independent of each other. A request header asks for it
   `matched_units` of `input_units` with the `credited_units` the chosen worker is expected to have
   cached.
 
-  With `--policy-controller on` the policy engine places the request, each list it picked from is
+  With `--grand-central on` Grand Central places the request, each list it picked from is
   one entry, and four of these read differently:
   - `origin` is `engine`, whichever rule of the engine placed the request.
   - `prediction` is `null`.

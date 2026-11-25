@@ -5,16 +5,16 @@
 //! leaves the ready set, or a request, which asks the rank cache's select
 //! for a rank and books its estimated tokens on the rank it takes. The
 //! gateway's minimum-tokens policy forwards a request to that select and
-//! adds nothing. A request that finds no rank records `null`. The policy
-//! controller crate replays the rows through the rank cache of the load
+//! adds nothing. A request that finds no rank records `null`. The Grand
+//! Central crate replays the rows through the rank cache of the load
 //! monitor a host builds
-//! (`crates/policy_controller/tests/classic/minimum_tokens.rs`).
+//! (`crates/grand_central/tests/classic/minimum_tokens.rs`).
 //!
 //! This file is an ignored test of the worker crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \

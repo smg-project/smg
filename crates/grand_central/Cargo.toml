@@ -1,0 +1,535 @@
+[package]
+name = "smg-grand-central"
+version = "0.1.0"
+edition = "2021"
+description = "Grand Central: the routing engine (a bounded view, a typed decision, a lifecycle, a filter, score and pick framework under one versioned spec) and, in later steps, the standalone controller's store, ingestion, API and election"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+keywords = ["routing", "policy", "load-balancing", "llm"]
+categories = ["algorithms"]
+
+[dependencies]
+# No host crate in the default build: the engine knows nothing about its
+# host (a gateway, a controller, a binding).
+# The credit tally is read by every deciding thread and replaced whole on
+# the rare write (a rank's first dispatch, a membership change): a load
+# costs no shared write.
+arc-swap = "1.9.1"
+# The ring a file's hands write into: a bounded queue written in place
+# that wakes no thread, where a channel pays for a waker at every frame
+# and nothing sleeps on it. The KV index below already builds it. The
+# hand-over's argument in src/store/memory/turn.rs stands on two facts
+# of its push and its pop as read at 0.3.14, the version the lock file
+# holds: a version that moves reads them again.
+crossbeam-queue = "0.3"
+# The KV index the store holds one of per model: the chain index, the map
+# each of its writers keeps and its block types. It names no workspace crate.
+kv-index = { workspace = true }
+parking_lot = { workspace = true }
+rustc-hash = "2"
+# The spec's JSON schema is generated from its types; serde_json renders it
+# as the committed artifact.
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+# A JSON policy spec reads one way in every build: `float_roundtrip` reads a
+# number as the nearest double. Without it here the crate built alone, and a
+# controller's image, read a long number one last bit apart from a gateway's
+# build, where another crate of the workspace asks for the feature.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+# The document's digest (SHA-256), at the version the gRPC client crate under
+# `controller` and the gateway already link.
+sha2 = "0.11"
+thiserror = { workspace = true }
+# The WebAssembly plugin host (`wasm`): the runtime and one kept instance per
+# module per decider. The log lines a plugin writes go through the
+# optional tracing declared with the controller's dependencies below; this
+# feature turns it on too.
+thread_local = { version = "1.1", optional = true }
+# The gRPC user plugin (`grpc`, under the `controller` feature): a Unix
+# socket's connector, the stream a channel's receiver is sent as, and the
+# service a connector is. The runtime, the transport and the protocol's
+# code are the controller's own, below.
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+tower = { version = "0.5", default-features = false, features = ["util"], optional = true }
+wasmtime = { workspace = true, optional = true }
+
+# The Kubernetes Lease elector (design 10), behind the `kubernetes` feature:
+# the gateway's own kube client stack, pinned to the same release. The
+# runtime handle its election thread blocks on is the optional tokio declared
+# with the controller's dependencies below; this feature turns it on too.
+# Nothing of it is built without the feature.
+k8s-openapi = { version = "0.27.0", features = ["v1_33"], optional = true }
+kube = { version = "3.0.1", default-features = false, features = ["client", "rustls-tls", "ring"], optional = true }
+
+# The controller's engine client (the `controller` feature): the gRPC
+# connector each worker object dials through and the cache events' wire.
+smg-grpc-client = { workspace = true, optional = true }
+
+# The load report type for `in-process` and `worker-host`. The worker host
+# also needs the runtime for worker objects, the registry and collector
+# ports, and the worker crate's workflows for the membership steps it runs.
+async-trait = { workspace = true, optional = true }
+smg-worker = { workspace = true, optional = true }
+wfaas = { workspace = true, optional = true }
+# The header map a request's headers are read from (the `in-process` feature).
+http = { workspace = true, optional = true }
+# Worker discovery (the `discovery` feature): the discovery crate with its
+# four providers, each of which the controller's flags can select.
+smg-service-discovery = { workspace = true, features = ["consul", "file", "kubernetes", "slurm"], optional = true }
+
+# The standalone controller (the `controller` feature): the listeners, the
+# health service, the admin endpoints and the binary. Every dependency below
+# is optional so a host that embeds the engine (the gateway, a binding)
+# builds the crate as it is today, with no server stack.
+axum = { workspace = true, optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+metrics = { version = "0.24.6", optional = true }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, optional = true }
+# The protocol's generated messages, service and client (`proto`): the code
+# the build script writes from the contract files names both.
+prost = { workspace = true, optional = true }
+# The process TLS crypto provider, installed once before the first listener;
+# the gateway, the servicer and the mock worker install the same one.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
+tonic = { workspace = true, features = ["tls-ring"], optional = true }
+tonic-health = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+# The spec file's YAML form, and the path of a field its reader refuses
+# (in the tree already, under the web framework).
+serde_path_to_error = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+
+# The plugin host measures a call's bound on the CPU its thread had: the
+# thread CPU clock, read at a tick a call is still in flight, at the start of
+# a call on an armed thread and at the end of a late call whose start was
+# read. Already in the tree under the WebAssembly runtime. Where no such
+# clock exists the bound stays on the wall clock. `use-libc-auxv`: the
+# clock's first read looks for the kernel's fast path through the process's
+# auxiliary vector, and the library's own read of it faults where a tool
+# hides that page from the process (a run under valgrind); libc's read is the
+# one such tools serve. `fs`: the controller opens its spec file without
+# waiting, where an open of a pipe waits for a writer.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "time", "use-libc-auxv"], optional = true }
+
+# The binary's allocator, the one the gateway's binary registers, on the
+# targets the gateway registers it.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
+# The build script compiles the protocol under the `controller` feature
+# alone: the engine's own build runs nothing and needs no `protoc`.
+[build-dependencies]
+tonic-prost-build = { version = "0.14.6", optional = true }
+
+[features]
+# Reading and applying a policy document in process. The turn uses only
+# Tokio's sync primitives. It builds on every target. The spec store's file
+# calls come of `rustix`, a dependency on Linux and macOS alone: on another
+# target a door has no spec store to bind.
+operator = [
+    "dep:rustix",
+    "dep:serde_path_to_error",
+    "dep:serde_yaml",
+    "dep:tokio",
+    "dep:tracing",
+]
+# The standalone controller: the listeners with their scopes, the
+# protocol's generated service and client, the election, the gRPC health
+# service and the admin endpoints. It turns on `worker-host`, so every
+# controller keeps its worker objects, probes them and reads cache events,
+# and `in-process`, the engine over worker objects.
+# Off by default: the engine alone has no server dependency. It builds on
+# Linux and macOS: the gRPC plugin kind dials a Unix socket and reads its
+# peer's user through `rustix`, which is declared for those two.
+controller = [
+    "operator",
+    "in-process",
+    "worker-host",
+    "dep:axum",
+    "dep:clap",
+    "dep:hyper-util",
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
+    "dep:prost",
+    "dep:rustls",
+    "dep:smg-grpc-client",
+    "dep:thread_local",
+    "dep:tikv-jemallocator",
+    "dep:tokio-stream",
+    "dep:tonic",
+    "dep:tonic-health",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
+    "dep:tower",
+    "dep:tracing-subscriber",
+    "tokio/fs",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "tokio/signal",
+]
+
+# The gateway's side of the controller's protocol: the reference client, the
+# link a host's requests share, the watcher and the worker follower. It adds
+# no dependency to the controller's. The gateway builds it on the targets
+# the controller builds on, to follow a controller.
+client = ["controller"]
+
+# The Kubernetes Lease backend of the elector.
+kubernetes = ["dep:k8s-openapi", "dep:kube", "tokio/rt"]
+
+# A replica's worker objects: one object of the worker crate for every row of
+# the membership store, in a registry the host hands in, built, replaced and
+# dropped as the rows come, change and go. Off by default: it brings the
+# worker crate's workflows. It names nothing of the controller, and builds
+# without it. Where the build holds the engine clients, as the controller's
+# does, it turns their engine port on: the controller hands each object the
+# gRPC connector.
+worker-host = [
+    "dep:async-trait",
+    "dep:smg-worker",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:wfaas",
+    "smg-grpc-client?/engine-port",
+    "smg-worker/runtime",
+    "smg-worker/workflow",
+    "tokio/macros",
+]
+
+# Worker discovery on the leading controller, over the replica's worker
+# objects. Off by default.
+discovery = ["controller", "dep:smg-service-discovery"]
+
+# The engine in a gateway's own process: one front over the gateway's worker
+# objects, which reads a worker's health where the worker crate keeps it. It
+# names nothing of the store. Off by default: it brings the worker crate's
+# runtime. The engine's own task takes Tokio's timer, which that runtime
+# builds already.
+in-process = [
+    "dep:http",
+    "dep:smg-worker",
+    "dep:tokio",
+    "smg-worker/runtime",
+    "tokio/macros",
+    "tokio/time",
+]
+
+default = ["wasm"]
+# The WebAssembly plugin host over the committed `smg:policy` worlds.
+wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
+# A case's hold of the gRPC plugin runtime's I/O thread, the stand-in for a
+# host that takes the thread's core. The package's own tests and benches
+# turn it on through the dev-dependency on the package itself, and the
+# gateway's `test-util` turns it on for the gateway's tests. A build of the
+# gateway's package alone leaves it off.
+#
+# It also builds the lookup over holders a host scored
+# (`overlap::deepest_of_within_groups`), which the gateway's reference index
+# calls in its cases.
+test-util = ["smg-worker?/test-util"]
+
+[dev-dependencies]
+# The package itself with `test-util`, for its own tests and benches alone.
+# Without `default-features = false` the default set would reach every test
+# target whatever features a run selected, and a run with no default
+# features would not be one. The key is not the package's name: on a build
+# line cargo reads `smg-grand-central/<feature>` as a dependency of that
+# name first, and the controller image's line, which names its features so,
+# would turn them on for this test edge alone and build no binary.
+smg-grand-central-test-util = { package = "smg-grand-central", path = ".", default-features = false, features = ["test-util"] }
+# The discovery cases record the jobs a provider submits.
+smg-service-discovery = { workspace = true, features = ["test-util"] }
+# The in-process engine's cases set a worker's status.
+openai-protocol = { workspace = true }
+criterion = "0.8"
+# The Kubernetes elector's tests run its client against a service in the
+# test's process that plays one Lease, and its three-process cell against
+# the same stand-in served over HTTP.
+axum = { workspace = true }
+http = { workspace = true }
+# The worker follower's tests answer as a controller would: a body of frames
+# that ends with trailers, or never ends.
+http-body = "1.0"
+http-body-util = { workspace = true }
+# The cases add the test macro and tokio's paused clock.
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
+# The spec store cases collect the lines the source logs.
+tracing-subscriber = { workspace = true }
+# The corpus test reads YAML documents.
+serde_yaml = { workspace = true }
+# The contract tests (tests/contracts.rs) compile the protocol to a
+# descriptor set through protoc and resolve the WebAssembly world; no code
+# is generated and nothing at run time reads the files.
+prost-build = { version = "0.14.4", default-features = false }
+prost-types = { workspace = true }
+wit-parser = { version = "0.258.3", default-features = false, features = ["std"] }
+# The lease-file tests and bench write under a directory of their own.
+tempfile = "3"
+# The gRPC plugin's tests and bench serve a plugin of their own over a
+# socket in such a directory; this wraps its listener.
+tokio-stream = { version = "0.1", features = ["net"] }
+# The plugin host's test guests are WebAssembly text in the test sources,
+# assembled and wrapped into components of the committed world at test time:
+# no binary fixture and no cross target.
+wat = "1"
+wit-component = { version = "0.258.3", default-features = false }
+# The controller's mutual-TLS test mints its authority, server and client
+# certificates when it runs; no certificate file lives in the repository.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# The admin router's tests drive it with `oneshot`, no socket.
+# The Kubernetes elector's stand-in is a `service_fn` of the same crate.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# The controller's cases poll the mock worker's gRPC engines in-process:
+# the same `GetLoads` answers the gateway's tests read.
+mock-worker = { path = "../mock_worker" }
+# The classic rows' scripted engine answers the worker crate's engine calls
+# in `tonic::Status`, under two features that turn no `tonic` on.
+tonic = { workspace = true }
+
+# The spec file's open is read on a terminal pair its test makes (`pty`).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1", default-features = false, features = ["pty"] }
+
+# The in-process bench's allocator: the gateway binary's, on the gateway's targets.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }
+
+[[bin]]
+name = "smg-grand-central"
+path = "src/bin/smg-grand-central.rs"
+required-features = ["controller"]
+
+# A program that decides in its own process: it starts the engine and
+# serves each request by the one call the engine has for a request.
+[[example]]
+name = "in_process"
+required-features = ["in-process"]
+
+[[test]]
+name = "binary"
+required-features = ["controller"]
+
+[[test]]
+name = "operator_door"
+required-features = ["operator"]
+
+[[test]]
+name = "spec_file"
+required-features = ["controller"]
+
+[[test]]
+name = "spec_store"
+required-features = ["controller"]
+
+# The program of the `in_process` example, driven by cases: the example's
+# own module, taken in as it stands.
+[[test]]
+name = "caller"
+required-features = ["in-process"]
+
+# Replays recorded rows through the load report conversion and the
+# hard-demand rows over worker objects, both under `in-process`.
+# The overload rows run a host's load monitor, which `worker-host` brings.
+[[test]]
+name = "classic_rows"
+required-features = ["in-process", "worker-host"]
+
+[[test]]
+name = "controller"
+required-features = ["controller"]
+
+[[test]]
+name = "elector_k8s_cell"
+required-features = ["kubernetes"]
+
+[[test]]
+name = "failover"
+required-features = ["client"]
+
+[[test]]
+name = "fleet"
+required-features = ["client"]
+
+[[test]]
+name = "grpc_plugin"
+required-features = ["controller"]
+
+# Two cases in a process of their own: each lowers a limit of the process.
+[[test]]
+name = "grpc_runtime"
+required-features = ["controller"]
+
+[[test]]
+name = "membership_calls"
+required-features = ["controller"]
+
+[[test]]
+name = "replicas"
+required-features = ["controller"]
+
+[[test]]
+name = "replication"
+required-features = ["controller"]
+
+[[test]]
+name = "watch_workers"
+required-features = ["controller"]
+
+# One case in a process of its own: another bind or TLS call of the process
+# would install the crypto provider first.
+[[test]]
+name = "crypto_provider"
+required-features = ["controller"]
+
+[[bench]]
+name = "decision"
+harness = false
+
+[[bench]]
+name = "shadow"
+harness = false
+
+# One validation by a spec's index keys. Apart from `decision`: that binary
+# is a pull-request gate's, and a row added to it moves its other rows.
+[[bench]]
+name = "spec_index"
+harness = false
+
+[[bench]]
+name = "pair_table"
+harness = false
+
+[[bench]]
+name = "affinity"
+harness = false
+
+[[bench]]
+name = "affinity_rows"
+harness = false
+
+[[bench]]
+name = "elector"
+harness = false
+
+[[bench]]
+name = "wasm_plugin"
+harness = false
+required-features = ["wasm"]
+
+[[bench]]
+name = "grpc_plugin"
+harness = false
+required-features = ["controller"]
+
+[[bench]]
+name = "epd"
+harness = false
+
+[[bench]]
+name = "encode_pair"
+harness = false
+
+[[bench]]
+name = "decode_later"
+harness = false
+
+[[bench]]
+name = "contention"
+harness = false
+
+[[bench]]
+name = "store_view"
+harness = false
+
+[[bench]]
+name = "store"
+harness = false
+
+[[bench]]
+name = "store_journal"
+harness = false
+
+[[bench]]
+name = "power_of_two"
+harness = false
+
+[[bench]]
+name = "prefix_hash"
+harness = false
+
+# A session key kept on its ring worker over the overload veto. Apart from
+# `decision`, whose binary takes no new id.
+[[bench]]
+name = "vetoed"
+harness = false
+
+# The `bucket` preset's rows. Apart from `decision`, as `spec_index` is:
+# that binary runs at its gate's bound.
+[[bench]]
+name = "bucket"
+harness = false
+
+[[bench]]
+name = "draw"
+harness = false
+
+[[bench]]
+name = "pair_classes"
+harness = false
+
+[[bench]]
+name = "decide_stream"
+harness = false
+required-features = ["controller"]
+
+[[bench]]
+name = "encode_classes"
+harness = false
+
+# The sent-prefix predictor's read and write, alone. A decision's naming
+# reads it through the store's record, and no id of `decision` times that
+# read yet.
+[[bench]]
+name = "predictor"
+harness = false
+
+[[bench]]
+name = "dispatch_credit"
+harness = false
+
+[[bench]]
+name = "signals"
+harness = false
+
+# A `has-room` rule beside the same profile without it. Apart from
+# `decision`, whose binary takes no new id.
+[[bench]]
+name = "has_room"
+harness = false
+
+# A registered scorer's read of a row's report through the view's
+# reading, beside the same scorer reading the row's field.
+[[bench]]
+name = "load_report_reader"
+harness = false
+
+# The in-process engine over a host's worker objects: a binary with switches.
+[[bench]]
+name = "in_process"
+harness = false
+required-features = ["in-process"]
+
+# A batch of cache events through the worker host's adapter, beside the same
+# writes on a bare chain index.
+[[bench]]
+name = "kv_adapter"
+harness = false
+required-features = ["worker-host"]
+
+[lints]
+workspace = true

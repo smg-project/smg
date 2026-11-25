@@ -4,13 +4,6 @@
 //! sink keeps the admission cursor of each rank and applies what the cursor
 //! admits. Neither names the other's types: the batch and the id are the
 //! sink's own.
-//!
-//! The policy controller's store states the same port over its own index
-//! (`store::kv_events` of that crate). The two statements differ today in
-//! what each host needs: the id is the sink's own type here and the
-//! store's worker id there; the store holds three more reasons, a relay's
-//! frames; and `Applied` is read by the cursor here (another rank's batch
-//! included), by the index there.
 
 /// The header facts of one batch, read by the cursor; the batch itself (the
 /// servicer's message, with the blocks the index applies) rides beside them
@@ -67,8 +60,7 @@ pub enum BatchOutcome {
 /// and `DataLoss`, the server's own status codes, and a snapshot's two ends,
 /// `Snapshot` and `SnapshotAbandoned`. A host's sink may find two with its
 /// cursor, `PublisherRestart` and `GapCleared`, and count a `Snapshot`
-/// where it clears for one. The store's statement holds three more, a
-/// relay's frames, which no stream of this crate carries.
+/// where it clears for one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResyncReason {
     /// The server's history no longer reaches the cursor.

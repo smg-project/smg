@@ -23,12 +23,15 @@
 //!
 //! - `Registered` / `Replaced`: reconcile every group the worker
 //!   participates in. New groups start a polling loop; existing groups
-//!   restart with a new interval if the per-worker override changed.
+//!   restart with a new interval if the per-worker override changed. A
+//!   group whose loop stands asks the worker at once (see Polling).
 //! - `Removed`: reconcile every group the removed worker participated
 //!   in. Empty groups stop their loops and evict cached state.
 //! - `StatusChanged`: workers leaving `Ready` are evicted from the
 //!   watch-channel snapshot and the DP cache (the group loop is left
-//!   alone and will skip non-Ready workers on its next tick).
+//!   alone and will skip non-Ready workers on its next tick). A worker
+//!   that turns `Ready` from `Pending` is asked at once by the loops of
+//!   its groups (see Polling).
 //! - `RecvError::Lagged`: stop every loop, clear shared state, and
 //!   rebuild from the current registry snapshot. Monitoring state is
 //!   derived data; full rebuild is the recovery mechanism. A worker
@@ -46,17 +49,34 @@
 //!    protection on a group member needs the data (the original
 //!    conditional gate — never "never poll").
 //! 2. Fetch loads concurrently from each of them that its load stream
-//!    does not serve.
-//! 3. Update load-aware policies and the DP cache.
-//! 4. Atomically clear stale entries for the group from the watch
-//!    channel and merge in the fresh loads.
+//!    does not serve and whose last fetch has answered.
+//! 3. For each batch of answers, those that come within
+//!    `POLLED_PUBLISH_WINDOW` of its first: update load-aware policies and
+//!    the DP cache.
+//! 4. Atomically clear the stale entries of the batch's workers from the
+//!    watch channel and merge in the fresh loads.
 //!
 //! A group's interval is the smallest its workers state for themselves, in
 //! whole seconds, and the monitor's own where none states one
 //! ([`WorkerMonitor::with_interval`]). It is never under
-//! [`LEAST_POLL_INTERVAL`]. A tick that a slow poll overran is skipped: the
-//! loop polls once when that poll returns, and next on the interval's own
-//! beat.
+//! [`LEAST_POLL_INTERVAL`]. A tick ends at the next one at the latest. A
+//! fetch still open then is kept: its answer is a batch when it comes, and
+//! its engine is asked again behind it, at once where the tick it comes in
+//! has not ended. Where another worker holds the worker's URL by then, an
+//! answer is not told to the sink and nothing of it is published; a fetch
+//! that failed is said as one, as at any tick.
+//!
+//! A worker that joins a group whose loop stands is asked at once and not
+//! at the next tick, so it holds a report ahead of that tick. It joins at
+//! its registration or in another worker's place where it is `Ready` by
+//! then, and else at its turn from `Pending` to `Ready`. A worker that
+//! comes back into the ready set is no join: the next tick picks it up.
+//! A worker registered `NotReady`, as one imported from the mesh while
+//! unhealthy, is no join at its first turn to `Ready` either: the next
+//! tick picks it up. The loop runs a tick for the engines of the workers
+//! that joined alone, by the same fetch and publish, and asks no other
+//! engine of the group. Workers that join while a tick is at work are
+//! asked together when it ends.
 //!
 //! ## The port
 //!
@@ -76,10 +96,10 @@ use std::{
 };
 
 use dashmap::DashMap;
-use futures::future;
+use futures::{future::BoxFuture, stream::FuturesUnordered};
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::{
     sync::{broadcast, Notify},
     task::JoinHandle,
@@ -250,6 +270,22 @@ fn dp_rank_token_loads(report: &WorkerLoadResponse) -> HashMap<isize, isize> {
 struct GroupState {
     handle: JoinHandle<()>,
     interval: Duration,
+    /// The workers that joined the group, for its loop: it takes them all
+    /// at its next tick, and a tick ends at the next beat at the latest
+    /// ([`WorkerMonitor::ask_joined`]).
+    joins: Arc<Joined>,
+}
+
+/// The workers that joined a group and that its loop has yet to ask, the
+/// newest at each URL. A worker that joins again before the loop takes it
+/// stands once, and one that leaves the group is taken out
+/// ([`WorkerMonitor::forget_joined`]), so no more workers stand here than
+/// the group has.
+#[derive(Default)]
+struct Joined {
+    workers: Mutex<FxHashMap<String, Arc<dyn Worker>>>,
+    /// Wakes the loop: one wake takes every worker said by then.
+    wake: Notify,
 }
 
 /// Outcome of probing one native load endpoint.
@@ -698,6 +734,14 @@ const PUSHED_ONE_WAY_MARGIN: Duration = Duration::from_millis(20);
 /// fifty rebuilds a second a thousand-worker fleet spends well under a
 /// percent of a core here.
 const PUSHED_PUBLISH_WINDOW: Duration = Duration::from_millis(20);
+/// A group's polled answers that come within this window of the first share
+/// one publish: the window of the pushed reports, and for its reason. The
+/// engines of a group asked at one instant answer together, so their tick is
+/// one rebuild and one word to the sink; an engine that answers later is
+/// published when it does. The window is kept as well as the loop is
+/// scheduled, and a batch ends with its tick: two answers on either side of
+/// a tick's end are two publishes.
+const POLLED_PUBLISH_WINDOW: Duration = PUSHED_PUBLISH_WINDOW;
 
 /// Debounce window for batching worker evictions into one snapshot rebuild.
 /// Registry churn (a rollout, a scale-down) emits removals as a gradual
@@ -987,7 +1031,7 @@ impl<G: Generation> WorkerMonitor<G> {
         // A record feeds the DP-rank token cache nothing. The cache's one
         // reader is the HTTP pair router's rank pick, and a stream is opened
         // for a gRPC worker alone: no pick reads a pushing worker's entry. A
-        // poll feeds the cache (`poll_group_once`).
+        // poll feeds the cache (`poll_group`).
         //
         // The window's publish takes the report once, under the incarnation
         // that pushed last: the file's pusher, queued once a window.
@@ -1132,11 +1176,11 @@ impl<G: Generation> WorkerMonitor<G> {
         }
     }
 
-    /// The end of a group's tick, for the sink: every Ready worker of the
-    /// group, polled or served by its stream, and each polled member's
-    /// report as the tick publishes it, with whether its answer carried rank
-    /// capacity. It is said whether or not a fetch succeeded, and when
-    /// nobody was polled.
+    /// A batch of a group's answers, for the sink: every Ready worker of
+    /// the group, polled or served by its stream, and each report of the
+    /// batch as it is published, with whether its answer carried rank
+    /// capacity. It is said whether or not a fetch succeeded, and with no
+    /// report at the end of a tick that no answer came in.
     fn end_tick(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -2012,21 +2056,72 @@ impl<G: Generation> WorkerMonitor<G> {
         // it must not own a strong reference back to the monitor.
         let monitor = Arc::downgrade(self);
         let group_key = key.clone();
+        let joins = Arc::new(Joined::default());
+        let joined = Arc::clone(&joins);
 
         #[expect(
             clippy::disallowed_methods,
             reason = "Group polling loop runs for the lifetime of the group; the JoinHandle is stored in group_handles and aborted on group removal, or at the monitor's stop or drop"
         )]
         let handle = tokio::spawn(async move {
-            group_monitor_loop(monitor, group_key, interval).await;
+            group_monitor_loop(monitor, group_key, interval, joined).await;
         });
 
         let mut handles = self.group_handles.lock();
         // Two reconciles of one group can each find no loop and each spawn
         // one: the loop written over is told to end, so none polls on
         // with no handle.
-        if let Some(replaced) = handles.insert(key, GroupState { handle, interval }) {
+        let state = GroupState {
+            handle,
+            interval,
+            joins,
+        };
+        if let Some(replaced) = handles.insert(key, state) {
             replaced.handle.abort();
+        }
+    }
+
+    /// Have each group of `worker` whose loop stands ask it ahead of the
+    /// group's next beat: the worker joined the group behind a beat, by a
+    /// registration, in another worker's place or by its turn from
+    /// `Pending` to `Ready`, and holds no report until it is asked
+    /// ([`group_monitor_loop`]). A group with no loop is told nothing: the
+    /// loop a reconcile starts for it asks its workers at its first beat.
+    /// Nor is any loop told of a worker that is not `Ready`: a tick asks
+    /// `Ready` workers alone, and the turn of a `Pending` worker to `Ready`
+    /// is said here.
+    fn ask_joined(&self, worker: &Arc<dyn Worker>) {
+        if worker.status() != WorkerStatus::Ready {
+            return;
+        }
+        let handles = self.group_handles.lock();
+        for key in group_keys_for_worker(worker) {
+            if let Some(state) = handles.get(&key) {
+                state
+                    .joins
+                    .workers
+                    .lock()
+                    .insert(worker.url().to_owned(), Arc::clone(worker));
+                state.joins.wake.notify_one();
+            }
+        }
+    }
+
+    /// Take `worker` out of what the loops of its groups have yet to ask:
+    /// it left them, by its removal or for its successor. A successor that
+    /// joined at its URL since stays.
+    fn forget_joined(&self, worker: &Arc<dyn Worker>) {
+        let handles = self.group_handles.lock();
+        for key in group_keys_for_worker(worker) {
+            if let Some(state) = handles.get(&key) {
+                let mut joined = state.joins.workers.lock();
+                if joined
+                    .get(worker.url())
+                    .is_some_and(|joined| Arc::ptr_eq(joined, worker))
+                {
+                    joined.remove(worker.url());
+                }
+            }
         }
     }
 
@@ -2786,8 +2881,9 @@ fn group_keys_for_worker(worker: &Arc<dyn Worker>) -> Vec<WorkerGroupKey> {
 }
 
 /// The least interval a group polls at. A tick asks every polled engine of
-/// the group for its load and publishes one snapshot, so at this interval
-/// an engine is asked ten times a second. A load that has to be newer than
+/// the group whose last fetch has answered for its load, and the engines
+/// that answer together are one published snapshot, so at this interval an
+/// engine is asked ten times a second. A load that has to be newer than
 /// that is pushed on the worker's event stream.
 pub const LEAST_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -2830,6 +2926,10 @@ async fn run_event_loop<G: Generation>(
         };
         match event {
             Ok(WorkerEvent::Registered { worker, .. }) => {
+                // A loop that stands is told of the worker ahead of the
+                // reconcile: a loop the reconcile starts asks the worker
+                // at its own first beat.
+                monitor.ask_joined(&worker);
                 for key in group_keys_for_worker(&worker) {
                     monitor.reconcile_group(&key);
                 }
@@ -2841,6 +2941,7 @@ async fn run_event_loop<G: Generation>(
                 // stopped loop cannot prune the stale entry on a later
                 // tick — it would persist forever otherwise.
                 monitor.evict_worker_loads(&worker);
+                monitor.forget_joined(&worker);
                 for key in group_keys_for_worker(&worker) {
                     monitor.reconcile_group(&key);
                 }
@@ -2850,9 +2951,12 @@ async fn run_event_loop<G: Generation>(
                 // rejects URL changes), but the model list may have
                 // shrunk so some old groups disappear. Evict the URL
                 // from caches before reconciling so the disappearing
-                // groups do not leak the entry; the surviving / new
-                // groups will repopulate it on their next poll tick.
+                // groups do not leak the entry. A surviving group asks the
+                // successor at once and repopulates it, a new group at
+                // its first beat.
                 monitor.evict_worker_loads(&old);
+                monitor.forget_joined(&old);
+                monitor.ask_joined(&new);
                 let mut keys = group_keys_for_worker(&old);
                 keys.extend(group_keys_for_worker(&new));
                 keys.sort_by(|a, b| {
@@ -2867,16 +2971,25 @@ async fn run_event_loop<G: Generation>(
                 }
             }
             Ok(WorkerEvent::StatusChanged {
-                worker, new_status, ..
+                worker,
+                old_status,
+                new_status,
+                ..
             }) => {
                 // The event can be handled behind the worker's return. A
                 // worker that is the registry's `Ready` worker again keeps
                 // its loads: its feed has carried on since.
                 if new_status == WorkerStatus::Ready {
-                    // The group's polling loop reads the registry on every
-                    // tick and picks the worker up by itself. A report
-                    // held while the worker was not `Ready` waits in the
-                    // flush's queue: the flusher is woken to publish it.
+                    // A `Pending` worker joined its groups behind a beat:
+                    // their loops ask it ahead of the next. A worker that
+                    // comes back into the ready set is picked up by the
+                    // group's polling loop, which reads the registry on
+                    // every tick. A report held while the worker was not
+                    // `Ready` waits in the flush's queue: the flusher is
+                    // woken to publish it.
+                    if old_status == WorkerStatus::Pending {
+                        monitor.ask_joined(&worker);
+                    }
                     monitor.pushed_notify.notify_one();
                 } else if !monitor.load_state.is_current_incarnation(&worker) {
                     monitor.evict_worker_loads(&worker);
@@ -2943,64 +3056,243 @@ async fn group_monitor_loop<G: Generation>(
     monitor: Weak<WorkerMonitor<G>>,
     group_key: WorkerGroupKey,
     interval: Duration,
+    joins: Arc<Joined>,
 ) {
     let mut interval_timer = tokio::time::interval(interval);
-    // A tick that a poll overran is skipped. The timer's own default fires
-    // every such tick when the slow poll returns: one poll behind another
-    // with no interval between them, thirty of them behind a poll that ran
-    // to its deadline at the least interval.
+    // A tick ends at the next one at the latest, so no fetch overruns one.
+    // A tick that the loop's own work overran is skipped: the timer's own
+    // default fires every such tick one behind another, with no interval
+    // between them.
     interval_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let mut open = OpenFetches::default();
+    // The timer's next beat: its first comes at once, ahead of any join.
+    let mut next = tokio::time::Instant::now();
     loop {
-        interval_timer.tick().await;
+        // A beat asks the group. A worker that joins the group between two
+        // beats is asked by a tick of its own, so it holds a report ahead
+        // of the next beat. A beat that is due goes first: it asks the
+        // workers that joined with the rest.
+        let on_beat = tokio::select! {
+            biased;
+            at = interval_timer.tick() => {
+                next = at + interval;
+                true
+            }
+            () = joins.wake.notified() => false,
+        };
+        // One tick takes every worker said by now: a beat asks them with
+        // the rest of the group.
+        let joined: Vec<Arc<dyn Worker>> = std::mem::take(&mut *joins.workers.lock())
+            .into_values()
+            .collect();
+        let now = tokio::time::Instant::now();
+        if on_beat {
+            // The tick ends at the timer's next beat: the first one past
+            // now, since the timer skips a beat the loop came late to.
+            while next <= now {
+                next += interval;
+            }
+        } else if joined.is_empty() || next <= now {
+            // A beat took them behind the wake, or the beat is due and
+            // takes them: no tick of a join holds a beat up.
+            continue;
+        }
 
         let Some(monitor) = monitor.upgrade() else {
             debug!("WorkerMonitor was dropped; exiting group loop for {group_key}");
             return;
         };
-        poll_group_once(&monitor, &group_key, interval, Instant::now()).await;
+        poll_group(
+            &monitor,
+            &group_key,
+            interval,
+            Instant::now(),
+            &mut open,
+            Some(next),
+            (!on_beat).then_some(joined.as_slice()),
+        )
+        .await;
         // Drop the temporary strong reference so we do not keep the
         // monitor alive across the next `interval_timer.tick().await`.
         drop(monitor);
     }
 }
 
-/// One tick of a group at `now`: the poll decision per worker, the polls of
-/// those not served by their stream, and the publish of what they returned.
+/// The engine fetches a group has open: asked at a tick and not answered
+/// yet. The group's loop keeps them from one tick to the next, so a tick
+/// waits for no engine past its own end and asks no engine whose last
+/// request is still open.
+#[derive(Default)]
+struct OpenFetches {
+    /// Each fetch answers with the instant it was asked at.
+    answers: FuturesUnordered<BoxFuture<'static, (Instant, EngineAnswer)>>,
+    /// The first member of each of those fetches: its engine is asked no
+    /// second time while the fetch is open.
+    asked: Vec<Arc<dyn Worker>>,
+}
+
+/// The engine a worker's fetch asks, as [`polled_engines`] groups them: the
+/// address of a data-parallel engine for each of its rank workers, and a
+/// worker's own URL otherwise.
+fn engine_of(worker: &dyn Worker) -> (bool, &str) {
+    match worker.dp_rank() {
+        Some(_) => (true, worker.base_url()),
+        None => (false, worker.url()),
+    }
+}
+
+/// The workers of `workers` whose engine is one of `engines`' (`among`), or
+/// is none of theirs.
+fn of_engines(
+    workers: &[Arc<dyn Worker>],
+    engines: &[Arc<dyn Worker>],
+    among: bool,
+) -> Vec<Arc<dyn Worker>> {
+    let engines: FxHashSet<(bool, &str)> = engines
+        .iter()
+        .map(|worker| engine_of(worker.as_ref()))
+        .collect();
+    workers
+        .iter()
+        .filter(|worker| engines.contains(&engine_of(worker.as_ref())) == among)
+        .cloned()
+        .collect()
+}
+
+/// What `wait` ends with: none where it has not ended by `until`.
+async fn by<T>(
+    until: Option<tokio::time::Instant>,
+    wait: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match until {
+        Some(until) => tokio::time::timeout_at(until, wait).await.ok(),
+        None => Some(wait.await),
+    }
+}
+
+impl OpenFetches {
+    /// Asks the engines of `workers` at `now`: the poll decision per worker,
+    /// and one fetch an engine for its members that their stream does not
+    /// serve.
+    fn ask<G: Generation>(
+        &mut self,
+        monitor: &Arc<WorkerMonitor<G>>,
+        group_key: &WorkerGroupKey,
+        interval: Duration,
+        now: Instant,
+        workers: &[Arc<dyn Worker>],
+    ) {
+        let on_connection = group_key.connection_mode != ConnectionMode::Http;
+        let mut polled: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers.len());
+        for worker in workers {
+            let mode = monitor.sink.poll_mode(worker, now, interval);
+            monitor
+                .poll_counts
+                .decided(worker.url(), mode, on_connection);
+            if mode != PollMode::Suppressed {
+                polled.push(Arc::clone(worker));
+            }
+        }
+        // One answer an engine, its polled members together: the sink is
+        // told an engine's answer whole.
+        for members in polled_engines(&polled) {
+            self.asked.extend(members.first().cloned());
+            let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
+            let counts = Arc::clone(&monitor.poll_counts);
+            let connection_mode = group_key.connection_mode;
+            self.answers.push(Box::pin(async move {
+                let answer = WorkerMonitor::<G>::fetch_engine_loads(
+                    members,
+                    connection_mode,
+                    &native_loads_memo,
+                    &counts,
+                )
+                .await;
+                (now, answer)
+            }));
+        }
+    }
+}
+
+/// One whole tick of a group at `now`: every engine it asks is awaited, and
+/// their answers are one publish.
+#[cfg(any(test, feature = "test-util"))]
 async fn poll_group_once<G: Generation>(
     monitor: &Arc<WorkerMonitor<G>>,
     group_key: &WorkerGroupKey,
     interval: Duration,
     now: Instant,
 ) {
+    poll_group(
+        monitor,
+        group_key,
+        interval,
+        now,
+        &mut OpenFetches::default(),
+        None,
+        None,
+    )
+    .await;
+}
+
+/// One tick of a group at `now`: the poll decision per worker, the polls of
+/// those not served by their stream, and the publish of what the engines
+/// answer. The answers that come within [`POLLED_PUBLISH_WINDOW`] of the
+/// first are one batch: the sink is told the batch and the batch is
+/// published, so an engine's report is published when the engine answers.
+/// The tick ends at its last answer, or at `ends` with the fetches still
+/// open left in `open` for a later tick; with no `ends` it awaits every
+/// answer as one batch.
+///
+/// A beat's tick asks the group (`joined` is none). The tick of the workers
+/// that joined the group since asks their engines alone, each for the
+/// members a beat asks it for, and publishes what they answer as a beat's
+/// tick does. One that finds nobody to ask is no tick: a worker that is not
+/// `Ready` by now, or that its stream serves.
+async fn poll_group<G: Generation>(
+    monitor: &Arc<WorkerMonitor<G>>,
+    group_key: &WorkerGroupKey,
+    interval: Duration,
+    now: Instant,
+    open: &mut OpenFetches,
+    ends: Option<tokio::time::Instant>,
+    joined: Option<&[Arc<dyn Worker>]>,
+) {
     // Only poll Ready workers — Pending/NotReady/Failed do not
     // serve traffic and should not contribute load samples. A worker its
     // host asks for no load is no member of the tick.
-    let workers: Vec<Arc<dyn Worker>> = monitor
-        .worker_registry
-        .get_workers_filtered(
-            Some(&group_key.model_id),
-            Some(group_key.worker_type),
-            Some(group_key.connection_mode),
-            None,
-            false,
-        )
-        .into_iter()
-        .filter(|w| w.status() == WorkerStatus::Ready && monitor.sink.polls(w.as_ref()))
-        .collect();
-
-    if workers.is_empty() {
-        debug!("No Ready workers in group {group_key}, skipping");
-        return;
-    }
+    let listed = || -> Vec<Arc<dyn Worker>> {
+        monitor
+            .worker_registry
+            .get_workers_filtered(
+                Some(&group_key.model_id),
+                Some(group_key.worker_type),
+                Some(group_key.connection_mode),
+                None,
+                false,
+            )
+            .into_iter()
+            .filter(|w| w.status() == WorkerStatus::Ready && monitor.sink.polls(w.as_ref()))
+            .collect()
+    };
+    let mut workers = listed();
 
     // Polling is unconditional by default so registration alone gives a
     // worker live load state. `--disable-load-monitoring` restores the
     // conditional gate: a load-aware policy, engine-metrics re-export, or
     // overload protection on any group member still forces the poll —
     // never "never poll".
-    if !monitor.loads_wanted(&workers) {
+    let mut asks = if workers.is_empty() {
+        debug!("No Ready workers in group {group_key}, skipping");
+        false
+    } else if monitor.loads_wanted(&workers) {
+        true
+    } else {
         debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
+        false
+    };
+    if !asks && open.answers.is_empty() {
         return;
     }
 
@@ -3008,102 +3300,177 @@ async fn poll_group_once<G: Generation>(
     // within the interval is served by that stream: its report, verdicts
     // and gauges are already current from `apply_pushed_load`, and nothing
     // here touches its entry. The others are polled: no record ever
-    // (`poll`) or records gone quiet (`fallback`).
-    let mut polled: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers.len());
-    let on_connection = group_key.connection_mode != ConnectionMode::Http;
-    for worker in &workers {
-        let mode = monitor.sink.poll_mode(worker, now, interval);
-        monitor
-            .poll_counts
-            .decided(worker.url(), mode, on_connection);
-        if mode != PollMode::Suppressed {
-            polled.push(Arc::clone(worker));
+    // (`poll`) or records gone quiet (`fallback`). A worker whose engine
+    // has not answered an earlier tick has no decision at this one, nor
+    // has a worker that took its URL since. The answer that comes is
+    // published for a worker that holds its URL still, and the engine is
+    // asked again behind it.
+    if asks {
+        // A beat's tick asks the group. A join's asks the engines of the
+        // workers that joined and are members of the tick, alone, and is no
+        // tick where it asks nobody.
+        let joiners = joined.map(|joined| {
+            let members: Vec<Arc<dyn Worker>> = workers
+                .iter()
+                .filter(|worker| joined.iter().any(|joined| Arc::ptr_eq(worker, joined)))
+                .cloned()
+                .collect();
+            of_engines(&workers, &members, true)
+        });
+        let to_ask = joiners.as_deref().unwrap_or(&workers);
+        if open.asked.is_empty() {
+            open.ask(monitor, group_key, interval, now, to_ask);
+        } else {
+            let free = of_engines(to_ask, &open.asked, false);
+            open.ask(monitor, group_key, interval, now, &free);
+        }
+        if open.answers.is_empty() {
+            if joined.is_some() {
+                return;
+            }
+            debug!(
+                "Every worker in group {group_key} pushed its load within {interval:?}; no poll"
+            );
         }
     }
 
-    // One answer an engine, its polled members together: the sink is told
-    // an engine's answer whole.
-    let engines: Vec<EngineAnswer> = if polled.is_empty() {
-        debug!("Every worker in group {group_key} pushed its load within {interval:?}; no poll");
-        Vec::new()
-    } else {
-        let futures: Vec<_> = polled_engines(&polled)
-            .into_iter()
-            .map(|members| {
-                let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
-                let counts = Arc::clone(&monitor.poll_counts);
-                let connection_mode = group_key.connection_mode;
-                async move {
-                    WorkerMonitor::<G>::fetch_engine_loads(
-                        members,
-                        connection_mode,
-                        &native_loads_memo,
-                        &counts,
-                    )
-                    .await
-                }
-            })
+    // Whether the sink was told at this tick: it is told every batch, and
+    // a tick that asks is told at its end where no answer came.
+    let mut told = false;
+    while let Some(first) = by(ends, futures::StreamExt::next(&mut open.answers))
+        .await
+        .flatten()
+    {
+        // The batch closes at its window, at the end of the tick, or at
+        // the last open fetch's answer, whichever is first.
+        let closes = ends.map(|ends| ends.min(tokio::time::Instant::now() + POLLED_PUBLISH_WINDOW));
+        let mut engines = Vec::with_capacity(open.answers.len() + 1);
+        engines.push(first);
+        by(closes, async {
+            while let Some(engine) = futures::StreamExt::next(&mut open.answers).await {
+                engines.push(engine);
+            }
+        })
+        .await;
+        // The engines whose answer comes behind the tick that asked them.
+        let late: Vec<Arc<dyn Worker>> = engines
+            .iter()
+            .filter(|(asked_at, _)| *asked_at < now)
+            .filter_map(|(_, engine)| engine.first())
+            .map(|(worker, _)| Arc::clone(worker))
             .collect();
-        future::join_all(futures).await
-    };
+        if open.answers.is_empty() {
+            open.asked.clear();
+        } else {
+            let answered: FxHashSet<(bool, &str)> = engines
+                .iter()
+                .filter_map(|(_, engine)| engine.first())
+                .map(|(worker, _)| engine_of(worker.as_ref()))
+                .collect();
+            open.asked
+                .retain(|asked| !answered.contains(&engine_of(asked.as_ref())));
+        }
 
-    let mut group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)> = Vec::new();
-    // The polled workers whose fetch failed, apart from those whose engine
-    // answered with no row: the publish keeps a failed one's last report
-    // beside the entries.
-    let mut failed: Vec<Arc<dyn Worker>> = Vec::new();
-    for mut engine in engines {
-        let carries_rank_capacity = monitor.reconcile_engine(&mut engine, now);
-        for ((worker, response), carries_rank_capacity) in
-            engine.into_iter().zip(carries_rank_capacity)
-        {
-            let Some(load) = response else {
-                failed.push(worker);
-                continue;
-            };
-            if load.loads.is_empty() {
+        let mut group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)> = Vec::new();
+        // The URL set the publish prunes: the workers the batch's engines
+        // were asked for only, so a worker served by its stream keeps its
+        // entry (the pushed path owns it) and one whose engine has not
+        // answered keeps its last report until it does. Without the prune
+        // of a batch that fetched nothing, a group that starts timing out
+        // keeps publishing its previous loads forever — subscribers see a
+        // stale snapshot indefinitely.
+        let mut urls: Vec<String> = Vec::with_capacity(engines.len());
+        // The polled workers whose fetch failed, apart from those whose engine
+        // answered with no row: the publish keeps a failed one's last report
+        // beside the entries.
+        let mut failed: Vec<Arc<dyn Worker>> = Vec::new();
+        for (asked_at, mut engine) in engines {
+            // A fetch that failed is said to the sink for the workers it
+            // was asked for, as at any tick: that word names workers and
+            // lays nothing at a URL.
+            let failed_fetch = engine.iter().all(|(_, response)| response.is_none());
+            if failed_fetch {
+                monitor.reconcile_engine(&mut engine, asked_at);
+            }
+            // An answer for a worker whose URL another worker holds by now
+            // says nothing at that URL: the rank counts and the row there
+            // are the other worker's once its own poll wrote them, and what
+            // the worker that left still has there goes with its eviction.
+            engine.retain(|(worker, _)| {
+                monitor
+                    .worker_registry
+                    .get_by_url(worker.url())
+                    .is_none_or(|holder| Arc::ptr_eq(&holder, worker))
+            });
+            // With no member left nothing is published, and an answer that
+            // came is not told to the sink, where an engine with no answer
+            // reads as a fetch that failed.
+            if engine.is_empty() {
                 continue;
             }
-            // The wedged rule reads the queue depth off every report.
-            let waiting: i64 = load
-                .loads
-                .iter()
-                .map(|rank| i64::from(rank.num_waiting_reqs))
-                .sum();
-            let state = worker.runtime_state();
-            liveness::on_load_report(&worker, state.as_deref(), waiting, None, false, None);
-            group_loads.push((worker, load, carries_rank_capacity));
+            // No member of a fetch that failed carries rank capacity.
+            let carries_rank_capacity = if failed_fetch {
+                vec![false; engine.len()]
+            } else {
+                monitor.reconcile_engine(&mut engine, asked_at)
+            };
+            for ((worker, response), carries_rank_capacity) in
+                engine.into_iter().zip(carries_rank_capacity)
+            {
+                urls.push(worker.url().to_string());
+                let Some(load) = response else {
+                    failed.push(worker);
+                    continue;
+                };
+                if load.loads.is_empty() {
+                    continue;
+                }
+                // The wedged rule reads the queue depth off every report.
+                let waiting: i64 = load
+                    .loads
+                    .iter()
+                    .map(|rank| i64::from(rank.num_waiting_reqs))
+                    .sum();
+                let state = worker.runtime_state();
+                liveness::on_load_report(&worker, state.as_deref(), waiting, None, false, None);
+                group_loads.push((worker, load, carries_rank_capacity));
+            }
+        }
+
+        monitor.end_tick(&workers, &group_loads);
+        told = true;
+
+        if group_loads.is_empty() {
+            debug!("No loads fetched for group {group_key}, pruning stale entries");
+        } else {
+            debug!(
+                "Fetched loads from {}/{} polled workers in group {group_key}",
+                group_loads.len(),
+                urls.len()
+            );
+            let rows = group_loads.iter().map(|(_, load, _)| load.loads.len());
+            monitor.poll_counts.published(rows.sum());
+        }
+        monitor.publish_polled(&group_key.model_id, &urls, group_loads, &failed);
+
+        // An engine whose answer came behind the tick that asked it is
+        // asked again at once, as a tick of its own would ask it: the
+        // group's workers and its need for loads are read anew, and the
+        // sink is told those workers from here on. At the end of a tick
+        // the next tick asks.
+        if !late.is_empty() && ends.is_some_and(|ends| tokio::time::Instant::now() < ends) {
+            workers = listed();
+            asks = !workers.is_empty() && monitor.loads_wanted(&workers);
+            if asks {
+                let again = of_engines(&workers, &late, true);
+                open.ask(monitor, group_key, interval, Instant::now(), &again);
+            }
         }
     }
 
-    monitor.end_tick(&workers, &group_loads);
-
-    if polled.is_empty() {
-        return;
+    if asks && !told {
+        monitor.end_tick(&workers, &[]);
     }
-
-    // The URL set the publish prunes: the polled workers only, so a worker
-    // served by its stream keeps its entry (the pushed path owns it).
-    // Without the empty-fetch prune, a group that starts timing out keeps
-    // publishing its previous tick's loads forever — subscribers see a
-    // stale snapshot indefinitely.
-    let polled_urls: Vec<String> = polled.iter().map(|w| w.url().to_string()).collect();
-
-    if group_loads.is_empty() {
-        debug!("No loads fetched for group {group_key}, pruning stale entries");
-        monitor.publish_polled(&group_key.model_id, &polled_urls, Vec::new(), &failed);
-        return;
-    }
-
-    debug!(
-        "Fetched loads from {}/{} polled workers in group {group_key}",
-        group_loads.len(),
-        polled.len()
-    );
-
-    let rows = group_loads.iter().map(|(_, load, _)| load.loads.len());
-    monitor.poll_counts.published(rows.sum());
-    monitor.publish_polled(&group_key.model_id, &polled_urls, group_loads, &failed);
 }
 
 /// `poll_group_once` for a host's tests: one tick over engines the host's own
@@ -3334,6 +3701,108 @@ mod native_loads_tests {
         }
     }
 
+    /// What the routing side is told by a tick whose engine's answer is under
+    /// way while another handle comes to hold its worker's URL, one request
+    /// under way on the handle that came: the URL, and what that tick's
+    /// reconcile calls were handed. `replaced` says how the handle came: by
+    /// `replace()`, or by a removal, its eviction and a registration.
+    async fn told_by_a_tick_across_a_swap(replaced: bool) -> (String, Vec<(String, usize)>) {
+        // The engine holds its answer until it is let go.
+        let let_go = Arc::new(Notify::new());
+        let asked = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/v1/loads",
+            axum::routing::get({
+                let (let_go, asked) = (Arc::clone(&let_go), Arc::clone(&asked));
+                move || {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    let let_go = Arc::clone(&let_go);
+                    async move {
+                        let_go.notified().await;
+                        (StatusCode::OK, NATIVE_BODY)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let recorder = Arc::new(ReconcileRecorder::default());
+        let monitor = Arc::new(WorkerMonitor::new(
+            registry.clone(),
+            Arc::clone(&recorder),
+            1,
+            false,
+            false,
+        ));
+        let worker = gauge_worker(&url);
+        worker.set_status(WorkerStatus::Ready);
+        let left = registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let tick = poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now());
+        tokio::pin!(tick);
+        tokio::select! {
+            () = &mut tick => panic!("the tick ended ahead of its engine's answer"),
+            () = wait_until("the tick's fetch", || asked.load(Ordering::SeqCst) == 1) => {}
+        }
+
+        // Another handle comes to hold the URL, with one request under way
+        // on it: by `replace()`, or the worker leaves, its eviction is said
+        // and another worker is registered there.
+        let came = gauge_worker(&url);
+        came.set_status(WorkerStatus::Ready);
+        if replaced {
+            assert!(registry.replace(&left, Arc::clone(&came)));
+        } else {
+            assert!(registry.remove(&left).is_some());
+            monitor.evict_worker_loads(&worker);
+            registry.register(Arc::clone(&came)).unwrap();
+        }
+        let held = WorkerLoadGuard::with_key(Arc::clone(&came), None);
+        let_go.notify_one();
+        tick.await;
+
+        let told = recorder.0.lock().clone();
+        drop(held);
+        (url, told)
+    }
+
+    /// A worker can leave, and another be registered at its URL, while its
+    /// engine's answer is under way. The batch of that answer names the
+    /// handle that left, and what is booked at the URL belongs to the worker
+    /// that came: the routing side is told nothing there by the count of the
+    /// handle that left.
+    #[tokio::test]
+    async fn a_handle_that_left_trims_nothing_of_the_worker_at_its_url() {
+        let (_, told) = told_by_a_tick_across_a_swap(false).await;
+        assert!(
+            told.is_empty(),
+            "the handle that left trimmed what is booked on the worker at its URL: {told:?}"
+        );
+    }
+
+    /// A `replace()` hands the worker that comes the runtime of the handle
+    /// that leaves. The batch of an answer that was under way names the
+    /// handle that left, and its count is the live one at the URL: the
+    /// routing side is told the URL with it, as before.
+    #[tokio::test]
+    async fn a_replaced_handle_trims_by_the_count_it_shares() {
+        let (url, told) = told_by_a_tick_across_a_swap(true).await;
+        assert_eq!(told, vec![(url, 1)]);
+    }
+
     /// Every poll hands the routing side each polled worker, with the
     /// router's live in-flight count on it: the safety net for a completion
     /// the routing side never saw.
@@ -3375,6 +3844,123 @@ mod native_loads_tests {
         })
         .await;
         drop(held);
+    }
+
+    /// A group asks on its beat, and a worker that joins it behind a beat
+    /// holds no report until it is asked. Each kind of join is asked at
+    /// once: a worker registered `Ready`, one put in another's place and one
+    /// that turns `Ready` from `Pending` hold a report ahead of the next
+    /// beat, an hour away here. The join asks the worker that joined alone:
+    /// the engine of the worker that stood is asked at the first beat and no
+    /// second time. A worker that comes back into the ready set is no join:
+    /// its engine is not asked ahead of the beat. A worker that joins many
+    /// times while a tick is at work stands once in what the loop has yet to
+    /// ask.
+    #[tokio::test]
+    async fn a_worker_that_joins_a_living_group_holds_a_report_ahead_of_the_next_beat() {
+        let stood = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let activated = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let monitor = Arc::new(WorkerMonitor::new(
+            registry.clone(),
+            Arc::new(LoadReaders::Blind),
+            3600,
+            false,
+            false,
+        ));
+        let worker = gauge_worker(&stood.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+        // Registered ahead of the monitor's start and `Pending`: the
+        // monitor hears of this worker by its turn to `Ready` alone.
+        let worker = gauge_worker(&activated.url);
+        worker.set_status(WorkerStatus::Pending);
+        let activates = registry.register(worker).unwrap();
+        monitor.start_event_loop();
+        let reported = |url: &str| monitor.load_snapshot().contains(url);
+        wait_until("the report of the first beat", || reported(&stood.url)).await;
+
+        let registered = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let worker = gauge_worker(&registered.url);
+        worker.set_status(WorkerStatus::Ready);
+        let id = registry.register(worker).unwrap();
+        wait_until("the report of a worker registered behind the beat", || {
+            reported(&registered.url)
+        })
+        .await;
+        assert_eq!(registered.probes.load(Ordering::SeqCst), 1);
+
+        let successor = gauge_worker(&registered.url);
+        successor.set_status(WorkerStatus::Ready);
+        let replaced = Instant::now();
+        assert!(registry.replace(&id, successor));
+        wait_until("the report of a worker put in another's place", || {
+            monitor
+                .load_snapshot()
+                .report(&registered.url)
+                .is_some_and(|(_, sampled)| sampled > replaced)
+        })
+        .await;
+
+        assert_eq!(activated.probes.load(Ordering::SeqCst), 0);
+        registry.transition_status(&activates, WorkerStatus::Ready);
+        wait_until(
+            "the report of a worker that turned Ready from Pending behind the beat",
+            || reported(&activated.url),
+        )
+        .await;
+        assert_eq!(activated.probes.load(Ordering::SeqCst), 1);
+
+        // A return: the worker leaves the ready set and comes back. The
+        // monitor hears the events in their order: once it has asked the
+        // worker registered behind the return, it has heard the return.
+        registry.transition_status(&activates, WorkerStatus::NotReady);
+        registry.transition_status(&activates, WorkerStatus::Ready);
+        let later = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let worker = gauge_worker(&later.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+        wait_until(
+            "the report of a worker registered behind the return",
+            || reported(&later.url),
+        )
+        .await;
+        assert_eq!(activated.probes.load(Ordering::SeqCst), 1);
+
+        assert_eq!(stood.probes.load(Ordering::SeqCst), 1);
+
+        // A tick at work: the engine of the worker that joins takes the
+        // request and never answers.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = gauge_worker(&format!("http://{}", silent.local_addr().unwrap()));
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+        let _asked = silent.accept().await.unwrap();
+        for _ in 0..16 {
+            let successor = gauge_worker(&registered.url);
+            successor.set_status(WorkerStatus::Ready);
+            assert!(registry.replace(&id, successor));
+        }
+        // The monitor hears the events in their order: once it has heard
+        // this worker, it has heard every replacement above.
+        let last = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let worker = gauge_worker(&last.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker).unwrap();
+        let yet_to_ask = || -> Vec<String> {
+            let groups = monitor.group_handles.lock();
+            let group = groups.values().next().unwrap();
+            let mut urls: Vec<String> = group.joins.workers.lock().keys().cloned().collect();
+            urls.sort();
+            urls
+        };
+        wait_until("the word of the last join", || {
+            yet_to_ask().contains(&last.url)
+        })
+        .await;
+        let mut once_each = vec![registered.url.clone(), last.url.clone()];
+        once_each.sort();
+        assert_eq!(yet_to_ask(), once_each);
     }
 
     /// `NATIVE_BODY` reports 4 waiting requests, so a threshold of 4 vetoes and
@@ -3721,6 +4307,8 @@ mod native_loads_tests {
     struct SourceConnector {
         source: Option<Arc<HostLoads>>,
         asked: Mutex<Vec<String>>,
+        /// The runtime each ask named.
+        asked_as: Mutex<Vec<RuntimeType>>,
         /// How many of the next asks never answer.
         silent_asks: AtomicUsize,
     }
@@ -3733,6 +4321,7 @@ mod native_loads_tests {
                     calls: AtomicUsize::new(0),
                 })),
                 asked: Mutex::new(Vec::new()),
+                asked_as: Mutex::new(Vec::new()),
                 silent_asks: AtomicUsize::new(0),
             })
         }
@@ -3765,9 +4354,10 @@ mod native_loads_tests {
         async fn http_load_source(
             &self,
             base_url: &str,
-            _runtime: RuntimeType,
+            runtime: RuntimeType,
         ) -> Option<Arc<dyn LoadSource>> {
             self.asked.lock().push(base_url.to_string());
+            self.asked_as.lock().push(runtime);
             // One poll asks at a time in these cases: a read, then a write.
             if self.silent_asks.load(Ordering::Relaxed) > 0 {
                 self.silent_asks.fetch_sub(1, Ordering::Relaxed);
@@ -4547,14 +5137,14 @@ mod native_loads_tests {
         assert_eq!(connector.calls(), 6);
     }
 
-    /// The ticks a slow poll overran are skipped, at every interval. The
-    /// first ask of the host's connector never answers, so the first poll
-    /// lasts the poll's deadline: thirty ticks at the least interval, three
-    /// at one second. One poll follows it at once and the next comes one
-    /// interval later. The timer's own default sends a poll for every tick
-    /// overrun, one behind another.
+    /// An engine whose ask is open is asked no second time, at every
+    /// interval. The first ask of the host's connector never answers, so
+    /// it lasts the poll's deadline: thirty ticks at the least interval,
+    /// three at one second. One poll follows it at once and the next comes
+    /// one interval later: no poll for every tick the ask was open, one
+    /// behind another.
     #[tokio::test(start_paused = true)]
-    async fn the_ticks_a_slow_poll_overran_are_skipped_at_every_interval() {
+    async fn an_engine_whose_ask_is_open_is_asked_no_second_time_at_every_interval() {
         for interval in [LEAST_POLL_INTERVAL, Duration::from_secs(1)] {
             let (connector, monitor) = polled_every(interval, &[None]);
             connector.silent_asks.store(1, Ordering::Relaxed);
@@ -4563,12 +5153,53 @@ mod native_loads_tests {
             assert_eq!(
                 connector.calls(),
                 1,
-                "the polls behind a slow poll at {interval:?}"
+                "the polls behind an open ask at {interval:?}"
             );
             tokio::time::sleep(interval).await;
             assert_eq!(connector.calls(), 2, "the next tick at {interval:?}");
             monitor.stop().await;
         }
+    }
+
+    /// An engine that answers is published beside one whose ask is open.
+    /// The first ask of the host's connector never answers, so one engine
+    /// of two has its fetch open for the poll's deadline. The other is
+    /// published at the tick that asked it and asked again at the next,
+    /// and the first is asked again once its fetch ended.
+    #[tokio::test(start_paused = true)]
+    async fn an_engine_that_answers_is_published_beside_one_whose_ask_is_open() {
+        let interval = Duration::from_secs(1);
+        let (connector, monitor) = polled_every(interval, &[None, None]);
+        connector.silent_asks.store(1, Ordering::Relaxed);
+        let published = |monitor: &WorkerMonitor| {
+            let snapshot = monitor.load_state.snapshot();
+            (0..2)
+                .filter(|at| {
+                    snapshot
+                        .get(&format!("http://engine-{at}.invalid:8000"))
+                        .is_some()
+                })
+                .count()
+        };
+        monitor.start_event_loop();
+        // Between the first tick and the second.
+        tokio::time::sleep(interval / 2).await;
+        assert_eq!(
+            (connector.calls(), published(&monitor)),
+            (1, 1),
+            "the engine that answered, behind the first tick"
+        );
+        tokio::time::sleep(interval).await;
+        assert_eq!(connector.calls(), 2, "the second tick asks it again");
+        // Behind the deadline of the open fetch: the third tick asked one
+        // engine, the fourth both.
+        tokio::time::sleep(LOAD_POLL_DEADLINE - interval).await;
+        assert_eq!(
+            (connector.calls(), published(&monitor)),
+            (5, 2),
+            "both engines, behind the open fetch's end"
+        );
+        monitor.stop().await;
     }
 
     /// What polling costs at the least interval, for a group of eight
@@ -4735,6 +5366,55 @@ mod native_loads_tests {
         assert_eq!(late.calls(), 1);
         assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
         assert!(memo.is_empty());
+    }
+
+    /// A registration's one read of an engine's load route asks the host's
+    /// connector first, with the engine's address and its runtime. While
+    /// the connector may still say, the engine is asked nothing. A
+    /// connector that has not said at the poll's deadline keeps no source
+    /// for this read: the engine's route is asked once, its answer by rank
+    /// is the read's, and the source is never called.
+    ///
+    /// The read builds under its step's feature, and so does this case.
+    #[cfg(feature = "workflow")]
+    #[tokio::test]
+    async fn a_registrations_read_asks_the_engine_once_its_connector_is_late_to_say() {
+        use crate::connection::client_factory::http_client;
+
+        let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
+        let late = SourceConnector::keeping(Some(host_answer(2)));
+        late.silent_asks.store(1, Ordering::Relaxed);
+        let client = http_client();
+        // The wait for the connector runs on a paused clock, and the engine
+        // is read on the running one: no request waits on a clock that jumps.
+        tokio::time::pause();
+        let read = WorkerMonitor::read_engine_loads(
+            late.as_ref(),
+            RuntimeType::Sglang,
+            &client,
+            &stub.url,
+            None,
+        );
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = &mut read => panic!("the read ended before the connector's deadline"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(*late.asked.lock(), [stub.url.as_str()]);
+        assert_eq!(*late.asked_as.lock(), [RuntimeType::Sglang]);
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
+
+        tokio::time::advance(LOAD_POLL_DEADLINE + Duration::from_millis(1)).await;
+        tokio::time::resume();
+        let loads = read.await;
+        assert!(
+            matches!(&loads, Some(NativeLoads::Available(answer)) if answer.names_dp_ranks(2)),
+            "the engine's own answer by rank"
+        );
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(late.asked.lock().len(), 1);
+        assert_eq!(late.calls(), 0);
     }
 
     /// A polled answer's named values stand under the bounds a pushed
@@ -5263,6 +5943,100 @@ mod native_loads_tests {
                     .select_and_increment_lowest_dp_load(worker.as_ref(), 1),
                 if missing { None } else { Some(1) },
             );
+        }
+    }
+
+    /// An engine can answer, or fail, after its worker left and another
+    /// worker took the URL, of another model or of the same. What comes late
+    /// says nothing at that URL: the worker that came keeps the row and the
+    /// rank counts its own poll wrote.
+    #[tokio::test]
+    async fn an_answer_for_a_worker_that_left_says_nothing_at_the_url_another_took() {
+        const LEFT: &str = r#"{"dp_rank_count":2,"loads":[
+            {"dp_rank":0,"num_used_tokens":900,"max_total_num_tokens":1000},
+            {"dp_rank":1,"num_used_tokens":100,"max_total_num_tokens":1000}]}"#;
+        const CAME: &str = r#"{"dp_rank_count":2,"loads":[
+            {"dp_rank":0,"num_used_tokens":100,"max_total_num_tokens":1000},
+            {"dp_rank":1,"num_used_tokens":900,"max_total_num_tokens":1000}]}"#;
+        let group = |model: &str| WorkerGroupKey {
+            model_id: model.to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        for late in [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE] {
+            for model_of_came in ["b", "a"] {
+                let case = format!("{late} behind a worker of model {model_of_came}");
+                // The engine holds its first answer until it is let go, gives
+                // it with the status `late`, and gives every later one at once.
+                let let_go = Arc::new(Notify::new());
+                let asked = Arc::new(AtomicUsize::new(0));
+                let app = axum::Router::new().route(
+                    "/v1/loads",
+                    axum::routing::get({
+                        let (let_go, asked) = (Arc::clone(&let_go), Arc::clone(&asked));
+                        move || {
+                            let first = asked.fetch_add(1, Ordering::SeqCst) == 0;
+                            let let_go = Arc::clone(&let_go);
+                            async move {
+                                if first {
+                                    let_go.notified().await;
+                                    (late, LEFT)
+                                } else {
+                                    (StatusCode::OK, CAME)
+                                }
+                            }
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test stub server lives for the duration of the test process"
+                )]
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.expect("stub serve");
+                });
+
+                let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+                let worker = gauge_worker(&url);
+                worker.set_status(WorkerStatus::Ready);
+                let left = registry.register(worker).unwrap();
+                let (of_left, of_came) = (group("a"), group(model_of_came));
+                let tick =
+                    poll_group_once(&monitor, &of_left, Duration::from_secs(10), Instant::now());
+                tokio::pin!(tick);
+                tokio::select! {
+                    () = &mut tick => panic!("the tick ended ahead of its engine's answer"),
+                    () = wait_until("the tick's fetch", || asked.load(Ordering::SeqCst) == 1) => {}
+                }
+
+                assert!(registry.remove(&left).is_some());
+                let came = gauge_worker_with_model(&url, model_of_came);
+                came.set_status(WorkerStatus::Ready);
+                registry.register(Arc::clone(&came)).unwrap();
+                poll_group_once(&monitor, &of_came, Duration::from_secs(10), Instant::now()).await;
+                let lighter_rank = || {
+                    monitor
+                        .worker_load_manager
+                        .select_and_increment_lowest_dp_load(came.as_ref(), 0)
+                };
+                let used_tokens = || {
+                    monitor.load_state.snapshot().get(&url).map(|row| {
+                        row.loads
+                            .iter()
+                            .map(|rank| rank.num_used_tokens)
+                            .collect::<Vec<_>>()
+                    })
+                };
+                assert_eq!(used_tokens(), Some(vec![100, 900]), "{case}");
+                assert_eq!(lighter_rank(), Some(0), "{case}");
+
+                let_go.notify_one();
+                tick.await;
+                assert_eq!(used_tokens(), Some(vec![100, 900]), "{case}");
+                assert_eq!(lighter_rank(), Some(0), "{case}");
+            }
         }
     }
 

@@ -8,6 +8,7 @@ use rand::{
     distr::{Alphanumeric, SampleString},
     rng as thread_rng, RngExt,
 };
+use tracing_test::traced_test;
 
 use super::*;
 
@@ -1045,6 +1046,20 @@ fn test_eviction_single_tenant_all_entries() {
     );
 }
 
+/// The size pass writes no tenant key into its debug events.
+#[test]
+#[traced_test]
+fn test_evict_by_size_events_name_no_tenant() {
+    let tree = Tree::new();
+    tree.insert_text("hello", "tenant-alpha");
+    tree.insert_text("world", "tenant-beta");
+
+    tree.evict_tenant_by_size(5);
+
+    assert!(tree.total_char_size() <= 5, "the pass ran");
+    assert!(!logs_contain("tenant-alpha") && !logs_contain("tenant-beta"));
+}
+
 // ==================== Last Tenant Cache Tests ====================
 
 #[test]
@@ -2042,6 +2057,51 @@ fn test_match_and_insert_with_detached_path_node_keeps_count_reachable() {
         "the prompt must be cached for w1"
     );
     assert_eq!(cached.tenant.as_ref(), "w1");
+}
+
+/// The replay passes a path node the tenant already stands on with no look
+/// at its edge, and the suffix is spliced below the last of them. An
+/// eviction that empties that node between the two steps detaches it, and
+/// a suffix spliced under a detached node is counted for the tenant on a
+/// node the root does not reach. One thread cannot part the two steps, so
+/// what the splice then meets is laid by hand inside `select`: the eviction
+/// detaches the node, and the tenant is put back on it as the replay read
+/// it. The splice must leave the detached node alone and insert the whole
+/// text from the root.
+#[test]
+fn test_match_and_insert_with_splices_no_suffix_under_a_detached_node() {
+    let tree = Tree::new();
+    let prefix = "shared system prompt";
+    let w1 = intern_tenant("w1");
+    tree.insert_text(prefix, "w1");
+    let node = path_nodes(&tree, prefix).pop().expect("one node");
+    let text = format!("{prefix}, then a user turn");
+
+    tree.match_and_insert_with(&text, |_| {
+        tree.evict_tenant_by_size(0);
+        assert!(
+            tree.root.children.is_empty(),
+            "the eviction detaches the emptied node"
+        );
+        node.tenant_last_access_time.insert(Arc::clone(&w1), 0);
+        Some("w1")
+    });
+
+    assert!(
+        node.children.is_empty(),
+        "the suffix hangs under the detached node"
+    );
+    assert_eq!(
+        tree.tenant_char_size(&w1),
+        reachable_chars(&tree, "w1"),
+        "w1's count must equal the chars it holds on reachable nodes"
+    );
+    let cached = tree.match_prefix_with_counts(&text);
+    assert_eq!(
+        cached.matched_char_count,
+        text.chars().count(),
+        "the prompt must be cached for w1"
+    );
 }
 
 /// Seeded traffic with an eviction injected between the match and the

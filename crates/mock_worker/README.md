@@ -86,7 +86,7 @@ parts with no clause for an image part, a literal `<image>` in the text) is
 refused with `multimodal_prompt_contract_mismatch`; with the right count the
 request is answered, the encode worker takes one `Encode` for each image, and
 a prefill and a decode worker take the request. That holds with the gateway's
-policy controller off and its media processing at `auto` or `router` (the
+Grand Central off and its media processing at `auto` or `router` (the
 defaults are off and `auto`); with `--mm-processing worker` the gateway does
 not process the media and refuses the request with `multimodal_not_supported`.
 The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a
@@ -245,6 +245,7 @@ experiments against it transfer to engines:
 | `--global-l3-ms-per-token` | 0 | pass time per token restored from the shared tier |
 | `--block-size` | 16 | cache block/page size (tokens); must match the worker's `kv_block_size` |
 | `--prefix-cache` | true | prefix caching + KV events |
+| `--grpc-kv-events` | true | serve the gRPC subscription to KV-cache events; `false` refuses it as an engine without the call does, so a gateway hears no KV event from the process over gRPC, while the engines keep their prefix cache and the load records stay served (the ZMQ publishers are not touched) |
 | `--prefill-first` | false | SGLang-style prefill-only passes |
 | `--reserve-full-isl` | true | admit a waiting prompt only when the free and evictable blocks could hold all of it beyond its cached blocks, stopping at the first that does not fit (vLLM's `scheduler_reserve_full_isl`: a gate, only the pass's chunk is allocated at admission); `false` skips the gate |
 | `--context-length` | 32768 | advertised context length |

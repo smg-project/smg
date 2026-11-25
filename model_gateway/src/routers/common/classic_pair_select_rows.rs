@@ -4,8 +4,8 @@
 //! overload thresholds or doubted by the liveness tracker), the KV transport
 //! each worker names, the policy each pool runs under, whether shedding is
 //! on, and what the gateway's pair placement answered at each request. The
-//! policy controller crate replays the rows through its own pair decision
-//! (`crates/policy_controller/tests/classic_rows.rs`).
+//! Grand Central crate replays the rows through its own pair decision
+//! (`crates/grand_central/tests/classic_rows.rs`).
 //!
 //! A request's answer is the pair it was placed on, each worker by its place
 //! in its pool's list, or no pair with the role the placement named and why.
@@ -24,20 +24,22 @@
 //! This file is an ignored test of the gateway crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
 //!   cargo test -p smg --lib routers::common::classic_pair_select_rows -- --ignored --nocapture
 //! ```
 //!
-//! That filter also runs this module's two child recorders
-//! ([`classic_pair_bound_rows`], [`classic_pair_runtime_rows`]), each of
-//! which writes a sheet of its own beside this one: their rows draw
-//! nothing. A row of the second is placed on the wire that carries one
-//! runtime's request, and names the runtime of a worker that is not on the
-//! sheet's own.
+//! That filter also runs this module's three child recorders
+//! ([`classic_pair_bound_rows`], [`classic_pair_runtime_rows`],
+//! [`classic_pair_named_rows`]), each of which writes a sheet of its own
+//! beside this one: their rows draw nothing. A row of the second is placed
+//! on the wire that carries one runtime's request, and names the runtime of
+//! a worker that is not on the sheet's own. A row of the third states the
+//! text its requests carry under `x-smg-target-worker`, and the pair a
+//! failed attempt was sent to where its requests are retries.
 //!
 //! A sequence row is recorded twenty times from fresh pools and fresh
 //! policies and must come out the same each time; a drawn row records how
@@ -46,6 +48,7 @@
 
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 
+use axum::http::HeaderMap;
 use openai_protocol::{
     model_card::ModelCard,
     worker::{WorkerSpec, WorkerStatus},
@@ -174,6 +177,14 @@ struct Row {
     /// one: `grpc`, which carries one runtime's request.
     #[serde(skip_serializing_if = "Option::is_none")]
     wire: Option<&'static str>,
+    /// The text the row's requests carry under `x-smg-target-worker`: the
+    /// worker they name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'static str>,
+    /// The pair a failed attempt of each request was sent to, where the
+    /// row's requests are retries: the prefill's place, then the decode's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tried: Option<(usize, usize)>,
     prefills: Vec<Member>,
     decodes: Vec<Member>,
     /// How many requests the row places, one after another.
@@ -357,6 +368,17 @@ impl Bed {
     /// One request through the gateway's pair placement, behind the prefill
     /// admission when the row names its bound.
     fn pick(&self) -> Answer {
+        self.pick_with(None, &[])
+    }
+
+    /// [`Self::pick`] for a request that carries `headers` and that a failed
+    /// attempt already sent to the engines `tried`, each by its base URL.
+    fn pick_with(&self, headers: Option<&HeaderMap>, tried: &[String]) -> Answer {
+        let inputs = PlacementInputs {
+            headers,
+            tried,
+            ..PlacementInputs::default()
+        };
         let Some(admission) = &self.admission else {
             return self.answer(&select_pair(
                 &self.registry,
@@ -365,7 +387,7 @@ impl Bed {
                 &self.pairs,
                 None,
                 None,
-                PlacementInputs::default(),
+                inputs,
                 Stated::nothing,
             ));
         };
@@ -384,7 +406,7 @@ impl Bed {
                     &self.pairs,
                     None,
                     Some(capacity),
-                    PlacementInputs::default(),
+                    inputs,
                     Stated::nothing,
                 );
                 answer = Some(self.answer(&placed));
@@ -450,6 +472,8 @@ impl Cell {
             shed: self.shed,
             prefill_bound: self.prefill_bound,
             wire: self.wire,
+            target: None,
+            tried: None,
             prefills: self.prefills,
             decodes: self.decodes,
             requests,
@@ -1013,3 +1037,7 @@ mod classic_pair_bound_rows;
 /// none, on the wire that carries one runtime's request and on a sheet of
 /// their own.
 mod classic_pair_runtime_rows;
+
+/// The rows of a pair whose request names its worker, on a sheet of their
+/// own.
+mod classic_pair_named_rows;

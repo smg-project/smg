@@ -720,8 +720,8 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
 
-    /// Choose off for the classic routing policies or on for the policy
-    /// controller. With on, the routing flags keep their meaning through a
+    /// Choose off for the classic routing policies or on for Grand
+    /// Central. With on, the routing flags keep their meaning through a
     /// policy document
     #[arg(
         long,
@@ -729,7 +729,7 @@ struct RoutingArgs {
         default_value = "off",
         help_heading = "Routing Policy"
     )]
-    policy_controller: String,
+    grand_central: String,
 
     /// Run this policy document in place of the one the routing flags mean.
     /// The document replaces those flags. A policy name, a policy's own
@@ -1615,9 +1615,11 @@ struct ModelArgs {
 
     // ==================== Parsers ====================
     /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
-    /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
+    /// symphony, a worker's labels decide for its model, else this flag and
+    /// --tool-call-parser, before Symphony's registry, for every model; a
+    /// name here alone that a table answers to leaves a model the registry
+    /// knows to the registry and reads only the models it does not know: a
+    /// Symphony table's name here (and in
     /// --tool-call-parser, or there alone) reads them with that table, and
     /// so does a legacy parser's name whose format a table reads (the
     /// table's aliases); `hf` reads each with the table its tokenizer's
@@ -1627,9 +1629,9 @@ struct ModelArgs {
     reasoning_parser: Option<String>,
 
     /// Parser for tool-call interactions (e.g., json, qwen). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
-    /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
+    /// symphony, a worker's labels decide for its model, else this flag, for
+    /// every model, before Symphony's registry, which reads a model it knows
+    /// only where the flags select nothing: a Symphony table's name here (and in
     /// --reasoning-parser, or here alone) reads them with that table, and
     /// so does a legacy parser's name whose format a table reads (the
     /// table's aliases); `hf` reads each with the table its tokenizer's
@@ -1640,9 +1642,10 @@ struct ModelArgs {
 
     /// Which parser reads a chat completion's reasoning and tool calls:
     /// Symphony (the default) or the per-model parsers (legacy). With
-    /// Symphony, a model's worker labels decide, else Symphony's registry
-    /// for a model it knows, else --tool-call-parser and
-    /// --reasoning-parser: a Symphony table's name reads with that table,
+    /// Symphony, a model's worker labels decide, else --tool-call-parser and
+    /// --reasoning-parser, else Symphony's registry for a model it knows (a
+    /// reasoning name alone that a table answers to comes after the
+    /// registry): a Symphony table's name reads with that table,
     /// and so does a legacy parser's name whose format a table reads (qwen
     /// for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so
     /// existing flags keep a working parser); any other legacy parser's
@@ -2224,18 +2227,18 @@ mod tests {
 
         for (flags, enabled) in [
             (&[][..], false),
-            (&["--policy-controller", "on"][..], true),
-            (&["--policy-controller", "off"][..], false),
+            (&["--grand-central", "on"][..], true),
+            (&["--grand-central", "off"][..], false),
         ] {
             let config = cli_args_from(flags)
                 .to_router_config(vec![], vec![])
                 .expect("the routing configuration");
-            assert_eq!(config.policy_controller, enabled, "{flags:?}");
+            assert_eq!(config.grand_central, enabled, "{flags:?}");
         }
-        let refusal = Cli::try_parse_from(["smg", "--policy-controller", "other"])
+        let refusal = Cli::try_parse_from(["smg", "--grand-central", "other"])
             .expect_err("the switch takes only on and off");
         assert_eq!(refusal.kind(), ErrorKind::InvalidValue);
-        assert!(refusal.to_string().contains("--policy-controller"));
+        assert!(refusal.to_string().contains("--grand-central"));
     }
 
     fn policy_file(
@@ -2243,12 +2246,12 @@ mod tests {
     ) -> Result<
         (
             tempfile::NamedTempFile,
-            smg_policy_controller::document::PolicySpec,
+            smg_grand_central::document::PolicySpec,
         ),
         Box<dyn std::error::Error>,
     > {
         let file = tempfile::NamedTempFile::new()?;
-        let document = smg_policy_controller::document::PolicySpec::preset(name)?;
+        let document = smg_grand_central::document::PolicySpec::preset(name)?;
         serde_yaml::to_writer(file.as_file(), &document)?;
         Ok((file, document))
     }
@@ -2257,7 +2260,7 @@ mod tests {
     fn the_plain_start_takes_the_document() {
         let (file, document) = policy_file("round_robin").expect("a policy document file");
         let path = file.path().to_str().expect("a UTF-8 path");
-        let config = cli_args_from(&["--policy-controller", "on", "--policy-spec", path])
+        let config = cli_args_from(&["--grand-central", "on", "--policy-spec", path])
             .to_router_config(vec![], vec![])
             .expect("the routing configuration");
         assert_eq!(config.policy_spec_path.as_deref(), Some(path));
@@ -2274,7 +2277,7 @@ mod tests {
         let (file, document) = policy_file("round_robin").expect("a policy document file");
         let path = file.path().to_str().expect("a UTF-8 path");
         let config = cli_args_from(&[
-            "--policy-controller",
+            "--grand-central",
             "on",
             "--policy-spec",
             path,
@@ -2294,7 +2297,7 @@ mod tests {
     /// The flags under the routing policy heading a document does not
     /// replace: the controller's own, and what the gateway reads itself.
     const BESIDE_A_DOCUMENT: [&str; 8] = [
-        "policy_controller",
+        "grand_central",
         "policy_spec",
         "print_policy_spec",
         "dp_aware",
