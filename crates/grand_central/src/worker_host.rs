@@ -38,13 +38,12 @@
 //! | `overload` | not carried to the object by a holder built with no thresholds: nothing judges its workers. Under a host whose own load monitor judges it ([`Objects::with_overload_thresholds`]), the object's thresholds: the row's own, each over the host's default for its signal, the usage as a ratio. A row of the external runtime takes no default, and no row takes one while the host's document switches it off ([`Objects::state_overload_switch`]). [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
 //!
 //! A new object starts at its row's status. A replacement takes the
-//! standing object's running state, including its status. A host that gets
-//! health from the rows can use [`Objects::with_status_followed`] to copy
-//! their status on tail changes and snapshots, for objects kept or laid
-//! again. The holder checks the row's revision under the object's
-//! mutation lock and hands the registry the status: the registry's
-//! subscribers hear the change, and a
-//! promotion comes back as any promotion does. The host's vetoes stand.
+//! standing object's running state, including its status. From there an
+//! object's status leads its row's: a host writes a status on the object,
+//! by its connect signal and its drain ([`Objects::connect_row`],
+//! [`Objects::drain_row`]) and by its health driver ([`HealthAdapter`]),
+//! and the store is told. A status written into the store's table alone
+//! does not move the object.
 //! The id and the revision stand beside the object in the
 //! holder ([`RowRevision`]), with every fact of the row the object does not
 //! hold as stated: inside the crate the two together state the row

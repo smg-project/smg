@@ -527,7 +527,6 @@ mod tests {
                 Constraints, Decided, InProcess, LentList, Request, RequestFacts, RequestMaker,
                 Role, WorkerLists,
             },
-            store::WorkerStatus,
         };
 
         /// A single request with the list its host hands for it.
@@ -547,16 +546,13 @@ mod tests {
             }
         }
 
-        let mut replica = Replica::new();
-        replica.objects = replica.objects.with_status_followed();
+        let replica = Replica::new();
         let rows = [replica.write(A), replica.write(B)];
         for url in [A, B] {
             let row = replica.store.by_key(url).expect("a row");
-            let ready = WorkerStatus::Ready;
-            assert!(replica
-                .store
-                .set_status(row.id, ready, row.revision)
-                .is_some());
+            replica
+                .objects
+                .connect_row(&replica.store, row.id, row.revision);
         }
         replica.follow();
         let registry = replica.objects.registry();

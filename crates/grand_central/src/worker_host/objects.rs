@@ -5,7 +5,7 @@
 //! replica that leads an object's status leads its row's: a status is
 //! written on the object, and the holder tells the store ([`mod@status`],
 //! which says the lock order once). A host can
-//! also ask it to follow the rows' status, or to build each object with the
+//! also ask it to build each object with the
 //! thresholds its own load monitor judges overload by. A door reads the row
 //! that stands off it ([`mod@read`]).
 
@@ -63,7 +63,7 @@ mod standby;
 mod status;
 mod write;
 
-#[cfg(all(test, feature = "controller"))]
+#[cfg(test)]
 pub(crate) use status::tests::stand;
 
 /// The row an object stands for.
@@ -182,13 +182,8 @@ impl Held {
 /// replaces the object of a row whose facts changed under the same id in
 /// the registry. A new incarnation of a key gets a new object and id.
 ///
-/// By default a status change reads no row and leaves the object alone.
-/// With [`Self::with_status_followed`], the holder copies the row's status
-/// on a status change, on a build or replacement, and on a snapshot read
-/// that keeps the object. The registry makes the write, as it makes a
-/// health driver's: its subscribers hear the change once, and a promoted
-/// worker comes back as any promotion brings it, an open breaker on
-/// trial. The host's own vetoes stand.
+/// A status change reads no row and leaves the object alone: an object's
+/// status leads its row's.
 ///
 /// A row that leaves ends its object, even where a row stands under its id
 /// again by the time the change is read: a row registered again under the
@@ -286,7 +281,6 @@ pub struct Objects<G> {
     registry: Arc<WorkerRegistry<G>>,
     /// What makes an object's engine connection, where the host handed one.
     connector: Option<Arc<dyn EngineConnector>>,
-    status_followed: bool,
     /// What the host keeps for its workers, by the address they dial and
     /// the row a registration wrote.
     credentials: Option<Arc<Credentials>>,
@@ -335,16 +329,6 @@ impl<G> fmt::Debug for Objects<G> {
 }
 
 impl<G> Objects<G> {
-    /// For a host that drives no health of its own and writes each row's
-    /// status into the store itself: an object's status follows its
-    /// row's. A controller's own service and a watcher do not use it: a
-    /// status is written on the object there, or laid as it is told.
-    #[must_use]
-    pub fn with_status_followed(mut self) -> Self {
-        self.status_followed = true;
-        self
-    }
-
     /// For a host that is no gateway: it holds the socket of no host-local
     /// wire, so the object of a row that one gateway alone reaches is built
     /// with its checks off, whatever the row's policy says. A health loop
@@ -397,7 +381,6 @@ impl<G: Generation> Objects<G> {
         Self {
             registry,
             connector: None,
-            status_followed: false,
             credentials: None,
             forgotten_at: AtomicU64::new(0),
             host_local_unchecked: false,
@@ -873,7 +856,8 @@ impl<G: Generation> Objects<G> {
     /// rows it names are settled as they stand now.
     fn apply<S: WorkersStore + ?Sized>(&self, store: &S, change: MembershipChange) {
         match change {
-            MembershipChange::StatusChanged { id, .. } => self.follow_status(store, id),
+            // A status change moves no fact: the object's status leads.
+            MembershipChange::StatusChanged { .. } => {}
             // The old incarnation first: its object leaves the URL the new
             // one's is built under. It leaves whatever stands under its id
             // now: an incarnation a key takes again is another life. An
@@ -936,7 +920,6 @@ impl<G: Generation> Objects<G> {
                 if self.remade(row) {
                     self.restate(row);
                 }
-                self.follow_status(store, row.id);
                 // The store may have given the row a new place in its
                 // counts, which holds no count yet: a lay hands its own.
                 self.counted(store, row.id);
@@ -988,13 +971,6 @@ impl<G: Generation> Objects<G> {
         }
     }
 
-    #[inline]
-    fn follow_status<S: WorkersStore + ?Sized>(&self, store: &S, row: WorkerId) {
-        if self.status_followed {
-            self.copy_status(store, row);
-        }
-    }
-
     /// The status the table holds for the row an object was built from,
     /// where the row stands at that revision still: what an object takes
     /// from the table. Read under the object's mutation lock, so of two
@@ -1043,11 +1019,9 @@ impl<G: Generation> Objects<G> {
         self.held.write().leave(id);
     }
 
-    /// Lay `row`'s object: one built from the row, with the row's status
-    /// where the holder follows statuses.
+    /// Lay `row`'s object: one built from the row.
     fn lay<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow) {
         self.put(store, row, self.build(row));
-        self.follow_status(store, row.id);
     }
 
     /// State the entry of the object that stands for `row` again, from the
@@ -1719,9 +1693,8 @@ mod tests {
             engine::{Decision, DemandFacts, InProcess, Role, ShedReason},
         };
 
-        let mut replica = Replica::new();
-        replica.objects = replica.objects.with_status_followed();
-        // A stored worker that states `runtime`, ready by a check's word.
+        let replica = Replica::new();
+        // A stored worker that states `runtime`, ready by its connect signal.
         let ready = |key: &str, runtime: u32| {
             let stated = WorkerFacts {
                 demand_facts: DemandFacts {
@@ -1732,10 +1705,9 @@ mod tests {
             };
             let id = replica.register(stated, None);
             let row = replica.store.get(id).expect("the registered row");
-            let ready = replica
-                .store
-                .set_status(id, WorkerStatus::Ready, row.revision);
-            ready.expect("ready");
+            replica
+                .objects
+                .connect_row(&replica.store, id, row.revision);
             id
         };
         let (seven, nine) = (ready(A, 7), ready(B, 9));
@@ -1806,8 +1778,7 @@ mod tests {
             },
         };
 
-        let mut replica = Replica::new();
-        replica.objects = replica.objects.with_status_followed();
+        let replica = Replica::new();
         let door = StoreDoor::new(Arc::clone(&replica.store));
         // The registration of the worker at `A` as one that states `runtime`.
         let registers = |runtime: u32| {
@@ -3115,7 +3086,7 @@ mod tests {
         }
     }
 
-    /// By default a status write leaves the object alone.
+    /// A status write leaves the object alone.
     #[test]
     fn a_write_that_moves_no_fact_leaves_the_same_object() {
         let mut replica = Replica::new();
@@ -3140,14 +3111,16 @@ mod tests {
         assert_eq!(replica.at(A).status(), ObjectStatus::Pending);
     }
 
+    /// The holder's copy of the status a table holds, as a told status's
+    /// lay and a cut's call it.
     #[test]
-    fn a_followed_status_makes_a_worker_available_only_while_ready() {
+    fn a_status_copied_from_the_table_makes_a_worker_available_only_while_ready() {
         let mut replica = Replica::new();
-        replica.objects = replica.objects.with_status_followed();
         replica.follow();
         replica.store.upsert(facts(A, 1));
         replica.follow();
         let row = replica.row(A);
+        let copy = |replica: &Replica| replica.objects.copy_status(replica.store.as_ref(), row.id);
         let (id, worker) = (replica.id(A), replica.at(A));
         assert_eq!(worker.status(), ObjectStatus::Pending);
         assert!(!worker.is_available());
@@ -3161,7 +3134,7 @@ mod tests {
                 .store
                 .set_status(row.id, row_status, row.revision)
                 .is_some());
-            replica.follow();
+            copy(&replica);
             assert!(Arc::ptr_eq(&worker, &replica.at(A)));
             assert_eq!(worker.status(), object_status);
             assert_eq!(worker.is_available(), available);
@@ -3183,7 +3156,7 @@ mod tests {
             .set_status(row.id, WorkerStatus::Ready, row.revision)
             .is_some());
         replica.told();
-        replica.follow();
+        copy(&replica);
         assert_eq!(worker.status(), ObjectStatus::Ready);
         assert_eq!(replica.told(), [("status", id)]);
         // A promotion comes back as any promotion does: the open breaker
@@ -3196,30 +3169,30 @@ mod tests {
 
     #[test]
     fn a_status_at_a_new_row_revision_waits_for_the_new_object() {
-        let mut replica = Replica::new();
-        replica.objects = replica.objects.with_status_followed();
+        let replica = Replica::new();
+        let store = replica.store.as_ref();
         replica.store.upsert(facts(A, 1));
         replica.follow();
         let row = replica.row(A);
         let before = replica.at(A);
-        let change = replica
-            .store
-            .set_status(row.id, WorkerStatus::Ready, row.revision)
-            .expect("the status moved");
+        let moved = store.set_status(row.id, WorkerStatus::Ready, row.revision);
+        assert!(moved.is_some(), "the status moved");
         replica.patch(A, labels("gold"));
 
-        replica.objects.apply(replica.store.as_ref(), change);
+        replica.objects.copy_status(store, row.id);
         assert_eq!(before.status(), ObjectStatus::Pending);
         replica.follow();
         let after = replica.at(A);
         assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.status(), ObjectStatus::Pending, "a lay copies none");
+        replica.objects.copy_status(store, row.id);
         assert_eq!(after.status(), ObjectStatus::Ready);
     }
 
     #[test]
     fn a_status_change_leaves_an_object_the_holder_did_not_lay_alone() {
-        let mut replica = Replica::new();
-        replica.objects = replica.objects.with_status_followed();
+        let replica = Replica::new();
+        let store = replica.store.as_ref();
         replica.store.upsert(facts(A, 1));
         replica.follow();
         let row = replica.row(A);
@@ -3227,7 +3200,7 @@ mod tests {
             .store
             .set_status(row.id, WorkerStatus::Ready, row.revision)
             .is_some());
-        replica.follow();
+        replica.objects.copy_status(store, row.id);
         let registry = replica.objects.registry();
         let foreign = object(&row);
         assert!(registry.replace(&replica.id(A), Arc::clone(&foreign)));
@@ -3237,14 +3210,13 @@ mod tests {
             .store
             .set_status(row.id, WorkerStatus::NotReady, row.revision)
             .is_some());
-        replica.follow();
+        replica.objects.copy_status(store, row.id);
         assert_eq!(foreign.status(), ObjectStatus::Ready);
     }
 
     #[test]
-    fn a_snapshot_follows_status_for_both_kept_and_replaced_objects() {
+    fn a_cut_laid_whole_lays_the_status_of_both_kept_and_replaced_objects() {
         let mut replica = Replica::new();
-        replica.objects = replica.objects.with_status_followed();
         replica.store.upsert(facts(A, 1));
         replica.store.upsert(facts(B, 1));
         replica.follow();
@@ -3262,8 +3234,8 @@ mod tests {
                 .set_status(row.id, WorkerStatus::Ready, row.revision)
                 .is_some());
         }
-        assert!(replica.store.restore_from(other.checkpoint()));
-        replica.follow();
+        let cut = other.checkpoint();
+        assert!(replica.objects.restore_from(replica.store.as_ref(), cut));
 
         assert!(Arc::ptr_eq(&a, &replica.at(A)));
         assert!(a.is_available());
@@ -3279,8 +3251,8 @@ mod tests {
         assert!(other
             .set_status(row.id, WorkerStatus::NotReady, row.revision)
             .is_some());
-        assert!(replica.store.restore_from(other.checkpoint()));
-        replica.follow();
+        let cut = other.checkpoint();
+        assert!(replica.objects.restore_from(replica.store.as_ref(), cut));
         assert!(Arc::ptr_eq(&a, &replica.at(A)));
         assert!(!a.is_available());
         assert_eq!(replica.told(), [("status", id_a)]);
@@ -3449,8 +3421,9 @@ mod tests {
         assert_eq!((replica.id(E), replica.id(F)), (e.clone(), f.clone()));
         assert_eq!(replica.tier(F).as_deref(), Some("gold"));
         // E stands as its object was built: the very object, and its entry
-        // names the row's revision still.
+        // names the row's revision still. A whole read copies no status.
         assert!(Arc::ptr_eq(&stood, &replica.at(E)));
+        assert_eq!(stood.status(), ObjectStatus::Pending);
         let standing = replica.objects.standing(&e).expect("E's row");
         assert_eq!(standing.revision, replica.row(E).revision);
         // G's revision moved: an object in its place, built at that revision.
@@ -3612,7 +3585,7 @@ mod tests {
     #[test]
     fn an_adapter_write_waits_for_the_holders_status_read() {
         let registry = Arc::new(WorkerRegistry::<Members>::new());
-        let objects = Arc::new(Objects::new(Arc::clone(&registry)).with_status_followed());
+        let objects = Arc::new(Objects::new(Arc::clone(&registry)));
         let store = Late::default();
         let row = store.upsert(facts(A, 1)).id();
         objects.follow(&store);
@@ -3622,7 +3595,7 @@ mod tests {
         assert!(store
             .set_status(row, WorkerStatus::Ready, revision)
             .is_some());
-        objects.follow(&store);
+        objects.copy_status(&store, row);
         assert_eq!(worker.status(), ObjectStatus::Ready);
 
         let adapter = HealthAdapter::new(
@@ -3657,7 +3630,7 @@ mod tests {
                 assert_eq!(answer, Some((ObjectStatus::NotReady, ObjectStatus::Ready)));
                 assert_eq!(worker.status(), ObjectStatus::Ready);
             });
-            objects.follow(&store);
+            objects.copy_status(&store, row);
             connected.join().expect("the adapter finished");
         });
         assert_eq!(

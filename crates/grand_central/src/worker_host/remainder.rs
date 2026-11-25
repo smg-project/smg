@@ -255,7 +255,7 @@ mod tests {
             GatewayId, HealthPolicy, MemoryStore, Overload, Reachability, Registrant, Signals,
             WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore as _,
         },
-        worker_host::{Members, Objects},
+        worker_host::{objects::stand, Members, Objects},
     };
 
     fn holder() -> Objects<Members> {
@@ -509,20 +509,20 @@ mod tests {
     fn a_rows_maker_its_status_and_its_later_lives_read_back() {
         const URL: &str = "http://w:8000";
         let store = MemoryStore::new();
-        let objects = holder().with_status_followed();
+        let objects = holder();
         let maker = Registrant::provider("found", "one").expect("a maker");
         let id = store.upsert_by(at(URL), maker).id();
         store.upsert(at("http://control:8000"));
         assert_eq!(read_back(&store, &objects, "two makers"), 2);
 
+        // A status stands on the object, and the store is told it.
         for status in [
             WorkerStatus::Ready,
             WorkerStatus::NotReady,
             WorkerStatus::Failed,
             WorkerStatus::Draining,
         ] {
-            let revision = store.get(id).expect("the row").revision;
-            store.set_status(id, status, revision).expect("a move");
+            stand(&objects, &store, id, status);
             read_back(&store, &objects, &format!("{status:?}"));
         }
 
