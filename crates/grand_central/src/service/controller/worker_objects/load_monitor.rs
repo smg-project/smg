@@ -833,8 +833,9 @@ mod tests {
     }
 
     /// A leader polls each `Ready` worker and publishes their reports: one
-    /// that stood before its term at once, and one that comes during it
-    /// with its group's next poll, an interval later.
+    /// that stood before its term at once, and one that comes during it at
+    /// once too, by one poll of its own. Its group's next poll still comes
+    /// on its beat, an interval behind the term's first, and takes both.
     #[tokio::test(start_paused = true)]
     async fn a_leader_polls_its_workers_and_publishes_their_reports() {
         let mut replica = Replica::new();
@@ -846,15 +847,32 @@ mod tests {
             "the term's first poll is published"
         );
 
-        replica.register(facts(B));
+        time::sleep(EVERY / 2).await;
         let polled = replica.polls();
         replica.engine.waiting.store(5, SeqCst);
-        time::sleep(EVERY - Duration::from_millis(100)).await;
-        assert_eq!(replica.polls(), polled, "a poll came inside the period");
+        replica.register(facts(B));
         assert!(
-            comes(|| replica.waiting(A) == Some(5) && replica.waiting(B) == Some(5)).await,
-            "the period's poll takes both workers"
+            comes(|| replica.waiting(B) == Some(5)).await,
+            "a worker that comes during the term is asked at once"
         );
+        time::sleep(EVERY / 2 - Duration::from_millis(100)).await;
+        assert_eq!(
+            replica.polls(),
+            polled + 1,
+            "the worker that came is asked once inside the period, and no other"
+        );
+        assert_eq!(
+            replica.waiting(A),
+            Some(3),
+            "the report of the worker that stood is left to the period's poll"
+        );
+
+        replica.engine.waiting.store(7, SeqCst);
+        assert!(
+            comes(|| replica.waiting(A) == Some(7) && replica.waiting(B) == Some(7)).await,
+            "the period's poll comes on its beat and takes both workers"
+        );
+        assert_eq!(replica.polls(), polled + 3, "one poll a worker on the beat");
         assert!(replica.stopped().await, "the task ends at the stop");
     }
 
