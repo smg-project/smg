@@ -2,19 +2,35 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 use crate::{test_support::http_client_builder, ImageDetail, ImageSource};
-/// Exercise mutually exclusive branches, exact-cap equality and unaligned caps.
+/// The aligned size against the model processor's arithmetic, row for row:
+/// both floors, a float product that lands above the floor, the grid rounded
+/// up, a cap rounded down to the grid and the scale back under it.
 #[test]
-fn branches_on_source_geometry_then_aligns_like_the_model() {
+fn aligned_sizes_match_the_model_processor() {
     for ((w, h, cap), expected) in [
-        ((2000, 100, 1000), (1008, 56)), // shrink only; do not raise short side
-        ((1000, 50, 1000), (2240, 112)), // equality takes the short-side branch
-        ((50, 1000, 1000), (112, 2240)),
-        ((1000, 500, 1000), (1008, 504)),
-        ((100, 50, 1000), (224, 112)),
+        // The default cap: a floor, the grid alone, the scale back.
+        ((1, 1, 2016), (168, 168)),
+        ((500, 400, 2016), (504, 420)),
+        ((512, 512, 2016), (532, 532)),
+        ((2000, 2000, 2016), (2016, 2016)),
+        ((2000, 1334, 2016), (2016, 1344)),
+        ((4284, 5712, 2016), (1512, 2016)),
+        // The area floor, then the short-side floor on what it left.
+        ((224, 112, 2016), (336, 168)),
+        ((167, 168, 2016), (168, 196)),
+        // 153 * (168.0 / 153) lands above 168: one grid step more.
+        ((153, 153, 2016), (196, 196)),
+        // A floor first, then the cap on the enlarged long side.
+        ((1000, 50, 2016), (2016, 112)),
+        ((50, 1000, 1000), (56, 980)),
+        // A cap off the grid is rounded down; a cap on it stands.
+        ((1000, 500, 1000), (980, 504)),
         ((1000, 500, 1009), (1008, 504)),
-        ((70, 112, 1000), (112, 168)),
-        ((1125, 500, 1022), (1008, 448)),
-        ((2067, 1000, 2030), (2016, 980)),
+        ((2017, 2016, 2016), (2016, 1988)),
+        ((3600, 3600, 3600), (3584, 3584)),
+        // A side the scale takes to nothing keeps one cell.
+        ((33600, 168, 140), (140, 28)),
+        ((100, 100, 27), (28, 28)),
     ] {
         assert_eq!(
             dimensions(w, h, cap).unwrap(),
@@ -22,6 +38,9 @@ fn branches_on_source_geometry_then_aligns_like_the_model() {
             "{w}x{h} cap {cap}"
         );
     }
+    assert!(dimensions(0, 112, 1000).is_err());
+    assert!(dimensions(112, 0, 1000).is_err());
+    assert!(dimensions(u32::MAX, 1, u32::MAX).is_err());
     let error = dimensions(100, 100, 0).unwrap_err();
     assert_eq!(
         error.to_string(),
@@ -74,16 +93,16 @@ fn encoded(w: u32, h: u32) -> Arc<ImageFrame> {
 fn lazy_pixels_match_header_and_cache_identity() {
     let original = encoded(2000, 100);
     let resized = image(original.clone(), 1000).unwrap();
-    assert_eq!(resized.size(), ImageSize::new(1008, 56));
+    assert_eq!(resized.size(), ImageSize::new(980, 56));
     assert_eq!(
         (
             resized.image().unwrap().width(),
             resized.image().unwrap().height()
         ),
-        (1008, 56)
+        (980, 56)
     );
     assert_ne!(resized.hash, original.hash);
-    assert_eq!(resized.hash, image(original, 1009).unwrap().hash);
+    assert_eq!(resized.hash, image(original, 1007).unwrap().hash);
 }
 
 /// Reject oversized headers before trying to decode an empty payload.
@@ -107,46 +126,28 @@ fn rejects_image_budget_before_decoding_pixels() {
     assert!(budget(IMAGE_MAX_TOTAL_PIXELS, IMAGE_MAX_TOTAL_PIXELS, "image").is_ok());
 }
 
-/// Check source planning across shrink and enlargement half-grid ties.
+/// Across sources, at caps where no size passes the pixel budget, every side
+/// is on the grid, holds one cell at least and stays under the cap rounded
+/// down to the grid.
 #[test]
-fn geometry_matrix_and_ties_obey_the_source_contract() {
-    // Calculate the branch's rational scale separately, including caps exactly
-    // halfway between grid points after shrinking and sub-patch inputs.
-    let round_grid = |side: u64, numerator: u64, denominator: u64| {
-        let n = side * numerator;
-        let d = denominator * 28;
-        let q = n / d;
-        let r = n % d;
-        let rounded = q + u64::from(r * 2 > d || (r * 2 == d && q % 2 == 1));
-        (rounded.max(1) * 28) as u32
-    };
-    for w in [
-        1, 27, 28, 42, 70, 111, 112, 113, 999, 1000, 1008, 1125, 2067, 3584, 8192,
-    ] {
-        for h in [
-            1, 27, 28, 42, 70, 111, 112, 113, 999, 1000, 1008, 1125, 2067, 3584, 8192,
-        ] {
-            for cap in [
-                1, 27, 112, 150, 999, 1000, 1008, 1022, 2016, 2030, 3584, 8192,
-            ] {
-                let (num, den) = if w.max(h) > cap {
-                    (cap, w.max(h))
-                } else if w.min(h) < 112 {
-                    (112, w.min(h))
-                } else {
-                    (1, 1)
-                };
-                let expected = (
-                    round_grid(w.into(), num.into(), den.into()),
-                    round_grid(h.into(), num.into(), den.into()),
-                );
-                assert_eq!(dimensions(w, h, cap).unwrap(), expected, "{w}x{h}/{cap}");
+fn geometry_matrix_stays_on_the_grid_under_the_cap() {
+    const SIDES: [u32; 17] = [
+        1, 27, 28, 42, 70, 111, 112, 113, 167, 168, 999, 1000, 1008, 1125, 2067, 3584, 8192,
+    ];
+    for w in SIDES {
+        for h in SIDES {
+            for cap in [1, 27, 112, 150, 999, 1000, 1008, 1022, 2016, 2030, 3584] {
+                let sides = dimensions(w, h, cap).unwrap();
+                let limit = (cap - cap % 28).max(28);
+                for side in [sides.0, sides.1] {
+                    assert!(
+                        side % 28 == 0 && (28..=limit).contains(&side),
+                        "{w}x{h}/{cap}: {sides:?}"
+                    );
+                }
             }
         }
     }
-    assert!(dimensions(0, 112, 1000).is_err());
-    assert!(dimensions(112, 0, 1000).is_err());
-    assert!(dimensions(u32::MAX, 1, u32::MAX).is_err());
 }
 
 /// Check direct kernel pixels for each supported encoded format and alpha policy.
@@ -224,7 +225,7 @@ async fn tracker_deduplicates_without_confusing_effective_sizes() {
         STANDARD.encode(&source.raw_bytes)
     );
     let mut tracker = AsyncMultiModalTracker::new(connector).with_minimax_image_resize(true);
-    for cap in [1000, 1000, 1009, 2016] {
+    for cap in [1000, 1000, 1007, 2016] {
         tracker
             .push_part(MediaContentPart::ImageUrl {
                 url: url.clone().into(),
@@ -248,8 +249,8 @@ async fn tracker_deduplicates_without_confusing_effective_sizes() {
     assert!(Arc::ptr_eq(&frames[0], &frames[1]));
     assert_eq!(frames[0].hash, frames[2].hash);
     assert_ne!(frames[0].hash, frames[3].hash);
-    assert_eq!(frames[0].size(), ImageSize::new(1008, 56));
-    assert_eq!(frames[3].size(), ImageSize::new(2240, 112));
+    assert_eq!(frames[0].size(), ImageSize::new(980, 56));
+    assert_eq!(frames[3].size(), ImageSize::new(2016, 112));
 }
 
 /// A custom grid must not silently resize already planned source pixels again.
@@ -262,19 +263,34 @@ fn source_policy_rejects_an_incompatible_processor_grid() {
     assert!(MiniMaxM3VisionProcessor::from_preprocessor_config(&config).is_err());
 }
 
-/// The exact fixed area is admitted using only headers; one grid step more is refused.
+/// The exact fixed area is admitted using only headers; one grid step more is
+/// refused. Where the aligned size passes the budget the nearest-grid size
+/// stands, and a source that fits the budget with it is admitted.
 #[test]
 fn image_budget_boundary_needs_no_decode() {
-    for (side, valid) in [(3584, true), (3612, false)] {
+    for ((w, h, cap), planned) in [
+        ((3584, 3584, 3584), Some((3584, 3584))),
+        ((3612, 3612, 3612), None),
+        // The cap is rounded down to the grid, so the aligned size fits.
+        ((3600, 3600, 3600), Some((3584, 3584))),
+        // Aligned 3612x3612, 3556x3640 and 168x78820 pass the budget.
+        ((3590, 3590, 4000), Some((3584, 3584))),
+        ((3557, 3656, 3640), Some((3528, 3640))),
+        ((1, 499, 100_000), Some((112, 55_888))),
+    ] {
         let frame = Arc::new(ImageFrame::encoded(
             bytes::Bytes::new(),
             ImageDetail::Auto,
             ImageSource::InlineBytes,
             "boundary".into(),
-            ImageSize::new(side, side),
+            ImageSize::new(w, h),
             None,
         ));
-        assert_eq!(image(frame, side).is_ok(), valid);
+        assert_eq!(
+            image(frame, cap).ok().map(|frame| frame.size()),
+            planned.map(|(w, h)| ImageSize::new(w, h)),
+            "{w}x{h} cap {cap}"
+        );
     }
 }
 
@@ -293,7 +309,7 @@ fn sglang_day0_geometry_and_cache_identity() {
         assert!(sglang_dimensions(512, 512, cap).is_err());
     }
     assert!(sglang_dimensions(201, 1, 2016).is_err());
-    let frame = encoded(512, 512);
+    let frame = encoded(1008, 1008);
     let vllm = image(frame.clone(), 2016).unwrap();
     let sglang = image_for_runtime(frame, 2016, true).unwrap();
     assert_eq!(vllm.size(), sglang.size());
@@ -305,16 +321,16 @@ fn sglang_day0_geometry_and_cache_identity() {
 fn vllm_source_contract_is_unchanged_by_sglang_opt_in() {
     let frame = encoded(1000, 50);
     let resized = image(frame.clone(), 1000).unwrap();
-    assert_eq!(resized.size(), ImageSize::new(2240, 112));
+    assert_eq!(resized.size(), ImageSize::new(980, 56));
     let mut hash = blake3::Hasher::new();
     hash.update(b"minimax-m3-source-resize-v1");
     hash.update(frame.hash.as_bytes());
-    hash.update(&2240u32.to_le_bytes());
-    hash.update(&112u32.to_le_bytes());
+    hash.update(&980u32.to_le_bytes());
+    hash.update(&56u32.to_le_bytes());
     assert_eq!(resized.hash, hash.finalize().to_hex().to_string());
     assert_eq!(
         resized.image().unwrap().to_rgb8(),
-        resize_image(frame.image().unwrap().clone(), 2240, 112).to_rgb8()
+        resize_image(frame.image().unwrap().clone(), 980, 56).to_rgb8()
     );
     let error = sglang_dimensions(512, 512, 1000).unwrap_err();
     assert!(error
