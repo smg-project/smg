@@ -1154,10 +1154,9 @@ impl Objects<Members> {
 
     /// The classes of `generation`'s two lists as lent, derived now.
     ///
-    /// One side alone is no pair, as the store's own build of a model's
-    /// classes has it: where a list lends no worker whose row's object
-    /// stands, no member is made and the rule does not run, and every
-    /// worker of both lists takes class `0`.
+    /// One side alone is no pair: where a list lends no worker whose row's
+    /// object stands, no member is made and the rule does not run, and
+    /// every worker of both lists takes class `0`.
     fn derive_pairs(&self, generation: &Members, mode: Pairing) -> PartnerClasses {
         /// A row as the rule reads it: by the descriptor it states, else by
         /// `own`, what its worker object offers a partner.
@@ -1703,9 +1702,8 @@ mod tests {
         assert_eq!(retry(&replica, 7), unstated);
     }
 
-    /// One side alone is no pair, as the store's own build of a model's
-    /// classes has it: the holder makes no member and does not run the
-    /// rule, and every worker lent takes class `0`, which is what the rule
+    /// One side alone is no pair: the holder makes no member and does not run
+    /// the rule, and every worker lent takes class `0`, which is what the rule
     /// answers over one side. In a debug build the rule refuses to read a
     /// descriptor that stands between blanks, and no write of the store
     /// leaves one so. So the case lays such a row by the holder's own step:
