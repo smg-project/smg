@@ -1992,6 +1992,8 @@ impl Placement<'_> {
     pub fn decode_id(&self) -> Option<WorkerId>; // a pair's decode worker's id
     pub fn owes_events(&self) -> bool;           // a side under a lease has not ended
     pub fn kept(self) -> Placement<'static>;     // without the borrowed key, to keep to the end
+    // a pair's decode stands chosen: decode_again may pick it again
+    pub fn decode_chosen(&self) -> bool;
     // a pair's decode decided again behind its prefill's answer, the request stated again
     pub fn decode_again(&mut self, request: &PlaceRequest<'_>) -> Result<(), Unplaced>;
     // dropped with a side not ended: the engine hears a release before the side went out,
@@ -2057,6 +2059,8 @@ impl Placement<'static> {
 impl PlacementSide {
     pub fn sent(&mut self); // this side of the request went out
     pub fn profile(&self) -> &'static str; // the label of the profile that picked this side
+    // a pair's decode side: its decode stands chosen and may be decided again
+    pub fn decode_chosen(&self) -> bool;
     // a pair's decode side: its decode decided again, answered the decode the request goes to
     pub fn decode_again(&mut self, request: &PlaceRequest<'_>) -> Result<Arc<dyn Worker>, Unplaced>;
     pub fn side_end(&self) -> SideEnd; // a handle on this side's end
@@ -2093,9 +2097,11 @@ drop. One that never went out is released. So a host that sends a pair's decode 
 orders nothing by hand.
 
 A host that keeps sides asks the decode again on the pair's decode side, once the prefill
-side's send was said. It may let the prefill side go before that call or behind it. A prefill's
-end that waits is said behind the decode the call took. Behind a call that took none, it still
-waits. A side that is not a pair's decode side is refused by name, with no decision made.
+side's send was said. It asks first whether the decode still stands chosen (`decode_chosen`),
+and makes no call where it does not: the call would be refused by name, with no decision made.
+It may let the prefill side go before that call or behind it. A prefill's end that waits is said
+behind the decode the call took. Behind a call that took none, it still waits. A side that is
+not a pair's decode side is refused by name, with no decision made.
 
 Whatever a request lends that second decision (its rule, its headers, its ring, its lists'
 admission and their workers' own calls) is asked under the pair's lock. None of it may send or

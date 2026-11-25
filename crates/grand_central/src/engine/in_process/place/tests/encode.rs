@@ -285,6 +285,7 @@ fn references_beside_an_image_keep_one_decision_on_a_decode_that_takes_images() 
     let (prefill, takes_images) = (three.id(0, 0), three.id(1, 1));
     assert_eq!(*heard.lock(), [issued(prefill), issued(takes_images)]);
     placement.sent(Side::Prefill);
+    assert!(!placement.decode_chosen(), "a decode held to images");
     let never_chosen = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
     assert_eq!(placement.decode_again(&with_an_image), Err(never_chosen));
     drop(placement);
@@ -298,6 +299,7 @@ fn references_beside_an_image_keep_one_decision_on_a_decode_that_takes_images() 
     assert_eq!(three.places(&placement), (0, 0, vec![0]));
     assert_eq!(*heard.lock(), [issued(prefill)]);
     placement.sent(Side::Prefill);
+    assert!(placement.decode_chosen(), "no image holds the decode");
     assert_eq!(placement.decode_again(&with_none), Ok(()));
     assert_eq!(three.places(&placement), (0, 0, vec![0]));
     drop(placement);
@@ -375,6 +377,7 @@ fn a_request_whose_media_is_its_encoders_to_meet_keeps_one_decision() {
     let (prefill, decode) = (three.id(0, 0), three.id(1, 0));
     assert_eq!(*heard.lock(), [issued(prefill), issued(decode)]);
     placement.sent(Side::Prefill);
+    assert!(!placement.decode_chosen(), "a demand left to its encoders");
     let never_chosen = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
     assert_eq!(placement.decode_again(&demanding), Err(never_chosen));
     drop(placement);
@@ -388,6 +391,7 @@ fn a_request_whose_media_is_its_encoders_to_meet_keeps_one_decision() {
     assert_eq!(three.places(&placement), (0, 0, vec![0]));
     assert_eq!(*heard.lock(), [issued(prefill)]);
     placement.sent(Side::Prefill);
+    assert!(placement.decode_chosen(), "no demand is split");
     assert_eq!(placement.decode_again(&undemanding), Ok(()));
 }
 

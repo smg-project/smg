@@ -134,7 +134,9 @@ pub(crate) type CandidateFilter<'a> = &'a (dyn Fn(&dyn Worker) -> bool + Sync);
 /// The read of a model's pair index as it stands now, for a pair's decode
 /// asked again behind its prefill ([`decode_again`]). The read costs a
 /// snapshot and an index, so a route hands it as a call: Grand
-/// Central's arm alone makes it, once, and a classic pair reads nothing.
+/// Central's arm alone makes it, once, for a decode that stands chosen. A
+/// classic pair reads nothing, and so does a decode booked with its
+/// prefill.
 pub(crate) type PairsAgain<'a> = &'a dyn Fn() -> Arc<PdPairIndex>;
 
 /// What a route states of its request for Grand Central alone: the
@@ -973,7 +975,10 @@ impl ByEngine {
     /// the request stated for the engine alone at the first decision is
     /// stated again as this answer kept it ([`Stated`]). A side
     /// that a guard took already was sent: it is asked nothing, and the
-    /// pair index is not read.
+    /// pair index is not read. Nor is a side whose decode does not stand
+    /// chosen ([`PlacementSide::decode_chosen`]): the engine booked that
+    /// decode with its prefill, under a document that asks no decode again
+    /// or behind a hold of the request, and would refuse the call by name.
     #[inline(never)]
     #[expect(
         clippy::too_many_arguments,
@@ -996,6 +1001,13 @@ impl ByEngine {
         let Some(side) = held.as_mut() else {
             return (None, ahead);
         };
+        // A decode the engine booked with its prefill does not stand
+        // chosen: the document asks no decode again, or a hold of the
+        // request booked the pair whole. The engine would refuse the call
+        // by name, so none is made: the first decode stands.
+        if !side.decode_chosen() {
+            return (None, ahead);
+        }
         let pairs = pairs();
         let asked = with_pair_request(
             engine,
@@ -2740,7 +2752,12 @@ fn pair_by_engine(
 /// it decides its dispatch's shape ([`Placed::owed_behind_prefill`]), so a
 /// classic pair states no request again. The front is whole without that:
 /// always inlined, a classic answer pays the one test of its pointer here,
-/// and its pair index is not read.
+/// and its pair index is not read. Nor is a request stated again for a
+/// decode the engine booked with its prefill: the engine's arm asks the
+/// decode's side whether it stands chosen
+/// ([`PlacementSide::decode_chosen`]) before it reads the pair index, so
+/// the decode is decided again where the document asks it and nowhere
+/// else.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
@@ -10026,6 +10043,19 @@ pub(crate) mod tests {
         pair: &PlacedPair,
         ahead: WorkerLoadGuard,
     ) -> (Option<Placed>, WorkerLoadGuard) {
+        let pairs = || pairs_of(registry, policies);
+        asked_again_over(registry, policies, &pairs, rule, pair, ahead)
+    }
+
+    /// [`asked_again`] over the caller's own read of the pair index.
+    fn asked_again_over(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        pairs: PairsAgain<'_>,
+        rule: Option<CandidateFilter<'_>>,
+        pair: &PlacedPair,
+        ahead: WorkerLoadGuard,
+    ) -> (Option<Placed>, WorkerLoadGuard) {
         let inputs = PlacementInputs {
             candidate_filter: rule,
             ..Default::default()
@@ -10034,7 +10064,7 @@ pub(crate) mod tests {
             registry,
             policies,
             MODEL,
-            &|| pairs_of(registry, policies),
+            pairs,
             None,
             inputs,
             &pair.decode,
@@ -10283,14 +10313,27 @@ pub(crate) mod tests {
     }
 
     /// A document that picks a pair's decode with its prefill booked the
-    /// decode at the pair's one decision. The engine refuses the ask as a
-    /// decode that is not chosen, which is no failure of the request: the
-    /// guard handed in is the guard to keep, the ask says nothing, and the
-    /// route sends the first decode. The engine hears that decode's
-    /// dispatch at its send and its end at the guard's drop. Every pair is
-    /// placed so under the stock document.
+    /// decode at the pair's one decision, so that decode does not stand
+    /// chosen and its ask is answered at the answer's own test: the pair
+    /// index is not read and no request is stated again, where a decode
+    /// that stands chosen reads the index once. It is no failure of the
+    /// request: the guard handed in is the guard to keep, the ask says
+    /// nothing, and the route sends the first decode. The engine hears
+    /// that decode's dispatch at its send and its end at the guard's drop.
+    /// Every pair is placed so under the stock document.
     #[test]
     fn a_decode_booked_with_its_prefill_answers_the_ask_as_the_first_decode_standing() {
+        // The pair index is read once for each request an ask states again.
+        let reads = std::cell::Cell::new(0_usize);
+        let asked =
+            |registry: &WorkerRegistry, policies: &PolicyRegistry, pair: &PlacedPair, ahead| {
+                let counted = || {
+                    reads.set(reads.get() + 1);
+                    pairs_of(registry, policies)
+                };
+                asked_again_over(registry, policies, &counted, None, pair, ahead)
+            };
+
         let registry = one_pair();
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let heard = hearing_pairs_on(&policies, false);
@@ -10308,15 +10351,22 @@ pub(crate) mod tests {
             ]
         );
 
-        let (moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
+        let (moved, guard) = asked(&registry, &policies, &pair, ahead);
         assert!(moved.is_none());
         assert!(guard.counts(pair.decode.worker()));
         assert_eq!(said().len(), 4, "the ask says nothing");
+        assert_eq!(reads.get(), 0, "no request is stated for this decode");
 
         let guard = pair.decode.sent(guard);
         assert_eq!(said()[4..], ["dispatched Decode"]);
         drop(guard);
         assert_eq!(said()[5..], ["completed Cancelled"]);
         assert_eq!(pair.decode.load(), 0);
+
+        // A decode that stands chosen is decided again by one request.
+        let (registry, policies, _heard, pair, ahead) = a_pair_behind_its_prefill();
+        let (_moved, guard) = asked(&registry, &policies, &pair, ahead);
+        assert_eq!(reads.get(), 1, "the one request reads the pair index");
+        drop(guard);
     }
 }

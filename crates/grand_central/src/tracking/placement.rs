@@ -317,6 +317,20 @@ impl Placement<'_> {
         self.held.as_ref().is_some_and(DecisionGuard::owes)
     }
 
+    /// Whether the pair's decode stands chosen, as the lease's guard says
+    /// it ([`DecisionGuard::decode_chosen`]): the document picks the decode
+    /// after the prefill, the first decision named a decode and booked
+    /// nothing for it, and [`Self::decode_again`] may decide it again.
+    /// `false` for a decode booked with its prefill and for a single
+    /// request, and from that call's pick, from the decode's send and from
+    /// the prefill's end. A host asks it ahead of [`Self::decode_again`]:
+    /// where it answers `false` that call is refused by name with no
+    /// decision made, so the host states no request again.
+    #[must_use]
+    pub fn decode_chosen(&self) -> bool {
+        self.held.as_ref().is_some_and(DecisionGuard::decode_chosen)
+    }
+
     /// Decides a pair's decode again, behind its prefill's answer, for a
     /// pair whose first decision booked the prefill alone
     /// ([`PlaceRequest::decode_again`] under a document that picks the
