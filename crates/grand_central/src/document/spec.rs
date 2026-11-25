@@ -6032,8 +6032,8 @@ impl AppliedSpec {
         self.decode_pick
     }
 
-    /// The lists this generation declares, as a store reads them when it
-    /// writes a worker's row.
+    /// The lists this generation declares: a worker's candidate row is
+    /// written under them, and a store counts the members outside them.
     #[must_use]
     pub fn lists(&self) -> &ViewLists {
         &self.lists
@@ -6048,8 +6048,8 @@ impl AppliedSpec {
     }
 }
 
-/// The lists a generation declares, as a store reads them when it writes a
-/// worker's row ([`Candidate`](crate::engine::view::Candidate)): the row names its
+/// The lists a generation declares, as the writer of a worker's candidate
+/// row ([`Candidate`](crate::engine::view::Candidate)) reads them: the row names its
 /// engine family and its zone by a position from 1, and holds one bit for
 /// each label selector the worker meets. Built once, at validation.
 #[derive(Debug, Default, PartialEq, Eq)]

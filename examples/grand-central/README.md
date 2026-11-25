@@ -161,15 +161,11 @@ This example registers the one the stock controller's binary runs on, with
 the same settings: `src/main.rs` declares both, and `Cargo.toml` names one
 dependency under a target rule. The rule leaves an Apple target out: the
 allocator compiles no background thread there, which the settings ask for,
-and the example runs on the system allocator. The choice shows under
-registrations. Each one builds the store's world again, and the system
-allocator keeps resident what those builds free. In a one-thread probe of the
-store, 4,096 registrations of one model leave hundreds of megabytes resident
-under the system allocator and about a dozen under this one. A controller
-that registers none runs on the system allocator and pays that. On Linux
-aarch64 the allocator is built for 64 KiB pages, so one binary runs on every
-page size: the workspace's cargo configuration sets it, and a repository of
-your own needs the same line.
+and the example runs on the system allocator. A controller that registers
+none runs on the system allocator. On Linux aarch64 the allocator is built
+for 64 KiB pages, so one binary runs on every page size: the workspace's
+cargo configuration sets it, and a repository of your own needs the same
+line.
 
 ## In a repository of your own
 

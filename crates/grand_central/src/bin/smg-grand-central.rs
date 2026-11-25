@@ -7,9 +7,7 @@ use std::process::ExitCode;
 use smg_grand_central::{service::controller, stages::StageRegistry};
 
 /// The process's allocator, the one the gateway's binary registers, on the
-/// targets the gateway registers it. A burst of registrations builds the
-/// store's world again at every write: the system allocator keeps resident
-/// what those builds free, hundreds of megabytes where the heap holds a few.
+/// targets the gateway registers it.
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

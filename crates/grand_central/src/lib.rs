@@ -50,7 +50,7 @@
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
 //!   which the controller's store is fed (membership, health,
-//!   reservations, sessions, leases), the one-process
+//!   reservations, leases), the one-process
 //!   [`store::MemoryStore`] behind them and the contract tests over it. KV
 //!   events are the worker host's: they feed the index its tables hold for
 //!   each model (`worker_host::KvTables`), which no decision reads yet. A
