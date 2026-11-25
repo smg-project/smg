@@ -1,15 +1,16 @@
 """Warm-up readiness regressions against the project's current modules.
 
-The failure case originally reproduced unsafe readiness on 14f7; both cases
-now guard the repair and its healthy partial-budget behavior. Only the clock
+The original cases retain the 14f7 safety and between-step budget contracts.
+The deadline-aware cases separately exercise the real tail-request deadline. Only the clock
 and wire/server/task dependencies are fake. Neither tested function is
 extracted, copied, replaced, wrapped, or marked xfail. These CPU tests make
 no claim about historical runtime identity or the underlying GPU stall.
 """
 
-import json
+import asyncio
 from types import SimpleNamespace
 
+import pytest
 from smg_grpc_servicer import rust_lifecycle as lifecycle
 from smg_grpc_servicer import warmup
 
@@ -109,27 +110,6 @@ def run_case(monkeypatch, *, fail_second):
     try:
         report = warmup.run_warmup(make_plan(), wire, budget_secs=10.0)
         lifecycle._warmup_over(server, FakeCompletedTask(report))
-        print(
-            "FAKEWIRE_TRACE "
-            + json.dumps(
-                {
-                    "scenario": "timeout_and_failed_flush"
-                    if fail_second
-                    else "healthy_partial_budget",
-                    "covered": report.covered,
-                    "errors": report.errors,
-                    "budget_hit": report.budget_hit,
-                    "flushed": report.flushed,
-                    "flush_refusal": report.flush_refusal,
-                    "generate_calls": wire.calls,
-                    "pending_backend": sorted(wire.pending_backend),
-                    "readiness_events": server.events,
-                    "wire_resources": "no real network, model, threads or backend",
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
         return report, wire, server
     finally:
         wire.close()
@@ -165,5 +145,110 @@ def test_completed_partial_budget_releases_readiness(monkeypatch):
     assert wire.flush_calls == 1
     assert wire.pending_backend == set()
     assert wire.closed is True
+    assert server.ready is True
+    assert server.events == [False, True]
+
+
+class DeadlineClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+class DeadlineAwareWire:
+    def __init__(self, clock):
+        self.clock = clock
+        self.calls = []
+        self.completed = []
+        self.pending_backend = set()
+        self.deadline_events = []
+        self.flush_calls = 0
+        self.closed = False
+
+    def generate(self, request, timeout):
+        self.calls.append((request.request_id, timeout))
+        self.pending_backend.add(request.request_id)
+        if timeout < 3.0:
+            self.clock.now += timeout
+            self.deadline_events.append((request.request_id, timeout, self.clock.now))
+            raise TimeoutError("Generate deadline; backend completion remains unacknowledged")
+        self.clock.now += 3.0
+        self.pending_backend.remove(request.request_id)
+        self.completed.append(request.request_id)
+        return object()
+
+    def flush_cache(self):
+        self.flush_calls += 1
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+class AsyncDeadlineAwareWire(DeadlineAwareWire):
+    async def generate(self, request, timeout):
+        await asyncio.sleep(0)
+        return super().generate(request, timeout)
+
+    async def flush_cache(self):
+        return super().flush_cache()
+
+    async def close(self):
+        return super().close()
+
+
+@pytest.mark.parametrize("async_wire", [False, True], ids=["blocking", "async"])
+def test_budget_deadline_does_not_interrupt_a_healthy_admitted_request(monkeypatch, async_wire):
+    clock = DeadlineClock()
+    monkeypatch.setattr(warmup, "time", SimpleNamespace(monotonic=clock.monotonic))
+    requests = tuple(
+        warmup.WarmupRequest(f"smg-warmup-deadline-{n}", 8, 1, n, 32) for n in range(5)
+    )
+    steps = tuple(
+        warmup.WarmupStep(f"deadline-prefill-{n}", "prefill", (request,))
+        for n, request in enumerate(requests)
+    )
+    plan = warmup.WarmupPlan("full", make_plan().inputs, steps)
+    wire = AsyncDeadlineAwareWire(clock) if async_wire else DeadlineAwareWire(clock)
+
+    async def execute():
+        try:
+            report = await warmup.run_warmup_async(plan, wire, budget_secs=10.0)
+            assert not (asyncio.all_tasks() - {asyncio.current_task()})
+            return report
+        finally:
+            await wire.close()
+
+    if async_wire:
+        report = asyncio.run(execute())
+    else:
+        try:
+            report = warmup.run_warmup(plan, wire, budget_secs=10.0)
+        finally:
+            wire.close()
+    server = FakeServer()
+    lifecycle.hold_readiness(server, False)
+    can_serve = lifecycle._warmup_over(server, FakeCompletedTask(report))
+    assert report.unrecovered_transport_errors == 0, {
+        "clock": clock.now,
+        "calls": wire.calls,
+        "pending": sorted(wire.pending_backend),
+        "deadline_events": wire.deadline_events,
+    }
+    assert report.covered == 4 < len(plan.steps)
+    assert report.errors == 0
+    assert report.budget_hit is True
+    assert report.flushed is True
+    assert report.flush_refusal is None
+    assert wire.calls == [(request.request_id, 10.0) for request in requests[:4]]
+    assert wire.completed == [request.request_id for request in requests[:4]]
+    assert wire.deadline_events == []
+    assert wire.pending_backend == set()
+    assert wire.flush_calls == 1
+    assert wire.closed is True
+    assert report.secs == clock.now == 12.0
+    assert can_serve is True
     assert server.ready is True
     assert server.events == [False, True]

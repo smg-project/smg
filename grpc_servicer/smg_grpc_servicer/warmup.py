@@ -54,10 +54,19 @@ flips, so the first-time costs are paid while nothing is routed here:
 
 Every request carries its own token ids (no two requests share a prefix
 block), so prefix caching never turns a planned prefill into a hit, and the
-engine's cache is flushed at the end. A failed request is a logged line, never
-the end of the start; a time budget bounds the whole pass, each request's
-timeout clamped to what is left of it. Under data parallelism every rank is a
-scheduler of its own: the plan runs the staircase once per rank and every
+engine's cache is flushed at the end. Ordinary request failures are logged
+without ending the start; an unconfirmed Generate transport failure must
+keep readiness held. The time budget stops admission of new steps; an
+admitted step keeps a bounded completion window. Each request's timeout is
+its caller's, capped by the initial budget (or the timeout floor), not by a
+shrinking remainder. For wires that respect their deadlines, the Generate
+phase takes at most the budget plus that fixed ceiling and fanout/scheduling
+overhead. The cache flush is separate (the gRPC wires bound it at 60 seconds);
+a generic in-process wire must supply its own flush bound. Thus a 300-second
+budget with the default 600-second caller timeout can take about 600 seconds
+for Generate, plus the flush. A real timeout still leaves engine-side
+completion unconfirmed and cannot release readiness. Under data parallelism
+every rank is a scheduler of its own: the plan runs the staircase once per rank and every
 prefill shape on every rank at once, each request pinned to its rank, where
 the wire can pin one (:attr:`WarmupInputs.data_parallel_size`). The engine
 modules supply the inputs (:class:`WarmupInputs`) and the wire
@@ -83,8 +92,9 @@ LEVEL_FAST = "fast"
 LEVEL_FULL = "full"
 LEVELS = (LEVEL_FAST, LEVEL_FULL)
 DEFAULT_LEVEL = LEVEL_FULL
-#: The whole pass is bounded by this many seconds unless the knob says
-#: otherwise. An engine module whose plan is longer (the chunk remainders)
+#: New steps are admitted for at most this many seconds unless the knob says
+#: otherwise; an admitted step retains the bounded completion window above.
+#: An engine module whose plan is longer (the chunk remainders)
 #: states a default of its own through :func:`parse_setting`'s
 #: ``default_budget_secs``; the engines that plan the length classes alone
 #: keep this one.
@@ -112,9 +122,9 @@ TOKEN_ID_SPAN_MAX = 30000
 CONSECUTIVE_FAILED_STEPS = 3
 #: How long one warm-up request may take; a step at a new shape pays a compile.
 REQUEST_TIMEOUT_SECS = 600.0
-#: A request's timeout never drops below this when the budget's remainder
-#: clamps it: the engine gets a second to answer the shape before the request
-#: counts as failed and the pass ends on the budget.
+#: A budget below this uses this floor when capping a request's completion
+#: window. A caller may still select a shorter timeout. Expiry remains an
+#: unconfirmed Generate transport failure, not permission to serve.
 REQUEST_TIMEOUT_FLOOR_SECS = 1.0
 #: The running window the staircase assumes when the engine's configuration
 #: does not state one (the engines' common default).
@@ -752,7 +762,8 @@ class WarmupReport:
                 text += f": {self.flush_refusal}"
         if self.unrecovered_transport_errors:
             text += (
-                f"; {self.unrecovered_transport_errors} request transport errors"
+                f"; {self.unrecovered_transport_errors} request transport "
+                f"error{'s' if self.unrecovered_transport_errors != 1 else ''}"
                 "; engine-side completion unconfirmed"
             )
         return text
@@ -789,7 +800,7 @@ class _Pass:
         done = len(self.report.results)
         if done >= len(self.plan.steps):
             return None
-        if time.monotonic() - self._started > self.budget_secs:
+        if time.monotonic() - self._started >= self.budget_secs:
             self.report.budget_hit = True
             return None
         if self._failed_in_a_row >= CONSECUTIVE_FAILED_STEPS:
@@ -803,17 +814,14 @@ class _Pass:
             return None
         return self.plan.steps[done]
 
-    def remaining(self) -> float:
-        """What is left of the budget, :data:`REQUEST_TIMEOUT_FLOOR_SECS` at least."""
-        return max(
-            self.budget_secs - (time.monotonic() - self._started), REQUEST_TIMEOUT_FLOOR_SECS
-        )
-
     def timeout(self, request_timeout_secs: float) -> float:
-        """A request's timeout: the caller's, clamped to what is left of the
-        budget, so a step that hangs near the budget's end cannot hold
-        readiness past it."""
-        return min(request_timeout_secs, self.remaining())
+        """The fixed completion ceiling of each admitted request.
+
+        The budget stops new steps, without cutting short an admitted request
+        solely because earlier steps used time. This stays finite even when
+        the caller's timeout is much longer than the initial pass budget.
+        """
+        return min(request_timeout_secs, max(self.budget_secs, REQUEST_TIMEOUT_FLOOR_SECS))
 
     def record(self, step: WarmupStep, secs: float, errors: list[BaseException]) -> None:
         self.report.results.append(StepResult(step, secs, len(errors)))
@@ -944,9 +952,11 @@ def run_warmup(
     log: logging.Logger = logger,
 ) -> WarmupReport:
     """Run ``plan`` over a blocking ``wire``: the requests of a step together
-    (one thread each), the steps in order, under ``budget_secs`` (a request's
-    timeout is ``request_timeout_secs`` clamped to what is left of the
-    budget); the engine's cache flushed at the end. Returns the report."""
+    (one thread each), admitting steps for ``budget_secs``. An admitted
+    request keeps a fixed timeout: ``request_timeout_secs`` capped by the
+    initial budget or the timeout floor. Generate may run for the admission
+    budget plus that ceiling and fanout/scheduling overhead; the engine's cache
+    flush follows under the wire's own separate bound. Returns the report."""
     run = _Pass(plan, budget_secs, log)
     while (step := run.next_step()) is not None:
         started = time.monotonic()
@@ -984,8 +994,10 @@ async def run_warmup_async(
     request_timeout_secs: float = REQUEST_TIMEOUT_SECS,
     log: logging.Logger = logger,
 ) -> WarmupReport:
-    """:func:`run_warmup` over a wire whose methods are coroutines (an engine
-    driven in this process, on its event loop)."""
+    """:func:`run_warmup` with the same admission budget and fixed request
+    ceiling, over coroutine methods (an engine driven on its event loop).
+    The wire supplies its own flush bound; this driver does not add one.
+    """
     run = _Pass(plan, budget_secs, log)
     while (step := run.next_step()) is not None:
         started = time.monotonic()
