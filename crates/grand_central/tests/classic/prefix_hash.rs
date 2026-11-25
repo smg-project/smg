@@ -757,9 +757,7 @@ pub mod through_the_one_call {
     use openai_protocol::worker::WorkerStatus;
     use smg_grand_central::{
         document::AppliedSpec,
-        engine::{
-            HeaderRead, InProcess, LentList, ListCell, PlaceRequest, Prompt, WorkerId, WorkerLists,
-        },
+        engine::{HeaderRead, InProcess, LentList, ListCell, PlaceRequest, WorkerId, WorkerLists},
         policies::consistent_hashing::{Head, LentRing},
     };
     use smg_worker::{identity::basic::Worker, test_support::ready_worker};
@@ -882,11 +880,7 @@ pub mod through_the_one_call {
                 .collect();
             // The list as its host lends it: with the cell it keeps beside it.
             let cell = ListCell::default();
-            let members = LentList {
-                workers: &list,
-                cell: &cell,
-                facts: None,
-            };
+            let members = LentList::of(&list, &cell);
             let hold = |loads: &[u32]| {
                 for (worker, &load) in list.iter().zip(loads) {
                     while worker.load() < load as usize {
@@ -930,17 +924,12 @@ pub mod through_the_one_call {
                     .iter()
                     .map(|&i| WorkerId::from_address(&url(i)));
                 let tried: Vec<WorkerId> = tried.collect();
-                let asked = PlaceRequest {
-                    prompt: Prompt {
-                        tokens: tokens.as_deref(),
-                        text: text.as_deref(),
-                        ..Prompt::NONE
-                    },
-                    headers,
-                    tried: &tried,
-                    ring: Some(&lender),
-                    ..PlaceRequest::of(MODEL, WorkerLists::Single(members))
-                };
+                let mut asked = PlaceRequest::of(MODEL, WorkerLists::Single(members));
+                asked.prompt.tokens = tokens.as_deref();
+                asked.prompt.text = text.as_deref();
+                asked.headers = headers;
+                asked.tried = &tried;
+                asked.ring = Some(&lender);
                 let placement = engine.place(&asked).map_err(|why| format!("{why:?}"))?;
                 let went = |held: &Arc<dyn Worker>| Arc::ptr_eq(held, &placement.worker);
                 answers.push(list.iter().position(went).expect("a worker of the row"));

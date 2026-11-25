@@ -269,15 +269,9 @@ mod tests {
         /// The engine's one call for a request over the list as it stands:
         /// the address of the worker it is placed on, or why it has none.
         fn place(&self, admits: Option<WorkerRule<'_>>) -> Result<String, Unplaced> {
-            let lent = LentList {
-                workers: &self.workers,
-                cell: &self.cell,
-                facts: None,
-            };
-            let request = PlaceRequest {
-                admits,
-                ..PlaceRequest::of(MODEL, WorkerLists::Single(lent))
-            };
+            let lent = LentList::of(&self.workers, &self.cell);
+            let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
+            request.admits = admits;
             let placement = self.engine.place(&request)?;
             Ok(placement.worker.url().to_owned())
         }

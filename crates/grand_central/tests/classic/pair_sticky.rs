@@ -368,26 +368,12 @@ impl<'r> Bed<'r> {
         tried: Option<[usize; 2]>,
     ) -> Result<Here, &'static str> {
         let [prefill_cell, decode_cell] = &self.cells;
-        let lists = PairLists {
-            prefill: LentList {
-                workers: &self.prefills,
-                cell: prefill_cell,
-                facts: None,
-            },
-            decode: LentList {
-                workers: &self.decodes,
-                cell: decode_cell,
-                facts: None,
-            },
-            classes: &self.classes,
-            admission: &Open,
-            prefill_places: None,
-            decode_places: None,
-            prefill_stalled: &[],
-            prefill_held: &[],
-            decode_stalled: &[],
-            decode_held: &[],
-        };
+        let lists = PairLists::of(
+            LentList::of(&self.prefills, prefill_cell),
+            LentList::of(&self.decodes, decode_cell),
+            &self.classes,
+            &Open,
+        );
         let (key, id) = (key.map(|key| self.key(key)), id.map(|id| self.key(id)));
         let keyed;
         let headers: &dyn HeaderRead = match &key {
@@ -402,14 +388,12 @@ impl<'r> Bed<'r> {
                 .map(|worker| WorkerId::from_address(worker.url()))
                 .to_vec()
         });
-        let request = PlaceRequest {
-            headers,
-            request_id: id.as_deref(),
-            attempt: u8::from(!tried.is_empty()),
-            tried: &tried,
-            ring: self.ring.as_ref().map(|ring| ring as &dyn LentRing),
-            ..PlaceRequest::of(model, WorkerLists::Pair(lists))
-        };
+        let mut request = PlaceRequest::of(model, WorkerLists::Pair(lists));
+        request.headers = headers;
+        request.request_id = id.as_deref();
+        request.attempt = u8::from(!tried.is_empty());
+        request.tried = &tried;
+        request.ring = self.ring.as_ref().map(|ring| ring as &dyn LentRing);
         let mut placement = match self.engine.place(&request) {
             Ok(placement) => placement,
             // A shed by its reason, its stage and its side, as the pair

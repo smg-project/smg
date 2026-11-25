@@ -77,8 +77,8 @@ use smg_grand_central::{
     document::{AppliedSpec, Assignment, PolicySpec},
     engine::{
         prefills_full, Decided, Decision, DecodeVerdict, Demands, Identity, InProcess, LiftedVeto,
-        PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain, Prompt,
-        PublishedList, Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
+        PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain, PublishedList,
+        Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -383,18 +383,12 @@ impl Decodes {
     /// The pair's two lists as `host` hands them for one request: its own
     /// list as the prefills, and these decodes.
     fn lists<'a>(&'a self, host: &'a Host) -> WorkerLists<'a> {
-        WorkerLists::Pair(PairLists {
-            prefill: host.list.lent(),
-            decode: self.list.lent(),
-            classes: &self.classes,
-            admission: self.admission,
-            prefill_places: None,
-            decode_places: None,
-            prefill_stalled: &[],
-            prefill_held: &[],
-            decode_stalled: &[],
-            decode_held: &[],
-        })
+        WorkerLists::Pair(PairLists::of(
+            host.list.lent(),
+            self.list.lent(),
+            &self.classes,
+            self.admission,
+        ))
     }
 
     /// One pair request of `host` by the one call: the model, the two
@@ -405,15 +399,10 @@ impl Decodes {
     /// ([`NAMED`]). The call answers workers and no place of a list, so the
     /// place this says is the first.
     fn called(&self, host: &Host, rule: bool, named: bool) -> Option<u32> {
-        let mut request = PlaceRequest {
-            prompt: Prompt {
-                tokens: Some(&place::PROMPT),
-                ..Prompt::NONE
-            },
-            admits: ruled::admits(rule),
-            demands: self.demands,
-            ..PlaceRequest::of(MODEL, self.lists(host))
-        };
+        let mut request = PlaceRequest::of(MODEL, self.lists(host));
+        request.prompt.tokens = Some(&place::PROMPT);
+        request.admits = ruled::admits(rule);
+        request.demands = self.demands;
         if named {
             request.headers = &NUMBER;
         }

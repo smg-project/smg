@@ -48,10 +48,10 @@ use serde::Deserialize;
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        fingerprint, Constraints, Decision, EncodeClasses, EncodeItems, EncodeLists, EncodeMember,
-        EncodePlaced, EncoderFacts, FixedFacts, Identity, InProcess, LentList, ListCell,
-        PairAdmission, PairLists, PartnerClasses, Phase, Request as HostRequest, RequestFacts,
-        RequestMaker, WorkerLists,
+        fingerprint, Decision, EncodeClasses, EncodeItems, EncodeLists, EncodeMember, EncodePlaced,
+        EncoderFacts, FixedFacts, Identity, InProcess, LentList, ListCell, PairAdmission,
+        PairLists, PartnerClasses, Phase, Request as HostRequest, RequestFacts, RequestMaker,
+        WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     store::{EncodeHandoff, EncodeOffer},
@@ -458,11 +458,9 @@ impl Fleet {
 
     /// The list at `list` as its host lends it for one decision.
     fn lent(&self, list: usize) -> LentList<'_> {
-        LentList {
-            workers: &self.lists[list],
-            cell: &self.cells[list],
-            facts: Some(&self.said[list]),
-        }
+        let mut lent = LentList::of(&self.lists[list], &self.cells[list]);
+        lent.facts = Some(&self.said[list]);
+        lent
     }
 }
 
@@ -549,26 +547,12 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer], lent: boo
     let prefill_classes: Vec<u32> = (0..row.prefills.len())
         .map(|at| classes.prefill_class(at))
         .collect();
-    let lists = EncodeLists {
-        pair: PairLists {
-            prefill: fleet.lent(0),
-            decode: fleet.lent(1),
-            classes: &fleet.partners,
-            admission: &Open,
-            prefill_places: None,
-            decode_places: None,
-            prefill_stalled: &[],
-            prefill_held: &[],
-            decode_stalled: &[],
-            decode_held: &[],
-        },
-        encoders: fleet.lent(2),
-        encoders_places: None,
-        encoders_stalled: &[],
-        encoders_held: &[],
-        facts: &of_encoders,
-        prefill_classes: &prefill_classes,
-    };
+    let lists = EncodeLists::of(
+        PairLists::of(fleet.lent(0), fleet.lent(1), &fleet.partners, &Open),
+        fleet.lent(2),
+        &of_encoders,
+        &prefill_classes,
+    );
     let now = Instant::now();
     let mut placed = EncodePlaced::new();
     let mut found = Vec::new();
@@ -613,18 +597,14 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer], lent: boo
         // The request as its host makes it for the prefill phase: held to
         // no wire, its decode sent with its prefill.
         let asked = Asked {
-            request: HostRequest {
-                id: &id,
-                facts: {
-                    let mut facts = RequestFacts::default();
-                    facts.model = MODEL;
-                    facts.phase = Phase::Prefill;
-                    facts.media.images = u16::from(request.images);
-                    facts.seed = seed;
-                    facts
-                },
-                constraints: Constraints::default(),
-            },
+            request: HostRequest::of(&id, {
+                let mut facts = RequestFacts::default();
+                facts.model = MODEL;
+                facts.phase = Phase::Prefill;
+                facts.media.images = u16::from(request.images);
+                facts.seed = seed;
+                facts
+            }),
             lists,
         };
         let decision = match engine.decide_encode_at(&asked, items, &mut placed, || now) {

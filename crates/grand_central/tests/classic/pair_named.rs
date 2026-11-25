@@ -319,37 +319,21 @@ fn run(row: &Row) -> Result<Vec<Here>, String> {
     );
     let (prefill_cell, decode_cell) = (ListCell::default(), ListCell::default());
     let gates = Gates(row);
-    let lists = PairLists {
-        prefill: LentList {
-            workers: &prefills,
-            cell: &prefill_cell,
-            facts: None,
-        },
-        decode: LentList {
-            workers: &decodes,
-            cell: &decode_cell,
-            facts: None,
-        },
-        classes: &classes,
-        admission: &gates,
-        prefill_places: None,
-        decode_places: None,
-        prefill_stalled: &[],
-        prefill_held: &[],
-        decode_stalled: &[],
-        decode_held: &[],
-    };
+    let lists = PairLists::of(
+        LentList::of(&prefills, &prefill_cell),
+        LentList::of(&decodes, &decode_cell),
+        &classes,
+        &gates,
+    );
     let headers = [(TARGET, row.target.as_str())];
     let tried: Vec<WorkerId> = row.tried.map_or_else(Vec::new, |[prefill, decode]| {
         [&prefills[prefill], &decodes[decode]]
             .map(|worker| WorkerId::from_address(worker.url()))
             .to_vec()
     });
-    let request = PlaceRequest {
-        headers: &headers,
-        tried: &tried,
-        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists))
-    };
+    let mut request = PlaceRequest::of(MODEL, WorkerLists::Pair(lists));
+    request.headers = &headers;
+    request.tried = &tried;
     let at = |list: &[Arc<dyn Worker>], worker: &Arc<dyn Worker>| {
         let place = list.iter().position(|listed| Arc::ptr_eq(listed, worker));
         place.ok_or("a placement names a worker of no list")

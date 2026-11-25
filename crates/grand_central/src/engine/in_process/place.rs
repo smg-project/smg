@@ -64,11 +64,6 @@
 //! request is made of that anew: its routing value derived and its prompt's
 //! blocks hashed a second time.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 mod decode_again;
 mod encode;
 mod pair;
@@ -191,6 +186,7 @@ pub trait PromptEntry {
 /// A request's prompt, as its caller holds it: what the stages that place a
 /// prompt on the worker that holds its beginning read.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct Prompt<'a> {
     /// The prompt's token ids, where the caller tokenized it.
     pub tokens: Option<&'a [u32]>,
@@ -229,7 +225,9 @@ pub struct Prompt<'a> {
 }
 
 impl Prompt<'_> {
-    /// A request that states no prompt.
+    /// A request that states no prompt. Code outside this crate starts
+    /// here and assigns what its request states: the record gains fields,
+    /// so no literal of it builds there.
     pub const NONE: Self = Self {
         tokens: None,
         text: None,
@@ -257,15 +255,16 @@ pub type WorkerRule<'a> = &'a dyn Fn(&dyn Worker) -> bool;
 
 /// What a caller states of one request.
 ///
-/// Every field is the caller's own reading of its request. A caller names
-/// the fields it holds over [`PlaceRequest::of`], which states nothing
-/// else:
-/// `PlaceRequest { streaming: true, tried: &tried, ..PlaceRequest::of(model, lists) }`.
+/// Every field is the caller's own reading of its request. A caller starts
+/// from [`PlaceRequest::of`], which states nothing else, and assigns the
+/// fields it holds: `request.streaming = true; request.tried = &tried;`.
+/// The record gains fields, so no literal of it builds outside this crate.
 ///
 /// A request is not [`Send`]: its headers, its route's rule and its
 /// prompt's entry in a lent tree are borrowed as their caller holds them,
 /// and none is asked to be [`Sync`]. A caller makes one for each call,
 /// between two awaits.
+#[non_exhaustive]
 pub struct PlaceRequest<'a> {
     /// The model the request is for, as its caller resolved it.
     pub model: &'a str,

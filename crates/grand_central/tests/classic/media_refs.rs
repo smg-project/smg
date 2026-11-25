@@ -125,12 +125,10 @@ impl Replayed for Row {
         let mut answers = Vec::with_capacity(self.requests.len());
         for asked in &self.requests {
             let (wire_modes, runtime) = runtimes.stays_on(asked.wire.as_ref())?;
-            let demands = Demands {
-                runtime,
-                vision: asked.pixels,
-                references: asked.references(),
-                ..Demands::default()
-            };
+            let mut demands = Demands::default();
+            demands.runtime = runtime;
+            demands.vision = asked.pixels;
+            demands.references = asked.references();
             let mut constraints = Constraints::default();
             constraints.wire_modes = wire_modes;
             constraints.demands = demands;

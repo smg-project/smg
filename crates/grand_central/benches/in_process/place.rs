@@ -17,6 +17,7 @@
 //! conversations states each turn's own ([`turn`]).
 //!
 //! [`InProcess::place`]: smg_grand_central::engine::InProcess::place
+//! [`Prompt::entry`]: smg_grand_central::engine::Prompt::entry
 
 use std::{
     borrow::Cow,
@@ -24,7 +25,7 @@ use std::{
 };
 
 use smg_grand_central::{
-    engine::{Identity, PlaceRequest, Prompt, PromptEntry, TokenKey, WorkerLists},
+    engine::{Identity, PlaceRequest, PromptEntry, TokenKey, WorkerLists},
     policies::consistent_hashing::LentRing,
     tracking::{Outcome, Placement, Side, TransportClass},
 };
@@ -91,16 +92,11 @@ pub(super) fn lent(host: &Host) -> Option<&'static dyn LentRing> {
 /// the place this says is the first. With `rule` the request states a
 /// route's rule ([`ruled::admits`]), and it lends `ring` ([`lent`]).
 pub(super) fn one(host: &Host, rule: bool, ring: Option<&'static dyn LentRing>) -> Option<u32> {
-    let request = PlaceRequest {
-        prompt: Prompt {
-            tokens: Some(&PROMPT),
-            entry: Some(&Whole),
-            ..Prompt::NONE
-        },
-        admits: ruled::admits(rule),
-        ring,
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()))
-    };
+    let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()));
+    request.prompt.tokens = Some(&PROMPT);
+    request.prompt.entry = Some(&Whole);
+    request.admits = ruled::admits(rule);
+    request.ring = ring;
     let mut answer = host.engine.place(&request);
     let placement = answer.as_mut().ok()?;
     if placement.owes_events() {
@@ -125,15 +121,10 @@ pub(super) fn asks() -> Option<bool> {
 /// the turn states a route's rule ([`ruled::admits`]), which a decision
 /// made inside the tree asks ahead of the tree's write.
 pub(super) fn turn(host: &Host, prompt: &conversations::Turn<'_>, rule: bool) -> Option<u32> {
-    let request = PlaceRequest {
-        prompt: Prompt {
-            tokens: Some(prompt.tokens),
-            entry: Some(prompt),
-            ..Prompt::NONE
-        },
-        admits: ruled::admits(rule),
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()))
-    };
+    let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()));
+    request.prompt.tokens = Some(prompt.tokens);
+    request.prompt.entry = Some(prompt);
+    request.admits = ruled::admits(rule);
     let mut answer = host.engine.place(&request);
     let placement = answer.as_mut().ok()?;
     let worker = placement.id().0 as u32;

@@ -57,8 +57,8 @@ use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{
         EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, FixedFacts, Identity, InProcess,
-        MediaCounts, PairLists, PartnerClasses, PlaceRequest, Plain, Prompt, PublishedList,
-        Request, RequestMaker, WorkerId, WorkerLists,
+        MediaCounts, PairLists, PartnerClasses, PlaceRequest, Plain, PublishedList, Request,
+        RequestMaker, WorkerId, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     store::GatewayId,
@@ -208,27 +208,17 @@ impl Sides {
     /// The three lists as the host hands them for one request.
     fn lists<'a>(&'a self, host: &'a Host) -> EncodeLists<'a> {
         let places = |list: usize| Some(self.places.as_ref()?[list].as_slice());
-        let pair = PairLists {
-            prefill: host.list.lent(),
-            decode: self.decodes.lent(),
-            classes: &self.classes,
-            admission: &Open,
-            prefill_places: places(0),
-            decode_places: places(1),
-            prefill_stalled: &[],
-            prefill_held: &[],
-            decode_stalled: &[],
-            decode_held: &[],
-        };
-        EncodeLists {
+        let mut pair = PairLists::of(host.list.lent(), self.decodes.lent(), &self.classes, &Open);
+        pair.prefill_places = places(0);
+        pair.decode_places = places(1);
+        let mut encode_lists = EncodeLists::of(
             pair,
-            encoders: self.encoders.lent(),
-            encoders_places: places(2),
-            encoders_stalled: &[],
-            encoders_held: &[],
-            facts: &self.facts,
-            prefill_classes: &self.prefill_classes,
-        }
+            self.encoders.lent(),
+            &self.facts,
+            &self.prefill_classes,
+        );
+        encode_lists.encoders_places = places(2);
+        encode_lists
     }
 
     /// One request of an `encode_ring...` cell, by the engine's entry or by
@@ -337,17 +327,12 @@ impl Sides {
         ring: Option<&dyn LentRing>,
         rule: bool,
     ) -> Option<u32> {
-        let request = PlaceRequest {
-            prompt: Prompt {
-                tokens: Some(&place::PROMPT),
-                ..Prompt::NONE
-            },
-            media: images(),
-            encode: Some(items),
-            ring,
-            admits: ruled::admits(rule),
-            ..PlaceRequest::of(MODEL, WorkerLists::Encode(self.lists(host)))
-        };
+        let mut request = PlaceRequest::of(MODEL, WorkerLists::Encode(self.lists(host)));
+        request.prompt.tokens = Some(&place::PROMPT);
+        request.media = images();
+        request.encode = Some(items);
+        request.ring = ring;
+        request.admits = ruled::admits(rule);
         let mut answer = host.engine.place(&request);
         let placement = answer.as_mut().ok()?;
         if placement.encoders.workers().len() != ITEMS {

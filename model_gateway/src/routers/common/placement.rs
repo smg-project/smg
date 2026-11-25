@@ -1488,12 +1488,11 @@ fn placed_by_engine(
     // Made where the list holds no worker alone: a list with workers pays
     // the test of its length.
     let own;
-    let lent = if lent.workers.is_empty() {
+    let mut lent = lent;
+    if lent.workers.is_empty() {
         own = smg_grand_central::engine::ListCell::default();
-        LentList { cell: &own, ..lent }
-    } else {
-        lent
-    };
+        lent.cell = &own;
+    }
     let mut tried = TriedIds::new();
     tried_ids(lent.workers, inputs.tried, &mut tried);
     let mut request = place_request(
@@ -2826,23 +2825,12 @@ fn with_pair_request<R>(
         Some(claimed) => claimed,
         None => &gates,
     };
-    let lists = PairLists {
-        prefill,
-        decode,
-        classes,
-        admission,
-        // No place of a list is stated. A pinned request is held to its
-        // wire by its demand, a side at a time, and the engine asks the
-        // route's rule of a list itself.
-        prefill_places: None,
-        decode_places: None,
-        // The gateway's standing vetoes are on its worker objects, which
-        // the engine reads: none is stated beside a list.
-        prefill_stalled: &[],
-        prefill_held: &[],
-        decode_stalled: &[],
-        decode_held: &[],
-    };
+    // No place of a list is stated. A pinned request is held to its
+    // wire by its demand, a side at a time, and the engine asks the
+    // route's rule of a list itself.
+    // The gateway's standing vetoes are on its worker objects, which
+    // the engine reads: none is stated beside a list.
+    let lists = PairLists::of(prefill, decode, classes, admission);
     // A failed attempt lists both its engines, whichever side failed.
     let (mut tried, mut decodes_tried) = (TriedIds::new(), TriedIds::new());
     tried_ids(prefill.workers, inputs.tried, &mut tried);

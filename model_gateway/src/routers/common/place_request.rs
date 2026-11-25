@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use smg_grand_central::engine::{
-    worker_id, Demands, FixedFacts, HashSeeds, HeaderRead, PlaceRequest, Prompt, PromptEntry,
-    TextKey, TokenKey, WorkerId, WorkerLists, WorkerRule,
+    worker_id, FixedFacts, HashSeeds, HeaderRead, PlaceRequest, PromptEntry, TextKey, TokenKey,
+    WorkerId, WorkerLists, WorkerRule,
 };
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker};
 
@@ -183,37 +183,33 @@ pub(crate) fn place_request<'a>(
         Some(headers) => headers,
         None => &(),
     };
-    PlaceRequest {
-        prompt: Prompt {
-            tokens: inputs.tokens,
-            text: inputs.text,
-            seeds: seeds(inputs.cache_namespace),
-            entry: Some(inputs),
-        },
-        headers,
-        request_id: inputs.rid,
-        attempt: u8::try_from(inputs.tried.len()).unwrap_or(u8::MAX),
-        tried,
-        admits: inputs
-            .candidate_filter
-            .map(|rule| -> WorkerRule<'a> { rule }),
-        max_output_tokens: stated.max_output_tokens,
-        explain_id_header: Some(request_id::OWN_REQUEST_ID.as_str()),
-        demands: Demands {
-            runtime: wire.map_or(0, |wire| wire_number(wire.runtime, wire.connection)),
-            ..Demands::default()
-        },
-        ..PlaceRequest::of(model_id, lists)
-    }
+    let mut request = PlaceRequest::of(model_id, lists);
+    request.prompt.tokens = inputs.tokens;
+    request.prompt.text = inputs.text;
+    request.prompt.seeds = seeds(inputs.cache_namespace);
+    request.prompt.entry = Some(inputs);
+    request.headers = headers;
+    request.request_id = inputs.rid;
+    request.attempt = u8::try_from(inputs.tried.len()).unwrap_or(u8::MAX);
+    request.tried = tried;
+    request.admits = inputs
+        .candidate_filter
+        .map(|rule| -> WorkerRule<'a> { rule });
+    request.max_output_tokens = stated.max_output_tokens;
+    request.explain_id_header = Some(request_id::OWN_REQUEST_ID.as_str());
+    request.demands.runtime = wire.map_or(0, |wire| wire_number(wire.runtime, wire.connection));
+    request
 }
 
 /// The two seeds of a request's cache partition, and the plain ones for a
 /// request with none: the seed its workers hash the partition's blocks
 /// under, and the partition's whole identity.
 fn seeds(namespace: Option<CacheNamespace>) -> HashSeeds {
-    namespace.map_or(HashSeeds::PLAIN, |namespace| HashSeeds {
-        event: namespace.event_seed(),
-        partition: namespace.partition_seed(),
+    namespace.map_or(HashSeeds::PLAIN, |namespace| {
+        let mut seeds = HashSeeds::PLAIN;
+        seeds.event = namespace.event_seed();
+        seeds.partition = namespace.partition_seed();
+        seeds
     })
 }
 
@@ -221,7 +217,7 @@ fn seeds(namespace: Option<CacheNamespace>) -> HashSeeds {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
     use openai_protocol::common::CachePartition;
-    use smg_grand_central::engine::{LentList, ListCell};
+    use smg_grand_central::engine::{Demands, LentList, ListCell};
 
     use super::*;
     use crate::{
@@ -259,11 +255,7 @@ mod tests {
         let namespace = CacheNamespace::derive(&partition).expect("a partition");
         let fleet: Arc<[Arc<dyn Worker>]> = Arc::from([worker("http://a:1"), worker("http://b:1")]);
         let cell = ListCell::default();
-        let lent = LentList {
-            workers: &fleet,
-            cell: &cell,
-            facts: None,
-        };
+        let lent = LentList::of(&fleet, &cell);
         let filter = |candidate: &dyn Worker| candidate.url() == "http://b:1";
         let engines = ["http://a:1".to_owned()];
         let mut ids = TriedIds::new();
@@ -301,10 +293,9 @@ mod tests {
         );
         assert_eq!(request.prompt.tokens, Some(&tokens[..]));
         assert_eq!(request.prompt.text, Some("a prompt"));
-        let seeds = HashSeeds {
-            event: namespace.event_seed(),
-            partition: namespace.partition_seed(),
-        };
+        let mut seeds = HashSeeds::PLAIN;
+        seeds.event = namespace.event_seed();
+        seeds.partition = namespace.partition_seed();
         assert_eq!(request.prompt.seeds, seeds);
         assert_eq!(
             request.headers.header("x-smg-routing-key"),
@@ -380,10 +371,8 @@ mod tests {
             Some(pinned),
             nothing,
         );
-        let demanded = Demands {
-            runtime: wire_number(RuntimeType::Vllm, ConnectionMode::Grpc),
-            ..Demands::default()
-        };
+        let mut demanded = Demands::default();
+        demanded.runtime = wire_number(RuntimeType::Vllm, ConnectionMode::Grpc);
         assert_eq!(request.demands, demanded);
         assert!(request.admits.is_some() && request.attempt == 1);
     }
