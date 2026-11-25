@@ -26,7 +26,8 @@
 //! program's own ring (`examples/in_process/ring.rs`) is taken in too: its
 //! cases read the ring a generation holds (`caller/lent_ring.rs`). The wire
 //! a retry stays on has its cases beside them (`caller/demand.rs`), and so
-//! has the route's own rule for a retry (`caller/rule.rs`).
+//! has the route's own rule for a retry (`caller/rule.rs`). The token tree
+//! the program lends has its cases too (`caller/tree.rs`).
 //!
 //! [`InProcess::place`]: smg_grand_central::engine::InProcess::place
 
@@ -58,6 +59,8 @@ mod rule;
 mod single;
 #[path = "caller/stage.rs"]
 mod stage;
+#[path = "caller/tree.rs"]
+mod tree;
 
 /// The model every case serves.
 const MODEL: &str = "model-a";
