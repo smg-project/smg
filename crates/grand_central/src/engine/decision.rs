@@ -442,6 +442,10 @@ pub struct Trace {
     /// sums runs past the trace's last row, the rows listed can differ
     /// too: each is a row of that tie.
     pub top: [(WorkerId, f32); TRACE_TOP],
+    /// How many rows of `top` are set, which can be none where the picker
+    /// compared workers: the decision the placing call keeps for a single
+    /// request reads no best row of its scores where no stage of the
+    /// document takes its issue and the document keeps no sample.
     pub top_len: u8,
     pub seed: u64,
     pub generation: u64,
