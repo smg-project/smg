@@ -141,9 +141,11 @@ pub trait CacheIndex: Send + Sync {
 
     /// How many times the index gave a number one worker handed back to the
     /// next worker that asked for one. A list's table reads it ahead of the
-    /// numbers and is read again once it moved, and a lookup it moved under
-    /// names nobody: a number that changed hands never names its former
-    /// worker. The default is an index that hands no number out twice.
+    /// numbers and is read again once it moved, a row it moved under
+    /// between the reads of the row's number and of its size keeps no
+    /// number, and a lookup it moved under names nobody: a number that
+    /// changed hands never names its former worker. The default is an
+    /// index that hands no number out twice.
     fn numbers_reused(&self) -> u64 {
         0
     }
@@ -1077,11 +1079,19 @@ impl Table {
             let Some(index) = &index else {
                 continue;
             };
+            let reused = index.numbers_reused();
             let number = index.worker_number(worker.url());
             let Some(number) = number.filter(|&number| (number as usize) < NUMBERS) else {
                 continue;
             };
             let blocks = index.worker_blocks(number);
+            // The count moved between the row's two reads, and it does not
+            // say which number moved: the size may be that of the number's
+            // new worker. The row keeps no number, so its worker takes no
+            // baseline from it.
+            if index.numbers_reused() != reused {
+                continue;
+            }
             numbers[row] = number;
             sizes[row] = count(blocks);
             // The worker keeps its own baseline: what its index held when

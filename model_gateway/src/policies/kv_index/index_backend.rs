@@ -468,8 +468,9 @@ const _: () = assert!(CHAIN_INDEX_SHARDS == 1);
 /// Grand Central's reads of the index, where it decides in the
 /// gateway's own process: a worker's id and its block count once a list of
 /// workers is read, and one lookup a request. The count of ids handed out
-/// again is read beside both: ahead of a list's ids, and by a request
-/// where it takes the list's table and behind its lookup.
+/// again is read beside both: ahead of a list's ids and around each
+/// worker's id and block count, and by a request where it takes the list's
+/// table and behind its lookup.
 impl CacheIndex for KvIndex {
     fn worker_number(&self, address: &str) -> Option<u32> {
         self.worker_id(address)

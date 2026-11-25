@@ -2601,6 +2601,79 @@ fn a_number_that_changed_hands_names_its_new_worker() {
     assert_eq!(bed.holders(&asked, NOW), [(1, 4, 0)]);
 }
 
+/// A chain index met by a handoff under one of its reads: the stream of
+/// worker 0 ends and worker 1 stores the handoff's blocks under its number.
+struct HandedOn {
+    index: ChainIndex,
+    handoff: Mutex<Option<(u32, ChainBlockMap, Vec<u64>)>>,
+    /// Whether the handoff meets the read of worker 0's number, ahead of
+    /// the read of the number's size. It meets the first lookup otherwise.
+    under_number: bool,
+}
+
+impl HandedOn {
+    fn hand_on(&self) {
+        if let Some((number, map, hashes)) = self.handoff.lock().take() {
+            self.index.remove_worker(number, map);
+            store(&self.index, 1, &hashes);
+        }
+    }
+}
+
+impl CacheIndex for HandedOn {
+    fn worker_number(&self, of: &str) -> Option<u32> {
+        let number = self.index.worker_id(of);
+        if self.under_number && of == address(0) {
+            self.hand_on();
+        }
+        number
+    }
+
+    fn numbers_reused(&self) -> u64 {
+        self.index.ids_reused()
+    }
+
+    fn worker_blocks(&self, number: u32) -> usize {
+        self.index.worker_block_count(number)
+    }
+
+    fn deepest_into(
+        &self,
+        block_hashes: &[u64],
+        block_size: u32,
+        within: &[u64],
+        cap: usize,
+        below: &mut dyn FnMut(u32) -> u32,
+        kept: &mut Vec<(u32, u32)>,
+    ) {
+        if !self.under_number {
+            self.hand_on();
+        }
+        CacheIndex::deepest_into(
+            &self.index,
+            block_hashes,
+            block_size,
+            within,
+            cap,
+            below,
+            kept,
+        );
+    }
+}
+
+/// The lending of a [`HandedOn`] index for every model.
+struct Lends(Arc<HandedOn>);
+
+impl CacheIndexes for Lends {
+    fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+        Some(Arc::clone(&self.0) as Arc<dyn CacheIndex>)
+    }
+
+    fn block_size(&self, _: &str) -> Option<u32> {
+        Some(BLOCK)
+    }
+}
+
 /// A number that changes hands under a decision's own lookup names nobody
 /// to it: the table read the number for its former worker, and the lookup
 /// finds the blocks of its new one. The next decision reads the table again
@@ -2608,63 +2681,6 @@ fn a_number_that_changed_hands_names_its_new_worker() {
 /// under such a lookup, and the next column holds the new worker's blocks.
 #[test]
 fn a_number_handed_on_under_a_lookup_names_nobody() {
-    /// A chain index whose first lookup is met by a handoff: the stream of
-    /// worker 0 ends and worker 1 stores the asked prompt under its number.
-    struct HandedOn {
-        index: ChainIndex,
-        handoff: Mutex<Option<(u32, ChainBlockMap, Vec<u64>)>>,
-    }
-
-    impl CacheIndex for HandedOn {
-        fn worker_number(&self, address: &str) -> Option<u32> {
-            self.index.worker_id(address)
-        }
-
-        fn numbers_reused(&self) -> u64 {
-            self.index.ids_reused()
-        }
-
-        fn worker_blocks(&self, number: u32) -> usize {
-            self.index.worker_block_count(number)
-        }
-
-        fn deepest_into(
-            &self,
-            block_hashes: &[u64],
-            block_size: u32,
-            within: &[u64],
-            cap: usize,
-            below: &mut dyn FnMut(u32) -> u32,
-            kept: &mut Vec<(u32, u32)>,
-        ) {
-            if let Some((number, map, hashes)) = self.handoff.lock().take() {
-                self.index.remove_worker(number, map);
-                store(&self.index, 1, &hashes);
-            }
-            CacheIndex::deepest_into(
-                &self.index,
-                block_hashes,
-                block_size,
-                within,
-                cap,
-                below,
-                kept,
-            );
-        }
-    }
-
-    struct Lends(Arc<HandedOn>);
-
-    impl CacheIndexes for Lends {
-        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
-            Some(Arc::clone(&self.0) as Arc<dyn CacheIndex>)
-        }
-
-        fn block_size(&self, _: &str) -> Option<u32> {
-            Some(BLOCK)
-        }
-    }
-
     let asked = prompt(1_000, 4);
     let handed_on = |spec: AppliedSpec| {
         let index = ChainIndex::new();
@@ -2674,6 +2690,7 @@ fn a_number_handed_on_under_a_lookup_names_nobody() {
         let handed = Arc::new(HandedOn {
             index,
             handoff: Mutex::new(Some((number, map, hashes_of(&asked)))),
+            under_number: false,
         });
         let bed = Bed::new(Affinity::default(), spec, 4);
         bed.affinity
@@ -2694,6 +2711,53 @@ fn a_number_handed_on_under_a_lookup_names_nobody() {
     assert_eq!(
         held(&bed.column(&facts, Phase::Prefill).0),
         [(0, 0), (4, 0), (0, 0), (0, 0)]
+    );
+}
+
+/// What a worker gained since its admission is counted from a size the
+/// index held for that worker. A number that changes hands between a
+/// table's read of a row's number and of its size would give the row the
+/// size of the number's new worker: the row keeps no number in that table,
+/// its worker takes no baseline from it, and the table read again counts
+/// the worker's growth from its own size.
+#[test]
+fn a_number_handed_on_under_a_rows_read_gives_its_worker_no_baseline() {
+    let asked = prompt(1_000, 4);
+    let own = hashes_of(&prompt(3_000, 2));
+    let index = ChainIndex::new();
+    // Worker 0 holds two blocks under its number at its admission. Under
+    // the read of its row its stream ends and worker 1 stores five.
+    let (number, map) = stored(&index, 0, &own);
+    let handed = Arc::new(HandedOn {
+        index,
+        handoff: Mutex::new(Some((number, map, hashes_of(&prompt(5_000, 5))))),
+        under_number: true,
+    });
+    let bed = Bed::new(Affinity::default(), paired(), 4);
+    bed.affinity
+        .set_indexes(Arc::new(Lends(Arc::clone(&handed))) as Arc<dyn CacheIndexes>);
+    // A row: the blocks the index holds, the blocks gained since the
+    // admission.
+    let indexed = |column: &[AffinityFacts]| -> Vec<(u32, u32)> {
+        let indexed = |row: &AffinityFacts| (row.indexed_blocks, row.indexed_growth);
+        column.iter().map(indexed).collect()
+    };
+    let facts = request(&asked, 7, NOW);
+    let (under, _) = bed.column(&facts, Phase::Prefill);
+    assert_eq!(handed.index.worker_id(&address(1)), Some(number));
+    // Worker 0's stream opens again with the two blocks it held, and the
+    // table is read again.
+    store(&handed.index, 0, &own);
+    let (next, _) = bed.column(&facts, Phase::Prefill);
+    // Under the handoff worker 0 is not given the five blocks of worker 1,
+    // which worker 1's own row reads. Behind it worker 0 holds what it held
+    // at its admission and gained nothing.
+    assert_eq!(
+        (indexed(&under), indexed(&next)),
+        (
+            vec![(0, 0), (5, 0), (0, 0), (0, 0)],
+            vec![(2, 0), (5, 0), (0, 0), (0, 0)]
+        )
     );
 }
 
