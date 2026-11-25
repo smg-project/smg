@@ -1818,8 +1818,10 @@ impl PDRouter {
                     reason = "drains a prefill body concurrently with Decode; aborted before client commitment and detached after it"
                 )]
                 let drain = tokio::spawn(async move {
+                    // The worker's own success status, as the read whole
+                    // keeps it, or the 502 of a body cut before its end.
+                    let mut drained = resp.status();
                     let mut chunks = resp.bytes_stream();
-                    let mut drained = StatusCode::OK;
                     while let Some(chunk) = chunks.next().await {
                         if let Err(e) = chunk {
                             warn!(
@@ -9856,34 +9858,43 @@ mod tests {
 
     /// A prefill that answers a success other than 200 is told by what its
     /// route's read keeps of it. Sent at once with its decode, the read
-    /// answers the worker's own status, and the prefill is told it. Sent
-    /// ahead of its decode, the read keeps the body and no status, and the
-    /// prefill's good answer is told as status 200. The class is `Ok` on
-    /// both, and the decode is told its own 200.
+    /// answers the worker's own status, and so does the drain of a streamed
+    /// pair: the prefill is told it. Sent ahead of its decode, the read
+    /// keeps the body and no status, and the prefill's good answer is told
+    /// as status 200. The class is `Ok` on each, and the decode is told its
+    /// own 200.
     #[tokio::test]
     async fn the_engine_hears_a_prefills_other_success_by_what_its_read_keeps() {
-        for (shape, prefill_end) in [
-            (Shape::Parallel, "completed Prefill Ok 202"),
-            (Shape::Sequential, "completed Prefill Ok 200"),
+        for (shape, streamed, prefill_end) in [
+            (Shape::Parallel, false, "completed Prefill Ok 202"),
+            (Shape::Parallel, true, "completed Prefill Ok 202"),
+            (Shape::Sequential, false, "completed Prefill Ok 200"),
         ] {
             let answer = serde_json::from_str(healthy_answer(shape, PdSide::Prefill))
                 .expect("a healthy answer is JSON");
             let (prefill_url, _) =
                 spawn_delayed_stub(StatusCode::ACCEPTED, answer, std::time::Duration::ZERO).await;
-            let decode_url = healthy_stub(shape, PdSide::Decode).await;
+            let decode_url = if streamed {
+                let (path, kind) = ("/v1/chat/completions", "text/event-stream");
+                spawn_cut_stub(path, kind, CHAT_SSE_CHUNKS, false).await
+            } else {
+                healthy_stub(shape, PdSide::Decode).await
+            };
             let router = single_attempt_router();
             let heard = hearing_pair_sides_on(&router.policy_registry);
             register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
 
-            let response = chat_through(&router, false).await;
-            assert_eq!(response.status(), StatusCode::OK, "{shape:?}");
+            let response = chat_through(&router, streamed).await;
+            assert_eq!(response.status(), StatusCode::OK, "{shape:?} {streamed}");
             axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
+            // A drain and a relay tell their side's end from a task of
+            // their own.
             assert_eq!(
-                ends_heard(&heard),
+                ends_heard_at(&heard, 2).await,
                 ["completed Decode Ok 200", prefill_end],
-                "{shape:?}"
+                "{shape:?} {streamed}"
             );
         }
     }
