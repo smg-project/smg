@@ -8,8 +8,9 @@
 //! on the worker objects. [`decide`] names a request's rows from them, hands
 //! them to the decision and, where the decision picked, writes the engine's
 //! record of the prefixes it sent. A pair decision reads a column a side in
-//! the rows' place ([`AffinityFacts`]): [`column()`] fills one from the same
-//! data, and [`record_prefix`] writes the record behind the pair's pick.
+//! the rows' place ([`AffinityFacts`]): the engine's own pair decision fills
+//! one from the same data and writes the record behind the pair's pick
+//! (`column`, `record_by_column`).
 //!
 //! Behind a single decision the pick states what its first target holds of
 //! the request ([`Overlap`]): the worker's entry of the rows the decision was
@@ -679,29 +680,13 @@ struct RecordRead {
 
 /// What the fill of a column read of the record of sent prefixes
 /// ([`column()`]). The write behind the pick made over that column stands on
-/// it ([`record_prefix`]).
+/// it ([`record_by_column`]).
 #[derive(Clone, Copy, Debug)]
-pub struct PrefixRead {
+pub(super) struct PrefixRead {
     read: RecordRead,
-    /// The rows sent the record's deepest block of the request, the first
-    /// of them, as many as fit, for a write handed no column
-    /// ([`record_prefix`]): a pick of one of them may be a repeat that
-    /// writes nothing.
-    deepest: [u32; Self::KEPT],
 }
 
 impl PrefixRead {
-    /// The deepest rows a read keeps, for a write handed no column
-    /// ([`record_prefix`]). There a pick of a row past them is no
-    /// repeat: where it is written, the write is tried from the request's
-    /// first block, or on from where a write of the request's leading part
-    /// that its thread keeps for that row stands ([`write_behind`]). A turn
-    /// of it that finds the request held for that row as far as the turn's
-    /// end adds no block: it makes that end the newest of the record's
-    /// list, its last use the read's tick, which can change the block that
-    /// leaves next at the record's bound.
-    const KEPT: usize = 8;
-
     /// Whether the fill found the worker of `entry`, an entry of the column
     /// it wrote, among those sent the request's deepest block: it wrote
     /// that depth into the entry of each of them, however many they are.
@@ -942,13 +927,21 @@ struct Table {
     /// ([`Engine::pool_record_for`]). The record speaks to it for every row
     /// ([`Self::recorded`]), and its holders are named ahead of the
     /// index's. A single decision reads by this word. A pair's side reads
-    /// by its own profile's, which its fill is handed ([`side_column`]),
-    /// whatever this word is. For a single decision's reader that reads
-    /// cache events too, the index decides a request of token ids alone
-    /// ([`Self::index_alone`]).
+    /// by its own profile's ([`Self::side_alone`]), whatever this word is.
+    /// For a single decision's reader that reads cache events too, the index
+    /// decides a request of token ids alone ([`Self::index_alone`]).
     ///
     /// [`Engine::pool_record_for`]: crate::engine::Engine::pool_record_for
     alone: bool,
+    /// The profile that decides the place's side of the model's pair reads
+    /// sent prefixes alone ([`Engine::side_reads_sent_alone`]): the word a
+    /// side's column is filled by ([`column()`]). It can differ from
+    /// [`Self::alone`], which is the word of the profile a request of the
+    /// phase asked alone resolves to. Read here once a table, as that word
+    /// is: both are the document's the list's value was made under.
+    ///
+    /// [`Engine::side_reads_sent_alone`]: crate::engine::Engine::side_reads_sent_alone
+    side_alone: bool,
     /// The host's token tree for the place, where it lends one, the
     /// profile reads a record and the model has no index of cache events: a
     /// request whose host names its entry is decided inside the tree's
@@ -1044,6 +1037,7 @@ impl Table {
             unheard_any: false,
             record: None,
             alone: false,
+            side_alone: false,
             sent: None,
             sent_text: None,
             block: spec.block_size(),
@@ -1141,6 +1135,7 @@ impl Table {
             let bound = usize::try_from(bound).unwrap_or(usize::MAX);
             table.record = Some(affinity.record_of(registered, bound));
             table.alone = alone;
+            table.side_alone = engine.side_reads_sent_alone(model, phase);
             if cap != 0 {
                 let lent = affinity.indexes.get();
                 if table.index.is_none() {
@@ -1696,12 +1691,7 @@ impl Table {
         // The record is read where it speaks for a row of the list.
         let speaks = self.recorded(facts.hash_kind, alone, None);
         let record = self.record.as_deref().filter(|_| speaks)?;
-        let (blocks, found) = self.read_written(record, facts, alone, (keys, deepest), waiting);
-        let mut read = PrefixRead {
-            read: found,
-            deepest: [NONE; PrefixRead::KEPT],
-        };
-        let mut named = 0usize;
+        let (blocks, read) = self.read_written(record, facts, alone, (keys, deepest), waiting);
         for &id in deepest.iter() {
             let Some(row) = self.spoken_row(id, facts.hash_kind, alone) else {
                 continue;
@@ -1709,12 +1699,8 @@ impl Table {
             if let Some(entry) = column.get_mut(row as usize) {
                 entry.predicted_blocks = blocks;
             }
-            if let Some(slot) = read.deepest.get_mut(named) {
-                *slot = row;
-            }
-            named += 1;
         }
-        Some(read)
+        Some(PrefixRead { read })
     }
 }
 
@@ -2007,9 +1993,10 @@ struct Asked<'a> {
 /// list's table, which says so. A profile that reads affinity and is named
 /// no row (it shows its rows to a plugin, whose stage reads the column
 /// whole) is handed its list's column, in [`RequestFacts::affinity`]:
-/// what [`column()`] fills, but for the record of sent prefixes, which is
-/// read here by that profile's own word. Where it reads sent prefixes
-/// alone, the column holds what the record holds for every worker.
+/// one entry a worker of the list, as a side of the engine's pair decision
+/// is handed, with the record of sent prefixes read by that profile's own
+/// word. Where it reads sent prefixes alone, the column holds what the
+/// record holds for every worker.
 ///
 /// `token_key` names the request's entry in the host's token tree of sent
 /// prefixes ([`TokenKey`]), given the tree's page in tokens. It is called
@@ -2191,70 +2178,41 @@ pub(super) fn decide_behind<'p, 'h>(
 }
 
 /// One list's column for a decision that reads a column in the rows' place:
-/// each side of a pair decision its caller makes itself, by the side's own
-/// list and `phase`.
+/// each side of the engine's pair decision, by the side's own list and
+/// `phase`.
 ///
 /// `column` is emptied and filled with one entry a worker of `workers`, in
 /// the list's order: the worker's age, what the model's index holds for it
 /// and what that gained since its admission, and what the worker holds of
 /// the request, by the index where the index speaks for the worker and by
 /// the record of sent prefixes where it does not: for every worker where
-/// the request is hashed by its text. The record is read here as a profile
-/// that reads cache events reads it, whatever the side's profile reads.
-/// The engine's own pair decision fills a side's column by the side's own
-/// word instead, through a form of this function inside the crate. The
-/// caller hands the column to the side it was filled for and to no other.
+/// the request is hashed by its text. The record is read by the word of the
+/// side's own profile, which the list's table read with its other words of
+/// the document ([`Table::side_alone`]): under a profile that reads sent
+/// prefixes alone the record speaks for every worker of the list, whatever
+/// the index holds for it ([`Table::recorded`]). The table's word of a
+/// single decision's reader is not asked: it is another profile's where a
+/// binding of the phase is listed ahead of the pair's. The caller hands the
+/// column to the side it was filled for and to no other.
 ///
 /// The parameters are [`decide`]'s, and `phase` is the phase the list is
 /// decided at, which a pair's request does not carry for both its lists.
 /// Returns what was read of the record of sent prefixes, where the record
-/// speaks for a worker of the list: the caller hands it to [`record_prefix`] behind
-/// the pick. Nothing is allocated once `column` and the calling thread's
-/// buffers have grown, but where a table is read.
+/// speaks for a worker of the list: the read keeps its word, and the write
+/// behind the pick asks the rule by it ([`record_by_column`]). Nothing is
+/// allocated once `column` and the calling thread's buffers have grown, but
+/// where a table is read.
 #[expect(
     clippy::too_many_arguments,
     reason = "the list as `decide` takes it, the phase a pair's request does not carry, and the column"
 )]
-pub fn column(
+pub(super) fn column(
     affinity: &Affinity,
     pool: &PoolAffinity,
     spec: &AppliedSpec,
     workers: &[Arc<dyn Worker>],
     ids: &[WorkerId],
     phase: Phase,
-    facts: &RequestFacts<'_>,
-    column: &mut Vec<AffinityFacts>,
-) -> Option<PrefixRead> {
-    side_column(
-        affinity, pool, spec, workers, ids, phase, false, facts, column,
-    )
-}
-
-/// [`column()`] for a reader that states its own word of the record of sent
-/// prefixes. `alone` says the profile the column is filled for reads sent
-/// prefixes alone: the record then speaks for every worker of the list,
-/// whatever the index holds for it ([`Table::recorded`]). A side of the
-/// engine's own pair decision hands its profile's word
-/// ([`Engine::side_reads_sent_alone`]). The pool's table keeps the word of
-/// a single decision's reader over the pool, which is another profile's
-/// where a binding of the phase is listed ahead of the pair's, so a side's
-/// fill does not ask it. The fill's
-/// read keeps the word, and the write behind the pick asks the rule by it
-/// ([`record_by_column`]).
-///
-/// [`Engine::side_reads_sent_alone`]: crate::engine::Engine::side_reads_sent_alone
-#[expect(
-    clippy::too_many_arguments,
-    reason = "what `column` takes and its reader's word of the record"
-)]
-pub(super) fn side_column(
-    affinity: &Affinity,
-    pool: &PoolAffinity,
-    spec: &AppliedSpec,
-    workers: &[Arc<dyn Worker>],
-    ids: &[WorkerId],
-    phase: Phase,
-    alone: bool,
     facts: &RequestFacts<'_>,
     column: &mut Vec<AffinityFacts>,
 ) -> Option<PrefixRead> {
@@ -2269,7 +2227,9 @@ pub(super) fn side_column(
         now: facts.now_micros,
     };
     let read = with_buffers(|buffers| {
-        pool.with_table(&asked, |table| table.fill(facts, alone, buffers, column))
+        pool.with_table(&asked, |table| {
+            table.fill(facts, table.side_alone, buffers, column)
+        })
     });
     // A place whose stages read no affinity keeps no table: every worker
     // reads as holding nothing, just admitted.
@@ -2320,16 +2280,16 @@ pub(super) fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFact
 /// write that keeps where a prompt went. A single's writes name the worker
 /// the request goes to ([`sent_target`]), which may be a later target.
 ///
-/// The rule's word is read through that one function at five places: the
-/// words of a lease, the record's two writes here, the store of a
-/// prompt in a lent tree ([`sent_address`]), the hand-over of a pin
-/// the keyed entry followed to this lookup, and a pair's two writes behind
-/// its pick. Those two ask it a side at a time, each of its own side
-/// (`pair::record_sides`), and then name the target the request goes to
-/// ([`sent_to`]). A pair's first pick states what its prefill holds
-/// through here too ([`state`]): its first target is its prefill, and the
-/// word asked is the pick's own, which is the prefill side's, whatever
-/// placed its decode. Under the rule's default word a request it
+/// The rule's word is read through that one function by the words of a
+/// lease, the record's two writes here, the store of a prompt in a lent
+/// tree ([`sent_address`]), the hand-over of a pin the keyed entry followed
+/// to this lookup, a pair's two writes behind its pick, and the statement
+/// of what a pick's first target holds ([`state`]). A pair's two writes ask
+/// it a side at a time, each of its own side (`pair::record_sides`), and
+/// then name the target the request goes to ([`sent_to`]). A pair's first
+/// pick states what its prefill holds by the pick's own word, which is the
+/// prefill side's, whatever placed its decode: its first target is its
+/// prefill. Under the rule's default word a request it
 /// places is the profile's own, and its prompt is kept as any pick's. Under
 /// the other the rule keeps the request from the profile, as a gateway's
 /// sticky map hands a request it places to no policy: the policy's record
@@ -2347,38 +2307,26 @@ pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
 /// sent, and this write has no `sends_to` to ask: `id` is the worker its
 /// caller says the request goes to.
 ///
-/// `pool`, `phase` and `facts` are the ones the column was filled with, and
-/// `read` is what that fill returned. A worker the index speaks for, a
-/// worker that is not of the list, and a list whose table was since read
-/// for another place write nothing. The index speaks for no worker on a
-/// request hashed by its text: such a request is written for any worker of
-/// the list.
+/// `pool`, `phase` and `facts` are the ones the column was filled with,
+/// `read` is what that fill returned and `column` the column it filled. A
+/// worker the index speaks for, a worker that is not of the list, and a
+/// list whose table was since read for another place write nothing. The
+/// index speaks for no worker on a request hashed by its text, and for none
+/// where the fill read the record by the word of a profile that reads sent
+/// prefixes alone: such a request is written for any worker of the list.
 ///
-/// Whether the picked worker was sent the request's deepest block is read
-/// here from the rows `read` kept, the first eight of them: a holder past
-/// them is written from the request's first block, or on from where a
-/// write the calling thread keeps for it stands. The engine's own
-/// decisions read it from their column.
-pub fn record_prefix(
-    pool: &PoolAffinity,
-    phase: Phase,
-    facts: &RequestFacts<'_>,
-    read: PrefixRead,
-    id: WorkerId,
-) {
-    record_by_column(pool, phase, facts, read, None, id);
-}
-
-/// [`record_prefix`], handed the column `read` was returned with where the
-/// caller kept it: the picked worker's entry of it says whether the fill
-/// found that worker among those sent the request's deepest block
-/// ([`PrefixRead::found`]), which the rows `read` kept say of eight.
+/// The picked worker's entry of the column says whether the fill found
+/// that worker among those sent the request's deepest block
+/// ([`PrefixRead::found`]): a pick of one of them may be a repeat that
+/// writes nothing. A worker the column holds no entry for is written as no
+/// repeat. The fill gives every worker of its list an entry, so no decision
+/// of the engine hands such a column.
 pub(super) fn record_by_column(
     pool: &PoolAffinity,
     phase: Phase,
     facts: &RequestFacts<'_>,
     read: PrefixRead,
-    column: Option<&[AffinityFacts]>,
+    column: &[AffinityFacts],
     id: WorkerId,
 ) {
     let standing = pool.table.load();
@@ -2391,10 +2339,9 @@ pub(super) fn record_by_column(
     let (Some(record), Some(row)) = (table.record.as_ref(), spoken) else {
         return;
     };
-    let held = match column.and_then(|column| column.get(row as usize)) {
-        Some(sent) => read.found(sent),
-        None => read.deepest.contains(&row),
-    };
+    let held = column
+        .get(row as usize)
+        .is_some_and(|sent| read.found(sent));
     if record.repeats(read.read, held) {
         return with_buffers(|buffers| buffers.waiting.write_on(read.read.tick));
     }

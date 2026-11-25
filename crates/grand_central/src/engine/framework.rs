@@ -6325,8 +6325,9 @@ impl Engine {
     /// side's phase asked alone resolves to, unless a binding of that
     /// phase is listed ahead of the pair's. The side's column is filled by
     /// this word, whichever profile its pool keeps the record for
-    /// ([`Self::pool_record_for`]). `false` where the model has no pair
-    /// binding, and for a phase its plan has no side for.
+    /// ([`Self::pool_record_for`]): the pool's table reads it once, beside
+    /// that record's word, and no decision asks it here. `false` where the
+    /// model has no pair binding, and for a phase its plan has no side for.
     #[cfg(feature = "in-process")]
     pub(crate) fn side_reads_sent_alone(&self, model: &str, side: Phase) -> bool {
         self.pair_binding(model)

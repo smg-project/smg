@@ -1921,11 +1921,12 @@ fn a_column_reads_the_write_its_thread_keeps_and_the_next_turn_is_kept() {
         let facts = request(prompt, 7, NOW);
         let (column, read) = prefills.column(&facts, Phase::Prefill);
         let read = read.expect("the record speaks for the prefills");
-        record_prefix(
+        record_by_column(
             &prefills.pool,
             Phase::Prefill,
             &facts,
             read,
+            &column,
             prefills.ids[to],
         );
         held(&column)
@@ -2060,11 +2061,12 @@ fn a_worker_that_left_is_given_no_place_in_a_record_made_anew() {
         };
         if let_go {
             // The follow names a record that holds a place alone.
-            let (_, first) = bed.column(&facts, Phase::Single);
+            let (column_of, first) = bed.column(&facts, Phase::Single);
             let first = first.expect("the record speaks for the list");
-            record_prefix(&bed.pool, Phase::Single, &facts, first, bed.ids[0]);
+            let (list, id) = (&bed.pool, bed.ids[0]);
+            record_by_column(list, Phase::Single, &facts, first, &column_of, id);
         }
-        let (_, read) = bed.column(&facts, Phase::Single);
+        let (column_of, read) = bed.column(&facts, Phase::Single);
         let read = read.expect("the record speaks for the list");
         bed.column(&other, Phase::Single);
         if let_go {
@@ -2075,7 +2077,8 @@ fn a_worker_that_left_is_given_no_place_in_a_record_made_anew() {
         assert!(bed.affinity.records.lock().is_empty(), "the record left");
         bed.affinity.forget(bed.ids[2]);
         bed.column(&facts, Phase::Single);
-        record_prefix(&bed.pool, Phase::Single, &facts, read, bed.ids[2]);
+        let (list, id) = (&bed.pool, bed.ids[2]);
+        record_by_column(list, Phase::Single, &facts, read, &column_of, id);
         let behind = held(&bed.column(&facts, Phase::Single).0);
         assert_eq!(behind, [(0, 0); 4], "let go: {let_go}");
     }
@@ -2210,7 +2213,7 @@ fn the_index_decides_a_single_request_of_token_ids_alone() {
     bed.decide(&request(&asked, 7, NOW), Some(3));
     assert_eq!(bed.holders(&asked, NOW), [(3, 0, 4)]);
     // A column filled beside no index keeps what it read of the record.
-    let (_, before) = bed.column(&request(&asked, 7, NOW), Phase::Single);
+    let (filled_before, before) = bed.column(&request(&asked, 7, NOW), Phase::Single);
     let before = before.expect("the record speaks while the index holds no block");
     // The index holds two of the request's blocks for the first worker, and
     // decides alone from the table's next read.
@@ -2227,7 +2230,8 @@ fn the_index_decides_a_single_request_of_token_ids_alone() {
     // that stands is asked at the write. The record holds the first pick's
     // four blocks and no more.
     bed.decide(&later, Some(2));
-    record_prefix(&bed.pool, Phase::Single, &later, before, bed.ids[1]);
+    let (list, id) = (&bed.pool, bed.ids[1]);
+    record_by_column(list, Phase::Single, &later, before, &filled_before, id);
     assert_eq!(bed.holders(&asked, NOW + SECOND), [(0, 2, 0)]);
     {
         let standing = bed.pool.table.load();
@@ -2432,9 +2436,10 @@ fn a_profile_that_reads_cache_events_is_named_no_send_to_a_worker_the_index_hold
     for first in [1_000, 5_000] {
         let begun = prompt(first, 2);
         let facts = request(&begun, 7, NOW);
-        let (_, read) = side.column(&facts, Phase::Decode);
+        let (column_of, read) = side.column(&facts, Phase::Decode);
         let read = read.expect("the record speaks for the third worker");
-        record_prefix(&side.pool, Phase::Decode, &facts, read, side.ids[2]);
+        let (list, id) = (&side.pool, side.ids[2]);
+        record_by_column(list, Phase::Decode, &facts, read, &column_of, id);
     }
     // What the side holds of each whole prompt: its list's column, and the
     // holders a decode asked alone is named.
@@ -2977,11 +2982,12 @@ fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
     let (column_of, read) = prefills.column(&facts, Phase::Prefill);
     assert_eq!(held(&column_of), [(0, 0); 4]);
     let read = read.expect("the record speaks for the prefills");
-    record_prefix(
+    record_by_column(
         &prefills.pool,
         Phase::Prefill,
         &facts,
         read,
+        &column_of,
         prefills.ids[1],
     );
     let sent_to_one = [(0, 0), (0, 4), (0, 0), (0, 0)];
@@ -2990,8 +2996,16 @@ fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
     // A worker that is not of the list writes nothing, and neither does a
     // write for another place than the list's table stands for.
     let read = read.expect("the record speaks for the prefills");
-    record_prefix(&prefills.pool, Phase::Prefill, &facts, read, WorkerId(999));
-    record_prefix(&prefills.pool, Phase::Decode, &facts, read, prefills.ids[2]);
+    let (list, stranger) = (&prefills.pool, WorkerId(999));
+    record_by_column(list, Phase::Prefill, &facts, read, &column_of, stranger);
+    record_by_column(
+        list,
+        Phase::Decode,
+        &facts,
+        read,
+        &column_of,
+        prefills.ids[2],
+    );
     assert_eq!(
         held(&prefills.column(&facts, Phase::Prefill).0),
         sent_to_one
@@ -3001,7 +3015,7 @@ fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
     let (decodes, _) = pool(3);
     let decode_ids: Vec<WorkerId> = (100..103).map(WorkerId).collect();
     let mut filled = Vec::new();
-    let mut decode_column = || {
+    let decode_column = |filled: &mut Vec<AffinityFacts>| {
         let read = column(
             &prefills.affinity,
             &decode_pool,
@@ -3010,19 +3024,67 @@ fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
             &decode_ids,
             Phase::Decode,
             &facts,
-            &mut filled,
+            filled,
         );
-        (held(&filled), read)
+        (held(filled), read)
     };
-    let (holds, read) = decode_column();
+    let (holds, read) = decode_column(&mut filled);
     assert_eq!(holds, [(0, 0); 3]);
     let read = read.expect("the record speaks for the decodes");
-    record_prefix(&decode_pool, Phase::Decode, &facts, read, decode_ids[2]);
-    assert_eq!(decode_column().0, [(0, 0), (0, 0), (0, 4)]);
+    record_by_column(
+        &decode_pool,
+        Phase::Decode,
+        &facts,
+        read,
+        &filled,
+        decode_ids[2],
+    );
+    assert_eq!(decode_column(&mut filled).0, [(0, 0), (0, 0), (0, 4)]);
     assert_eq!(
         held(&prefills.column(&facts, Phase::Prefill).0),
         sent_to_one
     );
+    assert_eq!(prefills.affinity.left_out(), 0);
+}
+
+/// A write behind a column reads the picked worker's own entry of it, and a
+/// worker the column holds no entry for is written as no repeat. The first
+/// prefill is sent a prompt, so the next read finds the record holding the
+/// prompt whole, its end used at this tick: a pick the column names among
+/// the prompt's holders is a repeat, which writes nothing. The second
+/// prefill's entry names it no holder, though the column's first entry
+/// names one: its pick is recorded. The write for the third prefill is
+/// handed an empty column: no entry says the fill found that worker there,
+/// so the prompt is recorded for it. The fill gives every worker of its
+/// list an entry, so no decision of the engine hands such a column: this
+/// case hands one itself, to hold the write's own contract.
+#[test]
+fn a_write_handed_no_entry_for_its_worker_is_no_repeat() {
+    let (affinity, _, _) = hosted(false);
+    let prefills = Bed::new(affinity, paired(), 3);
+    let asked = prompt(1_000, 4);
+    let facts = request(&asked, 7, NOW);
+    let write_for = |column: &[AffinityFacts], read: PrefixRead, at: usize| {
+        let (list, id) = (&prefills.pool, prefills.ids[at]);
+        record_by_column(list, Phase::Prefill, &facts, read, column, id);
+    };
+    let holds = || held(&prefills.column(&facts, Phase::Prefill).0);
+    let (filled, read) = prefills.column(&facts, Phase::Prefill);
+    assert_eq!(held(&filled), [(0, 0); 3]);
+    let read = read.expect("the record speaks for the prefills");
+    write_for(&filled, read, 0);
+
+    // The record holds the prompt whole and fresh for the first prefill.
+    let (filled, read) = prefills.column(&facts, Phase::Prefill);
+    assert_eq!(held(&filled), [(0, 4), (0, 0), (0, 0)]);
+    let read = read.expect("the record speaks for the prefills");
+    assert!(read.read.whole && read.read.fresh, "{read:?}");
+    // The second prefill's own entry names it no holder.
+    write_for(&filled, read, 1);
+    assert_eq!(holds(), [(0, 4), (0, 4), (0, 0)]);
+    // The column holds no entry for the third prefill.
+    write_for(&[], read, 2);
+    assert_eq!(holds(), [(0, 4); 3]);
     assert_eq!(prefills.affinity.left_out(), 0);
 }
 
@@ -3055,11 +3117,12 @@ fn a_sides_column_holds_a_text_sent_to_a_worker_the_index_holds_blocks_for() {
     let (column_of, read) = prefills.column(&facts, Phase::Prefill);
     assert_eq!(held(&column_of), [(0, 0); 3]);
     let read = read.expect("the record speaks for the prefills");
-    record_prefix(
+    record_by_column(
         &prefills.pool,
         Phase::Prefill,
         &facts,
         read,
+        &column_of,
         prefills.ids[1],
     );
     let sent_to_one = [(0, 0), (0, 4), (0, 0)];
@@ -3072,11 +3135,12 @@ fn a_sides_column_holds_a_text_sent_to_a_worker_the_index_holds_blocks_for() {
     let (column_of, read) = prefills.column(&by_tokens, Phase::Prefill);
     assert_eq!(held(&column_of), by_index);
     let read = read.expect("the record speaks for the third prefill");
-    record_prefix(
+    record_by_column(
         &prefills.pool,
         Phase::Prefill,
         &by_tokens,
         read,
+        &column_of,
         prefills.ids[1],
     );
     assert_eq!(
@@ -3096,75 +3160,79 @@ fn a_sides_column_holds_a_text_sent_to_a_worker_the_index_holds_blocks_for() {
     assert_eq!(prefills.affinity.left_out(), 0);
 }
 
-/// A pair side's column is read by the word its reader states, and the
-/// write behind its pick by the word of its read. The pool's table is not
-/// asked: its word is the profile's that a request of the phase asked alone
-/// resolves to, which can be another's. A side whose profile reads sent
+/// A pair side's column is read by its own profile's word of the record,
+/// which its list's table reads from the document, and the write behind its
+/// pick by the word of its read. Two documents decide over one list, one
+/// record and one index, each through a table of its own, as a list's value
+/// stands under each applied document. A side whose profile reads sent
 /// prefixes alone is handed what was sent to a worker the index holds a
 /// block for, and its pick of such a worker is written. A side whose
 /// profile reads cache events too is handed none of it over the same list,
 /// and its pick of such a worker writes nothing, as before: the reader that
-/// reads alone knows no send the other placed there. The public
-/// [`column()`] answers as the second, under either table.
+/// reads alone knows no send the other placed there.
 #[test]
 fn a_sides_column_is_read_by_its_readers_word_of_the_record() {
     let pair = PolicySpec::pair_presets("cache_aware", "cache_aware");
     let mut pair = reading_alone(pair.expect("the pair presets"));
     pair.generation = 1;
     let read_alone = AppliedSpec::validate(&pair).expect("the pair document validates");
-    for (spec, pools_word) in [(paired(), false), (read_alone, true)] {
-        let (affinity, _, index) = hosted(true);
-        let index = index.expect("the index");
-        let other = hashes_of(&prompt(9_000, 1));
-        store(&index, 0, &other);
-        store(&index, 1, &other);
-        let prefills = Bed::new(affinity, spec, 3);
-        let asked = prompt(1_000, 4);
-        let facts = request(&asked, 7, NOW);
-        let side = |alone: bool| {
-            let mut filled = Vec::new();
-            let read = side_column(
-                &prefills.affinity,
-                &prefills.pool,
-                &prefills.spec,
-                &prefills.workers,
-                &prefills.ids,
-                Phase::Prefill,
-                alone,
-                &facts,
-                &mut filled,
-            );
-            let read = read.expect("the record speaks for the third prefill");
-            (held(&filled), read)
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let other = hashes_of(&prompt(9_000, 1));
+    store(&index, 0, &other);
+    store(&index, 1, &other);
+    let prefills = Bed::new(affinity, paired(), 3);
+    // The same list under the document whose sides read alone, through a
+    // table of its own.
+    let alone_pool = PoolAffinity::default();
+    let asked = prompt(1_000, 4);
+    let facts = request(&asked, 7, NOW);
+    let side = |alone: bool| {
+        let (pool, spec) = if alone {
+            (&alone_pool, &read_alone)
+        } else {
+            (&prefills.pool, &prefills.spec)
         };
-        let record = |read: PrefixRead| {
-            record_prefix(
-                &prefills.pool,
-                Phase::Prefill,
-                &facts,
-                read,
-                prefills.ids[1],
-            );
-        };
-        let nobody = [(0, 0); 3];
+        let mut filled = Vec::new();
+        let read = column(
+            &prefills.affinity,
+            pool,
+            spec,
+            &prefills.workers,
+            &prefills.ids,
+            Phase::Prefill,
+            &facts,
+            &mut filled,
+        );
+        let read = read.expect("the record speaks for the third prefill");
+        (filled, read, pool)
+    };
+    let record = |(filled, read, pool): (Vec<AffinityFacts>, PrefixRead, &PoolAffinity)| {
+        record_by_column(pool, Phase::Prefill, &facts, read, &filled, prefills.ids[1]);
+    };
+    let holds = |alone: bool| held(&side(alone).0);
+    let nobody = [(0, 0); 3];
 
-        let (holds, read) = side(false);
-        assert_eq!(holds, nobody);
-        record(read);
-        assert_eq!(side(true).0, nobody, "a pick read by the index's word");
+    // The second prefill picked behind the read of the side that reads cache
+    // events: the index speaks for it to that reader, so nothing is written.
+    assert_eq!(holds(false), nobody);
+    record(side(false));
+    assert_eq!(holds(true), nobody, "a pick read by the index's word");
 
-        let (holds, read) = side(true);
-        assert_eq!(holds, nobody);
-        record(read);
-        assert_eq!(side(true).0, [(0, 0), (0, 4), (0, 0)]);
-        assert_eq!(side(false).0, nobody, "the index speaks to that reader");
-        assert_eq!(held(&prefills.column(&facts, Phase::Prefill).0), nobody);
+    // The same pick behind the read of the side that reads alone is written.
+    record(side(true));
+    assert_eq!(holds(true), [(0, 0), (0, 4), (0, 0)]);
+    assert_eq!(holds(false), nobody, "the index speaks to that reader");
 
-        let standing = prefills.pool.table.load();
-        let table = standing.as_deref().expect("the prefills' table");
-        assert_eq!(table.alone, pools_word, "the pool's own word");
-        assert_eq!(prefills.affinity.left_out(), 0);
-    }
+    // Each table read both its words from its own document.
+    let words = |pool: &PoolAffinity| {
+        let standing = pool.table.load();
+        let table = standing.as_deref().expect("the list's table");
+        (table.alone, table.side_alone)
+    };
+    assert_eq!(words(&prefills.pool), (false, false));
+    assert_eq!(words(&alone_pool), (true, true));
+    assert_eq!(prefills.affinity.left_out(), 0);
 }
 
 /// A single decision reads the record of sent prefixes by its own reader's
@@ -3229,38 +3297,47 @@ fn a_single_decision_reads_the_record_by_its_own_word_beside_a_pairs_side() {
     };
     let side = || {
         let mut filled = Vec::new();
-        let read = side_column(
+        let read = column(
             &decodes.affinity,
             &decodes.pool,
             &decodes.spec,
             &decodes.workers,
             &decodes.ids,
             Phase::Decode,
-            true,
             &paired,
             &mut filled,
         );
-        (held(&filled), read.expect("the record speaks to the side"))
+        (filled, read.expect("the record speaks to the side"))
     };
+    let holds = || held(&side().0);
 
     // The pair's side sends the prompt to the second decode.
-    let (holds, read) = side();
-    assert_eq!(holds, [(0, 0), (0, 0), (4, 0), (0, 0)]);
-    record_prefix(&decodes.pool, Phase::Decode, &paired, read, decodes.ids[1]);
+    let (filled, read) = side();
+    assert_eq!(held(&filled), [(0, 0), (0, 0), (4, 0), (0, 0)]);
+    record_by_column(
+        &decodes.pool,
+        Phase::Decode,
+        &paired,
+        read,
+        &filled,
+        decodes.ids[1],
+    );
     let sent = [(0, 0), (0, 4), (4, 0), (0, 0)];
-    assert_eq!(side().0, sent);
+    assert_eq!(holds(), sent);
 
     // The decode request asked alone is named the index's holder.
     let named = decodes.decide(&asked_alone, None).expect("rows");
     assert_eq!(named.holders, [(2, 4, 0)]);
     decodes.decide(&asked_alone, Some(0));
-    assert_eq!(side().0, sent, "a pick of a worker with a block");
+    assert_eq!(holds(), sent, "a pick of a worker with a block");
     decodes.decide(&asked_alone, Some(3));
-    assert_eq!(side().0, [(0, 0), (0, 4), (4, 0), (0, 4)]);
+    assert_eq!(holds(), [(0, 0), (0, 4), (4, 0), (0, 4)]);
 
+    // The table holds the two words apart: the single decision's reader
+    // reads no record alone, and the side's own profile does.
     let standing = decodes.pool.table.load();
     let table = standing.as_deref().expect("the decodes' table");
-    assert!(!table.alone && table.record.is_some());
+    assert!(!table.alone && table.side_alone && table.record.is_some());
     assert_eq!(decodes.affinity.left_out(), 0);
 }
 
@@ -3279,11 +3356,12 @@ fn a_sides_column_keeps_the_record_beside_an_index() {
     let (column_of, read) = prefills.column(&facts, Phase::Prefill);
     assert_eq!(held(&column_of), [(2, 0), (0, 0), (0, 0), (0, 0)]);
     let read = read.expect("the record speaks for the other prefills");
-    record_prefix(
+    record_by_column(
         &prefills.pool,
         Phase::Prefill,
         &facts,
         read,
+        &column_of,
         prefills.ids[1],
     );
     let (column_of, _) = prefills.column(&facts, Phase::Prefill);
@@ -3450,6 +3528,56 @@ fn a_profile_named_no_row_reads_the_record_alone_for_a_worker_the_index_holds_bl
         ..alone
     };
     assert_eq!(handed(&merged), by_index);
+}
+
+/// A decode request asked alone is a single decision read at its own phase,
+/// where the index does not decide alone. Under a profile that is named no
+/// row and reads cache events too, its pick of a worker the index holds
+/// blocks for writes nothing, as a pick over named rows writes nothing
+/// there. So the same list, read next by a profile that reads sent prefixes
+/// alone, is handed no send for that worker.
+#[test]
+fn a_decode_request_asked_alone_writes_nothing_for_a_worker_the_index_holds_blocks_for() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 1, &hashes_of(&asked)[..2]);
+    let decode = || RequestFacts {
+        phase: Phase::Decode,
+        ..request(&asked, 7, NOW)
+    };
+    let handed = |bed: &Bed| {
+        let mut seen = None;
+        decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut decode(),
+            None,
+            |_| None,
+            || None,
+            |_| true,
+            |facts| {
+                seen = Some(held(facts.affinity));
+                shed()
+            },
+        );
+        seen.expect("a decision")
+    };
+    let by_index = [(0, 0), (2, 0), (0, 0), (0, 0)];
+    let merged = Bed::new(affinity, handed_whole(), 4);
+    assert!(merged.decide(&decode(), Some(1)).is_none());
+    assert_eq!(handed(&merged), by_index);
+    // The record took nothing of that pick: a reader of the record alone
+    // is handed the index's blocks and no send.
+    let alone = Bed {
+        pool: PoolAffinity::default(),
+        spec: named_no_row(reading_alone),
+        ..merged
+    };
+    assert_eq!(handed(&alone), by_index);
 }
 
 /// A pick states what its first target holds of the request, read from the
@@ -4550,13 +4678,14 @@ fn an_empty_index_write_keeps_the_predicted_worker_named() {
     store(&index, 1, &hashes_of(&other));
     let asked = prompt(1_000, 4);
     let facts = request(&asked, 7, NOW);
-    let (_, read) = prefills.column(&facts, Phase::Prefill);
+    let (column_of, read) = prefills.column(&facts, Phase::Prefill);
     let read = read.expect("the record speaks for the first prefill");
-    record_prefix(
+    record_by_column(
         &prefills.pool,
         Phase::Prefill,
         &facts,
         read,
+        &column_of,
         prefills.ids[0],
     );
 
