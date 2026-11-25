@@ -1,4 +1,4 @@
-//! What the gateway's start hands the policy engine it starts: the worker
+//! What the gateway's start hands the Grand Central it starts: the worker
 //! registry, whose events the engine's task follows, and the monitor of the
 //! workers' cache events. And what a start under a supplied document builds
 //! its worker objects with: the overload thresholds of its own settings,
@@ -17,14 +17,14 @@ use axum::http::{header::CONTENT_TYPE, StatusCode};
 use openai_protocol::{
     generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
-use smg_grpc_client::common_proto::{
-    kv_cache_event::Data, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
-};
-use smg_policy_controller::{
+use smg_grand_central::{
     document::{OverloadSpec, PolicySpec},
     engine::{Candidate, RequestFacts, Scorer, TieBand, WorkerId},
     stages::{Lifecycle, StageRegistry},
     tracking::{EventKind, EventSet, Membership},
+};
+use smg_grpc_client::common_proto::{
+    kv_cache_event::Data, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
 };
 use smg_worker::{
     health::overload::OverloadThresholds,
@@ -148,7 +148,7 @@ async fn the_started_engine_tells_a_stage_a_worker_that_joins_and_one_that_leave
     }))
     .expect("a policy document");
     let config = RouterConfig {
-        policy_controller: true,
+        grand_central: true,
         policy_spec: Some(document),
         ..RouterConfig::default()
     };
@@ -179,7 +179,7 @@ async fn the_started_engine_tells_a_stage_a_worker_that_joins_and_one_that_leave
 #[tokio::test]
 async fn the_started_gateway_builds_its_workers_with_its_own_overload_thresholds() {
     let config = RouterConfig {
-        policy_controller: true,
+        grand_central: true,
         policy_spec: Some(PolicySpec::preset("round_robin").expect("a stock policy")),
         worker_overload_waiting_requests: Some(32),
         worker_overload_token_usage: Some(0.9),
@@ -215,11 +215,11 @@ fn bound(blocks: &[OverloadSpec]) -> PolicySpec {
     document
 }
 
-/// A gateway that runs `document` under the policy controller with these
+/// A gateway that runs `document` under Grand Central with these
 /// two overload thresholds of its own.
 fn under(document: PolicySpec, waiting: Option<usize>, usage: Option<f64>) -> ServerConfig {
     ServerConfig::minimal(RouterConfig {
-        policy_controller: true,
+        grand_central: true,
         policy_spec: Some(document),
         worker_overload_waiting_requests: waiting,
         worker_overload_token_usage: usage,
@@ -301,17 +301,17 @@ async fn a_document_whose_overload_words_this_gateway_refuses_ends_the_start() {
         (
             vec![said(true, false), said(false, false)],
             stated,
-            "policy controller: bindings[1].overload.enabled = false is not the true bindings[0] says, by its block or the block's default: a gateway builds its workers with one default set of overload thresholds, so the bindings of its document say one word",
+            "Grand Central: bindings[1].overload.enabled = false is not the true bindings[0] says, by its block or the block's default: a gateway builds its workers with one default set of overload thresholds, so the bindings of its document say one word",
         ),
         (
             vec![said(true, false), said(true, true)],
             stated,
-            "policy controller: bindings[1].overload.shed_when_all_vetoed = true is not the false bindings[0] says, by its block or the block's default: a gateway's routes read one shed word for the process, so the bindings of its document say one word",
+            "Grand Central: bindings[1].overload.shed_when_all_vetoed = true is not the false bindings[0] says, by its block or the block's default: a gateway's routes read one shed word for the process, so the bindings of its document say one word",
         ),
         (
             vec![said(true, false)],
             (None, None),
-            "policy controller: worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: the block has no default threshold to switch on, and a worker's own thresholds veto either way; state a threshold, or switch the block off in the document",
+            "Grand Central: worker_overload_waiting_requests and worker_overload_token_usage are both none beside a policy document whose overload block is on: the block has no default threshold to switch on, and a worker's own thresholds veto either way; state a threshold, or switch the block off in the document",
         ),
     ] {
         let refused = build_app_context(&under(bound(&blocks), waiting, usage), Extensions::new())
@@ -361,7 +361,7 @@ fn stored(event_id: u64, tokens: &[u32]) -> KvCacheEvent {
 #[tokio::test]
 async fn the_started_engine_places_by_the_cache_events_the_monitor_applied() {
     let config = RouterConfig {
-        policy_controller: true,
+        grand_central: true,
         policy: PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864),
         ..RouterConfig::default()
     };

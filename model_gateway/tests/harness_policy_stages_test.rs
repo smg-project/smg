@@ -1,7 +1,7 @@
-//! The test harness starts the policy engine the way a served gateway does.
-//! Where a test's configuration runs the policy controller, a context the
+//! The test harness starts Grand Central the way a served gateway does.
+//! Where a test's configuration runs Grand Central, a context the
 //! harness builds starts the engine over the document in force and the table
-//! of stages the test lent it. With the policy controller off the harness
+//! of stages the test lent it. With Grand Central off the harness
 //! starts no engine.
 
 use std::{
@@ -17,7 +17,7 @@ use axum::{
 use openai_protocol::completion::CompletionRequest;
 use serde_json::json;
 use smg::{config::RouterConfig, middleware::TenantRequestMeta, tenant::TenantKey};
-use smg_policy_controller::{
+use smg_grand_central::{
     document::PolicySpec,
     engine::{Candidate, RequestFacts, Scorer, Target, TieBand},
     stages::{Lifecycle, StageRegistry},
@@ -106,13 +106,13 @@ fn completion() -> CompletionRequest {
 /// One completion over the gRPC route of a gateway of two workers, built by
 /// the harness with the test's table lent. The configuration supplies a
 /// document whose one profile ranks by the test's stage, and
-/// `policy_controller` says whether the gateway runs it. The answer is what
+/// `grand_central` says whether the gateway runs it. The answer is what
 /// the stage did and was told from the gateway's start on: `built` each time
 /// the table built it, `scored` each time the engine asked it, `dispatched`
 /// and `ended` for each dispatch and each end it heard, `released` for a
 /// lease given up with neither.
 #[expect(clippy::expect_used, reason = "test helper: failures should panic")]
-async fn one_request(policy_controller: bool) -> Vec<&'static str> {
+async fn one_request(grand_central: bool) -> Vec<&'static str> {
     let heard = Heard::default();
     let kept = Arc::clone(&heard);
     let mut stages = StageRegistry::builtin();
@@ -134,7 +134,7 @@ async fn one_request(policy_controller: bool) -> Vec<&'static str> {
     let mut config = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
-        .policy_controller(policy_controller)
+        .grand_central(grand_central)
         .build_unchecked();
     config.policy_spec = Some(document);
     let ports = [engine().await, engine().await];
@@ -164,7 +164,7 @@ async fn one_request(policy_controller: bool) -> Vec<&'static str> {
 const PLACED: [&str; 4] = ["built", "scored", "dispatched", "ended"];
 
 /// A test lends a table that holds a scorer of its own, and its configuration
-/// runs the policy controller under a document that names the scorer. The
+/// runs Grand Central under a document that names the scorer. The
 /// gateway the harness builds places a gRPC request by that scorer, which
 /// hears the request's dispatch and its end.
 #[tokio::test]
@@ -172,15 +172,15 @@ async fn a_scorer_the_test_lent_places_a_grpc_request_and_hears_its_dispatch_and
     assert_eq!(one_request(true).await, PLACED);
 }
 
-/// With the policy controller off the harness starts no engine, though the
+/// With Grand Central off the harness starts no engine, though the
 /// test lends a table and supplies a document: the scorer is never built, and
 /// the request is answered by the classic policy. The run's own value
-/// ([`common::POLICY_CONTROLLER_ENV`]) turns the controller on for this
+/// ([`common::GRAND_CENTRAL_ENV`]) turns the controller on for this
 /// context as for every other, and the same request is then the engine's.
 #[tokio::test]
-async fn a_configuration_that_leaves_the_policy_controller_off_starts_no_engine() {
+async fn a_configuration_that_leaves_grand_central_off_starts_no_engine() {
     let heard = one_request(false).await;
-    if common::policy_controller_forced() {
+    if common::grand_central_forced() {
         assert_eq!(heard, PLACED);
     } else {
         assert!(heard.is_empty(), "{heard:?}");
@@ -190,7 +190,7 @@ async fn a_configuration_that_leaves_the_policy_controller_off_starts_no_engine(
 /// Serves one request on a gateway of `config` whose `workers` went through
 /// the gateway's registration steps, and answers what the gateway's registry
 /// counted: the classic policy objects it made, and the requests that
-/// reached a classic policy's place under the policy engine.
+/// reached a classic policy's place under Grand Central.
 #[expect(clippy::expect_used, reason = "test helper: failures should panic")]
 async fn made_by_a_gateway(config: RouterConfig, workers: Vec<MockWorkerConfig>) -> usize {
     let gateway = AppTestContext::new_with_config(config, workers).await;
@@ -211,16 +211,13 @@ async fn made_by_a_gateway(config: RouterConfig, workers: Vec<MockWorkerConfig>)
 }
 
 /// What the registries of two gateways counted, each started by the harness
-/// with the policy controller as `policy_controller` says. The first
+/// with Grand Central as `grand_central` says. The first
 /// registered a regular worker and served a request. The second registered a
 /// prefill and a decode worker under the two port names and served a pair's
 /// request.
-async fn counted_by_two_gateways(
-    policy_controller: bool,
-    [prefill, decode]: [u16; 2],
-) -> [usize; 2] {
+async fn counted_by_two_gateways(grand_central: bool, [prefill, decode]: [u16; 2]) -> [usize; 2] {
     let mut single = TestRouterConfig::round_robin(0);
-    single.policy_controller = policy_controller;
+    single.grand_central = grand_central;
     // A gateway's start and its one request make a large future: each is boxed.
     let single = Box::pin(made_by_a_gateway(
         single,
@@ -238,7 +235,7 @@ async fn counted_by_two_gateways(
         .worker_startup_check_interval_secs(1)
         .build_unchecked();
     pair.health_check.disable_health_check = true;
-    pair.policy_controller = policy_controller;
+    pair.grand_central = grand_central;
     let workers = vec![
         TestWorkerConfig::prefill(prefill),
         TestWorkerConfig::decode(decode),
@@ -246,23 +243,23 @@ async fn counted_by_two_gateways(
     [single, Box::pin(made_by_a_gateway(pair, workers)).await]
 }
 
-/// Where the policy controller runs, a gateway makes no classic policy
+/// Where Grand Central runs, a gateway makes no classic policy
 /// object and hands no request to one: not at its start, not when a regular,
 /// a prefill or a decode worker registers, and not to serve a request or a
 /// pair's request.
 #[tokio::test]
-async fn a_gateway_that_runs_the_policy_controller_makes_and_asks_no_classic_policy() {
+async fn a_gateway_that_runs_grand_central_makes_and_asks_no_classic_policy() {
     assert_eq!(
         counted_by_two_gateways(true, [19_960, 19_961]).await,
         [0, 0]
     );
 }
 
-/// The same steps with the policy controller off make the configured
+/// The same steps with Grand Central off make the configured
 /// policies: the default policy, and for a pair each side's own beside it.
 #[tokio::test]
-async fn a_gateway_that_leaves_the_policy_controller_off_makes_its_classic_policies() {
-    let made = if common::policy_controller_forced() {
+async fn a_gateway_that_leaves_grand_central_off_makes_its_classic_policies() {
+    let made = if common::grand_central_forced() {
         [0, 0]
     } else {
         [1, 3]

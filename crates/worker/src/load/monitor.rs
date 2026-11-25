@@ -46,17 +46,20 @@
 //!    protection on a group member needs the data (the original
 //!    conditional gate — never "never poll").
 //! 2. Fetch loads concurrently from each of them that its load stream
-//!    does not serve.
-//! 3. Update load-aware policies and the DP cache.
-//! 4. Atomically clear stale entries for the group from the watch
-//!    channel and merge in the fresh loads.
+//!    does not serve and whose last fetch has answered.
+//! 3. For each batch of answers, those that come within
+//!    `POLLED_PUBLISH_WINDOW` of its first: update load-aware policies and
+//!    the DP cache.
+//! 4. Atomically clear the stale entries of the batch's workers from the
+//!    watch channel and merge in the fresh loads.
 //!
 //! A group's interval is the smallest its workers state for themselves, in
 //! whole seconds, and the monitor's own where none states one
 //! ([`WorkerMonitor::with_interval`]). It is never under
-//! [`LEAST_POLL_INTERVAL`]. A tick that a slow poll overran is skipped: the
-//! loop polls once when that poll returns, and next on the interval's own
-//! beat.
+//! [`LEAST_POLL_INTERVAL`]. A tick ends at the next one at the latest. A
+//! fetch still open then is kept: its answer is a batch when it comes, and
+//! its engine is asked again behind it, at once where the tick it comes in
+//! has not ended.
 //!
 //! ## The port
 //!
@@ -76,10 +79,10 @@ use std::{
 };
 
 use dashmap::DashMap;
-use futures::future;
+use futures::{future::BoxFuture, stream::FuturesUnordered};
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::{
     sync::{broadcast, Notify},
     task::JoinHandle,
@@ -698,6 +701,14 @@ const PUSHED_ONE_WAY_MARGIN: Duration = Duration::from_millis(20);
 /// fifty rebuilds a second a thousand-worker fleet spends well under a
 /// percent of a core here.
 const PUSHED_PUBLISH_WINDOW: Duration = Duration::from_millis(20);
+/// A group's polled answers that come within this window of the first share
+/// one publish: the window of the pushed reports, and for its reason. The
+/// engines of a group asked at one instant answer together, so their tick is
+/// one rebuild and one word to the sink; an engine that answers later is
+/// published when it does. The window is kept as well as the loop is
+/// scheduled, and a batch ends with its tick: two answers on either side of
+/// a tick's end are two publishes.
+const POLLED_PUBLISH_WINDOW: Duration = PUSHED_PUBLISH_WINDOW;
 
 /// Debounce window for batching worker evictions into one snapshot rebuild.
 /// Registry churn (a rollout, a scale-down) emits removals as a gradual
@@ -1132,11 +1143,11 @@ impl<G: Generation> WorkerMonitor<G> {
         }
     }
 
-    /// The end of a group's tick, for the sink: every Ready worker of the
-    /// group, polled or served by its stream, and each polled member's
-    /// report as the tick publishes it, with whether its answer carried rank
-    /// capacity. It is said whether or not a fetch succeeded, and when
-    /// nobody was polled.
+    /// A batch of a group's answers, for the sink: every Ready worker of
+    /// the group, polled or served by its stream, and each report of the
+    /// batch as it is published, with whether its answer carried rank
+    /// capacity. It is said whether or not a fetch succeeded, and with no
+    /// report at the end of a tick that no answer came in.
     fn end_tick(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -2786,8 +2797,9 @@ fn group_keys_for_worker(worker: &Arc<dyn Worker>) -> Vec<WorkerGroupKey> {
 }
 
 /// The least interval a group polls at. A tick asks every polled engine of
-/// the group for its load and publishes one snapshot, so at this interval
-/// an engine is asked ten times a second. A load that has to be newer than
+/// the group whose last fetch has answered for its load, and the engines
+/// that answer together are one published snapshot, so at this interval an
+/// engine is asked ten times a second. A load that has to be newer than
 /// that is pushed on the worker's event stream.
 pub const LEAST_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -2945,62 +2957,207 @@ async fn group_monitor_loop<G: Generation>(
     interval: Duration,
 ) {
     let mut interval_timer = tokio::time::interval(interval);
-    // A tick that a poll overran is skipped. The timer's own default fires
-    // every such tick when the slow poll returns: one poll behind another
-    // with no interval between them, thirty of them behind a poll that ran
-    // to its deadline at the least interval.
+    // A tick ends at the next one at the latest, so no fetch overruns one.
+    // A tick that the loop's own work overran is skipped: the timer's own
+    // default fires every such tick one behind another, with no interval
+    // between them.
     interval_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let mut open = OpenFetches::default();
     loop {
-        interval_timer.tick().await;
+        let beat = interval_timer.tick().await;
 
         let Some(monitor) = monitor.upgrade() else {
             debug!("WorkerMonitor was dropped; exiting group loop for {group_key}");
             return;
         };
-        poll_group_once(&monitor, &group_key, interval, Instant::now()).await;
+        // The tick ends at the timer's next beat: the first one past now,
+        // since the timer skips a beat the loop came late to.
+        let mut ends = beat + interval;
+        let now = tokio::time::Instant::now();
+        while ends <= now {
+            ends += interval;
+        }
+        poll_group(
+            &monitor,
+            &group_key,
+            interval,
+            Instant::now(),
+            &mut open,
+            Some(ends),
+        )
+        .await;
         // Drop the temporary strong reference so we do not keep the
         // monitor alive across the next `interval_timer.tick().await`.
         drop(monitor);
     }
 }
 
-/// One tick of a group at `now`: the poll decision per worker, the polls of
-/// those not served by their stream, and the publish of what they returned.
+/// The engine fetches a group has open: asked at a tick and not answered
+/// yet. The group's loop keeps them from one tick to the next, so a tick
+/// waits for no engine past its own end and asks no engine whose last
+/// request is still open.
+#[derive(Default)]
+struct OpenFetches {
+    /// Each fetch answers with the instant it was asked at.
+    answers: FuturesUnordered<BoxFuture<'static, (Instant, EngineAnswer)>>,
+    /// The first member of each of those fetches: its engine is asked no
+    /// second time while the fetch is open.
+    asked: Vec<Arc<dyn Worker>>,
+}
+
+/// The engine a worker's fetch asks, as [`polled_engines`] groups them: the
+/// address of a data-parallel engine for each of its rank workers, and a
+/// worker's own URL otherwise.
+fn engine_of(worker: &dyn Worker) -> (bool, &str) {
+    match worker.dp_rank() {
+        Some(_) => (true, worker.base_url()),
+        None => (false, worker.url()),
+    }
+}
+
+/// The workers of `workers` whose engine is one of `engines`' (`among`), or
+/// is none of theirs.
+fn of_engines(
+    workers: &[Arc<dyn Worker>],
+    engines: &[Arc<dyn Worker>],
+    among: bool,
+) -> Vec<Arc<dyn Worker>> {
+    let engines: FxHashSet<(bool, &str)> = engines
+        .iter()
+        .map(|worker| engine_of(worker.as_ref()))
+        .collect();
+    workers
+        .iter()
+        .filter(|worker| engines.contains(&engine_of(worker.as_ref())) == among)
+        .cloned()
+        .collect()
+}
+
+/// What `wait` ends with: none where it has not ended by `until`.
+async fn by<T>(
+    until: Option<tokio::time::Instant>,
+    wait: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match until {
+        Some(until) => tokio::time::timeout_at(until, wait).await.ok(),
+        None => Some(wait.await),
+    }
+}
+
+impl OpenFetches {
+    /// Asks the engines of `workers` at `now`: the poll decision per worker,
+    /// and one fetch an engine for its members that their stream does not
+    /// serve.
+    fn ask<G: Generation>(
+        &mut self,
+        monitor: &Arc<WorkerMonitor<G>>,
+        group_key: &WorkerGroupKey,
+        interval: Duration,
+        now: Instant,
+        workers: &[Arc<dyn Worker>],
+    ) {
+        let on_connection = group_key.connection_mode != ConnectionMode::Http;
+        let mut polled: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers.len());
+        for worker in workers {
+            let mode = monitor.sink.poll_mode(worker, now, interval);
+            monitor
+                .poll_counts
+                .decided(worker.url(), mode, on_connection);
+            if mode != PollMode::Suppressed {
+                polled.push(Arc::clone(worker));
+            }
+        }
+        // One answer an engine, its polled members together: the sink is
+        // told an engine's answer whole.
+        for members in polled_engines(&polled) {
+            self.asked.extend(members.first().cloned());
+            let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
+            let counts = Arc::clone(&monitor.poll_counts);
+            let connection_mode = group_key.connection_mode;
+            self.answers.push(Box::pin(async move {
+                let answer = WorkerMonitor::<G>::fetch_engine_loads(
+                    members,
+                    connection_mode,
+                    &native_loads_memo,
+                    &counts,
+                )
+                .await;
+                (now, answer)
+            }));
+        }
+    }
+}
+
+/// One whole tick of a group at `now`: every engine it asks is awaited, and
+/// their answers are one publish.
 async fn poll_group_once<G: Generation>(
     monitor: &Arc<WorkerMonitor<G>>,
     group_key: &WorkerGroupKey,
     interval: Duration,
     now: Instant,
 ) {
+    poll_group(
+        monitor,
+        group_key,
+        interval,
+        now,
+        &mut OpenFetches::default(),
+        None,
+    )
+    .await;
+}
+
+/// One tick of a group at `now`: the poll decision per worker, the polls of
+/// those not served by their stream, and the publish of what the engines
+/// answer. The answers that come within [`POLLED_PUBLISH_WINDOW`] of the
+/// first are one batch: the sink is told the batch and the batch is
+/// published, so an engine's report is published when the engine answers.
+/// The tick ends at its last answer, or at `ends` with the fetches still
+/// open left in `open` for a later tick; with no `ends` it awaits every
+/// answer as one batch.
+async fn poll_group<G: Generation>(
+    monitor: &Arc<WorkerMonitor<G>>,
+    group_key: &WorkerGroupKey,
+    interval: Duration,
+    now: Instant,
+    open: &mut OpenFetches,
+    ends: Option<tokio::time::Instant>,
+) {
     // Only poll Ready workers — Pending/NotReady/Failed do not
     // serve traffic and should not contribute load samples. A worker its
     // host asks for no load is no member of the tick.
-    let workers: Vec<Arc<dyn Worker>> = monitor
-        .worker_registry
-        .get_workers_filtered(
-            Some(&group_key.model_id),
-            Some(group_key.worker_type),
-            Some(group_key.connection_mode),
-            None,
-            false,
-        )
-        .into_iter()
-        .filter(|w| w.status() == WorkerStatus::Ready && monitor.sink.polls(w.as_ref()))
-        .collect();
-
-    if workers.is_empty() {
-        debug!("No Ready workers in group {group_key}, skipping");
-        return;
-    }
+    let listed = || -> Vec<Arc<dyn Worker>> {
+        monitor
+            .worker_registry
+            .get_workers_filtered(
+                Some(&group_key.model_id),
+                Some(group_key.worker_type),
+                Some(group_key.connection_mode),
+                None,
+                false,
+            )
+            .into_iter()
+            .filter(|w| w.status() == WorkerStatus::Ready && monitor.sink.polls(w.as_ref()))
+            .collect()
+    };
+    let mut workers = listed();
 
     // Polling is unconditional by default so registration alone gives a
     // worker live load state. `--disable-load-monitoring` restores the
     // conditional gate: a load-aware policy, engine-metrics re-export, or
     // overload protection on any group member still forces the poll —
     // never "never poll".
-    if !monitor.loads_wanted(&workers) {
+    let mut asks = if workers.is_empty() {
+        debug!("No Ready workers in group {group_key}, skipping");
+        false
+    } else if monitor.loads_wanted(&workers) {
+        true
+    } else {
         debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
+        false
+    };
+    if !asks && open.answers.is_empty() {
         return;
     }
 
@@ -3008,102 +3165,133 @@ async fn poll_group_once<G: Generation>(
     // within the interval is served by that stream: its report, verdicts
     // and gauges are already current from `apply_pushed_load`, and nothing
     // here touches its entry. The others are polled: no record ever
-    // (`poll`) or records gone quiet (`fallback`).
-    let mut polled: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers.len());
-    let on_connection = group_key.connection_mode != ConnectionMode::Http;
-    for worker in &workers {
-        let mode = monitor.sink.poll_mode(worker, now, interval);
-        monitor
-            .poll_counts
-            .decided(worker.url(), mode, on_connection);
-        if mode != PollMode::Suppressed {
-            polled.push(Arc::clone(worker));
+    // (`poll`) or records gone quiet (`fallback`). A worker whose engine
+    // has not answered an earlier tick has no decision at this one, nor
+    // has a worker that took its URL since: the answer is published when
+    // it comes, and the engine is asked again behind it.
+    if asks {
+        if open.asked.is_empty() {
+            open.ask(monitor, group_key, interval, now, &workers);
+        } else {
+            let free = of_engines(&workers, &open.asked, false);
+            open.ask(monitor, group_key, interval, now, &free);
+        }
+        if open.answers.is_empty() {
+            debug!(
+                "Every worker in group {group_key} pushed its load within {interval:?}; no poll"
+            );
         }
     }
 
-    // One answer an engine, its polled members together: the sink is told
-    // an engine's answer whole.
-    let engines: Vec<EngineAnswer> = if polled.is_empty() {
-        debug!("Every worker in group {group_key} pushed its load within {interval:?}; no poll");
-        Vec::new()
-    } else {
-        let futures: Vec<_> = polled_engines(&polled)
-            .into_iter()
-            .map(|members| {
-                let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
-                let counts = Arc::clone(&monitor.poll_counts);
-                let connection_mode = group_key.connection_mode;
-                async move {
-                    WorkerMonitor::<G>::fetch_engine_loads(
-                        members,
-                        connection_mode,
-                        &native_loads_memo,
-                        &counts,
-                    )
-                    .await
-                }
-            })
-            .collect();
-        future::join_all(futures).await
-    };
-
-    let mut group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)> = Vec::new();
-    // The polled workers whose fetch failed, apart from those whose engine
-    // answered with no row: the publish keeps a failed one's last report
-    // beside the entries.
-    let mut failed: Vec<Arc<dyn Worker>> = Vec::new();
-    for mut engine in engines {
-        let carries_rank_capacity = monitor.reconcile_engine(&mut engine, now);
-        for ((worker, response), carries_rank_capacity) in
-            engine.into_iter().zip(carries_rank_capacity)
-        {
-            let Some(load) = response else {
-                failed.push(worker);
-                continue;
-            };
-            if load.loads.is_empty() {
-                continue;
+    // Whether the sink was told at this tick: it is told every batch, and
+    // a tick that asks is told at its end where no answer came.
+    let mut told = false;
+    while let Some(first) = by(ends, futures::StreamExt::next(&mut open.answers))
+        .await
+        .flatten()
+    {
+        // The batch closes at its window, at the end of the tick, or at
+        // the last open fetch's answer, whichever is first.
+        let closes = ends.map(|ends| ends.min(tokio::time::Instant::now() + POLLED_PUBLISH_WINDOW));
+        let mut engines = Vec::with_capacity(open.answers.len() + 1);
+        engines.push(first);
+        by(closes, async {
+            while let Some(engine) = futures::StreamExt::next(&mut open.answers).await {
+                engines.push(engine);
             }
-            // The wedged rule reads the queue depth off every report.
-            let waiting: i64 = load
-                .loads
+        })
+        .await;
+        // The engines whose answer comes behind the tick that asked them.
+        let late: Vec<Arc<dyn Worker>> = engines
+            .iter()
+            .filter(|(asked_at, _)| *asked_at < now)
+            .filter_map(|(_, engine)| engine.first())
+            .map(|(worker, _)| Arc::clone(worker))
+            .collect();
+        if open.answers.is_empty() {
+            open.asked.clear();
+        } else {
+            let answered: FxHashSet<(bool, &str)> = engines
                 .iter()
-                .map(|rank| i64::from(rank.num_waiting_reqs))
-                .sum();
-            let state = worker.runtime_state();
-            liveness::on_load_report(&worker, state.as_deref(), waiting, None, false, None);
-            group_loads.push((worker, load, carries_rank_capacity));
+                .filter_map(|(_, engine)| engine.first())
+                .map(|(worker, _)| engine_of(worker.as_ref()))
+                .collect();
+            open.asked
+                .retain(|asked| !answered.contains(&engine_of(asked.as_ref())));
+        }
+
+        let mut group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)> = Vec::new();
+        // The URL set the publish prunes: the workers the batch's engines
+        // were asked for only, so a worker served by its stream keeps its
+        // entry (the pushed path owns it) and one whose engine has not
+        // answered keeps its last report until it does. Without the prune
+        // of a batch that fetched nothing, a group that starts timing out
+        // keeps publishing its previous loads forever — subscribers see a
+        // stale snapshot indefinitely.
+        let mut urls: Vec<String> = Vec::with_capacity(engines.len());
+        // The polled workers whose fetch failed, apart from those whose engine
+        // answered with no row: the publish keeps a failed one's last report
+        // beside the entries.
+        let mut failed: Vec<Arc<dyn Worker>> = Vec::new();
+        for (asked_at, mut engine) in engines {
+            let carries_rank_capacity = monitor.reconcile_engine(&mut engine, asked_at);
+            for ((worker, response), carries_rank_capacity) in
+                engine.into_iter().zip(carries_rank_capacity)
+            {
+                urls.push(worker.url().to_string());
+                let Some(load) = response else {
+                    failed.push(worker);
+                    continue;
+                };
+                if load.loads.is_empty() {
+                    continue;
+                }
+                // The wedged rule reads the queue depth off every report.
+                let waiting: i64 = load
+                    .loads
+                    .iter()
+                    .map(|rank| i64::from(rank.num_waiting_reqs))
+                    .sum();
+                let state = worker.runtime_state();
+                liveness::on_load_report(&worker, state.as_deref(), waiting, None, false, None);
+                group_loads.push((worker, load, carries_rank_capacity));
+            }
+        }
+
+        monitor.end_tick(&workers, &group_loads);
+        told = true;
+
+        if group_loads.is_empty() {
+            debug!("No loads fetched for group {group_key}, pruning stale entries");
+        } else {
+            debug!(
+                "Fetched loads from {}/{} polled workers in group {group_key}",
+                group_loads.len(),
+                urls.len()
+            );
+            let rows = group_loads.iter().map(|(_, load, _)| load.loads.len());
+            monitor.poll_counts.published(rows.sum());
+        }
+        monitor.publish_polled(&group_key.model_id, &urls, group_loads, &failed);
+
+        // An engine whose answer came behind the tick that asked it is
+        // asked again at once, as a tick of its own would ask it: the
+        // group's workers and its need for loads are read anew, and the
+        // sink is told those workers from here on. At the end of a tick
+        // the next tick asks.
+        if !late.is_empty() && ends.is_some_and(|ends| tokio::time::Instant::now() < ends) {
+            workers = listed();
+            asks = !workers.is_empty() && monitor.loads_wanted(&workers);
+            if asks {
+                let again = of_engines(&workers, &late, true);
+                open.ask(monitor, group_key, interval, Instant::now(), &again);
+            }
         }
     }
 
-    monitor.end_tick(&workers, &group_loads);
-
-    if polled.is_empty() {
-        return;
+    if asks && !told {
+        monitor.end_tick(&workers, &[]);
     }
-
-    // The URL set the publish prunes: the polled workers only, so a worker
-    // served by its stream keeps its entry (the pushed path owns it).
-    // Without the empty-fetch prune, a group that starts timing out keeps
-    // publishing its previous tick's loads forever — subscribers see a
-    // stale snapshot indefinitely.
-    let polled_urls: Vec<String> = polled.iter().map(|w| w.url().to_string()).collect();
-
-    if group_loads.is_empty() {
-        debug!("No loads fetched for group {group_key}, pruning stale entries");
-        monitor.publish_polled(&group_key.model_id, &polled_urls, Vec::new(), &failed);
-        return;
-    }
-
-    debug!(
-        "Fetched loads from {}/{} polled workers in group {group_key}",
-        group_loads.len(),
-        polled.len()
-    );
-
-    let rows = group_loads.iter().map(|(_, load, _)| load.loads.len());
-    monitor.poll_counts.published(rows.sum());
-    monitor.publish_polled(&group_key.model_id, &polled_urls, group_loads, &failed);
 }
 
 /// `poll_group_once` for a host's tests: one tick over engines the host's own
@@ -4547,14 +4735,14 @@ mod native_loads_tests {
         assert_eq!(connector.calls(), 6);
     }
 
-    /// The ticks a slow poll overran are skipped, at every interval. The
-    /// first ask of the host's connector never answers, so the first poll
-    /// lasts the poll's deadline: thirty ticks at the least interval, three
-    /// at one second. One poll follows it at once and the next comes one
-    /// interval later. The timer's own default sends a poll for every tick
-    /// overrun, one behind another.
+    /// An engine whose ask is open is asked no second time, at every
+    /// interval. The first ask of the host's connector never answers, so
+    /// it lasts the poll's deadline: thirty ticks at the least interval,
+    /// three at one second. One poll follows it at once and the next comes
+    /// one interval later: no poll for every tick the ask was open, one
+    /// behind another.
     #[tokio::test(start_paused = true)]
-    async fn the_ticks_a_slow_poll_overran_are_skipped_at_every_interval() {
+    async fn an_engine_whose_ask_is_open_is_asked_no_second_time_at_every_interval() {
         for interval in [LEAST_POLL_INTERVAL, Duration::from_secs(1)] {
             let (connector, monitor) = polled_every(interval, &[None]);
             connector.silent_asks.store(1, Ordering::Relaxed);
@@ -4563,12 +4751,53 @@ mod native_loads_tests {
             assert_eq!(
                 connector.calls(),
                 1,
-                "the polls behind a slow poll at {interval:?}"
+                "the polls behind an open ask at {interval:?}"
             );
             tokio::time::sleep(interval).await;
             assert_eq!(connector.calls(), 2, "the next tick at {interval:?}");
             monitor.stop().await;
         }
+    }
+
+    /// An engine that answers is published beside one whose ask is open.
+    /// The first ask of the host's connector never answers, so one engine
+    /// of two has its fetch open for the poll's deadline. The other is
+    /// published at the tick that asked it and asked again at the next,
+    /// and the first is asked again once its fetch ended.
+    #[tokio::test(start_paused = true)]
+    async fn an_engine_that_answers_is_published_beside_one_whose_ask_is_open() {
+        let interval = Duration::from_secs(1);
+        let (connector, monitor) = polled_every(interval, &[None, None]);
+        connector.silent_asks.store(1, Ordering::Relaxed);
+        let published = |monitor: &WorkerMonitor| {
+            let snapshot = monitor.load_state.snapshot();
+            (0..2)
+                .filter(|at| {
+                    snapshot
+                        .get(&format!("http://engine-{at}.invalid:8000"))
+                        .is_some()
+                })
+                .count()
+        };
+        monitor.start_event_loop();
+        // Between the first tick and the second.
+        tokio::time::sleep(interval / 2).await;
+        assert_eq!(
+            (connector.calls(), published(&monitor)),
+            (1, 1),
+            "the engine that answered, behind the first tick"
+        );
+        tokio::time::sleep(interval).await;
+        assert_eq!(connector.calls(), 2, "the second tick asks it again");
+        // Behind the deadline of the open fetch: the third tick asked one
+        // engine, the fourth both.
+        tokio::time::sleep(LOAD_POLL_DEADLINE - interval).await;
+        assert_eq!(
+            (connector.calls(), published(&monitor)),
+            (5, 2),
+            "both engines, behind the open fetch's end"
+        );
+        monitor.stop().await;
     }
 
     /// What polling costs at the least interval, for a group of eight

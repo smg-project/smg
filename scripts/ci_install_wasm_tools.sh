@@ -3,8 +3,8 @@
 # the example policy plugin: examples/wasm/wasm-guest-policy/build.sh wraps
 # the guest's core module as a component with `wasm-tools component new`.
 #
-# The release is the one of the wit-component crate the policy crate's tests
-# depend on (crates/policy_controller/Cargo.toml: 0.x.y there is 1.x.y here),
+# The release is the one of the wit-component crate the Grand Central crate's tests
+# depend on (crates/grand_central/Cargo.toml: 0.x.y there is 1.x.y here),
 # for the host's architecture, checked against a pinned sha256 before anything
 # is unpacked, installed under a prefix of the job's own and put on
 # GITHUB_PATH for the steps that follow. The caller's own PATH is not changed:

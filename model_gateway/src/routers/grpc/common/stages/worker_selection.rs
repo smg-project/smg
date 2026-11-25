@@ -88,7 +88,7 @@ type AdmittedPdPair = (Arc<dyn Worker>, Placed, RuntimeType);
 const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
 /// Why an EPD selection produced nothing: a full Prefill pool, unsupported
-/// media references, an encode item where the policy engine places the
+/// media references, an encode item where Grand Central places the
 /// gateway's requests, or a failure judged per role afterwards by
 /// [`WorkerSelectionStage::selection_failure`].
 enum EpdSelectionFailure {
@@ -98,9 +98,9 @@ enum EpdSelectionFailure {
     DecodeVisionUnsupported,
     EncodeNotSupported,
     EncodeVisionUnsupported,
-    /// The policy engine places the gateway's requests, and it places no
+    /// Grand Central places the gateway's requests, and it places no
     /// encoder: a request that carries an encode item is not served.
-    EncodeUnderPolicyEngine,
+    EncodeUnderGrandCentral,
 }
 
 impl PrefillCandidateError for EpdSelectionFailure {
@@ -160,14 +160,14 @@ pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_tim
 
 /// Client-visible, gateway-owned code for a request refused ahead of its
 /// prefill/decode pair because it carries media for the model's encode
-/// workers and the gateway places its requests by the policy engine
-/// (`--policy-controller on`), which places no encoder.
-pub(crate) const ENCODE_UNDER_POLICY_ENGINE_CODE: &str = "encode_under_policy_engine";
+/// workers and the gateway places its requests by Grand Central
+/// (`--grand-central on`), which places no encoder.
+pub(crate) const ENCODE_UNDER_GRAND_CENTRAL_CODE: &str = "encode_under_grand_central";
 
 /// The lines of that refusal, a model at a time under the refusal lines'
 /// own allowance: a client that sends one such request sends the next
 /// alike.
-static ENCODE_UNDER_POLICY_ENGINE_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+static ENCODE_UNDER_GRAND_CENTRAL_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
     placement::REFUSAL_LINES_PER_SECOND,
     Duration::from_secs(1),
     placement::REFUSAL_LOG_MODELS,
@@ -698,8 +698,8 @@ impl WorkerSelectionStage {
                             },
                             // This mode captures no context requirements, so
                             // this call reads the budget off the body. The
-                            // placement makes it only where the policy
-                            // engine decides.
+                            // placement makes it only where Grand
+                            // Central decides.
                             || placement::Stated::of_limit(output_budget(&ctx.input.request_type)),
                         ),
                     )
@@ -781,8 +781,8 @@ impl WorkerSelectionStage {
     /// TokenSpeed EPD re-selects only the prefill/decode pair — the first dispatch
     /// already launched the encode jobs, and the plan carries their
     /// bootstrap rooms. A disaggregated retry takes a fresh Prefill
-    /// admission slot for its new prefill worker, and states to the policy
-    /// engine what the attempt before stated ([`Placed::stated`]) where the
+    /// admission slot for its new prefill worker, and states to Grand
+    /// Central what the attempt before stated ([`Placed::stated`]) where the
     /// snapshot keeps no budget.
     pub(crate) async fn reselect(
         &self,
@@ -880,7 +880,7 @@ impl WorkerSelectionStage {
                     candidate_filter: Some(&pinned),
                     tried: &ctx.tried,
                 };
-                // What the attempt before stated to the policy engine, as
+                // What the attempt before stated to Grand Central, as
                 // its decode's answer kept it. The body dropped at the
                 // build, and the encode mode's snapshot keeps no budget.
                 // The placement makes this call only where the engine
@@ -932,7 +932,7 @@ impl WorkerSelectionStage {
     /// its load guard.
     ///
     /// The pair index as it stands now is read by the placement's own call,
-    /// for a decode the policy engine placed and whose send was not said.
+    /// for a decode Grand Central placed and whose send was not said.
     /// A classic pair reads nothing here.
     ///
     /// The route's rule for a decode the request may move to: the request's
@@ -1075,7 +1075,7 @@ impl WorkerSelectionStage {
     /// queued request commits to a worker only once it is admitted. The
     /// prefill's load is held ahead of its send ([`PrefillAhead`]): the
     /// dispatch says the send where the prefill goes out.
-    /// `restated` is what a retry states again to the policy engine
+    /// `restated` is what a retry states again to Grand Central
     /// ([`placement::Stated`]) where `demand` holds no budget: the
     /// placement makes that call where the engine decides, and a classic
     /// selection never makes it. A first selection hands
@@ -1123,7 +1123,7 @@ impl WorkerSelectionStage {
     }
 
     /// EPD counterpart of [`Self::admit_pd_pair`]. `stated` states the
-    /// request to the policy engine ([`placement::Stated`]): the placement
+    /// request to Grand Central ([`placement::Stated`]): the placement
     /// makes that call where the engine decides, once a pass of the
     /// admission, and a classic selection never makes it.
     async fn admit_encode_prefill_decode_workers(
@@ -1179,8 +1179,8 @@ impl WorkerSelectionStage {
                     EpdSelectionFailure::DecodeVisionUnsupported => {
                         return self.vision_refusal(model_id, "decode workers")
                     }
-                    EpdSelectionFailure::EncodeUnderPolicyEngine => {
-                        return self.encode_under_policy_engine(model_id)
+                    EpdSelectionFailure::EncodeUnderGrandCentral => {
+                        return self.encode_under_grand_central(model_id)
                     }
                     EpdSelectionFailure::Unavailable => {}
                 }
@@ -2026,31 +2026,31 @@ impl WorkerSelectionStage {
         )
     }
 
-    /// The gateway places its requests by the policy engine
-    /// (`--policy-controller on`), which places a prefill/decode pair and no
+    /// The gateway places its requests by Grand Central
+    /// (`--grand-central on`), which places a prefill/decode pair and no
     /// encoder: a request that carries media for the model's encode workers
     /// is not served, whatever the pools hold. A 501, as the gateway answers
     /// a kind of request that one of its routes does not serve. A 501 is
     /// terminal for the retry layer by status, and no retry changes this
     /// answer. Its line is written under the refusal lines' allowance.
-    fn encode_under_policy_engine(&self, model_id: &str) -> Response {
-        if let Some(admitted) = ENCODE_UNDER_POLICY_ENGINE_LOG.admit(model_id) {
+    fn encode_under_grand_central(&self, model_id: &str) -> Response {
+        if let Some(admitted) = ENCODE_UNDER_GRAND_CENTRAL_LOG.admit(model_id) {
             warn!(
                 function = "WorkerSelectionStage::execute",
                 mode = ?self.mode,
                 model_id = %model_id,
-                code = ENCODE_UNDER_POLICY_ENGINE_CODE,
+                code = ENCODE_UNDER_GRAND_CENTRAL_CODE,
                 suppressed = admitted.suppressed,
-                "Refused a request that carries media for the encode workers: the policy engine places no encoder"
+                "Refused a request that carries media for the encode workers: Grand Central places no encoder"
             );
         }
         error::not_implemented(
-            ENCODE_UNDER_POLICY_ENGINE_CODE,
+            ENCODE_UNDER_GRAND_CENTRAL_CODE,
             format!(
                 "model '{model_id}' takes a request's media on encode workers, and this gateway \
-                 runs with --policy-controller on, which places no request on encode workers \
+                 runs with --grand-central on, which places no request on encode workers \
                  yet: send the request without media, or to a gateway that runs with \
-                 --policy-controller off"
+                 --grand-central off"
             ),
         )
     }
@@ -2173,8 +2173,8 @@ impl WorkerSelectionStage {
     ) -> Option<Placed> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         // What the pool's windows leave of the demand narrows the candidates.
-        // The demand as the request states it keeps the budget the policy
-        // engine is told.
+        // The demand as the request states it keeps the budget Grand
+        // Central is told.
         let left = context.left_by(&snapshot, &[RoutingPool::GrpcPipelineRegular], model_id);
         let accepts = |worker: &dyn Worker| {
             admits.is_none_or(|admits| admits(worker))
@@ -2243,7 +2243,7 @@ impl WorkerSelectionStage {
     /// the engines the request's failed attempts dispatched to, skipped
     /// while another available candidate is left (see
     /// `PlacementInputs::tried`); a first attempt has none. `stated` states
-    /// what the policy engine alone reads of the request, and is called
+    /// what Grand Central alone reads of the request, and is called
     /// where the engine decides and nowhere else ([`placement::Stated`]).
     #[expect(
         clippy::too_many_arguments,
@@ -2362,7 +2362,7 @@ impl WorkerSelectionStage {
     /// index, then let the configured policies and admission choose the roles.
     ///
     /// Each worker is answered as the placement answers it ([`Placed`]):
-    /// the route makes that side's load guard from it. The policy engine
+    /// the route makes that side's load guard from it. Grand Central
     /// is told the budget `demand` holds, which is the body's, and where it
     /// holds none what `restated` answers (see [`Self::admit_pd_pair`]).
     ///
@@ -2392,7 +2392,7 @@ impl WorkerSelectionStage {
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
         // What the pools' windows leave of the demand narrows the pairs. The
-        // demand as the request states it keeps the budget the policy engine
+        // demand as the request states it keeps the budget Grand Central
         // is told.
         let left = demand.with_context(demand.context.left_by(
             &snapshot,
@@ -2542,11 +2542,11 @@ impl WorkerSelectionStage {
     /// guard from it.
     ///
     /// This is the encode stage's own selection, the fifth of the functions
-    /// that choose a worker, and it holds that function's arm for the policy
-    /// engine. The engine places the pair, through
+    /// that choose a worker, and it holds that function's arm for Grand
+    /// Central. The engine places the pair, through
     /// [`placement::select_pair`], and no encoder. Where the gateway started
     /// the engine, a request that carries an encode item is refused by name
-    /// ahead of the pair ([`Self::encode_under_policy_engine`]). A request
+    /// ahead of the pair ([`Self::encode_under_grand_central`]). A request
     /// with no item is placed on the engine's pair, and the lines below
     /// assign it no encoder and ask no policy. `stated` states that
     /// request to the engine ([`placement::Stated`]): the pair's placement
@@ -2565,7 +2565,7 @@ impl WorkerSelectionStage {
         // The engine's arm. An item is refused ahead of the pair, so the
         // engine is told of no request that it would then have to give up.
         if needs_encode && self.policy_registry.engine().is_some() {
-            return Err(EpdSelectionFailure::EncodeUnderPolicyEngine);
+            return Err(EpdSelectionFailure::EncodeUnderGrandCentral);
         }
         let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
         // An encoder serves the request by its runtime's encode handoff: a
@@ -2663,7 +2663,7 @@ impl WorkerSelectionStage {
                 candidate_filter: Some(&eligible),
                 ..inputs
             },
-            // The request as its caller states it, for the policy engine
+            // The request as its caller states it, for Grand Central
             // alone: under the engine this mode places a request that
             // carries no item, and refuses one that does (above).
             stated,
@@ -4004,7 +4004,7 @@ mod tests {
             .expect("a worker")
     }
 
-    /// Where the gateway started the policy engine, the regular stage's pick
+    /// Where the gateway started Grand Central, the regular stage's pick
     /// keeps the engine's placement for its load guards. The engine hears
     /// the dispatch where the first guard is made and the end where that
     /// guard is dropped. A batch's other guards and the selection's own drop
@@ -4039,7 +4039,7 @@ mod tests {
         assert_eq!(said()[3..], ["issued", "released Abandoned"]);
     }
 
-    /// The stage states the request's completion budget to the policy engine
+    /// The stage states the request's completion budget to Grand Central
     /// as the answer's limit. The regular selection reads it off the context
     /// requirements it is handed, a first attempt's and a retry's alike, and
     /// the pair selection off its demand as the request states it. What the
@@ -4108,9 +4108,7 @@ mod tests {
     /// that worker. A request that states no id has no value to count under.
     #[test]
     fn the_regular_stage_hands_the_engine_the_bodys_id() {
-        use smg_policy_controller::document::{
-            AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec,
-        };
+        use smg_grand_central::document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec};
 
         use crate::routers::{common::placement::tests::engine_on, grpc::context::LoadGuards};
 
@@ -5302,7 +5300,7 @@ mod tests {
         }
     }
 
-    /// Where the gateway started the policy engine, the encode stage's
+    /// Where the gateway started Grand Central, the encode stage's
     /// selection asks no classic policy. A request that carries an item is
     /// refused by name ahead of its pair: a 501 under the stage's own code,
     /// which the retry layer does not repeat, and the engine hears of no
@@ -5375,7 +5373,7 @@ mod tests {
         let item = [vec![1]];
 
         // The engine places: an item is refused, and the engine hears nothing.
-        let policies = PolicyRegistry::for_policy_engine(
+        let policies = PolicyRegistry::for_engine(
             PolicyConfig::RoundRobin,
             RoutingKeyOverrideConfig::default(),
         );
@@ -5397,7 +5395,7 @@ mod tests {
         assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
         assert_eq!(
             error::extract_error_code_from_response(&refusal),
-            ENCODE_UNDER_POLICY_ENGINE_CODE
+            ENCODE_UNDER_GRAND_CENTRAL_CODE
         );
         assert!(!is_retryable_response(&refusal));
         assert!(said().is_empty(), "the engine heard {:?}", said());
@@ -5443,8 +5441,8 @@ mod tests {
         assert_eq!(counted.asked.load(Ordering::Relaxed), 1);
     }
 
-    /// The encode mode states the body's completion budget to the policy
-    /// engine too. That mode captures no context requirements, so its stage
+    /// The encode mode states the body's completion budget to Grand
+    /// Central too. That mode captures no context requirements, so its stage
     /// hands the selection a reading of the request itself, and the pair's
     /// placement makes it where the engine decides. A request with no item
     /// goes through the stage whole here: the engine places its pair, and
@@ -5464,7 +5462,7 @@ mod tests {
                 (8942, WorkerType::Decode, "ECCPUConnector"),
             ],
         );
-        let policies = PolicyRegistry::for_policy_engine(
+        let policies = PolicyRegistry::for_engine(
             PolicyConfig::RoundRobin,
             RoutingKeyOverrideConfig::default(),
         );
@@ -5512,7 +5510,7 @@ mod tests {
                 (8945, WorkerType::Decode, "ECCPUConnector"),
             ],
         );
-        let policies = PolicyRegistry::for_policy_engine(
+        let policies = PolicyRegistry::for_engine(
             PolicyConfig::RoundRobin,
             RoutingKeyOverrideConfig::default(),
         );

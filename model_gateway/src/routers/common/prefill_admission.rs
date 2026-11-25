@@ -105,8 +105,8 @@ impl Drop for PrefillReservation {
 
 /// The Prefill load one client request holds from its selection to its
 /// prefill's send: the one form of that load which is not sent. The worker
-/// is counted from the selection on, under the route's own key, and the
-/// policy engine is told nothing yet.
+/// is counted from the selection on, under the route's own key, and
+/// Grand Central is told nothing yet.
 ///
 /// Its `sent` is the only way to the load a route holds through its
 /// Prefill phase ([`PrefillLoadGuard`]), so a route says the send where it
@@ -114,7 +114,7 @@ impl Drop for PrefillReservation {
 /// request that goes out as several says its send once, ahead of them. A
 /// route that sends no prefill drops it: the worker is counted no more,
 /// and what the answer left with the load is let go behind that, which
-/// the policy engine hears as a release.
+/// Grand Central hears as a release.
 #[must_use = "the load is sent where the prefill goes out, or dropped where it never does"]
 pub struct PrefillAhead {
     /// The worker's count and, with admission, its slot. Released first.
@@ -128,7 +128,7 @@ impl PrefillAhead {
     /// The prefill's request goes out now: the load as the request holds
     /// it through its Prefill phase. An answer of the classic policies
     /// hands its load on as it stands, by the one test of what the answer
-    /// left. For an answer of the policy engine the engine hears the
+    /// left. For an answer of Grand Central the engine hears the
     /// dispatch, the load's guard keeps the engine's side to the load's
     /// release, and from here on it counts the worker under the routing
     /// value the engine names ([`Unsent::sent`]).
@@ -167,7 +167,7 @@ pub enum PrefillLoadGuard {
 }
 
 impl PrefillLoadGuard {
-    /// This load, sent for an answer of the policy engine: the load's guard
+    /// This load, sent for an answer of Grand Central: the load's guard
     /// is handed to what the answer left ([`Unsent::sent`]) and keeps the
     /// engine's side from here on, so the load's release is the end of the
     /// prefill's side. With admission that guard is the reservation's own,
@@ -273,7 +273,7 @@ pub(crate) fn hold_unbounded<C, A>(
 /// admission disabled, and by the admission itself behind the selection
 /// with it enabled ([`PrefillAdmission::admit`] holds the answer as a value
 /// it does not read). So the worker counts the request under the route's
-/// key up to the prefill's send, even where the policy engine names a
+/// key up to the prefill's send, even where Grand Central names a
 /// routing value of its own.
 ///
 /// `hand_on` takes what `select` answered as the route keeps it: the
@@ -1311,7 +1311,7 @@ mod tests {
         acquired
     }
 
-    /// A served pair of the policy engine through [`acquire_prefill`], with
+    /// A served pair of Grand Central through [`acquire_prefill`], with
     /// admission off and on. The acquisition counts the prefill worker,
     /// under the route's key, and tells the engine nothing. The engine
     /// hears the prefill's dispatch where the route says its send, and the
@@ -1361,7 +1361,7 @@ mod tests {
         }
     }
 
-    /// A pair of the policy engine whose prefill is never sent, with
+    /// A pair of Grand Central whose prefill is never sent, with
     /// admission off and on: its load is dropped as it was acquired. The
     /// worker is counted no more, the admission's slot takes the next
     /// request, and the engine hears the prefill's side released: one
@@ -1405,7 +1405,7 @@ mod tests {
         }
     }
 
-    /// Where the policy engine names a routing value for a pair, the
+    /// Where Grand Central names a routing value for a pair, the
     /// prefill worker counts the request under the route's own key from
     /// the selection to the send, and under the engine's value from the
     /// send on, with admission off and on. Its load stands at one from the
@@ -1451,7 +1451,7 @@ mod tests {
         }
     }
 
-    /// Under the policy engine a pair whose prefills are all at the
+    /// Under Grand Central a pair whose prefills are all at the
     /// admission limit is answered as the wait, as a classic placement
     /// answers it: the request is not refused, and with no queue it is
     /// told the queue is full.

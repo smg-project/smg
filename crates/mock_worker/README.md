@@ -86,7 +86,7 @@ parts with no clause for an image part, a literal `<image>` in the text) is
 refused with `multimodal_prompt_contract_mismatch`; with the right count the
 request is answered, the encode worker takes one `Encode` for each image, and
 a prefill and a decode worker take the request. That holds with the gateway's
-policy controller off and its media processing at `auto` or `router` (the
+Grand Central off and its media processing at `auto` or `router` (the
 defaults are off and `auto`); with `--mm-processing worker` the gateway does
 not process the media and refuses the request with `multimodal_not_supported`.
 The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a

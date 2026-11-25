@@ -18,7 +18,7 @@
 //!   session registry) shared by the OpenAI and HTTP routers
 //! - [`overload`] — shed responses for the absolute worker-overload
 //!   guard, shared by the HTTP and gRPC selection paths
-//! - `pair_classes` — a pair index's partner lists as the policy engine
+//! - `pair_classes` — a pair index's partner lists as Grand Central
 //!   reads them: a class on each worker and the table of classes that pair
 //! - `pair_index` — the prefill and decode workers that may pair, decided
 //!   once for a membership generation and read by every placement

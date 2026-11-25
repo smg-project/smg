@@ -10,7 +10,7 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
-use smg_policy_controller::engine::{LentList, PublishedList};
+use smg_grand_central::engine::{LentList, PublishedList};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -178,7 +178,7 @@ pub(crate) struct ModelLabels {
 pub struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
-    /// Each pool's list as the policy engine is lent it: the list, the cell
+    /// Each pool's list as Grand Central is lent it: the list, the cell
     /// the engine keeps its value of the list in, and what this gateway
     /// states of each worker beside its object. Made where the engine is
     /// first asked over that list (see [`Self::lent`]). A gateway that
@@ -398,7 +398,7 @@ impl ModelWorkerSnapshot {
         })
     }
 
-    /// The list of `pool` as the policy engine is lent it: the pool's own
+    /// The list of `pool` as Grand Central is lent it: the pool's own
     /// list ([`Self::pool`]) with the cell that stands beside it and what
     /// the gateway states of each worker ([`stated_facts`]). The engine
     /// keeps its value of the list in that cell from the list's first

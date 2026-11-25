@@ -2687,7 +2687,7 @@ mod load_snapshot_tests {
     /// them but the last (the entries of the worker's own rank where an
     /// engine answers, every entry of a gateway's rollup), and a pushed
     /// report's publish copies each of its entries, so a field the entry
-    /// gains is a cost of each, on the path with a policy engine and on the
+    /// gains is a cost of each, on the path with Grand Central and on the
     /// one without: the pin is exact. The entry's own sample instant is two
     /// words of it.
     #[test]
