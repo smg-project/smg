@@ -105,14 +105,12 @@ fn decide_and_book(
             view[((z >> 16) % n) as usize].id,
             view[((z >> 32) % n) as usize].id,
         ];
-        let facts = RequestFacts {
-            model: "m",
-            prompt_tokens: 512,
-            seed,
-            now_micros: 1_000_000,
-            tried: &drawn[..shape.exclusions],
-            ..RequestFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.prompt_tokens = 512;
+        facts.seed = seed;
+        facts.now_micros = 1_000_000;
+        facts.tried = &drawn[..shape.exclusions];
         let decision = engine.decide(&facts, pool, black_box(view), cx, scratch);
         if let Some(target) = decision.pick().and_then(|p| p.targets.first()) {
             engine.on_dispatched(&dated(), target, Side::Single, 0);
@@ -151,11 +149,9 @@ fn decide_threads(c: &mut Criterion) {
             let fleet = common::fleet(n);
             let mut view = Vec::with_capacity(n);
             common::build_view(&fleet, &mut view);
-            let pool = PoolFacts {
-                pool_size: n as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool = PoolFacts::default();
+            pool.pool_size = n as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             for &threads in &THREADS {
                 group.bench_with_input(

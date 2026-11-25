@@ -498,13 +498,11 @@ fn session(seed: u64) -> Request<'static> {
 
 /// A plain single request of 1,024 prompt tokens: it asks only a worker.
 fn plain(seed: u64) -> Request<'static> {
-    let facts = RequestFacts {
-        model: MODEL,
-        phase: Phase::Single,
-        prompt_tokens: 1_024,
-        seed,
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.model = MODEL;
+    facts.phase = Phase::Single;
+    facts.prompt_tokens = 1_024;
+    facts.seed = seed;
     Request {
         id: b"bench",
         facts,

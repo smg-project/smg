@@ -50,8 +50,8 @@ use smg_grand_central::{
     engine::{
         fingerprint, Constraints, Decision, EncodeClasses, EncodeItems, EncodeLists, EncodeMember,
         EncodePlaced, EncoderFacts, FixedFacts, Identity, InProcess, LentList, ListCell,
-        MediaCounts, PairAdmission, PairLists, PartnerClasses, Phase, Request as HostRequest,
-        RequestFacts, RequestMaker, WorkerLists,
+        PairAdmission, PairLists, PartnerClasses, Phase, Request as HostRequest, RequestFacts,
+        RequestMaker, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     store::{EncodeHandoff, EncodeOffer},
@@ -620,15 +620,13 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer], lent: boo
         let asked = Asked {
             request: HostRequest {
                 id: &id,
-                facts: RequestFacts {
-                    model: MODEL,
-                    phase: Phase::Prefill,
-                    media: MediaCounts {
-                        images: u16::from(request.images),
-                        ..MediaCounts::default()
-                    },
-                    seed,
-                    ..RequestFacts::default()
+                facts: {
+                    let mut facts = RequestFacts::default();
+                    facts.model = MODEL;
+                    facts.phase = Phase::Prefill;
+                    facts.media.images = u16::from(request.images);
+                    facts.seed = seed;
+                    facts
                 },
                 constraints: Constraints::default(),
             },

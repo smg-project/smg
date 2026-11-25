@@ -337,12 +337,14 @@ mod tests {
     /// ties.
     #[test]
     fn the_scorer_scores_a_workers_share_of_the_busiest_and_ties_an_idle_fleet() {
-        let row = |running: Option<u32>| Candidate {
-            load: running.map(|running| LoadRow {
-                running,
-                ..LoadRow::default()
-            }),
-            ..Candidate::default()
+        let row = |running: Option<u32>| {
+            let mut candidate = Candidate::default();
+            candidate.load = running.map(|running| {
+                let mut load = LoadRow::default();
+                load.running = running;
+                load
+            });
+            candidate
         };
         let scores = |rows: &[Candidate]| {
             let kept: Vec<u32> = (0..).take(rows.len()).collect();

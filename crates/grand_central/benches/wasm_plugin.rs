@@ -135,14 +135,13 @@ fn engine_of(profile: Profile) -> Engine {
 }
 
 fn facts(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 512,
-        budget_micros: FRAME_MICROS,
-        seed,
-        now_micros: 1_000_000,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.prompt_tokens = 512;
+    facts.budget_micros = FRAME_MICROS;
+    facts.seed = seed;
+    facts.now_micros = 1_000_000;
+    facts
 }
 
 fn worlds() -> Vec<(&'static str, Vec<u8>)> {
@@ -196,11 +195,9 @@ fn decide(c: &mut Criterion) {
             let mut view = Vec::with_capacity(n);
             build_view(&fleet, &mut view);
             let mut scratch = Scratch::new();
-            let pool = PoolFacts {
-                pool_size: n as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool = PoolFacts::default();
+            pool.pool_size = n as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             group.throughput(Throughput::Elements(n as u64));
             group.bench_with_input(BenchmarkId::new(world, n), &n, |b, _| {
@@ -236,18 +233,14 @@ fn decide_held(c: &mut Criterion) {
             let mut held = Vec::with_capacity(n);
             build_column(&fleet, &mut held);
             let mut scratch = Scratch::new();
-            let pool = PoolFacts {
-                pool_size: n as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool = PoolFacts::default();
+            pool.pool_size = n as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             // A column of another length is refused before the plugin is
             // called: the cell would time the refusal.
-            let first = RequestFacts {
-                affinity: &held,
-                ..facts(0)
-            };
+            let mut first = facts(0);
+            first.affinity = &held;
             let first = engine.decide(&first, &pool, &view, &cx, &mut scratch);
             assert!(
                 first.pick().is_some(),
@@ -258,10 +251,8 @@ fn decide_held(c: &mut Criterion) {
                 let mut seed = 0u64;
                 b.iter(|| {
                     seed += 1;
-                    let facts = RequestFacts {
-                        affinity: black_box(&held),
-                        ..facts(seed)
-                    };
+                    let mut facts = facts(seed);
+                    facts.affinity = black_box(&held);
                     engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
                 });
             });
@@ -298,11 +289,9 @@ fn decide_fresh(c: &mut Criterion) {
             let mut view = Vec::with_capacity(n);
             build_view(&fleet, &mut view);
             let mut scratch = Scratch::new();
-            let pool = PoolFacts {
-                pool_size: n as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool = PoolFacts::default();
+            pool.pool_size = n as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             group.throughput(Throughput::Elements(n as u64));
             group.bench_with_input(BenchmarkId::new(world, n), &n, |b, _| {
@@ -349,11 +338,9 @@ fn fuel_exhausted(c: &mut Criterion) {
     let mut view = Vec::with_capacity(n);
     build_view(&fleet, &mut view);
     let mut scratch = Scratch::new();
-    let pool = PoolFacts {
-        pool_size: n as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = n as u32;
+    pool.generation = 1;
     let cx = Constraints::default();
     group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
         let mut seed = 0u64;
@@ -376,11 +363,9 @@ fn prompt(c: &mut Criterion) {
     let fleet = fleet(CANDIDATES);
     let mut view = Vec::with_capacity(CANDIDATES);
     build_view(&fleet, &mut view);
-    let pool = PoolFacts {
-        pool_size: CANDIDATES as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = CANDIDATES as u32;
+    pool.generation = 1;
     let cx = Constraints::default();
     for (world, component) in worlds() {
         for (declares, declared) in [("undeclared", false), ("declared", true)] {
@@ -395,10 +380,8 @@ fn prompt(c: &mut Criterion) {
                     let mut seed = 0u64;
                     b.iter(|| {
                         seed += 1;
-                        let facts = RequestFacts {
-                            block_hashes: &hashes[..carried],
-                            ..facts(seed)
-                        };
+                        let mut facts = facts(seed);
+                        facts.block_hashes = &hashes[..carried];
                         engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
                     });
                 });
@@ -465,11 +448,9 @@ fn native(c: &mut Criterion) {
         let mut view = Vec::with_capacity(n);
         build_view(&fleet, &mut view);
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
@@ -502,11 +483,9 @@ fn decide_named(c: &mut Criterion) {
         let mut view = Vec::with_capacity(n);
         build_view(&fleet, &mut view);
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
         let turn = DecisionSlot::new(0).enter();
         group.throughput(Throughput::Elements(n as u64));
@@ -554,11 +533,9 @@ fn membership(c: &mut Criterion) {
         let mut view = Vec::with_capacity(n);
         build_view(&fleet, &mut view);
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
         let members: Vec<WorkerId> = view.iter().map(|row| row.id).collect();
         engine.on_membership(&Membership::Snapshot(&members));

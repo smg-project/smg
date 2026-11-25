@@ -3,7 +3,7 @@
 use smg_grand_central::{
     document::{PolicySpec, API_VERSION},
     engine::{
-        Candidate, Constraints, Health, Picker, PoolFacts, RequestFacts, Scratch, Targets, TieBand,
+        Candidate, Constraints, Picker, PoolFacts, RequestFacts, Scratch, Targets, TieBand,
         WorkerId,
     },
     stages::{Best, Lifecycle, StageBuild, StageError, StageRegistry},
@@ -53,15 +53,13 @@ fn a_yaml_parameter_moves_the_pick() {
     // Three healthy rows, each with one more request in flight than the
     // row before it: the first is the best by the scorer.
     let rows: Vec<Candidate> = (0..3)
-        .map(|position| Candidate {
-            position,
-            id: WorkerId(u64::from(position) + 70),
-            in_flight: position,
-            health: Health {
-                healthy: true,
-                ..Health::default()
-            },
-            ..Candidate::default()
+        .map(|position| {
+            let mut row = Candidate::default();
+            row.position = position;
+            row.id = WorkerId(u64::from(position) + 70);
+            row.in_flight = position;
+            row.health.healthy = true;
+            row
         })
         .collect();
     let document = |past: u32| -> PolicySpec {
@@ -83,12 +81,11 @@ profiles:
         let engine = document(past)
             .validate_in(&catalog, &[])
             .expect("validates");
+        let mut pool = PoolFacts::default();
+        pool.pool_size = rows.len() as u32;
         let decision = engine.decide(
             &RequestFacts::default(),
-            &PoolFacts {
-                pool_size: rows.len() as u32,
-                ..PoolFacts::default()
-            },
+            &pool,
             &rows,
             &Constraints::default(),
             &mut Scratch::new(),

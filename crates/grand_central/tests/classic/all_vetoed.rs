@@ -50,13 +50,12 @@ enum State {
 
 impl State {
     fn health(self) -> Health {
-        Health {
-            healthy: self != Self::Down,
-            breaker_open: self == Self::Breaker,
-            overloaded: matches!(self, Self::Over | Self::StalledOver),
-            stalled: matches!(self, Self::Stalled | Self::StalledOver),
-            ..Health::default()
-        }
+        let mut health = Health::default();
+        health.healthy = self != Self::Down;
+        health.breaker_open = self == Self::Breaker;
+        health.overloaded = matches!(self, Self::Over | Self::StalledOver);
+        health.stalled = matches!(self, Self::Stalled | Self::StalledOver);
+        health
     }
 }
 
@@ -172,15 +171,16 @@ impl Bed {
             _ => (0..row.workers.len()).collect(),
         };
         let mut pool: Vec<Candidate> = (0..row.workers.len())
-            .map(|place| Candidate {
-                position: place as u32,
-                id: if lent {
+            .map(|place| {
+                let mut candidate = Candidate::default();
+                candidate.position = place as u32;
+                candidate.id = if lent {
                     WorkerId::from_address(&address(place))
                 } else {
                     id(place)
-                },
-                key: 1_000 + place as u32,
-                ..Candidate::default()
+                };
+                candidate.key = 1_000 + place as u32;
+                candidate
             })
             .collect();
         for (&place, worker) in places.iter().zip(&row.workers) {
@@ -209,22 +209,18 @@ impl Bed {
             .collect();
         let ring = self.lent.as_ref().map(|ring| ring as &dyn LentRing);
         let at = ring.zip(key).map(|(ring, key)| ring.position(key));
-        let facts = RequestFacts {
-            model: "m",
-            session_key: key.map_or(Identity::NONE, Identity::plain),
-            attempt: u8::from(!tried.is_empty()),
-            tried: &tried,
-            seed,
-            now_micros: self.clock,
-            ring,
-            ring_positions: at.as_slice(),
-            ..RequestFacts::default()
-        };
-        let pool_facts = PoolFacts {
-            pool_size: self.pool.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.session_key = key.map_or(Identity::NONE, Identity::plain);
+        facts.attempt = u8::from(!tried.is_empty());
+        facts.tried = &tried;
+        facts.seed = seed;
+        facts.now_micros = self.clock;
+        facts.ring = ring;
+        facts.ring_positions = at.as_slice();
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = self.pool.len() as u32;
+        pool_facts.generation = 1;
         let decision = self.engine.decide(
             &facts,
             &pool_facts,

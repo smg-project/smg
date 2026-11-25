@@ -28,9 +28,8 @@ use smg_grand_central::{
     cases,
     document::{PolicySpec, DENIED_HEADERS},
     engine::{
-        fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Health, Identity, LiftedVeto,
-        LoadRow, MediaCounts, OverloadRegime, Pair, Phase, PoolFacts, Queue, RequestFacts, Role,
-        Shed, ShedReason, SignalSource, Target, Trace, ZoneCapacity,
+        fingerprint, Identity, LiftedVeto, Pair, Phase, Queue, RequestFacts, Role, Shed,
+        ShedReason, Target, Trace,
     },
     mirrored, record,
     tracking::{Lease, LeaseKind, Side},
@@ -72,185 +71,46 @@ fn the_header_deny_list_holds_its_seven_names() {
 // a pattern that names every field without `..` and a match without a
 // wildcard arm, so a type cannot gain, lose or rename one without this file
 // failing to compile. No such pattern of a type marked non-exhaustive
-// builds outside the library: the lists of those five are stated there, by
+// builds outside the library: the lists of those types are stated there, by
 // the same macros, and read here (`mirrored::outcome` and its like).
 
 fn candidate_record() -> &'static [&'static str] {
-    record!(
-        Candidate,
-        Candidate {
-            position,
-            id,
-            role,
-            dp_rank,
-            dp_size,
-            health,
-            wire_modes,
-            engine_kind,
-            connector,
-            in_flight,
-            load,
-            load_sampled_at_micros,
-            session_hit,
-            session_in_flight,
-            pair_class,
-            has_capacity,
-            has_room,
-            zone,
-            labels,
-            ec_compatible,
-            vision,
-            host_local,
-            active_sessions,
-            key,
-            engine,
-        }
-    )
+    mirrored::candidate()
 }
 
 /// A candidate's affinity facts: a column beside the rows in the crate, five
 /// fields of the candidate's own record on both wires, at the numbers they
 /// were given as fields of the row.
 fn affinity_record() -> &'static [&'static str] {
-    record!(
-        AffinityFacts,
-        AffinityFacts {
-            overlap_blocks,
-            predicted_blocks,
-            admitted_age_ms,
-            indexed_growth,
-            indexed_blocks,
-        }
-    )
+    mirrored::affinity_facts()
 }
 
 fn request_record() -> &'static [&'static str] {
-    record!(
-        RequestFacts<'_>,
-        RequestFacts {
-            model,
-            namespace_seed,
-            tenant,
-            priority,
-            streaming,
-            max_output_tokens,
-            prompt_tokens,
-            block_hashes,
-            hash_kind,
-            session_key,
-            phase,
-            attempt,
-            tried,
-            budget_micros,
-            headers,
-            media,
-            seed,
-            block_size,
-            prompt_chars,
-            prompt_bytes,
-            now_micros,
-            session_counted,
-            affinity,
-            named,
-            model_fingerprint,
-            signal_cells,
-            client_key,
-            ring,
-            ring_positions,
-            session_key_from_rid,
-        }
-    )
+    mirrored::request_facts()
 }
 
 fn load_row_record() -> &'static [&'static str] {
-    record!(
-        LoadRow,
-        LoadRow {
-            running,
-            queued,
-            waiting_uncached_tokens,
-            kv_usage_permille,
-            active_kv_permille,
-            live_rate,
-            resident_tokens,
-            resident_counted,
-            report_age_ms,
-            source,
-            max_running,
-        }
-    )
+    mirrored::load_row()
 }
 
 fn constraints_record() -> &'static [&'static str] {
-    record!(
-        Constraints<'_>,
-        Constraints {
-            excluded,
-            wire_modes,
-            overload_lifted,
-            decode_later,
-            counted_on_decode,
-            subset_hint,
-            demands,
-            stalled,
-            held,
-            places
-        }
-    )
+    mirrored::constraints()
 }
 
 fn pool_record() -> &'static [&'static str] {
-    record!(
-        PoolFacts<'_>,
-        PoolFacts {
-            pool_size,
-            membership_epoch,
-            ring_epoch,
-            regime,
-            generation,
-            zones,
-            reach,
-            reported,
-            engines,
-            word,
-        }
-    )
+    mirrored::pool_facts()
 }
 
 fn zone_record() -> &'static [&'static str] {
-    record!(
-        ZoneCapacity,
-        ZoneCapacity {
-            zone,
-            healthy,
-            total
-        }
-    )
+    mirrored::zone_capacity()
 }
 
 fn media_record() -> &'static [&'static str] {
-    record!(
-        MediaCounts,
-        MediaCounts {
-            images,
-            audio,
-            video,
-            bytes
-        }
-    )
+    mirrored::media_counts()
 }
 
 fn health_record() -> &'static [&'static str] {
-    record!(
-        Health,
-        Health {
-            healthy,
-            breaker_open,
-            stalled,
-            draining,
-            overloaded
-        }
-    )
+    mirrored::health()
 }
 
 fn target_record() -> &'static [&'static str] {
@@ -395,39 +255,18 @@ fn enum_mirrors() -> Vec<(
                 }
             ),
         ),
-        (
-            "HashKind",
-            "HASH_KIND",
-            "hash-kind",
-            cases!(HashKind, HashKind { Token, Text }),
-        ),
+        ("HashKind", "HASH_KIND", "hash-kind", mirrored::hash_kind()),
         (
             "SignalSource",
             "SIGNAL_SOURCE",
             "signal-source",
-            cases!(
-                SignalSource,
-                SignalSource {
-                    None,
-                    Events,
-                    Scrape,
-                    Relay,
-                    Poll
-                }
-            ),
+            mirrored::signal_source(),
         ),
         (
             "OverloadRegime",
             "OVERLOAD_REGIME",
             "overload-regime",
-            cases!(
-                OverloadRegime,
-                OverloadRegime {
-                    None,
-                    Partial,
-                    Saturated
-                }
-            ),
+            mirrored::overload_regime(),
         ),
         (
             "LeaseKind",
@@ -2281,11 +2120,12 @@ fn the_published_session_example_is_what_the_crate_makes() {
         ("decode", Phase::Decode),
         ("encode", Phase::Encode),
     ] {
-        let session = RequestFacts {
-            model: "model-a",
-            session_key: Identity::plain("conversation-7"),
-            phase,
-            ..RequestFacts::default()
+        let session = {
+            let mut facts = RequestFacts::default();
+            facts.model = "model-a";
+            facts.session_key = Identity::plain("conversation-7");
+            facts.phase = phase;
+            facts
         }
         .session();
         stated.push((name, session.get()));

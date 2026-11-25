@@ -6,8 +6,7 @@ use smg_grand_central::{
     document::{PolicySpec, SpecError, API_VERSION},
     engine::{
         AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Decision, Engine,
-        Health, LoadRow, PairPools, Phase, PoolFacts, RequestFacts, ScoreFront, Scratch, Target,
-        WorkerId,
+        LoadRow, PairPools, Phase, PoolFacts, RequestFacts, ScoreFront, Scratch, Target, WorkerId,
     },
     stages::Lifecycle,
     tracking::{Lease, Membership, Side},
@@ -32,23 +31,20 @@ fn policy(stages: &str, limit: Option<u64>) -> Engine {
 }
 
 fn candidate(position: u32, sample: u64) -> Candidate {
-    Candidate {
-        position,
-        id: WorkerId(u64::from(position) + 1),
-        health: Health {
-            healthy: true,
-            ..Health::default()
-        },
-        load_sampled_at_micros: sample,
-        load: Some(LoadRow {
-            running: position + 1,
-            live_rate: 1_000,
-            resident_tokens: 320 * (position + 1),
-            resident_counted: true,
-            ..LoadRow::default()
-        }),
-        ..Candidate::default()
-    }
+    let mut row = Candidate::default();
+    row.position = position;
+    row.id = WorkerId(u64::from(position) + 1);
+    row.health.healthy = true;
+    row.load_sampled_at_micros = sample;
+    row.load = Some({
+        let mut load = LoadRow::default();
+        load.running = position + 1;
+        load.live_rate = 1_000;
+        load.resident_tokens = 320 * (position + 1);
+        load.resident_counted = true;
+        load
+    });
+    row
 }
 
 fn scores(policy: &Engine, facts: &RequestFacts<'_>, rows: &[Candidate]) -> Vec<f32> {
@@ -61,13 +57,12 @@ fn scores(policy: &Engine, facts: &RequestFacts<'_>, rows: &[Candidate]) -> Vec<
 }
 
 fn request() -> RequestFacts<'static> {
-    RequestFacts {
-        now_micros: NOW,
-        block_hashes: &[0; 16],
-        block_size: 16,
-        prompt_tokens: 256,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.now_micros = NOW;
+    facts.block_hashes = &[0; 16];
+    facts.block_size = 16;
+    facts.prompt_tokens = 256;
+    facts
 }
 
 #[test]
@@ -119,16 +114,16 @@ fn least_load_uses_the_decision_instant_and_keeps_the_exact_limit() {
     let stages = r#""least-load""#;
     let (limited, bare) = (policy(stages, Some(LIMIT_MS)), policy(stages, None));
     let mut rows = [candidate(0, EDGE), candidate(1, NOW), candidate(2, NOW)];
-    rows[0].load = Some(LoadRow {
-        running: 17,
-        live_rate: 400_000,
-        report_age_ms: u32::MAX,
-        ..LoadRow::default()
-    });
-    rows[1].load = rows[1].load.map(|row| LoadRow {
-        running: 7,
-        live_rate: 0,
-        ..row
+    let mut load = LoadRow::default();
+    load.running = 17;
+    load.live_rate = 400_000;
+    load.report_age_ms = u32::MAX;
+    rows[0].load = Some(load);
+    rows[1].load = rows[1].load.map(|row| {
+        let mut load_row = row;
+        load_row.running = 7;
+        load_row.live_rate = 0;
+        load_row
     });
     let reported = scores(&bare, &request(), &rows);
     assert_eq!(scores(&limited, &request(), &rows), reported);
@@ -147,17 +142,14 @@ fn least_load_uses_the_decision_instant_and_keeps_the_exact_limit() {
     let missing = scores(&steep, &request(), &rows);
     // This pressure would overflow the cost of a reported row. It has
     // no effect on a row already marked as unreported.
-    rows[0].load = Some(LoadRow {
-        active_kv_permille: 999,
-        ..LoadRow::default()
-    });
+    let mut load = LoadRow::default();
+    load.active_kv_permille = 999;
+    rows[0].load = Some(load);
     assert_eq!(scores(&steep, &request(), &rows), missing);
 
     rows[0] = candidate(0, 0);
-    let near_origin = RequestFacts {
-        now_micros: 1,
-        ..request()
-    };
+    let mut near_origin = request();
+    near_origin.now_micros = 1;
     assert_eq!(
         scores(&limited, &near_origin, &rows),
         scores(&bare, &near_origin, &rows),
@@ -169,9 +161,10 @@ fn least_load_asks_for_the_whole_pool_when_the_front_has_a_stale_report() {
     let engine = policy(r#""least-load""#, Some(LIMIT_MS));
     let stage = &engine.profiles()[0].scorers[0].scorer;
     let mut rows = [candidate(0, EDGE - 1), candidate(1, NOW), candidate(2, NOW)];
-    rows[1].load = rows[1].load.map(|row| LoadRow {
-        live_rate: 0,
-        ..row
+    rows[1].load = rows[1].load.map(|row| {
+        let mut load = row;
+        load.live_rate = 0;
+        load
     });
     let mut out = [0.0; 2];
     let kept = [0, 1, 2];
@@ -206,9 +199,10 @@ fn resident_work_scores_stale_reports_as_unreported() {
 
 fn hot_pool() -> [Candidate; 3] {
     let mut rows = [candidate(0, EDGE - 1), candidate(1, NOW), candidate(2, NOW)];
-    rows[0].load = rows[0].load.map(|row| LoadRow {
-        active_kv_permille: 950,
-        ..row
+    rows[0].load = rows[0].load.map(|row| {
+        let mut load = row;
+        load.active_kv_permille = 950;
+        load
     });
     rows
 }
@@ -218,17 +212,17 @@ fn prefix_affinity_ignores_stale_reports_in_the_kv_gate() {
     let stages = r#""prefix-affinity",{"kv-pressure":{"ceiling":0.8}}"#;
     let (limited, bare) = (policy(stages, Some(LIMIT_MS)), policy(stages, None));
     let mut rows = hot_pool();
-    let facts = RequestFacts {
-        affinity: &[
-            AffinityFacts {
-                overlap_blocks: 8,
-                ..AffinityFacts::default()
-            },
-            AffinityFacts::default(),
-            AffinityFacts::default(),
-        ],
-        ..request()
-    };
+    let affinity = [
+        {
+            let mut affinity_facts = AffinityFacts::default();
+            affinity_facts.overlap_blocks = 8;
+            affinity_facts
+        },
+        AffinityFacts::default(),
+        AffinityFacts::default(),
+    ];
+    let mut facts = request();
+    facts.affinity = &affinity;
     assert_eq!(scores(&bare, &facts, &rows), [1.0; 3]);
     let stale = scores(&limited, &facts, &rows);
     assert_eq!(stale, [1.0, 0.5, 0.5]);
@@ -240,18 +234,20 @@ fn prefix_affinity_ignores_stale_reports_in_the_kv_gate() {
         ScoreFront::At(1)
     );
     assert_eq!(front, stale.as_slice());
-    let named = RequestFacts {
-        named: Some(AffinityRows {
-            holders: &[AffinityHolder {
-                row: 0,
-                overlap_blocks: 8,
-                predicted_blocks: 0,
-            }],
-            ..AffinityRows::default()
-        }),
-        affinity: &[],
-        ..facts
-    };
+    let holders = [{
+        let mut holder = AffinityHolder::default();
+        holder.row = 0;
+        holder.overlap_blocks = 8;
+        holder.predicted_blocks = 0;
+        holder
+    }];
+    let mut named = facts;
+    named.named = Some({
+        let mut affinity_rows = AffinityRows::default();
+        affinity_rows.holders = &holders;
+        affinity_rows
+    });
+    named.affinity = &[];
     assert_eq!(
         stage.score_front(&named, &rows, &kept, &kept, &mut front).1,
         ScoreFront::Unsaid
@@ -266,16 +262,13 @@ fn the_warmup_slice_ignores_stale_reports_in_the_kv_gate() {
     let stages = r#"{"warmup-slice":{"share":1.0,"blocks":8}},{"kv-pressure":{"ceiling":0.8}}"#;
     let (limited, bare) = (policy(stages, Some(LIMIT_MS)), policy(stages, None));
     let mut rows = hot_pool();
-    let mature = AffinityFacts {
-        admitted_age_ms: u32::MAX,
-        indexed_blocks: 64,
-        indexed_growth: 64,
-        ..AffinityFacts::default()
-    };
-    let facts = RequestFacts {
-        affinity: &[mature, mature, AffinityFacts::default()],
-        ..request()
-    };
+    let mut mature = AffinityFacts::default();
+    mature.admitted_age_ms = u32::MAX;
+    mature.indexed_blocks = 64;
+    mature.indexed_growth = 64;
+    let affinity = [mature, mature, AffinityFacts::default()];
+    let mut facts = request();
+    facts.affinity = &affinity;
     assert_eq!(scores(&bare, &facts, &rows), [1.0; 3]);
     let stale = scores(&limited, &facts, &rows);
     assert_eq!(stale, [0.0, 0.0, 1.0]);
@@ -341,17 +334,14 @@ fn a_stale_report_behind_the_front_sends_the_pool_through_whole_scoring() {
     for entry in &mut column[..4] {
         entry.overlap_blocks = 8;
     }
-    let facts = RequestFacts {
-        affinity: &column,
-        ..request()
-    };
+    let mut facts = request();
+    facts.affinity = &column;
     let decide = |policy: &Engine, rows: &[Candidate], reported| {
+        let mut pool = PoolFacts::default();
+        pool.reported = reported;
         policy.decide(
             &facts,
-            &PoolFacts {
-                reported,
-                ..PoolFacts::default()
-            },
+            &pool,
             rows,
             &Constraints::default(),
             &mut Scratch::new(),
@@ -374,9 +364,10 @@ fn both_sides_of_a_pair_use_the_report_age_limit() {
     let engine = spec.validate().expect("the pair policy");
     let side = |base| {
         let mut stale = candidate(0, EDGE - 1);
-        stale.load = stale.load.map(|row| LoadRow {
-            live_rate: 1_000_000,
-            ..row
+        stale.load = stale.load.map(|row| {
+            let mut load = row;
+            load.live_rate = 1_000_000;
+            load
         });
         stale.in_flight = 3;
         let mut rows = [stale, candidate(1, NOW)];

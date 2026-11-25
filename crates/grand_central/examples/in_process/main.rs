@@ -84,23 +84,20 @@ fn own_stage() -> Result<(), Box<dyn Error>> {
     // A record made ready is an engine of its own. The two ranks state the
     // engine they share, and the worker behind them the next engine of the
     // list: an engine states its place among the engines of its list.
-    let rank = |position: u32, dp_rank: u16, in_flight: u32| Candidate {
-        engine: 0,
-        dp_rank,
-        dp_size: 2,
-        in_flight,
-        ..Candidate::ready(position, WorkerId(u64::from(position)), Role::Single)
+    let rank = |position: u32, dp_rank: u16, in_flight: u32| {
+        let mut row = Candidate::ready(position, WorkerId(u64::from(position)), Role::Single);
+        row.engine = 0;
+        row.dp_rank = dp_rank;
+        row.dp_size = 2;
+        row.in_flight = in_flight;
+        row
     };
-    let alone = Candidate {
-        engine: 1,
-        in_flight: 2,
-        ..Candidate::ready(2, WorkerId(2), Role::Single)
-    };
+    let mut alone = Candidate::ready(2, WorkerId(2), Role::Single);
+    alone.engine = 1;
+    alone.in_flight = 2;
     let records = [rank(0, 0, 3), rank(1, 1, 0), alone];
-    let facts = RequestFacts {
-        model: MODEL,
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.model = MODEL;
     let (pool, cx) = (PoolFacts::default(), Constraints::default());
     let decision = engine.decide(&facts, &pool, &records, &cx, &mut Scratch::new());
     let first = decision.pick().and_then(|pick| pick.targets.first());

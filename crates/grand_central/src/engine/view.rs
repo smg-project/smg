@@ -7,12 +7,6 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
-#![expect(
-    clippy::exhaustive_enums,
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::sync::atomic::AtomicU64;
 
 use super::demands::DemandFacts;
@@ -120,6 +114,7 @@ impl Phase {
 
 /// What the request's block hashes were computed over.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HashKind {
     /// Token blocks of the model's block size of record.
     #[default]
@@ -167,6 +162,7 @@ pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32
 
 /// Where a candidate's load row came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SignalSource {
     #[default]
     None,
@@ -182,6 +178,7 @@ pub enum SignalSource {
 
 /// The pool's overload regime, as the host reads it per decision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OverloadRegime {
     #[default]
     None,
@@ -247,6 +244,7 @@ impl From<smg_worker::worker::ConnectionMode> for WireModes {
 /// Health as the pool reads it. Each flag is one bit of the host's routing
 /// state, read once per decision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Health {
     /// The worker's status is ready.
     pub healthy: bool,
@@ -313,9 +311,10 @@ pub(crate) fn threshold_permille(usage: f64) -> u16 {
 /// core, in the record's own names, rounded to narrow fields by the host.
 /// Permille fields are the record's ratios times 1000.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..LoadRow::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LoadRow {
     /// Requests running on the engine.
     pub running: u32,
@@ -512,9 +511,10 @@ impl Session {
 /// when the column is empty. On a wire the five are fields of the
 /// candidate's own record, at the numbers they were given.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..AffinityFacts::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AffinityFacts {
     /// Prefix blocks of the request this worker holds, by the event index.
     pub overlap_blocks: u32,
@@ -540,6 +540,7 @@ pub struct AffinityFacts {
 /// release build reads them as they stand, a row past the count naming
 /// nobody. In-process only.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct AffinityRows<'a> {
     /// The rows that hold a leading part of the request, ascending by row,
     /// each with what it holds. A row not named reads as holding nothing.
@@ -562,6 +563,7 @@ pub struct AffinityRows<'a> {
 /// of what it holds, by both readings. Its age and its index size stay with
 /// the host, which ruled the warming rows from them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AffinityHolder {
     /// The row's index in the candidate slice.
     pub row: u32,
@@ -813,10 +815,12 @@ impl Reads<'_> {
 /// candidate's [`AffinityFacts`] in the same record and encodes to about 76
 /// bytes with its load row.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Candidate::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default,
+/// or from [`Candidate::ready`], and assigns what it knows, and a pattern of
+/// it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(align(64))]
+#[non_exhaustive]
 pub struct Candidate {
     /// The row's position in the host's candidate slice; targets name it.
     /// In-process only: the wire names rows by their order. It is also the
@@ -944,8 +948,8 @@ impl Candidate {
     /// records by hand: its status is ready and no other health bit is set,
     /// both admission bits are open, and it is an engine of its own
     /// ([`Self::engine`] is its position). Every other field is the
-    /// default's, and a caller writes what its stage reads over it:
-    /// `Candidate { in_flight: 3, ..Candidate::ready(0, id, Role::Single) }`.
+    /// default's, and a caller assigns what its stage reads over it:
+    /// `let mut row = Candidate::ready(0, id, Role::Single); row.in_flight = 3;`.
     ///
     /// An engine states its place among the engines of its list, so the
     /// position is that place only while every record before it is an
@@ -1048,6 +1052,7 @@ impl LoadReportCutoff {
 
 /// Media on the request: counts and bytes, for workers that take media.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MediaCounts {
     pub images: u16,
     pub audio: u16,
@@ -1078,6 +1083,7 @@ impl MediaCounts {
 /// header list, and its value. A value never pairs with a name the spec did
 /// not allow.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Header<'a> {
     pub name: u8,
     pub value: &'a str,
@@ -1153,9 +1159,10 @@ impl SessionCountedUnder {
 /// One request as a decision sees it. Borrowed from the host for the
 /// duration of the decision.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..RequestFacts::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct RequestFacts<'a> {
     /// The resolved model id, after aliasing.
     pub model: &'a str,
@@ -1540,9 +1547,10 @@ impl<'a> RequestFacts<'a> {
 /// speaks and the request-level lifts around the profile. The admission bits
 /// of a prefill window and a decode room ride the candidate rows.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Constraints::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct Constraints<'a> {
     /// Candidates this host just failed to reach.
     pub excluded: &'a [WorkerId],
@@ -1652,6 +1660,7 @@ impl Constraints<'_> {
 
 /// Healthy capacity of one zone, by the zone's position.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ZoneCapacity {
     pub zone: u16,
     pub healthy: u32,
@@ -1730,9 +1739,10 @@ impl<'a> Engines<'a> {
 
 /// Pool-wide facts beside the candidates.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..PoolFacts::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct PoolFacts<'a> {
     /// Pool size before any narrowing.
     pub pool_size: u32,

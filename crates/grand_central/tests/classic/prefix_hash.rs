@@ -36,8 +36,8 @@ use serde::Deserialize;
 use smg_grand_central::{
     document::PolicySpec,
     engine::{
-        fingerprint, Candidate, Constraints, Engine, HashKind, Health, Identity, PoolFacts,
-        RequestFacts, Scratch, WorkerId,
+        fingerprint, Candidate, Constraints, Engine, HashKind, Identity, PoolFacts, RequestFacts,
+        Scratch, WorkerId,
     },
     policies::consistent_hashing::LentRing,
 };
@@ -284,15 +284,13 @@ impl Bed {
         assert_eq!(places.len(), loads.len(), "a place of every worker");
         let engine = config.spec().validate().map_err(|err| err.to_string())?;
         let pool = (0..loads.len())
-            .map(|i| Candidate {
-                position: i as u32,
-                id: WorkerId(1_000 + i as u64),
-                key: 1_000 + i as u32,
-                health: Health {
-                    healthy: true,
-                    ..Health::default()
-                },
-                ..Candidate::default()
+            .map(|i| {
+                let mut row = Candidate::default();
+                row.position = i as u32;
+                row.id = WorkerId(1_000 + i as u64);
+                row.key = 1_000 + i as u32;
+                row.health.healthy = true;
+                row
             })
             .collect();
         let mut bed = Self {
@@ -341,28 +339,24 @@ impl Bed {
             .map(|&i| self.pool[self.places[i]].id)
             .collect();
         let ring = self.lent.as_ref().map(|ring| ring as &dyn LentRing);
-        let facts = RequestFacts {
-            model: "m",
-            session_key: request
-                .key
-                .as_deref()
-                .map_or(Identity::NONE, Identity::plain),
-            prompt_tokens: request.tokens,
-            // A caller that lends its ring states where the request stands
-            // on it: the stage is handed no block hash.
-            block_hashes: if ring.is_some() { &[] } else { &request.hashes },
-            hash_kind: request.kind,
-            tried: &tried,
-            seed: self.seed,
-            ring,
-            ring_positions: &request.places,
-            ..RequestFacts::default()
-        };
-        let pool_facts = PoolFacts {
-            pool_size: self.pool.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.session_key = request
+            .key
+            .as_deref()
+            .map_or(Identity::NONE, Identity::plain);
+        facts.prompt_tokens = request.tokens;
+        // A caller that lends its ring states where the request stands
+        // on it: the stage is handed no block hash.
+        facts.block_hashes = if ring.is_some() { &[] } else { &request.hashes };
+        facts.hash_kind = request.kind;
+        facts.tried = &tried;
+        facts.seed = self.seed;
+        facts.ring = ring;
+        facts.ring_positions = &request.places;
+        let mut pool_facts = PoolFacts::default();
+        pool_facts.pool_size = self.pool.len() as u32;
+        pool_facts.generation = 1;
         let decision = self.engine.decide(
             &facts,
             &pool_facts,

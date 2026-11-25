@@ -153,21 +153,18 @@ fn cells(c: &mut Criterion, group: &str, engine: fn() -> Engine, in_flight_cycle
     let mut group = c.benchmark_group(group);
     for n in [8, 64, 512] {
         let rows: Vec<_> = (0..n)
-            .map(|position| Candidate {
-                position,
-                id: WorkerId(1003 + u64::from(position)),
-                in_flight: position % in_flight_cycle,
-                ..Candidate::default()
+            .map(|position| {
+                let mut row = Candidate::default();
+                row.position = position;
+                row.id = WorkerId(1003 + u64::from(position));
+                row.in_flight = position % in_flight_cycle;
+                row
             })
             .collect();
-        let pool = PoolFacts {
-            pool_size: n,
-            ..PoolFacts::default()
-        };
-        let facts = RequestFacts {
-            now_micros: SENT_AT + 911,
-            ..RequestFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n;
+        let mut facts = RequestFacts::default();
+        facts.now_micros = SENT_AT + 911;
         let constraints = Constraints::default();
         let engine = engine();
         let mut scratch = Scratch::new();
@@ -179,10 +176,7 @@ fn cells(c: &mut Criterion, group: &str, engine: fn() -> Engine, in_flight_cycle
             b.iter(|| engine.decide(&facts, &pool, black_box(&rows), &constraints, &mut scratch));
         });
 
-        let facts = RequestFacts {
-            now_micros: SENT_AT + u64::from(TTL_MS) * 1000,
-            ..facts
-        };
+        facts.now_micros = SENT_AT + u64::from(TTL_MS) * 1000;
         // The cutoff empties each row, so put the send back before timing
         // the next decision.
         let _ = engine.decide(&facts, &pool, &rows, &constraints, &mut scratch);

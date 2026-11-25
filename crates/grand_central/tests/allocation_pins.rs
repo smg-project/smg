@@ -27,9 +27,9 @@ use common::counting_alloc::{calls, Counting};
 use smg_grand_central::{
     document::{PolicySpec, PRESETS},
     engine::{
-        AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, Health,
-        LoadRow, PairPools, PoolFacts, RequestFacts, Role, Scratch, SignalSource, Target,
-        WireModes, WorkerId,
+        AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, LoadRow,
+        PairPools, PoolFacts, RequestFacts, Role, Scratch, SignalSource, Target, WireModes,
+        WorkerId,
     },
     stages::Lifecycle,
     store::{
@@ -53,25 +53,24 @@ fn allocations_during<T>(work: impl FnOnce() -> T) -> (T, usize) {
 /// reads its pool between two reports.
 fn fleet(n: u32) -> Vec<Candidate> {
     (0..n)
-        .map(|i| Candidate {
-            position: i,
-            id: WorkerId(1_000 + u64::from(i)),
-            health: Health {
-                healthy: i % 6 != 5,
-                ..Health::default()
-            },
-            in_flight: i % 7,
-            load: Some(LoadRow {
-                running: i % 5,
-                queued: i % 3,
-                kv_usage_permille: (i * 37 % 900) as u16,
-                live_rate: 1_000 + i * 13 % 3_000,
-                report_age_ms: 5,
-                source: SignalSource::Events,
-                ..LoadRow::default()
-            }),
-            load_sampled_at_micros: 990_000 + u64::from(i % 9) * 1_000,
-            ..Candidate::default()
+        .map(|i| {
+            let mut row = Candidate::default();
+            row.position = i;
+            row.id = WorkerId(1_000 + u64::from(i));
+            row.health.healthy = i % 6 != 5;
+            row.in_flight = i % 7;
+            row.load = Some({
+                let mut load = LoadRow::default();
+                load.running = i % 5;
+                load.queued = i % 3;
+                load.kv_usage_permille = (i * 37 % 900) as u16;
+                load.live_rate = 1_000 + i * 13 % 3_000;
+                load.report_age_ms = 5;
+                load.source = SignalSource::Events;
+                load
+            });
+            row.load_sampled_at_micros = 990_000 + u64::from(i % 9) * 1_000;
+            row
         })
         .collect()
 }
@@ -84,21 +83,19 @@ fn engine_of(preset: &str) -> Engine {
 }
 
 fn facts(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 512,
-        seed,
-        now_micros: 1_000_000,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.prompt_tokens = 512;
+    facts.seed = seed;
+    facts.now_micros = 1_000_000;
+    facts
 }
 
 fn pool(n: u32) -> PoolFacts<'static> {
-    PoolFacts {
-        pool_size: n,
-        generation: 1,
-        ..PoolFacts::default()
-    }
+    let mut pool = PoolFacts::default();
+    pool.pool_size = n;
+    pool.generation = 1;
+    pool
 }
 
 #[test]
@@ -263,49 +260,52 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
         let fastest = [n - 8, n - 16, n - 24, n - 32];
         let column = |blocks: u32| -> Vec<AffinityFacts> {
             (0..n)
-                .map(|i| AffinityFacts {
-                    overlap_blocks: if i % 8 == 0 { blocks } else { 0 },
-                    ..AffinityFacts::default()
+                .map(|i| {
+                    let mut affinity = AffinityFacts::default();
+                    affinity.overlap_blocks = if i % 8 == 0 { blocks } else { 0 };
+                    affinity
                 })
                 .collect()
         };
         let (cold, held) = (column(0), column(4));
-        let names = [AffinityHolder {
-            row: 0,
-            overlap_blocks: 4,
-            predicted_blocks: 0,
-        }];
+        let mut holder = AffinityHolder::default();
+        holder.row = 0;
+        holder.overlap_blocks = 4;
+        holder.predicted_blocks = 0;
+        let names = [holder];
         // Each first, and whether the host says the pool's fact of it.
         let firsts = [
             (
-                RequestFacts {
-                    affinity: &cold,
-                    ..facts(1)
+                {
+                    let mut request_facts = facts(1);
+                    request_facts.affinity = &cold;
+                    request_facts
                 },
                 true,
             ),
             (
-                RequestFacts {
-                    named: Some(AffinityRows {
-                        holders: &names,
-                        ..AffinityRows::default()
-                    }),
-                    ..facts(1)
+                {
+                    let mut request_facts = facts(1);
+                    request_facts.named = Some({
+                        let mut affinity_rows = AffinityRows::default();
+                        affinity_rows.holders = &names;
+                        affinity_rows
+                    });
+                    request_facts
                 },
                 true,
             ),
             (
-                RequestFacts {
-                    affinity: &cold,
-                    ..facts(1)
+                {
+                    let mut request_facts = facts(1);
+                    request_facts.affinity = &cold;
+                    request_facts
                 },
                 false,
             ),
         ];
-        let said = PoolFacts {
-            reported: true,
-            ..pool(n)
-        };
+        let mut said = pool(n);
+        said.reported = true;
         let unsaid = pool(n);
         let cx = Constraints::default();
         for (order, (first, reported)) in firsts.iter().enumerate() {
@@ -315,10 +315,8 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
                 .decide(first, of_first, &view, &cx, &mut scratch)
                 .pick()
                 .expect("the fleet routes");
-            let second = RequestFacts {
-                affinity: &held,
-                ..facts(2)
-            };
+            let mut second = facts(2);
+            second.affinity = &held;
             let (decision, allocations) =
                 allocations_during(|| engine.decide(&second, &said, &view, &cx, &mut scratch));
             let pick = decision.pick().expect("the fleet routes");
@@ -353,14 +351,10 @@ fn a_decision_after_a_soft_filter_fallback_allocates_nothing() {
         .filter(|c| c.health.healthy)
         .map(|c| c.id)
         .collect();
-    let first = RequestFacts {
-        tried: &tried,
-        ..facts(1)
-    };
-    let next = RequestFacts {
-        tried: &tried,
-        ..facts(2)
-    };
+    let mut first = facts(1);
+    first.tried = &tried;
+    let mut next = facts(2);
+    next.tried = &tried;
     let cx = Constraints::default();
     let mut scratch = Scratch::new();
     engine
@@ -409,10 +403,8 @@ fn a_round_robin_decision_over_a_changing_survivor_set_allocates_nothing() {
         let mut scratch = Scratch::new();
         let mut churn = |seed: u64| {
             let tried = [view[(seed % u64::from(n)) as usize].id];
-            let f = RequestFacts {
-                tried: &tried,
-                ..facts(seed)
-            };
+            let mut f = facts(seed);
+            f.tried = &tried;
             engine
                 .decide(&f, &pool(n), &view, &cx, &mut scratch)
                 .pick()
