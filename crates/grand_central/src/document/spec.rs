@@ -8001,6 +8001,11 @@ mod tests {
             (silver.engine_kind, silver.zone, silver.labels),
             (1, 1, 0b001)
         );
+        // Each position is read from its own list: this worker's family
+        // stands second among the families, and its zone first among the
+        // zones.
+        let apart = lists.positions("beta", Some("east"), &labels(&[]));
+        assert_eq!((apart.engine_kind, apart.zone), (2, 1));
         // A bit is the selector's place in the list, whatever the keys'
         // order: two selectors of one key stand apart here.
         let mixed = spec_with_view(r#"{"labels":["z","b=1","m","b","a=2","q=x"]}"#);
