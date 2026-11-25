@@ -1615,6 +1615,47 @@ mod tests {
         assert_eq!(whole(text), (64, 200));
     }
 
+    /// A request made with no block hashed is sized as the one made with
+    /// its list. The stage reads the list's length alone, under a `max`
+    /// with the count the prompt's size gives ([`Gates::whole`],
+    /// [`RequestFacts::blocks`]), and a list of token blocks holds one hash
+    /// for each whole block of the prompt, one at least: never more than
+    /// that count. So a prompt under one block, one that ends on a block's
+    /// edge, one that ends inside a block and one longer than the document
+    /// reads each state one size both ways.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_request_made_with_no_block_hashed_is_sized_as_the_one_hashed() {
+        use crate::{
+            document::spec::AppliedSpec,
+            engine::prompt_hashes::{HashSeeds, PromptHashes},
+        };
+        let document = PolicySpec::preset("cache_aware").expect("a preset");
+        let spec = AppliedSpec::validate(&document).expect("the preset validates");
+        let gates = Gates::of(None, None, Some(16));
+        for tokens in [7_u32, 16, 54, 64, 1_600, 100_000] {
+            let prompt: Vec<u32> = (0..tokens).collect();
+            let listed = PromptHashes::under_document(
+                &spec,
+                Some(16),
+                Some(&prompt),
+                None,
+                HashSeeds::PLAIN,
+            );
+            let unhashed = PromptHashes::unhashed(&spec, Some(16), &prompt, HashSeeds::PLAIN);
+            let mut with_list = RequestFacts::default();
+            listed.write_to(&mut with_list);
+            let mut without = RequestFacts::default();
+            unhashed.write_to(&mut without);
+            assert!(!with_list.block_hashes.is_empty(), "{tokens}");
+            assert!(without.block_hashes.is_empty(), "{tokens}");
+            assert_eq!(without.blocks(16), with_list.blocks(16), "{tokens}");
+            let (bare, full) = (gates.whole(&without), gates.whole(&with_list));
+            assert_eq!((bare.block, bare.size), (full.block, full.size), "{tokens}");
+            assert_eq!((bare.block, bare.size), (16, tokens.max(16)), "{tokens}");
+        }
+    }
+
     /// The engine of the built-in `cache_aware` document.
     fn built_in() -> Engine {
         PolicySpec::preset("cache_aware")
