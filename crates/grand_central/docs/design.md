@@ -2599,9 +2599,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    reads the store's log. No task lays it. No turn that takes the controller's own store starts with
    a read of its table **[built]**: a write call decides over the object that stands, a call's read
    and a first copy read the objects, and a standby's applier lays its leader's event. A
-   refused write reads its own record, and a cut laid whole reads the store's records once
-   **[built]**. A
-   host's follow and its call that lays a kept credential again still read the store's log.
+   turn of the keeper's own reads no log of the store's changes **[built]**: a refused write
+   reads its own record, a cut laid whole reads the store's records once, then the status the
+   table holds for each, and the call that lays a kept credential again reads the objects. A
+   host's follow still reads the store's log.
 
 **One rule for a registration's write [built].** What a registration makes of the record under
 its address is one function beside the other membership rules (`WorkerFacts::laid_over`,

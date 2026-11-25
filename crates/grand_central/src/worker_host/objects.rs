@@ -209,14 +209,18 @@ impl Held {
 ///
 /// With a keeper ([`Self::with_credentials`]), each read of the store has
 /// the keeper forget the rows that left, whoever wrote the removal, and an
-/// entry goes with its last row. The holder reads the store in four
-/// places. [`Self::follow`] and [`Self::lay_again`] read its tail, and a
-/// cut laid whole reads the store's rows once. A write
+/// entry goes with its last row. The holder reads the store in three
+/// places. [`Self::follow`] reads its tail, and a
+/// cut laid whole reads the store's rows once, then the status the table
+/// holds for each. A write
 /// the store refuses reads the write's own record, and
 /// the keeper forgets that one row where it left. The
 /// keeper's clock is read ahead of the store: a row bound behind that read
 /// stays, and the next read of the tail or of a cut forgets it whatever it
-/// finds.
+/// finds. Two turns forget with no read. A write call that takes a row
+/// out has the keeper forget that row. [`Self::lay_again`] has it forget
+/// each bound row that holds no object: an answer may bind a row that
+/// left before it.
 ///
 /// The holder is the registry's one writer: an object any other writer left
 /// under a row's URL is replaced by the row's.
@@ -233,8 +237,7 @@ impl Held {
 /// turn either: no product code calls those, and they go with the store's
 /// table. A row written so has no object, and no copy holds it, until the
 /// holder reads it: where the store refuses its key's next write, where a
-/// cut is laid whole, or where its host calls [`Self::follow`] or
-/// [`Self::lay_again`], which follows first.
+/// cut is laid whole, or where its host calls [`Self::follow`].
 ///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
@@ -448,19 +451,22 @@ impl<G: Generation> Objects<G> {
     /// token's answer says so
     /// ([`KeptCredential::accepted`](super::KeptCredential::accepted),
     /// [`KeptCredential::put_back`](super::KeptCredential::put_back)),
-    /// with the facts it kept. The call follows `store` first and holds
-    /// the follow's turn to its end. It reads the keeper as a build does:
+    /// with the facts it kept. The call takes the holder's turn and reads
+    /// no store: each object is built anew from the row read back from it,
+    /// and `store` is handed the row's count. The keeper forgets first, by
+    /// the objects that stand: an answer may have bound a row that left
+    /// before it. The call reads the keeper as a build does:
     /// where a registration is in flight at the address, an object that
     /// holds what it stated marks the flight, and its put-back says so.
     /// Return how many objects were laid again: none where no keeper was
     /// handed in, where no row dials the address, or where each object
     /// there holds what its row takes.
     pub fn lay_again<S: WorkersStore + ?Sized>(&self, store: &S, facts: &WorkerFacts) -> usize {
-        let mut place = self.read_to.lock();
-        self.follow_from(store, &mut place);
+        let _turn = self.read_to.lock();
         let Some(credentials) = &self.credentials else {
             return 0;
         };
+        self.forget_left(self.keeper_clock());
         let address = dial_address(facts);
         let stale: Vec<WorkerId> = {
             let held = self.held.read();
@@ -479,8 +485,7 @@ impl<G: Generation> Objects<G> {
                 .collect()
         };
         let mut laid = 0;
-        // A row that left behind the read above is the next follow's.
-        for row in stale.into_iter().filter_map(|id| store.get(id)) {
+        for row in stale.into_iter().filter_map(|id| self.row(id)) {
             self.lay(store, &row);
             laid += 1;
         }
@@ -732,10 +737,9 @@ impl<G: Generation> Objects<G> {
     /// the object of every row that stands.
     ///
     /// A host calls it for a row written through the store's own entries.
-    /// Such a row gets its object here, at [`Self::lay_again`], which
-    /// follows first, where the store refuses its key's next write, or
-    /// where a cut is laid whole. Every other writer of a row lays its
-    /// object itself.
+    /// Such a row gets its object here, where the store refuses its key's
+    /// next write, or where a cut is laid whole. Every other writer of a
+    /// row lays its object itself.
     ///
     /// The first read is the store's snapshot. So is a read the store's
     /// tail no longer reaches back to, and one behind a move of the store's
@@ -1569,16 +1573,29 @@ mod tests {
             self.objects.registry().get_by_url(url).expect("an object")
         }
 
-        /// A registration taken: its keep, its write, the token accepted
-        /// with the row the door answered, and the address laid again
-        /// where the acceptance says so. Return the row.
+        /// A registration taken: its keep, its write through the holder, the
+        /// token accepted with the row the write answered, and the address
+        /// laid again where the acceptance says so. Return the row.
         fn register(&self, facts: WorkerFacts, credential: Option<&str>) -> WorkerId {
             let token = self.kept(&facts, credential);
-            let row = self.store.upsert(facts.clone()).id();
+            let row = self.write(facts.clone());
             if token.accepted(row) {
                 self.lay_again(&facts);
             }
             row
+        }
+
+        /// A registration's write as a door over the holder makes it,
+        /// decided over the object that stands. A write the store refuses
+        /// is decided once more, over what its read left.
+        fn write(&self, facts: WorkerFacts) -> WorkerId {
+            let store = self.store.as_ref();
+            let lay = || {
+                self.objects
+                    .upsert(store, facts.clone(), Registrant::Control)
+            };
+            let change = lay().or_else(lay);
+            change.expect("the store takes the second write").id()
         }
 
         /// A registration's keep, its answer left to the case.
@@ -2644,8 +2661,8 @@ mod tests {
         replica.remove(A);
         replica.follow();
         assert!(token.accepted(row));
-        // The read `lay_again` makes finds nothing, and forgets the row
-        // all the same.
+        // The lay-again its acceptance asks for finds no object for the
+        // row, and has the keeper forget it.
         assert_eq!(replica.lay_again(&facts(A, 1)), 0);
         assert!(replica.credentials.is_empty());
         replica.store.upsert(facts(A, 2));
@@ -2875,22 +2892,75 @@ mod tests {
         assert_eq!(replica.lay_again(&facts(E, 1)), 0);
     }
 
+    /// Laying again reads no store. A row a registration wrote around the
+    /// holder has no object for the call to lay, and the keeper forgets
+    /// it: its object, once its host follows, takes no credential. A row
+    /// written through the holder is laid again from the row its object
+    /// states, not from the store's.
     #[test]
-    fn laying_again_follows_the_store_first() {
+    fn laying_again_reads_the_objects_and_no_store() {
         let replica = Replica::new();
         let token = replica.kept(&facts(A, 1), Some(KEY_A));
         let row = replica.store.upsert(facts(A, 1)).id();
         assert!(token.accepted(row));
-        // No follow ran: the call reads the row and builds its object with
-        // its credential, so nothing is left to lay again.
         assert_eq!(replica.lay_again(&facts(A, 1)), 0);
-        assert!(replica.holds_credential(A, Some(KEY_A)));
+        assert!(replica.objects.is_empty(), "no follow ran");
+        assert!(replica.credentials.is_empty(), "a row with no object");
+        replica.follow();
+        assert!(replica.holds_credential(A, None));
 
-        // A row that left behind the last follow is ended, not laid.
-        assert!(replica.kept(&facts(A, 1), Some(KEY_B)).accepted(row));
-        replica.remove(A);
+        // Through the holder, then a rotation, then the store's row moved
+        // around the holder: the call lays the row the object states.
+        let row = replica.register(facts(B, 1), Some(KEY_A));
+        assert!(replica.kept(&facts(B, 1), Some(KEY_B)).accepted(row));
+        let late = WorkerPatch {
+            priority: Some(7),
+            ..WorkerPatch::default()
+        };
+        replica.patch(B, late);
+        assert_eq!(replica.lay_again(&facts(B, 1)), 1);
+        assert!(replica.holds_credential(B, Some(KEY_B)));
+        let standing = replica.objects.standing(&replica.id(B));
+        assert_eq!(standing.map(|standing| standing.revision), Some(1));
+    }
+
+    /// A removal that lands ahead of its registration's answer finds no
+    /// bound row to forget. The answer then binds a row that left. It
+    /// says the address is to be laid again, and that call finds no object
+    /// for the row and has the keeper forget it.
+    #[test]
+    fn laying_again_forgets_a_row_bound_after_it_left() {
+        let replica = Replica::new();
+        let store = replica.store.as_ref();
+        let token = replica.kept(&facts(A, 1), Some(KEY_A));
+        let row = replica.write(facts(A, 1));
+        let removed = replica.objects.remove(store, row, 1);
+        assert!(removed.is_some(), "the holder's own removal");
+        assert!(token.accepted(row), "a row not bound before");
+        assert_eq!(replica.credentials.len(), 1, "bound behind its leaving");
         assert_eq!(replica.lay_again(&facts(A, 1)), 0);
-        assert!(replica.objects.registry().get_by_url(A).is_none());
+        assert!(replica.credentials.is_empty());
+    }
+
+    /// A write through the holder that takes a row out has the keeper
+    /// forget that row in the same call, with no follow: a removal its
+    /// row, and a key's next life the old life's row.
+    #[test]
+    fn a_write_that_takes_a_row_out_forgets_it() {
+        let replica = Replica::new();
+        let store = replica.store.as_ref();
+        let row = replica.register(facts(A, 1), Some(KEY_A));
+        replica.register(facts(B, 1), Some(KEY_B));
+        assert_eq!(replica.credentials.len(), 2);
+        assert!(replica.objects.remove(store, row, 1).is_some());
+        assert_eq!(replica.credentials.len(), 1, "the removed row's alone");
+        // The other key's next life, stated with no keep.
+        let next = replica
+            .objects
+            .upsert(store, facts(B, 2), Registrant::Control);
+        assert!(matches!(next, Some(MembershipChange::Replaced { .. })));
+        assert!(replica.credentials.is_empty(), "the old life's row");
+        assert!(replica.holds_credential(B, None));
     }
 
     #[test]
@@ -2981,6 +3051,68 @@ mod tests {
         assert!(replica.objects.restore_from(store, cut));
         assert!(replica.objects.is_empty(), "the cut dropped the row");
         assert!(replica.credentials.is_empty(), "behind the cut's read");
+    }
+
+    /// A refused write names the row it was decided over to the keeper,
+    /// whatever it decided: a change in place, a new width, a key's next
+    /// life, a removal. That row left around the holder, and the keeper
+    /// forgets it.
+    #[test]
+    fn a_refused_write_of_each_kind_forgets_the_row_it_was_decided_over() {
+        type Refused = fn(&Replica, WorkerId) -> Option<MembershipChange>;
+        fn lay(replica: &Replica, facts: WorkerFacts) -> Option<MembershipChange> {
+            let store = replica.store.as_ref();
+            replica.objects.upsert(store, facts, Registrant::Control)
+        }
+        let writes: [(&str, Refused); 4] = [
+            ("a change in place", |replica, _| {
+                lay(replica, labelled(A, 1, "gold"))
+            }),
+            ("a new width", |replica, _| {
+                let wider = WorkerFacts {
+                    dp_size: 2,
+                    ..facts(A, 1)
+                };
+                lay(replica, wider)
+            }),
+            ("a key's next life", |replica, _| lay(replica, facts(A, 2))),
+            ("a removal", |replica, row| {
+                replica.objects.remove(replica.store.as_ref(), row, 1)
+            }),
+        ];
+        for (name, write) in writes {
+            let replica = Replica::new();
+            let row = replica.register(facts(A, 1), Some(KEY_A));
+            // Another writer's removal, around the holder.
+            replica.remove(A);
+            assert_eq!(write(&replica, row), None, "{name}: over a row that left");
+            assert!(replica.credentials.is_empty(), "{name}");
+        }
+    }
+
+    /// A write refused over a row another writer moved in place reads the
+    /// row and lays it. The row stands, so the keeper keeps what is bound
+    /// to it: the forgetting behind that read drops a row that left alone.
+    #[test]
+    fn a_refused_write_over_a_row_moved_in_place_keeps_its_credential() {
+        let replica = Replica::new();
+        let store = replica.store.as_ref();
+        let row = replica.register(facts(A, 1), Some(KEY_A));
+        // Another writer's patch, around the holder.
+        let late = WorkerPatch {
+            priority: Some(7),
+            ..WorkerPatch::default()
+        };
+        replica.patch(A, late);
+        let refused = replica.objects.patch(store, row, labels("gold"), 1);
+        assert_eq!(refused, None, "decided over a row that moved");
+        assert_eq!(replica.credentials.len(), 1, "the row stands");
+        assert!(replica.holds_credential(A, Some(KEY_A)));
+        // What is bound still: an object laid later takes it.
+        replica.patch(A, labels("silver"));
+        let refused = replica.objects.patch(store, row, labels("gold"), 2);
+        assert_eq!(refused, None, "moved once more");
+        assert!(replica.holds_credential(A, Some(KEY_A)), "laid with it");
     }
 
     #[test]
