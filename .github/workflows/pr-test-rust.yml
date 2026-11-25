@@ -1570,6 +1570,8 @@ jobs:
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
+  # AMD API suites keep the approved 60-minute job / 45-minute test ceilings.
+  # The remaining job time covers environment/model setup and owned teardown.
   e2e-1gpu-completions-vllm-amd:
     name: e2e-1gpu-completions-vllm-amd (vllm)
     needs: [build-wheel, detect-changes]
