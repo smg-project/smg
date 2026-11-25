@@ -52,7 +52,7 @@ use super::{
     config::Scope,
     decide::{self, Streams},
     decision_slots::{self, DecisionSlots, Reads},
-    election::{self, split_identity, ElectionObservation, Running},
+    election::{self, split_identity, ElectionObservation, LeasePlace, Running},
     floor::Floors,
     gateways::Gateways,
     generations::{
@@ -229,7 +229,10 @@ impl Shared {
     /// it can, so the other builders do not change. The identity and the
     /// fence are `elector`'s, so no instance answers under an identity
     /// another fence guards. A spec document names the stages `catalog`
-    /// holds. `deciders` is how many threads decide. The store comes with
+    /// holds, and its door is built under that fence where `place`, the
+    /// lease's, is one another replica can take
+    /// ([`Generations::stating`]): no later step puts it there.
+    /// `deciders` is how many threads decide. The store comes with
     /// the feed of the log it journals to, the one value one place builds
     /// ([`journaled`](super::replication::journaled)), and with the holder
     /// of the replica's worker objects, whose rows stand in that store: the
@@ -258,7 +261,7 @@ impl Shared {
             Arc<Objects<Members>>,
             LoadReceiver,
         ),
-        catalog: Arc<StageRegistry>,
+        (catalog, place): (Arc<StageRegistry>, &LeasePlace),
         deciders: usize,
     ) -> io::Result<Self> {
         let gateways = Arc::new(Gateways::new(
@@ -289,11 +292,14 @@ impl Shared {
             },
         )?;
         // The door states each generation's overload switch on the worker
-        // objects the deciding threads read.
+        // objects the deciding threads read. Under a lease another replica
+        // can take it stands under this replica's fence from its first
+        // instant.
         let generations = Arc::new(Generations::stating(
             Arc::clone(&store),
             catalog,
             Arc::clone(&objects),
+            place.is_shared().then(|| elector.fence()),
         ));
         Ok(Self {
             controller_id,
@@ -1252,7 +1258,7 @@ mod tests {
                 &elector,
                 bed::unserved(stood),
                 bed::followed(journaled_at(&LeasePlace::Process, 0, 2)),
-                Arc::new(catalog),
+                (Arc::new(catalog), &LeasePlace::Process),
                 2,
             )
             .expect("the deciders start"),
@@ -1309,7 +1315,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             state,
-            catalog,
+            (catalog, &LeasePlace::Process),
             1,
         );
     }
@@ -1341,7 +1347,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             (Arc::clone(&store), feed, Arc::clone(&objects), loads),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1417,7 +1423,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             bed::followed((Arc::clone(&store), feed)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1504,7 +1510,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             bed::followed((store, feed)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1546,14 +1552,18 @@ mod tests {
             &elector,
             bed::unserved(stood),
             bed::followed((store, feed)),
-            Arc::new(StageRegistry::builtin()),
+            // The door stands under the fence, as under a lease another
+            // replica can take: its start passes the document.
+            (
+                Arc::new(StageRegistry::builtin()),
+                &LeasePlace::File("shared".into()),
+            ),
             1,
         )
         .expect("the decider starts");
-        shared.generations.under(Arc::clone(&shared.fence));
         shared
             .generations
-            .defer(LEAST_LOAD.into(), Format::Yaml)
+            .start_with(LEAST_LOAD.into(), Format::Yaml)
             .expect("a valid document");
         assert_eq!(shared.store.snapshot().spec().generation(), 0);
 
@@ -1612,7 +1622,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             bed::followed((Arc::clone(&store), feed)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1740,7 +1750,7 @@ mod tests {
                 &elector,
                 bed::unserved(stood),
                 bed::followed((Arc::clone(&store), feed)),
-                Arc::new(StageRegistry::builtin()),
+                (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
                 2,
             )
             .expect("the deciders start"),
@@ -2102,7 +2112,7 @@ mod tests {
             &elector,
             (stood, stop, role, lag),
             bed::followed(journaled_from(&LeasePlace::Process, 0)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -2374,7 +2384,7 @@ mod tests {
                     &elector,
                     bed::unserved(stood),
                     bed::followed((store, feed)),
-                    Arc::new(StageRegistry::builtin()),
+                    (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
                     2,
                 )
                 .expect("the deciders start"),

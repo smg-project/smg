@@ -498,23 +498,20 @@ impl Controller {
         // The standby's lag, made once from the configured interval: the
         // readiness reads the one `Shared` holds.
         let lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
+        // Under a lease another replica can take, the document door is
+        // built under this replica's fence, with a spec source or with
+        // none: its source writes while the replica leads, and its hook
+        // settles a worker's status under the replica's own lead.
         let shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
             (stood, stopped, led, lag),
             (journal.0, journal.1, workers.holder(), monitor.loads()),
-            Arc::clone(&catalog),
+            (Arc::clone(&catalog), &config.election.lease),
             config.decide_shards,
         )
         .map_err(Error::DecisionThreads)?;
-        // Under a lease another replica can take, the document door reads
-        // this replica's fence from here, with a spec source or with none:
-        // its source writes while the replica leads, and its hook settles
-        // a worker's status under the replica's own lead.
-        if config.election.lease.is_shared() {
-            shared.generations.under(Arc::clone(&shared.fence));
-        }
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
         let shared = Arc::new(shared);
@@ -689,18 +686,11 @@ impl Controller {
         // Under a shared lease a replica may follow a leader, and then
         // runs its leader's generations: its own file is passed here and
         // applied under its first lead, and its source writes while the
-        // replica leads under the term its bytes were read under, by the
-        // fence the bind put the door under.
-        let deferred = self.config.election.lease.is_shared();
+        // replica leads under the term its bytes were read under. The door
+        // knows which start this is by the fence the bind built it under.
         let read = {
-            let path = path.clone();
-            tokio::task::spawn_blocking(move || {
-                if deferred {
-                    SpecFile::start_deferred(path, generations)
-                } else {
-                    SpecFile::start(path, generations)
-                }
-            })
+            let (path, generations) = (path.clone(), Arc::clone(&generations));
+            tokio::task::spawn_blocking(move || SpecFile::start(path, generations))
         };
         match read.await {
             Ok(Ok(file)) => self.spec_file = Some(file),
@@ -710,11 +700,11 @@ impl Controller {
         info!(
             controller_id = %self.config.controller_id,
             path = %path.display(),
-            generation = self.shared.generations.generation(),
-            at_first_take = deferred,
+            generation = generations.generation(),
+            at_first_take = generations.starts_deferred(),
             "spec file"
         );
-        self.metrics.spec(Arc::clone(&self.shared.generations));
+        self.metrics.spec(generations);
         Ok(())
     }
 
@@ -1399,8 +1389,12 @@ mod tests {
     //! serve that leaves by a listener's error.
 
     use std::{
+        fs::File,
         future::pending,
-        sync::Arc,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -1413,12 +1407,13 @@ mod tests {
         time::timeout,
     };
     use tonic::{
-        codegen::tokio_stream::StreamExt as _,
+        codegen::tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt as _},
         transport::{server::TcpIncoming, Server},
     };
 
     use super::{
         config::tests::valid,
+        decide,
         decision_slots::{tests as bed, TERM_MARK},
         election::{self, ElectionObservation},
         following,
@@ -1434,7 +1429,7 @@ mod tests {
                 ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
                 LeaseRecord, MemoryLease, TickOutcome,
             },
-            proto::{self, grand_central_server::GrandCentral as _},
+            proto::{self, busy::Reason, grand_central_server::GrandCentral as _},
         },
         store::{HealthPolicy, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
     };
@@ -1910,6 +1905,57 @@ mod tests {
         );
     }
 
+    /// `stream` polled by a task of its own, as a connection's task polls
+    /// it: at the word of the stream's waker alone. The task, which ends
+    /// with the case, and the words it hands on.
+    fn polled<S>(mut stream: S) -> (JoinSet<()>, mpsc::Receiver<S::Item>)
+    where
+        S: Stream + Send + Unpin + 'static,
+        S::Item: Send,
+    {
+        let (words, heard) = mpsc::channel(2);
+        let mut poller = JoinSet::new();
+        poller.spawn(async move {
+            while let Some(word) = stream.next().await {
+                if words.send(word).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (poller, heard)
+    }
+
+    /// The next word of a stream [`polled`] by a task of its own, waited
+    /// for five seconds at most.
+    async fn word<T>(heard: &mut mpsc::Receiver<T>) -> T {
+        timeout(Duration::from_secs(5), heard.recv())
+            .await
+            .expect("a word within five seconds")
+            .expect("the stream is open")
+    }
+
+    /// A watch of the rows over `gateways`, opened once its replica leads
+    /// and [`polled`] by a task of its own, with its first page read:
+    /// nothing is written behind it, and the watch waits.
+    async fn waiting_watch(
+        gateways: &Service,
+    ) -> (
+        JoinSet<()>,
+        mpsc::Receiver<Result<proto::WorkerEvent, tonic::Status>>,
+    ) {
+        let (wait, begun) = (Duration::from_secs(20), Instant::now());
+        while gateways.leading(Instant::now()).is_err() {
+            assert!(begun.elapsed() < wait, "no first take");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut watch = tonic::Request::new(proto::WatchWorkersRequest::default());
+        watch.extensions_mut().insert(told("gateway-a"));
+        let watching = gateways.watch_workers(watch).await.expect("opened");
+        let (watcher, mut heard) = polled(watching.into_inner());
+        word(&mut heard).await.expect("the rows, none yet");
+        (watcher, heard)
+    }
+
     /// The role's word ends with the task that tells it. A serve that
     /// leaves by a listener's error ends that task with its listeners and
     /// says no stop: a watch that waits for its next event is woken at the
@@ -1925,41 +1971,110 @@ mod tests {
             Error::Task("a listener failed".to_owned())
         });
         let case = async {
-            let (wait, begun) = (Duration::from_secs(20), Instant::now());
-            while gateways.leading(Instant::now()).is_err() {
-                assert!(begun.elapsed() < wait, "no first take");
+            let (_watcher, mut heard) = waiting_watch(&gateways).await;
+            // The listener fails.
+            fail.send(()).expect("the serve waits for its fault");
+            let ended = word(&mut heard).await.expect_err("the word's end");
+            assert_eq!(ended.code(), tonic::Code::Aborted);
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends within its grace period");
+        assert!(matches!(served, Err(Error::Task(_))), "{served:?}");
+    }
+
+    /// The role's word ends with the task that tells it, and not with the
+    /// serve. A serve that leaves by a listener's error ends its tasks at
+    /// once and then waits for the release of its lease: a watch that
+    /// waits ends while that release is still on its way. The case holds
+    /// the lock of the lease's file, so no release lands until it lets go.
+    #[tokio::test]
+    async fn a_watch_that_waits_ends_ahead_of_the_release_of_a_serve_that_left_by_an_error() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut config = valid();
+        config.election.lease = election::LeasePlace::File(dir.path().join("lease"));
+        // Room for the held release and a loaded host inside the grace
+        // period: the serve waits for the release no longer than that.
+        config.shutdown_grace = Duration::from_secs(30);
+        let controller = Controller::bind(config).await.expect("the listeners bind");
+        let gateways = Service::new(vec![Scope::Gateway], Arc::clone(&controller.shared));
+        let (fail, failed) = oneshot::channel::<()>();
+        let returned = AtomicBool::new(false);
+        let serve = async {
+            let fault = async move {
+                let _ = failed.await;
+                Error::Task("a listener failed".to_owned())
+            };
+            let served = controller.serve_until(pending(), fault).await;
+            returned.store(true, Ordering::SeqCst);
+            served
+        };
+        let case = async {
+            let (_watcher, mut heard) = waiting_watch(&gateways).await;
+            // A write of the lease waits for this lock, the release too.
+            let lock = File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.path().join("lease.lock"))
+                .expect("the lock file beside the lease");
+            lock.lock().expect("the lease's lock");
+            fail.send(()).expect("the serve waits for its fault");
+            let ended = word(&mut heard).await.expect_err("the word's end");
+            assert_eq!(ended.code(), tonic::Code::Aborted);
+            assert!(
+                !returned.load(Ordering::SeqCst),
+                "the serve still waits for its release"
+            );
+            lock.unlock().expect("the lock is let go");
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends within its grace period");
+        assert!(matches!(served, Err(Error::Task(_))), "{served:?}");
+    }
+
+    /// A serve that leaves by a listener's error says no close. Its return
+    /// ends the close's channel, whose one sender is the serve's own: a
+    /// decide stream still open ends there in the close's words. The
+    /// stream answered a request and sleeps, and a task that outlives the
+    /// listeners polls it.
+    #[tokio::test]
+    async fn a_serve_that_leaves_by_an_error_ends_a_decide_stream_still_open() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let fence = controller.elector.fence();
+        // Opened ahead of the serve: nobody leads yet, such a stream asks
+        // for no session, and its request is told that nobody leads.
+        let (frames, inbound) = mpsc::channel(1);
+        let open = decide::serve(
+            Arc::clone(&controller.shared),
+            &told("gateway-a"),
+            ReceiverStream::new(inbound),
+        );
+        let Ok(open) = open else {
+            panic!("a stream opens where nobody leads");
+        };
+        let (_poller, mut heard) = polled(open);
+        let asked = frames.send(Ok(bed::frame(1, 1))).await;
+        asked.expect("the stream reads its frames");
+        let answer = word(&mut heard).await.expect("an answer");
+        assert_eq!(bed::busy(&answer), Reason::NotLeader);
+        let (fail, failed) = oneshot::channel::<()>();
+        let serve = controller.serve_until(pending(), async move {
+            let _ = failed.await;
+            Error::Task("a listener failed".to_owned())
+        });
+        let case = async {
+            // The take lands, then the listener fails.
+            while fence.term() == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            let mut watch = tonic::Request::new(proto::WatchWorkersRequest::default());
-            watch.extensions_mut().insert(told("gateway-a"));
-            let mut watching = gateways
-                .watch_workers(watch)
-                .await
-                .expect("opened")
-                .into_inner();
-            // A task of its own polls the watch, as a connection's does:
-            // at the word of the stream's waker alone.
-            let (words, mut heard) = mpsc::channel(2);
-            let mut watcher = JoinSet::new();
-            watcher.spawn(async move {
-                while let Some(word) = watching.next().await {
-                    if words.send(word).await.is_err() {
-                        return;
-                    }
-                }
-            });
-            let mut next = async || {
-                timeout(Duration::from_secs(5), heard.recv())
-                    .await
-                    .expect("a word within five seconds")
-                    .expect("the stream is open")
-            };
-            next().await.expect("the rows, none yet");
-            // Nothing is written from here: the watch waits. The listener
-            // fails.
             fail.send(()).expect("the serve waits for its fault");
-            let ended = next().await.expect_err("the word's end");
-            assert_eq!(ended.code(), tonic::Code::Aborted);
+            let ended = word(&mut heard).await.expect_err("the stream's end");
+            assert_eq!(
+                (ended.code(), ended.message()),
+                (tonic::Code::Unavailable, decide::CLOSING)
+            );
         };
         let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
             .await
@@ -2418,15 +2533,18 @@ mod tests {
         assert_eq!(replica.shared.lag.within(), Duration::from_secs(30));
     }
 
-    /// The bind puts the document door under the replica's fence wherever
+    /// The bind builds the document door under the replica's fence wherever
     /// another replica can take the lease, with no spec source too. Until
     /// that replica leads its door reads no lead, so the door's hook
     /// settles no worker's status into the table of a replica that
-    /// follows. A replica alone over its lease writes always.
+    /// follows, and a file's start there passes its document and applies
+    /// none. A replica alone over its lease writes always, and its file's
+    /// start applies.
     #[tokio::test]
     async fn the_bind_puts_the_door_under_the_fence_of_a_shared_lease() {
         let alone = Controller::bind(valid()).await.expect("the listeners bind");
         assert!(alone.shared.generations.source_writes());
+        assert!(!alone.shared.generations.starts_deferred());
 
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut config = valid();
@@ -2435,6 +2553,7 @@ mod tests {
         let fence = replica.elector.fence();
         assert_eq!(fence.leader_term(Instant::now()), None, "it has not led");
         assert!(!replica.shared.generations.source_writes());
+        assert!(replica.shared.generations.starts_deferred());
     }
 
     #[tokio::test]
