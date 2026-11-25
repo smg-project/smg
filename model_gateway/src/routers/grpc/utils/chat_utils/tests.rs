@@ -96,26 +96,20 @@ fn a_refusal_part_outside_an_assistant_turn_is_refused() {
     assert!(validate_chat_content_parts(&messages).is_ok());
 }
 
-/// A media part is taken in a user message (and in a tool result): in a
-/// system, developer, assistant or root message it is refused at the door in
-/// this door's own sentence (with the role's article), before any fetch, not
-/// after the pipeline ran it and the rendered prompt's anchors did not match
-/// it (none for a system, developer or root part, one too many for an
-/// assistant part).
+/// A media part is refused at the door in an assistant message alone, in
+/// this door's own sentence: no media plan counts an assistant message's
+/// part. In a system, developer or root message it passes the door, as in a
+/// user message and in a tool result: the render and the anchor check behind
+/// it answer for it.
 #[test]
-fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
+fn a_media_part_is_refused_at_the_door_in_an_assistant_message_alone() {
     let parts = [
         json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}),
         json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
         json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}),
         json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
     ];
-    for (role, phrase) in [
-        ("system", "a system"),
-        ("developer", "a developer"),
-        ("assistant", "an assistant"),
-        ("root", "a root"),
-    ] {
+    for role in ["system", "developer", "root", "assistant"] {
         for part in &parts {
             let kind = part["type"].as_str().unwrap();
             let messages: Vec<ChatMessage> = serde_json::from_value(json!([
@@ -123,13 +117,16 @@ fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
                 {"role": "user", "content": "describe"}
             ]))
             .unwrap();
-            let error = validate_chat_content_parts(&messages).unwrap_err();
-            assert_eq!(
-                error,
+            let refusal = (role == "assistant").then(|| {
                 format!(
-                    "Unsupported chat content part type {kind:?} in {phrase} message for gRPC \
-                     backends: media parts are taken in user and tool messages"
+                    "Unsupported chat content part type {kind:?} in an assistant message for \
+                     gRPC backends: media parts are taken in user and tool messages"
                 )
+            });
+            assert_eq!(
+                validate_chat_content_parts(&messages).err(),
+                refusal,
+                "{role}"
             );
         }
     }

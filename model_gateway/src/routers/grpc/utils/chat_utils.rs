@@ -802,8 +802,13 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
     validate_chat_parts(messages, None)
 }
 
-/// Reject unsupported parts and permit a homogeneous list of declared Flash
-/// tool references only in a tool message sent to the model template.
+/// Reject unsupported parts: a `tool_reference` part, which names a function
+/// the request declares, is taken only in a tool message sent to a model
+/// template that reads such parts, in a list of such parts alone. A media
+/// part is refused here in an assistant message alone: in any other message
+/// it goes on to the render, and a request the gateway plans media for is
+/// held to one anchor in the rendered prompt for each media part
+/// (`multimodal::validate_rendered_media_anchors`).
 fn validate_chat_parts(
     messages: &[ChatMessage],
     template_request: Option<&ChatCompletionRequest>,
@@ -819,22 +824,6 @@ fn validate_chat_parts(
             ChatMessage::Function { .. } => None,
         };
         let assistant = matches!(message, ChatMessage::Assistant { .. });
-        // The roles whose content the public contract keeps to text: a media
-        // part there is refused here, before any fetch, in this door's own
-        // sentence, not after the pipeline processed it and the rendered
-        // prompt's anchors did not match it (none for a system, developer or
-        // root part; one too many for an assistant part on a template that
-        // renders assistant media). The binding carries the role's article
-        // for the sentence.
-        let text_only_role = match message {
-            ChatMessage::System { .. } => Some("a system"),
-            ChatMessage::Developer { .. } => Some("a developer"),
-            ChatMessage::Assistant { .. } => Some("an assistant"),
-            ChatMessage::Root { .. } => Some("a root"),
-            ChatMessage::User { .. } | ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {
-                None
-            }
-        };
         if let Some(MessageContent::Parts(parts)) = content {
             for part in parts {
                 match part {
@@ -866,14 +855,20 @@ fn validate_chat_parts(
                                 .to_string(),
                         );
                     }
-                    _ => {
-                        if let (Some(kind), Some(role)) = (media_part_type(part), text_only_role) {
+                    // An assistant message's media part is in no media plan
+                    // (`multimodal::media_plan_chat`): it is refused here, in
+                    // this door's own sentence, before a template that
+                    // renders it writes an anchor the plan does not count.
+                    _ if assistant => {
+                        if let Some(kind) = media_part_type(part) {
                             return Err(format!(
-                                "Unsupported chat content part type {kind:?} in {role} message \
-                                 for gRPC backends: media parts are taken in user and tool messages"
+                                "Unsupported chat content part type {kind:?} in an assistant \
+                                 message for gRPC backends: media parts are taken in user and \
+                                 tool messages"
                             ));
                         }
                     }
+                    _ => {}
                 }
             }
         }
