@@ -71,7 +71,7 @@ impl PromptEntry for PlacementInputs<'_> {
             return None;
         }
         let (text, marker) = CacheNamespace::keyed_text(self.cache_namespace, self.text?);
-        Some(TextKey { text, marker })
+        Some(TextKey::of(text, marker))
     }
 }
 
