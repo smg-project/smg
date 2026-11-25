@@ -4063,6 +4063,68 @@ mod tests {
         );
     }
 
+    /// A purge that is owed stays owed across events that went unheard. A
+    /// worker with a window of twenty seconds leaves, not drained, and its
+    /// removal is heard. More events than the worker registry's channel
+    /// holds follow, none a registration under its address: its prompts
+    /// leave with them, and what is written behind that pass leaves at the
+    /// look. A prompt written behind the look is gone at the window, as
+    /// the worker registry lists no worker under the address then.
+    #[tokio::test(start_paused = true)]
+    async fn a_purge_owed_across_unheard_events_runs_at_its_window() {
+        use smg_worker::{model_card::ModelCard, test_support::no_health_check};
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+
+        let (_registry, policy, workers, listed) = followed_cache_aware_model();
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("a cache-aware policy");
+        let mut long_window = no_health_check();
+        long_window.drain_settle_secs = 20;
+        let third: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w3:8000")
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("llama-3"))
+                .health_config(long_window)
+                .build(),
+        );
+        cache_aware.add_worker(third.as_ref());
+        listed.register(Arc::clone(&third)).expect("a worker");
+        let tree = cache_aware.string_tree("llama-3").expect("the tree");
+        tree.insert_text("a prompt sent to the third worker", "http://w3:8000");
+        let remembered = |url: &str| tree.get_tenant_char_count().get(url).copied();
+
+        // Heard: the third worker's address is owed a purge twenty seconds
+        // later.
+        listed.remove_by_url("http://w3:8000").expect("the removal");
+        let removed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for _ in 0..1_024 {
+            listed.remove_by_url("http://w2:8000").expect("the removal");
+            listed.register(Arc::clone(&workers[1])).expect("a worker");
+        }
+        until("the unlisted worker gone behind unheard events", || {
+            remembered("http://w3:8000").is_none()
+        })
+        .await;
+
+        // Past the look, five seconds behind the unheard events.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        tree.insert_text("written behind the look", "http://w3:8000");
+        tokio::time::sleep_until(removed_at + Duration::from_secs(19)).await;
+        assert!(
+            remembered("http://w3:8000").is_some(),
+            "kept until the window"
+        );
+        until("the purge at the window", || {
+            remembered("http://w3:8000").is_none()
+        })
+        .await;
+        assert!(
+            removed_at.elapsed() < Duration::from_secs(21),
+            "twenty seconds behind the removal"
+        );
+    }
+
     /// A registry made for Grand Central keeps the token trees the
     /// engine is lent: none until the start asks, one owner however often
     /// it asks, under the numbers of the document the start hands it. The

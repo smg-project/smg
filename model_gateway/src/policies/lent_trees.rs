@@ -237,11 +237,13 @@ impl LentTrees {
 /// owed none: what stands under it is that worker's own.
 ///
 /// A purge that is owed stays owed across events that went unheard. A
-/// registration under its address may be among them, so a store that can
-/// ask the registry does, when the purge is due. A removal may be among
-/// them too, and no event that was heard names its address: `forget` is
-/// asked once more, five seconds behind them ([`Left::looks_again`]), for
-/// what a decision under way wrote behind the purge of that wake.
+/// registration under its address may be among them, so when it is due
+/// [`Left::settled`] alone names it: a store that can ask the registry
+/// does, and a store that cannot lets it go. A removal may be among them
+/// too, and no event that was heard names its address: `forget` is asked
+/// once more, five seconds behind them ([`Left::looks_again`]), and a
+/// store that asks the registry looks then for what a decision under way
+/// wrote behind the purge of that wake.
 ///
 /// The task holds `stores` weakly, and of the registry its events alone. It
 /// ends with the registry, at the first wake after `stores` are gone, or
@@ -258,13 +260,14 @@ pub(super) fn follow_removals<S: Send + Sync + 'static>(
     let forget = Arc::new(forget);
     runtime.spawn(async move {
         // The addresses owed a purge behind a settle window, each with the
-        // instant it is due.
-        let mut owed: Vec<(Instant, String)> = Vec::new();
+        // instant it is due and whether events went unheard inside its
+        // window.
+        let mut owed: Vec<(Instant, String, bool)> = Vec::new();
         // The instant the look behind events that went unheard is due.
         let mut look: Option<Instant> = None;
         loop {
             let mut left = Left::default();
-            let heard = match owed.iter().map(|(due, _)| *due).chain(look).min() {
+            let heard = match owed.iter().map(|(due, ..)| *due).chain(look).min() {
                 Some(due) => timeout_at(due, events.recv()).await.ok(),
                 None => Some(events.recv().await),
             };
@@ -289,26 +292,37 @@ pub(super) fn follow_removals<S: Send + Sync + 'static>(
                 // written behind it is looked for a window from now. A
                 // look that was owed already is answered by it too.
                 look = now.checked_add(SETTLE_WHERE_NONE_IS_STATED);
+                // A registration may be among them, under an address that
+                // is owed a purge.
+                for (_, _, unheard) in &mut owed {
+                    *unheard = true;
+                }
             } else if look.is_some_and(|due| due <= now) {
                 left.looks_again = true;
                 look = None;
             }
-            owed.retain(|(due, address)| {
+            owed.retain(|(due, address, unheard)| {
                 if left.listed.contains(address) {
                     return false;
                 }
                 if *due <= now {
-                    left.again.push(address.clone());
+                    let due_now = if *unheard {
+                        &mut left.again_if_unlisted
+                    } else {
+                        &mut left.again
+                    };
+                    due_now.push(address.clone());
                 }
                 *due > now
             });
             // A window that ends past what the clock can say never ends: its
             // address is owed nothing.
-            owed.extend(
-                left.settles
-                    .drain(..)
-                    .filter_map(|(address, settle)| Some((now.checked_add(settle)?, address))),
-            );
+            // A removal heard in a wake with unheard events is owed its
+            // purge the same way.
+            let unheard = left.unheard > 0;
+            owed.extend(left.settles.drain(..).filter_map(|(address, settle)| {
+                Some((now.checked_add(settle)?, address, unheard))
+            }));
             let Some(stores) = stores.upgrade() else {
                 return;
             };
@@ -342,8 +356,13 @@ pub(super) struct Left {
     settles: Vec<(String, Duration)>,
     /// The addresses a worker was registered under.
     listed: Vec<String>,
-    /// The addresses whose purge behind a settle window is due.
+    /// The addresses whose purge behind a settle window is due, every
+    /// event inside the window heard.
     again: Vec<String>,
+    /// The addresses whose purge behind a settle window is due, where
+    /// events went unheard inside the window: a registration under one may
+    /// be among them.
+    again_if_unlisted: Vec<String>,
     /// How many events went unheard: a removal may be among them.
     unheard: u64,
     /// Whether the look behind events that went unheard is due.
@@ -386,10 +405,10 @@ impl Left {
 
     /// The addresses to purge at this wake in a store where a worker that
     /// rejoins under its address starts with no prompt: those a removal
-    /// named, then those whose purge behind a settle window is due. The
-    /// second stay owed across events that went unheard: a worker
-    /// registered under one by an event of those starts with no prompt
-    /// once more.
+    /// named, then those whose purge behind a settle window is due, every
+    /// event inside the window heard. Where events went unheard inside it,
+    /// a worker may stand under the address by one of them: such a store
+    /// asks no registry and lets that purge go.
     pub(super) fn purged(&self) -> impl Iterator<Item = &str> {
         self.addresses.iter().chain(&self.again).map(String::as_str)
     }
@@ -398,11 +417,15 @@ impl Left {
     /// worker is registered under again keeps its prompts: those whose
     /// worker was being drained when it left and that no worker was
     /// registered under behind the removal, then those whose purge behind
-    /// a settle window is due. A registration that went unheard is not
-    /// told by either: such a store asks the registry for the addresses it
-    /// lists.
+    /// a settle window is due, whether or not events went unheard inside
+    /// the window. A registration that went unheard is not told by either:
+    /// such a store asks the registry for the addresses it lists.
     pub(super) fn settled(&self) -> impl Iterator<Item = &str> {
-        self.drained.iter().chain(&self.again).map(String::as_str)
+        self.drained
+            .iter()
+            .chain(&self.again)
+            .chain(&self.again_if_unlisted)
+            .map(String::as_str)
     }
 
     /// How many events went unheard.
@@ -422,7 +445,11 @@ impl Left {
     /// behind a settle window is due, events went unheard, or the look
     /// behind them is due.
     fn asks_for_a_purge(&self) -> bool {
-        self.unheard > 0 || self.looks_again || !self.addresses.is_empty() || !self.again.is_empty()
+        self.unheard > 0
+            || self.looks_again
+            || !self.addresses.is_empty()
+            || !self.again.is_empty()
+            || !self.again_if_unlisted.is_empty()
     }
 }
 
@@ -770,6 +797,50 @@ mod tests {
             held(&trees, MODEL) == ["http://a:1"]
         })
         .await;
+    }
+
+    /// A purge that is owed is let go where events went unheard inside its
+    /// window: a worker may stand under the address by one of them, and
+    /// these trees ask no registry. A removal is heard and purged. More
+    /// events than the registry's channel holds follow, the task never run
+    /// between them, a registration under the address the first of them:
+    /// the trees are emptied. A prompt sent to the worker that came then
+    /// stands past the instant the purge was due, and past the look.
+    #[tokio::test(start_paused = true)]
+    async fn a_purge_owed_across_unheard_events_is_let_go() {
+        let trees = Arc::new(owner(document(1_000, 0)));
+        let registry = WorkerRegistry::new();
+        worker_at(&registry, "http://a:1");
+        worker_at(&registry, "http://b:1");
+        sent(&trees, MODEL, &["http://a:1", "http://b:1"]);
+        trees.follow_removals(&registry, &Handle::current());
+
+        registry.remove_by_url("http://b:1").expect("the removal");
+        until("the purge behind the removal", || {
+            held(&trees, MODEL) == ["http://a:1"]
+        })
+        .await;
+
+        let mut witness = registry.subscribe_events();
+        worker_at(&registry, "http://b:1");
+        for wave in 0..1_500 {
+            worker_at(&registry, &format!("http://wave-{wave}:1"));
+        }
+        assert!(
+            matches!(witness.try_recv(), Err(TryRecvError::Lagged(_))),
+            "the burst must overflow the channel, or this case holds nothing"
+        );
+        until("the trees emptied behind unheard events", || {
+            held(&trees, MODEL).is_empty()
+        })
+        .await;
+        sent(&trees, MODEL, &["http://b:1"]);
+        tokio::time::sleep(SETTLE_WHERE_NONE_IS_STATED * 2 + Duration::from_secs(1)).await;
+        assert_eq!(
+            held(&trees, MODEL),
+            ["http://b:1"],
+            "the worker that came keeps its prompt"
+        );
     }
 
     /// Events the task did not hear empty every tree. More events than the
