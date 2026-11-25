@@ -2562,6 +2562,25 @@ impl Leases {
         Ok((held, found))
     }
 
+    /// The chosen side a decode call's issue replaced on the lease under
+    /// `key`, as the pair's first decision filed it, while the side that
+    /// issue laid is issued or dispatched. It is read and stays kept. `None`
+    /// for a side no call issued, and for an issued side that ended: a
+    /// place keeps what an issue replaced past its lease's end, so the
+    /// side's own count of issues says whether a call laid it. A file no
+    /// decode call issued into looks no record up.
+    #[cfg(feature = "controller")]
+    fn replaced_decode(&self, key: &Key) -> Option<DecodeSide> {
+        if self.decodes.replaced.is_empty() {
+            return None;
+        }
+        let at = self.records.get(key)?.decode;
+        let issued = self.decodes.get(at, key)?;
+        let kept = self.decodes.replaced.get(at as usize)?.as_ref();
+        let (_, (first, _)) = kept.filter(|(owner, _)| owner == key)?;
+        (issued.issues != 0 && issued.side.state.is_live()).then_some(*first)
+    }
+
     /// Undoes the current decode issue if `issue` is `None` or matches, returning both prior sides.
     /// Returns `None` without changes if there is no matching issue with saved state.
     #[cfg(feature = "controller")]
