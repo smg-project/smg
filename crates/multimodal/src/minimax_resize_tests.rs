@@ -26,6 +26,7 @@ fn aligned_sizes_match_the_model_processor() {
         // A cap off the grid is rounded down; a cap on it stands.
         ((1000, 500, 1000), (980, 504)),
         ((1000, 500, 1009), (1008, 504)),
+        // 2016 * 2016 / 2044 = 1988.38 is cut to 1988, on the grid already.
         ((2017, 2016, 2016), (2016, 1988)),
         ((3600, 3600, 3600), (3584, 3584)),
         // A side the scale takes to nothing keeps one cell.
@@ -70,6 +71,42 @@ fn processor_does_not_repeat_resize_or_shrink_to_legacy_area_budget() {
             (w as usize / 28) * (h as usize / 28)
         );
     }
+}
+
+/// No aligned size is planned over the processor's 200:1 aspect limit, nor
+/// for a source over it: the nearest-grid size stands, and the processor
+/// serves or refuses it as before.
+#[test]
+fn a_planned_size_stays_within_the_processors_aspect_limit() {
+    use crate::vision::{processors::minimax_m3::MiniMaxM3VisionProcessor, VisionPreProcessor};
+    let mut config = crate::PreProcessorConfig::default();
+    config
+        .extra
+        .insert(RESIZED_KEY.into(), serde_json::json!(true));
+    let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
+    for ((w, h, cap), planned) in [
+        // Aligned 5628x28 is 201:1; the nearest-grid size keeps 199:1.
+        ((5572, 28, 5640), (22_288, 112)),
+        ((28, 5572, 5640), (112, 22_288)),
+        ((4095, 21, 5628), (21_840, 112)),
+        // Aligned 5600x28 is 200:1 and stands.
+        ((5600, 28, 5600), (5600, 28)),
+    ] {
+        let size = image(encoded(w, h), cap).unwrap().size();
+        assert_eq!((size.width, size.height), planned, "{w}x{h} cap {cap}");
+        let output = processor
+            .preprocess(&[&DynamicImage::new_rgb8(size.width, size.height)])
+            .unwrap_or_else(|err| panic!("{w}x{h} cap {cap}: {err}"));
+        assert_eq!(
+            output.feature_token_counts,
+            vec![(size.width as usize / 28) * (size.height as usize / 28)]
+        );
+    }
+    // The model processor sizes no source over 200:1: the plan is the
+    // nearest-grid one, which the processor refuses as before.
+    let size = image(encoded(1, 499), 2016).unwrap().size();
+    assert_eq!((size.width, size.height), (112, 55_888));
+    assert!(processor.calculate_num_tokens(112, 55_888).is_err());
 }
 
 /// Encode a small source fixture for lazy decode.
@@ -126,28 +163,68 @@ fn rejects_image_budget_before_decoding_pixels() {
     assert!(budget(IMAGE_MAX_TOTAL_PIXELS, IMAGE_MAX_TOTAL_PIXELS, "image").is_ok());
 }
 
-/// Across sources, at caps where no size passes the pixel budget, every side
-/// is on the grid, holds one cell at least and stays under the cap rounded
-/// down to the grid.
+/// Check source planning across both rules. The aligned size, where the
+/// budget and the aspect limit admit it, is on the grid, holds one cell at
+/// least and stays under the cap rounded down to the grid. Everywhere else the
+/// nearest-grid size stands to the pixel, half-grid ties included.
 #[test]
-fn geometry_matrix_stays_on_the_grid_under_the_cap() {
+fn geometry_matrix_and_ties_obey_the_source_contract() {
+    // Calculate the branch's rational scale separately, including caps exactly
+    // halfway between grid points after shrinking and sub-patch inputs.
+    let round_grid = |side: u64, numerator: u64, denominator: u64| {
+        let n = side * numerator;
+        let d = denominator * 28;
+        let q = n / d;
+        let r = n % d;
+        let rounded = q + u64::from(r * 2 > d || (r * 2 == d && q % 2 == 1));
+        (rounded.max(1) * 28) as u32
+    };
     const SIDES: [u32; 17] = [
         1, 27, 28, 42, 70, 111, 112, 113, 167, 168, 999, 1000, 1008, 1125, 2067, 3584, 8192,
     ];
+    let mut nearest = 0;
     for w in SIDES {
         for h in SIDES {
-            for cap in [1, 27, 112, 150, 999, 1000, 1008, 1022, 2016, 2030, 3584] {
+            // 3654 and 3682 are half-grid ties over the budget: one rounds
+            // down to an even cell count, one up.
+            for cap in [
+                1, 27, 112, 150, 999, 1000, 1008, 1022, 2016, 2030, 3584, 3640, 3654, 3682, 4004,
+                8192,
+            ] {
                 let sides = dimensions(w, h, cap).unwrap();
-                let limit = (cap - cap % 28).max(28);
-                for side in [sides.0, sides.1] {
-                    assert!(
-                        side % 28 == 0 && (28..=limit).contains(&side),
-                        "{w}x{h}/{cap}: {sides:?}"
-                    );
+                let (aw, ah) = aligned(w, h, cap);
+                if u64::from(aw) * u64::from(ah) <= IMAGE_MAX_TOTAL_PIXELS
+                    && w.max(h) <= 200 * w.min(h)
+                    && aw.max(ah) <= 200 * aw.min(ah)
+                {
+                    assert_eq!(sides, (aw, ah), "{w}x{h}/{cap}");
+                    let limit = (cap - cap % 28).max(28);
+                    for side in [sides.0, sides.1] {
+                        assert!(
+                            side % 28 == 0 && (28..=limit).contains(&side),
+                            "{w}x{h}/{cap}: {sides:?}"
+                        );
+                    }
+                    continue;
                 }
+                let (num, den) = if w.max(h) > cap {
+                    (cap, w.max(h))
+                } else if w.min(h) < 112 {
+                    (112, w.min(h))
+                } else {
+                    (1, 1)
+                };
+                let expected = (
+                    round_grid(w.into(), num.into(), den.into()),
+                    round_grid(h.into(), num.into(), den.into()),
+                );
+                assert_eq!(sides, expected, "{w}x{h}/{cap}");
+                nearest += 1;
             }
         }
     }
+    // 288 sources are over the aspect limit; nine sizes pass the budget.
+    assert_eq!(nearest, 297);
 }
 
 /// Check direct kernel pixels for each supported encoded format and alpha policy.

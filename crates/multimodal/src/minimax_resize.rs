@@ -31,7 +31,8 @@ pub const SGLANG_RESIZE_KEY: &str = "minimax_sglang_resize";
 #[path = "minimax_resize_tests.rs"]
 mod tests;
 
-/// The model processor's aligned size where it fits the pixel budget. Else
+/// The model processor's aligned size for a source within its 200:1 aspect
+/// limit, where that size fits the pixel budget and the same limit. Else
 /// branch on original dimensions, then use the nearest patch-grid alignment
 /// (ties to even, like Python round), never rounding the input cap.
 pub(crate) fn dimensions(
@@ -48,12 +49,17 @@ pub(crate) fn dimensions(
         )));
     }
     let (w, h) = aligned(width, height, cap);
-    if u64::from(w) * u64::from(h) <= IMAGE_MAX_TOTAL_PIXELS {
+    let within = |long: u32, short: u32| f64::from(long) / f64::from(short) <= 200.0;
+    if u64::from(w) * u64::from(h) <= IMAGE_MAX_TOTAL_PIXELS
+        && within(width.max(height), width.min(height))
+        && within(w.max(h), w.min(h))
+    {
         return Ok((w, h));
     }
-    // The processor's size passes the budget and would be refused. The
-    // nearest-grid size, which can round a side down, still serves a source
-    // that fits the budget with it.
+    // The model processor sizes no source over 200:1, and a size over the
+    // budget or over 200:1 would be refused. The nearest-grid size, which can
+    // round a side down and does not scale an enlarged source back under the
+    // cap, serves what it served before.
     let long = width.max(height);
     let short = width.min(height);
     let (numerator, denominator) = if long > cap {
@@ -88,8 +94,9 @@ pub(crate) fn dimensions(
 /// The model processor's aligned size. A source under the area floor, then one
 /// under the short-side floor, is enlarged in proportion, each side rounded
 /// up; both sides are rounded up to the patch grid; and where one is over the
-/// cap, both are scaled back by `cap / long` and rounded up again. The cap is
-/// first rounded down to the grid, so no side ends above it.
+/// cap, both are scaled back by `cap / long`, cut to whole pixels and rounded
+/// up to the grid again. The cap is first rounded down to the grid, so no
+/// side ends above it but for the one cell a side keeps.
 fn aligned(width: u32, height: u32, cap: u32) -> (u32, u32) {
     // The floors are the processor's float arithmetic, operation for
     // operation: 153 * (168.0 / 153) lands above 168 and rounds up to 169.
