@@ -639,7 +639,7 @@ mod tests {
         service::{
             controller::{
                 config::Scope,
-                decision_slots::tests::followed,
+                decision_slots::tests::{followed, unserved},
                 election::{ElectionObservation, LeasePlace, Said},
                 floor::{FLOORS_SPENT_MAX, FLOOR_BELIEVED, FLOOR_REACH},
                 gateways::{
@@ -695,7 +695,7 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            unserved(stood),
             followed(journaled_at(&LeasePlace::Process, 0, 2)),
             Arc::new(crate::stages::StageRegistry::builtin()),
             2,

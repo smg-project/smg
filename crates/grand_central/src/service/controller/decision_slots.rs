@@ -1596,7 +1596,7 @@ pub(crate) mod tests {
         panic::resume_unwind,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            mpsc as std_mpsc, Arc, Weak,
+            mpsc as std_mpsc, Arc, OnceLock, Weak,
         },
         thread,
         time::{Duration, Instant},
@@ -1637,6 +1637,7 @@ pub(crate) mod tests {
                     Gateways, Vetoed,
                 },
                 lifecycle,
+                standby::{self, Lag},
                 watch_workers::Feed,
                 wire::{self, Checked},
                 worker_objects::WorkerObjects,
@@ -1753,6 +1754,28 @@ pub(crate) mod tests {
     ) -> (Arc<MemoryStore>, Feed, Arc<Objects<Members>>, LoadReceiver) {
         let objects = holder(&store);
         (store, feed, objects, frame_loads::silent())
+    }
+
+    /// `standing` with the rest of a run loop's side where no serve runs,
+    /// as the service's shared state takes the four: the listeners' close
+    /// nobody says, the role's word nobody tells, and a lag under the bound
+    /// of no load poll interval. The two words' senders stand to the
+    /// process's end, so a stream over the state reads no word and no end
+    /// of its telling.
+    pub(crate) fn unserved(
+        standing: watch::Receiver<ElectionObservation>,
+    ) -> (
+        watch::Receiver<ElectionObservation>,
+        watch::Receiver<bool>,
+        watch::Receiver<Option<u64>>,
+        Arc<Lag>,
+    ) {
+        static UNTOLD: OnceLock<(watch::Sender<bool>, watch::Sender<Option<u64>>)> =
+            OnceLock::new();
+        let (stop, role) =
+            UNTOLD.get_or_init(|| (watch::Sender::new(false), watch::Sender::new(None)));
+        let lag = Arc::new(Lag::new(standby::synced_within(Duration::ZERO)));
+        (standing, stop.subscribe(), role.subscribe(), lag)
     }
 
     /// A store, a candidate of its election and the deciders over both.
