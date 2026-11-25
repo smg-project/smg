@@ -8,6 +8,7 @@ use rand::{
     distr::{Alphanumeric, SampleString},
     rng as thread_rng, RngExt,
 };
+use tracing_test::traced_test;
 
 use super::*;
 
@@ -1043,6 +1044,20 @@ fn test_eviction_single_tenant_all_entries() {
         final_size <= 50,
         "Size {final_size} should be <= 50 after eviction"
     );
+}
+
+/// The size pass writes no tenant key into its debug events.
+#[test]
+#[traced_test]
+fn test_evict_by_size_events_name_no_tenant() {
+    let tree = Tree::new();
+    tree.insert_text("hello", "tenant-alpha");
+    tree.insert_text("world", "tenant-beta");
+
+    tree.evict_tenant_by_size(5);
+
+    assert!(tree.total_char_size() <= 5, "the pass ran");
+    assert!(!logs_contain("tenant-alpha") && !logs_contain("tenant-beta"));
 }
 
 // ==================== Last Tenant Cache Tests ====================
