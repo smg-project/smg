@@ -790,29 +790,53 @@ fn resolve_template_thinking(
 }
 
 /// Validate content sent to a model template, using the tool declarations
-/// that the template will receive.
+/// that the template will receive. `Ok(Some(refusal))` is a request with a
+/// media part in a system, developer or root message: the caller gives the
+/// refusal where the rendered prompt's anchors are not counted against the
+/// request's media (`multimodal::validate_rendered_media_anchors`).
 pub(crate) fn validate_chat_template_content_parts(
     request: &ChatCompletionRequest,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     validate_chat_parts(&request.messages, Some(request))
 }
 
 /// Validate gRPC chat content outside the regular template preparation path.
 pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
-    validate_chat_parts(messages, None)
+    validate_chat_parts(messages, None).map(|_| ())
 }
 
 /// Reject unsupported parts: a `tool_reference` part, which names a function
 /// the request declares, is taken only in a tool message sent to a model
 /// template that reads such parts, in a list of such parts alone. A media
-/// part is refused here in an assistant message alone: in any other message
-/// it goes on to the render, and a request the gateway plans media for is
-/// held to one anchor in the rendered prompt for each media part
-/// (`multimodal::validate_rendered_media_anchors`).
+/// part is taken in a user message and in a tool result, and refused in an
+/// assistant message, whose parts no media plan counts
+/// (`multimodal::media_plan_chat`).
+///
+/// A media part in a system, developer or root message is refused where the
+/// rendered prompt's anchors are not counted against the request's media:
+/// here outside the template path (`template_request` is `None`), and on
+/// that path by the caller, which is handed the refusal of the first such
+/// part as `Ok(Some(_))`. That check counts the anchors of each modality and
+/// does not tell which anchor is whose, and the anchors are paired with the
+/// request's media in message order: so on the template path such a part is
+/// refused here too where another message carries a part of the same
+/// modality, which a render that moves a message would pair wrongly.
 fn validate_chat_parts(
     messages: &[ChatMessage],
     template_request: Option<&ChatCompletionRequest>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
+    let refusal = |kind: &str, role: &str| {
+        format!(
+            "Unsupported chat content part type {kind:?} in {role} message for gRPC backends: \
+             media parts are taken in user and tool messages"
+        )
+    };
+    // The kind and the role of the first media part in a system, developer
+    // or root message, and three sets of modalities, a bit each: those of
+    // such parts, those the messages walked carry, and those two messages
+    // carry.
+    let mut left_to_caller = None;
+    let (mut left_modalities, mut carried, mut shared) = (0_u8, 0_u8, 0_u8);
     for message in messages {
         let content = match message {
             ChatMessage::System { content, .. }
@@ -824,6 +848,19 @@ fn validate_chat_parts(
             ChatMessage::Function { .. } => None,
         };
         let assistant = matches!(message, ChatMessage::Assistant { .. });
+        // The roles a media part is refused in, each with its article for
+        // this door's sentence: an assistant message always, a system,
+        // developer or root message by the rule above.
+        let text_only_role = match message {
+            ChatMessage::System { .. } => Some("a system"),
+            ChatMessage::Developer { .. } => Some("a developer"),
+            ChatMessage::Assistant { .. } => Some("an assistant"),
+            ChatMessage::Root { .. } => Some("a root"),
+            ChatMessage::User { .. } | ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {
+                None
+            }
+        };
+        let mut in_message = 0_u8;
         if let Some(MessageContent::Parts(parts)) = content {
             for part in parts {
                 match part {
@@ -855,34 +892,40 @@ fn validate_chat_parts(
                                 .to_string(),
                         );
                     }
-                    // An assistant message's media part is in no media plan
-                    // (`multimodal::media_plan_chat`): it is refused here, in
-                    // this door's own sentence, before a template that
-                    // renders it writes an anchor the plan does not count.
-                    _ if assistant => {
-                        if let Some(kind) = media_part_type(part) {
-                            return Err(format!(
-                                "Unsupported chat content part type {kind:?} in an assistant \
-                                 message for gRPC backends: media parts are taken in user and \
-                                 tool messages"
-                            ));
+                    _ => {
+                        if let Some((kind, modality)) = media_part_type(part) {
+                            let bit = 1_u8 << modality as u8;
+                            if let Some(role) = text_only_role {
+                                if assistant || template_request.is_none() {
+                                    return Err(refusal(kind, role));
+                                }
+                                left_to_caller = left_to_caller.or(Some((kind, role)));
+                                left_modalities |= bit;
+                            }
+                            in_message |= bit;
                         }
                     }
-                    _ => {}
                 }
             }
         }
+        shared |= carried & in_message;
+        carried |= in_message;
     }
-    Ok(())
+    match left_to_caller {
+        Some((kind, role)) if left_modalities & shared != 0 => Err(refusal(kind, role)),
+        Some((kind, role)) => Ok(Some(refusal(kind, role))),
+        None => Ok(None),
+    }
 }
 
-/// The wire name (`type`) of a media content part; `None` for any other part.
-fn media_part_type(part: &ContentPart) -> Option<&'static str> {
+/// The wire name (`type`) and the modality of a media content part; `None`
+/// for any other part.
+fn media_part_type(part: &ContentPart) -> Option<(&'static str, Modality)> {
     match part {
-        ContentPart::ImageUrl { .. } => Some("image_url"),
-        ContentPart::AudioUrl { .. } => Some("audio_url"),
-        ContentPart::InputAudio { .. } => Some("input_audio"),
-        ContentPart::VideoUrl { .. } => Some("video_url"),
+        ContentPart::ImageUrl { .. } => Some(("image_url", Modality::Image)),
+        ContentPart::AudioUrl { .. } => Some(("audio_url", Modality::Audio)),
+        ContentPart::InputAudio { .. } => Some(("input_audio", Modality::Audio)),
+        ContentPart::VideoUrl { .. } => Some(("video_url", Modality::Video)),
         ContentPart::Text { .. } | ContentPart::Refusal { .. } | ContentPart::Unknown(_) => None,
     }
 }

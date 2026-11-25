@@ -92,7 +92,7 @@ pub(crate) async fn prepare_chat_like(
 ) -> Result<(Vec<u32>, ProcessedMessages, symphony::PreparedConstraint), Response> {
     // Validate against the rendered tool set, which allowed_tools may narrow.
     let body_ref = utils::request_as_rendered(request);
-    utils::validate_chat_template_content_parts(&body_ref)
+    let unanchored_media_refusal = utils::validate_chat_template_content_parts(&body_ref)
         .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
@@ -124,6 +124,19 @@ pub(crate) async fn prepare_chat_like(
             body_ref.tools.is_some(),
         )
         .await?;
+        // A system, developer or root media part goes on to the render only
+        // where the rendered prompt's anchors of each modality are counted
+        // against the request's media behind it: without a media plan, or
+        // with one whose placeholders are the engine's own, the door's
+        // refusal stands.
+        if let Some(refusal) = unanchored_media_refusal.filter(|_| {
+            media
+                .media
+                .as_ref()
+                .is_none_or(|media| media.placeholders.is_worker_only())
+        }) {
+            return Err(error::bad_request("unsupported_content_part", refusal));
+        }
         let media_order = media.media_order;
 
         // The model's provider profile, derived once for the request, before
@@ -469,6 +482,108 @@ mod tests {
                     "declares tools: {declares_tools}"
                 );
             }
+        }
+    }
+
+    /// A system message's image is taken where the rendered prompt carries
+    /// its anchor and refused by the anchor check where it carries none; a
+    /// model without a media spec and a template that writes media as text
+    /// have no anchor check, and the door's refusal stands for them.
+    #[tokio::test]
+    async fn a_system_image_is_taken_only_under_the_anchor_check() {
+        use std::sync::Arc;
+
+        use llm_multimodal::PreProcessorConfig;
+        use llm_tokenizer::{
+            chat_template::ChatTemplateContentFormat,
+            mock::MockTokenizer,
+            traits::{MediaHandling, RendererCapabilities},
+        };
+
+        use crate::routers::grpc::{
+            multimodal::MultimodalModelConfig,
+            regular::stages::testing::components_forwarding_media_of,
+        };
+
+        // The image anchor of the family the config below names.
+        const ANCHOR: u32 = 32000;
+        for (has_spec, media_handling, rendered, refusal) in [
+            (true, MediaHandling::Preprocess, vec![1, ANCHOR, 3], None),
+            (
+                true,
+                MediaHandling::Preprocess,
+                vec![1, 2, 3],
+                Some("multimodal_prompt_contract_mismatch"),
+            ),
+            (
+                false,
+                MediaHandling::Preprocess,
+                vec![1, ANCHOR, 3],
+                Some("unsupported_content_part"),
+            ),
+            (
+                true,
+                MediaHandling::TemplateText,
+                vec![1, ANCHOR, 3],
+                Some("unsupported_content_part"),
+            ),
+        ] {
+            let tokenizer = MockTokenizer::new()
+                .with_tokens(&[("<image>", ANCHOR)])
+                .with_deferred_chat_ids(rendered)
+                .with_content_format(ChatTemplateContentFormat::OpenAI)
+                .with_renderer_capabilities(RendererCapabilities {
+                    media_handling,
+                    ..Default::default()
+                });
+            let (_dir, components) = components_forwarding_media_of("m", Arc::new(tokenizer)).await;
+            if has_spec {
+                components
+                    .multimodal
+                    .as_ref()
+                    .expect("multimodal components")
+                    .config_registry
+                    .insert(
+                        "m".to_string(),
+                        Arc::new(MultimodalModelConfig::new(
+                            json!({"model_type": "llava", "image_token_index": ANCHOR}),
+                            PreProcessorConfig::default(),
+                            None,
+                        )),
+                    );
+            }
+            let mut ctx = RequestContext::for_chat(
+                Arc::new(request(json!({
+                    "model": "m",
+                    "messages": [
+                        {"role": "system", "content": [
+                            {"type": "image_url", "image_url": {"url": "https://a/1.png"}},
+                            {"type": "text", "text": "You are an image analyst."}
+                        ]},
+                        {"role": "user", "content": "What is in the system image?"}
+                    ]
+                }))),
+                None,
+                "m".into(),
+                components,
+            );
+            let refused_with = ChatPreparationStage::new(&[])
+                .prepare(&mut ctx)
+                .await
+                .err()
+                .map(|response| {
+                    response
+                        .headers()
+                        .get("x-smg-error-code")
+                        .and_then(|code| code.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned()
+                });
+            assert_eq!(
+                refused_with.as_deref(),
+                refusal,
+                "media spec: {has_spec}, {media_handling:?}"
+            );
         }
     }
 }

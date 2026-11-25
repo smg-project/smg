@@ -96,51 +96,80 @@ fn a_refusal_part_outside_an_assistant_turn_is_refused() {
     assert!(validate_chat_content_parts(&messages).is_ok());
 }
 
-/// A media part is refused at the door in an assistant message alone, in
-/// this door's own sentence: no media plan counts an assistant message's
-/// part. In a system, developer or root message it passes the door, as in a
-/// user message and in a tool result: the render and the anchor check behind
-/// it answer for it.
+/// A media part is taken in a user message and in a tool result, and refused
+/// in an assistant message in this door's own sentence (with the role's
+/// article). In a system, developer or root message it is refused the same
+/// way outside the template path, and on that path where another message
+/// carries a part of the same modality; any other one is left to the caller,
+/// which is handed the refusal to give where the rendered prompt's anchors
+/// are not counted.
 #[test]
-fn a_media_part_is_refused_at_the_door_in_an_assistant_message_alone() {
+fn a_media_part_outside_user_and_tool_messages_is_refused_or_left_to_the_caller() {
     let parts = [
         json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}),
         json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
         json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}),
         json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
     ];
-    for role in ["system", "developer", "root", "assistant"] {
+    let request = |messages: Value| -> ChatCompletionRequest {
+        serde_json::from_value(json!({"model": "test-model", "messages": messages})).unwrap()
+    };
+    for (role, phrase) in [
+        ("system", "a system"),
+        ("developer", "a developer"),
+        ("assistant", "an assistant"),
+        ("root", "a root"),
+    ] {
         for part in &parts {
             let kind = part["type"].as_str().unwrap();
-            let messages: Vec<ChatMessage> = serde_json::from_value(json!([
-                {"role": role, "content": [{"type": "text", "text": "you see"}, part]},
-                {"role": "user", "content": "describe"}
-            ]))
-            .unwrap();
-            let refusal = (role == "assistant").then(|| {
-                format!(
-                    "Unsupported chat content part type {kind:?} in an assistant message for \
-                     gRPC backends: media parts are taken in user and tool messages"
-                )
-            });
-            assert_eq!(
-                validate_chat_content_parts(&messages).err(),
-                refusal,
-                "{role}"
+            let refusal = format!(
+                "Unsupported chat content part type {kind:?} in {phrase} message for gRPC \
+                 backends: media parts are taken in user and tool messages"
             );
+            let message =
+                json!({"role": role, "content": [{"type": "text", "text": "you see"}, part]});
+            let first = request(json!([message, {"role": "user", "content": "describe"}]));
+            assert_eq!(
+                validate_chat_content_parts(&first.messages),
+                Err(refusal.clone()),
+                "{role}, outside the template path"
+            );
+            assert_eq!(
+                validate_chat_template_content_parts(&first),
+                if role == "assistant" {
+                    Err(refusal.clone())
+                } else {
+                    Ok(Some(refusal.clone()))
+                },
+                "{role}, the one message with a part of its modality"
+            );
+            let other = json!({"role": "user", "content": [part]});
+            for messages in [json!([other, message]), json!([message, other])] {
+                assert_eq!(
+                    validate_chat_template_content_parts(&request(messages)),
+                    Err(refusal.clone()),
+                    "{role}, beside another message's part of its modality"
+                );
+            }
         }
     }
-    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+    let (image, audio) = (&parts[0], &parts[1]);
+    // A part of another modality is no part to change places with.
+    let mixed = request(json!([
+        {"role": "user", "content": [audio]},
+        {"role": "system", "content": [image]}
+    ]));
+    assert!(matches!(
+        validate_chat_template_content_parts(&mixed),
+        Ok(Some(_))
+    ));
+    let taken = request(json!([
         {"role": "system", "content": [{"type": "text", "text": "you see"}]},
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
-        ]},
-        {"role": "tool", "tool_call_id": "call_1", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
-        ]}
-    ]))
-    .unwrap();
-    assert!(validate_chat_content_parts(&messages).is_ok());
+        {"role": "user", "content": [image]},
+        {"role": "tool", "tool_call_id": "call_1", "content": [image]}
+    ]));
+    assert_eq!(validate_chat_template_content_parts(&taken), Ok(None));
+    assert_eq!(validate_chat_content_parts(&taken.messages), Ok(()));
 }
 
 #[test]
