@@ -1189,7 +1189,7 @@ impl MemoryStore {
     /// How many members' reads under the standing generation's lists the
     /// store keeps: one a member under lists that name an engine family or
     /// a zone, and none under any other.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "operator"))]
     pub(crate) fn listed_members(&self) -> usize {
         self.loads.lock().writer.listed()
     }

@@ -850,7 +850,7 @@ impl Writer {
 
     /// How many members' reads under the standing generation's lists are
     /// kept ([`Self::list`], [`Self::relist`]).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "operator"))]
     pub(super) fn listed(&self) -> usize {
         self.listed.len()
     }
