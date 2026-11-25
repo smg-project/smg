@@ -44,6 +44,35 @@ fn decodes_of(pairs: &BTreeSet<(usize, usize)>) -> BTreeSet<usize> {
     pairs.iter().map(|&(_, decode)| decode).collect()
 }
 
+/// The answer to one request over `pair` whose route states a rule that
+/// takes every worker, and the workers that rule was asked of, each by
+/// its address, in the order of its asks. The request names `number`, and
+/// nobody for `None`.
+fn rule_asks(
+    engine: &'static InProcess,
+    lists: &Lists,
+    pair: PairLists<'_>,
+    number: Option<&str>,
+) -> (Result<(usize, usize), Unplaced>, Vec<String>) {
+    let asked = RefCell::new(Vec::new());
+    let rule = |worker: &dyn Worker| {
+        asked.borrow_mut().push(worker.url().to_owned());
+        true
+    };
+    let stated = number.map(|number| [(TARGET, number)]);
+    let headers: &dyn HeaderRead = match &stated {
+        Some(stated) => stated,
+        None => &(),
+    };
+    let request = PlaceRequest {
+        headers,
+        admits: Some(&rule),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let answer = placed(engine, lists, &request);
+    (answer, asked.take())
+}
+
 /// The decode a pair names is counted behind the prefill its own profile
 /// picks. The prefill takes its turns, and the decode is the one the
 /// number reaches among that prefill's partners, in the decode list's
@@ -102,9 +131,10 @@ fn a_number_past_the_picks_partners_sheds_the_pair_behind_that_pick() {
 /// call reads them, in the decode list's order, at the places the caller
 /// states for the decodes: a decode that is not ready and one over its
 /// thresholds are passed over, and so is one the route's rule refuses.
-/// The rule is asked there of each decode that is available, of each
-/// prefill that is, as the call counts them, then of each prefill ready
-/// or not, and behind the decision of its pick's two workers alone.
+/// The rule is asked there of each decode that is available, of the
+/// prefills that are as far as the first that opens the pair, then of
+/// each prefill ready or not, and behind the decision of its pick's two
+/// workers alone.
 ///
 /// The classic router's decode policy is handed the partners the route's
 /// rule takes that are available (`P:2635-2640`, `P:2676-2680`,
@@ -156,8 +186,8 @@ fn the_decodes_number_counts_the_decodes_that_can_be_sent_to() {
     };
     let (_, decode) = placed(engine, &lists, &request).expect("a placement");
     assert_eq!(decode, 1, "past the decode the rule refuses");
-    let asks = "three decodes, two prefills counted and held, the pick's two";
-    assert_eq!(rule_asked.get(), 9, "{asks}");
+    let asks = "three decodes, the prefill that opens the pair, two held, the pick's two";
+    assert_eq!(rule_asked.get(), 8, "{asks}");
 }
 
 /// A rule the request states is asked of the prefills ahead of the call's
@@ -329,15 +359,16 @@ fn a_decode_named_alone_that_cannot_take_the_request_after_all_is_never_replaced
     let shedding = hosted(engine_of(&document));
     assert_eq!(racing(shedding, overloads), Err(MISSED));
 
-    // The rule takes every worker while it is counted: two decodes and
-    // two prefills. Behind that it refuses the named decode.
+    // The rule takes every worker while it is counted: two decodes, and
+    // the first prefill, which opens the pair. Behind that it refuses the
+    // named decode.
     let lists = Lists::of(2, 2);
     let classes = lists.every();
     let named = lists.decodes[0].url();
     let rule_asked = Cell::new(0_u32);
     let rule = |worker: &dyn Worker| {
         rule_asked.set(rule_asked.get() + 1);
-        rule_asked.get() <= 4 || worker.url() != named
+        rule_asked.get() <= 3 || worker.url() != named
     };
     let headers = [(TARGET, "0")];
     let request = PlaceRequest {
@@ -346,8 +377,8 @@ fn a_decode_named_alone_that_cannot_take_the_request_after_all_is_never_replaced
         ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
     };
     assert_eq!(placed(steering, &lists, &request), Err(MISSED));
-    let asks = "the count, the two prefills held, two decisions' picks";
-    assert_eq!(rule_asked.get(), 10, "{asks}");
+    let asks = "the count's three, the two prefills held, two decisions' picks";
+    assert_eq!(rule_asked.get(), 9, "{asks}");
 }
 
 /// The decodes' count passes over a decode at a place its host masks and
@@ -467,8 +498,8 @@ fn where_no_prefill_opens_the_pair_the_decodes_number_is_not_read() {
 /// nobody is, whatever the header's text. That answer is the pair's shed
 /// as saturated: a decode pool that is not over its thresholds whole is
 /// steered nowhere. Lent the one counted decode's place, a decision would
-/// count the number among no partner of its pick and shed the pair under
-/// the target's name.
+/// find the first prefill no partner there, and shed the pair with no
+/// endpoint under `partnered`.
 ///
 /// The classic router counts a prefill as open by an open partner of its
 /// own (`P:2723-2728`, `P:2756-2771`). With none open it never asks its
@@ -564,9 +595,10 @@ fn a_prefill_over_its_thresholds_opens_no_pair_under_a_profile_that_does_not_wei
 /// be sent to beside a partner that is over its thresholds. No prefill
 /// opens the pair: the header is not read, and the request is answered as
 /// one that names nobody is, whatever the header's text. Read by the
-/// second prefill's leave, the number would be counted among no partner
-/// of the first prefill, the decision's pick, and the pair shed under the
-/// target's name.
+/// second prefill's leave, the call would lend the one counted decode's
+/// place: the decision would show its prefill profile the second prefill
+/// alone, refuse it over its thresholds, and name that refusal by the
+/// first prefill's partners there, with no endpoint under `partnered`.
 ///
 /// The classic router lifts no veto with its shedding on (`P:2672`,
 /// `P:2653-2655`): no prefill is open, and it refuses the pair, whose
@@ -660,4 +692,50 @@ fn a_prefill_behind_a_mask_or_a_demand_opens_no_pair() {
         ..pinned()
     };
     assert_eq!(placed(engine, &lists, &request), Ok((1, 1)), "a demand");
+}
+
+/// The prefills are read in their list's order as far as the first that
+/// opens the pair, and the route's rule is asked of no prefill behind it:
+/// of the first of four here, ahead of its own read of every prefill,
+/// ready or not. Where no prefill opens the pair, every prefill that can
+/// be sent to is read and asked. Here three prefills pair with a decode
+/// over its thresholds, and the fourth, the one partner of the decode
+/// that can be sent to, is not ready: the header is not read.
+///
+/// The classic router asks its route's rule of every candidate of both
+/// pools ahead of its policies (`P:2635-2640`), once a pass
+/// (`P:196-200`). The answers are the same: a rule there answers by
+/// reading alone.
+#[test]
+fn the_prefills_are_read_as_far_as_the_first_that_opens_the_pair() {
+    let engine = ring_decode();
+    let lists = Lists::of(4, 2);
+    let urls = |workers: &[Arc<dyn Worker>]| -> Vec<String> {
+        let url = |worker: &Arc<dyn Worker>| worker.url().to_owned();
+        workers.iter().map(url).collect()
+    };
+    let (prefills, decodes) = (urls(&lists.prefills), urls(&lists.decodes));
+
+    let every = lists.every();
+    let (pair, asks) = rule_asks(engine, &lists, lists.under(&every, &Open), Some("0"));
+    assert_eq!(pair.map(|(_, decode)| decode), Ok(0), "the decode named");
+    // Both decodes, the first prefill, the rule's own read of the four
+    // prefills, and behind them the pick's two workers.
+    let counted = [&decodes[..], &prefills[..1], &prefills[..]].concat();
+    assert_eq!(asks[..counted.len()], counted, "one prefill opens the pair");
+    assert_eq!(asks.len(), counted.len() + 2, "the pick's two");
+
+    // The first three prefills pair with decode 0 alone, the fourth with
+    // decode 1 alone.
+    let (zero, one): (&[u32], &[u32]) = (&[0], &[1]);
+    let apart = PartnerClasses::number(2, [zero, zero, zero, one]);
+    lists.decodes[0].set_overloaded(true);
+    lists.prefills[3].set_status(WorkerStatus::NotReady);
+    let pair = lists.under(&apart, &Open);
+    let (unnamed, _) = rule_asks(engine, &lists, pair, None);
+    let (named, asks) = rule_asks(engine, &lists, pair, Some("0"));
+    assert_eq!(named, unnamed, "the header is not read");
+    // The one decode that can be sent to, then each prefill that can.
+    let read = [&decodes[1..], &prefills[..3]].concat();
+    assert_eq!(asks[..read.len()], read, "no prefill opens the pair");
 }
