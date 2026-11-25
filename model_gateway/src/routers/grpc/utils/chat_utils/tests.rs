@@ -1578,8 +1578,9 @@ fn minimax_effort_none_switches_thinking_off_and_renders_no_effort() {
 /// off, the opening one while it is on, nothing for the template's default,
 /// and the reasoning parser starts where the prefix leaves the completion. A
 /// template with the switch writes its own prefix; a tokenizer without the
-/// marker tokens, another profile, a prompt without a generation prompt and
-/// a prefill that states its thought get none, and a prompt whose template
+/// marker tokens, another profile, a prompt without a generation prompt, a
+/// request whose template key holds any value but its toggle's own and one
+/// that continues its final message get none, and a prompt whose template
 /// wrote the marker itself keeps that one.
 #[test]
 fn minimax_template_without_a_thinking_switch_gets_the_thought_prefix() {
@@ -1592,6 +1593,7 @@ fn minimax_template_without_a_thinking_switch_gets_the_thought_prefix() {
          {% endif %}";
     const SWITCH_WITH_TOOLS: &str = "{% for message in messages %}[{{ message.role }}]{% endfor %}\
          {% if add_generation_prompt %}ai\n\
+         {% if tools and thinking_mode == \"disabled\" %}</mm:think>{% endif %}\
          {% if tools and thinking_mode == \"enabled\" %}<mm:think>{% endif %}{% endif %}";
     const MARKERS: [(&str, u32); 2] = [("<mm:think>", 200059), ("</mm:think>", 200060)];
     let request = |model: &str, thinking: Option<Value>, reasoning_effort: Option<&str>| {
@@ -1676,8 +1678,10 @@ fn minimax_template_without_a_thinking_switch_gets_the_thought_prefix() {
         "a tokenizer without the marker tokens"
     );
     // The Messages route renders through the same rule, by its own reading
-    // of the `thinking` block: `adaptive` counts as on and `between_tools`
-    // as off, as for a template with the switch.
+    // of the `thinking` block: `between_tools` counts as off, as for a
+    // template with the switch. An `adaptive` block takes no prefix: the
+    // template alone renders the mode it asks, and the request reads as it
+    // did before the prefix.
     for (thinking, prompt, in_thought, name) in [
         (disabled(), "[user]ai\n</mm:think>", false, "disabled"),
         (
@@ -1694,8 +1698,8 @@ fn minimax_template_without_a_thinking_switch_gets_the_thought_prefix() {
         ),
         (
             Some(json!({"type": "adaptive"})),
-            "[user]ai\n<mm:think>",
-            true,
+            "[user]ai\n",
+            false,
             "adaptive",
         ),
         (None, "[user]ai\n", false, "no thinking block"),
@@ -1745,71 +1749,83 @@ fn minimax_template_without_a_thinking_switch_gets_the_thought_prefix() {
     // A checkpoint whose template for requests with tools has the switch its
     // default one lacks reports no switch and writes the marker itself where
     // the request declares tools: the prompt keeps that one, and the
-    // reasoning parser starts inside the thought on both prompts.
+    // reasoning parser starts inside the thought on both prompts. Where the
+    // request's template key holds any value but its toggle's own (the other
+    // mode, or a word that names none), the gateway writes nothing: the
+    // prompt and the parser's start are that template's own.
     let switch_with_tools = template(SWITCH_WITH_TOOLS).with_tokens(&MARKERS);
-    let mut tooled = request("MiniMax-M3", enabled(), None);
-    tooled.chat_template_kwargs = Some(HashMap::from([(
-        "thinking_mode".to_string(),
-        json!("enabled"),
-    )]));
-    for (tools, name) in [
-        (None, "the gateway's prefix without tools"),
+    let tools = || Some(json!([{"type": "function", "function": {"name": "f", "parameters": {}}}]));
+    for (tools, mode, prompt, in_thought, name) in [
         (
-            Some(json!([{"type": "function", "function": {"name": "f", "parameters": {}}}])),
+            None,
+            "enabled",
+            "[user]ai\n<mm:think>",
+            true,
+            "the gateway's prefix without tools",
+        ),
+        (
+            tools(),
+            "enabled",
+            "[user]ai\n<mm:think>",
+            true,
             "the template's own marker with tools",
         ),
+        (
+            tools(),
+            "disabled",
+            "[user]ai\n</mm:think>",
+            false,
+            "a template key that states the other value",
+        ),
+        (
+            tools(),
+            "adaptive",
+            "[user]ai\n",
+            false,
+            "a template key that names no mode",
+        ),
     ] {
+        let mut tooled = request("MiniMax-M3", enabled(), None);
+        tooled.chat_template_kwargs =
+            Some(HashMap::from([("thinking_mode".to_string(), json!(mode))]));
         tooled.tools = tools.map(|tools| serde_json::from_value(tools).unwrap());
+        assert_eq!(render(&switch_with_tools, &tooled), prompt, "{name}");
         assert_eq!(
-            render(&switch_with_tools, &tooled),
-            "[user]ai\n<mm:think>",
-            "{name}"
-        );
-        assert!(
             chat_reasoning_starts_in_prefill(&tooled, &switch_with_tools),
+            in_thought,
             "{name}: where the reasoning parser starts"
         );
     }
-    // A prefill stands behind the prefix. One that states its thought takes
-    // none: the prompt and the parser's start are the template's own.
-    for (text, prompt, in_thought) in [
-        ("Sure", "[user]ai\n<mm:think>Sure", true),
-        (
-            "plan</mm:think>Answer:",
-            "[user]ai\nplan</mm:think>Answer:",
-            false,
-        ),
-    ] {
-        let mut prefilled = request("MiniMax-M3", enabled(), None);
-        prefilled.continue_final_message = true;
-        prefilled.messages.push(
-            serde_json::from_value(json!({
-                "role": "assistant",
-                "content": [{"type": "text", "text": text}]
-            }))
-            .unwrap(),
-        );
-        assert_eq!(render(&no_switch, &prefilled), prompt, "a prefill {text:?}");
-        assert_eq!(
-            chat_reasoning_starts_in_prefill(&prefilled, &no_switch),
-            in_thought,
-            "a prefill {text:?}: where the reasoning parser starts"
-        );
-    }
+    // A request that continues its final message takes no prefix: the prefill
+    // stands behind the generation prompt as before.
+    let mut prefilled = request("MiniMax-M3", enabled(), None);
+    prefilled.continue_final_message = true;
+    prefilled.messages.push(
+        serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Sure"}]
+        }))
+        .unwrap(),
+    );
+    assert_eq!(
+        render(&no_switch, &prefilled),
+        "[user]ai\nSure",
+        "a prefill"
+    );
+    assert!(
+        !chat_reasoning_starts_in_prefill(&prefilled, &no_switch),
+        "a prefill: where the reasoning parser starts"
+    );
 }
 
-/// A continued final message keeps the rule of the thought prefix. Where the
-/// renderer continues the message in place, the prompt ends past the thought
-/// and takes no prefix. Where it cannot (here: the template renders no
-/// message text, so the text never reaches the prompt), it writes a
-/// generation prompt and the message's text behind it, and the prefix stands
-/// between the two. The reasoning parser starts from the rendered prompt
-/// either way: inside the thought behind the opening marker alone. A message
-/// that states its thought (it closes one, or is an earlier answer sent back
-/// whole) takes no prefix: the prompt stands as the renderer fell back to it
-/// and the parser starts where that prompt leaves the completion.
+/// A request that continues its final message takes no thought prefix, a
+/// thought marker in that message or not: the prompt and the reasoning
+/// parser's start are the template's own. The renderer continues the message
+/// in place, or cannot (here: the template renders no message text, so the
+/// text never reaches the prompt) and writes a generation prompt and the
+/// message's text behind it.
 #[test]
-fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
+fn minimax_continued_final_message_takes_no_thought_prefix() {
     const FALLS_BACK: &str = "{% for message in messages %}[{{ message.role }}]{% endfor %}\
          {% if add_generation_prompt %}ai\n{% endif %}";
     const CONTINUES: &str =
@@ -1863,22 +1879,20 @@ fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
         }
         serde_json::from_value(body).expect("chat request")
     };
-    for (tokenizer, thinking, text, prompt, continued, in_thought, name) in [
+    for (tokenizer, thinking, text, prompt, continued, name) in [
         (
             &falls_back,
             Some("enabled"),
             "Sure",
-            "[user]ai\n<mm:think>Sure",
+            "[user]ai\nSure",
             false,
-            true,
             "fell back, enabled",
         ),
         (
             &falls_back,
             Some("disabled"),
             "Sure",
-            "[user]ai\n</mm:think>Sure",
-            false,
+            "[user]ai\nSure",
             false,
             "fell back, disabled",
         ),
@@ -1886,9 +1900,8 @@ fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
             &falls_back,
             Some("enabled"),
             "",
-            "[user]ai\n<mm:think>",
+            "[user]ai\n",
             false,
-            true,
             "fell back on an empty message, enabled",
         ),
         (
@@ -1896,7 +1909,6 @@ fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
             None,
             "Sure",
             "[user]ai\nSure",
-            false,
             false,
             "fell back, no switch",
         ),
@@ -1906,7 +1918,6 @@ fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
             "plan</mm:think>Answer:",
             "[user]ai\nplan</mm:think>Answer:",
             false,
-            false,
             "fell back on a message that closes its thought, enabled",
         ),
         (
@@ -1914,7 +1925,6 @@ fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
             Some("enabled"),
             "<mm:think>plan</mm:think>Answer:",
             "[user]ai\n<mm:think>plan</mm:think>Answer:",
-            false,
             false,
             "fell back on an answer sent back whole, enabled",
         ),
@@ -1924,7 +1934,6 @@ fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
             "Sure",
             "[user]hello[assistant]Sure",
             true,
-            false,
             "continued in place, enabled",
         ),
         (
@@ -1933,7 +1942,6 @@ fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
             "Sure",
             "[user]hello[assistant]Sure",
             true,
-            false,
             "continued in place, disabled",
         ),
     ] {
@@ -1941,39 +1949,35 @@ fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
         let rendered = process_chat_messages(&request, tokenizer.as_ref(), None).expect("render");
         assert_eq!(rendered.text, prompt, "{name}");
         assert_eq!(rendered.continued_final_message, continued, "{name}");
-        assert_eq!(
-            chat_reasoning_starts_in_rendered_prefill(
+        assert!(
+            !chat_reasoning_starts_in_rendered_prefill(
                 &request,
                 rendered.generation_prompt,
                 rendered.continued_final_message,
                 tokenizer.as_ref()
             ),
-            in_thought,
             "{name}: where the reasoning parser starts"
         );
     }
     // The Messages route: a trailing assistant message with text is the
     // continued one.
-    for (thinking, content, prompt, in_thought, name) in [
+    for (thinking, content, prompt, name) in [
         (
             json!({"type": "enabled", "budget_tokens": 1024}),
             json!("Sure"),
-            "[user]ai\n<mm:think>Sure",
-            true,
+            "[user]ai\nSure",
             "enabled",
         ),
         (
             json!({"type": "disabled"}),
             json!("Sure"),
-            "[user]ai\n</mm:think>Sure",
-            false,
+            "[user]ai\nSure",
             "disabled",
         ),
         (
             json!({"type": "enabled", "budget_tokens": 1024}),
             json!([{"type": "text", "text": "plan</mm:think>"}, {"type": "text", "text": "Answer:"}]),
             "[user]ai\nplan</mm:think>Answer:",
-            false,
             "enabled, a message that closes its thought",
         ),
     ] {
@@ -1990,13 +1994,12 @@ fn minimax_thought_prefix_follows_a_continuation_that_fell_back() {
         let (rendered, _) =
             process_messages_with_encoding(&messages, falls_back.as_ref(), None).expect("render");
         assert_eq!(rendered.text, prompt, "the Messages route, {name}");
-        assert_eq!(
-            messages_reasoning_starts_in_prefill(
+        assert!(
+            !messages_reasoning_starts_in_prefill(
                 &messages,
                 rendered.continued_final_message,
                 falls_back.as_ref()
             ),
-            in_thought,
             "the Messages route, {name}: where the reasoning parser starts"
         );
     }

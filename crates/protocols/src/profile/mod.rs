@@ -271,16 +271,30 @@ impl ProviderProfile {
     /// directly after the `</mm:think>` prefix"). Such a template renders one
     /// prompt whatever the request asks, so the gateway writes the prefix
     /// where the tokenizer has the marker. `None` without a preference (the
-    /// template's default, the model decides) and under every other profile.
-    pub fn thinking_prefix(self, thinking: Option<bool>) -> Option<&'static str> {
+    /// template's default, the model decides), under every other profile, and
+    /// for a request whose `kwargs` hold the templates' key with any value but
+    /// the preference's own ([`Self::thinking_from_template_kwargs`]): a
+    /// template that reads the key applies it, and that request keeps the
+    /// prompt it had before the prefix.
+    pub fn thinking_prefix(
+        self,
+        thinking: Option<bool>,
+        kwargs: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Option<&'static str> {
         match self {
-            ProviderProfile::Minimax => thinking.map(|on| {
-                if on {
-                    minimax::THOUGHT_OPEN
-                } else {
-                    minimax::THOUGHT_CLOSE
-                }
-            }),
+            ProviderProfile::Minimax => thinking
+                .filter(|&on| {
+                    kwargs
+                        .and_then(|kwargs| kwargs.get(minimax::THINKING_MODE_KEY))
+                        .is_none_or(|_| self.thinking_from_template_kwargs(kwargs) == Some(on))
+                })
+                .map(|on| {
+                    if on {
+                        minimax::THOUGHT_OPEN
+                    } else {
+                        minimax::THOUGHT_CLOSE
+                    }
+                }),
             _ => None,
         }
     }

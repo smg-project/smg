@@ -1,6 +1,6 @@
 //! Reasoning and tool parser helpers.
 
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
 use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
@@ -10,9 +10,7 @@ use llm_tokenizer::{
 /// protocol crate; it is re-exported here, where the routers read it.
 pub use openai_protocol::worker::TagVocabulary;
 use openai_protocol::{
-    chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, MessageContent},
-    common::ContentPart,
-    messages::{InputContent, InputContentBlock},
+    chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
     model_card::ModelCard,
     profile::ProviderProfile,
     worker::{ConstrainedDecoding, GrammarStart},
@@ -565,8 +563,11 @@ fn resolve_thinking_pref(
 /// the prompt does that. Once the prompt is rendered it is the prompt's
 /// `continued_final_message`, not the request's ask: a template that cannot
 /// continue the message appends its text after the generation prompt, and
-/// the completion then starts wherever that prompt leaves it. `behind` is
-/// that text: the final message's, where the request continues one.
+/// the completion then starts wherever that prompt leaves it.
+/// `takes_no_prefix` names a request the gateway writes its thought prefix
+/// for in no case: one that asks to continue its final message, whatever the
+/// renderer made of it, and a Messages request whose `thinking` block is
+/// `adaptive`, the mode the template alone renders.
 pub fn reasoning_starts_in_prefill(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -574,7 +575,7 @@ pub fn reasoning_starts_in_prefill(
     continues_final_assistant: bool,
     tokenizer: &dyn Tokenizer,
     provider: ProviderProfile,
-    behind: Option<&str>,
+    takes_no_prefix: bool,
 ) -> bool {
     if continues_final_assistant
         && tokenizer
@@ -587,13 +588,15 @@ pub fn reasoning_starts_in_prefill(
     // Behind a thought prefix the gateway wrote for a template without a
     // switch, the completion starts where the prefix leaves it: inside the
     // thought behind the opening marker alone. The render writes the prefix
-    // behind every generation prompt, the one a continuation falls back to
-    // as well (`chat_utils::apply_chat_template_with_thinking_prefix`), and
-    // a prompt without one, or one that continues its final message, never
-    // reaches this line. It writes none ahead of a text that states its
-    // thought itself, and the completion then starts as the template's own
-    // prompt leaves it.
-    if chat_utils::thinking_prefix(provider, thinking, tokenizer, behind).is_some() {
+    // behind the generation prompt of a request that continues no final
+    // message (`chat_utils::apply_chat_template_with_thinking_prefix`): a
+    // prompt without a generation prompt never reaches this line, and a
+    // continued message is read as before, where the template's own prompt
+    // leaves the completion. `chat_utils::thinking_prefix` says why the
+    // gateway writes that prefix and when it writes none.
+    if !takes_no_prefix
+        && chat_utils::thinking_prefix(provider, thinking, tokenizer, kwargs).is_some()
+    {
         return thinking == Some(true);
     }
     should_mark_reasoning_started(thinking, tokenizer)
@@ -654,20 +657,6 @@ pub fn chat_reasoning_starts_in_rendered_prefill_for(
     if !generation_prompt && !continued_final_message {
         return false;
     }
-    // The text of a final message the request continues, its text parts
-    // joined as the render joins them behind a generation prompt.
-    let behind = match request.messages.last() {
-        Some(ChatMessage::Assistant {
-            content: Some(content),
-            ..
-        }) if request.continue_final_message => Some(match content {
-            MessageContent::Text(text) => Cow::Borrowed(text.as_str()),
-            MessageContent::Parts(parts) => {
-                Cow::Owned(parts.iter().filter_map(ContentPart::text).collect())
-            }
-        }),
-        _ => None,
-    };
     reasoning_starts_in_prefill(
         request.chat_template_kwargs.as_ref(),
         request.effective_reasoning_effort(),
@@ -675,7 +664,7 @@ pub fn chat_reasoning_starts_in_rendered_prefill_for(
         continued_final_message,
         tokenizer,
         provider,
-        behind.as_deref(),
+        request.continues_final_assistant(),
     )
 }
 
@@ -711,24 +700,6 @@ pub fn messages_reasoning_starts_in_prefill_for(
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
-    // The text of a final message the request continues, its text blocks
-    // joined as the render joins them.
-    let behind = request
-        .messages
-        .last()
-        .filter(|_| request.continues_final_assistant())
-        .map(|message| match &message.content {
-            InputContent::String(text) => Cow::Borrowed(text.as_str()),
-            InputContent::Blocks(blocks) => Cow::Owned(
-                blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        InputContentBlock::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-        });
     reasoning_starts_in_prefill(
         None,
         request.reasoning_effort(),
@@ -736,7 +707,20 @@ pub fn messages_reasoning_starts_in_prefill_for(
         continued_final_message,
         tokenizer,
         provider,
-        behind.as_deref(),
+        request.continues_final_assistant() || asks_adaptive_thinking(request.thinking.as_ref()),
+    )
+}
+
+/// Whether a Messages request's `thinking` block is `adaptive`: the mode a
+/// template without a thinking switch renders by itself, so the gateway
+/// writes no thought prefix for it and reads the response as before
+/// (`chat_utils::thinking_prefix`).
+pub(crate) fn asks_adaptive_thinking(
+    thinking: Option<&openai_protocol::messages::ThinkingConfig>,
+) -> bool {
+    matches!(
+        thinking,
+        Some(openai_protocol::messages::ThinkingConfig::Adaptive { .. })
     )
 }
 

@@ -44,6 +44,10 @@ pub(crate) struct MessagesPrompt<'a> {
     /// The thinking preference the prompt is rendered with
     /// (`CreateMessageRequest::template_thinking`).
     pub thinking: Option<bool>,
+    /// Whether the `thinking` block is `adaptive`: the mode a template without
+    /// a thinking switch renders by itself, so the render writes no thought
+    /// prefix for it.
+    pub adaptive_thinking: bool,
     /// `output_config.effort` as the provider profile hands it to the
     /// template (`CreateMessageRequest::template_reasoning_effort_for`),
     /// rendered as the `reasoning_effort` kwarg.
@@ -69,6 +73,7 @@ impl<'a> MessagesPrompt<'a> {
             messages: &request.messages,
             system: request.system.as_ref(),
             thinking: request.template_thinking_for(provider),
+            adaptive_thinking: super::parsers::asks_adaptive_thinking(request.thinking.as_ref()),
             reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
             provider,
@@ -89,6 +94,7 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
             messages: &request.messages,
             system: request.system.as_ref(),
             thinking: request.template_thinking_for(provider),
+            adaptive_thinking: super::parsers::asks_adaptive_thinking(request.thinking.as_ref()),
             reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
             provider,
@@ -260,6 +266,7 @@ fn process_messages_prompt(
         transformed_messages,
         params,
         assistant_prefix,
+        continues_final_assistant || request.adaptive_thinking,
     )
     .map_err(|e| PromptError::of_render(&e))?;
 

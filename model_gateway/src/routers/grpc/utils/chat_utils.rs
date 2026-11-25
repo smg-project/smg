@@ -790,59 +790,97 @@ fn resolve_template_thinking(
 }
 
 /// The thought prefix the gateway writes behind the generation prompt for a
-/// thinking preference the template cannot apply: the profile's
-/// ([`ProviderProfile::thinking_prefix`]) where the template has no thinking
-/// switch and the tokenizer has the marker as a token (an earlier model of
-/// the family has no such token and renders as before). A template with a
-/// switch writes its own prefix and gets none. Neither does a prompt whose
-/// text `behind` the prefix (a prefill, a final message the renderer could
-/// not continue in place) holds a thought marker of the profile: that text
-/// states its thought itself, and the prompt renders as it does without the
-/// prefix. The render writes it
+/// thinking preference the template cannot apply. This is the one place that
+/// decides it, apart from the conditions of the render named below: the
+/// render writes what it returns
 /// ([`apply_chat_template_with_thinking_prefix`]) and the reasoning parser
 /// starts from the same answer (`parsers::reasoning_starts_in_prefill`).
+///
+/// # Why the gateway writes it
+///
+/// The prompt is the template's to write, and a template with a thinking
+/// switch applies the request's preference itself. A template without one
+/// cannot, and a model family ships such a template: it states the adaptive
+/// mode whatever the request asks and writes nothing behind its generation
+/// prompt, though its own instructions tell the model that a disabled answer
+/// begins directly behind the closing thought marker. Under it a request for
+/// thinking enabled or disabled renders the prompt of a request with no
+/// preference, and no template argument changes that, because the template
+/// reads none for the mode. Short of replacing the shipped template, the
+/// prefix is the only way the preference reaches the model: the gateway
+/// writes it, and nothing else of the prompt.
+///
+/// # What it writes
+///
+/// The profile's marker ([`ProviderProfile::thinking_prefix`]): the closing
+/// thought marker for thinking disabled, the opening one for thinking
+/// enabled, and nothing where the request states no preference (none at
+/// all, or the `adaptive` mode of a Chat request; the `adaptive` block of a
+/// Messages request reads as thinking on, and the conditions of the render
+/// named below stop it). It is the prefix a template of the family that has
+/// the switch writes itself, at the same place.
+///
+/// # When it writes nothing
+///
+/// Nothing is written, and the prompt stands as the template rendered it,
+/// where:
+///
+/// - the template has a thinking switch ([`Tokenizer::thinking_toggle`]): it
+///   writes its own prefix and is left alone;
+/// - the tokenizer has no token for the marker (an earlier model of the
+///   family has none and renders as before);
+/// - the profile has no such prefix, or the request states no preference;
+/// - the request's `kwargs` hold the profile's template key with any value
+///   but the preference's own (the profile's reading): a template that reads
+///   the key applies it (a checkpoint's template for requests with tools
+///   may, where the default one the tokenizer reports does not), and that
+///   request renders and is read as it was before the prefix;
+/// - the prompt has no generation prompt, the request continues its final
+///   message, or it is a Messages request whose `thinking` block is
+///   `adaptive`, the mode the template alone renders (the render's own
+///   conditions);
+/// - the template wrote the same marker behind its generation prompt itself:
+///   the prompt keeps that one, and the render takes its own copy out of a
+///   prompt encoded from its text (a prompt whose encoding the renderer
+///   deferred keeps both: its ids are made from the prefix as handed over).
+///
+/// A template of the family that gains the switch is detected as one that
+/// has it where it branches on the key in a form the detector knows, and
+/// falls under the first of these: the gateway then writes nothing for it,
+/// with no change here.
 pub(crate) fn thinking_prefix(
     provider: ProviderProfile,
     thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
-    behind: Option<&str>,
+    kwargs: Option<&HashMap<String, Value>>,
 ) -> Option<&'static str> {
-    provider.thinking_prefix(thinking).filter(|marker| {
+    provider.thinking_prefix(thinking, kwargs).filter(|marker| {
         tokenizer.thinking_toggle() == ThinkingToggle::None
             && tokenizer.token_to_id(marker).is_some()
-            && !behind.is_some_and(|text| {
-                [true, false]
-                    .into_iter()
-                    .filter_map(|on| provider.thinking_prefix(Some(on)))
-                    .any(|marker| text.contains(marker))
-            })
     })
 }
 
 /// Apply the chat template and write the thought prefix of a template with
-/// no thinking switch ([`thinking_prefix`]) behind every generation prompt
-/// the render writes, ahead of `assistant_prefix` (the text of a continued
-/// final message the gateway appends there). The chat render and the
+/// no thinking switch ([`thinking_prefix`]) behind the generation prompt of
+/// a request that continues no final message. The chat render and the
 /// Messages render both render through it:
 ///
 /// - a prompt rendered without a generation prompt takes no prefix;
-/// - a final message the renderer continues in place is rendered past its
-///   thought and takes none;
-/// - where the renderer cannot continue that message it writes a generation
-///   prompt and the message's text behind it
-///   (`ChatTemplateOutput::continued_final_message` is false). The prefix
-///   belongs between the two, so the prompt is rendered again the way the
-///   renderer fell back: the conversation without the message, a generation
-///   prompt, the prefix, the message's text;
-/// - a prefill or such a message that holds a thought marker states its
-///   thought itself: the prompt takes no prefix and stands as the renderer
-///   wrote it;
+/// - neither does a Messages request whose `thinking` block is `adaptive`:
+///   the template alone renders the mode it asks (`takes_no_prefix`);
+/// - neither does a request that continues its final message
+///   (`takes_no_prefix` as well), whether the renderer continues the
+///   message in place, falls back to a generation prompt and the message's
+///   text, or the gateway appends that text itself (`assistant_prefix`): its
+///   prompt is rendered as it was before the prefix;
 /// - a template that wrote the same marker behind its generation prompt (a
 ///   checkpoint whose template for requests with tools has the switch its
-///   default one lacks) keeps its one.
+///   default one lacks) keeps its one: the gateway's copy is taken out of a
+///   prompt encoded from its text and stays in one whose encoding the
+///   renderer deferred.
 ///
-/// The reasoning parser reads where the prefix stands from the same two
-/// flags of the rendered prompt and the text of a continued final message
+/// The reasoning parser reads where the prefix stands from the same request
+/// and the flags of the rendered prompt
 /// (`parsers::reasoning_starts_in_prefill`).
 pub(crate) fn apply_chat_template_with_thinking_prefix(
     tokenizer: &dyn Tokenizer,
@@ -850,10 +888,11 @@ pub(crate) fn apply_chat_template_with_thinking_prefix(
     messages: Vec<Value>,
     params: ChatTemplateParams<'_>,
     assistant_prefix: Option<String>,
+    takes_no_prefix: bool,
 ) -> anyhow::Result<ChatTemplateOutput> {
-    let thinking = params.thinking;
-    let Some(marker) = thinking_prefix(provider, thinking, tokenizer, assistant_prefix.as_deref())
-        .filter(|_| params.add_generation_prompt || params.continue_final_message)
+    let Some(marker) =
+        thinking_prefix(provider, params.thinking, tokenizer, params.template_kwargs)
+            .filter(|_| params.add_generation_prompt && !takes_no_prefix)
     else {
         return tokenizer.apply_chat_template_with_encoding_owned(
             messages,
@@ -861,44 +900,13 @@ pub(crate) fn apply_chat_template_with_thinking_prefix(
             assistant_prefix.as_deref(),
         );
     };
-    let mut prefix = marker.to_owned();
-    let mut rendered = if params.continue_final_message {
-        let fallen_back = ChatTemplateParams {
-            add_generation_prompt: true,
-            continue_final_message: false,
-            ..params
-        };
-        let rendered = tokenizer.apply_chat_template_with_encoding(
-            &messages,
-            params,
-            assistant_prefix.as_deref(),
-        )?;
-        let Some((last, head)) = messages
-            .split_last()
-            .filter(|_| rendered.generation_prompt && !rendered.continued_final_message)
-        else {
-            return Ok(rendered);
-        };
-        let mut text = last
-            .get("content")
-            .cloned()
-            .and_then(prefill_text)
-            .unwrap_or_default();
-        text.push_str(assistant_prefix.as_deref().unwrap_or_default());
-        if thinking_prefix(provider, thinking, tokenizer, Some(&text)).is_none() {
-            return Ok(rendered);
-        }
-        prefix.push_str(&text);
-        tokenizer.apply_chat_template_with_encoding(head, fallen_back, Some(&prefix))?
-    } else {
-        prefix.push_str(assistant_prefix.as_deref().unwrap_or_default());
-        tokenizer.apply_chat_template_with_encoding_owned(messages, params, Some(&prefix))?
-    };
+    let mut rendered =
+        tokenizer.apply_chat_template_with_encoding_owned(messages, params, Some(marker))?;
     // The prefix ends the text of a prompt encoded from it; a deferred
     // encoding has taken the prefix as it was handed over.
     let own = rendered
         .text
-        .strip_suffix(prefix.as_str())
+        .strip_suffix(marker)
         .filter(|own| own.ends_with(marker))
         .map(str::len);
     if let Some(at) = own.filter(|_| matches!(rendered.encoding, PromptEncoding::FromText)) {
@@ -1658,6 +1666,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             transformed_messages,
             params,
             assistant_prefix,
+            continues_final_assistant,
         )
         .map_err(|e| PromptError::of_render(&e))?
     };
