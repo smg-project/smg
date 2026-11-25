@@ -66,9 +66,10 @@ use crate::engine::{
 /// shadow's outcome is written into `outcome`, for the caller that counts
 /// it.
 struct WithShadow<'a> {
-    /// The binding's position, and how its shadow profile reads the
-    /// affinity rows of the live decision ([`Engine::shadow_for`]).
-    binding: (u32, ShadowRows),
+    /// The binding's position, how its shadow profile reads the affinity
+    /// rows of the live decision ([`Engine::shadow_for`]), and what the
+    /// request lends that profile alone ([`RequestMaker::shadow_ring`]).
+    binding: (u32, ShadowRows, records::with_shadow::Lends<'a>),
     outcome: &'a mut Shadow,
 }
 
@@ -216,8 +217,10 @@ pub(super) fn decide(
     binding: (u32, ShadowRows),
 ) -> (Decision, Option<Shadowed>) {
     let mut outcome = Shadow::NotDue;
+    let spec = &own.document.spec;
+    let lends = |shadow| maker.shadow_ring(spec, shadow);
     let whole = WithShadow {
-        binding,
+        binding: (binding.0, binding.1, &lends),
         outcome: &mut outcome,
     };
     let decision = single::decide(own, request, members, maker, late, loads, now, whole);

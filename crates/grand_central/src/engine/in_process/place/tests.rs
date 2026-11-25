@@ -2485,6 +2485,134 @@ fn a_shadow_is_lent_the_ring_where_it_places_as_its_live_profile_does() {
     assert_eq!(another_depth, alone, "a shadow of another depth");
 }
 
+/// A shadow profile that places by a ring is lent the request's ring
+/// behind a live profile that reads none, and walks it as it would live:
+/// the live profile takes the idle worker and the shadow the ring's
+/// owner. The lender is asked there for the shadow alone, so by the
+/// shadow's rules: a request that keeps its budget for its answer asks it
+/// nothing, and a lender that panics costs its request nothing.
+#[test]
+fn a_shadow_alone_walks_the_lent_ring() {
+    // The ring preset's binding keeps its routing key: the preset's
+    // profile is its shadow, and the profile of `least_load` decides.
+    let mut document = PolicySpec::preset("consistent_hashing").expect("a built-in preset");
+    let twin = document.profiles.keys().next().cloned();
+    let live = PolicySpec::preset("least_load").expect("a built-in preset");
+    let live = live.profiles.into_values().next();
+    document
+        .profiles
+        .insert("live".into(), live.expect("the preset's profile"));
+    document.bindings[0].profile = Some("live".into());
+    document.bindings[0].shadow = twin.map(ShadowSpec::Profile);
+    document.generation = 1;
+    let engine = hosted(engine_of(&document));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let addresses = list.iter().map(|worker| worker.url().to_owned());
+    let ring = Walked(Lent(addresses.collect()), AtomicU32::new(0));
+    // The key stands at the second address: the ring's owner is the
+    // busy worker, and the live profile takes the idle one.
+    assert_eq!(ring.position("conv-1") % 2, 1, "the key's owner");
+    for _ in 0..8 {
+        list[1].increment_load();
+    }
+    let headers = [("x-smg-routing-key", "conv-1")];
+    // Agreed, another target, another outcome, skipped.
+    let counted = || engine.shadow_kinds(0);
+    let placed = |ring: &dyn LentRing, budget_micros| {
+        let request = PlaceRequest {
+            headers: &headers,
+            ring: Some(ring),
+            budget_micros,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the idle worker");
+        (counted(), engine.faults())
+    };
+    let said = placed(&ring, 0);
+    let walks = ring.1.load(atomic::Ordering::Relaxed);
+    assert_eq!((walks, said), (1, ([0, 1, 0, 0], 0)), "the lent ring");
+    // Under the shadow's floor the lender is asked nothing.
+    assert_eq!(placed(&Unasked, 500), ([0, 1, 0, 1], 0), "a short budget");
+    // A lender that panics is its shadow's fault: counted, and nothing
+    // is compared.
+    assert_eq!(placed(&Unasked, 0), ([0, 1, 0, 1], 1), "a lender's panic");
+    // A request no worker serves is refused ahead of its shadow.
+    let unserved = PlaceRequest {
+        headers: &headers,
+        ring: Some(&Unasked),
+        demands: Demands {
+            vision: true,
+            ..Demands::default()
+        },
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    let refused = |emptied_by| {
+        Some(Unplaced::Shed {
+            reason: ShedReason::NoEndpoints,
+            emptied_by,
+            retry_after_secs: 1,
+        })
+    };
+    assert_eq!(engine.place(&unserved).err(), refused("vision"));
+    assert_eq!((counted(), engine.faults()), ([0, 1, 0, 1], 1), "a refusal");
+    // Over a list of nobody no row stands to be placed: the lender is
+    // asked nothing, and the two refusals are counted as agreed.
+    let nobody = PublishedList::new(pool(0));
+    let empty = PlaceRequest {
+        headers: &headers,
+        ring: Some(&Unasked),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(nobody.lent()))
+    };
+    assert_eq!(engine.place(&empty).err(), refused("none"));
+    assert_eq!((counted(), engine.faults()), ([1, 1, 0, 1], 1), "nobody");
+}
+
+/// The prefix form of the ring as a shadow behind a live profile that
+/// reads none: the shadow is stated the places of its request's heads, by
+/// its own rule, and walks the lent ring. A lender that places no head
+/// lends the shadow no ring: it is asked nothing more, and the shadow
+/// places by its own.
+#[test]
+fn a_prefix_shadow_alone_walks_the_lent_ring() {
+    let mut document = PolicySpec::preset("prefix_hash").expect("a built-in preset");
+    let twin = document.profiles.keys().next().cloned();
+    let live = PolicySpec::preset("least_load").expect("a built-in preset");
+    let live = live.profiles.into_values().next();
+    document
+        .profiles
+        .insert("live".into(), live.expect("the preset's profile"));
+    document.bindings[0].profile = Some("live".into());
+    document.bindings[0].shadow = twin.map(ShadowSpec::Profile);
+    document.generation = 1;
+    let engine = hosted(engine_of(&document));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let addresses = list.iter().map(|worker| worker.url().to_owned());
+    let ring = Walked(Lent(addresses.collect()), AtomicU32::new(0));
+    let ids: Vec<u32> = (0..64).collect();
+    // The shadow's skips and the faults, behind one more request.
+    let placed = |ring: &dyn LentRing| {
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            ring: Some(ring),
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        engine.place(&request).expect("a placement");
+        let [.., skipped] = engine.shadow_kinds(0);
+        (skipped, engine.faults())
+    };
+    assert_eq!(placed(&ring), (0, 0), "the shadow ran");
+    assert_eq!(ring.1.load(atomic::Ordering::Relaxed), 1, "the lent ring");
+    // A lender that places no head panics where it is asked for a key's
+    // place or walked: the shadow ran, and no fault is counted.
+    assert_eq!(placed(&Headless), (0, 0), "a lender of no head");
+}
+
 /// A ring no decision may ask.
 #[derive(Debug)]
 struct Unasked;

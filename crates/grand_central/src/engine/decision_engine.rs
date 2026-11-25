@@ -51,6 +51,7 @@ use super::{
 };
 use crate::{
     document::AppliedSpec,
+    policies::consistent_hashing::LentRing,
     store::GatewayId,
     tracking::lease::{Lease, Said, Side},
 };
@@ -75,6 +76,28 @@ pub trait RequestMaker {
     /// maker that waits holds up the seat's other requests, and one that
     /// asks the engine again can wait on the seat it holds.
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w>;
+
+    /// The ring the request lends its binding's shadow profile and where
+    /// the request stands on it, by the word of that profile alone: the
+    /// profile `shadow` of the document. `None` from a maker that does not
+    /// say, where the request is lent no ring and where it has no place
+    /// on it: the shadow profile then reads the request as
+    /// [`RequestMaker::make`] made it.
+    ///
+    /// An engine that runs a shadow asks this inside the shadow's own
+    /// run, behind the live decision of that ask, and only where the
+    /// shadow profile reads a ring, the profile that decides the request
+    /// reads none and a worker stands to be placed. A panic here is the
+    /// shadow's fault, and the time it takes is the shadow's: spent, like
+    /// the rest of a shadow's run, ahead of a later ask of the same call.
+    fn shadow_ring<'w>(
+        &'w self,
+        spec: &'w AppliedSpec,
+        shadow: u16,
+    ) -> Option<(&'w dyn LentRing, &'w [u64])> {
+        let _ = (spec, shadow);
+        None
+    }
 
     /// What the request states where it is plain ([`Plain`]): `None` for
     /// every other request, and from a maker that does not say.
