@@ -45,10 +45,15 @@
 //! would be picked by the pair's routing value, so none is. Where the
 //! decode's side is not the ring's, the decision is held to
 //! the prefill's place and the decode is its own profile's pick. A pair
-//! whose decode side alone is the ring's is read for no target: its
-//! prefill is its profile's pick, known inside the decision alone. A pair
 //! with no prefill to count leaves its hold with its routing value, which
 //! keeps no prefill of a pair over a veto.
+//!
+//! Where the decode's side alone is the ring's ([`decode_alone`]), the
+//! prefill is its profile's pick, known inside a decision alone. The call
+//! then lends the places of the decodes that can be sent to, and each of
+//! its decisions counts the decode's number among the partners there of
+//! the prefill it picks ([`Constraints::target_worker`]), and books that
+//! decode with its prefill.
 //!
 //! **A controller's served decision** counts a single request's number by
 //! the same function ([`reached`]), over the list its worker objects lend
@@ -59,28 +64,27 @@
 //! asked there.
 //!
 //! [`Constraints::places`]: crate::engine::view::Constraints::places
+//! [`Constraints::target_worker`]: crate::engine::view::Constraints::target_worker
 //! [`KeySourceSpec::target`]: crate::document::spec::KeySourceSpec::target
 
 use std::{iter, sync::Arc};
 
 use smg_worker::identity::basic::Worker;
 
-use super::{admitted, Call, PlaceRequest, Unplaced, ASKS};
+use super::{admitted, hold_to_rule, Call, PlaceRequest, Unplaced, ASKS};
 #[cfg(feature = "controller")]
 use crate::engine::decision::{Decision, Shed};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision::ShedReason, in_process::Loaded, list_cell::LentList, view::Role, PairLists,
-        WorkerLists,
+        decision::{ShedReason, TARGET_WORKER},
+        in_process::Loaded,
+        list_cell::LentList,
+        view::Role,
+        PairLists, WorkerLists,
     },
     tracking::Placement,
 };
-
-/// What a request that names its worker is shed under where that worker
-/// cannot take it: by the one call in a host's own process, and by a
-/// controller's served decision.
-pub(crate) const TARGET_WORKER: &str = "target-worker";
 
 /// The shed of a request whose named worker cannot take it: the request
 /// has no worker, and moves to no other.
@@ -297,9 +301,11 @@ fn taking(
 /// One call for a pair over `lists`, under a document one of whose
 /// bindings names a target source. A pair that names no worker is placed
 /// as under any other document ([`super::pair::place`]): its binding has no such
-/// source, it carries no text under the header, or its prefill side is no
-/// plain hash ring's
+/// source, it carries no text under the header, or neither of its sides
+/// is a plain hash ring's
 /// ([`Engine::names_worker_on`](crate::engine::framework::Engine::names_worker_on)).
+/// One whose decode side alone is such a ring's has its decode counted
+/// inside each decision ([`decode_alone`]).
 ///
 /// One that names a worker has its two lists read once: each worker by its
 /// own test of being available, and the route's rule asked of each that
@@ -376,8 +382,9 @@ pub(super) fn pair<'a>(
     let spec = &engine.document.spec;
     // The sides are looked up for a request that names a worker alone.
     let sides = |named| (named, spec.engine().names_worker_on(request.model));
-    let Some((named, [true, decode_named])) = number(spec, request).map(sides) else {
-        return super::pair::place(engine, request, lists, &mut call);
+    let (named, [prefill_named, decode_named]) = match number(spec, request).map(sides) {
+        Some((named, held @ ([true, _] | [false, true]))) => (named, held),
+        _ => return super::pair::place(engine, request, lists, &mut call),
     };
     // The places of each side whose worker meets what its role is held to
     // of the request's hard demands, among the places its host states,
@@ -414,6 +421,10 @@ pub(super) fn pair<'a>(
     // A place a hold of the host stands on is a place of the mask.
     let prefill_places = (stated[0], lists.prefill_stalled);
     let decode_places = (stated[1], lists.decode_stalled);
+    if !prefill_named {
+        let counted = [prefill_places, decode_places];
+        return decode_alone(engine, request, lists, counted, named, call);
+    }
     let available = |worker: &dyn Worker| worker.is_available();
     let mut decodes = taking(request, lists.decode, decode_places, available);
     let lifted = decodes.is_empty() && spec.engine().steers_all_vetoed(request.model);
@@ -486,4 +497,105 @@ pub(super) fn pair<'a>(
     held(super::pair::asks(
         engine, request, &held_to, &lent, &mut call,
     ))
+}
+
+/// The call of a pair that names its worker where the decode's side alone
+/// reads the header: the prefill is the pick of its own profile, known
+/// inside a decision alone, so no place stated ahead says the decode. The
+/// decodes are read once here, as [`pair`] reads them, among the places it
+/// counts on the decode's side (`counted`, the prefill's side and then the
+/// decode's: the places whose worker meets what its role is held to of the
+/// request's hard demands, and the mask of its host), and their places are
+/// lent beside the lists. Each decision of the call is stated the number
+/// ([`Call::named_decode`]) and counts it among those places, over the
+/// partners of the prefill it picks: its first partners where the pair is
+/// made among those. The call asks again as any pair's does
+/// ([`super::pair::asks`]), and each of its asks is lent the same places.
+/// Each decision books the decode with its prefill under every document:
+/// a decode asked again behind the prefill would count no number.
+/// So a rule the request states is asked of both lists here, of the
+/// decodes and the prefills as they are counted and of the prefills ready
+/// or not ([`hold_to_rule`]), and of no list behind that: a decode the
+/// rule refuses as a pick is counted by the call's next ask as it was by
+/// its first.
+///
+/// Where no prefill opens the pair, the header is not read, and the pair
+/// is placed as one that names no worker. A prefill opens it where it is
+/// read as [`pair`] reads its prefills (the same places, mask, test and
+/// rule) and a decode counted here partners it. So no decode that can be
+/// sent to opens none: the binding's rule for decodes that are all over
+/// their thresholds then takes the decode by load. And a decision's
+/// default for a prefill pool its vetoes refuse pairs by load over the
+/// decodes at its places: the lent places would hide the others from it.
+/// A prefill over its thresholds alone opens the pair too where its
+/// profile places among such prefills ([`Engine::lifts_prefills`]). A
+/// decision still reaches that default under a number where the fleet
+/// changes between this read and its own: it then pairs among the lent
+/// decodes.
+///
+/// The gateway's own pair selection counts the open partners of its
+/// prefill policy's pick so
+/// (`model_gateway/src/routers/common/placement.rs:2884-2887`,
+/// `:2914-2920`), reads no header for a decode pool all over its
+/// thresholds (`:2909-2912`), and none where no prefill is open: it
+/// answers there as for a pair that names no worker, and pairs by load a
+/// pool whose every worker is vetoed (`:2729-2747`, `:2772-2798`). It
+/// counts a prefill over its thresholds as open under a policy that
+/// weighs load itself, its shedding off (`:2672-2680`). The lines are
+/// main `4b41f39a7`'s.
+///
+/// # Errors
+///
+/// The pair's shed with no endpoint, under [`TARGET_WORKER`]: the
+/// decision's own, where the number reaches no partner of its pick or the
+/// decode it reaches is shed, and the call's, where no pair its asks named
+/// could be sent to. The shed of a request whose rule takes no prefill,
+/// under `admits`. Any other answer of [`super::pair::place`] stands as it
+/// is.
+///
+/// [`Engine::lifts_prefills`]: crate::engine::framework::Engine::lifts_prefills
+#[inline(never)]
+fn decode_alone<'a>(
+    engine: Loaded<'static, '_>,
+    request: &PlaceRequest<'a>,
+    lists: &PairLists<'_>,
+    [prefill_counted, decode_counted]: [(Option<&[u32]>, &[u32]); 2],
+    named: Option<u32>,
+    mut call: Call,
+) -> Result<Placement<'a>, Unplaced> {
+    let available = |worker: &dyn Worker| worker.is_available();
+    let decodes = taking(request, lists.decode, decode_counted, available);
+    let opens = |state: &dyn Fn(&dyn Worker) -> bool| {
+        let pairs = |prefill: usize, &decode: &u32| lists.classes.pairs(prefill, decode as usize);
+        let prefills = taking(request, lists.prefill, prefill_counted, state);
+        let mut prefills = prefills.iter().map(|&prefill| prefill as usize);
+        prefills.any(|prefill| decodes.iter().any(|decode| pairs(prefill, decode)))
+    };
+    let lifted = |worker: &dyn Worker| worker.routing_state().eligible_ignoring_overload();
+    let lifts = || engine.document.spec.engine().lifts_prefills(request.model);
+    if !(opens(&available) || (lifts() && opens(&lifted))) {
+        return super::pair::place(engine, request, lists, &mut call);
+    }
+    // The rule's prefills, found ahead of the first ask: the asks behind
+    // it find no places again, and two asks are the call's.
+    let mut prefills = None;
+    let stated = lists.prefill_places;
+    hold_to_rule(request, Some(lists.prefill), stated, &mut prefills)?;
+    if prefills.is_some() {
+        call.spent = 1;
+    }
+    // A text that is no number reaches no decode, where a decision counts.
+    call.named_decode = Some(named.unwrap_or(u32::MAX));
+    let held_to = PairLists {
+        prefill_places: prefills.as_deref().or(stated),
+        decode_places: Some(&decodes),
+        ..*lists
+    };
+    let lent = WorkerLists::Pair(held_to);
+    let placed = super::pair::asks(engine, request, &held_to, &lent, &mut call);
+    // Each pair the asks named held the one decode.
+    placed.map_err(|unplaced| match unplaced {
+        Unplaced::NoWorkers => MISSED,
+        other => other,
+    })
 }

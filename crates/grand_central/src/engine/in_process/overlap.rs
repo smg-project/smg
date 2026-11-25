@@ -15,7 +15,9 @@
 //! the request ([`Overlap`]): the worker's entry of the rows the decision was
 //! given, whoever named them. No stage is asked for it. It is stated where
 //! the request's own profile reads affinity: rows named for a binding's
-//! shadow alone state nothing of the live pick.
+//! shadow alone state nothing of the live pick. A pair's first decision
+//! states the same of its prefill, the first target's worker, from the
+//! prefills' column, and nothing of its decode (`state`).
 //!
 //! A request whose host names its entry in a token tree ([`TokenKey`]) is
 //! decided another way where the host lends the tree of the request's place
@@ -40,19 +42,21 @@
 //!   it again at most once a second, behind one atomic flag, and swaps it in
 //!   by pointer. A decision loads the pointer and writes no shared word.
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
-//!   workers the index does not speak for ([`PrefixPredictor`]), behind one
-//!   reader-writer lock. A naming takes it as a reader, and only where the
-//!   list holds such a worker. A pick writes behind the blocks its naming
-//!   found its worker to hold, sixteen blocks a turn, each turn by a try: a
-//!   turn that meets a held lock ends the write there, so a pick waits for
-//!   nobody. Its thread keeps the rest, reads it at its own namings and
-//!   writes it on behind its next picks. The map of the records is behind a
-//!   mutex that only the read of a list's table, a change of membership and
-//!   the timer's sweep take.
+//!   workers the index does not speak for, and to every worker by a request
+//!   hashed by its text ([`PrefixPredictor`]), behind one reader-writer
+//!   lock. A naming takes it as a reader, and only where the record speaks
+//!   for a worker of the list on its request. A pick writes behind the
+//!   blocks its naming found its worker to hold, sixteen blocks a turn, each
+//!   turn by a try: a turn that meets a held lock ends the write there, so a
+//!   pick waits for nobody. Its thread keeps the rest, reads it at its own
+//!   namings and writes it on behind its next picks. The map of the records
+//!   is behind a mutex that only the read of a list's table, a change of
+//!   membership and the timer's sweep take.
 //! - **Once a thread**: the buffers a naming writes into, and the writes
 //!   of a record that met a held lock, eight at most. A decision allocates
 //!   nothing once they have grown, but what a tree's own match and write
-//!   allocate.
+//!   allocate, and the list of a prompt that is hashed on a road that reads
+//!   it.
 //!
 //! No decision holds a lock across its stages: the naming ends before the
 //! decision runs, and the record is written after it answered. A decision
@@ -87,6 +91,7 @@ use crate::{
         decision::{Decision, Overlap, Target},
         decision_engine::{TextKey, TokenKey},
         lease_events,
+        prompt_hashes::PromptHashes,
         view::{
             blocks_within, fingerprint, AffinityFacts, AffinityHolder, AffinityRows, Feed,
             HashKind, Phase, RequestFacts, WorkerId,
@@ -363,7 +368,7 @@ pub trait CacheIndexes: Send + Sync {
     /// an index of cache events speaks of token blocks, and says nothing of
     /// a request of text. `None`, the default, where the host keeps none:
     /// the request is named its rows from the record of hashed windows of
-    /// its text.
+    /// its text, which speaks for every worker of its list.
     fn string_tree(&self, model: &str, phase: Phase) -> Option<Arc<StringTree>> {
         let _ = (model, phase);
         None
@@ -583,7 +588,8 @@ impl Affinity {
 }
 
 /// One model's record of the prefixes sent to its workers the index does
-/// not speak for, shared by every deciding thread.
+/// not speak for, and to every worker by a request hashed by its text
+/// ([`Table::recorded`]), shared by every deciding thread.
 struct PrefixRecord {
     predictor: RwLock<PrefixPredictor>,
     /// The record's bound as the last table set it: a table's read takes
@@ -869,11 +875,13 @@ struct Table {
     /// none: the bits a request held to places is kept within
     /// ([`Self::mask`]).
     numbers: Box<[u32]>,
-    /// A bit a row: the index speaks for the row. It holds a number in the
-    /// index and a block or more there. The record of sent prefixes speaks
-    /// for every other row.
+    /// A bit a row: the index speaks for the row on a request hashed by
+    /// token blocks. The row holds a number in the index and a block or more
+    /// there. The record of sent prefixes speaks for every other row, and
+    /// for every row on a request hashed by its text ([`Self::recorded`]).
     heard: Box<[u64]>,
-    /// Whether the index speaks for any row, and whether the record does.
+    /// Whether the index speaks for any row, and whether the record does on
+    /// a request hashed by token blocks.
     heard_any: bool,
     unheard_any: bool,
     /// The model's record of sent prefixes, where the profile reads one.
@@ -1097,17 +1105,30 @@ impl Table {
         self.phase == phase && *self.model == *model
     }
 
-    /// Whether the index speaks for `row`.
-    fn heard(&self, row: u32) -> bool {
-        is_set(&self.heard, row as usize)
+    /// Whom the record of sent prefixes speaks for on a request hashed by
+    /// `kind`: the one rule every read and every write of the record asks.
+    /// `row` asks it of one worker of the list, and `None` asks whether the
+    /// record speaks for any.
+    ///
+    /// An index of cache events speaks of token blocks. On a request hashed
+    /// by token blocks it speaks for each worker it holds a block for, and
+    /// the record for the others. A request hashed by windows of its text
+    /// asks no index, so the record speaks for every worker of the list: a
+    /// worker the index holds a block for is read and written as any other.
+    fn recorded(&self, kind: HashKind, row: Option<u32>) -> bool {
+        match (kind, row) {
+            (HashKind::Text, _) => true,
+            (HashKind::Token, Some(row)) => !is_set(&self.heard, row as usize),
+            (HashKind::Token, None) => self.unheard_any,
+        }
     }
 
     /// The row of the worker `id` where the record of sent prefixes speaks
-    /// for it: a worker of the list the index does not speak for.
-    fn spoken_row(&self, id: WorkerId) -> Option<u32> {
+    /// for it on a request hashed by `kind` ([`Self::recorded`]).
+    fn spoken_row(&self, id: WorkerId, kind: HashKind) -> Option<u32> {
         let at = self.by_id.binary_search_by_key(&id, |&(id, _)| id).ok()?;
         let row = self.by_id[at].1;
-        (!self.heard(row)).then_some(row)
+        self.recorded(kind, Some(row)).then_some(row)
     }
 
     /// Calls `each` with the row of every worker of the list at `address`,
@@ -1205,7 +1226,9 @@ impl Table {
     /// the others: after the index's, in the room they leave, or ahead of
     /// them where no prefix stage of the profile reads cache events. So no
     /// row is named twice. The index is asked for a request hashed by token
-    /// blocks alone, the record for a request of either kind.
+    /// blocks alone, the record for a request of either kind: a request
+    /// hashed by its text is named its holders by the record among every
+    /// row ([`Self::recorded`]).
     ///
     /// The warming rows are the table's whose naming has not ended at the
     /// request's instant: whole within the cap, a draw of the cap past it.
@@ -1244,7 +1267,7 @@ impl Table {
         let record = self
             .record
             .as_deref()
-            .filter(|_| hashed && self.unheard_any);
+            .filter(|_| hashed && self.recorded(facts.hash_kind, None));
         let mut read = None;
         if self.ahead {
             read = record.map(|record| {
@@ -1304,7 +1327,7 @@ impl Table {
     ) -> (u32, RecordRead) {
         PrefixPredictor::fold_into(keys, facts.namespace_seed, facts.block_hashes);
         let tick = tick_of(facts.now_micros);
-        let usable = |id: WorkerId| self.spoken_row(id).is_some();
+        let usable = |id: WorkerId| self.spoken_row(id, facts.hash_kind).is_some();
         let predictor = record.predictor.read();
         let found = predictor.deepest_among(keys, &usable);
         deepest.clear();
@@ -1336,7 +1359,7 @@ impl Table {
         for write in &waiting.writes {
             // A leave told since stops the write, so it names nobody.
             let stands = std::ptr::eq(&*write.record, record) && write.left == read.left;
-            if !stands || self.spoken_row(write.target).is_none() {
+            if !stands || self.spoken_row(write.target, facts.hash_kind).is_none() {
                 continue;
             }
             let blocks = shared(&write.keys, keys) as u32;
@@ -1392,7 +1415,8 @@ impl Table {
         }
         let mut seen = 0usize;
         for &id in deepest.iter() {
-            let Some(row) = self.spoken_row(id).filter(|&row| among(places, row)) else {
+            let spoken = self.spoken_row(id, facts.hash_kind);
+            let Some(row) = spoken.filter(|&row| among(places, row)) else {
                 continue;
             };
             let holder = AffinityHolder {
@@ -1468,7 +1492,9 @@ impl Table {
     /// that such a worker was sent. A column has an entry a row, so nothing
     /// is capped and nothing drawn. As for the rows a decision is named,
     /// the index is asked for a request hashed by token blocks alone and
-    /// the record for a request of either kind.
+    /// the record for a request of either kind: for the rows the index does
+    /// not speak for, and for every row where the request is hashed by its
+    /// text ([`Self::recorded`]).
     ///
     /// Returns what was read of the record, where it was read: the pick's
     /// write stands on it.
@@ -1516,7 +1542,8 @@ impl Table {
             }
         }
         // The record is read where it speaks for a row of the list.
-        let record = self.record.as_deref().filter(|_| self.unheard_any)?;
+        let speaks = self.recorded(facts.hash_kind, None);
+        let record = self.record.as_deref().filter(|_| speaks)?;
         let (blocks, found) = self.read_written(record, facts, (keys, deepest), waiting);
         let mut read = PrefixRead {
             read: found,
@@ -1524,7 +1551,7 @@ impl Table {
         };
         let mut named = 0usize;
         for &id in deepest.iter() {
-            let Some(row) = self.spoken_row(id) else {
+            let Some(row) = self.spoken_row(id, facts.hash_kind) else {
                 continue;
             };
             if let Some(entry) = column.get_mut(row as usize) {
@@ -1807,7 +1834,10 @@ struct Asked<'a> {
 /// what `decide` answers. Where that is a pick and the record of sent
 /// prefixes speaks for the target the request goes to, the first one its
 /// caller sends to (`sends_to`), the request's prefix is written for it:
-/// the record says where a prefix was sent.
+/// the record says where a prefix was sent. The record speaks for a worker
+/// the index holds no block for, and for every worker of the list where
+/// the request is hashed by its text: an index of cache events speaks of
+/// token blocks.
 ///
 /// `workers` is the list the decision is made over and `pool` what the
 /// engine keeps beside that list. `ids` holds the workers' ids by their
@@ -1886,6 +1916,40 @@ pub fn decide<'p>(
     token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
     text_key: impl FnOnce() -> Option<TextKey<'p>>,
     sends_to: impl Fn(&Target) -> bool,
+    decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
+) -> Decision {
+    let hashed = || None;
+    decide_hashed(
+        affinity, pool, spec, workers, ids, facts, places, token_key, text_key, sends_to, hashed,
+        decide,
+    )
+}
+
+/// [`decide`] for a request whose making may have left its prompt's block
+/// hashes out of `facts`. `hashed` answers the whole list where it did
+/// ([`Made::hashed_whole`]) and `None` where the facts hold it. It is asked
+/// on the roads that read the list, by an index of cache events and by the
+/// record of sent prefixes, once, and those roads decide by a copy of the
+/// facts that holds it. A request decided inside a lent tree's match reads
+/// none of the list, and asks nothing.
+///
+/// [`Made::hashed_whole`]: super::place::Made::hashed_whole
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what `decide` takes, and the prompt's hashes where the request's making left them out"
+)]
+pub(super) fn decide_hashed<'p, 'h>(
+    affinity: &Affinity,
+    pool: &PoolAffinity,
+    spec: &AppliedSpec,
+    workers: &[Arc<dyn Worker>],
+    ids: &[WorkerId],
+    facts: &mut RequestFacts<'_>,
+    places: Option<&[u32]>,
+    token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
+    text_key: impl FnOnce() -> Option<TextKey<'p>>,
+    sends_to: impl Fn(&Target) -> bool,
+    hashed: impl FnOnce() -> Option<&'h PromptHashes>,
     mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
 ) -> Decision {
     // No binding of the phase reads affinity: one test, and no table.
@@ -1922,7 +1986,9 @@ pub fn decide<'p>(
     with_buffers(|buffers| {
         pool.with_table(&asked, |table| {
             let keys = (token_key, text_key);
-            table.decide(workers, facts, places, buffers, keys, sends_to, decide)
+            table.decide(
+                workers, facts, places, buffers, keys, sends_to, hashed, decide,
+            )
         })
     })
 }
@@ -1933,9 +1999,9 @@ pub fn decide<'p>(
 /// one that left, and its prompt is stored for no target.
 #[expect(
     clippy::too_many_arguments,
-    reason = "what `decide` takes but a request's places, the count of leaves read ahead of the answer, and the answer"
+    reason = "what `decide_hashed` takes but a request's places, the count of leaves read ahead of the answer, and the answer"
 )]
-pub(super) fn decide_behind<'p>(
+pub(super) fn decide_behind<'p, 'h>(
     affinity: &Affinity,
     pool: &PoolAffinity,
     spec: &AppliedSpec,
@@ -1945,10 +2011,11 @@ pub(super) fn decide_behind<'p>(
     token_key: impl FnOnce(usize) -> Option<TokenKey<'p>>,
     text_key: impl FnOnce() -> Option<TextKey<'p>>,
     sends_to: impl Fn(&Target) -> bool,
+    hashed: impl FnOnce() -> Option<&'h PromptHashes>,
     leaves: u64,
     made: Decision,
 ) -> Decision {
-    decide(
+    decide_hashed(
         affinity,
         pool,
         spec,
@@ -1962,6 +2029,7 @@ pub(super) fn decide_behind<'p>(
         token_key,
         text_key,
         |target| affinity.leaves() == leaves && sends_to(target),
+        hashed,
         |_| made,
     )
 }
@@ -1973,8 +2041,9 @@ pub(super) fn decide_behind<'p>(
 /// the list's order: the worker's age, what the model's index holds for it
 /// and what that gained since its admission, and what the worker holds of
 /// the request, by the index where the index speaks for the worker and by
-/// the record of sent prefixes where it does not. The caller hands the
-/// column to the side it was filled for and to no other.
+/// the record of sent prefixes where it does not: for every worker where
+/// the request is hashed by its text. The caller hands the column to the
+/// side it was filled for and to no other.
 ///
 /// The parameters are [`decide`]'s, and `phase` is the phase the list is
 /// decided at, which a pair's request does not carry for both its lists.
@@ -2017,9 +2086,10 @@ pub fn column(
 /// States in a decision's pick what its first target holds of the request
 /// ([`Overlap`]): that worker's entry of `feed`, the rows the decision was
 /// given. They are the rows named or the column filled here, a column the
-/// request's host filled, or the rows that host named
-/// ([`RequestFacts::feed`]): whoever named them, the entry is read the same
-/// way, and no stage is asked. A worker the rows do not name holds nothing,
+/// request's host filled, the rows that host named
+/// ([`RequestFacts::feed`]), or the prefills' column of a pair's first
+/// decision: whoever named them, the entry is read the same way, and no
+/// stage is asked. A worker the rows do not name holds nothing,
 /// as it did to the stages: the pick then states a miss of the request's
 /// blocks. `facts` are the request's own, which say its size, and `block`
 /// is the document's block size, by which the request is counted where its
@@ -2029,13 +2099,17 @@ pub fn column(
 /// over: a decision that reads no fact, as a pin's answer handed through
 /// here, then makes no copy of them for this statement.
 ///
+/// A pair's first target is its prefill, with its decode beside it: handed
+/// the prefills' column, a pair's pick states what its prefill holds. A
+/// pick has room for one statement, so nothing is stated of the decode.
+///
 /// Nothing is stated where the decision picked nobody, and for a pick the
 /// binding's sessions rule placed alone and keeps from the profile
 /// ([`told_target`]): such a request is none of the profile's, as a
 /// gateway's sticky map hands a request it places to no policy. The one
 /// place a pick's overlap is stated. Its callers ask it where the
 /// request's own profile reads affinity, and not for a shadow's rows.
-fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFacts<'_>, block: u32) {
+pub(super) fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFacts<'_>, block: u32) {
     let Some(row) = told_target(decision).map(|target| target.position) else {
         return;
     };
@@ -2077,7 +2151,9 @@ pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
 /// `pool`, `phase` and `facts` are the ones the column was filled with, and
 /// `read` is what that fill returned. A worker the index speaks for, a
 /// worker that is not of the list, and a list whose table was since read
-/// for another place write nothing.
+/// for another place write nothing. The index speaks for no worker on a
+/// request hashed by its text: such a request is written for any worker of
+/// the list.
 ///
 /// Whether the picked worker was sent the request's deepest block is read
 /// here from the rows `read` kept, the first eight of them: a holder past
@@ -2111,7 +2187,8 @@ pub(super) fn record_by_column(
     let Some(table) = table.filter(|table| table.is_of(facts.model, phase)) else {
         return;
     };
-    let (Some(record), Some(row)) = (table.record.as_ref(), table.spoken_row(id)) else {
+    let spoken = table.spoken_row(id, facts.hash_kind);
+    let (Some(record), Some(row)) = (table.record.as_ref(), spoken) else {
         return;
     };
     let held = match column.and_then(|column| column.get(row as usize)) {
@@ -2212,9 +2289,9 @@ impl Table {
     /// a request hashed by its text in the string tree.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the list, the request's facts and its places, the buffers, its entry in each tree and the target its caller takes, and the decision"
+        reason = "the list, the request's facts and its places, the buffers, its entry in each tree and the target its caller takes, its hashes where its making left them out, and the decision"
     )]
-    fn decide<'p>(
+    fn decide<'p, 'h>(
         &self,
         workers: &[Arc<dyn Worker>],
         facts: &mut RequestFacts<'_>,
@@ -2225,12 +2302,16 @@ impl Table {
             impl FnOnce() -> Option<TextKey<'p>>,
         ),
         sends_to: impl Fn(&Target) -> bool,
+        hashed: impl FnOnce() -> Option<&'h PromptHashes>,
         mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         if !self.reads {
             return decide(facts);
         }
         if self.cap == 0 {
+            // The fill reads the prompt's hashes: the list is asked for.
+            let whole = hashed().map(|hashes| hashes.over(facts));
+            let facts = whole.as_ref().unwrap_or(facts);
             return self.decide_by_column(facts, buffers, sends_to, decide);
         }
         // The entry is asked for where the host lends the place a tree,
@@ -2269,6 +2350,9 @@ impl Table {
             };
             return self.decide_in_tree(walk, sends_to, workers, facts, places, buffers, decide);
         }
+        // The naming reads the prompt's hashes: the list is asked for.
+        let whole = hashed().map(|hashes| hashes.over(facts));
+        let facts = whole.as_ref().unwrap_or(facts);
         let read = self.name(facts, places, buffers);
         let named = self.named_rows(buffers);
         let mut decision = decide(&mut RequestFacts {
@@ -2279,10 +2363,12 @@ impl Table {
         let (Some(read), Some(record)) = (read, self.record.as_ref()) else {
             return decision;
         };
-        // The index speaks for a worker whose cache events are heard: the
-        // record takes no entry for it.
+        // The record takes an entry for the worker it speaks for on this
+        // request: on one hashed by token blocks, not for a worker the index
+        // holds a block for.
+        let kind = facts.hash_kind;
         let sent = sent_target(&decision, sends_to);
-        let Some(target) = sent.filter(|to| !self.heard(to.position)) else {
+        let Some(target) = sent.filter(|to| self.recorded(kind, Some(to.position))) else {
             return decision;
         };
         let held = buffers.deepest.contains(&target.id);
@@ -2422,8 +2508,9 @@ impl Table {
         let (Some(read), Some(record)) = (read, self.record.as_ref()) else {
             return decision;
         };
+        let kind = facts.hash_kind;
         let sent = sent_target(&decision, sends_to);
-        let Some(target) = sent.filter(|to| !self.heard(to.position)) else {
+        let Some(target) = sent.filter(|to| self.recorded(kind, Some(to.position))) else {
             return decision;
         };
         let sent = buffers.column.get(target.position as usize);

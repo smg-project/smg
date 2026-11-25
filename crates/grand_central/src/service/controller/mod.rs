@@ -6,7 +6,7 @@
 //! controller's deciding threads, and, on the leader, the control scope's
 //! registration calls and the gateway scope's watch of the worker rows, and
 //! the run loop sweeps the gateways that are gone; the scopes' other call
-//! bodies arrive with the gateway, ingestion and control scope PRs. In the
+//! bodies arrive with the gateway and control scope PRs. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
@@ -489,6 +489,13 @@ impl Controller {
             config.decide_shards,
         )
         .map_err(Error::DecisionThreads)?;
+        // Under a lease another replica can take, the document door reads
+        // this replica's fence from here, with a spec source or with none:
+        // its source writes while the replica leads, and its hook settles
+        // a worker's status under the replica's own lead.
+        if config.election.lease.is_shared() {
+            shared.generations.under(Arc::clone(&shared.fence));
+        }
         shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
@@ -663,11 +670,8 @@ impl Controller {
         // runs its leader's generations: its own file is passed here and
         // applied under its first lead, and its source writes while the
         // replica leads under the term its bytes were read under, by the
-        // fence.
+        // fence the bind put the door under.
         let deferred = self.config.election.lease.is_shared();
-        if deferred {
-            generations.under(Arc::clone(&self.shared.fence));
-        }
         let read = {
             let path = path.clone();
             tokio::task::spawn_blocking(move || {
@@ -787,9 +791,9 @@ impl Controller {
     /// replica leads ([`Self::readiness`]). No call asks the term itself:
     /// the holder's doc says what a write on a replica that follows comes
     /// to ("A host's write calls"). A row written through the entries of
-    /// [`Self::store`] itself has no worker object until the holder next
-    /// reads the store, at its next call that writes a row or its next
-    /// first copy.
+    /// [`Self::store`] itself has no worker object, and no first copy holds
+    /// it, until its host has the holder follow the store
+    /// ([`Objects::follow`]) or a registration under its key is refused.
     pub fn workers(&self) -> Arc<Objects<Members>> {
         self.workers.holder()
     }
@@ -2334,6 +2338,25 @@ mod tests {
         assert_eq!(replica.follows().ok(), port);
         // Synced reads the configured poll interval, not the stock one.
         assert_eq!(replica.shared.lag.within(), Duration::from_secs(30));
+    }
+
+    /// The bind puts the document door under the replica's fence wherever
+    /// another replica can take the lease, with no spec source too. Until
+    /// that replica leads its door reads no lead, so the door's hook
+    /// settles no worker's status into the table of a replica that
+    /// follows. A replica alone over its lease writes always.
+    #[tokio::test]
+    async fn the_bind_puts_the_door_under_the_fence_of_a_shared_lease() {
+        let alone = Controller::bind(valid()).await.expect("the listeners bind");
+        assert!(alone.shared.generations.source_writes());
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut config = valid();
+        config.election.lease = election::LeasePlace::File(dir.path().join("lease"));
+        let replica = Controller::bind(config).await.expect("the listeners bind");
+        let fence = replica.elector.fence();
+        assert_eq!(fence.leader_term(Instant::now()), None, "it has not led");
+        assert!(!replica.shared.generations.source_writes());
     }
 
     #[tokio::test]

@@ -1841,6 +1841,7 @@ fn an_answer_made_ahead_of_a_leave_gives_its_worker_no_place() {
             |_| None,
             || None,
             |_| true,
+            || None,
             leaves,
             made,
         );
@@ -1906,9 +1907,9 @@ fn a_long_prompt_is_recorded_whole() {
     assert_eq!(bed.holders(&asked, NOW), [(2, 0, blocks)]);
 }
 
-/// The index speaks for a worker that holds blocks in it and the record for
-/// every other: a pick of a worker the index speaks for writes no entry,
-/// and no row is named twice.
+/// On a request hashed by token blocks the index speaks for a worker that
+/// holds blocks in it and the record for every other: a pick of a worker
+/// the index speaks for writes no entry, and no row is named twice.
 #[test]
 fn the_index_speaks_for_its_workers_and_the_record_for_the_others() {
     let (affinity, _, index) = hosted(true);
@@ -1920,6 +1921,63 @@ fn the_index_speaks_for_its_workers_and_the_record_for_the_others() {
     assert_eq!(bed.holders(&asked, NOW), [(0, 2, 0)]);
     bed.decide(&request(&asked, 7, NOW), Some(3));
     assert_eq!(bed.holders(&asked, NOW), [(0, 2, 0), (3, 0, 4)]);
+}
+
+/// A request hashed by its text asks no index, so the record of sent
+/// prefixes speaks for every worker of its list. The pick of a worker the
+/// index holds blocks for writes the text's prefix for it, and the repeat is
+/// named that worker. So is a write that met a held record and waits with
+/// its thread. The classic router sends a request with no token ids to its
+/// tree of sent texts whatever its index of cache events holds
+/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`), and reads and
+/// writes that tree for any worker of the list (`:3519-3596`).
+///
+/// A request hashed by token blocks answers as before beside it: its pick of
+/// that worker writes no entry, and the index alone names the worker.
+#[test]
+fn a_request_of_text_is_recorded_for_a_worker_the_index_holds_blocks_for() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let tokens = prompt(1_000, 4);
+    store(&index, 0, &hashes_of(&tokens)[..2]);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let said = text(1_000, 4);
+    let asked = worded(&said);
+    let facts = request(&asked, 7, NOW);
+    assert_eq!(
+        (facts.hash_kind, facts.block_hashes.len()),
+        (HashKind::Text, 4)
+    );
+    assert!(
+        bed.holders(&asked, NOW).is_empty(),
+        "nobody was sent the text, whatever the index holds"
+    );
+    bed.decide(&facts, Some(0));
+    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 4)]);
+    let record = {
+        let records = bed.affinity.records.lock();
+        Arc::clone(records.get(MODEL).expect("the model's record"))
+    };
+    assert_eq!(record.predictor.read().len(), 4, "one placement a window");
+
+    bed.decide(&request(&tokens, 7, NOW), Some(0));
+    assert_eq!(bed.holders(&tokens, NOW), [(0, 2, 0)]);
+    assert_eq!(
+        record.predictor.read().len(),
+        4,
+        "a token request's pick of the worker writes nothing"
+    );
+
+    // Another text's write meets a held record: its thread reads it kept.
+    let waiting = text(5_000, 4);
+    let waiting = worded(&waiting);
+    {
+        let _reader = record.predictor.read();
+        bed.decide(&request(&waiting, 7, NOW), Some(0));
+    }
+    assert_eq!(record.predictor.read().len(), 4, "the write waits");
+    assert_eq!(bed.holders(&waiting, NOW), [(0, 0, 4)]);
+    assert_eq!(bed.affinity.left_out(), 0);
 }
 
 /// A worker whose index is empty beside a fleet that holds a level is thin:
@@ -2335,6 +2393,76 @@ fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
     assert_eq!(prefills.affinity.left_out(), 0);
 }
 
+/// A pair side's column holds a text's prefix for a worker the index holds
+/// blocks for. A request hashed by its text asks no index, so the record of
+/// sent prefixes speaks for every worker of the side's list: its pick is
+/// written behind the column for such a worker, and the side's next column
+/// holds it. So where the index holds a block for every worker of the list.
+/// The classic router keeps a tree of sent texts a side, and reads and
+/// writes it for a request with no token ids whatever its index holds
+/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`).
+///
+/// A request hashed by token blocks answers as before beside it: a pick of
+/// a worker the index speaks for writes nothing, and a list whose every
+/// worker the index speaks for reads no record.
+#[test]
+fn a_sides_column_holds_a_text_sent_to_a_worker_the_index_holds_blocks_for() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let tokens = prompt(1_000, 4);
+    let other = hashes_of(&prompt(9_000, 1));
+    store(&index, 0, &other);
+    store(&index, 1, &hashes_of(&tokens)[..2]);
+    let prefills = Bed::new(affinity, paired(), 3);
+    let said = text(1_000, 4);
+    let asked = worded(&said);
+
+    // The index holds no block for the third prefill yet.
+    let facts = request(&asked, 7, NOW);
+    let (column_of, read) = prefills.column(&facts, Phase::Prefill);
+    assert_eq!(held(&column_of), [(0, 0); 3]);
+    let read = read.expect("the record speaks for the prefills");
+    record_prefix(
+        &prefills.pool,
+        Phase::Prefill,
+        &facts,
+        read,
+        prefills.ids[1],
+    );
+    let sent_to_one = [(0, 0), (0, 4), (0, 0)];
+    assert_eq!(
+        held(&prefills.column(&facts, Phase::Prefill).0),
+        sent_to_one
+    );
+    let by_tokens = request(&tokens, 7, NOW);
+    let by_index = [(0, 0), (2, 0), (0, 0)];
+    let (column_of, read) = prefills.column(&by_tokens, Phase::Prefill);
+    assert_eq!(held(&column_of), by_index);
+    let read = read.expect("the record speaks for the third prefill");
+    record_prefix(
+        &prefills.pool,
+        Phase::Prefill,
+        &by_tokens,
+        read,
+        prefills.ids[1],
+    );
+    assert_eq!(
+        held(&prefills.column(&by_tokens, Phase::Prefill).0),
+        by_index
+    );
+
+    // The table read a second on finds a block for every prefill.
+    store(&index, 2, &other);
+    let later = NOW + SECOND;
+    let (column_of, read) = prefills.column(&request(&asked, 7, later), Phase::Prefill);
+    assert_eq!(held(&column_of), sent_to_one);
+    assert!(read.is_some(), "a request of text reads the record");
+    let (column_of, read) = prefills.column(&request(&tokens, 7, later), Phase::Prefill);
+    assert_eq!(held(&column_of), by_index);
+    assert!(read.is_none(), "a token request reads none");
+    assert_eq!(prefills.affinity.left_out(), 0);
+}
+
 /// A profile that reads affinity and is named no row is handed the column
 /// whole: here its two warm-up stages rule by different windows, so no one
 /// ruling names its warming rows.
@@ -2395,6 +2523,51 @@ fn a_profile_named_no_row_is_handed_the_prefix_its_pick_sent() {
         },
     );
     assert_eq!(seen.expect("a decision"), [(0, 0), (0, 4), (0, 0), (0, 0)]);
+}
+
+/// A profile that is named no row is handed a text's prefix for a worker
+/// the index holds blocks for: its pick of that worker is written, and the
+/// column of the repeat holds it. A request hashed by its text asks no
+/// index, as under the classic router
+/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`).
+/// A request hashed by token blocks answers as before beside it: its pick
+/// of that worker writes nothing, and its column holds the index's blocks.
+#[test]
+fn a_profile_named_no_row_is_handed_a_text_sent_to_a_worker_the_index_holds_blocks_for() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let tokens = prompt(1_000, 4);
+    store(&index, 1, &hashes_of(&tokens)[..2]);
+    let bed = Bed::new(affinity, handed_whole(), 4);
+    let said = text(1_000, 4);
+    let asked = worded(&said);
+    let handed = |prompt: &PromptHashes| {
+        let mut seen = None;
+        decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(prompt, 7, NOW),
+            None,
+            |_| None,
+            || None,
+            |_| true,
+            |facts| {
+                seen = Some(held(facts.affinity));
+                shed()
+            },
+        );
+        seen.expect("a decision")
+    };
+    assert_eq!(handed(&asked), [(0, 0); 4]);
+    assert!(bed.decide(&request(&asked, 7, NOW), Some(1)).is_none());
+    assert_eq!(handed(&asked), [(0, 0), (0, 4), (0, 0), (0, 0)]);
+    let by_index = [(0, 0), (2, 0), (0, 0), (0, 0)];
+    assert_eq!(handed(&tokens), by_index);
+    assert!(bed.decide(&request(&tokens, 7, NOW), Some(1)).is_none());
+    assert_eq!(handed(&tokens), by_index);
 }
 
 /// A pick states what its first target holds of the request, read from the
@@ -3357,10 +3530,59 @@ fn a_naming_the_record_fills_stands_whole_where_every_holder_is_refused() {
     assert_eq!(named_when(false), first);
 }
 
+/// A list whose every worker the index holds a block for still reads the
+/// record for a request hashed by its text, and writes its pick there: such
+/// a request asks the index nothing. The classic router reads its tree of
+/// sent texts for a request with no token ids, however many workers its
+/// index of cache events names
+/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`). A
+/// request hashed by token blocks reads no record over the same list and
+/// writes none, as before.
+#[test]
+fn a_pool_whose_workers_are_all_heard_reads_the_record_for_a_request_of_text() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let other = hashes_of(&prompt(9_000, 1));
+    store(&index, 0, &other);
+    store(&index, 1, &other);
+    let bed = Bed::new(affinity, preset("cache_aware"), 2);
+    let said = text(1_000, 4);
+    let asked = worded(&said);
+    let tokens = prompt(1_000, 4);
+
+    let named = bed.decide(&request(&asked, 7, NOW), Some(1));
+    assert!(
+        named.expect("rows").holders.is_empty(),
+        "nobody was sent the text before this pick"
+    );
+    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    bed.decide(&request(&tokens, 7, NOW), Some(1));
+    assert!(
+        bed.holders(&tokens, NOW).is_empty(),
+        "a token request's pick writes nothing"
+    );
+
+    let standing = bed.pool.table.load();
+    let table = standing.as_deref().expect("the list's table");
+    assert!(
+        table.heard_any && !table.unheard_any,
+        "the index holds a block for every worker"
+    );
+    let record = table.record.as_ref().expect("the model's record");
+    assert_eq!(record.predictor.read().len(), 4, "the text's four windows");
+    let reads = |prompt: &PromptHashes| {
+        let mut buffers = Buffers::new();
+        let read = table.name(&request(prompt, 7, NOW), None, &mut buffers);
+        (read.is_some(), buffers.keys.len())
+    };
+    assert_eq!(reads(&asked), (true, 4), "a request of text reads it");
+    assert_eq!(reads(&tokens), (false, 0), "a token request reads none");
+}
+
 /// A list whose every worker the index speaks for reads no record and
-/// writes none: a naming folds no key and a pick leaves no entry. Once a
-/// read of the table finds a worker with no block in the index, the record
-/// is read and written again.
+/// writes none for a request hashed by token blocks: a naming folds no key
+/// and a pick leaves no entry. Once a read of the table finds a worker with
+/// no block in the index, the record is read and written again.
 #[test]
 fn a_pool_whose_workers_are_all_heard_reads_no_record() {
     let (affinity, _, index) = hosted(true);

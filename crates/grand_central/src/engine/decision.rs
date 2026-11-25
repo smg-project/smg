@@ -4,12 +4,6 @@
 //! on its stream and the host's fallback takes over at once, so the enum
 //! never carries one.
 
-#![expect(
-    clippy::exhaustive_enums,
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::fmt;
 
 #[cfg(any(test, feature = "in-process"))]
@@ -33,9 +27,11 @@ pub const TRACE_TOP: usize = 3;
 /// One target: a candidate by position and id, with the decode side when the
 /// decision is a pair.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Target::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default,
+/// or from [`Target::of`], and assigns what it knows, and a pattern of it
+/// ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Target {
     /// Position in the host's candidate slice (the prefill's for a pair).
     pub position: u32,
@@ -48,9 +44,11 @@ pub struct Target {
 /// The decode side of a pair target, by position in the host's decode slice.
 /// The rendezvous the two sides meet at is the host's at dispatch.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Pair::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default,
+/// or from [`Pair::of`], and assigns what it knows, and a pattern of it
+/// ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Pair {
     pub decode_position: u32,
     pub decode_id: WorkerId,
@@ -198,10 +196,11 @@ impl Targets {
     /// Turns a decode side's targets into a pair's where they stand: each
     /// names `prefill` with the decode it held, in the order they had. The
     /// first pair states `decode`, the decode side's own session verdict,
-    /// and no pair behind it states one. Nothing is stated of a pair's
-    /// first target ([`Pick::overlap`]). The entries past the count are not
-    /// rewritten, as [`Self::clear`] leaves them. No accessor goes past the
-    /// count.
+    /// and no pair behind it states one. What the decode side's list
+    /// stated of its first target goes ([`Pick::overlap`]): the engine
+    /// over worker lists states what a pair's prefill holds behind this
+    /// turn. The entries past the count are not rewritten, as
+    /// [`Self::clear`] leaves them. No accessor goes past the count.
     pub(crate) fn pair_under(&mut self, prefill: &Target, decode: SessionVerdict) {
         // Taken by the first pair: the pairs behind it read none.
         let mut verdict = DecodeVerdict::of(decode);
@@ -338,6 +337,7 @@ impl fmt::Debug for Survivors {
 /// a byte the record had spare: the trace is no larger for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum LiftedVeto {
     /// No veto was lifted.
     #[default]
@@ -367,6 +367,7 @@ impl From<LiftedVeto> for proto::LiftedVeto {
 /// per-scorer contributions, the plan, the picker and the shadow pick join it
 /// with the observability contract.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Trace {
     /// The position of the profile the decision was made under, or
     /// [`Self::NO_PROFILE`] where it was made ahead of every profile.
@@ -493,8 +494,12 @@ pub enum OverlapSource {
 /// a single decision, from the first target's entry of the rows that
 /// decision was given: the rows the engine named from the host's own data,
 /// a caller's column, or the rows a caller named. No stage is asked. A
-/// decision given no rows states nothing. Neither does a pair, or a pick
-/// the binding's sessions rule keeps from the profile.
+/// pair's first decision states the same of its prefill, which is its first
+/// target's worker, from the prefills' column: a pick has room for one
+/// statement, so nothing is stated of the decode. A decision given no rows
+/// states nothing. Neither does a pair's decode decided again, an encode
+/// request's pair, or a pick the binding's sessions rule keeps from the
+/// profile.
 /// [`Engine::decide`](crate::engine::Engine::decide) itself states nothing.
 ///
 /// A request decided inside a tree its host lends is given the rows the
@@ -679,6 +684,7 @@ impl Pick {
 
 /// A shed: the reason, the stage that emptied the pool, and the pacing hint.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Shed {
     pub reason: ShedReason,
     /// The name of the filter or picker that left nothing.
@@ -694,6 +700,7 @@ pub struct Shed {
 /// built-in issues one until the admission step, and a host that meets one
 /// refuses the request.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Queue {
     pub ticket: u64,
     /// The longest the ticket may wait, within the request's admission
@@ -825,6 +832,14 @@ pub(crate) const SUBSET_HINT: &str = "subset-hint";
 /// pairs' membership the encode pass reads (`ec-compatible`,
 /// `decode-vision`) is answered ahead of every list's places.
 pub(crate) const PLACES: &str = "places";
+
+/// The stage a request that names its worker is shed under where that
+/// worker cannot take it: by the one call in a host's own process, and by
+/// a controller's served decision. A pair's decision is shed under it
+/// where the number its decode side states reaches no row
+/// ([`Constraints::target_worker`](crate::engine::view::Constraints::target_worker)),
+/// and declined under it where the number stands beside no places.
+pub(crate) const TARGET_WORKER: &str = "target-worker";
 
 /// A shed the deciders say in the engine's place, in the shape of the
 /// engine's own.

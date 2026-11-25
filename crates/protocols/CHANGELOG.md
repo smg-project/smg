@@ -33,6 +33,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   the public set) and `common::json_type_name` are public: a route that reads a metadata object or
   stores message items of its own (the gateway's Conversations routes) validates them with the
   rules the Responses request already validates with, in the same words and under the same codes.
+- `GenerationRequest::routing_text`, a provided method: the text the routing policies key on, by
+  default the text of `extract_text_for_routing`, so an implementer that states none is keyed as
+  before. `ChatCompletionRequest` states its own: the same text with a marker of 256 characters at
+  the place of each part that is no text (an image, an audio or a video clip, a part of an unknown
+  kind), 32 markers a request at most, each made from a digest of the part's reference that reads
+  1,024 bytes at most. The gateway's HTTP routes key a chat request on it.
 - `into_chat_tools` and the by-value `From<CustomTool> for Tool` and `From<InputSchema> for Value`:
   a caller that owns a Messages request's tools converts them into chat tools without copying the
   schemas (the properties and the additional fields move in); the by-reference forms stay for a

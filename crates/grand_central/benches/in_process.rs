@@ -235,6 +235,16 @@ const CELLS: &[Cell] = &[
         words: conversations::words,
         ..Cell::PLAIN
     },
+    // The cache-aware preset over one prompt at every turn, under a host
+    // that lends no tree. Asked by the one call (`--entry place`), a turn
+    // is named its worker by the engine's record of sent prefixes. Under
+    // `--entry place_text` the prompt is stated as text, hashed by its
+    // windows and read from the same record.
+    Cell {
+        name: "cache_aware_one_prompt",
+        document: || preset("cache_aware"),
+        ..Cell::PLAIN
+    },
     Cell {
         name: "cache_aware_recorded",
         document: || preset("cache_aware"),
@@ -334,6 +344,15 @@ const CELLS: &[Cell] = &[
         request: pair::request,
         ..Cell::PLAIN
     },
+    // A round-robin prefill beside the hash ring's decode, with a request
+    // that carries no key: `--entry place_named` names its decode alone,
+    // which each decision counts behind the prefill it picks.
+    Cell {
+        name: "pair_ring_decode_no_key",
+        document: ring_decode,
+        request: pair::request,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "least_load_on_runtime",
         document: || preset("least_load"),
@@ -424,6 +443,12 @@ const CELLS: &[Cell] = &[
 /// A built-in preset as a cell's document.
 fn preset(name: &str) -> PolicySpec {
     PolicySpec::preset(name).expect("a preset's name")
+}
+
+/// The pair document of a round-robin prefill beside the hash ring's
+/// decode: the decode's side alone reads a request's target source.
+fn ring_decode() -> PolicySpec {
+    PolicySpec::pair_presets("round_robin", "consistent_hashing").expect("a preset's name")
 }
 
 /// The `resident_work` cell's document: the `power_of_two` preset over

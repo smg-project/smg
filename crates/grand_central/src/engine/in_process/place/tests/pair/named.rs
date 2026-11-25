@@ -12,6 +12,8 @@ use super::{
 };
 use crate::engine::DecodeRefused;
 
+mod decode_alone;
+
 /// The stock pair of the presets `prefill` and `decode`. A side that is
 /// the hash ring brings the binding its target source.
 fn stock(prefill: &str, decode: &str) -> &'static InProcess {
@@ -99,14 +101,14 @@ fn a_pair_that_names_its_worker_goes_to_that_worker_on_each_side() {
     }
 }
 
-/// A side is held where its profile is the hash ring keyed by no prefix,
-/// the prefill's first. Under a ring prefill beside a round robin decode
-/// the prefill is the one named and the decode takes its turns. Under a
-/// round robin prefill beside a ring decode the pair is read for no target
-/// yet: its prefill takes its turns, and its decode is its routing value's
-/// owner, as with no header. So is a pair none of whose sides is the ring,
-/// though its binding names a target source. Under a document that names
-/// no target source the header is never read.
+/// A side reads the name where its profile is the hash ring keyed by no
+/// prefix. Under a ring prefill beside a round robin decode the prefill is
+/// the one named and the decode takes its turns. Under a round robin
+/// prefill beside a ring decode the prefill takes its turns and the decode
+/// is the one named, whatever the request's routing value
+/// ([`decode_alone`]). A pair none of whose sides is the ring is read for
+/// no target, though its binding names a target source. Under a document
+/// that names no target source the header is never read.
 ///
 /// The classic router holds the side whose own policy reads the header and
 /// no other: the prefill alone (`P:3695`, its second half), the decode
@@ -138,7 +140,7 @@ fn a_side_is_held_where_its_profile_is_the_plain_ring() {
     let ([prefills, decodes], reads) = six(stock("consistent_hashing", "round_robin"));
     assert_eq!(
         (prefills, reads),
-        (named, once.clone()),
+        (named.clone(), once.clone()),
         "the prefill is held"
     );
     assert_eq!(decodes.len(), 3, "the decode takes its turns");
@@ -148,9 +150,9 @@ fn a_side_is_held_where_its_profile_is_the_plain_ring() {
     let ([prefills, decodes], reads) = six(ring_decode);
     assert_eq!(prefills.len(), 3, "the prefill takes its turns");
     assert_eq!(
-        (decodes.len(), reads),
-        (1, once.clone()),
-        "one decode, by the key"
+        (decodes, reads),
+        (named, once.clone()),
+        "the decode is the one named"
     );
 
     let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
@@ -668,13 +670,69 @@ fn a_place_its_host_masks_takes_no_number() {
     assert_eq!(at("1"), Err(MISSED), "one prefill is counted");
 }
 
-/// A pair held to the two workers it names is decided once. Under a
-/// document that picks a pair's decode behind its prefill, such a pair's
-/// one decision books the decode with its prefill, whatever its caller
-/// states: a decode asked again is refused as one that never stood chosen,
-/// with no decision made, and the placement stands on the decode the
-/// request named. A pair that names no worker is decided again as before,
-/// and so is one held to its prefill alone: it names no decode.
+/// A pair that names its worker under a capped sessions rule goes to that
+/// worker on each side, or to none. The rule takes the first pin the
+/// decision's filters kept, and a decision held to the named places keeps
+/// no other worker: a session pinned on another pair follows its request
+/// to the pair it names, a pin at the rule's cap on a named worker has no
+/// worker to hand the session on to, and a number past the workers sheds
+/// the pair under `target-worker` whatever the session's pins.
+///
+/// The classic router's sticky override never runs on a side under
+/// consistent hashing: a policy that reads the routing value itself is
+/// not overridden (`sticky_for` in `model_gateway/src/policies/registry.rs`),
+/// so its hash policy reads the header on each side as with no override.
+#[test]
+fn a_pair_that_names_its_worker_under_a_capped_sessions_rule_goes_there_or_nowhere() {
+    let mut document =
+        PolicySpec::pair_presets("consistent_hashing", "consistent_hashing").expect("presets");
+    document.generation = 1;
+    // The stock rule with a cap of one request a session on a worker. Its
+    // own header names are left out: the binding's sources name the key.
+    let stock = PolicySpec::preset("manual").expect("a built-in preset");
+    let mut rule = stock.bindings[0].sessions.clone().expect("the stock rule");
+    rule.sticky_header.clear();
+    rule.headers.clear();
+    rule.inflight_cap = 1;
+    document.bindings[0].sessions = Some(rule);
+    let engine = hosted(engine_of(&document));
+    let lists = Lists::of(3, 3);
+    let classes = lists.every();
+    // The pair a request of the session is sent to, and its placement.
+    let sent = |number: &str| {
+        let headers = [(MANUAL_SESSION_HEADER, "talk-1"), (TARGET, number)];
+        let request = PlaceRequest {
+            headers: &headers,
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+        };
+        engine.place(&request).map(|mut placement| {
+            placement.sent(Side::Prefill);
+            placement.sent(Side::Decode);
+            (lists.places(&placement), placement.kept())
+        })
+    };
+    let pair_of = |number: &str| sent(number).map(|(pair, _)| pair);
+    // The session's first pair is sent and stays in flight: its pins, and
+    // one request of the session on each of its workers, the rule's cap.
+    let (first, _in_flight) = sent("0").expect("a placement");
+    assert_eq!(first, (0, 0), "the session's first pair");
+    lists.prefills[0].increment_routing_key_load("talk-1");
+    lists.decodes[0].increment_routing_key_load("talk-1");
+    // At the cap the session has no other worker among the named places.
+    assert_eq!(pair_of("0"), Ok((0, 0)), "at the rule's cap");
+    // Pinned on the first pair, it goes to the pair it names all the same.
+    assert_eq!(pair_of("1"), Ok((1, 1)), "past the session's pins");
+    assert_eq!(pair_of("3"), Err(MISSED), "three workers a side");
+}
+
+/// A pair that names its decode is decided once. Under a document that
+/// picks a pair's decode behind its prefill, such a pair's decision books
+/// the decode with its prefill, whatever its caller states: a decode asked
+/// again is refused as one that never stood chosen, with no decision made,
+/// and the placement stands on the decode the request named. A pair that
+/// names no worker is decided again as before, and so is one held to its
+/// prefill alone: it names no decode. A pair whose decode alone is named,
+/// behind a prefill of another profile, books it so as well.
 ///
 /// The classic router picks a pair's decode once, with its prefill
 /// (`P:2884-2920`), and sends that decode behind the prefill's answer.
@@ -703,9 +761,9 @@ fn a_pair_held_to_the_decode_it_names_books_it_with_its_prefill() {
         (first, answer, lists.places(&placement))
     };
     let again = |carried: &[(&str, &str)]| again_under(engine, carried);
-    let booked = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
+    const BOOKED: Unplaced = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
     let key = (MANUAL_SESSION_HEADER, "talk-1");
-    assert_eq!(again(&[key, (TARGET, "2")]), ((2, 2), Err(booked), (2, 2)));
+    assert_eq!(again(&[key, (TARGET, "2")]), ((2, 2), Err(BOOKED), (2, 2)));
     let (first, answer, then) = again(&[key]);
     assert_eq!(
         (answer, then),
@@ -715,4 +773,11 @@ fn a_pair_held_to_the_decode_it_names_books_it_with_its_prefill() {
     let ring_prefill = later("consistent_hashing", "round_robin");
     let (first, answer, then) = again_under(ring_prefill, &[key, (TARGET, "2")]);
     assert_eq!((first.0, answer, then.0), (2, Ok(()), 2), "no decode named");
+    let ring_decode = later("round_robin", "consistent_hashing");
+    let (first, answer, then) = again_under(ring_decode, &[key, (TARGET, "2")]);
+    assert_eq!(
+        (first.1, answer, then.1),
+        (2, Err(BOOKED), 2),
+        "the decode named behind a prefill of another profile"
+    );
 }

@@ -53,8 +53,11 @@ pub struct EngineFaults {
     pub decisions: u64,
     /// Words to the stages that panicked in a stage that heard them, under
     /// the engine's catch: a store's words of membership. A lease's words
-    /// are told under their host's catch and counted there
-    /// ([`MemoryStore::lifecycle_faults`](crate::store::MemoryStore::lifecycle_faults)).
+    /// are told under their host's catches and counted there: with the
+    /// requests that got no decision where a panic unwinds the decision
+    /// that told the word, and in
+    /// [`MemoryStore::lifecycle_faults`](crate::store::MemoryStore::lifecycle_faults)
+    /// at every other word.
     pub events: u64,
     /// Runs of the engine's upkeep that panicked.
     pub upkeep: u64,

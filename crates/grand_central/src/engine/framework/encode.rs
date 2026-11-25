@@ -44,11 +44,6 @@
 //! member all the same. A gap is named by what the model takes, and a
 //! place says what this request may reach.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
     run_profile, shed, Buffers, ClassBits, Engine, PairPools, Plan, Profile, Scratch, Set,
@@ -56,7 +51,7 @@ use super::{
 };
 use crate::{
     engine::{
-        decision::{Decision, ShedReason, Target, Targets, Trace, PLACES},
+        decision::{Decision, ShedReason, Target, Targets, Trace, PLACES, TARGET_WORKER},
         demands::{DemandFacts, Demands, References},
         view::{
             AffinityFacts, Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts,
@@ -100,6 +95,7 @@ const ENCODE_SCOPE: &str = "encode-scope";
 /// What the encode side reads of one encoder beside its candidate row, as
 /// its host states it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncoderFacts {
     /// The encoder's encode class; `0` when it states no end. Its host
     /// numbers the classes from 1 over the encoders it lends, as their
@@ -115,6 +111,7 @@ pub struct EncoderFacts {
 /// and the columns the encode side reads, each by a row's index in its
 /// pool.
 #[derive(Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct EncodePool<'a> {
     pub encoders: &'a [Candidate],
     /// One entry an encoder.
@@ -130,14 +127,19 @@ pub struct EncodePool<'a> {
     /// What each encoder states for a request's hard demands, one entry an
     /// encoder ([`FixedFacts::demands`](crate::engine::view::FixedFacts::demands)):
     /// read for a request whose encode side states a demand
-    /// ([`Constraints::demands`]), and by no other. An encoder with no
-    /// entry states nothing, so it meets no demand for a runtime or for
-    /// media by reference: an empty column says that of every encoder.
+    /// ([`Constraints::demands`]), and by no other. The column is empty or
+    /// holds one entry an encoder, in the encoders' order. An empty one
+    /// says that no encoder states anything, so none meets a demand for a
+    /// runtime or for media by reference. A column of any other length is
+    /// declined under `encode-column` for a request with items that names
+    /// either: read as stating nothing past its end, it would answer a
+    /// host's mistake as an encoder that lacks a fact.
     pub demands: &'a [DemandFacts],
 }
 
 /// The encode items of a request and what it asks for them.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct EncodeItems<'a> {
     /// Each item's key, the caller's content hash. Empty for a request
     /// without items. A key that carries its text ([`Identity::plain`]) is
@@ -517,8 +519,9 @@ struct Wanted<'a> {
     /// The demand's runtime and its references. Its vision stands in
     /// `pixels`, and nothing else of it is an encoder's to meet.
     demands: Demands,
-    /// Whether the demand names a runtime or references: a request that
-    /// names neither reads no entry of `stated`.
+    /// Whether the demand names a runtime or references
+    /// ([`reads_entries`]): a request that names neither reads no entry of
+    /// `stated`.
     held: bool,
     /// What each encoder states for a demand, by its place
     /// ([`EncodePool::demands`]).
@@ -540,13 +543,13 @@ impl<'a> Wanted<'a> {
             pixels: pixels || demands.vision,
             wires: cx.wire_modes,
             demands,
-            held: demands.runtime != 0 || demands.references != References::None,
+            held: reads_entries(demands),
             stated: encode.demands,
         }
     }
 
-    /// What the encoder at `at` states for a demand: nothing, where its
-    /// host handed no entry for it.
+    /// What the encoder at `at` states for a demand: nothing, under an
+    /// empty column.
     #[inline(always)]
     fn stated_at(&self, at: usize) -> DemandFacts {
         self.stated.get(at).copied().unwrap_or_default()
@@ -580,10 +583,13 @@ impl<'a> Wanted<'a> {
 
     /// Whether the encoder takes the request: its references, its vision
     /// and its wire. The one test of an encoder for a request, so an
-    /// encoder it refuses is left out of every pass. Inlined by force: each
-    /// pass asks it once an encoder, and its tests cost less than a call. A
-    /// request that states no demand pays one test for it, behind the
-    /// others.
+    /// encoder it refuses is left out of every pass. It answers what the
+    /// three parts answer together ([`Self::references`], [`Self::vision`],
+    /// [`Self::on_wire`]), written out so that a request with no demand
+    /// reads no entry: a change to one part is made here too. Inlined by
+    /// force: each pass asks it once an encoder, and its tests cost less
+    /// than a call. A request that states no demand pays one test for it,
+    /// behind the others.
     #[inline(always)]
     fn takes(&self, at: usize, row: &Candidate, of: EncoderFacts) -> bool {
         (!self.references || of.references)
@@ -604,6 +610,14 @@ impl<'a> Wanted<'a> {
     fn names_media(&self) -> bool {
         self.references || self.pixels || self.demands.references != References::None
     }
+}
+
+/// Whether a demand names a runtime or references: what the pass reads an
+/// encoder's entry for ([`EncodePool::demands`]). A demand that names
+/// neither reads no entry, so the column's shape is not asked for it.
+#[inline(always)]
+fn reads_entries(demands: Demands) -> bool {
+    demands.runtime != 0 || demands.references != References::None
 }
 
 /// The name of the gap when no encoder is open for the request, read from
@@ -789,7 +803,9 @@ impl Engine {
     /// key. A pair column of another length than its pool names
     /// `affinity-column` before a cut, as the pair entry names it. So does
     /// a column on the request, or rows named on it, before a stage of the
-    /// encode side is asked.
+    /// encode side is asked. A number on the decode side
+    /// ([`Constraints::target_worker`]) names `target-worker`: an encode
+    /// request names no worker.
     ///
     /// A list this side hands on in a pool's stead (the prefills or the
     /// decodes it admits, the encoders it offers a key) is numbered anew. A
@@ -849,9 +865,11 @@ impl Engine {
     /// of the pair's two sides ahead of this call, each among its own
     /// places. `unmet` is the stage of the demand that left a side nobody,
     /// where one did: a request with items is shed under it with no
-    /// endpoint, behind every answer for its encoders (a gap of their
+    /// endpoint, behind three answers for its encoders (a gap of their
     /// membership, none open, a saturated fleet) and ahead of the pair's.
-    /// The encoders' answers stand first, whatever its pair lacks. A
+    /// Those three stand first, whatever its pair lacks. The encoders'
+    /// `places` answer waits behind the side's stage, as it waits behind
+    /// a gap of the pair's membership. A
     /// request with no item reads no encoder: its caller sheds it ahead of
     /// this call, and `unmet` is not read for it.
     #[expect(
@@ -940,11 +958,16 @@ impl Engine {
         let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
         // The encode pool's columns are read for a request's items alone: a
         // request with none is answered whatever its host handed in them.
+        // What the encoders state for a demand is read for a demand that
+        // names a runtime or references, and its shape is asked for that
+        // request alone.
         let needs = !items.keys.is_empty();
         if needs
             && (encode.facts.len() != encode.encoders.len()
                 || encode.prefill_classes.len() != pools.prefills.len()
-                || !column_fits(encode.affinity, encode.encoders))
+                || !column_fits(encode.affinity, encode.encoders)
+                || (reads_entries(encode_cx.demands)
+                    && !column_fits(encode.demands, encode.encoders)))
         {
             return declined(ENCODE_COLUMN);
         }
@@ -961,6 +984,11 @@ impl Engine {
         // of the encode side is asked.
         if carries_a_column(facts) {
             return turned_away(ShedReason::PolicyDeclined, AFFINITY_COLUMN, unbound);
+        }
+        // An encode request names no worker: a number on its decode side
+        // would count rows this side numbers anew.
+        if decode_cx.target_worker.is_some() {
+            return turned_away(ShedReason::PolicyDeclined, TARGET_WORKER, unbound);
         }
         debug_assert_indexed(encode.encoders);
         debug_assert_cells(encode.signal_cells, encode.encoders);

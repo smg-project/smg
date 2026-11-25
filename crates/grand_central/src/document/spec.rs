@@ -45,12 +45,9 @@ use crate::engine::sticky_sessions::SessionTable;
 use crate::{
     document::routing_key::KeySources,
     engine::{
-        framework::{
-            Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer,
-            WeightedScorer,
-        },
+        framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, WeightedScorer},
         sticky_sessions::SessionRule,
-        view::{blocks_within, threshold_permille, HashKind, Phase, MAX_LOAD_REPORT_AGE_MS},
+        view::{blocks_within, HashKind, Phase, MAX_LOAD_REPORT_AGE_MS},
     },
     load::{
         load_report_reader::LoadReportReader,
@@ -699,7 +696,9 @@ pub enum AffinitySource {
     /// The record of the prefixes sent alone.
     Predictor,
     /// Each worker by what it has: its cache events where it publishes
-    /// them, and the prefixes sent to it where it does not.
+    /// them, and the prefixes sent to it where it does not. A request
+    /// hashed by its text reads the prefixes sent to every worker: cache
+    /// events are token blocks.
     #[default]
     Merged,
 }
@@ -2202,7 +2201,9 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// thresholds, and its routes read one shed word, both from that document:
 /// it refuses one whose bindings differ on either word. With no document
 /// supplied it reads its own two settings. A controller that judges on its
-/// worker objects does not read the switch yet.
+/// worker objects reads the switch there too, at each document that takes
+/// force: its default is off where every binding switches it off, and
+/// bindings that differ keep it on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
@@ -2252,6 +2253,40 @@ impl Default for OverloadSpec {
             waiting_requests: None,
             token_usage: None,
             shed_when_all_vetoed: false,
+        }
+    }
+}
+
+/// What a document's bindings say of the overload switch, taken together
+/// ([`OverloadSpec::enabled`]). A host builds its workers with one default
+/// set of thresholds, so it reads the bindings' words as one
+/// ([`AppliedSpec::overload_switch`]). A binding with no block says the
+/// block's default, which is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OverloadSwitch {
+    /// Every binding says on, or the document has no binding.
+    #[default]
+    On,
+    /// Every binding says off.
+    Off,
+    /// The bindings differ. What becomes of the default then is the rule
+    /// of the host that reads the word.
+    Differ,
+}
+
+impl OverloadSwitch {
+    /// The word `bindings` say, taken together.
+    fn of(bindings: &[BindingSpec]) -> Self {
+        let on =
+            |binding: &&BindingSpec| binding.overload.as_ref().is_none_or(|block| block.enabled);
+        let ons = bindings.iter().filter(on).count();
+        if ons == bindings.len() {
+            Self::On
+        } else if ons == 0 {
+            Self::Off
+        } else {
+            Self::Differ
         }
     }
 }
@@ -2444,12 +2479,11 @@ pub struct KeySourceSpec {
     /// so `rid`, `max_bytes` and `client` are refused beside it. It is
     /// read for a request a program places in process: a single request,
     /// and a pair under the `pd-pair` plan, on each side whose profile
-    /// scores by `consistent-hash` with no `prefix_tokens`, where its
-    /// prefill side is one. A pair's prefill is counted among the prefills
-    /// that have a decode to pair with, and its decode among that
-    /// prefill's partners. A pair whose prefill side is no such profile
-    /// and a request under the `epd` plan are not read for it. Default
-    /// false.
+    /// scores by `consistent-hash` with no `prefix_tokens`. A pair's
+    /// prefill is counted among the prefills that have a decode to pair
+    /// with. Its decode is counted among the partners of its prefill: the
+    /// one the request names, or the one the prefill's own profile picks.
+    /// A request under the `epd` plan is not read for it. Default false.
     #[serde(skip_serializing_if = "is_default")]
     pub target: bool,
 }
@@ -4225,6 +4259,29 @@ impl HashDepth {
 /// one its stages read.
 type BuiltProfile = (Profile, bool, Option<usize>);
 
+/// The two depths of one generation: how deep its stages read a request's
+/// block hashes, and how deep a stage reads them itself. The
+/// prefix-affinity stage declares the hashes and reads none of them: the
+/// lookup that names a request's holders reads them for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HashDepths {
+    /// The deepest read under the generation.
+    read: HashDepth,
+    /// The deepest read a stage makes itself.
+    by_stage: HashDepth,
+}
+
+impl HashDepths {
+    /// Deepens the generation's read to `other`, and its stages' own where
+    /// the stage reads the hashes `itself`.
+    fn deepen(&mut self, other: HashDepth, itself: bool) {
+        self.read.deepen(other);
+        if itself {
+            self.by_stage.deepen(other);
+        }
+    }
+}
+
 /// One profile's stages, built when this build carries every one of them,
 /// and whether the profile keeps a session key on its worker over the
 /// overload veto: the plain ring alone decides its pick. `depth` is
@@ -4235,7 +4292,7 @@ fn check_profile(
     view: &ViewSpec,
     from: StageInputs<'_>,
     deferred: &mut Deferred,
-    depth: &mut HashDepth,
+    depth: &mut HashDepths,
     sent_credits: &mut Vec<Arc<DispatchCredit>>,
 ) -> Result<Option<BuiltProfile>, SpecError> {
     let catalog = from.catalog;
@@ -4278,7 +4335,7 @@ fn check_profile(
         let stage = match scored(entry, name, &entry_at, from, settings, &mut sent)? {
             Scored::Typed(stage) => stage,
             Scored::Built(weighted) => {
-                depth.deepen(HashDepth::of(weighted.scorer.needs()));
+                depth.deepen(HashDepth::of(weighted.scorer.needs()), true);
                 scorers.push(weighted);
                 continue;
             }
@@ -4309,7 +4366,7 @@ fn check_profile(
         match scorer_of(&stage, gates, view, from.signals, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
-                depth.deepen(read);
+                depth.deepen(read, !matches!(stage, ScoreStage::PrefixAffinity(_)));
                 plain_ring |= matches!(
                     &stage,
                     ScoreStage::ConsistentHash(ring)
@@ -4417,7 +4474,7 @@ fn check_profile(
             }
             // A filter and a picker name no depth of their own.
             let unkeyed = filters.iter().map(|filter| filter.needs());
-            depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)));
+            depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)), true);
             Some((
                 Profile {
                     name: name.to_string(),
@@ -4524,21 +4581,6 @@ fn check_matcher(
         deferred.note(at.field("labels"), "the label matcher");
     }
     Ok(())
-}
-
-/// The thresholds a binding hands its pools: the crate's two defaults, and
-/// none when the block is switched off. A binding with no block has the
-/// default block. A block names no number of its own ([`check_overload`]):
-/// a worker's registration states its two over these. The usage goes to
-/// permille by the one conversion of a threshold ([`threshold_permille`]):
-/// the rounding a report's usage takes, so one rank's usage at or above the
-/// threshold as a ratio is never read as under it.
-fn overload_thresholds(block: Option<&OverloadSpec>) -> Option<OverloadThresholds> {
-    let enabled = block.is_none_or(|block| block.enabled);
-    enabled.then(|| OverloadThresholds {
-        waiting_requests: OVERLOAD_WAITING_REQUESTS,
-        kv_usage_permille: threshold_permille(f64::from(OVERLOAD_TOKEN_USAGE)),
-    })
 }
 
 /// A binding's overload block names no number, with its switch on or off:
@@ -4928,7 +4970,6 @@ fn resolve_plan(
         shadow,
         decode_shadow,
         sessions: None,
-        overload: overload_thresholds(b.overload.as_ref()),
     };
     if plan == PlanName::Single {
         if b.profile.is_some() && !b.profiles.is_empty() {
@@ -5246,7 +5287,7 @@ impl PolicySpec {
         &self,
         catalog: &StageRegistry,
         denied_headers: &[&str],
-    ) -> Result<(Engine, HashDepth, Arc<[SignalColumn]>), SpecError> {
+    ) -> Result<(Engine, HashDepths, Arc<[SignalColumn]>), SpecError> {
         if let Some(kind) = &self.kind {
             return Err(SpecError::Kind(kind.clone()));
         }
@@ -5272,7 +5313,7 @@ impl PolicySpec {
         check_signals(&self.signals)?;
         let signal_columns = resolve_signals(&self.signals);
         let mut deferred = Deferred::default();
-        let mut depth = HashDepth::default();
+        let mut depth = HashDepths::default();
         // What no stage declares: the sessions rules' counts and the view's
         // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
@@ -5395,7 +5436,6 @@ impl PolicySpec {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: overload_thresholds(None),
             });
         }
         needs.headers |= !self.view.headers.is_empty();
@@ -5594,7 +5634,7 @@ fn index_matching<'a>(
 /// number says which generation a replica runs, the digest which document,
 /// and one load reads the pair.
 ///
-/// It also holds what a store derives under, beside the engine: the
+/// It also holds what pair classes are derived under, beside the engine: the
 /// document's pairing mode ([`AppliedSpec::pairing`]). It says when a host
 /// asks a pair's decode ([`AppliedSpec::decode_pick`]). And it says how deep
 /// a host hashes a request for it ([`AppliedSpec::block_hashes_read`]).
@@ -5610,6 +5650,9 @@ pub struct AppliedSpec {
     digest: Option<Digest>,
     /// How deep the engine's stages read a request's block hashes.
     depth: HashDepth,
+    /// Whether no stage of the engine reads those hashes itself
+    /// ([`Self::hashes_named_alone`]).
+    named_alone: bool,
     /// The document's `view.max_block_hashes`: no read is past it.
     max_block_hashes: u32,
     /// The view's block size: a request that names none is counted by it.
@@ -5632,6 +5675,9 @@ pub struct AppliedSpec {
     /// Whether a binding names a target source
     /// ([`AppliedSpec::names_target`]).
     names_target: bool,
+    /// What the bindings say of the overload switch, taken together
+    /// ([`AppliedSpec::overload_switch`]).
+    overload_switch: OverloadSwitch,
     /// The document's signals, resolved, in column order
     /// ([`AppliedSpec::signal_columns`]).
     signal_columns: Arc<[SignalColumn]>,
@@ -5692,7 +5738,7 @@ impl AppliedSpec {
     fn of(
         document: &PolicySpec,
         digest: Digest,
-        (engine, depth, signal_columns): (Engine, HashDepth, Arc<[SignalColumn]>),
+        (engine, depth, signal_columns): (Engine, HashDepths, Arc<[SignalColumn]>),
     ) -> Self {
         let sources = |binding| KeySources::of_binding(binding, &document.view);
         let key_sources: Box<[_]> = document.bindings.iter().map(sources).collect();
@@ -5705,7 +5751,8 @@ impl AppliedSpec {
                 signals: document.signals.clone(),
             },
             digest: Some(digest),
-            depth,
+            depth: depth.read,
+            named_alone: depth.by_stage == HashDepth::Unread,
             signal_columns,
             max_block_hashes: document.view.max_block_hashes,
             block_size: Gates::of(None, None, document.view.block_size).block_size,
@@ -5721,6 +5768,7 @@ impl AppliedSpec {
                 .map(|name| name.as_str().into())
                 .collect(),
             names_target: key_sources.iter().flatten().any(KeySources::names_target),
+            overload_switch: OverloadSwitch::of(&document.bindings),
             key_sources,
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
@@ -5739,6 +5787,7 @@ impl AppliedSpec {
             built_from: BuiltFrom::default(),
             digest: None,
             depth: HashDepth::Unread,
+            named_alone: true,
             signal_columns: Arc::default(),
             max_block_hashes: ViewSpec::default().max_block_hashes,
             block_size: Gates::default().block_size,
@@ -5750,6 +5799,7 @@ impl AppliedSpec {
             view_headers: Box::default(),
             key_sources: Box::default(),
             names_target: false,
+            overload_switch: OverloadSwitch::On,
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
@@ -5900,6 +5950,20 @@ impl AppliedSpec {
         usize::try_from(blocks).unwrap_or(usize::MAX)
     }
 
+    /// Whether no stage reads a request's block hashes itself under this
+    /// generation: the lookup that names the request's holders reads them
+    /// where the prefix-affinity stage declares them, and nothing does
+    /// where no stage declares any.
+    /// The engine's own call then hashes a prompt where that lookup reads
+    /// the list, and not for a request it decides inside a lent token tree.
+    #[cfg_attr(
+        not(feature = "in-process"),
+        expect(dead_code, reason = "the engine's own placing call reads it")
+    )]
+    pub(crate) const fn hashes_named_alone(&self) -> bool {
+        self.named_alone
+    }
+
     /// What the host must feed under this generation
     /// ([`Engine::needs`]).
     #[must_use]
@@ -5940,7 +6004,17 @@ impl AppliedSpec {
         self.names_target
     }
 
-    /// The mode a store derives its pair classes under while this
+    /// What the bindings of this generation say of the overload switch,
+    /// taken together ([`OverloadSwitch`]), decided when the document was
+    /// applied. A host that builds its workers with a default set of
+    /// thresholds reads it where it builds that default. The unbound start
+    /// says on, as a document with no binding does.
+    #[must_use]
+    pub fn overload_switch(&self) -> OverloadSwitch {
+        self.overload_switch
+    }
+
+    /// The mode a model's pair classes are derived under while this
     /// generation stands: the document's `plans.pd-pair.pairing`.
     #[must_use]
     pub fn pairing(&self) -> Pairing {
@@ -6354,7 +6428,7 @@ mod tests {
             let (_, depth, _) = document
                 .built(&catalog, &[])
                 .expect("the document validates");
-            depth
+            depth.read
         };
         assert_eq!(depth(r#"{"pick":"random"}"#), HashDepth::Unread);
         // A guest of each kind declares the hashes and names no depth.
@@ -9120,39 +9194,35 @@ mod tests {
         assert!(alone.validate().is_ok());
     }
 
+    /// The start a binding is built from by hand ([`Binding::of`]) is the
+    /// binding a document gets that states its model and its profile and
+    /// nothing else: the two are held equal here.
+    #[test]
+    fn a_binding_of_a_model_and_a_profile_alone_is_the_start_built_by_hand() {
+        let built = spec_with_binding(r#"{"match":{"model":"m"},"profile":"p"}"#)
+            .validate()
+            .expect("the binding validates");
+        let binding = built.binding("m", Phase::Single).expect("the binding");
+        assert_eq!(
+            format!("{binding:?}"),
+            format!("{:?}", Binding::of("m".into(), 0))
+        );
+    }
+
     #[test]
     fn the_binding_rules_are_checked_in_shape_then_by_the_build() {
-        let thresholds = |spec: &PolicySpec| {
-            spec.validate()
-                .expect("the binding validates")
-                .binding("m", Phase::Single)
-                .and_then(|binding| binding.overload)
-        };
-        // A block names no number. Switched on, a binding hands its pools
-        // the crate's two, the usage in permille, whatever its shed word
-        // says. So does a binding with no block, and the binding of a
-        // document that writes none.
-        let defaults = OverloadThresholds {
-            waiting_requests: OVERLOAD_WAITING_REQUESTS,
-            kv_usage_permille: 800,
-        };
-        for on in [
+        // A block names no number, and a null is no number. Switched on or
+        // off, with a shed word or none, the binding validates, and so
+        // does a binding with no block.
+        for block in [
             r#"{"profile":"p"}"#,
             r#"{"profile":"p","overload":{}}"#,
             r#"{"profile":"p","overload":{"enabled":true,"shed_when_all_vetoed":true}}"#,
             r#"{"profile":"p","overload":{"waiting_requests":null,"token_usage":null}}"#,
+            r#"{"profile":"p","overload":{"enabled":false,"shed_when_all_vetoed":true}}"#,
         ] {
-            assert_eq!(thresholds(&spec_with_binding(on)), Some(defaults), "{on}");
+            assert!(spec_with_binding(block).validate().is_ok(), "{block}");
         }
-        assert_eq!(
-            thresholds(&doc(
-                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["kv-pressure"],"pick":"best"}}}"#
-            )),
-            Some(defaults)
-        );
-        // Off is the block's switch alone: the binding hands no threshold.
-        let off = r#"{"profile":"p","overload":{"enabled":false,"shed_when_all_vetoed":true}}"#;
-        assert_eq!(thresholds(&spec_with_binding(off)), None);
 
         let sessions = spec_with_binding(
             r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","ttl_s":600,"assignment":"min_load"}}"#,
@@ -9610,6 +9680,46 @@ mod tests {
             "no key's source"
         );
         assert!(!AppliedSpec::unbound().names_target());
+    }
+
+    /// What the bindings say of the overload switch, taken together, is
+    /// decided when the document is applied. A binding with no block, or a
+    /// block that names no switch, says on. Every binding off says off, and
+    /// one word against another says that they differ, whichever comes
+    /// first. A document with no binding says on, as the generation no
+    /// document was applied to does. The shed word is not the switch.
+    #[test]
+    fn the_applied_document_says_its_bindings_overload_switch_as_one_word() {
+        let said = |first: &str, second: &str| {
+            AppliedSpec::validate(&doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"pick":"best"}}}},"bindings":[
+                {{"match":{{"model":"chat/*"}},"profile":"p"{first}}},
+                {{"profile":"p"{second}}}]}}"#
+            )))
+            .expect("the document validates")
+            .overload_switch()
+        };
+        let off = r#","overload":{"enabled":false}"#;
+        let on = r#","overload":{"enabled":true}"#;
+        let sheds = r#","overload":{"shed_when_all_vetoed":true}"#;
+        let empty = r#","overload":{}"#;
+        for (first, second) in [("", ""), (on, ""), ("", empty), (sheds, on)] {
+            assert_eq!(said(first, second), OverloadSwitch::On, "{first} {second}");
+        }
+        assert_eq!(said(off, off), OverloadSwitch::Off);
+        let off_and_sheds = r#","overload":{"enabled":false,"shed_when_all_vetoed":true}"#;
+        assert_eq!(said(off, off_and_sheds), OverloadSwitch::Off);
+        for (first, second) in [(off, ""), ("", off), (off, on), (sheds, off)] {
+            assert_eq!(
+                said(first, second),
+                OverloadSwitch::Differ,
+                "{first} {second}"
+            );
+        }
+        let unbound = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}}}"#);
+        let no_binding = AppliedSpec::validate(&unbound).expect("the document validates");
+        assert_eq!(no_binding.overload_switch(), OverloadSwitch::On);
+        assert_eq!(AppliedSpec::unbound().overload_switch(), OverloadSwitch::On);
     }
 
     #[test]

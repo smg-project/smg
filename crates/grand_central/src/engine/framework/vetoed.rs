@@ -1496,7 +1496,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -1642,7 +1641,6 @@ mod tests {
                 shadow: Some(3),
                 decode_shadow: Some(2),
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -2121,7 +2119,8 @@ mod tests {
             let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
             assert_eq!(pair_of(&again), (1, first));
             let live = again.pick().expect("a decode");
-            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, live, &cx, scratch);
+            let later =
+                engine.shadow_decode_later(0, &req, &pool, pools, held, None, live, &cx, scratch);
             assert_eq!(later.map(|shadow| order(&shadow)[0]), Some(first));
         }
     }
@@ -2515,7 +2514,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -2954,7 +2952,8 @@ mod tests {
             });
             let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
             let live = again.pick().expect("a decode");
-            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, live, &cx, scratch);
+            let later =
+                engine.shadow_decode_later(0, &req, &pool, pools, held, None, live, &cx, scratch);
             let later = later.map(|shadow| order(&shadow)[0]);
             (twin, later, live.trace.lifted == LiftedVeto::Liveness)
         };
@@ -3032,7 +3031,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -3329,7 +3327,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -3456,7 +3453,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -3732,7 +3728,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -3925,7 +3920,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: rule,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -4477,7 +4471,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: Some(rule),
-                overload: None,
             }],
             1,
             Needs::default(),

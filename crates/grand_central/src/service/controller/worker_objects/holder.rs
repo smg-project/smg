@@ -29,7 +29,10 @@ use crate::{
 /// the registry judges the worker by
 /// ([`load_monitor`](crate::worker_host::load_monitor)). One set a worker:
 /// a registration's own values, each over the start's for an engine's
-/// worker.
+/// worker. The start's are stated while the document in force leaves its
+/// overload switch on, and an engine's row states its own alone where
+/// every binding switches it off: the document door states the word
+/// ([`Objects::state_overload_switch`]).
 /// The service runs that monitor while the replica leads, and it writes
 /// each verdict on the worker's object.
 ///

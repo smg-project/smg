@@ -3,7 +3,7 @@
 //! reads none.
 
 use super::{
-    key, mismatch, runtime_specific, wire_mismatch, Member, Mismatch, PairClasses,
+    key, mismatch, runtime_specific, wire_mismatch, Member, Mismatch, Numbering, PairClasses,
     PairingDescriptor, Refusal, LAYOUT_FACTS,
 };
 use crate::{
@@ -13,8 +13,6 @@ use crate::{
         PartnerClasses,
     },
 };
-
-mod written;
 
 const MODES: [Pairing; 3] = [Pairing::Off, Pairing::Lenient, Pairing::Strict];
 const COMPARING: [Pairing; 2] = [Pairing::Lenient, Pairing::Strict];
@@ -1002,4 +1000,24 @@ fn the_classes_hold_exactly_the_pairs_the_rule_makes_worker_by_worker() {
     // partner.
     assert!(refused > 20, "{refused} refusals over the fleets drawn");
     assert!(kept > 20, "{kept} fleets drawn keep a first partner");
+}
+
+#[test]
+fn two_things_of_one_hash_take_two_numbers() {
+    let mut numbering = Numbering::default();
+    let mut known: Vec<&str> = Vec::new();
+    let mut numbers = Vec::new();
+    for thing in ["a", "b", "a", "c", "b", "c"] {
+        // Every thing under one hash: the compare tells them apart.
+        let same = |number: u32| known[number as usize] == thing;
+        let (number, new) = numbering.number(7, known.len() as u32, same);
+        if new {
+            known.push(thing);
+        }
+        numbers.push(number);
+    }
+    assert_eq!(known, ["a", "b", "c"]);
+    assert_eq!(numbers, [0, 1, 0, 2, 1, 2]);
+    numbering.clear();
+    assert_eq!(numbering.number(7, 0, |_| false), (0, true));
 }

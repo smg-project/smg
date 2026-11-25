@@ -39,8 +39,8 @@ use crate::{
         membership::same_worker,
         reservations::{ReservationKind, ReservationStore},
         snapshot::{
-            left_models, micros, same_offer, Classes, OutsideLists, StaleGeneration, StoreSnapshot,
-            Writer, PUBLISH_WINDOW,
+            left_models, micros, OutsideLists, StaleGeneration, StoreSnapshot, Writer,
+            PUBLISH_WINDOW,
         },
         workers::{
             MembershipChange, MembershipTail, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
@@ -384,11 +384,7 @@ impl MemoryStore {
                 health.vetoes.clear();
                 // An unpublished build over no row drops the restore's old
                 // vetoes and the state derived from its membership.
-                drop(
-                    loads
-                        .writer
-                        .rebuild(cut.epoch, std::iter::empty(), Classes::Derive),
-                );
+                drop(loads.writer.rebuild(cut.epoch, std::iter::empty()));
             }
             workers.by_key.clear();
             workers.log.clear();
@@ -521,9 +517,6 @@ impl MemoryStore {
         change: MembershipChange,
         row: Option<WorkerRow>,
     ) -> bool {
-        // A row told again with the offer it had moves no pair class, here
-        // as in the leader's own write: the classes are carried.
-        let mut carried = false;
         // The models a registration that stays under its id takes its
         // worker off, for the stages: here as in the leader's own write.
         let mut off = Vec::new();
@@ -554,13 +547,9 @@ impl MemoryStore {
                     return false;
                 };
                 let resized = held.row.facts.dp_size != row.facts.dp_size;
-                carried = same_offer(&held.row.facts, &row.facts);
                 row.admitted_at = held.row.admitted_at;
                 let old = mem::replace(&mut held.row, row);
-                // A row that carries its offer left no model.
-                if !carried {
-                    off = left_models(old.facts, &held.row.facts);
-                }
+                off = left_models(old.facts, &held.row.facts);
                 if resized {
                     (MembershipChange::Resized { id }, None)
                 } else {
@@ -614,49 +603,25 @@ impl MemoryStore {
         // told, a registration that takes its worker off a model among
         // them. What is owed, the replica's loop pays at the window's end.
         match change {
-            MembershipChange::Registered { id } => {
-                let first = {
-                    let mut loads = self.loads.lock();
-                    let classes = Classes::Written {
-                        left: None,
-                        joined: Some(id),
-                    };
-                    loads.writer.owe(classes, now)
-                };
-                self.wake_host(first);
+            MembershipChange::Registered { .. } => {
+                self.owe(now);
                 self.tell_membership(change);
             }
-            MembershipChange::Replaced { old, new } => {
-                let classes = Classes::Written {
-                    left: Some(old),
-                    joined: Some(new),
-                };
+            MembershipChange::Replaced { new, .. } => {
                 // A replacement that takes its worker off a model says so
                 // for the new id, behind the build it pays and behind its
                 // own word, as at the leader's own write.
                 let models = Self::replaced_models(left, workers.rows.get(&new));
-                self.pay_leave(&workers, classes, now);
+                self.pay_leave(&workers, now);
                 self.tell_membership(change);
                 self.tell_left(new, &models);
             }
-            MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
-                let classes = if carried {
-                    Classes::Carry
-                } else {
-                    Classes::Written {
-                        left: Some(id),
-                        joined: Some(id),
-                    }
-                };
-                self.tell_leaving(&workers, classes, change, &off, now);
+            MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. } => {
+                self.tell_leaving(&workers, change, &off, now);
             }
             MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
             MembershipChange::Removed { id } => {
-                let classes = Classes::Written {
-                    left: Some(id),
-                    joined: None,
-                };
-                self.pay_leave(&workers, classes, now);
+                self.pay_leave(&workers, now);
                 self.tell_membership(change);
                 // The key is filed as gone, by this store's own clock.
                 if let Some(row) = left {
@@ -705,13 +670,12 @@ impl MemoryStore {
     /// the applying thread and outside the store's lock, and so is a
     /// generation the store refuses.
     ///
-    /// The generation is the one writer of the mode the pair classes are
-    /// derived under ([`AppliedSpec::pairing`]). A generation of another
-    /// mode derives the standing membership's pools again and publishes
-    /// them once, under the new generation: no member moved, so the
-    /// store's epoch stays and no watcher is told. An apply takes the
-    /// workers lock and then the load lock, as a membership write does: a
-    /// writer's wait, never a decision's.
+    /// No member moved, so the store's epoch stays and no watcher is told:
+    /// the pools are published as they stood, under the new generation,
+    /// whatever its pairing mode, and a build the membership writes left
+    /// owed is left to its window. An apply takes the workers lock and then
+    /// the load lock, as a membership write does: a writer's wait, never a
+    /// decision's.
     ///
     /// The generation's engine is then told every member once, by id
     /// ([`Membership::Snapshot`]), under the workers lock and with the load
@@ -804,17 +768,12 @@ impl MemoryStore {
                 return Ok(false);
             }
             let writer = &mut loads.writer;
-            let (world, before) =
-                writer.apply(Arc::clone(&spec), workers.epoch, workers.members())?;
+            let (world, before) = writer.apply(Arc::clone(&spec), workers.members())?;
             spec.engine().succeed(self.world.load().spec().engine());
+            // The pools are published as they stood: a build the membership
+            // writes left owed is left to its window, and with it the table
+            // of the members no world named.
             writer.replaced(self.world.swap(world));
-            // A generation of another pairing mode builds the membership
-            // and lists every member. One of the standing mode publishes
-            // the pools as they stood: the owed build is left to its
-            // window, and the table with it.
-            if !writer.owes() {
-                self.listed();
-            }
             drop(loads);
             self.tell_members(&workers);
             if let Some(journal) = &self.journal {
@@ -877,7 +836,7 @@ impl MemoryStore {
         let mut loads = self.loads.lock();
         let writer = &mut loads.writer;
         writer.clear_listed();
-        let world = writer.rebuild(workers.epoch, workers.members(), Classes::Derive);
+        let world = writer.rebuild(workers.epoch, workers.members());
         writer.replaced(self.world.swap(world));
         // The build listed every member: none is left for the table.
         self.listed();
@@ -932,15 +891,14 @@ impl MemoryStore {
     fn tell_leaving(
         &self,
         workers: &Workers,
-        classes: Classes,
         change: MembershipChange,
         left: &[String],
         now: Instant,
     ) {
         if left.is_empty() {
-            self.owe(classes, now);
+            self.owe(now);
         } else {
-            self.pay_leave(workers, classes, now);
+            self.pay_leave(workers, now);
             let id = change.id();
             self.tell_engine(&Membership::Left { id, models: left });
         }
@@ -968,13 +926,13 @@ impl MemoryStore {
     }
 
     /// A membership write left the pools to be built again. Called under
-    /// the workers lock by every membership write, with what the write asks
-    /// of the pair classes. The build is owed until the store's window ends
-    /// and takes in every write since the last: a storm of registrations
-    /// builds once a window, never once a write. A lease asks for none: it
-    /// books the slot the member's write gave it ([`Self::join`]).
-    fn owe(&self, classes: Classes, at: Instant) {
-        let first = self.loads.lock().writer.owe(classes, at);
+    /// the workers lock by every membership write. The build is owed until
+    /// the store's window ends and takes in every write since the last: a
+    /// storm of registrations builds once a window, never once a write. A
+    /// lease asks for none: it books the slot the member's write gave it
+    /// ([`Self::join`]).
+    fn owe(&self, at: Instant) {
+        let first = self.loads.lock().writer.owe(at);
         self.wake_host(first);
     }
 
@@ -1023,8 +981,8 @@ impl MemoryStore {
     /// wrote, a served call or a followed change. A storm of removals so
     /// builds once a removal. The window stands as it was, and the host is
     /// not woken: nothing is left owed.
-    fn pay_leave(&self, workers: &Workers, classes: Classes, at: Instant) {
-        self.loads.lock().writer.owe(classes, at);
+    fn pay_leave(&self, workers: &Workers, at: Instant) {
+        self.loads.lock().writer.owe(at);
         self.pay(workers, None);
     }
 
@@ -1571,8 +1529,6 @@ pub(crate) struct Told {
     pub(crate) at: Position,
     /// The membership epoch.
     pub(crate) epoch: u64,
-    /// The history the epoch stands in ([`WorkersStore::history`]).
-    pub(crate) history: u64,
     statuses: FxHashMap<WorkerId, WorkerStatus>,
 }
 
@@ -1588,13 +1544,11 @@ impl Told {
 #[cfg(feature = "worker-host")]
 impl MemoryStore {
     /// The told status of every row: what the journal last told of its
-    /// id, with the journal's place, the membership epoch and the history
-    /// the epoch stands in, all read in one hold of the membership lock.
+    /// id, with the journal's place and the membership epoch,
+    /// all read in one hold of the membership lock.
     /// A status write holds that lock from its apply to its telling, so
     /// no status stands half told here. The hold copies a place and one
-    /// status a row, and no row. The epoch and the history say whether
-    /// the store moved since a reader's own read of its rows: the holder
-    /// of the worker objects reads the store again where it did.
+    /// status a row, and no row.
     ///
     /// The told status is the log's own word, kept beside the epoch and
     /// the tail: no copy of what a decision reads. A decision reads a
@@ -1629,7 +1583,6 @@ impl MemoryStore {
         Told {
             at,
             epoch: workers.epoch,
-            history: workers.history,
             statuses,
         }
     }
@@ -1760,8 +1713,7 @@ impl WorkersStore for MemoryStore {
         patch.laid_on(&mut row.row.facts);
         row.row.revision += 1;
         let change = workers.record(MembershipChange::Relabelled { id });
-        // Labels, a priority and an overload are no part of an offer.
-        self.owe(Classes::Carry, Instant::now());
+        self.owe(Instant::now());
         self.tell_membership(change);
         Some(change)
     }
@@ -1777,12 +1729,8 @@ impl WorkersStore for MemoryStore {
         // gone would stay for good, the next incarnation having a new id.
         self.forget_worker(id);
         let change = workers.record_over(MembershipChange::Removed { id }, Some(&row.row));
-        let classes = Classes::Written {
-            left: Some(id),
-            joined: None,
-        };
         let now = Instant::now();
-        self.pay_leave(&workers, classes, now);
+        self.pay_leave(&workers, now);
         self.tell_membership(change);
         // The key's session pins stand through its absence in the
         // engine's table: the key is filed as gone, and the
@@ -3091,7 +3039,7 @@ impl MemoryStore {
     }
 
     /// Issues the two leases of one pair's decision under the one id the
-    /// store mints: [`Self::issue_decided`] for `record`, the prefill
+    /// store mints: [`Self::issue_keyed`] for `record`, the prefill
     /// part, with `side`, the decode side, laid beside it under the same
     /// hold of the turn. `booked` holds the slots of the counts the sides
     /// book, the prefill's first. `issued` hears the prefill and then the

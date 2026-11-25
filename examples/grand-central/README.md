@@ -121,7 +121,8 @@ drops a worker judged overloaded: the queue or the KV-cache usage in its
 engine's load reports stands at or over a threshold. A started controller's
 load monitor judges each worker by the threshold its registration names, or
 by the program's: by default 8 queued requests and a usage of 0.8, and a
-start may state others. A worker of the
+start may state others. A document whose every binding sets
+`overload.enabled: false` switches the program's off. A worker of the
 `external` runtime is judged by its registration's alone. The example's tests
 show what the verdict does: a worker judged overloaded is passed over, and
 the next one opens.

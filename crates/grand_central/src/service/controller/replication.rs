@@ -1104,12 +1104,22 @@ mod tests {
             leader
         }
 
+        /// A holder of the leader's worker objects, for a cut. The cases
+        /// write their rows through the store's own entries, which take no
+        /// turn of a holder: this one follows the store once, as the host
+        /// of such a store has it follow.
+        fn objects(&self) -> Arc<Objects<Members>> {
+            let objects = holder(&self.store);
+            objects.follow(&*self.store);
+            objects
+        }
+
         fn replication(&self) -> Replication {
             Replication::new(
                 Arc::clone(&self.store),
                 Arc::clone(&self.log),
                 self.elector.fence(),
-                holder(&self.store),
+                self.objects(),
             )
         }
 
@@ -2570,7 +2580,7 @@ mod tests {
 
         let leader = Leader::leading();
         leader.writes_a_page_and_one();
-        let objects = holder(&leader.store);
+        let objects = leader.objects();
         let (before, rows) = first_copy(&leader, &objects);
         assert_eq!(rows.len(), 129);
         door(&leader)
@@ -2587,7 +2597,7 @@ mod tests {
     fn a_copy_behind_a_terms_start_holds_every_row_under_the_new_term() {
         let leader = Leader::leading();
         leader.writes_a_page_and_one();
-        let objects = holder(&leader.store);
+        let objects = leader.objects();
         let (before, rows) = first_copy(&leader, &objects);
         let later = leader.term + 1;
         leader.store.set_term(later);
@@ -2604,7 +2614,7 @@ mod tests {
     fn a_copy_behind_a_status_tell_holds_the_told_status_at_its_place() {
         let leader = Leader::leading();
         let id = leader.writes(0);
-        let objects = holder(&leader.store);
+        let objects = leader.objects();
         let (before, rows) = first_copy(&leader, &objects);
         let [row] = rows.as_slice() else {
             panic!("one row was written");

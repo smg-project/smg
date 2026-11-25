@@ -27,18 +27,14 @@ use prost_types::{
 use smg_grand_central::{
     cases,
     document::{PolicySpec, DENIED_HEADERS},
-    engine::{
-        fingerprint, Identity, LiftedVeto, Pair, Phase, Queue, RequestFacts, Role, Shed,
-        ShedReason, Target, Trace,
-    },
-    mirrored, record,
-    tracking::{Lease, LeaseKind, Side},
+    engine::{fingerprint, Identity, Phase, RequestFacts, Role, ShedReason},
+    mirrored,
+    tracking::Side,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
 const PLUGIN_PROTO: &str = "policy_plugin.proto";
 const CONTROLLER_PROTO: &str = "grand_central.proto";
-const ENGINE_WIRE_PROTO: &str = "common.proto";
 const WORLD_WIT: &str = "smg-policy.wit";
 const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
@@ -114,89 +110,30 @@ fn health_record() -> &'static [&'static str] {
 }
 
 fn target_record() -> &'static [&'static str] {
-    record!(
-        Target,
-        Target {
-            position,
-            id,
-            dp_rank,
-            pair
-        }
-    )
+    mirrored::target()
 }
 
 fn pair_record() -> &'static [&'static str] {
-    record!(
-        Pair,
-        Pair {
-            decode_position,
-            decode_id,
-            decode_dp_rank,
-            decode_verdict
-        }
-    )
+    mirrored::pair()
 }
 
 fn shed_record() -> &'static [&'static str] {
-    record!(
-        Shed,
-        Shed {
-            reason,
-            emptied_by,
-            retry_after_secs,
-            wait_allowed,
-            trace
-        }
-    )
+    mirrored::shed()
 }
 
 fn queue_record() -> &'static [&'static str] {
-    record!(
-        Queue,
-        Queue {
-            ticket,
-            max_wait_micros,
-            trace
-        }
-    )
+    mirrored::queue()
 }
 
 fn trace_record() -> &'static [&'static str] {
-    record!(
-        Trace,
-        Trace {
-            profile,
-            survivors,
-            top,
-            top_len,
-            seed,
-            generation,
-            lifted
-        }
-    )
+    mirrored::trace()
 }
 
 /// The lease's session crosses under the name both contracts still spell,
 /// `session_key`. A gateway's client reads it under that name. A change that
 /// renames the field renames it in both contracts and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
-    record!(
-        Lease,
-        Lease {
-            id,
-            kind,
-            side,
-            target_index,
-            booked,
-            generation,
-            session as "session_key",
-            session_verdict,
-            issued_micros,
-            tokens,
-            chars,
-            bytes,
-        }
-    )
+    mirrored::lease()
 }
 
 fn outcome_record() -> &'static [&'static str] {
@@ -272,13 +209,7 @@ fn enum_mirrors() -> Vec<(
             "LeaseKind",
             "LEASE_KIND",
             "lease-kind",
-            cases!(
-                LeaseKind,
-                LeaseKind {
-                    Credit,
-                    Reservation
-                }
-            ),
+            mirrored::lease_kind(),
         ),
         (
             "Completed.Class",
@@ -474,6 +405,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "stalled",
                 "held",
                 "places",
+                "target_worker",
             ],
             wire_only: &[],
             wire: &[
@@ -772,8 +704,6 @@ const CONTROLLER_RPCS: &[Rpc] = &[
         false,
         true,
     ),
-    ("PushLoad", "LoadReport", "Ack", true, false),
-    ("PushKvEvents", "RelayKvFrame", "Ack", true, false),
     (
         "RegisterWorker",
         "RegisterWorkerRequest",
@@ -919,12 +849,6 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
         "made",
         &["registered", "replaced", "removed", "relabelled"],
     ),
-    (
-        CONTROLLER_PROTO,
-        "RelayKvFrame",
-        "frame",
-        &["batch", "subscribed", "resync", "ended"],
-    ),
     (CONTROLLER_PROTO, "ReplicaFrame", "frame", &["hello", "ack"]),
     (
         CONTROLLER_PROTO,
@@ -978,12 +902,6 @@ fn contracts_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts")
 }
 
-/// The engine wire's protos (`smg.grpc.common`): the controller protocol
-/// imports the load record and the event batch a relay forwards unchanged.
-fn engine_wire_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../worker/proto")
-}
-
 fn compile_protocol() -> io::Result<FileDescriptorSet> {
     let dir = contracts_dir();
     let mut config = prost_build::Config::new();
@@ -992,7 +910,7 @@ fn compile_protocol() -> io::Result<FileDescriptorSet> {
     config.protoc_arg("--experimental_allow_proto3_optional");
     config.load_fds(
         &[dir.join(PLUGIN_PROTO), dir.join(CONTROLLER_PROTO)],
-        &[dir, engine_wire_dir()],
+        &[dir],
     )
 }
 
@@ -1263,8 +1181,8 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     assert_eq!(controller.package(), PACKAGE);
     assert_eq!(
         controller.dependency,
-        strings(&[PLUGIN_PROTO, ENGINE_WIRE_PROTO]),
-        "the controller protocol imports the plugin vocabulary and the engine wire"
+        strings(&[PLUGIN_PROTO]),
+        "the controller protocol imports the plugin vocabulary alone"
     );
 
     for mirror in proto_mirrors() {
@@ -1333,21 +1251,14 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     // The lifted veto: the mark's variants in order, numbered from zero.
     // Its zero is none, a case, on purpose: the enum's comment says why.
     let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
-    let expected: Vec<(String, i32)> = cases!(
-        LiftedVeto,
-        LiftedVeto {
-            None,
-            Overload,
-            Liveness
-        }
-    )
-    .iter()
-    .enumerate()
-    .map(|(i, case)| {
-        let number = i32::try_from(i).unwrap_or(i32::MAX);
-        (format!("LIFTED_VETO_{}", screaming_case(case)), number)
-    })
-    .collect();
+    let expected: Vec<(String, i32)> = mirrored::lifted_veto()
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let number = i32::try_from(i).unwrap_or(i32::MAX);
+            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+        })
+        .collect();
     assert_eq!(
         found, expected,
         "the lifted vetoes are the mark's, from none"
@@ -1821,6 +1732,34 @@ fn the_membership_fields_are_pinned() {
             &["Pending", "Ready", "NotReady", "Draining", "Failed"]
         ))
     );
+}
+
+/// The ingestion scope left the principal's scopes with its two relay calls:
+/// its number and its name stay reserved, so a later scope takes neither.
+#[test]
+fn the_principals_scopes_keep_the_ingestion_scopes_number_and_name_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    assert_eq!(
+        enum_values(controller, "Principal.Scope"),
+        Some(vec![
+            ("SCOPE_UNSPECIFIED".to_owned(), 0),
+            ("SCOPE_GATEWAY".to_owned(), 1),
+            ("SCOPE_CONTROL".to_owned(), 3),
+            ("SCOPE_REPLICATION".to_owned(), 4),
+        ])
+    );
+    let scopes = message(controller, "Principal")
+        .and_then(|principal| principal.enum_type.iter().find(|e| e.name() == "Scope"))
+        .expect("Principal.Scope is in the controller file");
+    let reserved: Vec<i32> = scopes
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..=range.end())
+        .collect();
+    assert_eq!(reserved, [2], "the reserved number");
+    assert_eq!(scopes.reserved_name, strings(&["SCOPE_INGESTION"]));
 }
 
 /// The packed request block's layout as the world's comment states it: an

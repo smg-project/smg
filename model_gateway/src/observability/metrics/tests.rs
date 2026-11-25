@@ -8,7 +8,7 @@ use std::{
 use metrics_exporter_prometheus::PrometheusBuilder;
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
-    engine::{Candidate, Decision, Members, RequestFacts, Scorer, TieBand},
+    engine::{Candidate, Decision, Members, RequestFacts, Scorer, TieBand, POLICY_FAULTS_HELP},
     stages::{Lifecycle, StageRegistry},
     tracking::{EventSet, Lease},
 };
@@ -317,8 +317,8 @@ fn the_engines_fault_counts_are_published_from_zero_each_under_its_kind() {
 
         assert_eq!(scraped(), [Some(0); 3]);
         let rendered = handle.render();
-        let help = "# HELP smg_policy_faults_total Panics Grand Central held and counted";
-        assert!(rendered.contains(help), "{rendered}");
+        let help = format!("# HELP smg_policy_faults_total {POLICY_FAULTS_HELP}\n");
+        assert!(rendered.contains(&help), "{rendered}");
         let series = |line: &&str| line.starts_with("smg_policy_faults_total{");
         assert_eq!(rendered.lines().filter(series).count(), 3, "{rendered}");
 

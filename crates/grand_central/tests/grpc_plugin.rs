@@ -167,15 +167,10 @@ fn bound_profile(bound: Arc<PluginBinding>, stages: u32, fallbacks: bool) -> Pro
     } else {
         Box::new(Best)
     };
-    Profile {
-        name: "plugin".into(),
-        filters: vec![filter],
-        scorers: vec![WeightedScorer {
-            scorer,
-            weight: 1.0,
-        }],
-        picker,
-    }
+    let mut profile = Profile::of("plugin".into(), picker);
+    profile.filters = vec![filter];
+    profile.scorers = vec![WeightedScorer::of(scorer, 1.0)];
+    profile
 }
 
 fn profile(plugin: &Arc<Plugin>, stages: u32) -> Profile {
@@ -188,29 +183,24 @@ fn profile(plugin: &Arc<Plugin>, stages: u32) -> Profile {
 fn filter_then_picker(filter: &Arc<Plugin>, picker: &Arc<Plugin>) -> Profile {
     let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
     let best: Option<Box<dyn Picker>> = Some(Box::new(Best));
-    Profile {
-        name: "two-plugins".into(),
-        filters: vec![Box::new(GrpcFilter::new(filter.bind(), healthy))],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(GrpcPicker::new(picker.bind(), best)),
-    }
+    let mut profile = Profile::of(
+        "two-plugins".into(),
+        Box::new(GrpcPicker::new(picker.bind(), best)),
+    );
+    profile.filters = vec![Box::new(GrpcFilter::new(filter.bind(), healthy))];
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    profile
 }
 
 fn binding(plan: Plan, decode_profile: Option<u16>) -> Binding {
-    Binding {
-        model: "*".into(),
-        phases: vec![],
-        plan,
-        profile: 0,
-        decode_profile,
-        shadow: None,
-        decode_shadow: None,
-        sessions: None,
-        overload: None,
-    }
+    let mut binding = Binding::of("*".into(), 0);
+    binding.phases = vec![];
+    binding.plan = plan;
+    binding.decode_profile = decode_profile;
+    binding.shadow = None;
+    binding.decode_shadow = None;
+    binding.sessions = None;
+    binding
 }
 
 fn single_engine(profile: Profile) -> Engine {
@@ -988,14 +978,13 @@ fn a_pair_asks_both_sides_at_once_on_one_stream() {
     let mut pool_facts = PoolFacts::default();
     pool_facts.pool_size = 7;
     pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = engine.decide_pair(
         &facts(9),
         &pool_facts,
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -1059,14 +1048,13 @@ fn decide_pair(plugin: &Arc<Plugin>, facts: &RequestFacts<'_>) -> Decision {
     let mut pool_facts = PoolFacts::default();
     pool_facts.pool_size = 7;
     pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     engine.decide_pair(
         facts,
         &pool_facts,
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -1135,14 +1123,13 @@ fn a_pick_only_frame_is_not_sent_once_the_plugin_failed_its_decision() {
     let mut pool_facts = PoolFacts::default();
     pool_facts.pool_size = 7;
     pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = engine.decide_pair(
         &facts(9),
         &pool_facts,
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -1185,16 +1172,14 @@ fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
     served.behave(Behaviour::ScoreNan);
     let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
     let least: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
+    let mut profile = Profile::of("both-kinds".into(), Box::new(Best));
+    profile.filters = vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(GrpcScorer::new(remote.bind(), least)),
+        1.0,
+    )];
     let engine = Engine::new(
-        vec![Profile {
-            name: "both-kinds".into(),
-            filters: vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(GrpcScorer::new(remote.bind(), least)),
-                weight: 1.0,
-            }],
-            picker: Box::new(Best),
-        }],
+        vec![profile],
         vec![binding(Plan::PdPair, Some(0))],
         1,
         Needs::default(),
@@ -1211,14 +1196,13 @@ fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
     let mut pool_facts = PoolFacts::default();
     pool_facts.pool_size = 7;
     pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = engine.decide_pair(
         &request,
         &pool_facts,
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -2057,21 +2041,16 @@ fn a_miss_under_the_remainders_clamp_is_the_decisions_budget_spent_and_no_failur
 /// A profile whose filters are these plugins in order, each with its
 /// built-in fallback: every frame leaves at the decision's open.
 fn filters_of(plugins: &[&Arc<Plugin>]) -> Profile {
-    Profile {
-        name: "filters".into(),
-        filters: plugins
-            .iter()
-            .map(|plugin| {
-                let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
-                Box::new(GrpcFilter::new(plugin.bind(), healthy)) as Box<dyn Filter>
-            })
-            .collect(),
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    }
+    let mut profile = Profile::of("filters".into(), Box::new(Best));
+    profile.filters = plugins
+        .iter()
+        .map(|plugin| {
+            let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
+            Box::new(GrpcFilter::new(plugin.bind(), healthy)) as Box<dyn Filter>
+        })
+        .collect();
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    profile
 }
 
 /// A frame sent with its whole budget is still the remainder's where the
@@ -2533,18 +2512,16 @@ fn a_frame_past_the_window_is_refused_without_a_fault() {
     let scorers = (0..9)
         .map(|_| {
             let fallback: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
-            WeightedScorer {
-                scorer: Box::new(GrpcScorer::new(binder.bind(), fallback)) as Box<dyn Scorer>,
-                weight: 1.0,
-            }
+            WeightedScorer::of(
+                Box::new(GrpcScorer::new(binder.bind(), fallback)) as Box<dyn Scorer>,
+                1.0,
+            )
         })
         .collect();
-    let engine = single_engine(Profile {
-        name: "nine".into(),
-        filters: vec![Box::new(Healthy)],
-        scorers,
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("nine".into(), Box::new(Best));
+    profile.filters = vec![Box::new(Healthy)];
+    profile.scorers = scorers;
+    let engine = single_engine(profile);
     assert_eq!(
         lead(&decide(&engine, &pool(4), 1)),
         Some(103),
@@ -3366,15 +3343,10 @@ fn an_adapter_needs_the_lifecycle_where_its_row_or_its_fallback_does() {
     assert!(!adapter(None).needs_lifecycle());
 
     let engine_of = |fallback: Option<Box<dyn Scorer>>| {
-        single_engine(Profile {
-            name: "adapted".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(adapter(fallback)),
-                weight: 1.0,
-            }],
-            picker: Box::new(Best),
-        })
+        let mut profile = Profile::of("adapted".into(), Box::new(Best));
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(Box::new(adapter(fallback)), 1.0)];
+        single_engine(profile)
     };
     assert!(engine_of(Some(Box::new(Kept))).needs_lifecycle());
     assert!(!engine_of(None).needs_lifecycle());
@@ -3643,10 +3615,8 @@ fn a_dispatch_tells_the_plugin_the_index_its_lease_names() {
     let runtime = runtime();
     let plugin = load(&runtime, &served, "second-target");
     let engine = single_engine(profile(&plugin, ALL));
-    let lease = Lease {
-        target_index: 1,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.target_index = 1;
     engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
     assert!(eventually(|| served.seen().events.len() == 1));
     let seen = served.seen();
@@ -4171,10 +4141,8 @@ fn a_frame_carries_block_hashes_to_a_row_that_declares_them_alone() {
 fn a_lease_and_its_request_show_one_session_value_or_none() {
     let mut keyed = facts(1);
     keyed.session_key = Identity::plain("s-1");
-    let lease = Lease {
-        session: keyed.session(),
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.session = keyed.session();
     let value = lease.session.get();
     assert_ne!(value, 0, "a keyed request has a session");
     let runtime = runtime();

@@ -170,7 +170,7 @@ pub struct Replica {
     lines: Arc<Mutex<Vec<String>>>,
     /// The thread that reads the process's log into `lines`, until joined.
     reader: Option<thread::JoinHandle<()>>,
-    /// Where its gateway and ingestion scopes listen.
+    /// Where its gateway scope listens.
     pub gateway: SocketAddr,
     /// Where its control scope listens.
     pub control: SocketAddr,

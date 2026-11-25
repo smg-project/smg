@@ -16,10 +16,11 @@
 
 use crate::{
     engine::{
-        AffinityFacts, Candidate, Constraints, HashKind, Health, LoadRow, MediaCounts,
-        OverloadRegime, PoolFacts, RequestFacts, SignalSource, ZoneCapacity,
+        AffinityFacts, Candidate, Constraints, HashKind, Health, LiftedVeto, LoadRow, MediaCounts,
+        OverloadRegime, Pair, PoolFacts, Queue, RequestFacts, Shed, SignalSource, Target, Trace,
+        ZoneCapacity,
     },
-    tracking::{Membership, Outcome, ReleaseReason, Signal, TransportClass},
+    tracking::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Signal, TransportClass},
 };
 
 /// A record's field names in declaration order. The pattern names every
@@ -263,7 +264,8 @@ pub fn constraints() -> &'static [&'static str] {
             demands,
             stalled,
             held,
-            places
+            places,
+            target_worker
         }
     )
 }
@@ -360,6 +362,126 @@ pub fn overload_regime() -> &'static [&'static str] {
             None,
             Partial,
             Saturated
+        }
+    )
+}
+
+/// The fields of [`Target`].
+#[must_use]
+pub fn target() -> &'static [&'static str] {
+    record!(
+        Target,
+        Target {
+            position,
+            id,
+            dp_rank,
+            pair
+        }
+    )
+}
+
+/// The fields of [`Pair`].
+#[must_use]
+pub fn pair() -> &'static [&'static str] {
+    record!(
+        Pair,
+        Pair {
+            decode_position,
+            decode_id,
+            decode_dp_rank,
+            decode_verdict
+        }
+    )
+}
+
+/// The fields of [`Shed`].
+#[must_use]
+pub fn shed() -> &'static [&'static str] {
+    record!(
+        Shed,
+        Shed {
+            reason,
+            emptied_by,
+            retry_after_secs,
+            wait_allowed,
+            trace
+        }
+    )
+}
+
+/// The fields of [`Queue`].
+#[must_use]
+pub fn queue() -> &'static [&'static str] {
+    record!(
+        Queue,
+        Queue {
+            ticket,
+            max_wait_micros,
+            trace
+        }
+    )
+}
+
+/// The fields of [`Trace`].
+#[must_use]
+pub fn trace() -> &'static [&'static str] {
+    record!(
+        Trace,
+        Trace {
+            profile,
+            survivors,
+            top,
+            top_len,
+            seed,
+            generation,
+            lifted
+        }
+    )
+}
+
+/// The fields of [`Lease`].
+#[must_use]
+pub fn lease() -> &'static [&'static str] {
+    record!(
+        Lease,
+        Lease {
+            id,
+            kind,
+            side,
+            target_index,
+            booked,
+            generation,
+            session as "session_key",
+            session_verdict,
+            issued_micros,
+            tokens,
+            chars,
+            bytes,
+        }
+    )
+}
+
+/// The cases of [`LeaseKind`].
+#[must_use]
+pub fn lease_kind() -> &'static [&'static str] {
+    cases!(
+        LeaseKind,
+        LeaseKind {
+            Credit,
+            Reservation
+        }
+    )
+}
+
+/// The cases of [`LiftedVeto`].
+#[must_use]
+pub fn lifted_veto() -> &'static [&'static str] {
+    cases!(
+        LiftedVeto,
+        LiftedVeto {
+            None,
+            Overload,
+            Liveness
         }
     )
 }

@@ -28,7 +28,10 @@ use super::{
     generations::Generations,
     readiness::{Sample, State},
 };
-use crate::store::StoreStats;
+use crate::{
+    engine::{POLICY_FAULTS_HELP, POLICY_FAULT_KINDS},
+    store::StoreStats,
+};
 
 /// `1` for the controller's state (`starting`, `leader`, `syncing`,
 /// `follower`, `draining`), `0` for the other four. The admin listener sets it from the
@@ -128,8 +131,12 @@ pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_grand_central_lifecycle_faults_tot
 /// every engine the store built: `decision` (a whole decision, a shadow's
 /// beside a live decision among them), `event` (a stage at a word the
 /// engine tells it) and `upkeep` (a step of the engine's upkeep). It is a
-/// gateway's family of that name, with one definition in both processes,
-/// and it never starts again at a new document.
+/// gateway's family of that name, with one definition in both processes:
+/// each page takes the kinds and the description from the engine's
+/// constants ([`POLICY_FAULT_KINDS`], [`POLICY_FAULTS_HELP`]). The name
+/// stays a literal here, as every series this module declares (the
+/// README's guard reads them), and a case holds it to the engine's. It
+/// never starts again at a new document.
 ///
 /// On a controller `upkeep` is a run of the upkeep at the presence sweep's
 /// tick, and `event` is a stage's panic at a change of membership: the one
@@ -351,8 +358,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(POLICY_FAULTS_TOTAL),
             None,
-            "Panics Grand Central held and counted, by kind: decision (a decision that panicked, a shadow's beside a live decision among them), event (a stage at a lease event or a change of membership), upkeep (a step of the engine's upkeep: its sweep, the registry's follow, a load report, a fill of worker lists)"
-                .into(),
+            POLICY_FAULTS_HELP.into(),
         );
         recorder.describe_gauge(
             KeyName::from_const_str(MEMBERS_OUTSIDE_LIST),
@@ -422,7 +428,7 @@ impl Metrics {
         let lifecycle_faults =
             recorder.register_counter(&Key::from_name(LIFECYCLE_FAULTS_TOTAL), &metadata);
         let policy_faults =
-            ["decision", "event", "upkeep"].map(|kind| counter(POLICY_FAULTS_TOTAL, "kind", kind));
+            POLICY_FAULT_KINDS.map(|kind| counter(POLICY_FAULTS_TOTAL, "kind", kind));
         start.set(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -600,9 +606,9 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{
-        Generations, LoadTotals, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST, POLICY_FAULTS_TOTAL,
-        REPLICATION_LAG_SECONDS, REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED,
-        SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
+        Generations, LoadTotals, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST, POLICY_FAULTS_HELP,
+        POLICY_FAULTS_TOTAL, REPLICATION_LAG_SECONDS, REPLICATION_RESTORES_ASKED_TOTAL,
+        REPLICATION_SYNCED, SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
     };
     use crate::{
         service::controller::{
@@ -997,7 +1003,9 @@ mod tests {
                 &DecideStats::default(),
                 || counts,
             );
-            assert!(rendered.contains("# HELP smg_policy_faults_total Panics Grand Central "));
+            assert_eq!(POLICY_FAULTS_TOTAL, crate::engine::POLICY_FAULTS_TOTAL);
+            let help = format!("# HELP smg_policy_faults_total {POLICY_FAULTS_HELP}\n");
+            assert!(rendered.contains(&help), "{rendered}");
             assert!(rendered.contains("# TYPE smg_policy_faults_total counter"));
             ["decision", "event", "upkeep"].map(|kind| {
                 let label = format!("kind=\"{kind}\"");

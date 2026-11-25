@@ -171,14 +171,7 @@ enum Hop {
     Gone,
 }
 
-/// Where one of a worker's blocks lives: the run and the offset of the block within it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BlockRef {
-    pub run: u32,
-    pub offset: u32,
-}
-
-pub use crate::lane_map::ChainBlockMap;
+pub use crate::lane_map::{BlockRef, ChainBlockMap};
 
 /// Memory and shape counters, as the replay harness reports them and the gateway exports them.
 #[derive(Debug, Clone, Copy, Default)]

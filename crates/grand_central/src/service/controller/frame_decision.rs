@@ -69,7 +69,7 @@ use super::{
 use crate::{
     document::{spec::AppliedSpec, KeySources},
     engine::{
-        decision::{shed, Decision, Pair, Pick, ShedReason, Target},
+        decision::{shed, Decision, Pair, Pick, ShedReason, Target, TARGET_WORKER},
         decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},
         framework::{release, EncodeItems, EncodePlaced},
         in_process::{
@@ -443,7 +443,7 @@ fn decide_named(
         }
         Reached::NoWorker => {
             let (seed, generation) = (frame.seed(), spec.generation());
-            let stage = named_worker::TARGET_WORKER;
+            let stage = TARGET_WORKER;
             let answer = shed(ShedReason::NoEndpoints, stage, seed, generation);
             Ok(booked(answer, None, frame, read, true))
         }

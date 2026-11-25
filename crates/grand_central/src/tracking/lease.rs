@@ -9,12 +9,6 @@
 //! calls the lifecycle once per side. Every stateful built-in keeps its state
 //! behind these events alone.
 
-#![expect(
-    clippy::exhaustive_enums,
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{fmt, time::Instant};
 
 use crate::{
@@ -30,6 +24,7 @@ use crate::{
 pub struct LeaseId(pub u64);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LeaseKind {
     /// Soft load accounting. The built-in least-load scorer releases it at the
     /// next report sampled after the dispatch; release at completion and at
@@ -53,9 +48,10 @@ pub enum Side {
 
 /// The record of one issued decision, or of one side of a pair decision.
 ///
-/// The record gains fields: code outside this crate that builds one writes the
-/// rest as `..Lease::default()`, and a pattern of it ends with `..`.
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Lease {
     pub id: LeaseId,
     pub kind: LeaseKind,
@@ -247,6 +243,7 @@ pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_s
 
 /// What a gateway's `Dispatched` report says beside its lease.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Dispatch {
     /// Which target of the pick the gateway dispatched to.
     pub target_index: u8,

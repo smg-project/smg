@@ -15,8 +15,9 @@
 //! its `Engine`. Each method beside `place` is a call the host contract
 //! still owes a program, and leaves that list with the change that pays it.
 //!
-//! One module a plan holds the plan's cases. A single request is served so
-//! far (`caller/single.rs`). The example's own stage
+//! One module a plan holds the plan's cases. A single request
+//! (`caller/single.rs`) and a pair of a prefill worker and a decode worker
+//! (`caller/pair.rs`) are served so far. The example's own stage
 //! (`examples/in_process/engine_load.rs`) is taken in beside the program,
 //! and its cases decide over records made by hand (`caller/stage.rs`).
 //!
@@ -26,12 +27,14 @@
 
 use std::{future::Future, sync::Arc};
 
-use program::{settings, Program};
-use smg_grand_central::document::{AppliedSpec, PolicySettings};
+use program::{pair_settings, settings, Plan, Program};
+use smg_grand_central::document::{AppliedSpec, PolicySettings, RoutingSettings};
 use smg_worker::{identity::basic::Worker, load::state::TestFeed, test_support::ready_worker};
 
 #[path = "../examples/in_process/engine_load.rs"]
 mod engine_load;
+#[path = "caller/pair.rs"]
+mod pair;
 #[path = "../examples/in_process/program.rs"]
 mod program;
 #[path = "caller/single.rs"]
@@ -62,31 +65,64 @@ fn served(_: &dyn Worker) -> u16 {
     200
 }
 
-/// The program started from `spec` over `fleet`, with `sends` as its sends:
-/// the program, its load monitor's stand-in, whose channel the engine
-/// holds, and the engine's task to spawn.
-fn started(
+/// The program started from `spec` over `fleet`, routing to the kinds of
+/// worker `plan` says, with `sends` as its sends: the program, its load
+/// monitor's stand-in, whose channel the engine holds, and the engine's
+/// task to spawn.
+fn started_as(
+    plan: Plan,
     spec: AppliedSpec,
     fleet: &[Arc<dyn Worker>],
     sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
 ) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
     let mut channel = None;
     let loads = TestFeed::attached_to(|handed| channel = handed);
-    let (program, task) = Program::start(spec, channel, sends);
+    let (program, task) = Program::start(plan, spec, channel, sends);
     for worker in fleet {
         assert!(program.join(Arc::clone(worker)), "a free address joins");
     }
     (program, loads, task)
 }
 
-/// [`started`] under the document a gateway that sets `policy` means.
+/// [`started_as`] over single workers.
+fn started(
+    spec: AppliedSpec,
+    fleet: &[Arc<dyn Worker>],
+    sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
+) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
+    started_as(Plan::Single, spec, fleet, sends)
+}
+
+/// [`started_as`] under `settings`: the document they mean, and the kinds
+/// of worker their mode says.
+fn under_settings(
+    settings: &RoutingSettings,
+    fleet: &[Arc<dyn Worker>],
+    sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
+) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
+    let plan = Plan::of(settings).expect("a mode the program serves");
+    let document = settings.policy_document();
+    let document = document.expect("the settings have a document");
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    started_as(plan, spec, fleet, sends)
+}
+
+/// The program under the document a gateway that sets `policy` means, over
+/// single workers.
 fn under(
     policy: PolicySettings,
     fleet: &[Arc<dyn Worker>],
     sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
 ) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
-    let document = settings(policy).policy_document();
-    let document = document.expect("the settings have a document");
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    started(spec, fleet, sends)
+    under_settings(&settings(policy), fleet, sends)
+}
+
+/// The program under the document a gateway means that routes to pairs,
+/// both sides under `policy`.
+fn under_pairs(
+    policy: PolicySettings,
+    fleet: &[Arc<dyn Worker>],
+    sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
+) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
+    under_settings(&pair_settings(policy), fleet, sends)
 }

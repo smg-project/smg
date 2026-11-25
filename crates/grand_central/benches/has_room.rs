@@ -77,17 +77,13 @@ fn rows(n: usize) -> Vec<Candidate> {
 /// Tells the engine of one send to each row, stated after every report of
 /// the fleet was sampled: the rule's count holds it at each decision.
 fn send_each(engine: &Engine, rows: &[Candidate]) {
-    let lease = Lease {
-        issued_micros: 999_500,
-        tokens: 379,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = 999_500;
+    lease.tokens = 379;
     for row in rows {
-        let target = Target {
-            id: row.id,
-            dp_rank: row.dp_rank,
-            ..Target::default()
-        };
+        let mut target = Target::default();
+        target.id = row.id;
+        target.dp_rank = row.dp_rank;
         engine.on_dispatched(&lease, &target, Side::Single, 0);
     }
 }

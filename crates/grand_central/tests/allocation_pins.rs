@@ -136,18 +136,15 @@ fn a_least_cost_decision_after_the_first_allocates_nothing() {
         }
     }
     // Every row holds a send later than its report.
-    let lease = Lease {
-        issued_micros: 1_000_000,
-        tokens: 512,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = 1_000_000;
+    lease.tokens = 512;
     for row in &view {
-        let target = Target {
-            position: row.position,
-            id: row.id,
-            dp_rank: row.dp_rank,
-            pair: None,
-        };
+        let mut target = Target::default();
+        target.position = row.position;
+        target.id = row.id;
+        target.dp_rank = row.dp_rank;
+        target.pair = None;
         engine.on_dispatched(&lease, &target, Side::Single, 0);
     }
     let cx = Constraints::default();
@@ -185,18 +182,15 @@ fn a_decision_under_a_has_room_rule_allocates_nothing_after_the_first() {
             }
         }
         // Every row holds a send later than its report.
-        let lease = Lease {
-            issued_micros: 1_000_000,
-            tokens: 512,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = 1_000_000;
+        lease.tokens = 512;
         for row in &view {
-            let target = Target {
-                position: row.position,
-                id: row.id,
-                dp_rank: row.dp_rank,
-                pair: None,
-            };
+            let mut target = Target::default();
+            target.position = row.position;
+            target.id = row.id;
+            target.dp_rank = row.dp_rank;
+            target.pair = None;
             engine.on_dispatched(&lease, &target, Side::Single, 0);
         }
         let cx = Constraints::default();
@@ -464,18 +458,15 @@ fn the_pass_behind_a_draw_that_keeps_nobody_allocates_nothing() {
 fn a_decision_over_credited_rows_allocates_nothing() {
     let engine = engine_of("least_load");
     let view = fleet(512);
-    let lease = Lease {
-        issued_micros: 1_000_000,
-        tokens: 512,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = 1_000_000;
+    lease.tokens = 512;
     for c in &view {
-        let target = Target {
-            position: c.position,
-            id: c.id,
-            dp_rank: c.dp_rank,
-            pair: None,
-        };
+        let mut target = Target::default();
+        target.position = c.position;
+        target.id = c.id;
+        target.dp_rank = c.dp_rank;
+        target.pair = None;
         engine.on_dispatched(&lease, &target, Side::Single, 0);
     }
     let cx = Constraints::default();
@@ -511,12 +502,10 @@ fn a_pair_decision_under_a_table_allocates_nothing_after_the_first() {
     let cx = Constraints::default();
     let mut scratch = Scratch::new();
     let mut decide = |decodes: &[Candidate], seed: u64| {
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes,
-            table: smg_grand_central::engine::PairTable::new(&ends, &classes),
-            ..PairPools::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = decodes;
+        pools.table = smg_grand_central::engine::PairTable::new(&ends, &classes);
         allocations_during(|| {
             engine.decide_pair(&facts(seed), &pool(80), pools, &cx, &cx, &mut scratch)
         })
@@ -554,11 +543,9 @@ fn a_pair_decision_after_the_first_allocates_nothing() {
     }
     let cx = Constraints::default();
     let mut scratch = Scratch::new();
-    let pools = PairPools {
-        prefills: &prefills,
-        decodes: &decodes,
-        ..PairPools::default()
-    };
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     engine
         .decide_pair(&facts(1), &pool(80), pools, &cx, &cx, &mut scratch)
         .pick()
@@ -627,9 +614,10 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
             // An id of the host's own minting: the high bit.
             let lease = LeaseId(1 << 63 | u64::from(request));
             let filed = store.issue(LeaseRecord {
-                lease: Lease {
-                    id: lease,
-                    ..Lease::default()
+                lease: {
+                    let mut held_lease = Lease::default();
+                    held_lease.id = lease;
+                    held_lease
                 },
                 gateway,
                 request: u64::from(request),
@@ -643,11 +631,10 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
                 state: LeaseState::ISSUED,
             });
             assert_eq!(filed, Ok(()), "the store files the lease");
-            let dispatch = Dispatch {
-                target_index: 0,
-                side: Side::Single,
-                since_decision_micros: 100,
-            };
+            let mut dispatch = Dispatch::default();
+            dispatch.target_index = 0;
+            dispatch.side = Side::Single;
+            dispatch.since_decision_micros = 100;
             store.hand(&hand, lease, Said::Dispatched(dispatch, now));
             let outcome =
                 Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, worker);

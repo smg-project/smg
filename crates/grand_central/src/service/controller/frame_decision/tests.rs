@@ -2452,6 +2452,73 @@ fn a_served_decode_calls_side_keeps_the_calls_own_session_verdict() {
     assert_eq!(on_file(), claimed);
 }
 
+/// A served pair whose commit refused every target keeps no claim on
+/// either side. A frame that stated the later decode leaves its decode
+/// side chosen under the claim the pair's first decision made, and no
+/// stage heard that side's issue: the release that ends the prefill takes
+/// the decode's claim back with it, and the key's next pair is placed as a
+/// key no request carried. A release that names such a decode alone takes
+/// its claim back at that word. A release for another reason takes no
+/// claim back.
+#[test]
+fn a_served_refused_pair_keeps_no_claim_on_a_decode_that_stood_chosen() {
+    let store = Arc::new(MemoryStore::new());
+    store
+        .apply(ruled_pair_plan())
+        .expect("above the unbound start");
+    let p = side_member(&store, "p0", Role::Prefill, None);
+    for name in ["d0", "d1"] {
+        side_member(&store, name, Role::Decode, None);
+    }
+    LeasesStore::set_term(&*store, 1);
+    let objects = holder(&store);
+    let now = Instant::now();
+    let later = |n: u8, key: u64| {
+        let mut frame = keyed(at_prefill(n, WireModes::NONE, None), key);
+        frame.decode_later = true;
+        let (decision, prefill, _) = leased_pair(&store, &objects, frame, now);
+        let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+        let decode = sides.decode.expect("a pair's lease");
+        (pairs_of(&decision), prefill, decode)
+    };
+    let (chosen, prefill, decode) = later(1, 7);
+    assert_eq!(decode.state, LeaseState::Chosen);
+    let pins = |keys: [Session; 2]| keys.map(|session| pins_of(&store, session));
+    let alone = |id| Some([id, WorkerId(0)]);
+    let none = Some([WorkerId(0); 2]);
+    let keys = [prefill.session, decode.session];
+    assert_eq!(pins(keys), [alone(p), alone(chosen[0].1)], "a claim a side");
+    let hand = open(&store, GATEWAY);
+    let release = |lease: &Lease, side: proto::Side, reason: proto::released::Reason| {
+        let word = proto::Released {
+            what: Some(proto::released::What::LeaseId(lease.id.0)),
+            reason: reason.into(),
+            side: side.into(),
+        };
+        lifecycle::released(&store, &hand, &word).expect("the frame reads");
+    };
+    let whole = proto::Side::Unspecified;
+    let refused = proto::released::Reason::CommitFailed;
+    release(&prefill, whole, refused);
+    assert_eq!(pins(keys), [none; 2], "neither claim stays");
+    // The key's next pair claims anew, over both decodes, and a release
+    // for another reason takes no claim back.
+    let (next, again, decode) = later(2, 7);
+    assert_eq!(next.len(), 2, "{next:?}");
+    assert!(matches!(decode.session_verdict, SessionVerdict::Claimed(_)));
+    release(&again, whole, proto::released::Reason::ClientGone);
+    assert_eq!(pins(keys), [alone(p), alone(next[0].1)]);
+    // A release that names the decode alone takes that side's claim back
+    // at its word, and the prefill's release then takes the prefill's.
+    let (other, prefill, decode) = later(3, 8);
+    let keys = [prefill.session, decode.session];
+    assert_eq!(pins(keys), [alone(p), alone(other[0].1)], "a claim a side");
+    release(&prefill, proto::Side::Decode, refused);
+    assert_eq!(pins(keys), [alone(p), none], "the decode's claim goes");
+    release(&prefill, whole, refused);
+    assert_eq!(pins(keys), [none; 2]);
+}
+
 /// The keys the worker objects of `names` count, in the names' order: a
 /// key counts once on each worker that carries a request of it.
 fn keys_on<const N: usize>(objects: &Objects<Members>, names: [&str; N]) -> [usize; N] {

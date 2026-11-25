@@ -88,6 +88,7 @@ pub(super) fn ask<'a>(
 ) -> Result<Option<Placement<'a>>, Unplaced> {
     let mut made = Made {
         lists: lent,
+        named_decode: call.named_decode,
         ..Made::asked(engine, request, call)
     };
     let mut whole = None;

@@ -256,7 +256,12 @@ impl InProcess {
     /// runs the upkeep at a tick of its own. A panic in it is held and
     /// counted ([`Self::upkeep_faults`]): the host's tick goes on.
     pub(crate) fn upkeep(&self, now: Instant) {
-        let _swept = self.held(|| self.sweep(now));
+        let _swept = self.held(|| {
+            // A case's fault: the upkeep panics here as its sweep would.
+            #[cfg(test)]
+            tests::raise_the_armed_fault();
+            self.sweep(now);
+        });
     }
 
     /// The task's loop. `upkeep` is the step it runs once a second under

@@ -585,7 +585,7 @@ impl Router {
             && (self.policy_registry.engine().is_none()
                 || cache_namespace.is_some()
                 || self.policy_registry.any_policy_needs_request_text(None)))
-        .then(|| typed_req.extract_text_for_routing());
+        .then(|| typed_req.routing_text());
         let rid_key = self
             .policy_registry
             .derive_rid_key(typed_req.rid())

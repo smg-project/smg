@@ -389,13 +389,11 @@ fn run(row: &Row, engine: &Engine, draw: u64, classes: &Classes<'_>) -> Result<V
     let (pools, pool_size) = if prefills.is_empty() || decodes.is_empty() {
         (PairPools::default(), 0)
     } else {
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            table,
-            first,
-            ..PairPools::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = &decodes;
+        pools.table = table;
+        pools.first = first;
         (pools, prefills.len() as u32)
     };
     let mut pool_facts = PoolFacts::default();

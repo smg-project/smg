@@ -109,18 +109,15 @@ fn forms(c: &mut Criterion) {
     for &n in &SIZES {
         let engine = form_of(RESIDENT);
         let view = view_of(n);
-        let lease = Lease {
-            issued_micros: 1_000_000,
-            tokens: 512,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = 1_000_000;
+        lease.tokens = 512;
         for c in &view {
-            let target = Target {
-                position: c.position,
-                id: c.id,
-                dp_rank: c.dp_rank,
-                pair: None,
-            };
+            let mut target = Target::default();
+            target.position = c.position;
+            target.id = c.id;
+            target.dp_rank = c.dp_rank;
+            target.pair = None;
             engine.on_dispatched(&lease, &target, Side::Single, 0);
         }
         decide_over(&mut group, "resident_tokens_credited", &engine, &view);

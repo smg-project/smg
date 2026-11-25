@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
         Arc,
     },
 };
@@ -37,7 +37,7 @@ use super::{
     credentials::Credentials,
     kv_tables::KvTables,
     membership_writer::MembershipWriteRefused,
-    object::{builder, dial_address, external, status, thresholds, unchecked},
+    object::{builder, dial_address, external, status, takes_default, thresholds, unchecked},
     remainder::RowRemainder,
 };
 #[cfg(feature = "in-process")]
@@ -51,7 +51,10 @@ use crate::{
 };
 use crate::{
     engine::view::WorkerId,
-    store::{MembershipChange, MembershipTail, Reachability, WorkerFacts, WorkerRow, WorkersStore},
+    store::{
+        MembershipChange, MembershipTail, MemoryStore, Reachability, WorkerFacts, WorkerRow,
+        WorkersStore,
+    },
 };
 
 mod host_count;
@@ -191,6 +194,8 @@ impl Held {
 /// again by the time the change is read: a row registered again under the
 /// same key and incarnation is another life under the same id, and starts
 /// at the same revision. Its object is dropped and a new one is built.
+/// One object stays: the one built from the very row that stands under the
+/// id now, which the holder laid itself behind its own removal.
 ///
 /// A store that took another store's rows whole holds another history: a
 /// row may stand there under the id and the revision an object was built
@@ -207,10 +212,15 @@ impl Held {
 /// which carries the standing object's running state over. An entry's
 /// revision never moves under an object that stands.
 ///
-/// With a keeper ([`Self::with_credentials`]), each read has the keeper
-/// forget the rows that left, whoever wrote the removal, and an entry goes
-/// with its last row. The keeper's clock is read ahead of the store: a row
-/// bound behind that read stays, and the next read forgets it whatever it
+/// With a keeper ([`Self::with_credentials`]), each read of the store has
+/// the keeper forget the rows that left, whoever wrote the removal, and an
+/// entry goes with its last row. The holder reads the store in four
+/// places. [`Self::follow`] and [`Self::lay_again`] read its tail, and a
+/// cut laid whole reads the store's rows once. A write
+/// the store refuses reads the write's own record, and
+/// the keeper forgets that one row where it left. The
+/// keeper's clock is read ahead of the store: a row bound behind that read
+/// stays, and the next read of the tail or of a cut forgets it whatever it
 /// finds.
 ///
 /// The holder is the registry's one writer: an object any other writer left
@@ -226,9 +236,10 @@ impl Held {
 /// membership lock. A generation's apply and a term's start change no row.
 /// A caller of the store's own registration, patch or removal takes no
 /// turn either: no product code calls those, and they go with the store's
-/// table. A copy's told read carries the store's epoch and history, and
-/// the holder reads the store again where either moved since its own
-/// read, so a copy holds such a write too.
+/// table. A row written so has no object, and no copy holds it, until the
+/// holder reads it: where the store refuses its key's next write, where a
+/// cut is laid whole, or where its host calls [`Self::follow`] or
+/// [`Self::lay_again`], which follows first.
 ///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
@@ -291,16 +302,22 @@ pub struct Objects<G> {
     /// objects with thresholds ([`Self::with_overload_thresholds`]). An
     /// external row's object states its row's own alone.
     overload_defaults: Option<OverloadThresholds>,
+    /// Whether those defaults are stated at all: the overload switch of
+    /// the document in force, as the host stated it last
+    /// ([`Self::state_overload_switch`]). On until a host says otherwise.
+    /// Written under the holder's turn, so every build reads one word.
+    defaults_on: AtomicBool,
     /// One registration that keeps its credential at a time, from its keep
     /// to the lay-again its keeper's answer asks for ([`Self::keeping`]).
     keeping: Mutex<()>,
     /// Where the last read ended. Held through a read and through a write
     /// of the holder's own ([`mod@write`]): one follows or writes at a time.
     ///
-    /// The order of the locks, said here once: a door's turn, then this
-    /// one, then the store's membership lock. Nothing that holds this one
-    /// takes a door's turn, and no lock of the store is held over a write
-    /// of the registry.
+    /// The order of the locks, said here once: a door's turn or a document
+    /// door's lock, then this one, then an object's mutation lock, then
+    /// the store's membership lock. Nothing that holds this one takes a
+    /// door's turn or a document door's lock, and no lock of the store is
+    /// held over a write of the registry.
     read_to: Mutex<Place>,
     held: RwLock<Held>,
     /// How many members of a generation the holder held no row's object
@@ -362,6 +379,10 @@ impl<G> Objects<G> {
     /// their place, and with no signal in `defaults` the monitor does not
     /// judge a row that names none. No document names a threshold. The
     /// monitor judges each object by its own report.
+    ///
+    /// The host states its document's overload switch beside them
+    /// ([`Self::state_overload_switch`]). Switched off, an engine's row
+    /// takes its own alone too, as an external row does.
     #[must_use]
     pub fn with_overload_thresholds(mut self, defaults: OverloadThresholds) -> Self {
         self.overload_defaults = Some(defaults);
@@ -381,6 +402,7 @@ impl<G: Generation> Objects<G> {
             forgotten_at: AtomicU64::new(0),
             host_local_unchecked: false,
             overload_defaults: None,
+            defaults_on: AtomicBool::new(true),
             keeping: Mutex::new(()),
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
@@ -477,6 +499,80 @@ impl<G: Generation> Objects<G> {
         // A row that left behind the read above is the next follow's.
         for row in stale.into_iter().filter_map(|id| store.get(id)) {
             self.lay(store, &row);
+            laid += 1;
+        }
+        laid
+    }
+
+    /// State the overload switch of the host's document in force: whether
+    /// the defaults of [`Self::with_overload_thresholds`] are stated at
+    /// all. Off, the object of an engine's row states its row's own
+    /// thresholds alone, as an external row's does, and the monitor judges
+    /// no worker that names none. A holder that was handed no defaults
+    /// keeps the word and builds as before.
+    ///
+    /// Where the word moved, lay again the object of each row it changes:
+    /// an engine's row that names none for a signal the defaults state.
+    /// Each is built anew from the row as the holder holds it, read back
+    /// from its standing object, and takes that object's place, under its
+    /// id and with its running state, as a credential's lay-again does
+    /// ([`Self::lay_again`]). A row that names both of its own, and an
+    /// external row, keep their objects. The same word again lays nothing.
+    /// The call holds the holder's turn from the word to the last lay, so
+    /// every build reads one word. It reads no row of `store`: a row the
+    /// holder has not read yet, and another life of a row under its id,
+    /// are built under the word at the holder's read of them. So a host
+    /// that states the word ahead of its first read builds each object
+    /// once.
+    ///
+    /// A host calls it where its document takes force. A controller's
+    /// document door does, behind each generation's entry and inside the
+    /// door's lock, which comes ahead of the holder's turn.
+    ///
+    /// An object laid again loses its overload verdict until its worker's
+    /// next load report, the verdict of its row's own threshold too: the
+    /// registry's replacement releases it, as at a credential's lay-again.
+    /// One laid with no threshold, which no report judges, keeps none that
+    /// a report set inside that replacement: the holder releases it again
+    /// behind the registry's swap.
+    ///
+    /// An object laid again took its standing object's status. Behind each
+    /// lay the call settles that status with the table's, as a write call
+    /// does behind a put that replaces ([`Self::upsert`]): a move a health
+    /// driver made on the standing object ahead of its telling finds that
+    /// object replaced, and tells nothing. `leads` is the host's own word
+    /// of its lead, asked under the object's lock and again under the
+    /// store's. Where it holds, the table is told the object's status.
+    /// Where it does not, the table is not written, and the object takes
+    /// the status its row holds.
+    /// Return how many objects were laid again.
+    pub fn state_overload_switch(
+        &self,
+        store: &MemoryStore,
+        on: bool,
+        leads: &dyn Fn() -> bool,
+    ) -> usize {
+        let _turn = self.read_to.lock();
+        if self.defaults_on.swap(on, Relaxed) == on {
+            return 0;
+        }
+        let Some(defaults) = self.overload_defaults else {
+            return 0;
+        };
+        let changed: Vec<WorkerId> = {
+            let held = self.held.read();
+            let rows = held.facts.iter();
+            rows.filter(|(_, facts)| takes_default(facts, defaults))
+                .map(|(&row, _)| row)
+                .collect()
+        };
+        let mut laid = 0;
+        // Each row as the holder holds it: what the store holds past the
+        // holder's place is the holder's next read's.
+        for row in changed.into_iter().filter_map(|id| self.row(id)) {
+            self.lay(store, &row);
+            // What lays an object in another's place settles the two.
+            self.settle_row(store, row.id, row.revision, leads);
             laid += 1;
         }
         laid
@@ -652,6 +748,12 @@ impl<G: Generation> Objects<G> {
     /// Read `store`'s membership to its end and leave the registry holding
     /// the object of every row that stands.
     ///
+    /// A host calls it for a row written through the store's own entries.
+    /// Such a row gets its object here, at [`Self::lay_again`], which
+    /// follows first, where the store refuses its key's next write, or
+    /// where a cut is laid whole. Every other writer of a row lays its
+    /// object itself.
+    ///
     /// The first read is the store's snapshot. So is a read the store's
     /// tail no longer reaches back to, and one behind a move of the store's
     /// history ([`WorkersStore::history`]). A snapshot lays again every
@@ -665,6 +767,8 @@ impl<G: Generation> Objects<G> {
     /// once more and one that came and went builds nothing. A change that
     /// says a row left ends its object first, so a row that left and came
     /// back under its id is built anew.
+    /// An object built from the very row that stands is kept: the holder's
+    /// own removal is read here behind its own registration of the id.
     ///
     /// Calls to `follow` run one at a time. A status mirror reads the row
     /// and writes the object under the object's mutation lock.
@@ -677,12 +781,7 @@ impl<G: Generation> Objects<G> {
     /// [`Self::follow`] for the caller that holds the turn.
     fn follow_from<S: WorkersStore + ?Sized>(&self, store: &S, place: &mut Place) {
         loop {
-            // The keeper's clock ahead of the read of the store: a row a
-            // registration bound behind it is kept by the forgetting.
-            let read = self
-                .credentials
-                .as_ref()
-                .map(|credentials| credentials.taken());
+            let read = self.keeper_clock();
             // The history ahead of the rows: a restore that lands behind
             // this read of it is seen by the next.
             let history = store.history();
@@ -709,16 +808,39 @@ impl<G: Generation> Objects<G> {
                     place.epoch = Some(last);
                 }
                 MembershipTail::SnapshotRequired => {
-                    let (epoch, rows) = store.all_rows();
-                    self.reconcile(store, &rows);
-                    *place = Place {
-                        epoch: Some(epoch),
-                        history,
-                    };
+                    self.read_whole(store, place, history);
                 }
             }
             self.forget_left(read);
         }
+    }
+
+    /// The store's rows, read whole and once: each is held against the
+    /// object that stands for it ([`Self::reconcile`]), and `place` moves
+    /// to the rows' epoch in `history`, which the caller read ahead of
+    /// them. So the next read of the tail starts behind these rows. The
+    /// rows, for a caller that lays their statuses.
+    fn read_whole<S: WorkersStore + ?Sized>(
+        &self,
+        store: &S,
+        place: &mut Place,
+        history: u64,
+    ) -> Vec<WorkerRow> {
+        let (epoch, rows) = store.all_rows();
+        self.reconcile(store, &rows);
+        *place = Place {
+            epoch: Some(epoch),
+            history,
+        };
+        rows
+    }
+
+    /// The keeper's clock, read ahead of a read of the store: a row a
+    /// registration bound behind it is kept by the forgetting.
+    fn keeper_clock(&self) -> Option<u64> {
+        self.credentials
+            .as_ref()
+            .map(|credentials| credentials.taken())
     }
 
     /// Have the keeper forget the rows that left: each row a registration
@@ -735,6 +857,18 @@ impl<G: Generation> Objects<G> {
         self.forgotten_at.store(read, Relaxed);
     }
 
+    /// Have the keeper forget the one row `left`, where no object stands
+    /// for it any more: a read of one record found it gone. No other bound
+    /// row is asked about, since that read saw no other row of the store.
+    /// A row bound for a write the holder has not read yet so stays.
+    fn forget_one(&self, read: Option<u64>, left: WorkerId) {
+        let (Some(credentials), Some(read)) = (&self.credentials, read) else {
+            return;
+        };
+        let held = self.held.read();
+        credentials.forget_left(read, |row| row != left || held.facts.contains_key(&row));
+    }
+
     /// One change of the tail: a row it says left ends its object, then the
     /// rows it names are settled as they stand now.
     fn apply<S: WorkersStore + ?Sized>(&self, store: &S, change: MembershipChange) {
@@ -742,21 +876,37 @@ impl<G: Generation> Objects<G> {
             MembershipChange::StatusChanged { id, .. } => self.follow_status(store, id),
             // The old incarnation first: its object leaves the URL the new
             // one's is built under. It leaves whatever stands under its id
-            // now: an incarnation a key takes again is another life.
+            // now: an incarnation a key takes again is another life. An
+            // object built from the row that stands now is that life's,
+            // and stays (`end_left`).
             MembershipChange::Replaced { old, new } => {
-                self.end(old);
+                self.end_left(store, old);
                 self.settle(store, old);
                 self.settle(store, new);
             }
             // The row left, so its object does, even where its id stands
             // again: that row is another life, at the first revision too.
+            // An object built from the row that stands now is that life's,
+            // and stays (`end_left`).
             MembershipChange::Removed { id } => {
-                self.end(id);
+                self.end_left(store, id);
                 self.settle(store, id);
             }
             MembershipChange::Registered { id }
             | MembershipChange::Relabelled { id }
             | MembershipChange::Resized { id } => self.settle(store, id),
+        }
+    }
+
+    /// End the object of the row `id`, which the tail says left. An object
+    /// built from the very row that stands under the id now stays: it is
+    /// that next life's already. The holder reads its own writes in the
+    /// tail, since no write call moves its place: a removal it wrote, and
+    /// behind it its own registration of the id.
+    fn end_left<S: WorkersStore + ?Sized>(&self, store: &S, id: WorkerId) {
+        let next_life = |row: WorkerRow| self.stands(&row) && !self.remade(&row);
+        if !store.get(id).is_some_and(next_life) {
+            self.end(id);
         }
     }
 
@@ -930,10 +1080,11 @@ impl<G: Generation> Objects<G> {
         // The thresholds the host's own monitor judges the object by: the
         // row's own, each over the host's default for its signal. An
         // external row takes no default, as a gateway's external worker
-        // takes none.
+        // takes none, and no row takes one while the host's document
+        // switches the default off.
         if let Some(defaults) = self.overload_defaults {
             worker = worker.overload(thresholds(&row.facts.overload));
-            if !external(&row.facts) {
+            if !external(&row.facts) && self.defaults_on.load(Relaxed) {
                 worker = worker.overload_defaults(defaults);
             }
         }
@@ -970,23 +1121,70 @@ impl<G: Generation> Objects<G> {
             self.end(other.row);
             id = self.registry.reserve_id_for_url(&row.facts.key);
         }
-        {
+        let standing = {
             let mut entries = self.held.write();
             entries.objects.insert(row.id, id.clone());
             entries.state(row);
-            entries.rows.insert(
-                id,
-                Laid {
-                    remainder: Arc::new(RowRemainder::of(row)),
-                    object: Arc::clone(&object),
-                },
-            );
+            let laid = Laid {
+                remainder: Arc::new(RowRemainder::of(row)),
+                object: Arc::clone(&object),
+            };
+            entries
+                .rows
+                .insert(id, laid)
+                .map(|standing| standing.object)
+        };
+        self.registry.register_or_replace(Arc::clone(&object));
+        if let Some(standing) = standing {
+            self.release_verdict(&standing, &object);
         }
-        self.registry.register_or_replace(object);
         // Behind the registry's write: an object laid in another's place
         // takes the standing object's running state there, and with it the
         // leases the store counted on that object.
         self.counted(store, row.id);
+    }
+
+    /// Release the overload verdict `laid` took over from `standing`, the
+    /// object it was laid in the place of, where a load report judges
+    /// `standing` and none judges `laid`: `standing` states a threshold and
+    /// `laid` states none.
+    ///
+    /// The registry releases a verdict ahead of its swap, and outside the
+    /// lock its overload writers hold. A report that lands between the two
+    /// sets the flag again, on the running state both objects share. An
+    /// object that states a threshold is judged again at its worker's next
+    /// report. One that states none is judged by no report, so the flag
+    /// would stand on it until its worker left.
+    ///
+    /// What follows leans on the registry's one writer of the flag
+    /// ([`WorkerRegistry::set_worker_overloaded`]): each write is made
+    /// under that lock and behind its test that the registry holds the
+    /// handle still, and a call returns ahead of the lock where the flag
+    /// holds the word asked already.
+    ///
+    /// Behind the swap that test drops a write through `standing`. One
+    /// writer can hold the lock from ahead of the swap still, its write not
+    /// made yet. So a write through `standing` goes first, of the word the
+    /// flag does not hold: the registry drops it, behind that writer. Where
+    /// the flag moved ahead of it, that writer has written. Either way the
+    /// release that follows is the last word on the flag.
+    ///
+    /// The routine leaves when the registry releases and swaps under one
+    /// hold of that lock.
+    fn release_verdict(&self, standing: &Arc<dyn Worker>, laid: &Arc<dyn Worker>) {
+        let judged = |object: &Arc<dyn Worker>| object.metadata().overload.is_enabled();
+        if !judged(standing) || judged(laid) {
+            return;
+        }
+        // The swap went through: the registry holds `laid`, and no longer
+        // `standing`.
+        let held = self.registry.get_by_url(laid.url());
+        if !held.is_some_and(|held| Arc::ptr_eq(&held, laid)) {
+            return;
+        }
+        self.registry
+            .set_worker_overloaded(standing, !standing.is_overloaded());
+        self.registry.set_worker_overloaded(laid, false);
     }
 }
 
@@ -1830,6 +2028,346 @@ mod tests {
         }
     }
 
+    /// The overload switch stated on `replica`'s holder, as a replica that
+    /// leads states it: how many objects were laid again.
+    fn switch(replica: &Replica, on: bool) -> usize {
+        let store = replica.store.as_ref();
+        replica.objects.state_overload_switch(store, on, &|| true)
+    }
+
+    /// A host states its document's overload switch on the holder. Off, the
+    /// object of an engine's row states its row's own thresholds alone, and
+    /// on again the host's default under them. A moved word lays again the
+    /// objects it changes and no other: a row that names both of its own
+    /// and an external row keep their objects. The same word again lays
+    /// nothing, at once or behind a follow. A row laid again keeps its id,
+    /// its status and its count in flight, and loses its overload verdict
+    /// alone. A row that comes under a word is built by it, once.
+    #[test]
+    fn the_overload_switch_lays_again_the_rows_whose_default_it_changes() {
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        };
+        let set = |waiting_requests, token_usage| OverloadThresholds {
+            waiting_requests,
+            token_usage,
+        };
+        let own = |kv_usage_permille, waiting_requests| Overload {
+            kv_usage_permille,
+            waiting_requests,
+        };
+        let mut replica = Replica::new();
+        let registry = Arc::clone(replica.objects.registry());
+        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        // A names none, B a usage alone, C both, and D is external.
+        replica.store.upsert(facts(A, 1));
+        replica.store.upsert(WorkerFacts {
+            overload: own(Some(650), None),
+            ..facts(B, 1)
+        });
+        replica.store.upsert(WorkerFacts {
+            overload: own(Some(650), Some(3)),
+            ..facts(C, 1)
+        });
+        replica.store.upsert(WorkerFacts {
+            engine_kind: "external".to_string(),
+            ..facts(D, 1)
+        });
+        replica.follow();
+        let urls = [A, B, C, D];
+        let stated = |replica: &Replica, url| replica.at(url).metadata().overload;
+        // Every standing object runs: a request in flight, ready, vetoed.
+        let before = urls.map(|url| replica.at(url));
+        let ids = urls.map(|url| replica.id(url));
+        for worker in &before {
+            worker.increment_load();
+            worker.set_status(ObjectStatus::Ready);
+            assert!(replica
+                .objects
+                .registry()
+                .set_worker_overloaded(worker, true));
+        }
+        replica.told();
+
+        // On is the word a holder starts under: stated again, it lays none.
+        assert_eq!(switch(&replica, true), 0);
+        assert!(replica.told().is_empty());
+        // Off: the two rows that took a default are laid again.
+        assert_eq!(switch(&replica, false), 2);
+        let mut replaced = replica.told();
+        replaced.retain(|told| told.0 == "replaced");
+        replaced.sort_by(|one, other| one.1.as_str().cmp(other.1.as_str()));
+        let mut laid = vec![("replaced", ids[0].clone()), ("replaced", ids[1].clone())];
+        laid.sort_by(|one, other| one.1.as_str().cmp(other.1.as_str()));
+        assert_eq!(replaced, laid);
+        assert_eq!(stated(&replica, A), set(None, None));
+        assert_eq!(stated(&replica, B), set(None, Some(0.65)));
+        assert_eq!(stated(&replica, C), set(Some(3), Some(0.65)));
+        assert_eq!(stated(&replica, D), set(None, None));
+        for (at, url) in urls.into_iter().enumerate() {
+            let (after, again) = (replica.at(url), at < 2);
+            assert_eq!(!Arc::ptr_eq(&before[at], &after), again, "{url}");
+            assert_eq!(replica.id(url), ids[at], "{url}: the same id");
+            let running = (after.status(), after.load());
+            assert_eq!(
+                running,
+                (ObjectStatus::Ready, 1),
+                "{url}: its running state"
+            );
+            assert_eq!(after.is_overloaded(), !again, "{url}: the verdict alone");
+        }
+
+        // The same word again lays nothing, behind a follow too.
+        assert_eq!(switch(&replica, false), 0);
+        replica.follow();
+        assert_eq!(switch(&replica, false), 0);
+        assert!(replica.told().is_empty());
+        // A row that comes under the word is built by it, once.
+        replica.store.upsert(facts(E, 1));
+        replica.follow();
+        assert_eq!(replica.told(), [("registered", replica.id(E))]);
+        assert_eq!(stated(&replica, E), set(None, None));
+
+        // On again: each row that takes a default is laid again.
+        assert_eq!(switch(&replica, true), 3);
+        let replaced = replica
+            .told()
+            .into_iter()
+            .filter(|told| told.0 == "replaced");
+        assert_eq!(replaced.count(), 3);
+        assert_eq!(stated(&replica, A), defaults);
+        assert_eq!(stated(&replica, B), set(Some(8), Some(0.65)));
+        assert_eq!(stated(&replica, C), set(Some(3), Some(0.65)));
+        assert_eq!(stated(&replica, D), set(None, None));
+        assert_eq!(stated(&replica, E), defaults);
+    }
+
+    /// A host that states the word ahead of its first follow builds each
+    /// object once, by that word: nothing stands to lay again. A holder
+    /// that was handed no thresholds keeps the word and lays nothing: its
+    /// objects state none under either word.
+    #[test]
+    fn the_overload_switch_stated_ahead_of_the_first_follow_builds_each_object_once() {
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        };
+        let none = OverloadThresholds::default();
+        let mut judging = Replica::new();
+        let registry = Arc::clone(judging.objects.registry());
+        judging.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        for (mut replica, asked) in [(Replica::new(), false), (judging, true)] {
+            replica.store.upsert(facts(A, 1));
+            replica.store.upsert(facts(B, 1));
+            assert_eq!(switch(&replica, false), 0);
+            assert!(replica.told().is_empty(), "nothing is built by the word");
+            replica.follow();
+            let built: Vec<_> = replica.told().into_iter().map(|told| told.0).collect();
+            assert_eq!(built, ["registered", "registered"], "each object once");
+            for url in [A, B] {
+                assert_eq!(replica.at(url).metadata().overload, none, "{url}");
+            }
+            // The word back on changes a holder with thresholds alone.
+            let laid = switch(&replica, true);
+            assert_eq!(laid, if asked { 2 } else { 0 });
+            let stands = if asked { defaults } else { none };
+            for url in [A, B] {
+                assert_eq!(replica.at(url).metadata().overload, stands, "{url}");
+            }
+        }
+    }
+
+    /// The switch lays again a row as the holder holds it, and reads no row
+    /// of the store. A row that left and came back under its id, neither
+    /// read by the holder yet, is another life. A moved word lays the first
+    /// life's object again under the word, and nothing of the second life
+    /// takes its place: the second takes no status and no count in flight
+    /// of the first. The holder's next read ends the first life's object
+    /// and builds the second's anew, under the word.
+    #[test]
+    fn the_overload_switch_lays_no_row_the_holder_has_not_read() {
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        };
+        let none = OverloadThresholds::default();
+        let mut replica = Replica::new();
+        let registry = Arc::clone(replica.objects.registry());
+        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        let first = replica.store.upsert(facts(A, 1)).id();
+        replica.follow();
+        let (old_id, before) = (replica.id(A), replica.at(A));
+        before.increment_load();
+        before.set_status(ObjectStatus::Ready);
+        replica.told();
+
+        // The second life stands in the store alone.
+        replica.remove(A);
+        assert_eq!(replica.store.upsert(labelled(A, 1, "gold")).id(), first);
+        assert_eq!(switch(&replica, false), 1);
+        let replaced = replica
+            .told()
+            .into_iter()
+            .filter(|told| told.0 == "replaced");
+        assert_eq!(replaced.collect::<Vec<_>>(), [("replaced", old_id.clone())]);
+        // The first life's object under the word: its status and its count,
+        // and no label of the second life.
+        let laid = replica.at(A);
+        assert_eq!(replica.tier(A), None, "the first life's row");
+        assert_eq!(laid.metadata().overload, none);
+        assert_eq!((laid.status(), laid.load()), (ObjectStatus::Ready, 1));
+
+        replica.follow();
+        let new_id = replica.id(A);
+        assert_ne!(old_id, new_id);
+        assert_eq!(
+            replica.told(),
+            [("removed", old_id), ("registered", new_id)]
+        );
+        let second = replica.at(A);
+        assert_eq!(replica.tier(A).as_deref(), Some("gold"));
+        assert_eq!(second.metadata().overload, none, "built under the word");
+        assert_eq!(second.load(), 0, "nothing of the first life runs on");
+    }
+
+    /// A report that lands inside the registry's replacement leaves no
+    /// verdict on an object the switch laid with no threshold. A writer
+    /// judges as a load monitor does: it writes its verdict through the
+    /// object the registry holds, where that object states a threshold. It
+    /// runs against the switch's moves, off and on. The registry releases
+    /// a verdict ahead of its swap, so the writer's verdict lands between
+    /// the two in some round, and the object laid with no threshold would
+    /// stand vetoed with no report left to judge it.
+    #[test]
+    fn the_overload_switch_leaves_no_verdict_a_report_set_inside_a_replacement() {
+        /// Stops the writer where the case ends, a failed case too.
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Relaxed);
+            }
+        }
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: None,
+        };
+        let mut replica = Replica::new();
+        let registry = Arc::clone(replica.objects.registry());
+        replica.objects = Objects::new(Arc::clone(&registry)).with_overload_thresholds(defaults);
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        let stopped = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let _stop = Stop(&stopped);
+            scope.spawn(|| {
+                while !stopped.load(Relaxed) {
+                    let judged = registry
+                        .get_by_url(A)
+                        .filter(|object| object.metadata().overload.is_enabled());
+                    if let Some(object) = judged {
+                        registry.set_worker_overloaded(&object, true);
+                    }
+                }
+            });
+            for round in 0..400 {
+                assert_eq!(switch(&replica, false), 1);
+                let laid = replica.at(A);
+                assert!(!laid.metadata().overload.is_enabled());
+                assert!(!laid.is_overloaded(), "round {round}");
+                assert_eq!(switch(&replica, true), 1);
+            }
+        });
+    }
+
+    /// The overload switch settles a status with the table behind each
+    /// lay. A health driver moved the standing object, and its telling
+    /// finds that object replaced and tells nothing: the object laid again
+    /// took the moved status, and the table holds its own. On a replica
+    /// that leads the table is told the object's status by the time the
+    /// call returns. One that does not lead writes no row, and its object
+    /// takes the status its row holds.
+    #[test]
+    fn the_overload_switch_settles_a_status_that_moved_ahead_of_its_lay() {
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: None,
+        };
+        for leads in [true, false] {
+            let mut replica = Replica::new();
+            let registry = Arc::clone(replica.objects.registry());
+            replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+            let row = replica.store.upsert(facts(A, 1)).id();
+            replica.follow();
+            let before = replica.store.get(row).expect("the row");
+            assert_eq!(before.status, WorkerStatus::Pending);
+            // The driver's move, with no word to the table.
+            replica.at(A).set_status(ObjectStatus::Ready);
+            let epoch = replica.store.epoch();
+            let store = replica.store.as_ref();
+            let laid = replica
+                .objects
+                .state_overload_switch(store, false, &|| leads);
+            assert_eq!(laid, 1);
+            let after = replica.store.get(row).expect("the row");
+            let object = replica.at(A).status();
+            if leads {
+                assert_eq!(after.status, WorkerStatus::Ready, "the table is told");
+                assert_eq!(object, ObjectStatus::Ready);
+            } else {
+                assert_eq!(replica.store.epoch(), epoch, "no row is written");
+                assert_eq!(after.status, WorkerStatus::Pending);
+                assert_eq!(object, ObjectStatus::Pending, "its row's status");
+            }
+        }
+    }
+
+    /// A default that states one signal alone changes the rows that take
+    /// that signal, and no other: a row that names it keeps its object
+    /// under either word, whatever it leaves out of the other signal.
+    #[test]
+    fn the_overload_switch_leaves_a_row_that_takes_no_signal_of_the_default() {
+        let count = Overload {
+            kv_usage_permille: None,
+            waiting_requests: Some(3),
+        };
+        let usage = Overload {
+            kv_usage_permille: Some(650),
+            waiting_requests: None,
+        };
+        let stating = |waiting_requests, token_usage| OverloadThresholds {
+            waiting_requests,
+            token_usage,
+        };
+        // Each default with the row that takes it and the row that names it.
+        for (defaults, takes, names) in [
+            (stating(Some(8), None), usage, count),
+            (stating(None, Some(0.8)), count, usage),
+        ] {
+            let mut replica = Replica::new();
+            let registry = Arc::clone(replica.objects.registry());
+            replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+            replica.store.upsert(WorkerFacts {
+                overload: takes,
+                ..facts(A, 1)
+            });
+            replica.store.upsert(WorkerFacts {
+                overload: names,
+                ..facts(B, 1)
+            });
+            replica.follow();
+            let (took, named) = (replica.at(A), replica.at(B));
+            let stated = named.metadata().overload;
+            for on in [false, true] {
+                let laid = switch(&replica, on);
+                assert_eq!(laid, 1, "{defaults:?} switched to {on}");
+                assert!(!Arc::ptr_eq(&took, &replica.at(A)), "{defaults:?}");
+                assert!(Arc::ptr_eq(&named, &replica.at(B)), "{defaults:?}");
+                assert_eq!(replica.at(B).metadata().overload, stated);
+            }
+        }
+    }
+
     /// A row that states the external runtime takes no default: its object
     /// states the thresholds its row names and no other, a queue alone or a
     /// usage alone, and in any spelling of the runtime's name. An engine's
@@ -2439,6 +2977,41 @@ mod tests {
         objects.follow(&store);
         let later = registry.get_by_url(A).expect("the later worker's object");
         assert!(later.api_key().is_none());
+    }
+
+    /// A refused write's read and a cut laid whole forget, each what it
+    /// read. A registration decided over a row that left around the holder
+    /// is refused: its read ends the key's object, and the keeper drops
+    /// that row and asks about no other. So a row a registration bound and
+    /// the holder has not read yet keeps its credential, and its object is
+    /// built with it. A cut that drops a row ends its object, and the
+    /// keeper drops every row that left. A credential goes with its
+    /// address's last row.
+    #[test]
+    fn a_refused_write_and_a_cut_laid_whole_forget_the_rows_that_left() {
+        let replica = Replica::new();
+        let store = replica.store.as_ref();
+        replica.register(facts(A, 1), Some(KEY_A));
+        // A second registration, bound and not read by the holder yet.
+        let token = replica.kept(&facts(B, 1), Some(KEY_B));
+        assert!(token.accepted(store.upsert(facts(B, 1)).id()));
+        // Another writer's removal, then the holder's own write of the key.
+        replica.remove(A);
+        let labelled = WorkerFacts {
+            labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
+            ..facts(A, 1)
+        };
+        let refused = replica.objects.upsert(store, labelled, Registrant::Control);
+        assert_eq!(refused, None, "decided over a row that left");
+        assert_eq!(replica.credentials.len(), 1, "the row that left alone");
+        replica.follow();
+        assert!(replica.holds_credential(B, Some(KEY_B)), "the unread row's");
+
+        // A cut with no row.
+        let cut = MemoryStore::new().checkpoint();
+        assert!(replica.objects.restore_from(store, cut));
+        assert!(replica.objects.is_empty(), "the cut dropped the row");
+        assert!(replica.credentials.is_empty(), "behind the cut's read");
     }
 
     #[test]

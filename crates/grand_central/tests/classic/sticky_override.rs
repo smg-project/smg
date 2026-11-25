@@ -238,12 +238,10 @@ impl Bed {
         );
         let pick = decision.pick().expect("a pick");
         let target = *pick.targets.first().expect("a target");
-        let lease = Lease {
-            issued_micros: self.clock,
-            session: facts.session(),
-            session_verdict: pick.session_verdict,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = self.clock;
+        lease.session = facts.session();
+        lease.session_verdict = pick.session_verdict;
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);
         target.position as usize
     }

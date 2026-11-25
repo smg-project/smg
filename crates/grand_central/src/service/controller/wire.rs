@@ -610,6 +610,8 @@ impl Checked {
             held: &[],
             // No frame holds a request to places.
             places: None,
+            // No pair's frame is read for the number it names its decode by.
+            target_worker: None,
         }
     }
 }

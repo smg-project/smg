@@ -213,13 +213,14 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
 ///   prefill's first. It states no index of its own: the decode's names
 ///   the decode its host lends as the pick's first, under index 0.
 ///
-/// A word on a side a pair's lease does not hold tells nothing. A decode
-/// that stood chosen has no word of its own and no stage heard of that
-/// side: it leaves with its prefill. The prefill's release ends it for the
-/// session table, where the pair's first decision made that side's claim
-/// and the host lends that word the pick: a request's guard does. A
-/// controller's file lends a prefill's word a pick of no target, and the
-/// side keeps its claim there.
+/// A word on a side a pair's lease does not hold tells nothing. No stage
+/// heard of a decode that stood chosen: it leaves with its prefill, or with
+/// a release that names it alone. Either release ends it for the session
+/// table, where the pair's first decision made that side's claim, and for
+/// no stage. Its host lends that word the pick: a request's guard its
+/// decision, a controller's file the first target, on the worker the side
+/// is filed on. A guard says no word for a chosen decode its host gives up
+/// by name (`DecisionGuard::released_decode`).
 ///
 /// The hearers are a single's ([`Hearers`]). The counts of sends are those
 /// of the engine that counts its host's sends, and a count asks the host's
@@ -330,13 +331,9 @@ pub(crate) fn pair<L: Fn(WorkerId, u16) -> bool + Copy>(
                 return;
             };
             let ends_prefill = matches!(side, None | Some(Side::Prefill));
-            // A decode that stood chosen leaves with its prefill: its host
-            // says the prefill's word alone of the two.
-            let ends_decode = if chosen {
-                ends_prefill
-            } else {
-                matches!(side, None | Some(Side::Decode))
-            };
+            // A decode that stood chosen leaves with its prefill too, or
+            // with a release that names it alone.
+            let ends_decode = matches!(side, None | Some(Side::Decode)) || (chosen && ends_prefill);
             let decode = decode.filter(|_| ends_decode);
             if ends_prefill {
                 engine.released_table(prefill, reason);

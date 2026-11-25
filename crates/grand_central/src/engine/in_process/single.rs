@@ -68,7 +68,7 @@ use std::{
 
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
-use super::{keys, overlap, Loaded, PoolMembers};
+use super::{keys, overlap, place::Made, Loaded, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
@@ -287,11 +287,20 @@ impl WholeDecision for WithoutShadow {
 /// with every worker of the engines it tried named as tried ([`retried`]).
 /// A first attempt pays one test for it, and a retry over any other list
 /// one more.
+///
+/// `late` is the request as the engine's own call made it, where that call
+/// asks ([`Loaded::decide_into`]): the lookup asks it for the prompt's
+/// block hashes on a road that reads them ([`Made::hashed_whole`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a made request, its list, its maker and the request its call made, the loads, the instant and the whole decision"
+)]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
     request: &mut Request<'_>,
     members: &PoolMembers,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     whole: impl WholeDecision,
@@ -343,9 +352,9 @@ pub(super) fn decide(
     // A retry leaves every worker of the engines it tried: over a list
     // where an engine holds several, its facts name them all.
     let decision = if facts.tried.is_empty() || !records.has_ranks() {
-        by_facts::<false>(own, members, records, &live, facts, cx, maker, whole)
+        by_facts::<false>(own, members, records, &live, facts, cx, maker, late, whole)
     } else {
-        retried(own, members, records, &live, facts, cx, maker, whole)
+        retried(own, members, records, &live, facts, cx, maker, late, whole)
     };
     if let Some(meeting) = meeting {
         MEETING.set(meeting);
@@ -377,7 +386,7 @@ pub(super) fn decide(
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "a decision's inputs, the request's maker and the whole decision"
+    reason = "a decision's inputs, the request's maker, the request its call made and the whole decision"
 )]
 fn by_facts<const RETRY: bool>(
     own: Loaded<'_, '_>,
@@ -387,6 +396,7 @@ fn by_facts<const RETRY: bool>(
     facts: &mut RequestFacts<'_>,
     cx: &Constraints<'_>,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     mut whole: impl WholeDecision,
 ) -> Decision {
     let spec = &own.document.spec;
@@ -402,12 +412,12 @@ fn by_facts<const RETRY: bool>(
         Some(keyed) if !lease_events::stages_hear(&keyed) => keyed,
         // A pin that is the profile's own goes through the same lookup with
         // its answer made.
-        Some(keyed) => handed_on(own, members, records, facts, maker, keyed, leaves),
+        Some(keyed) => handed_on(own, members, records, facts, maker, late, keyed, leaves),
         // A profile whose stages read who holds the prompt is named its
         // rows from the gateway's own data, at the decision's instant the
         // keyed entry wrote, and its pick is recorded behind it; any other
         // passes straight to the whole pass.
-        None => overlap::decide(
+        None => overlap::decide_hashed(
             &own.affinity,
             members.affinity(),
             spec,
@@ -418,6 +428,7 @@ fn by_facts<const RETRY: bool>(
             |page| maker.token_key(page),
             || maker.text_key(),
             |target| maker.sends_to(target),
+            || late?.hashed_whole(spec),
             |facts| whole.decide(engine, records, workers, live, facts, cx),
         ),
     }
@@ -440,25 +451,32 @@ fn by_facts<const RETRY: bool>(
 /// Out of line: its code stays off the path of a request with no pin, and
 /// of a pin its rule keeps from the profile.
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the list and its records, the request's facts, its maker and the request its call made, the answer and the leaves read ahead of it"
+)]
 fn handed_on(
     own: Loaded<'_, '_>,
     members: &PoolMembers,
     records: &PoolRecords,
     facts: &mut RequestFacts<'_>,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     keyed: Decision,
     leaves: u64,
 ) -> Decision {
+    let spec = &own.document.spec;
     overlap::decide_behind(
         &own.affinity,
         members.affinity(),
-        &own.document.spec,
+        spec,
         members.workers(),
         records.ids(),
         facts,
         |page| maker.token_key(page),
         || maker.text_key(),
         |target| maker.sends_to(target),
+        || late?.hashed_whole(spec),
         leaves,
         keyed,
     )
@@ -482,7 +500,7 @@ fn handed_on(
 #[inline(never)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "a decision's inputs, the request's maker and the whole decision"
+    reason = "a decision's inputs, the request's maker, the request its call made and the whole decision"
 )]
 fn retried(
     own: Loaded<'_, '_>,
@@ -492,6 +510,7 @@ fn retried(
     facts: &mut RequestFacts<'_>,
     cx: &Constraints<'_>,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     whole: impl WholeDecision,
 ) -> Decision {
     let mut tried = TRIED.take();
@@ -500,7 +519,17 @@ fn retried(
         tried: &tried,
         ..*facts
     };
-    let decision = by_facts::<true>(own, members, records, live, &mut widened, cx, maker, whole);
+    let decision = by_facts::<true>(
+        own,
+        members,
+        records,
+        live,
+        &mut widened,
+        cx,
+        maker,
+        late,
+        whole,
+    );
     facts.now_micros = widened.now_micros;
     TRIED.set(tried);
     decision

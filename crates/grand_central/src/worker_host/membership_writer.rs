@@ -791,9 +791,9 @@ pub(crate) fn refresh(
 ///
 /// Labels are no part of a row's offer, and a patch writes them under the
 /// row's guard. A descriptor is part of it. Where it moved, the row takes
-/// the write a registration takes in place, and the store derives the
-/// row's pair classes again there. That write has no guard of its own: the
-/// door's turn holds the row as the guard read it.
+/// the write a registration takes in place, and the pair classes are
+/// derived again from the membership that write leaves. That write has no
+/// guard of its own: the door's turn holds the row as the guard read it.
 fn refresh_stated(
     turn: &impl Turn,
     seen: RowRevision,
@@ -1232,7 +1232,10 @@ pub(super) mod tests {
             engine: format!("{URL}@03"),
             ..stated()
         };
-        store.upsert(alias.clone());
+        door.found_one(&maker, &alias.key, &|_| alias.clone())
+            .map_err(|_| "the alias registered")?;
+        // The door numbers the alias's life: what it wrote must stand.
+        let alias = store.by_key(&alias.key).ok_or("the alias row")?.facts;
         let epoch = store.epoch();
         let two = ranked(2);
         assert_eq!(
@@ -1871,13 +1874,18 @@ pub(super) mod tests {
         assert_eq!(store.by_key(URL), None);
 
         // The second of two ranks stands with another label: the add
-        // writes neither.
+        // writes neither. Both ranks are registered at the door and the
+        // first is removed there, so the second stands alone.
         let (store, door) = open();
         let two = ranked(2);
-        store.upsert(WorkerFacts {
+        let gold = WorkerFacts {
             labels: [("tier".to_owned(), "gold".to_owned())].into(),
             ..two[1].clone()
-        });
+        };
+        find_rows(&*door, &control, &[two[0].clone(), gold]).expect("two ranks");
+        let first = store.by_key(&two[0].key).expect("rank zero");
+        door.gone(Remover::Registrant(&control), &two[0].key, standing(&first))
+            .expect("rank zero removed");
         let epoch = store.epoch();
         assert_eq!(
             find_rows_over(&*door, &control, Precondition::Absent, &two),

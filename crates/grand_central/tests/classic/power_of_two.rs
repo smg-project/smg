@@ -222,19 +222,16 @@ impl Bed {
     fn pick(&mut self, prompt_tokens: Option<u32>, seed: u64) -> usize {
         let picked = self.decide(prompt_tokens, seed);
         let candidate = &self.pool[picked];
-        let target = smg_grand_central::engine::Target {
-            position: candidate.position,
-            id: candidate.id,
-            dp_rank: candidate.dp_rank,
-            pair: None,
-        };
-        let lease = Lease {
-            issued_micros: self.clock,
-            // A request of unknown size states none: the stage credits
-            // its dispatch at its own mean.
-            tokens: prompt_tokens.unwrap_or(0),
-            ..Lease::default()
-        };
+        let mut target = smg_grand_central::engine::Target::default();
+        target.position = candidate.position;
+        target.id = candidate.id;
+        target.dp_rank = candidate.dp_rank;
+        target.pair = None;
+        let mut lease = Lease::default();
+        lease.issued_micros = self.clock;
+        // A request of unknown size states none: the stage credits
+        // its dispatch at its own mean.
+        lease.tokens = prompt_tokens.unwrap_or(0);
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);
         self.pool[picked].in_flight += 1;
         picked

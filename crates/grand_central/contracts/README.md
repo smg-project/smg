@@ -12,7 +12,7 @@ rewrites it; the test fails on any other difference).
 | file | what it is | design |
 |---|---|---|
 | `policy_plugin.proto` | package `smg.policy.v1`: the view (`RequestFacts`, `Candidate`, `LoadRow`, `Constraints`, `PoolFacts`, `Identity`), the decision (`Decision`, `Pick`, `Target`, `Pair`, `Shed`, `Queue`, `Trace`, `Lease`, `Busy`), the lifecycle (`LifecycleEvent`) and the `PolicyPlugin` service a user policy serves over gRPC | 4.1, 4.2, 4.3, 4.5, appendix A |
-| `grand_central.proto` | the same package: the `GrandCentral` service of the standalone controller in its four scopes (gateway, ingestion, control, replication), its frames, credits, worker events, snapshots, spec operations, leadership and the replication log; imports the file above and the engine wire's `common.proto` for the relayed load record and event batch | 5.1 to 5.5, 8, appendix A |
+| `grand_central.proto` | the same package: the `GrandCentral` service of the standalone controller in its three scopes (gateway, control, replication), its frames, credits, worker events, snapshots, spec operations, leadership and the replication log; imports the file above | 5.1 to 5.5, 8, appendix A |
 | `smg-policy.wit` | package `smg:policy@1.2.0`: the `types` and `host` interfaces and the two worlds a WebAssembly policy targets, `policy` (the view as records) and `policy-packed` (the view as bytes) | 4.5, appendix B |
 
 Section numbers are the Grand Central design's. The in-process form of
@@ -65,8 +65,7 @@ clock, a lease's issue instant), and each file's comments name them.
 
 - A gRPC plugin or a client of the controller compiles the two proto files
   with `protoc` and the generator of its language; the include path holds
-  this directory and the engine wire's directory (`crates/worker/proto`
-  in this repository) for `common.proto`. In Rust the generated types come
+  this directory. In Rust the generated types come
   from `tonic-prost-build` as the repository's own gRPC clients do.
 - A WebAssembly plugin targets one world of `smg-policy.wit` with
   `wit-bindgen` (or the generator of its language) and ships as a component.
