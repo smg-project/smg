@@ -5,6 +5,7 @@ The guarded CLI reserves at the actual paid HTTP transport boundary.
 """
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -162,7 +163,13 @@ class Ledger:
         config, halted = db.execute("SELECT config, halted FROM policy WHERE id=1").fetchone()
         if config != self.config:
             raise BudgetError("The shared ledger has a different policy")
-        return halted
+        # Independent of SQLite recovery: a lost paid response must stop sibling
+        # admission even if the database could not persist its halt.
+        return halted or os.path.lexists(self.fail_stop_path)
+
+    @property
+    def fail_stop_path(self):
+        return self.path.with_name(self.path.name + ".fail-stop")
 
     def reserve(
         self,
@@ -190,6 +197,7 @@ class Ledger:
         if input_tokens > price.input_limit or output_tokens > price.output_limit:
             raise BudgetError("Token bounds exceed the policy")
         amount = price.cost(input_tokens, output_tokens)
+        exhausted = False
         with self._transaction() as db:
             if self._halted(db):
                 raise BudgetError("The shared budget is halted")
@@ -204,19 +212,25 @@ class Ledger:
                 or arm_calls >= self.policy.calls_per_arm
                 or allocated + amount > self.policy.cap_nusd
             ):
-                raise BudgetError("Shared budget exhausted")
-            db.execute(
-                "INSERT INTO requests VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL)",
-                (
-                    request_id,
-                    arm,
-                    amount,
-                    input_tokens,
-                    output_tokens,
-                    json.dumps(metadata or {}, sort_keys=True),
-                    model,
-                ),
-            )
+                db.execute("UPDATE policy SET halted=1 WHERE id=1")
+                exhausted = True
+            else:
+                db.execute(
+                    "INSERT INTO requests VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL)",
+                    (
+                        request_id,
+                        arm,
+                        amount,
+                        input_tokens,
+                        output_tokens,
+                        json.dumps(metadata or {}, sort_keys=True),
+                        model,
+                    ),
+                )
+        # Raising inside the transaction would roll back the halt and release
+        # the admission lock before the caller could set it again.
+        if exhausted:
+            raise BudgetError("Shared budget exhausted")
         return amount
 
     def finish(self, request_id, input_tokens=None, output_tokens=None, *, outcome=None):
@@ -268,6 +282,12 @@ class Ledger:
         return {"calls": calls, "allocated_nusd": amount, "halted": halted}
 
     def halt(self):
+        try:
+            fd = os.open(self.fail_stop_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass  # Existing latch is never reset, including after DB recovery.
+        else:
+            os.close(fd)
         with self._transaction() as db:
             self._halted(db)
             db.execute("UPDATE policy SET halted=1 WHERE id=1")

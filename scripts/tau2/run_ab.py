@@ -19,6 +19,8 @@ import hashlib
 import json
 import os
 import random
+import re
+import shutil
 import subprocess
 import sys
 import uuid
@@ -399,7 +401,8 @@ def run_tau2(
         agent_llm_args["timeout"] = request_timeout
     agent_args = json.dumps(agent_llm_args)
     user_args = json.dumps({"temperature": 0.0})
-    interpreter = tau2_python or str(Path(tau2).parent / "python")
+    selected_tau2 = shutil.which(tau2) if Path(tau2).name == tau2 else tau2
+    interpreter = tau2_python or str(Path(selected_tau2 or tau2).parent / "python")
     cmd = [
         interpreter,
         "-I",
@@ -493,6 +496,13 @@ def run_tau2(
         arm.scores[domain] = scores
         invocation["status"] = "completed"
     except InvalidResults as error:
+        invocation["seed_identity_invalid"] = any(
+            type(row.get("trial")) is not int
+            or not 0 <= row["trial"] < num_trials
+            or type(row.get("seed")) is not int
+            or row["seed"] != trial_seeds(seed, num_trials)[row["trial"]]
+            for row in error.scored
+        )
         invocation.update(
             invalid_rows=error.invalid_rows,
             n_infrastructure_errors=len(error.unscored),
@@ -665,6 +675,11 @@ def build_report(
     incomplete = {
         a.name: incompleteness(a, domains, expected_tasks, k, seed) for a in (baseline, candidate)
     }
+    if baseline.name == candidate.name:
+        incomplete = {
+            label: incompleteness(a, domains, expected_tasks, k, seed)
+            for label, a in (("baseline", baseline), ("candidate", candidate))
+        }
     incomplete = {n: r for n, r in incomplete.items() if r}
     for name, reason in incomplete.items():
         lines.append(f"> ⚠️ **Incomplete arm `{name}`** — {reason}.")
@@ -787,7 +802,51 @@ def write_report_and_gate(
         getattr(args, "seed", 300),
     )
     budget_failed = False
+    provenance_failed = False
     if getattr(args, "enforce_budget", False):
+        # Legacy score files remain readable, but are not acceptance evidence
+        # without the fresh invocation and its raw result bytes.
+        for arm in (baseline, candidate):
+            for domain in arm.scores:
+                invocation = arm.invocations.get(domain)
+                valid = isinstance(invocation, dict)
+                if valid:
+                    valid = (
+                        invocation.get("arm") == arm.name
+                        and invocation.get("domain") == domain
+                        and invocation.get("status") == "completed"
+                        and invocation.get("exit_code") == 0
+                        and invocation.get("configured_seed") == getattr(args, "seed", 300)
+                        and invocation.get("trial_seeds")
+                        == trial_seeds(getattr(args, "seed", 300), k)
+                        and isinstance(invocation.get("invocation_id"), str)
+                        and re.fullmatch(r"[0-9a-f]{32}", invocation["invocation_id"]) is not None
+                        and isinstance(invocation.get("results_sha256"), str)
+                        and re.fullmatch(r"[0-9a-f]{64}", invocation["results_sha256"]) is not None
+                    )
+                if valid:
+                    try:
+                        path = Path(invocation["results_path"])
+                        valid = (
+                            path.name == "results.json"
+                            and path.parent.name == "ab_" + invocation["invocation_id"]
+                            and hashlib.sha256(path.read_bytes()).hexdigest()
+                            == invocation["results_sha256"]
+                            and domain_scores(load_results(json.loads(path.read_bytes())), k)
+                            == arm.scores[domain]
+                        )
+                    except (OSError, TypeError, KeyError, ValueError):
+                        valid = False
+                if not valid:
+                    provenance_failed = True
+                    label = (
+                        arm.name
+                        if baseline.name != candidate.name
+                        else ("baseline" if arm is baseline else "candidate")
+                    )
+                    payload["incomplete"][label] = (
+                        payload["incomplete"].get(label) or ""
+                    ) + "; missing or inconsistent invocation provenance"
         try:
             payload["budget"] = final_budget(baseline, candidate)
         except (OSError, ValueError, KeyError) as error:
@@ -826,6 +885,14 @@ def write_report_and_gate(
     )
     if (
         budget_failed
+        or provenance_failed
+        or (getattr(args, "enforce_budget", False) and not getattr(args, "expected_task_ids", None))
+        or any(
+            invocation.get("failure_kind") in {"nonzero_exit", "launch_error", "timeout"}
+            for arm in (baseline, candidate)
+            for invocation in arm.invocations.values()
+            if isinstance(invocation, dict)
+        )
         or unscored_infrastructure
         or any(
             invocation.get("seed_identity_invalid") is True

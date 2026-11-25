@@ -522,7 +522,7 @@ def test_unknown_actual_service_tier_retains_and_halts(installed, tier):
     assert guard.ledger.audit()["requests"][0]["metadata"]["service_tier"] == tier
 
 
-def sdk_contender(policy_path, context_path, digest, ledger_path, arm, role, ready, sent):
+def sdk_contender(policy_path, context_path, digest, ledger_path, arm, role, ready, sent, attempts):
     import os
 
     os.environ["OPENAI_API_KEY"] = "offline-test-key"
@@ -538,6 +538,22 @@ def sdk_contender(policy_path, context_path, digest, ledger_path, arm, role, rea
 
     policy, contexts = gc.load_policy(policy_path, context_path, digest)
     ledger = gc.Ledger(ledger_path, policy, create=False)
+    original_reserve = ledger.reserve
+    refused = []
+
+    def reserve(*args, **kwargs):
+        attempts.put(("attempt", arm))
+        try:
+            result = original_reserve(*args, **kwargs)
+        except gc.BudgetError as error:
+            assert str(error) in {"Shared budget exhausted", "The shared budget is halted"}
+            refused.append(True)
+            attempts.put(("refused", arm))
+            raise
+        attempts.put(("reserved", arm))
+        return result
+
+    ledger.reserve = reserve
 
     def handle(request):
         sent.put((arm, json.loads(request.content)["model"]))
@@ -575,7 +591,8 @@ def sdk_contender(policy_path, context_path, digest, ledger_path, arm, role, rea
         try:
             (user_turn if role == "user" else judge_turn)()
         except Exception:
-            pass  # the losing actual SDK request is refused before fake transport
+            if not refused:
+                raise  # An unrelated SDK failure is not evidence of contention.
         finally:
             gc.TASK.reset(token)
     finally:
@@ -593,11 +610,11 @@ def test_two_actual_sdk_processes_two_models_share_last_global_slot(configured):
     policy, _ = gc.load_policy(policy_path, context_path, digest)
     ledger = gc.Ledger(policy_path.parent / "shared-near-cap.db", policy)
     ctx = multiprocessing.get_context("spawn")
-    ready, sent = ctx.Barrier(2), ctx.Queue()
+    ready, sent, attempts = ctx.Barrier(2), ctx.Queue(), ctx.Queue()
     workers = [
         ctx.Process(
             target=sdk_contender,
-            args=(policy_path, context_path, digest, ledger.path, arm, role, ready, sent),
+            args=(policy_path, context_path, digest, ledger.path, arm, role, ready, sent, attempts),
         )
         for arm, role in [("vllm", "user"), ("smg", "nl_judge")]
     ]
@@ -610,6 +627,10 @@ def test_two_actual_sdk_processes_two_models_share_last_global_slot(configured):
         assert sent.get(timeout=1) in [("vllm", "gpt-5.2"), ("smg", "gpt-4.1-2025-04-14")]
         with pytest.raises(queue.Empty):
             sent.get(timeout=0.2)
+        observed = [attempts.get(timeout=1) for _ in range(4)]
+        assert {arm for state, arm in observed if state == "attempt"} == {"vllm", "smg"}
+        assert sum(state == "reserved" for state, _ in observed) == 1
+        assert sum(state == "refused" for state, _ in observed) == 1
         assert ledger.summary()["calls"] == 1 and ledger.summary()["allocated_nusd"] <= 24_000
         assert ledger.audit()["pending"] == 0
     finally:
@@ -618,6 +639,7 @@ def test_two_actual_sdk_processes_two_models_share_last_global_slot(configured):
                 worker.terminate()
                 worker.join()
         sent.close()
+        attempts.close()
 
 
 def test_actual_async_openai_alternate_path_zero_send(installed):
@@ -1095,3 +1117,125 @@ def test_parent98_regression_legitimate_values_are_not_rewritten():
         "--hallucination-retries",
         "0",
     ]
+
+
+@pytest.mark.parametrize("package", ["litellm", "openai"])
+def test_sdk_shadow_import_origin_is_rejected_before_import(
+    configured, monkeypatch, tmp_path, package
+):
+    actual = gc.importlib.util.find_spec
+    shadow = tmp_path / package
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("raise AssertionError('must not import')")
+
+    def find(name):
+        if name == package:
+            return types.SimpleNamespace(
+                origin=str(shadow / "__init__.py"), submodule_search_locations=[str(shadow)]
+            )
+        return actual(name)
+
+    monkeypatch.setattr(gc.importlib.util, "find_spec", find)
+    with pytest.raises(gc.BudgetError, match="SDK import origin"):
+        gc.verify_sources()
+
+
+def test_failed_initializer_does_not_publish_or_poison_final_path(configured, monkeypatch):
+    policy, contexts, digest, ledger, _ = configured
+    destination = ledger.path.with_name("atomic-new.db")
+    argv = [
+        "--policy",
+        str(policy),
+        "--contexts",
+        str(contexts),
+        "--contexts-sha256",
+        digest,
+        "--ledger",
+        str(destination),
+        "--scope",
+        ledger.policy.scope_id,
+        "--initialize",
+    ]
+    original = gc.Ledger
+
+    def broken(*args, **kwargs):
+        raise gc.BudgetError("injected initialization failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(gc, "Ledger", broken)
+        with pytest.raises(gc.BudgetError, match="initialization failure"):
+            gc.main(argv)
+    assert not destination.exists()
+    assert list(destination.parent.glob(".atomic-new.db-*")) == []
+    assert gc.main(argv) == 0
+    assert original(destination, ledger.policy, create=False).summary()["calls"] == 0
+
+
+def test_lost_paid_response_and_failed_sqlite_halt_stops_recovered_sibling(
+    installed, monkeypatch, tmp_path
+):
+    from contextlib import contextmanager
+
+    import httpx
+
+    guard, sent = installed
+    original = guard.ledger._transaction
+
+    @contextmanager
+    def unavailable():
+        raise gc.BudgetError("injected SQLite failure")
+        yield
+
+    def lost(request):
+        sent.append(json.loads(request.content))
+        monkeypatch.setattr(guard.ledger, "_transaction", unavailable)
+        raise httpx.ReadError("lost paid response", request=request)
+
+    guard.transport_factory = lambda: httpx.MockTransport(lost)
+    token = gc.TASK.set(("task0", 0))
+    try:
+        with pytest.raises(Exception):
+            user_turn()
+    finally:
+        gc.TASK.reset(token)
+        monkeypatch.setattr(guard.ledger, "_transaction", original)
+    assert len(sent) == 1 and guard.failed
+    assert guard.ledger.fail_stop_path.exists()
+    # Reopen independently, after SQLite has recovered; no pending-row heuristic.
+    script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from budget import Ledger, RunPolicy, Policy, BudgetError
+import json
+config=json.loads(open(sys.argv[2]).read())
+config['models']={k:Policy(**v) for k,v in config['models'].items()}
+ledger=Ledger(sys.argv[3], RunPolicy(**config), create=False)
+try:
+ ledger.reserve('recovered-sibling','smg','openai/gpt-5.2',10,2,
+                num_retries=0,output_limit_verified=True)
+except BudgetError as error:
+ assert 'halted' in str(error)
+ print('SIBLING_REFUSED_AT_LEDGER')
+else:
+ raise AssertionError('sibling admitted after unknown paid outcome')
+"""
+    config = tmp_path / "run-policy.json"
+    config.write_text(guard.ledger.config)
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(Path(gc.__file__).parent),
+            str(config),
+            str(guard.ledger.path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert child.returncode == 0, child.stderr
+    assert "SIBLING_REFUSED_AT_LEDGER" in child.stdout
+    assert guard.ledger.audit()["pending"] == 1

@@ -90,6 +90,7 @@ def test_opt_in_loader_failure_stops_real_startup(tmp_path, hook_failure):
     result = startup(tmp_path, "1", None, hook_failure)
     assert result.returncode != 0 and "main ran" not in result.stdout
     assert not (tmp_path / "sent").exists()
+    assert not (tmp_path / "startup_sys_path").exists()
     if hook_failure == "installer":
         assert (tmp_path / "refusal_installed").exists()
 

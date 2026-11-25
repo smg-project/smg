@@ -345,6 +345,7 @@ def test_executed_zero_rewards_remain_a_valid_comparison(monkeypatch, tmp_path, 
         arm = run_ab.Arm(name, "", scores={"retail": scores})
         path = tmp_path / f"{name}.json"
         arm.budget = run_ab.prepare_budget()
+        _attach_provenance(tmp_path, arm, _rows(ids=("failed-task",)))
         run_ab.save_scores(arm, path)
         files.append(path)
     report = tmp_path / "comparison.json"
@@ -403,6 +404,38 @@ def _rows(ids=("task",), trials=(0, 1), reward=0.0):
         for task in ids
         for trial in trials
     ]
+
+
+def _attach_provenance(tmp_path, arm, rows, configured_seed=300):
+    identity = run_ab.uuid.uuid4().hex
+    result = tmp_path / ("ab_" + identity) / "results.json"
+    result.parent.mkdir()
+    result.write_text(
+        json.dumps(
+            {
+                "simulations": [
+                    {
+                        "task_id": row["task_id"],
+                        "trial": row["trial"],
+                        "seed": row["seed"],
+                        "reward_info": {"reward": row["reward"]},
+                    }
+                    for row in rows
+                ]
+            }
+        )
+    )
+    arm.invocations["retail"] = dict(
+        invocation_id=identity,
+        arm=arm.name,
+        domain="retail",
+        configured_seed=configured_seed,
+        trial_seeds=run_ab.trial_seeds(configured_seed, 2),
+        status="completed",
+        exit_code=0,
+        results_path=str(result),
+        results_sha256=hashlib.sha256(result.read_bytes()).hexdigest(),
+    )
 
 
 def _coverage_gate(tmp_path, baseline_rows, candidate_rows, expected):
@@ -1024,6 +1057,9 @@ def test_concurrent_budget_errors_are_hard_gates_with_allow_incomplete(
         arm.scores["retail"] = run_ab.domain_scores(
             _rows(reward=1.0 if regression and arm.name == "vllm" else 0.0), 2
         )
+        _attach_provenance(
+            tmp_path, arm, _rows(reward=1.0 if regression and arm.name == "vllm" else 0.0)
+        )
         if arm.name == "smg":
             if state == "halted":
                 ledger.halt()
@@ -1078,6 +1114,7 @@ def test_valid_budget_keeps_quality_only_diagnostic_flag(monkeypatch, tmp_path, 
         arm = run_ab.Arm(name, "", budget=dict(descriptor))
         if name == "vllm":
             arm.scores["retail"] = run_ab.domain_scores(_rows(), 2)
+            _attach_provenance(tmp_path, arm, _rows())
         path = tmp_path / (name + ".json")
         run_ab.save_scores(arm, path)
         files.append(path)
@@ -1322,6 +1359,7 @@ def test_parent98_seed_identity_survives_saved_diff(
         ]
         arm = run_ab.Arm(name, "", scores={"retail": run_ab.domain_scores(rows, 2)})
         arm.budget = run_ab.prepare_budget()
+        _attach_provenance(tmp_path, arm, rows, configured_seed)
         path = tmp_path / f"{name}-seed-scores.json"
         run_ab.save_scores(arm, path)
         files.append(path)
@@ -1413,3 +1451,139 @@ def test_parent98_regression_missing_expected_manifest_is_fatal_cli(tmp_path, al
     assert result.returncode == run_ab.EXIT_INCOMPLETE, result.stdout + result.stderr
     assert "Traceback" not in result.stderr
     assert "missing expected task manifest" in result.stderr
+
+
+@pytest.mark.parametrize("allow_incomplete", [False, True])
+def test_guarded_nonzero_is_never_waived(monkeypatch, tmp_path, allow_incomplete):
+    monkeypatch.setattr(
+        run_ab.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=2)
+    )
+    arms = [run_ab.Arm(name, "http://unused.invalid") for name in ("vllm", "smg")]
+    for arm in arms:
+        _run_tau2(arm, tmp_path, domain="retail", num_trials=2, expected_task_ids=["task"])
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=allow_incomplete,
+        expected_task_ids={"retail": ["task"]},
+    )
+    assert run_ab.write_report_and_gate(*arms, ["retail"], 2, args) == run_ab.EXIT_INCOMPLETE
+
+
+def test_duplicate_display_names_do_not_erase_missing_baseline(tmp_path):
+    baseline = run_ab.Arm("same", "")
+    candidate = run_ab.Arm("same", "", scores={"retail": run_ab.domain_scores(_rows(), 2)})
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=False,
+        expected_task_ids={"retail": ["task"]},
+    )
+    assert (
+        run_ab.write_report_and_gate(baseline, candidate, ["retail"], 2, args)
+        == run_ab.EXIT_INCOMPLETE
+    )
+
+
+def _provenant_arm(tmp_path, name):
+    arm = run_ab.Arm(
+        name,
+        "",
+        scores={"retail": run_ab.domain_scores(_rows(), 2)},
+        budget=run_ab.prepare_budget(),
+    )
+    _attach_provenance(tmp_path, arm, _rows())
+    return arm
+
+
+@pytest.mark.parametrize(
+    "change", ["missing", "id", "digest", "configured_seed", "changed_raw", "score"]
+)
+def test_saved_provenance_is_required_even_for_quality_diagnostics(tmp_path, change):
+    a, b = (_provenant_arm(tmp_path, name) for name in ("vllm", "smg"))
+    record = a.invocations["retail"]
+    if change == "missing":
+        a.invocations.clear()
+    elif change == "id":
+        record["invocation_id"] = "other"
+    elif change == "digest":
+        record["results_sha256"] = "0" * 64
+    elif change == "configured_seed":
+        record["configured_seed"] = 301
+    elif change == "changed_raw":
+        Path(record["results_path"]).write_text("changed")
+    else:
+        a.scores["retail"]["pass1"] = 1.0
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids={"retail": ["task"]},
+        seed=300,
+    )
+    assert run_ab.write_report_and_gate(a, b, ["retail"], 2, args) == run_ab.EXIT_INCOMPLETE
+
+
+def test_empty_saved_diff_requires_expected_manifest_with_allow_incomplete(tmp_path):
+    descriptor = run_ab.prepare_budget()
+    a, b = (run_ab.Arm(n, "", budget=descriptor) for n in ("vllm", "smg"))
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids=None,
+    )
+    assert run_ab.write_report_and_gate(a, b, ["retail"], 2, args) == run_ab.EXIT_INCOMPLETE
+
+
+def test_wrong_seed_retained_beside_malformed_sibling_is_hard_failure(monkeypatch, tmp_path):
+    def fake(command, **kwargs):
+        result = tmp_path / "simulations" / command[command.index("--save-to") + 1] / "results.json"
+        result.parent.mkdir(parents=True)
+        data = _raw_trials()
+        data["simulations"][0]["seed"] = 301
+        data["simulations"][1]["reward_info"]["reward"] = True
+        result.write_text(json.dumps(data))
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_ab.subprocess, "run", fake)
+    a = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(a, tmp_path, domain="retail", num_trials=2, expected_task_ids=["task"])
+    assert a.invocations["retail"]["seed_identity_invalid"] is True
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=True,
+        expected_task_ids={"retail": ["task"]},
+    )
+    assert (
+        run_ab.write_report_and_gate(a, run_ab.Arm("smg", ""), ["retail"], 2, args)
+        == run_ab.EXIT_INCOMPLETE
+    )
+
+
+def test_bare_tau2_selects_its_path_environment_interpreter(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(run_ab.shutil, "which", lambda name: "/qualified/bin/tau2")
+
+    def fake(command, **kwargs):
+        commands.append(command)
+        return types.SimpleNamespace(returncode=2)
+
+    monkeypatch.setattr(run_ab.subprocess, "run", fake)
+    _run_tau2(
+        run_ab.Arm("vllm", "http://unused.invalid"),
+        tmp_path,
+        domain="retail",
+        num_trials=2,
+        expected_task_ids=["task"],
+        tau2="tau2",
+    )
+    assert commands[0][0] == "/qualified/bin/python"

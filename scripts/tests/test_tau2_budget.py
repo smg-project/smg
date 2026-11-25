@@ -95,12 +95,14 @@ def test_completed_calls_keep_reservations_and_call_limits(tmp_path):
     ledger = budget.Ledger(tmp_path / "budget.db", POLICY)
     reserve(ledger)
     ledger.finish("one", 0, 0)
-    with pytest.raises(budget.BudgetError):
-        reserve(ledger, "two")
     reserve(ledger, "two", "smg")
     with pytest.raises(budget.BudgetError):
+        reserve(ledger, "third-vllm")
+    with pytest.raises(budget.BudgetError):
         reserve(ledger, "three", "smg")
-    assert ledger.summary() == {"calls": 2, "allocated_nusd": 4000, "halted": False}
+    ledger.finish("two", 0, 0)
+    assert ledger.summary() == {"calls": 2, "allocated_nusd": 4000, "halted": True}
+    assert ledger.audit()["pending"] == 0
 
 
 def test_call_cap_is_shared_even_when_money_and_arm_allow_more(tmp_path):
@@ -219,3 +221,17 @@ def test_parent98_regression_sqlite_failure_stays_budget_error(monkeypatch, tmp_
         with ledger._transaction():
             pass
     assert error.value.__cause__ is primary
+
+
+def test_exhaustion_halts_inside_the_reservation_transaction(tmp_path):
+    ledger = budget.Ledger(tmp_path / "atomic-cap.db", replace(POLICY, cap_nusd=3000))
+    reserve(ledger)
+    with pytest.raises(budget.BudgetError, match="exhausted"):
+        reserve(ledger, "too-large", "smg")
+    # A new connection after the refusal cannot use the remaining allowance.
+    other = budget.Ledger(ledger.path, ledger.policy, create=False)
+    assert other.summary()["halted"] is True
+    with pytest.raises(budget.BudgetError, match="halted"):
+        other.reserve("small", "smg", POLICY.model, 1, 1, num_retries=0, output_limit_verified=True)
+    ledger.finish("one", 1, 1)  # Previously admitted calls can still settle.
+    assert ledger.audit()["pending"] == 0

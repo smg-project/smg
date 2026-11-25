@@ -336,3 +336,22 @@ configured seed itself is not the trial seed. Every task must match that exact
 trial mapping and the requested manifest seed. Missing or mismatched seed
 identities are fatal (exit 2), including sequential `--diff` with
 `--allow-incomplete`; legacy score files cannot invent missing seed provenance.
+
+
+Guarded sequential `--score-arm` writes the failed invocation into its score file
+and returns 0; the subsequent `--diff` command returns 2 for unscored
+infrastructure, guarded-child failures, absent invocation provenance, or missing
+expected-task manifests, including with `--allow-incomplete`. This flag waives
+quality-only incompleteness; it cannot waive safety or result-identity failures.
+Saved comparisons retain the invocation UUID, configured seed, result SHA256,
+and original invocation result file as well as the task/trial manifest.
+
+Budget exhaustion commits its halt while holding the reservation transaction;
+already-reserved calls may settle but no new reservation can pass. A fail-stop
+sidecar `<ledger>.fail-stop` latches a guard halt independently of SQLite, so a
+recovered sibling cannot resume admission after an unknown paid response even
+when the database could not save its halt. It is never reset within a run and
+must be retained with the original ledger, not deleted to resume a failed scope.
+Initialization publishes a privately initialized ledger without replacing any
+existing path; a failed initialization leaves the final ledger path available
+for an explicitly authorized retry.

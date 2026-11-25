@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import sys
+import tempfile
 import uuid
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -31,12 +32,14 @@ TAU2_SHA = {
 }
 SDK_SHA = {
     "litellm": {
+        "__init__.py": "e845de5ca5cb33a08033a96923a19f03e9b71b76bad77c9460e8def2a2d0b6dd",
         "llms/openai/chat/gpt_5_transformation.py": "4978d1eb5c558ead94776592c49c3df0c6dd026992f8118ac33a0550d56b87dc",
         "llms/openai/openai.py": "168232225255de4a7030b0340ac97c93f0cc09d40cac69a4c52bcb24311be8c7",
         "main.py": "d300782db65bc01513a26cb6cf9750c8feb30fba117c9901cc7d4163d36b8dd8",
         "utils.py": "0ce358c1c5d2f0c79e530f5d67b898ee7b12ad1436d96a3ca1069cd6ff5b8f67",
     },
     "openai": {
+        "__init__.py": "7fcfeb79b49b8b9604bc0d2337e8a313a9158e89103feebe488b2bfeb0286bb2",
         "_base_client.py": "8bea1cea96dcceae9fe08910d1a8e120d322a41de6bc8691872b6789f5f624c3",
         "_client.py": "dfb5fdbe43391eb631b0b183df2a39028b9be1d5896a0c08cb6d9ae5d59ce127",
         "resources/chat/completions/completions.py": "af93382026fe187254b1bae89315ef422ce1fe206cca08915fe921a3f5fbf094",
@@ -178,13 +181,19 @@ def verify_sources():
             raise BudgetError("Unsupported SDK version: " + name)
     for package, files in SDK_SHA.items():
         distribution = importlib.metadata.distribution(package)
+        selected = importlib.util.find_spec(package)
+        locations = tuple(selected.submodule_search_locations or ()) if selected else ()
+        if selected is None or selected.origin is None or len(locations) != 1:
+            raise BudgetError("Unknown SDK package source: " + package)
+        root = Path(selected.origin).resolve().parent
+        if (
+            Path(selected.origin).name != "__init__.py"
+            or root != Path(locations[0]).resolve()
+            or root != Path(distribution.locate_file(package)).resolve()
+        ):
+            raise BudgetError("SDK import origin differs from qualified distribution: " + package)
         for name, digest in files.items():
-            if (
-                hashlib.sha256(
-                    Path(distribution.locate_file(package + "/" + name)).read_bytes()
-                ).hexdigest()
-                != digest
-            ):
+            if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
                 raise BudgetError("Unqualified SDK request source: " + package + "/" + name)
     # uv's editable install keeps metadata in site-packages but imports the
     # package from the checkout. Check the actual import target in both modes.
@@ -392,9 +401,13 @@ class Guard:
                         raise BudgetError("Unknown total paid usage")
                 except Exception as error:
                     outcome["error_type"] = type(error).__name__
-                    guard.ledger.finish(
-                        request_id, outcome=outcome
-                    )  # retain reservation + halt; no retry send
+                    try:
+                        guard.ledger.finish(request_id, outcome=outcome)
+                    finally:
+                        guard.failed = True
+                        # Publish the filesystem fail-stop even when SQLite
+                        # cannot record this unknown paid outcome.
+                        guard.ledger.halt()
                     raise
                 guard.ledger.finish(request_id, prompt, completion, outcome=outcome)
                 return response
@@ -640,9 +653,16 @@ def main(argv=None):
     if args.check:
         return 0  # no ledger created/SDK imported/provider call
     if args.initialize:
-        fd = os.open(args.ledger, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        destination = Path(args.ledger).absolute()
+        fd, private = tempfile.mkstemp(prefix="." + destination.name + "-", dir=destination.parent)
         os.close(fd)
-        Ledger(args.ledger, policy)
+        try:
+            Ledger(private, policy)
+            # Hard-link publication is atomic and never replaces an existing
+            # path. A failed initialization leaves no poisoned final ledger.
+            os.link(private, destination)
+        finally:
+            Path(private).unlink(missing_ok=True)
         return 0  # explicit one-time init; never reset a prior scope's ledger
     command = validate_command(
         args.command[1:] if args.command[:1] == ["--"] else args.command, args.domain
