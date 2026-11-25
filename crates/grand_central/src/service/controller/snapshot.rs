@@ -27,12 +27,11 @@
 //! holder's turn once a write, as watches do. A call with no limit and no
 //! models takes that road too, alone or not: it would copy every row
 //! anyway, and a call let in while it runs shares the copy. The last call
-//! out lets the copy go where no watch is open to share it ([`SerialTurn`],
-//! [`Watchers::unshared`](super::watch_workers::Watchers::unshared)): a
-//! copy of every row is held only while a reader can share it. Any other
-//! call that is alone with no watch open reads the rows it may tell and
-//! keeps nothing ([`Objects::rows_serving`]): its limit's worth, or every
-//! row its models serve where it states no limit.
+//! out lets the copy go where no watch is open to share it
+//! ([`Readers::snapshot`]): a copy of every row is held only while a reader
+//! can share it. Any other call that is alone with no watch open reads the
+//! rows it may tell and keeps nothing ([`Objects::rows_serving`]): its
+//! limit's worth, or every row its models serve where it states no limit.
 //!
 //! A copy holds two locks, one after the other taken. The holder's turn
 //! is held for the rows: a registration call's write, a standby's applier
@@ -42,24 +41,21 @@
 //! that alone. No decision takes either. Whatever waits does so on the
 //! thread that brought it.
 //! **One snapshot is taken at a time, off the runtime's workers**
-//! ([`SerialTurn`]): one operator's copy is made at a time, and the take itself
+//! ([`in_turn`]): one operator's copy is made at a time, and the take itself
 //! holds no thread a stream of the listener runs on. A watch's open and a
 //! standby's base copy by themselves, in no turn.
 //!
 //! No standby is restored from the answer: redacted, and cut where a bound
 //! bit, it names no place of the log.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use prost::encoding::message;
 use tonic::Status;
 
-use super::{generations::Generations, watch_workers, wire};
+use super::{generations::Generations, watch_workers::Readers, wire};
 use crate::{
-    document::operator::{
-        snapshot::{self, Rows, WorkerRowsQuery},
-        SerialTurn,
-    },
+    document::operator::snapshot::{self, Rows, WorkerRowsQuery},
     service::proto::{self, snapshot_request::Slice},
     store::MemoryStore,
     worker_host::{Members, Objects},
@@ -112,15 +108,15 @@ fn names(keep: impl Fn(Slice) -> bool) -> String {
         .join(", ")
 }
 
-/// Takes a snapshot off the runtime's workers, with its turn held until
-/// the take ends. `out` runs when the last place goes back, including
+/// Takes a snapshot off the runtime's workers, in the turn of `readers`
+/// ([`Readers::snapshot`]), which is held until the take ends. The
+/// readers let their kept cut go when the last place goes back, including
 /// where a caller leaves while it waits.
 pub(super) async fn in_turn<T: Send + 'static>(
-    turn: &SerialTurn,
+    readers: &Arc<Readers>,
     take: impl FnOnce() -> T + Send + 'static,
-    out: impl FnOnce() + Send + 'static,
 ) -> Result<T, Status> {
-    let Some(held) = turn.take_with(out).await else {
+    let Some(held) = readers.snapshot().await else {
         return Err(Status::resource_exhausted(format!(
             "{SNAPSHOTS_WAITING} snapshots wait their turn: ask again later"
         )));
@@ -209,26 +205,22 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<SnapshotQuery, St
 }
 
 /// The rows of one take, by the cheapest road that keeps calls that come
-/// together at one copy a write. A cut kept at the log's head is shared
-/// with no copy. Where another call is let in or a watch is open the
-/// feed's cut is taken and kept: somebody can share it. A call with no
-/// limit and no models takes it too: it would copy every row anyway, and a
-/// call let in while it runs shares the copy. Any other call that is alone
-/// with no watch open reads the rows it may tell and keeps nothing. Each
-/// read is the worker objects': their holder cuts it.
+/// together at one copy a write. The readers of the feed say whether the
+/// take shares a cut ([`Readers::cut`]): one kept at the log's head, with
+/// no copy, or the one taken and kept where another call is let in or a
+/// watch is open. A call with no limit and no models shares it too: it
+/// would copy every row anyway, and a call let in while it runs shares the
+/// copy. Any other call that is alone with no watch open reads the rows it
+/// may tell and keeps nothing. Each read is the worker objects': their
+/// holder cuts it.
 pub(crate) fn read(
     asked: &SnapshotQuery,
-    turn: &SerialTurn,
-    feed: &watch_workers::Feed,
-    watchers: &watch_workers::Watchers,
+    readers: &Readers,
     (objects, store): (&Objects<Members>, &MemoryStore),
 ) -> Rows {
-    if let Some(cut) = feed.kept_at_head() {
-        return Rows::Shared(cut);
-    }
     let every = asked.rows.limit == usize::MAX && asked.rows.models.is_empty();
-    if every || turn.let_in() > 1 || watchers.open() {
-        return Rows::Shared(feed.rows_at_head(objects, store));
+    if let Some(cut) = readers.cut(every, objects, store) {
+        return Rows::Shared(cut);
     }
     let (rows, serving) = objects.rows_serving(store, &asked.rows.models, asked.rows.limit);
     Rows::Told(rows, serving)
@@ -301,7 +293,7 @@ mod tests {
     use tonic::Code;
 
     use super::{
-        asked, in_turn, served, taken, Rows, SerialTurn, SnapshotQuery, WorkerRowsQuery, SLICES,
+        asked, in_turn, served, taken, Readers, Rows, SnapshotQuery, WorkerRowsQuery, SLICES,
         SNAPSHOTS_WAITING,
     };
     use crate::{
@@ -309,8 +301,10 @@ mod tests {
         document::operator::snapshot::without_userinfo,
         service::{
             controller::{
+                election::LeasePlace,
                 generations::{tests::LEAST_LOAD, Format, Generations},
-                watch_workers::PAGE_BYTES,
+                replication::journaled_from,
+                watch_workers::{fill_within, PAGE_BYTES},
                 worker_wire,
             },
             proto::{self, snapshot_request::Slice},
@@ -379,6 +373,13 @@ mod tests {
     fn laid(objects: &Objects<Members>, store: &MemoryStore, key: &str, model: &str) {
         let written = objects.upsert(store, stated(key, model), Registrant::Control);
         written.expect("the store takes the write");
+    }
+
+    /// The readers of a feed of its own, with the snapshots' bound and a
+    /// table of eight principals that no case of this module seats.
+    fn readers() -> Arc<Readers> {
+        let (_, feed) = journaled_from(&LeasePlace::Process, 0);
+        Arc::new(Readers::of(feed, 8, SNAPSHOTS_WAITING))
     }
 
     /// The address of row `n`.
@@ -899,7 +900,8 @@ mod tests {
     /// waits for the case's word: a take on that thread could not be told.
     #[tokio::test]
     async fn one_snapshot_is_taken_at_a_time_and_a_call_past_the_wait_is_told_to_ask_again() {
-        let turn = Arc::new(SerialTurn::new(SNAPSHOTS_WAITING));
+        let readers = readers();
+        let turn = readers.snapshots();
         let runtime = thread::current().id();
         let (release, word) = mpsc::channel::<()>();
         let word = Arc::new(std::sync::Mutex::new(word));
@@ -908,7 +910,7 @@ mod tests {
         let on_runtime = Arc::new(AtomicBool::new(false));
         let mut calls = JoinSet::new();
         for n in 0..=SNAPSHOTS_WAITING {
-            let turn = Arc::clone(&turn);
+            let readers = Arc::clone(&readers);
             let (word, inside, most) = (Arc::clone(&word), Arc::clone(&inside), Arc::clone(&most));
             let on_runtime = Arc::clone(&on_runtime);
             calls.spawn(async move {
@@ -928,7 +930,7 @@ mod tests {
                     assert!(told.is_ok(), "the case's word came");
                     n
                 };
-                in_turn(&turn, take, || ()).await
+                in_turn(&readers, take).await
             });
         }
         // Every call is let in: one is taken, the others wait their turn.
@@ -941,7 +943,7 @@ mod tests {
             "a take ran on the runtime's thread"
         );
         assert_eq!(turn.let_in(), SNAPSHOTS_WAITING + 1);
-        let past = tokio::time::timeout(Duration::from_secs(5), in_turn(&turn, || (), || ()))
+        let past = tokio::time::timeout(Duration::from_secs(5), in_turn(&readers, || ()))
             .await
             .expect("an answer at once")
             .expect_err("no place is left");
@@ -972,18 +974,19 @@ mod tests {
     /// the word comes.
     #[tokio::test]
     async fn a_caller_that_leaves_frees_the_turn_no_earlier_than_its_take_ends() {
-        let turn = Arc::new(SerialTurn::new(SNAPSHOTS_WAITING));
+        let readers = readers();
+        let turn = readers.snapshots();
         let (release, word) = mpsc::channel::<()>();
         let (started, at_work) = mpsc::channel::<()>();
         let mut calls = JoinSet::new();
         let first = calls.spawn({
-            let turn = Arc::clone(&turn);
+            let readers = Arc::clone(&readers);
             async move {
                 let take = move || {
                     started.send(()).expect("the case listens");
                     word.recv_timeout(Duration::from_secs(30)).is_ok()
                 };
-                in_turn(&turn, take, || ()).await.map(|_told| ())
+                in_turn(&readers, take).await.map(|_told| ())
             }
         });
         // The first take is at work on the blocking pool.
@@ -1004,8 +1007,8 @@ mod tests {
         // A second call is let in and waits: its take does not begin.
         let ran = Arc::new(AtomicBool::new(false));
         calls.spawn({
-            let (turn, ran) = (Arc::clone(&turn), Arc::clone(&ran));
-            async move { in_turn(&turn, move || ran.store(true, Ordering::SeqCst), || ()).await }
+            let (readers, ran) = (Arc::clone(&readers), Arc::clone(&ran));
+            async move { in_turn(&readers, move || ran.store(true, Ordering::SeqCst)).await }
         });
         let since = Instant::now();
         while turn.let_in() < 2 {
@@ -1042,27 +1045,52 @@ mod tests {
 
     /// The last call out is the one whose place goes back while no other
     /// call is let in, whether its take ended or its caller left while it
-    /// waited. A call that leaves another let in is not the last.
+    /// waited: the readers let their feed's kept cut go there, with no
+    /// watch open to share it. A call that leaves another let in is not the
+    /// last: the cut stays for that one.
     #[tokio::test]
     async fn the_last_call_out_is_the_one_that_leaves_no_call_let_in() {
-        let turn = Arc::new(SerialTurn::new(SNAPSHOTS_WAITING));
-        let outs = Arc::new(AtomicUsize::new(0));
-        let counted = || {
-            let outs = Arc::clone(&outs);
-            move || {
-                outs.fetch_add(1, Ordering::SeqCst);
-            }
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let objects = holder();
+        let readers = Arc::new(Readers::of(feed.clone(), 8, SNAPSHOTS_WAITING));
+        let turn = readers.snapshots();
+        // A cut kept for the calls let in, as a take of every row keeps it.
+        let keep = || {
+            let kept = readers.cut(true, &objects, &store);
+            assert!(kept.is_some() && feed.kept().is_some(), "a cut is kept");
         };
-        // A call alone is the last out.
-        in_turn(&turn, || (), counted()).await.expect("its turn");
-        assert_eq!(outs.load(Ordering::SeqCst), 1);
 
-        // Two calls are let in: the first out leaves the second let in.
+        // A call alone is the last out.
+        keep();
+        in_turn(&readers, || ()).await.expect("its turn");
+        assert!(feed.kept().is_none(), "the last call out let the cut go");
+
+        // Two calls are let in: the first out leaves the second let in. The
+        // second take waits until the first call's place went back, and
+        // finds the cut still kept.
+        keep();
         let held = turn.hold().await;
+        let taken = Arc::new(AtomicUsize::new(0));
         let mut calls = JoinSet::new();
         for _ in 0..2 {
-            let (turn, out) = (Arc::clone(&turn), counted());
-            calls.spawn(async move { in_turn(&turn, || (), out).await });
+            let (readers, feed, taken) = (Arc::clone(&readers), feed.clone(), Arc::clone(&taken));
+            calls.spawn(async move {
+                let alone = Arc::clone(&readers);
+                let take = move || {
+                    if taken.fetch_add(1, Ordering::SeqCst) == 1 {
+                        let since = Instant::now();
+                        while alone.snapshots().let_in() > 1 {
+                            assert!(
+                                since.elapsed() < Duration::from_secs(20),
+                                "the first call's place did not go back"
+                            );
+                            thread::yield_now();
+                        }
+                    }
+                    feed.kept().is_some()
+                };
+                in_turn(&readers, take).await
+            });
         }
         let since = Instant::now();
         while turn.let_in() < 2 {
@@ -1074,15 +1102,17 @@ mod tests {
         }
         drop(held);
         while let Some(call) = calls.join_next().await {
-            call.expect("the call's task").expect("its turn came");
+            let kept = call.expect("the call's task").expect("its turn came");
+            assert!(kept, "a call that left another let in let the cut go");
         }
-        assert_eq!(outs.load(Ordering::SeqCst), 2, "one last call of the two");
+        assert!(feed.kept().is_none(), "one last call of the two");
 
         // A caller that leaves while it waits is the last out too.
+        keep();
         let held = turn.hold().await;
         let waiting = calls.spawn({
-            let (turn, out) = (Arc::clone(&turn), counted());
-            async move { in_turn(&turn, || (), out).await }
+            let readers = Arc::clone(&readers);
+            async move { in_turn(&readers, || true).await }
         });
         let since = Instant::now();
         while turn.let_in() < 1 {
@@ -1099,7 +1129,7 @@ mod tests {
             "the caller left"
         );
         assert_eq!(turn.let_in(), 0, "its place went back");
-        assert_eq!(outs.load(Ordering::SeqCst), 3, "the caller that left");
+        assert!(feed.kept().is_none(), "the caller that left");
         drop(held);
     }
 
@@ -1156,7 +1186,7 @@ mod tests {
                 models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
             })
         };
-        let rows = super::watch_workers::fill_within(limit, serving(), |row| {
+        let rows = fill_within(limit, serving(), |row| {
             let mut told = worker_wire::row(row);
             told.admitted_age_ms = super::super::replication::age_ms(now, row.admitted_at);
             let maker = told.maker.as_mut().map(|maker| &mut maker.key);

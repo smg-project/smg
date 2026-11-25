@@ -64,12 +64,12 @@ use super::{
     replication::{Batches, Replication},
     session, snapshot,
     standby::Lag,
-    watch_workers::{self, Feed, Source, Watchers, Watching},
+    watch_workers::{self, Feed, Readers, Source, Watching},
     wire, PROTOCOL_VERSION,
 };
 use crate::{
     document::{
-        operator::{DryRun, EnforceOutcome, EnforceRefused, NeedsRow, SerialTurn},
+        operator::{DryRun, EnforceOutcome, EnforceRefused, NeedsRow},
         spec::Digest,
     },
     engine::{explain::DecisionRecord, framework::Engine},
@@ -196,8 +196,11 @@ pub(crate) struct Shared {
     /// clone has seen no word, and marks its own seen where it hears from
     /// its start on.
     pub(crate) role: watch::Receiver<Option<u64>>,
-    /// Who watches this replica: the bounds of a watch's open.
-    pub(crate) watchers: Arc<Watchers>,
+    /// Who reads the rows of that feed and can share its kept cut: the
+    /// watches, within the bounds of a watch's open, and the operators'
+    /// snapshots in their turn, one taken at a time off the runtime's
+    /// workers.
+    pub(crate) readers: Arc<Readers>,
     /// A gateway's term floor above this replica's term, on its way to the
     /// election.
     pub(crate) floors: Floors,
@@ -206,9 +209,6 @@ pub(crate) struct Shared {
     /// under, the first of the three counts of design 5.4: the bind makes
     /// it once, where the configuration is known.
     pub(crate) lag: Arc<Lag>,
-    /// The turn of the operators' snapshots: one is taken at a time, off
-    /// the runtime's workers.
-    pub(crate) snapshots: SerialTurn,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -331,11 +331,16 @@ impl Shared {
             deciders,
             streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
             stop,
+            // The feed's readers are built over it: as many principals
+            // watch as may be present, and the snapshots wait their turn.
+            readers: Arc::new(Readers::of(
+                feed.clone(),
+                session::PRESENT_MAX,
+                snapshot::SNAPSHOTS_WAITING,
+            )),
             feed,
             role,
-            watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
-            snapshots: SerialTurn::new(snapshot::SNAPSHOTS_WAITING),
         })
     }
 
@@ -851,8 +856,8 @@ impl GrandCentral for Service {
             role,
             term,
         };
-        let watchers = &self.shared.watchers;
-        let watching = watch_workers::open(source, watchers, by, start, asked.models.clone())?;
+        let readers = &self.shared.readers;
+        let watching = watch_workers::open(source, readers, by, start, asked.models.clone())?;
         Ok(Response::new(watching))
     }
 
@@ -896,7 +901,7 @@ impl GrandCentral for Service {
     /// field refused by its name, the spec slice of a controller with no
     /// spec source among them, and a refused request takes no turn. One
     /// snapshot is taken at a time, off the runtime's workers
-    /// ([`SerialTurn`]), and its rows come by one of the roads of
+    /// ([`snapshot::in_turn`]), and its rows come by one of the roads of
     /// [`snapshot::read`]. The lead is read again behind that wait: the
     /// answer is told while this replica still leads the term the call was
     /// admitted under. A standby is restored on its `Replicate` stream,
@@ -915,24 +920,14 @@ impl GrandCentral for Service {
                 &asked,
                 term,
                 &shared.controller_id,
-                || {
-                    snapshot::read(
-                        &asked,
-                        &shared.snapshots,
-                        &shared.feed,
-                        &shared.watchers,
-                        (&shared.objects, &shared.store),
-                    )
-                },
+                || snapshot::read(&asked, &shared.readers, (&shared.objects, &shared.store)),
                 &shared.generations,
                 Instant::now(),
             )
         };
-        // The last call out lets the feed's kept cut go where no watch is
-        // open to share it.
-        let last = Arc::clone(&self.shared);
-        let out = move || last.watchers.unshared(&last.feed);
-        let taken = snapshot::in_turn(&self.shared.snapshots, take, out).await??;
+        // The feed's readers let its kept cut go at the last call out, where
+        // no watch is open to share it.
+        let taken = snapshot::in_turn(&self.shared.readers, take).await??;
         if self.watched(Instant::now())? != term {
             return Err(Status::unavailable(TAKE_OVER));
         }
@@ -3961,7 +3956,7 @@ mod tests {
         use proto::snapshot_request::Slice;
 
         let (_elector, _standing, control) = electing(true);
-        let places = control.shared.snapshots.fill();
+        let places = control.shared.readers.snapshots().fill();
         assert_eq!(places.len(), super::snapshot::SNAPSHOTS_WAITING + 1);
         let past = control
             .get_snapshot(snapshot(&[Slice::Workers]))
@@ -3999,11 +3994,11 @@ mod tests {
             .await
             .expect("a place is free again");
         assert_eq!(rows.into_inner().term, 1);
-        assert_eq!(control.shared.snapshots.let_in(), 0);
+        assert_eq!(control.shared.readers.snapshots().let_in(), 0);
 
         // A replica that does not lead refuses by its lead, places or none.
         let (_elector, _standing, follower) = electing(false);
-        let _places = follower.shared.snapshots.fill();
+        let _places = follower.shared.readers.snapshots().fill();
         let refused = follower
             .get_snapshot(snapshot(&[Slice::Workers]))
             .await
@@ -4039,7 +4034,12 @@ mod tests {
 
         // Another call is let in beside it: the cut stays for that one, the
         // next call shares it, and the last call out lets it go.
-        let beside = control.shared.snapshots.place().expect("a place is free");
+        let beside = control
+            .shared
+            .readers
+            .snapshots()
+            .place()
+            .expect("a place is free");
         assert_eq!(told().await, 0);
         let cut = feed.kept().expect("a call is let in to share the cut");
         assert_eq!(told().await, 0);
@@ -4105,7 +4105,9 @@ mod tests {
     /// takes no cut of every row: it reads the rows it may tell. One that
     /// states neither would copy every row anyway, so it takes the feed's
     /// cut, which a call let in while it runs shares. Beside another call
-    /// each takes the cut the two share, once.
+    /// each takes the cut the two share, once: the first of them takes it,
+    /// whatever it states. So does a call beside an open watch, where no cut
+    /// stands at the log's head: the watch can share it.
     #[tokio::test]
     async fn a_lone_snapshot_takes_a_cut_only_where_it_tells_every_row() {
         use proto::snapshot_request::Slice;
@@ -4157,12 +4159,33 @@ mod tests {
         assert_eq!((answer.workers.len(), answer.truncated), (3, false));
         assert_eq!(feed.cuts(), 1, "a lone call for its models took the cut");
 
-        // Another call is let in beside it: one cut, and both calls share it.
-        let beside = control.shared.snapshots.place().expect("a place is free");
+        // Another call is let in beside it: the call for one row takes the
+        // cut the two share, and the call behind it shares that one.
+        let beside = control
+            .shared
+            .readers
+            .snapshots()
+            .place()
+            .expect("a place is free");
         assert_eq!(told(1).await, (1, true));
+        assert_eq!(feed.cuts(), 2, "a call beside another takes their cut");
         assert_eq!(told(0).await, (4, false));
         assert_eq!(feed.cuts(), 2, "one copy for the calls let in");
         drop(beside);
+
+        // A watch is open, and no cut stands at the log's head: the call
+        // for one row takes the cut the watch can share, and keeps it.
+        assert_eq!(told(0).await, (4, false));
+        assert!(feed.kept().is_none(), "the last call out let the cut go");
+        let gateways = Service::new(vec![Scope::Gateway], Arc::clone(&control.shared));
+        let watching = gateways
+            .watch_workers(from("gateway-a", proto::WatchWorkersRequest::default()))
+            .await
+            .expect("opened");
+        assert_eq!(told(1).await, (1, true));
+        assert_eq!(feed.cuts(), 3, "a call beside an open watch takes its cut");
+        assert!(feed.kept().is_some(), "kept for the watch");
+        drop(watching);
     }
 
     /// A snapshot that waited its turn through a later take of the lease is
@@ -4174,7 +4197,7 @@ mod tests {
 
         let (_elector, _standing, control) = electing(true);
         let control = Arc::new(control);
-        let held = control.shared.snapshots.hold().await;
+        let held = control.shared.readers.snapshots().hold().await;
         let mut calls = JoinSet::new();
         calls.spawn({
             let control = Arc::clone(&control);
@@ -4182,7 +4205,7 @@ mod tests {
         });
         // The call is let in and waits behind the held turn.
         let began = Instant::now();
-        while control.shared.snapshots.let_in() < 1 {
+        while control.shared.readers.snapshots().let_in() < 1 {
             assert!(
                 began.elapsed() < Duration::from_secs(20),
                 "the call took no place"
@@ -4215,14 +4238,14 @@ mod tests {
 
         let (mut elector, _standing, control) = electing(true);
         let control = Arc::new(control);
-        let held = control.shared.snapshots.hold().await;
+        let held = control.shared.readers.snapshots().hold().await;
         let mut calls = JoinSet::new();
         calls.spawn({
             let control = Arc::clone(&control);
             async move { control.get_snapshot(snapshot(&[Slice::Workers])).await }
         });
         let began = Instant::now();
-        while control.shared.snapshots.let_in() < 1 {
+        while control.shared.readers.snapshots().let_in() < 1 {
             assert!(
                 began.elapsed() < Duration::from_secs(20),
                 "the call took no place"

@@ -67,7 +67,7 @@ use tracing::{info, warn};
 use super::{principal::Principal, worker_wire};
 pub(super) use crate::document::operator::snapshot::PAGE_BYTES;
 use crate::{
-    document::operator::snapshot::serves,
+    document::operator::{snapshot::serves, SerialTurn},
     service::{
         elector::Fence,
         proto,
@@ -201,10 +201,10 @@ impl Feed {
     /// it: a watch's start, and the operators' snapshot. Reads that come
     /// together or in a loop take that turn once a write, and the feed
     /// keeps one copy of the rows while a reader can share it
-    /// ([`Feed::let_go`], [`WatchPlace`], [`Watchers::unshared`]). The
-    /// kept cut is named by its place with its term, never by a sequence
-    /// alone: a restore can leave one sequence over other rows.
-    pub(crate) fn rows_at_head(
+    /// ([`Feed::let_go`], [`Readers`]). The kept cut is named by its place
+    /// with its term, never by a sequence alone: a restore can leave one
+    /// sequence over other rows.
+    fn rows_at_head(
         &self,
         objects: &Objects<Members>,
         store: &MemoryStore,
@@ -224,7 +224,7 @@ impl Feed {
     /// The kept cut where it stands at the log's last watched write: what a
     /// read shares with no copy. None where a write moved the log past it,
     /// and where none is kept.
-    pub(crate) fn kept_at_head(&self) -> Option<Arc<StoreCheckpoint>> {
+    fn kept_at_head(&self) -> Option<Arc<StoreCheckpoint>> {
         let kept = self.rows.lock();
         let head = self.log.head();
         kept.as_ref().filter(|cut| cut.at == head).cloned()
@@ -443,16 +443,29 @@ impl Watching {
     }
 }
 
-/// Who watches this replica: each principal that holds a watch open, with
-/// how many. It holds two bounds, and a peer sets neither: [`WATCHES_MAX`]
-/// watches a principal, and the rows it was built for.
+/// Who reads the rows of one feed and can share its kept cut: each
+/// principal that holds a watch open, with how many, and the operators'
+/// snapshot calls let in to their turn. A copy of every row is held only
+/// while one of them can share it, and the readers let it go themselves:
+/// at the last seat given back, and at the last snapshot call out with no
+/// watch open. They are built over their feed, so the copy they let go is
+/// the one their reads share.
+///
+/// It holds three bounds, and a peer sets none: [`WATCHES_MAX`] watches a
+/// principal, the rows it was built for, and the snapshot calls that may
+/// wait their turn.
 #[derive(Debug)]
-pub(crate) struct Watchers {
+pub(crate) struct Readers {
+    /// The feed these readers read: its kept cut is theirs to let go.
+    feed: Feed,
     /// A principal's open watches, under the key a `Session` seats it by.
     /// No row stands at zero.
     held: Mutex<FxHashMap<GatewayId, usize>>,
     /// The ceiling of rows.
     principals: usize,
+    /// The turn of the operators' snapshots: one is taken at a time, and a
+    /// call let in is a reader until its place goes back.
+    snapshots: SerialTurn,
 }
 
 /// One open watch's place in the table, held by its stream and given back
@@ -460,23 +473,25 @@ pub(crate) struct Watchers {
 /// the feed's kept cut go: no watch shares it.
 #[derive(Debug)]
 struct WatchPlace {
-    watchers: Arc<Watchers>,
+    readers: Arc<Readers>,
     of: GatewayId,
-    kept: Arc<Mutex<Option<Arc<StoreCheckpoint>>>>,
 }
 
-impl Watchers {
-    /// A table of at most `principals` rows.
-    pub(crate) fn new(principals: usize) -> Self {
+impl Readers {
+    /// The readers of `feed`: a table of at most `principals` rows, and a
+    /// turn that lets `waiting` snapshot calls wait behind the one taken.
+    pub(crate) fn of(feed: Feed, principals: usize, waiting: usize) -> Self {
         Self {
+            feed,
             held: Mutex::new(FxHashMap::default()),
             principals,
+            snapshots: SerialTurn::new(waiting),
         }
     }
 
     /// A seat for one more watch of `by`, or the refusal by name. The table
     /// has no gauge yet: the refusal and its line are its signal.
-    fn seat(self: &Arc<Self>, by: &Principal, feed: &Feed) -> Result<WatchPlace, Status> {
+    fn seat(self: &Arc<Self>, by: &Principal) -> Result<WatchPlace, Status> {
         let of = by.gateway();
         let mut held = self.held.lock();
         let open = held.get(&of).copied().unwrap_or(0);
@@ -503,10 +518,39 @@ impl Watchers {
         }
         held.insert(of, open + 1);
         Ok(WatchPlace {
-            watchers: Arc::clone(self),
+            readers: Arc::clone(self),
             of,
-            kept: Arc::clone(&feed.rows),
         })
+    }
+
+    /// A snapshot call's turn, with its place among the readers: both are
+    /// held until what this returns is dropped. None where as many calls
+    /// wait as may. The last call out lets the feed's kept cut go where no
+    /// watch is open to share it ([`Readers::unshared`]), whether its take
+    /// ended or its caller left while it waited.
+    pub(crate) async fn snapshot(self: &Arc<Self>) -> Option<impl Send + use<>> {
+        let last = Arc::clone(self);
+        self.snapshots.take_with(move || last.unshared()).await
+    }
+
+    /// The cut a snapshot's take shares, or none where the take reads the
+    /// rows it may tell and keeps nothing: the cheapest road that keeps
+    /// calls that come together at one copy a write. A cut kept at the
+    /// log's head is shared with no copy. Where another call is let in or
+    /// a watch is open the feed's cut is taken and kept: somebody can
+    /// share it. A take of `every` row takes it too: it would copy every
+    /// row anyway, and a call let in while it runs shares the copy.
+    pub(crate) fn cut(
+        &self,
+        every: bool,
+        objects: &Objects<Members>,
+        store: &MemoryStore,
+    ) -> Option<Arc<StoreCheckpoint>> {
+        if let Some(cut) = self.feed.kept_at_head() {
+            return Some(cut);
+        }
+        let shared = every || self.snapshots.let_in() > 1 || self.open();
+        shared.then(|| self.feed.rows_at_head(objects, store))
     }
 
     /// Lets the feed's kept cut go where no watch is open: what the last
@@ -515,15 +559,27 @@ impl Watchers {
     /// row is held only while a reader can share it. The table's lock is
     /// given back first, as there: a watch that opens now takes a cut of
     /// its own at worst.
-    pub(crate) fn unshared(&self, feed: &Feed) {
+    fn unshared(&self) {
         if !self.open() {
-            *feed.rows.lock() = None;
+            *self.feed.rows.lock() = None;
         }
     }
 
     /// Whether a watch holds a seat: a reader that can share a kept cut.
-    pub(crate) fn open(&self) -> bool {
+    fn open(&self) -> bool {
         !self.held.lock().is_empty()
+    }
+
+    /// Whether these are the readers of `feed`: a clone of a feed shares its
+    /// kept cut, so a clone of the feed they were built over is theirs too.
+    fn are_of(&self, feed: &Feed) -> bool {
+        Arc::ptr_eq(&self.feed.rows, &feed.rows)
+    }
+
+    /// The snapshots' turn, for a case that fills it or holds it.
+    #[cfg(test)]
+    pub(crate) fn snapshots(&self) -> &SerialTurn {
+        &self.snapshots
     }
 
     /// The watches `by` holds open.
@@ -536,7 +592,7 @@ impl Watchers {
 impl Drop for WatchPlace {
     fn drop(&mut self) {
         let last = {
-            let mut held = self.watchers.held.lock();
+            let mut held = self.readers.held.lock();
             match held.get_mut(&self.of) {
                 Some(open) if *open > 1 => *open -= 1,
                 _ => {
@@ -548,22 +604,28 @@ impl Drop for WatchPlace {
         // The table's lock is given back first: a watch that opens now
         // takes a cut of its own at worst.
         if last {
-            *self.kept.lock() = None;
+            *self.readers.feed.rows.lock() = None;
         }
     }
 }
 
 /// Opens the watch `by` asked for: from `start`, of the rows that serve one
 /// of `models`, or of every row when none is named. It takes one of the
-/// principal's seats among `watchers`, or is refused by name.
+/// principal's seats among `readers`, or is refused by name. The source
+/// reads the feed those readers were built over, or the cut its watch
+/// keeps would not be the one its seat lets go: a debug build stops here.
 pub(crate) fn open(
     source: Source,
-    watchers: &Arc<Watchers>,
+    readers: &Arc<Readers>,
     by: &Principal,
     start: Start,
     models: Vec<String>,
 ) -> Result<Watching, Status> {
-    let seat = watchers.seat(by, &source.feed)?;
+    debug_assert!(
+        readers.are_of(&source.feed),
+        "a watch's source reads the feed its readers were built over"
+    );
+    let seat = readers.seat(by)?;
     // The role's word is the replica's, one for every watch: the feed's
     // task wakes the parked streams by it, and takes nothing else of this
     // watch.
@@ -835,7 +897,7 @@ pub(crate) mod tests {
     };
 
     use super::{
-        fill, open, start, Feed, Source, Start, Watchers, Watching, HELD, PAGE, PAGE_BYTES, STALL,
+        fill, open, start, Feed, Readers, Source, Start, Watching, HELD, PAGE, PAGE_BYTES, STALL,
         WATCHES_MAX,
     };
     use crate::{
@@ -869,8 +931,9 @@ pub(crate) mod tests {
         feed: Feed,
         elector: Elector,
         role: watch::Sender<Option<u64>>,
-        /// Who watches it: a table of two principals.
-        watchers: Arc<Watchers>,
+        /// Who reads it: a table of two principals, and a snapshots' turn
+        /// that no case of this module takes.
+        readers: Arc<Readers>,
     }
 
     fn leader() -> Leader {
@@ -894,10 +957,10 @@ pub(crate) mod tests {
         Leader {
             objects: holder(&store),
             store,
+            readers: Arc::new(Readers::of(feed.clone(), 2, 0)),
             feed,
             elector,
             role,
-            watchers: Arc::new(Watchers::new(2)),
         }
     }
 
@@ -921,13 +984,13 @@ pub(crate) mod tests {
                 term: 1,
             };
             let models = models.iter().map(|model| (*model).to_owned()).collect();
-            open(source, &self.watchers, &told(by), start, models)
+            open(source, &self.readers, &told(by), start, models)
         }
 
         /// `by`'s open watches read `want` at this instant: a stream's seat
         /// goes back at its drop itself, with no turn of the runtime.
         fn holds(&self, by: &str, want: usize) {
-            assert_eq!(self.watchers.open_of(&told(by)), want, "{by}'s watches");
+            assert_eq!(self.readers.open_of(&told(by)), want, "{by}'s watches");
         }
 
         /// A registration of `facts` through the holder: the row's id.
@@ -1859,6 +1922,31 @@ pub(crate) mod tests {
         drop(second);
         leader.holds("gateway-b", 0);
         assert!(leader.feed.rows.lock().is_none(), "the last watch left");
+    }
+
+    /// A source over another feed than its readers' would keep a cut that
+    /// no seat lets go, and a snapshot beside its watch would share none: a
+    /// debug build stops at the open.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "the feed its readers were built over")]
+    async fn a_source_over_another_feed_than_its_readers_stops_a_debug_build() {
+        let (leader, other) = (leader(), leader());
+        let source = Source {
+            store: Arc::clone(&other.store),
+            objects: Arc::clone(&other.objects),
+            feed: other.feed.clone(),
+            fence: other.elector.fence(),
+            role: other.role.subscribe(),
+            term: 1,
+        };
+        let _ = open(
+            source,
+            &leader.readers,
+            &told("gateway-a"),
+            Start::Snapshot,
+            Vec::new(),
+        );
     }
 
     #[tokio::test]
