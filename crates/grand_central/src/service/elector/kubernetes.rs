@@ -54,7 +54,10 @@ const NOT_FOUND: u16 = 404;
 /// current-thread runtime unless another thread runs it. The client's
 /// timeouts are the caller's `Config`; a read timeout at or under the renew
 /// deadline keeps a stalled round trip from outliving the fence, which
-/// closes by itself either way.
+/// closes by itself either way. The client's own retry of an answer that
+/// says try later is the caller's `Config` too, and the client library turns
+/// it on by default: a caller turns it off, or one call waits out the time
+/// the answer names.
 pub struct KubernetesLease {
     api: Api<Lease>,
     namespace: String,

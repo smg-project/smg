@@ -61,4 +61,4 @@ in words that name the provider and its feature.
 | `slurm` | The Slurm provider. |
 | `consul` | The Consul provider. |
 | `fs-watch` | The directory watch alone, for a host's own file readers. |
-| `test-util` | For the tests of a crate that hosts discovery: a double of the host trait whose job queue records what it took and, under `kubernetes`, that provider started on a client the test hands it and a pod fixture. |
+| `test-util` | For the tests of a crate that hosts discovery: a double of the host trait whose job queue records what it took and, under `kubernetes`, that provider started on a client configuration the test hands it and a pod fixture. |
