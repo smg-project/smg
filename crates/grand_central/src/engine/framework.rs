@@ -3280,7 +3280,10 @@ pub struct Binding {
     pub decode_shadow: Option<u16>,
     /// Sticky sessions: a keyed request stays on the worker its key was
     /// placed on (design 4.6), under the `single` plan and on each side of
-    /// a pair, by the side's own session.
+    /// a pair, by the side's own session. A document states the rule: code
+    /// outside this crate builds none ([`SessionRule`]), so a binding it
+    /// makes leaves this `None`, or takes the rule of a document's binding
+    /// ([`Engine::binding`]).
     pub sessions: Option<SessionRule>,
 }
 

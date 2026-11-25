@@ -28,7 +28,9 @@ use crate::{
 
 /// A binding's sessions rule as the engine runs it. A document's validation
 /// makes it, and code outside this crate states a sessions rule by a
-/// document. The record gains fields: a pattern of it there ends with `..`.
+/// document: it builds none, so a binding it makes in code holds none, or
+/// one it read from a document's binding. The record gains fields: a pattern
+/// of it there ends with `..`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SessionRule {
