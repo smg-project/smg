@@ -222,6 +222,7 @@ pub fn request_facts() -> &'static [&'static str] {
             client_key,
             ring,
             ring_positions,
+            decode_ring_positions,
             session_key_from_rid,
         }
     )

@@ -3130,6 +3130,18 @@ fn live_sides(binding: &Binding) -> [u16; 2] {
     [prefill, binding.decode_profile.unwrap_or(prefill)]
 }
 
+/// The live profiles the shadow of `side` is held against for the ring its
+/// request lends ([`Engine::unlent`]): both of `lives` where one list of
+/// places is both sides', and the side's own where each side is stated
+/// its own ([`RequestFacts::decode_ring_positions`]), whose list was
+/// stated by that side's word.
+fn held_to<'l>(lives: &'l [u16; 2], side: PairSide, facts: &RequestFacts<'_>) -> &'l [u16] {
+    match facts.decode_ring_positions {
+        Some(_) => std::slice::from_ref(&lives[side.index()]),
+        None => lives,
+    }
+}
+
 /// `entry` where its binding's plan pairs (`pd-pair` or `epd`): what makes
 /// a model's prefill entry its pair entry ([`Engine::pair_entry`]).
 fn paired(entry: &Entry) -> Option<&Entry> {
@@ -4791,18 +4803,25 @@ impl<'a> PairPools<'a> {
     /// for that pool ([`column_fits`]). The one place a pair's column and
     /// cells meet their pool, so no call site hands one side's with the
     /// other side's candidates.
+    ///
+    /// A side reads its own places on a lent ring in the one list
+    /// ([`RequestFacts::ring_positions`]): the decode side's own where the
+    /// request states them apart
+    /// ([`RequestFacts::decode_ring_positions`]), which neither side's
+    /// facts carry on. So a stage is never shown the other side's list.
     fn side(
         self,
         side: PairSide,
         facts: &RequestFacts<'a>,
     ) -> Option<(&'a [Candidate], RequestFacts<'a>)> {
-        let (pool, affinity, signal_cells, phase, seed) = match side {
+        let (pool, affinity, signal_cells, phase, seed, ring_positions) = match side {
             PairSide::Prefill => (
                 self.prefills,
                 self.prefill_affinity,
                 self.prefill_signal_cells,
                 Phase::Prefill,
                 facts.seed,
+                facts.ring_positions,
             ),
             // The decode side draws its own sequence, derived from the
             // request's seed: one seed on both sides made the decode picker
@@ -4816,6 +4835,7 @@ impl<'a> PairPools<'a> {
                 self.decode_signal_cells,
                 Phase::Decode,
                 Draw::new(facts.seed).next_u64(),
+                facts.decode_ring_positions.unwrap_or(facts.ring_positions),
             ),
         };
         debug_assert_indexed(pool);
@@ -4829,6 +4849,9 @@ impl<'a> PairPools<'a> {
                 // The side's own cells: the request's would be read by
                 // another pool's positions.
                 signal_cells,
+                // The side's own places, in the one list a stage reads.
+                ring_positions,
+                decode_ring_positions: None,
                 ..*facts
             };
             (pool, facts)
@@ -5689,9 +5712,13 @@ impl Engine {
     /// scorer of the profile that decides it places by that
     /// ([`Scorer::places_by_key_text`]), or, for a pair asked at its
     /// prefill, a scorer of its decode profile does. And no scorer of
-    /// either reads a ring by another text: a pair's two sides are handed
-    /// one ring and one place, so a side of another ring form would take
-    /// that place for its own. `false` where no binding matches. Only a
+    /// either reads a ring by another text: the answer is one place for
+    /// a pair's two sides, and a side of another ring form would take
+    /// that place for its own. A pair whose sides read the ring by two
+    /// words is answered `false`, and what makes its request states each
+    /// side its own places, by that side's profile alone
+    /// ([`RequestFacts::decode_ring_positions`]). `false` where no
+    /// binding matches. Only a
     /// request that lends a ring pays for the answer: one lookup of its
     /// binding, which names a pair's decode profile too. A decode asked
     /// again is answered for a decode request's own binding, which a
@@ -5825,11 +5852,13 @@ impl Engine {
     /// of a scorer of its decode profile. [`Self::states_key_place`]
     /// answers for the plain ring by the same two profiles, and this is
     /// its mirror: every scorer of either that places by heads names the
-    /// one rule, and no scorer of either reads a ring by another text. A
-    /// pair's two sides are handed one ring and one list of places, so a
-    /// side that reads no ring holds nothing back, and a pair of two
-    /// depths or of two ring forms states nothing. `None` then, and where
-    /// no binding matches. The scorers answered when the engine was built,
+    /// one rule, and no scorer of either reads a ring by another text. The
+    /// answer is one list of places for a pair's two sides, so a side
+    /// that reads no ring holds nothing back, and a pair of two depths or
+    /// of two ring forms has no such list. `None` then, where each side
+    /// is stated its own places
+    /// ([`RequestFacts::decode_ring_positions`]), and where no binding
+    /// matches. The scorers answered when the engine was built,
     /// and no stage is asked here. Only a request that lends a ring to a
     /// profile with no place for its key's text pays for the answer: one
     /// lookup of its binding, which names a pair's decode profile too.
@@ -6935,7 +6964,8 @@ impl Engine {
         Some(run_whole(self, index, facts, pool, set, cx, buf))
     }
 
-    /// `facts` with no ring lent, where the shadow profile at `shadow`
+    /// `facts` with no ring lent and no place stated, a pair's decode
+    /// side's own among them, where the shadow profile at `shadow`
     /// reads a lent ring by another place than one of the live profiles at
     /// `lives` states on it. The two read a ring by different kinds of
     /// place ([`Marks::ring_apart`]), or both place by heads and cut a
@@ -6968,6 +6998,7 @@ impl Engine {
         lives.iter().any(apart).then_some(RequestFacts {
             ring: None,
             ring_positions: &[],
+            decode_ring_positions: None,
             ..*facts
         })
     }
@@ -8466,11 +8497,17 @@ impl Engine {
     /// reads.
     ///
     /// A side's shadow is lent the ring its request lends by the rule of a
-    /// single's shadow ([`Self::shadow`]), held against both live sides: a
-    /// pair is lent one ring and one list of places for its two sides
-    /// ([`Self::states_key_place`]). So a shadow that reads a ring by
-    /// another place than either live side states is lent none, and
-    /// places on its own ring ([`Self::unlent`]).
+    /// single's shadow ([`Self::shadow`]), held against the word its
+    /// side's list was stated by. Where the pair is lent one list of
+    /// places for its two sides ([`Self::states_key_place`]), that is
+    /// both live sides' word: a shadow that reads a ring by another place
+    /// than either live side states is lent none. Where each side is
+    /// stated its own places ([`RequestFacts::decode_ring_positions`]),
+    /// it is the side's own live profile's word: a shadow that reads the
+    /// ring as its live side does is lent the ring with its side's
+    /// places ([`PairPools::side`]), and one that reads it as the other
+    /// side does is lent none. A shadow lent none places on its own ring
+    /// ([`Self::unlent`]).
     ///
     /// `None` where the binding names no shadow for the side, where the
     /// build did not find that profile free to run beside the live one
@@ -8524,14 +8561,16 @@ impl Engine {
         }
         let profile = self.profiles.get(usize::from(index))?;
         let entry = self.bindings.get(at as usize)?;
-        // The place stated on a lent ring is the two live sides'.
         let lives = live_sides(&entry.binding);
         // A side its binding's sessions rule or its picker's assignment
         // placed: a shadow's run is put to neither.
         if self.places_side(entry, lives[side.index()], facts) {
             return None;
         }
-        let unlent = self.unlent(index, &lives, facts);
+        // The place stated on a lent ring is the two live sides' where
+        // one list is both sides', and the side's own live profile's
+        // where each side is stated its own.
+        let unlent = self.unlent(index, held_to(&lives, side, facts), facts);
         let facts = unlent.as_ref().unwrap_or(facts);
         let (prefills, prefill_facts) = pools.side(PairSide::Prefill, facts)?;
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
@@ -8588,7 +8627,8 @@ impl Engine {
     /// run writes the scratch and the shadow profile's stages, and
     /// nothing a commit reads. The shadow is lent the ring its request
     /// lends by the rule of a side's at the pair's decision
-    /// ([`Self::shadow_side`]), held against both live sides
+    /// ([`Self::shadow_side`]): held against both live sides, or against
+    /// the decode's own alone where each side is stated its own places
     /// ([`Self::unlent`]).
     ///
     /// `first_decode` is the decode the pair's first decision named, as
@@ -8640,8 +8680,9 @@ impl Engine {
             return None;
         }
         let profile = self.profiles.get(usize::from(index))?;
-        // The place stated on a lent ring is the two live sides'.
-        let unlent = self.unlent(index, &lives, facts);
+        // The place stated on a lent ring, by the rule of a side's at the
+        // pair's first decision.
+        let unlent = self.unlent(index, held_to(&lives, side, facts), facts);
         let facts = unlent.as_ref().unwrap_or(facts);
         let (decodes, mut decode_facts) = pools.side(side, facts)?;
         let prefill = pools.prefills.iter().find(|row| row.id == prefill)?;
@@ -11732,6 +11773,38 @@ mod tests {
             let (_, read) = pools.side(side, &facts).expect("an empty column fits");
             assert!(read.named.is_none(), "the {name} side");
         }
+    }
+
+    /// Each side of a pair reads its own places on a lent ring in the one
+    /// list a stage reads: the decode side's own where its request states
+    /// them apart, else the request's one list. Neither side's facts carry
+    /// the decode side's list on, so no stage is shown the other side's. A
+    /// decode side stated an empty list reads none: its stage's own ring
+    /// places it.
+    #[test]
+    fn each_side_of_a_pair_reads_its_own_places_on_a_lent_ring() {
+        let (prefills, decodes) = (paired(2), paired(2));
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let read = |decode_ring_positions: Option<&[u64]>| {
+            let facts = RequestFacts {
+                model: "m",
+                ring_positions: &[7],
+                decode_ring_positions,
+                ..RequestFacts::default()
+            };
+            [(PairSide::Prefill, "prefill"), (PairSide::Decode, "decode")].map(|(side, name)| {
+                let (_, read) = pools.side(side, &facts).expect("an empty column fits");
+                assert!(read.decode_ring_positions.is_none(), "the {name} side");
+                read.ring_positions.to_vec()
+            })
+        };
+        assert_eq!(read(None), [vec![7], vec![7]]);
+        assert_eq!(read(Some(&[3, 5])), [vec![7], vec![3, 5]]);
+        assert_eq!(read(Some(&[])), [vec![7], vec![]]);
     }
 
     /// Each side of a pair reads its own pool's column: with the two columns

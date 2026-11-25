@@ -954,8 +954,8 @@ fn a_sides_shadow_of_another_ring_form_places_on_its_own_ring() {
     assert_eq!(shadows.len(), 1, "the shadow reads no place: {taken:?}");
 }
 
-/// A pair is lent one ring and one list of places for its two sides, so a
-/// side's shadow is held to the rule against both live sides. In each bed
+/// Where a pair is lent one list of places for its two sides, a side's
+/// shadow is held to the rule against both live sides. In each bed
 /// one live side states the routing value's place on the plain ring and
 /// the other reads no ring. A shadow of the prefix form is apart from that
 /// place, whichever live side states it: its own, or the other one where
@@ -1007,6 +1007,125 @@ fn a_later_decodes_shadow_is_lent_the_ring_by_the_rule_of_a_sides() {
         assert!(
             lives.len() > 1,
             "the live decode follows the place: {taken:?}"
+        );
+        if follows {
+            for (live, shadow) in taken {
+                let live = worker_id(host.decodes[live].as_ref());
+                assert_eq!(shadow, Some(live), "{next}");
+            }
+        } else {
+            let shadows: BTreeSet<_> = taken.iter().map(|taken| taken.1).collect();
+            assert_eq!(shadows.len(), 1, "{next} reads no place: {taken:?}");
+        }
+    }
+}
+
+/// The facts of a keyed request of a pair whose two sides are stated their
+/// own places on the lent ring: the prefill side stands at `places[0]` of
+/// it, the decode side at `places[1]`.
+fn on_ring_apart<'a>(ring: &'a InOrder, places: &'a [[u64; 1]; 2]) -> RequestFacts<'a> {
+    RequestFacts {
+        ring: Some(ring),
+        ring_positions: &places[0],
+        decode_ring_positions: Some(&places[1]),
+        ..keyed()
+    }
+}
+
+/// [`taken_on_ring`] for a pair whose two sides are stated their own
+/// places: the decode side at each of six places of the lent ring, and the
+/// prefill side three places further along.
+fn taken_apart(host: &Host, side: PairSide) -> Vec<(usize, Option<WorkerId>)> {
+    let ring = model_ring();
+    let taken = |place: u64| {
+        let places = [[(place + 3) % 6], [place]];
+        let (decision, said) = said_beside(host, on_ring_apart(&ring, &places));
+        let live = host.picked(&decision);
+        let shadow = said[side.index()].expect("the side's shadow");
+        assert_ne!(shadow.kind, ShadowKind::Skipped, "the shadow ran");
+        let live = match side {
+            PairSide::Prefill => live.0,
+            PairSide::Decode => live.1,
+        };
+        (live, shadow.first)
+    };
+    (0..6).map(taken).collect()
+}
+
+/// Where each side of a pair is stated its own places on the lent ring, a
+/// side's shadow is held to the rule against its own live side alone: its
+/// side's list was stated by that side's word. The pair here is the plain
+/// ring ahead of the prefix form. A shadow that reads the ring as its own
+/// live side does is lent the ring with its side's places, and takes the
+/// worker its live side takes at every place: held against both live
+/// sides it would be apart from the other one and lent none. A shadow
+/// that reads the ring as the other side does is lent none: its side's
+/// list is no place of its own, and it takes one worker whatever the
+/// places stated.
+#[test]
+fn a_sides_shadow_is_held_to_its_own_sides_word_where_each_side_states_its_own() {
+    let (plain, form) = ("consistent_hashing", "prefix_hash");
+    // The side, its shadow, and whether that shadow reads the ring as the
+    // side's own live profile does.
+    let beds = [
+        (PairSide::Decode, [None, Some(form)], true),
+        (PairSide::Decode, [None, Some(plain)], false),
+        (PairSide::Prefill, [Some(plain), None], true),
+        (PairSide::Prefill, [Some(form), None], false),
+    ];
+    for (side, next, as_its_own) in beds {
+        let host = stock([plain, form], next, (3, 3));
+        let taken = taken_apart(&host, side);
+        let lives: BTreeSet<usize> = taken.iter().map(|taken| taken.0).collect();
+        assert!(
+            lives.len() > 1,
+            "{side:?}: the live side follows its place: {taken:?}"
+        );
+        if as_its_own {
+            let list = match side {
+                PairSide::Prefill => &host.prefills,
+                PairSide::Decode => &host.decodes,
+            };
+            for (live, shadow) in taken {
+                let live = worker_id(list[live].as_ref());
+                assert_eq!(shadow, Some(live), "{side:?}");
+            }
+        } else {
+            let shadows: BTreeSet<Option<WorkerId>> = taken.iter().map(|taken| taken.1).collect();
+            assert_eq!(shadows.len(), 1, "{side:?} reads no place: {taken:?}");
+        }
+    }
+}
+
+/// The decode's shadow beside a decode decided again follows the same rule
+/// where each side is stated its own places: it is held against the
+/// decode's own live profile alone. The pair is the plain ring ahead of
+/// the prefix form. A decode's shadow of the prefix form takes the decode
+/// the live call takes at every place the decode side states: held
+/// against both live sides it would be apart from the prefill's and lent
+/// none. A shadow of the plain ring reads the ring as the prefill side
+/// does: it is lent none and takes one decode whatever the place.
+#[test]
+fn a_later_decodes_shadow_is_held_to_the_decodes_word_where_each_side_states_its_own() {
+    let (plain, form) = ("consistent_hashing", "prefix_hash");
+    let ring = model_ring();
+    for (next, follows) in [(form, true), (plain, false)] {
+        let host = stock([plain, form], [None, Some(next)], (3, 3));
+        let taken = |place: u64| {
+            let places = [[(place + 3) % 6], [place]];
+            let facts = on_ring_apart(&ring, &places);
+            let (first, _) = said_beside(&host, facts);
+            let held = target_at(&first, 0);
+            let (again, said) = said_behind(&host, facts, Some(&held));
+            let shadow = said[PairSide::Decode.index()].expect("the decode's shadow");
+            assert_ne!(shadow.kind, ShadowKind::Skipped, "the shadow ran");
+            (host.picked(&again).1, shadow.first)
+        };
+        let taken: Vec<_> = (0..6).map(taken).collect();
+        let lives: BTreeSet<usize> = taken.iter().map(|taken| taken.0).collect();
+        assert!(
+            lives.len() > 1,
+            "the live decode follows its place: {taken:?}"
         );
         if follows {
             for (live, shadow) in taken {

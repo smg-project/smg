@@ -356,10 +356,15 @@ pub struct PlaceRequest<'a> {
     /// keys. Under the prefix form of the ring stage the engine asks the
     /// ring where each head of the request stands
     /// ([`LentRing::head_position`]). A ring that answers nothing for a
-    /// head is asked nothing more and is not lent, and neither is a ring
-    /// to a request that has no head. Under any other document the ring
-    /// is asked nothing. `None` from a caller that keeps no ring: the
-    /// stage places by its own.
+    /// head is asked about no further head and is not lent, and neither
+    /// is a ring to a request that has no head. A pair whose two sides
+    /// read the ring by two words is asked for each side's own places: a
+    /// key's own place for one side and its heads' for the other, or the
+    /// heads two rules cut. Its ring stays lent while either side has a
+    /// place, and a side the ring places nothing for goes by its stage's
+    /// own ring. Under any other document the ring is asked nothing.
+    /// `None` from a caller that keeps no ring: the stage places by its
+    /// own.
     ///
     /// An encode request's items are lent this ring too
     /// ([`EncodeItems::ring`]). An item that carries its text goes to the
@@ -513,6 +518,10 @@ pub(super) struct Made<'r, 'a> {
     /// of the ring stage: asked of the lender at the request's first
     /// making, like the key's place.
     heads: OnceCell<Places>,
+    /// Where the request's heads stand on that ring for a pair's decode
+    /// side, where the two sides cut a prompt by two rules
+    /// ([`Made::stated_apart`]): `heads` holds the prefill side's then.
+    decode_heads: OnceCell<Places>,
     /// The panic of the route's rule where it was asked inside a decision
     /// ([`RequestMaker::sends_to`]): kept for the call, which raises it
     /// again outside the decision ([`raise`]).
@@ -622,6 +631,7 @@ impl<'r, 'a> Made<'r, 'a> {
             key: Cell::new(None),
             place: OnceCell::new(),
             heads: OnceCell::new(),
+            decode_heads: OnceCell::new(),
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
             decodes: Cell::new(Sent::NONE),
@@ -741,11 +751,18 @@ impl<'r, 'a> Made<'r, 'a> {
     /// of one ask of the call, and a later making of that ask borrows
     /// what it answered. A call that asks again makes its request anew,
     /// and asks the lender again.
+    ///
+    /// A pair's two profiles answer together, and their one list is both
+    /// sides'. Where they read the ring by two words no one list is, and
+    /// each side is stated its own ([`Self::stated_apart`]). The keys of
+    /// such a pair are derived here, once, as every other request's are,
+    /// and the lender is asked with them for each word a side reads
+    /// ([`Self::words_apart`]).
     fn stated<'w>(&'w self, spec: &'w AppliedSpec) -> Stated<'a, 'w> {
         let request = self.request;
         let (model, phase) = (request.model, request.phase());
         let Some(ring) = request.ring else {
-            return (self.keys(spec, |_, _| None), None, &[]);
+            return (self.keys(spec, |_, _| None), None, &[], None);
         };
         // The two questions are asked of one lookup of the binding.
         let engine = spec.engine();
@@ -753,10 +770,34 @@ impl<'r, 'a> Made<'r, 'a> {
         if engine.key_place_of(profiles) {
             return self.stated_key::<false>(spec, ring);
         }
-        match engine.head_rule_of(profiles) {
-            Some(rule) => self.stated_heads::<false>(spec, ring, rule),
-            None => (self.keys(spec, |_, _| None), None, &[]),
-        }
+        let Some(rule) = engine.head_rule_of(profiles) else {
+            let (Some(own), Some(decode)) = profiles else {
+                return (self.keys(spec, |_, _| None), None, &[], None);
+            };
+            // A pair whose two sides read the ring by two words: the
+            // lender is asked for each word a side reads, with the keys'
+            // one derivation.
+            let words = self.words_apart(spec, (own, decode));
+            let (first_key, first_heads) = (words.first_key, words.first_heads);
+            let key_at = Cell::new(None);
+            let keys = self.keys(spec, |text, source| {
+                if first_heads && source.is_some_and(leads_a_prompt) {
+                    key_at.set(Some(ring.head_position(Head::Text(text))));
+                }
+                first_key.then(|| ring.position(text))
+            });
+            let (places, decode_places) =
+                self.stated_apart(ring, &words, keys.ring_position, key_at.take());
+            // The ring is lent where either side has a place.
+            let lent = !(places.is_empty() && decode_places.is_empty());
+            return (
+                keys,
+                lent.then_some(ring),
+                places,
+                lent.then_some(decode_places),
+            );
+        };
+        self.stated_heads::<false>(spec, ring, rule)
     }
 
     /// [`Self::stated`] by a stage that places a routing value by its own
@@ -773,7 +814,7 @@ impl<'r, 'a> Made<'r, 'a> {
         let first = self.place.get().is_none();
         let keys = self.keys(spec, |text, _| first.then(|| ring.position(text)));
         let place = self.place.get_or_init(|| keys.ring_position);
-        (keys, Some(ring), place.as_slice())
+        (keys, Some(ring), place.as_slice(), None)
     }
 
     /// [`Self::stated`] by the prefix form of the ring, which cuts the
@@ -800,33 +841,143 @@ impl<'r, 'a> Made<'r, 'a> {
             None
         });
         let heads = self.heads.get_or_init(|| {
-            let mut places = Places::default();
-            match key_at.take() {
-                Some(answer) => places.state(answer),
-                None => {
-                    let (tokens, text) = (request.prompt.tokens, request.prompt.text);
-                    rule.heads(tokens, text, |head| {
-                        // A lender that places no head is asked nothing more.
-                        if !places.unplaced {
-                            places.state(ring.head_position(head));
-                        }
-                    });
-                    places.turn();
-                }
-            }
-            places
+            let prompt = (request.prompt.tokens, request.prompt.text);
+            Places::of_heads::<SHADOW>(ring, rule, prompt, key_at.take())
         });
         // The ring is lent with a place: a request that has no head, and
         // one whose lender places none, state nothing and lend nothing.
         let places = heads.as_slice();
         let ring = (!places.is_empty()).then_some(ring);
-        (keys, ring, places)
+        (keys, ring, places, None)
+    }
+
+    /// The word each side of a pair reads the lent ring by, where the two
+    /// sides read it by two words: `own` and `decode` are the pair's two
+    /// profiles
+    /// ([`Engine::ring_profiles`](crate::engine::Engine::ring_profiles)).
+    /// A side's word is the one a single request of its own profile is
+    /// stated by. A side that places a routing value by its own text
+    /// reads that text's place. A side of the prefix form reads the
+    /// places of the request's heads by its own rule. A side that reads
+    /// no ring, or reads it by two words itself, reads nothing.
+    ///
+    /// With the words, whether this making is the first to ask the lender
+    /// where the key's own text stands, and where the key stands as a
+    /// head: the lender's answers are kept at the first making, as a
+    /// single request's are.
+    #[inline(never)]
+    fn words_apart<'e>(&self, spec: &'e AppliedSpec, (own, decode): (usize, usize)) -> Words<'e> {
+        let engine = spec.engine();
+        let word = |at: usize| {
+            let alone = (Some(at), None);
+            if engine.key_place_of(alone) {
+                Word::Key
+            } else {
+                engine.head_rule_of(alone).map_or(Word::Unread, Word::Heads)
+            }
+        };
+        let (prefill, decode) = (word(own), word(decode));
+        let by_key = matches!(prefill, Word::Key) || matches!(decode, Word::Key);
+        let by_heads = matches!(prefill, Word::Heads(_)) || matches!(decode, Word::Heads(_));
+        Words {
+            prefill,
+            decode,
+            first_key: by_key && self.place.get().is_none(),
+            first_heads: by_heads && self.heads.get().is_none(),
+        }
+    }
+
+    /// [`Self::stated`] for a pair whose two sides read the lent ring by
+    /// two words (`words`), so that no one list is both sides': each
+    /// side's own places, the prefill side's first. Each side is stated
+    /// what a single request of its own profile is stated. `key_place` is
+    /// where the lender put the routing value's own text, and `key_at`
+    /// its answer for that value as a head, where this making asked.
+    ///
+    /// A routing value that leads the prompt is the one head under every
+    /// rule, so two sides of the prefix form then stand at one place. A
+    /// side that has no place places by its stage's own ring: its list
+    /// is empty ([`RequestFacts::decode_ring_positions`]). So a lender
+    /// that places no head leaves the side of the prefix form alone to
+    /// its own ring, and under two rules is asked about no head behind
+    /// the one it declined.
+    ///
+    /// The keys are derived in [`Self::stated`] and not here: a statement
+    /// that an out-of-line function returns whole passes every request's
+    /// statement through memory, a single request's too.
+    #[inline(never)]
+    fn stated_apart<'w>(
+        &'w self,
+        ring: &'a dyn LentRing,
+        words: &Words<'_>,
+        key_place: Option<u64>,
+        key_at: Option<Option<u64>>,
+    ) -> (&'w [u64], &'w [u64]) {
+        let request = self.request;
+        let prompt = (request.prompt.tokens, request.prompt.text);
+        let side = |word: Word<'_>, heads: &'w OnceCell<Places>| -> &'w [u64] {
+            match word {
+                Word::Unread => &[],
+                Word::Key => self.place.get_or_init(|| key_place).as_slice(),
+                Word::Heads(rule) => heads
+                    .get_or_init(|| Places::of_heads::<true>(ring, rule, prompt, key_at))
+                    .as_slice(),
+            }
+        };
+        let (prefill, decode) = (words.prefill, words.decode);
+        let places = side(prefill, &self.heads);
+        // Two rules cut two lists: the decode side's stands in its own
+        // cell where the prefill side's fills the first. A lender that
+        // placed no head for the first is asked about none for the second.
+        let second = matches!((prefill, decode), (Word::Heads(_), Word::Heads(_)));
+        let declined = second && self.heads.get().is_some_and(|heads| heads.unplaced);
+        let decode_places: &[u64] = match (declined, second) {
+            (true, _) => &[],
+            (false, true) => side(decode, &self.decode_heads),
+            (false, false) => side(decode, &self.heads),
+        };
+        (places, decode_places)
     }
 }
 
 /// What a request states of a lent ring ([`Made::stated`]): its keys, the
-/// ring its decision is lent, and its places on it.
-type Stated<'a, 'w> = (DerivedKeys<'a>, Option<&'a dyn LentRing>, &'w [u64]);
+/// ring its decision is lent, its places on it, and a pair's decode side's
+/// own places where the two sides are stated apart
+/// ([`RequestFacts::decode_ring_positions`]). A statement of one list
+/// ([`Made::stated_key`], [`Made::stated_heads`]) holds `None` there.
+type Stated<'a, 'w> = (
+    DerivedKeys<'a>,
+    Option<&'a dyn LentRing>,
+    &'w [u64],
+    Option<&'w [u64]>,
+);
+
+/// The words a pair's two sides read a lent ring by
+/// ([`Made::words_apart`]), and what the lender is still to be asked.
+#[derive(Clone, Copy)]
+struct Words<'e> {
+    /// The prefill side's word.
+    prefill: Word<'e>,
+    /// The decode side's word.
+    decode: Word<'e>,
+    /// A side reads the key's own place, and no making took it yet.
+    first_key: bool,
+    /// A side reads the heads' places, and no making took them yet.
+    first_heads: bool,
+}
+
+/// What one profile reads of a ring its request is lent
+/// ([`Made::words_apart`]).
+#[derive(Clone, Copy)]
+enum Word<'e> {
+    /// No place of the request's: the profile reads no ring, or reads it
+    /// by two words itself.
+    Unread,
+    /// The place of the routing value's own text.
+    Key,
+    /// The places of the request's heads, cut by this rule.
+    Heads(HeadRule<'e>),
+}
 
 /// Whether a routing value from `source` leads a request's prompt under a
 /// ring's prefix form: every source but the request's own id, whose value
@@ -855,12 +1006,45 @@ struct Places {
     /// How many places `inline` holds, while `spilled` holds none.
     len: usize,
     spilled: Vec<u64>,
-    /// The lender places no head: the request is lent no ring and states
-    /// no place.
+    /// The lender places no head: this list states no place, and a
+    /// request with no other place on the ring is lent none.
     unplaced: bool,
 }
 
 impl Places {
+    /// Where a request's heads stand on `ring`, the deepest first: the one
+    /// place of `key_at`, the lender's answer for a routing value that
+    /// leads the prompt, where the request has one, else its answers for
+    /// the heads `rule` cuts of `prompt`, its token ids and its text. A
+    /// lender that places no head is asked nothing more, and the list is
+    /// then none. `APART` parts the copy a pair's sides stated apart
+    /// compile ([`Made::stated_apart`]), and a shadow's own statement with
+    /// them ([`Made::stated_heads`]), from the live one list's: a closure
+    /// called from one place is built into its caller, so that statement
+    /// stays whole inside [`Made::stated`].
+    #[inline(always)]
+    fn of_heads<const APART: bool>(
+        ring: &dyn LentRing,
+        rule: HeadRule<'_>,
+        (tokens, text): (Option<&[u32]>, Option<&str>),
+        key_at: Option<Option<u64>>,
+    ) -> Self {
+        let mut places = Self::default();
+        match key_at {
+            Some(answer) => places.state(answer),
+            None => {
+                rule.heads(tokens, text, |head| {
+                    // A lender that places no head is asked nothing more.
+                    if !places.unplaced {
+                        places.state(ring.head_position(head));
+                    }
+                });
+                places.turn();
+            }
+        }
+        places
+    }
+
     /// The lender's answer for one head, behind those stated so far.
     fn state(&mut self, answer: Option<u64>) {
         let Some(place) = answer else {
@@ -908,7 +1092,7 @@ impl RequestMaker for Made<'_, '_> {
         let request = self.request;
         // The request's place is taken at the first making: a later one
         // asks the ring nothing, and nothing is hashed again.
-        let (keys, ring, places) = self.stated(spec);
+        let (keys, ring, places, decode_places) = self.stated(spec);
         let session_key = keys.session.map_or(Identity::NONE, |derived| derived.key);
         self.key.set(session_key.plain);
         // The headers the document's view shows a stage, each named by its
@@ -946,6 +1130,7 @@ impl RequestMaker for Made<'_, '_> {
             client_key: keys.client_key,
             ring,
             ring_positions: places,
+            decode_ring_positions: decode_places,
             attempt: request.attempt,
             tried: request.tried,
             budget_micros: self.budget_micros,
@@ -1024,7 +1209,7 @@ impl RequestMaker for Made<'_, '_> {
         let ring = self.request.ring?;
         // The shadow profile alone is asked what a deciding profile is.
         let (engine, profiles) = (spec.engine(), (Some(usize::from(shadow)), None));
-        let (_, ring, places) = if engine.key_place_of(profiles) {
+        let (_, ring, places, _) = if engine.key_place_of(profiles) {
             self.stated_key::<true>(spec, ring)
         } else {
             self.stated_heads::<true>(spec, ring, engine.head_rule_of(profiles)?)
