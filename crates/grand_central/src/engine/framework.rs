@@ -3219,12 +3219,13 @@ pub enum Plan {
     /// The prefill profile over the open prefills, then the decode profile
     /// over the chosen prefill's partners.
     PdPair,
-    /// The encode profile named here, once per encode item over the encode
-    /// pool with the pair's EC compatibility and the request's vision demand
-    /// as the plan's own filters, then the pair as under `PdPair`: the
-    /// binding's `profile` is the prefill side and `decode_profile` the
-    /// decode side. The encode side rides the plan, so a binding keeps the
-    /// pair's two fields.
+    /// The pair as under `PdPair`, then the encode profile named here over
+    /// the open encoders of the chosen prefill's class that take the
+    /// request's media, once per encode item or once for the items taken
+    /// as one. A request with items that no encoder is open to is refused
+    /// ahead of the pair. The binding's `profile` is the prefill side and
+    /// `decode_profile` the decode side. The encode side rides the plan,
+    /// so a binding keeps the pair's two fields.
     Epd {
         /// The encode profile, by position.
         encode: u16,
