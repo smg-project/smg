@@ -2122,6 +2122,11 @@ struct FiledDecode {
     /// pick's first, until that dispatch names another target the side's
     /// pick holds.
     taken: u8,
+    /// Whether the side's own dispatch deadline runs: the deadline's door
+    /// started it at its first pass behind the end of the prefill the side
+    /// was issued with ([`Leases::waits_on`]). The door's next pass ends a
+    /// side that still waits.
+    own_deadline: bool,
 }
 
 /// One issue of a chosen decode side, for a caller that may undo it
@@ -2152,6 +2157,7 @@ impl FiledDecode {
             filed_chosen,
             issues: 0,
             taken: 0,
+            own_deadline: false,
         }
     }
 
@@ -2854,7 +2860,9 @@ impl Leases {
     /// since, the deadline's span of them at most. `None` at a first place
     /// whose lease waits inside its deadline, at an empty queue and once
     /// the steps are spent. A lease waits while a side of it does
-    /// ([`Leases::abandon`]).
+    /// ([`Leases::abandon`]). A pair's decode side that waits behind its
+    /// prefill is not ended: its lease is queued again, a step as any
+    /// place stepped over ([`Leases::waits_on`]).
     fn end_due(&mut self, now: Instant, steps: &mut usize) -> Option<Sides> {
         while *steps > 0 {
             let &(due, key) = self.due.front()?;
@@ -2867,11 +2875,55 @@ impl Leases {
             }
             self.due.pop_front();
             *steps -= 1;
-            if waits {
+            if waits && !self.waits_on(&key, now) {
                 return self.abandon(&key);
             }
         }
         None
+    }
+
+    /// Whether the pair's lease under `key`, whose deadline the door found
+    /// due at `now`, waits on for its decode side alone: the lease's
+    /// deadline is then written one span behind `now` and queued again,
+    /// and nothing ends.
+    ///
+    /// A decode side issued with its prefill is sent when that prefill has
+    /// answered, so the time to name its dispatch starts at the prefill's
+    /// end. The side stands while its prefill is dispatched, as it stands
+    /// in a gateway's own process, where no deadline runs. At the door's
+    /// first pass behind that prefill's end it takes one whole deadline of
+    /// its own ([`FiledDecode::own_deadline`]), and the pass behind that
+    /// ends a side that still waits. An end hands the file no instant: the
+    /// door's own pass dates the side's deadline, and no clock is read.
+    ///
+    /// `false` for every other lease, which the deadline ends as it did: a
+    /// single's, a pair whose prefill waits too, and a side a decode call
+    /// issued, whose deadline the call wrote ([`Leases::issue_decode`]).
+    /// Cold, as [`Leases::abandon`] is: a due deadline alone reaches it.
+    #[cold]
+    fn waits_on(&mut self, key: &Key, now: Instant) -> bool {
+        let Some(held) = self.records.get_mut(key) else {
+            return false;
+        };
+        if held.record.decode.is_none() || held.record.state.is_issued() {
+            return false;
+        }
+        let Some(decode) = self.decodes.get_mut(held.decode, key) else {
+            return false;
+        };
+        if decode.filed_chosen || !decode.side.state.is_issued() {
+            return false;
+        }
+        if !matches!(held.record.state, LeaseState::Dispatched { .. }) {
+            if decode.own_deadline {
+                return false;
+            }
+            decode.own_deadline = true;
+        }
+        let deadline = now + DISPATCH_TTL;
+        held.record.dispatch_deadline = deadline;
+        self.queue(deadline, *key);
+        true
     }
 
     /// Ends what waits of the lease under `key` as abandoned: a single's

@@ -809,7 +809,7 @@ A pick's first target is booked at issue by the door or service. The caller can 
 
 ### When a gateway loses its stream
 
-A gateway asks the stock controller for decisions on a stream. A pick carries a **lease** that books its worker. A side that no dispatch names within five seconds is given up.
+A gateway asks the stock controller for decisions on a stream. A pick carries a **lease** that books its worker. A side that no dispatch names within five seconds is given up. A pair's decode side that was issued with its prefill is held while that prefill is dispatched. Once the prefill has ended, the side has at least five seconds to be dispatched.
 
 A stream can end with requests unanswered. Two rules keep one lease standing for one request.
 
