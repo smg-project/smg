@@ -26,11 +26,18 @@
 //! ([`pair_settings`]), or such pairs behind encoders that take a request's
 //! items ([`encode_settings`]).
 //!
+//! The program keeps a hash ring of its own for each generation
+//! ([`Ring`]) and lends it with every request: where the document places a
+//! routing value by a ring, the value goes where the program's ring puts it.
+//!
 //! A route says one thing more of a pair, which no setting holds: whether it
 //! sends the decode at once or behind the prefill's answer
 //! ([`Program::in_turn`]). A route of the second kind asks the engine for
 //! its decode again, behind that answer, where the placement says that the
-//! decode still stands chosen.
+//! decode still stands chosen. It stands chosen under a document that picks
+//! a pair's decode behind its prefill, and no setting holds that word: a
+//! host whose route asks again writes it into the document its settings
+//! mean (`plans.pd-pair.decode`).
 //!
 //! Of the engine the program asks what [`Engine`] lists, and nothing else.
 //! It keeps no circuit breaker's count and chooses no rank inside a worker:
@@ -54,6 +61,7 @@ use smg_grand_central::{
         InProcess, LentList, ModelLists, PairAdmission, PairLists, PartnerClasses, PlaceRequest,
         PublishedList, Unplaced, WorkerData, WorkerId, WorkerLists,
     },
+    policies::consistent_hashing::LentRing,
     store::{EncodeHandoff, EncodeOffer},
     tracking::{Outcome, Placement, Side, TransportClass},
 };
@@ -63,6 +71,8 @@ use smg_worker::{
     registry::{Generation, WorkerRegistry},
     worker::WorkerType,
 };
+
+use crate::ring::Ring;
 
 /// The attempts one client request gets at most: the first and two more.
 pub const ATTEMPTS: usize = 3;
@@ -179,6 +189,9 @@ struct Cut {
     /// The encode class each prefill names, by its place in the prefills'
     /// list.
     prefill_classes: Box<[u32]>,
+    /// The program's ring of the generation's workers, of every kind: one
+    /// ring serves every list.
+    ring: Ring,
 }
 
 impl Generation for Lists {
@@ -232,12 +245,19 @@ impl Lists {
                 classes: PartnerClasses::number(decodes.len(), partners),
                 encoder_facts: ends.encoder_facts(encoders.iter().map(|_| &offer)),
                 prefill_classes: classed.collect(),
+                ring: Ring::of(self.members.iter().map(|worker| worker.url())),
                 single: PublishedList::new(of(WorkerType::Regular)),
                 prefill: PublishedList::new(prefills),
                 decode: PublishedList::new(decodes),
                 encode: PublishedList::new(encoders),
             }
         })
+    }
+
+    /// The program's ring of this generation: every worker of the model
+    /// stands on it, whatever its kind.
+    pub fn ring(&self) -> &Ring {
+        &self.cut().ring
     }
 
     /// The single workers' list lent with its cell, and with no fact.
@@ -437,6 +457,11 @@ impl InFlight {
     /// holds the request no more while its decode runs, as a gateway's
     /// sequential dispatch frees the prefill once it is drained. A pair
     /// sent at once keeps both guards to the end of the response.
+    ///
+    /// The guard goes where the end is said, and this program's one
+    /// placement says that end behind its second ask. So the prefill still
+    /// counts the request while the engine decides the decode. A host that
+    /// keeps a pair's two sides may let the prefill go ahead of that ask.
     fn prefill_ended(&mut self, status: u16) {
         self.ended(Side::Prefill, status);
         drop(self.first.take());
@@ -559,7 +584,8 @@ impl Program {
     /// list, a pair's two, or an encode request's three. The items a
     /// request carries are stated with those three lists, at its first
     /// attempt alone: a retry states none and is placed as the pair. A
-    /// model that has no generation lends no list and states no item. A
+    /// model that has no generation lends no list and states no item. The
+    /// generation's ring is lent with its lists ([`Lists::ring`]). A
     /// program whose route sends a pair's decode behind its prefill's
     /// answer says so here.
     fn request<'a>(
@@ -588,12 +614,17 @@ impl Program {
         items.keys = asked.items;
         let lends = matches!(lent, WorkerLists::Encode(_));
         let carries = attempt == 0 && lends && !asked.items.is_empty();
+        // The generation's ring goes with every request. The engine asks it
+        // where the document's ring stage places by a routing value's text,
+        // and for an encode request's items.
+        let ring = lists.map(|lists| lists.ring() as &dyn LentRing);
         PlaceRequest {
             headers,
             encode: carries.then_some(items),
             attempt,
             tried,
             decode_again: self.in_turn,
+            ring,
             ..PlaceRequest::of(asked.model, lent)
         }
     }
