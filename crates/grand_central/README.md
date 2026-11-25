@@ -1222,7 +1222,7 @@ The leader's load monitor takes the load records on a worker's stream, and a sta
 - A choice by the media a worker can process, outside `epd`. No built-in filter reads it.
 - A request's hard demands through a served controller. A host that decides in process states them (`Constraints::demands`), a worker's registration states what it offers (`WorkerFacts::demand_facts`), and the door keeps the workers that meet them before any stage runs. A registration that changes what a worker states starts another life of the worker, as a change of its wires does. The stock controller's `Decide` request has no field for a demand yet, and a worker it registers states none.
 - A binding that matches on a tenant, a priority, a header, a prompt size or labels. The fields are in the schema. A document that writes one is refused as not in this build.
-- A pair's shadows at a decode decided again, for an encode request, beside a side its sessions rule places, through a served controller and in a gateway, and plugin stages in a shadow profile.
+- A pair's shadows at an encode request's first decision, beside a side its sessions rule or its picker's assignment places, through a served controller and in a gateway, and plugin stages in a shadow profile.
 - `canary`, `override: allowed` and `admission` on a binding, and `issue_session_id` in a sessions rule.
 - A sessions rule under `epd`. Under `pd-pair` a rule runs on both sides where it states `rule_placed: told`, and any other is refused.
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.

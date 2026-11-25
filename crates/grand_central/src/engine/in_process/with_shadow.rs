@@ -139,9 +139,8 @@ impl InProcess {
     /// plan asks one ([`ShadowSide`]) and by each kind, a count of zero
     /// too. A binding of one profile counts beside its single requests. A
     /// pair's binding counts beside each side that names a shadow, and
-    /// its decode side beside a decode decided again as well. No decision
-    /// counts beside a decode decided again yet: a host is told zeros
-    /// under that side. A row is told once, in the order of the rows: the
+    /// its decode side beside a decode decided again as well, in a count
+    /// of its own. A row is told once, in the order of the rows: the
     /// bindings from the last row on share it ([`SHADOW_ROWS`]). A shadow
     /// that panicked is in no count here: it is one of the engine's faults
     /// ([`DecisionEngine::faults`](crate::engine::DecisionEngine::faults)).

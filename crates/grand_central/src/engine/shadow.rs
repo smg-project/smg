@@ -46,7 +46,7 @@ pub enum ShadowSide {
     /// Beside the decode side of a pair, at the pair's first decision.
     Decode,
     /// Beside a decode decided after its prefill, at that second
-    /// decision. The pair's first decision counted its decode side
+    /// decision. A first decision that asked its decode side counted it
     /// beside the decode it named first: the two are never one count.
     DecodeAgain,
 }

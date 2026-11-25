@@ -2,6 +2,7 @@
 //! objects.
 
 use std::{
+    collections::BTreeMap,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
@@ -20,7 +21,7 @@ use smg_worker::{
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::spec::{AppliedSpec, PolicySpec, ShadowSpec},
     engine::{
         decision::{LiftedVeto, ShedReason, Targets, SUBSET_HINT},
         decision_engine::{DecisionEngine, HeldDecision, HeldDecode},
@@ -31,6 +32,7 @@ use crate::{
         pair_classes::PartnerClasses,
         prompt_hashes::{HashSeeds, PromptHashes},
         records::worker_id,
+        shadow::ShadowSide,
         view::{
             Candidate, Constraints, FixedFacts, Identity, MediaCounts, PoolFacts, RequestFacts,
             WireModes, WorkerId,
@@ -2824,6 +2826,63 @@ fn an_encode_requests_decode_is_asked_again_over_its_three_lists() {
     assert_eq!(pair_of(&decode.decision).map(|pair| pair.0), Some(pair.0));
     assert_eq!(*heard.lock(), [Side::Prefill, Side::Decode]);
     assert_eq!(host.engine.leases.0.load(Ordering::Relaxed), 1);
+}
+
+/// An encode request under a binding that names a decode shadow. Its first
+/// decision asks no side's shadow and counts none: the encode entry lends
+/// no room for one. Its decode decided again goes through a pair's own
+/// entry, which asks the decode's shadow and counts it apart. So a host
+/// reads one count under `decode-again` for such a request, with none
+/// under `decode` beside it.
+///
+/// Classic picks a pair's decode once, with its prefill
+/// (`model_gateway/src/routers/common/placement.rs:3054`, on main
+/// `2454cbd2d`). It decides no decode again and runs no second policy
+/// beside one, so the count is the engine's own answer.
+#[test]
+fn an_encode_requests_decode_decided_again_counts_its_decode_shadow() {
+    let mut document = stock();
+    let decode = document.profiles.get("decode").expect("the decode profile");
+    let twin = decode.clone();
+    document.profiles.insert("decode-next".to_owned(), twin);
+    let sides = BTreeMap::from([("decode".to_owned(), "decode-next".to_owned())]);
+    document.bindings[0].shadow = Some(ShadowSpec::Sides(sides));
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let host = Host::under(spec, 2, 2, 1);
+    // The counts a host is told, summed by side: a single request's, the
+    // prefill's, the decode's, and the decode decided again's.
+    let by_side = |host: &Host| {
+        let mut sides = [0_u64; 4];
+        let _ = host.engine.shadow_counts(|count| {
+            let at = match count.side {
+                ShadowSide::Single => 0,
+                ShadowSide::Prefill => 1,
+                ShadowSide::Decode => 2,
+                ShadowSide::DecodeAgain => 3,
+            };
+            sides[at] += count.count;
+        });
+        sides
+    };
+    let said = (&[of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    let mut placed = EncodePlaced::new();
+    let now = Instant::now();
+    let asks = Asks {
+        later: true,
+        ..host.asks(said)
+    };
+    let first = (host.engine).decide_encode_at(&asks, items, &mut placed, || now);
+    let (first, later) = first.expect("a decision");
+    assert!(later && first.lease.is_some(), "the prefill is issued");
+    assert_eq!(by_side(&host), [0; 4], "the first decision asks none");
+    let decode = decode_again(&host, &asks, first, now);
+    assert!(decode.lease.is_some(), "the decode is issued");
+    assert_eq!(by_side(&host), [0, 0, 0, 1], "counted apart");
 }
 
 /// What a decode takes is its host's word alone: a request that asks images
