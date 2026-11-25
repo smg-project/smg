@@ -234,7 +234,7 @@ impl InProcess {
     /// leaves the lists it had not handed to theirs.
     #[must_use]
     pub fn upkeep_faults(&self) -> u64 {
-        self.upkeep_faults.load(Ordering::Relaxed)
+        self.held.upkeep.load(Ordering::Relaxed)
     }
 
     /// One step of the engine's task under the task's catch: `None` where
@@ -245,7 +245,7 @@ impl InProcess {
             Ok(done) => Some(done),
             Err(payload) => {
                 release(payload);
-                self.upkeep_faults.fetch_add(1, Ordering::Relaxed);
+                self.held.upkeep.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }

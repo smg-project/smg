@@ -220,7 +220,7 @@ pub(super) fn decide(
         Shadow::Said(said) => Some(said),
         Shadow::NotDue => None,
         Shadow::Faulted => {
-            own.faults.fetch_add(1, Ordering::Relaxed);
+            own.held.decisions.fetch_add(1, Ordering::Relaxed);
             None
         }
     };

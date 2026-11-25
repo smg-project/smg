@@ -1,7 +1,8 @@
 //! The controller's process series: its state, its start time, the load
 //! monitor's counts, the decide call's and the store's two counts (design 14
 //! names the rest, which arrive with the scopes, the replication and the
-//! election). They live on a recorder of the controller's own, not the
+//! election), and the engine's family of the panics it held, as a
+//! gateway names it. They live on a recorder of the controller's own, not the
 //! process global, so a gateway that embeds the controller keeps its
 //! recorder and two controllers in one test process keep theirs; the admin
 //! listener renders it in the Prometheus text form. The monitor's counts
@@ -118,10 +119,27 @@ pub const MEMBERS_OUTSIDE_LIST: &str = "smg_grand_central_members_outside_list";
 pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_grand_central_overload_flips_total";
 /// Lifecycle calls that panicked as a lease's event was applied (a
 /// dispatch, a completion, a release a frame brings, a dispatch
-/// deadline's end): each is held there, so it ends no thread. A call that
-/// panics inside a decision (the issue's, the release of a lease the
+/// deadline's end, a decode call's issue): each is held there, so it ends
+/// no thread. A call that unwinds the decision it was made in (the issue
+/// of a single request's lease or a pair's, the release of a lease the
 /// decision gives up) counts with the requests that got no decision.
 pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_grand_central_lifecycle_faults_total";
+/// Panics the engine held under its own catches, by `kind`, over
+/// every engine the store built: `decision` (a whole decision, a shadow's
+/// beside a live decision among them), `event` (a stage at a word the
+/// engine tells it) and `upkeep` (a step of the engine's upkeep). It is a
+/// gateway's family of that name, with one definition in both processes,
+/// and it never starts again at a new document.
+///
+/// On a controller `upkeep` is a run of the upkeep at the presence sweep's
+/// tick, and `event` is a stage's panic at a change of membership: the one
+/// word a store says under the engine's catch. A stage's panic at a
+/// lease's word is held by the controller: it counts with the requests
+/// that got no decision where it unwinds the decision that told the word,
+/// and in [`LIFECYCLE_FAULTS_TOTAL`] at every other word, a decode call's
+/// issue among them. A live decision's panic also counts as a request
+/// with no decision ([`DECIDE_NO_DECISION_TOTAL`], `fault`).
+pub const POLICY_FAULTS_TOTAL: &str = "smg_policy_faults_total";
 
 /// The controller's series and the handle that renders them.
 pub(crate) struct Metrics {
@@ -139,6 +157,8 @@ pub(crate) struct Metrics {
     outside: [Gauge; 2],
     overload_flips: Counter,
     lifecycle_faults: Counter,
+    /// The panics the store's engines held: `decision`, `event`, `upkeep`.
+    policy_faults: [Counter; 3],
     /// Held from a scrape's sample of the state to the end of its render:
     /// the gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
@@ -328,6 +348,12 @@ impl Metrics {
             None,
             "Lifecycle calls that panicked as a lease's event was applied, each held there".into(),
         );
+        recorder.describe_counter(
+            KeyName::from_const_str(POLICY_FAULTS_TOTAL),
+            None,
+            "Panics Grand Central held and counted, by kind: decision (a decision that panicked, a shadow's beside a live decision among them), event (a stage at a lease event or a change of membership), upkeep (a step of the engine's upkeep: its sweep, the registry's follow, a load report, a fill of worker lists)"
+                .into(),
+        );
         recorder.describe_gauge(
             KeyName::from_const_str(MEMBERS_OUTSIDE_LIST),
             None,
@@ -395,6 +421,8 @@ impl Metrics {
             recorder.register_counter(&Key::from_name(OVERLOAD_FLIPS_TOTAL), &metadata);
         let lifecycle_faults =
             recorder.register_counter(&Key::from_name(LIFECYCLE_FAULTS_TOTAL), &metadata);
+        let policy_faults =
+            ["decision", "event", "upkeep"].map(|kind| counter(POLICY_FAULTS_TOTAL, "kind", kind));
         start.set(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -412,6 +440,7 @@ impl Metrics {
             outside,
             overload_flips,
             lifecycle_faults,
+            policy_faults,
             scrape: Mutex::new(()),
             recorder,
             spec: OnceLock::new(),
@@ -519,12 +548,21 @@ impl Metrics {
         self.decides.outlasted.absolute(read(&counts.outlasted));
     }
 
-    /// Sets the store's series from one read of its counts.
+    /// Sets the store's series from one read of its counts: the members
+    /// outside a list, the lifecycle calls that panicked, and the panics
+    /// its engines held, by kind.
     fn observe_store(&self, counts: StoreStats) {
         let [engines, zones] = &self.outside;
         engines.set(f64::from(counts.outside.engines));
         zones.set(f64::from(counts.outside.zones));
         self.lifecycle_faults.absolute(counts.lifecycle_faults);
+        // The engines' counts are the store's own for its life, whichever
+        // document each rose under: each series is set to its count as read.
+        let held = counts.engine_faults;
+        let read = [held.decisions, held.events, held.upkeep];
+        for (counter, count) in self.policy_faults.iter().zip(read) {
+            counter.absolute(count);
+        }
     }
 
     /// Sets the load counters and the overload flips from one read of the
@@ -562,7 +600,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{
-        Generations, LoadTotals, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST,
+        Generations, LoadTotals, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST, POLICY_FAULTS_TOTAL,
         REPLICATION_LAG_SECONDS, REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED,
         SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
     };
@@ -571,7 +609,7 @@ mod tests {
             decision_slots::DecideStats,
             readiness::{Sample, State},
         },
-        store::OutsideLists,
+        store::{EngineFaults, OutsideLists},
     };
 
     fn line(rendered: &str, series: &str, label: &str) -> Option<String> {
@@ -904,6 +942,7 @@ mod tests {
                 zones: 5,
             },
             lifecycle_faults: 4,
+            engine_faults: EngineFaults::default(),
         };
         let rendered = metrics.render(
             || State::Leader,
@@ -932,6 +971,62 @@ mod tests {
             line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"zones\"").as_deref(),
             Some("smg_grand_central_members_outside_list{list=\"zones\"} 0")
         );
+    }
+
+    /// The panics the store's engines held render as the engine's
+    /// family, a series a kind, each at zero from the first scrape. Each is
+    /// set to its count as its scrape's read answers it, under its own kind.
+    /// The store's counts never fall. Were a read to answer less, the series
+    /// would stay where it stood: a scraper reads a fall as a restart.
+    #[test]
+    fn the_panics_the_stores_engines_held_render_by_kind_and_never_fall() {
+        let metrics = Metrics::new();
+        let scraped = |held: [u64; 3]| {
+            let [decisions, events, upkeep] = held;
+            let counts = StoreStats {
+                engine_faults: EngineFaults {
+                    decisions,
+                    events,
+                    upkeep,
+                },
+                ..StoreStats::default()
+            };
+            let rendered = metrics.render(
+                || State::Leader,
+                &LoadTotals::default(),
+                &DecideStats::default(),
+                || counts,
+            );
+            assert!(rendered.contains("# HELP smg_policy_faults_total Panics Grand Central "));
+            assert!(rendered.contains("# TYPE smg_policy_faults_total counter"));
+            ["decision", "event", "upkeep"].map(|kind| {
+                let label = format!("kind=\"{kind}\"");
+                let series =
+                    line(&rendered, POLICY_FAULTS_TOTAL, &label).expect("the kind's series");
+                assert!(series.starts_with(&format!("smg_policy_faults_total{{{label}}} ")));
+                let count = series.rsplit(' ').next().expect("the series' value");
+                count.parse::<u64>().expect("a whole count")
+            })
+        };
+        assert_eq!(scraped([0, 0, 0]), [0, 0, 0]);
+        assert_eq!(scraped([1, 2, 3]), [1, 2, 3]);
+        assert_eq!(
+            scraped([1, 2, 3]),
+            [1, 2, 3],
+            "a second scrape adds nothing"
+        );
+        assert_eq!(scraped([4, 2, 5]), [4, 2, 5]);
+        assert_eq!(scraped([0, 0, 0]), [4, 2, 5]);
+        // The older series are not this family's: neither moved.
+        let rendered = metrics.render(
+            || State::Leader,
+            &LoadTotals::default(),
+            &DecideStats::default(),
+            StoreStats::default,
+        );
+        assert!(rendered.contains("smg_grand_central_lifecycle_faults_total 0"));
+        let fault = "smg_grand_central_decide_no_decision_total{cause=\"fault\"} 0";
+        assert!(rendered.contains(fault), "{rendered}");
     }
 
     #[test]

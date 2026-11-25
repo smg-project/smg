@@ -127,6 +127,31 @@ fn next_applied() -> u64 {
     APPLIED.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// The panics an engine's own catches held, one count a catch: a whole
+/// decision's ([`DecisionEngine::faults`]), a word's to the stages
+/// ([`InProcess::unheard`]) and a step's of the engine's own task
+/// ([`InProcess::upkeep_faults`]).
+///
+/// An engine counts into counts of its own. A host that builds an engine
+/// for each of its documents hands every one the same counts
+/// ([`InProcess::with_origin`]): a count then outlasts the document it
+/// rose under, and an engine a decision still holds past its document
+/// counts where the host reads.
+#[derive(Debug, Default)]
+pub(crate) struct HeldFaults {
+    decisions: AtomicU64,
+    words: AtomicU64,
+    upkeep: AtomicU64,
+}
+
+impl HeldFaults {
+    /// The three counts as one read answers them: the decisions', the
+    /// words' and the task's steps'.
+    pub(crate) fn read(&self) -> [u64; 3] {
+        [&self.decisions, &self.words, &self.upkeep].map(|count| count.load(Ordering::Relaxed))
+    }
+}
+
 /// The engine that decides in its host's own process.
 ///
 /// Built once, at the gateway's start, from the document in force then. It
@@ -157,16 +182,16 @@ pub struct InProcess {
     /// The one clock of the engine's decisions: a decision's instant and a
     /// load report's sample instant are counted from its origin.
     clock: DecisionClock,
-    /// How many whole decisions panicked, and how many shadow profiles did
-    /// after a live decision that stood ([`DecisionEngine::faults`]).
-    faults: AtomicU64,
-    /// How many words of a lease and changes of membership panicked in a
-    /// stage that heard them.
-    unheard: AtomicU64,
-    /// How many steps of the engine's own task panicked: a run of the
-    /// upkeep, a step of the registry's follow, or a telling of load
-    /// reports ([`Self::upkeep_faults`]).
-    upkeep_faults: AtomicU64,
+    /// The panics the engine's catches held ([`HeldFaults`]). Its
+    /// decisions: how many whole decisions panicked, and how many shadow
+    /// profiles did after a live decision that stood
+    /// ([`DecisionEngine::faults`]). Its words: how many words of a lease
+    /// and changes of membership panicked in a stage that heard them
+    /// ([`Self::unheard`]). Its task's steps: a run of the upkeep, a step
+    /// of the registry's follow, or a telling of load reports
+    /// ([`Self::upkeep_faults`]). The engine's own, or its host's where the
+    /// host handed them ([`Self::with_origin`]).
+    held: Arc<HeldFaults>,
     /// The last lease id handed out. A pair's lease writes it, and a thread
     /// once for a run of its single requests' ids (`single::lease_id`):
     /// one atomic step, on cache lines of its own.
@@ -362,9 +387,7 @@ impl InProcess {
             telling: Mutex::new(()),
             epochs: AtomicU64::new(0),
             clock: DecisionClock::new(),
-            faults: AtomicU64::new(0),
-            unheard: AtomicU64::new(0),
-            upkeep_faults: AtomicU64::new(0),
+            held: Arc::default(),
             leases: OwnWord(AtomicU64::new(0)),
             sessions,
             affinity: Affinity::default(),
@@ -381,10 +404,16 @@ impl InProcess {
     /// stages stamped and the next takes over, a profile's count of sends
     /// ([`Engine::succeed`](crate::engine::framework::Engine::succeed)),
     /// is read on the clock it was written on.
+    ///
+    /// The engine counts the panics it holds into `held`, the host's: every
+    /// engine the host builds counts there, and the three readers of each
+    /// ([`DecisionEngine::faults`], [`Self::unheard`],
+    /// [`Self::upkeep_faults`]) answer the counts of them all.
     #[must_use]
-    pub(crate) fn with_origin(spec: AppliedSpec, origin: Instant) -> Self {
+    pub(crate) fn with_origin(spec: AppliedSpec, origin: Instant, held: Arc<HeldFaults>) -> Self {
         Self {
             clock: DecisionClock::from_origin(origin),
+            held,
             ..Self::new(spec)
         }
     }
@@ -482,14 +511,14 @@ impl InProcess {
     /// what the word answers, and `None` where a stage panicked at it. The
     /// panic is held here and counted ([`Self::unheard`]). The stages behind
     /// the one that panicked do not hear the word, and what the word is of
-    /// goes on: a request, a registration or a removal.
+    /// goes on: a request, a registration, a removal or an apply.
     #[inline]
     fn word_caught<R>(&self, tell: impl FnOnce() -> R) -> Option<R> {
         match catch_unwind(AssertUnwindSafe(tell)) {
             Ok(answered) => Some(answered),
             Err(payload) => {
                 release(payload);
-                self.unheard.fetch_add(1, Ordering::Relaxed);
+                self.held.words.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
@@ -555,9 +584,9 @@ impl InProcess {
 
     /// How many words of a lease (its issue, its dispatch, its end, its
     /// release) and changes of membership panicked in a stage that heard
-    /// them. The word stands as said: the request, the registration or the
-    /// removal it is of goes on, and the stages after the one that panicked
-    /// did not hear it.
+    /// them. The word stands as said: the request, the registration, the
+    /// removal or the apply it is of goes on, and the stages after the one
+    /// that panicked did not hear it.
     ///
     /// A lease's issue is such a word at a first decision and at a decode's
     /// own call alike: the call answers its pick and the lease all the same
@@ -565,7 +594,7 @@ impl InProcess {
     /// [`DecisionEngine::decide_decode_under`]).
     #[must_use]
     pub fn unheard(&self) -> u64 {
-        self.unheard.load(Ordering::Relaxed)
+        self.held.words.load(Ordering::Relaxed)
     }
 
     /// The document in force, in a handle that keeps showing it whatever
@@ -798,7 +827,7 @@ impl InProcess {
             Ok(decided) => decided,
             Err(payload) => {
                 release(payload);
-                self.faults.fetch_add(1, Ordering::Relaxed);
+                self.held.decisions.fetch_add(1, Ordering::Relaxed);
                 Err(DecisionRefused::Faulted)
             }
         }
@@ -1333,7 +1362,7 @@ impl DecisionEngine for InProcess {
     }
 
     fn faults(&self) -> u64 {
-        self.faults.load(Ordering::Relaxed)
+        self.held.decisions.load(Ordering::Relaxed)
     }
 }
 
