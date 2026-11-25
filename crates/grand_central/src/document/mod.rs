@@ -2,22 +2,24 @@
 //! comes from, the calls an operator makes on a document in force, and the
 //! document a gateway's routing settings mean.
 
+pub(crate) mod applied;
 #[cfg(feature = "operator")]
 pub mod operator;
 pub(crate) mod routing_key;
 pub(crate) mod routing_settings;
 pub(crate) mod spec;
 
+pub use applied::AppliedSpec;
 pub use routing_key::{strip_lineage, DerivedKey, DerivedKeys, KeySource, KeySources};
 pub use routing_settings::{
     ConnectionModeSetting, LoadMetricSetting, ModeSettings, PolicySettings,
     RoutingKeyOverrideSettings, RoutingSettings, RoutingSettingsError,
 };
 pub use spec::{
-    AcrossRanks, AdmissionSpec, AffinitySource, AppliedSpec, Assignment, BestParams,
-    BestWithTemperatureParams, BindingSpec, BoundedLoadParams, Bounds, BucketParams, CanarySpec,
-    Capacity, ConsistentHashParams, CostMargin, DecodePick, Digest, ExplainSpec, FilterSpec,
-    FilterStage, HasRoomParams, HeaderMatch, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
+    AcrossRanks, AdmissionSpec, AffinitySource, Assignment, BestParams, BestWithTemperatureParams,
+    BindingSpec, BoundedLoadParams, Bounds, BucketParams, CanarySpec, Capacity,
+    ConsistentHashParams, CostMargin, DecodePick, Digest, ExplainSpec, FilterSpec, FilterStage,
+    HasRoomParams, HeaderMatch, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
     LeastCostParams, LeastLoadParams, Match, Needs, OverloadSpec, OverloadSwitch, Override,
     Pairing, PdPairPlanSpec, PickSpec, PickStage, PlanName, PlansSpec, PolicySpec,
     PrefixAffinityParams, ProfileSpec, Recovery, ResidentWorkParams, RoutingKeySpec, RulePlaced,

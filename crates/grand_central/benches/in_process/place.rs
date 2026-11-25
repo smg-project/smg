@@ -41,10 +41,7 @@ struct Whole;
 
 impl PromptEntry for Whole {
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
-        Some(TokenKey {
-            tokens: Cow::Borrowed(&PROMPT),
-            marker: 0,
-        })
+        Some(TokenKey::of(Cow::Borrowed(&PROMPT), 0))
     }
 }
 

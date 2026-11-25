@@ -353,6 +353,7 @@ impl RequestMaker for Request<'_> {
 /// A lease issued for a plain request that was never made states no
 /// session: no rule of a place picked by its picker alone reads one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Plain {
     /// The request's phase
     /// ([`RequestFacts::phase`](super::view::RequestFacts::phase)).
@@ -366,6 +367,24 @@ pub struct Plain {
     /// asked apart, where that lease is issued
     /// ([`RequestMaker::prompt_chars`], [`RequestMaker::prompt_bytes`]).
     pub prompt_tokens: u32,
+}
+
+impl Plain {
+    /// A plain request's phase, its wires and its prompt's size in tokens. It
+    /// takes every field whose silence would change an answer with no word, as
+    /// a size left out would be told to the stages as zero, and a later field
+    /// with a true neutral value joins by assignment. It checks nothing. Code
+    /// outside this crate starts here: the record gains fields, so no literal
+    /// of it builds there.
+    #[inline]
+    #[must_use]
+    pub const fn of(phase: Phase, wires: WireModes, prompt_tokens: u32) -> Self {
+        Self {
+            phase,
+            wires,
+            prompt_tokens,
+        }
+    }
 }
 
 /// The workers a request may be sent to, as its host lends them for one
@@ -417,6 +436,7 @@ pub enum WorkerLists<'a> {
 /// It is never a field of a request's facts: no stage, trace or kept
 /// sample holds a client's tokens. Its `Debug` prints sizes alone.
 #[cfg(feature = "in-process")]
+#[non_exhaustive]
 pub struct TokenKey<'a> {
     /// The ids the tree is matched and written by: the prompt's token ids,
     /// behind the partition's marker where the request has one.
@@ -424,6 +444,21 @@ pub struct TokenKey<'a> {
     /// How many of the leading ids are the marker and no part of the
     /// prompt: a match's length has them taken off. Zero with no partition.
     pub marker: usize,
+}
+
+#[cfg(feature = "in-process")]
+impl<'a> TokenKey<'a> {
+    /// An entry's ids and its marker's length. It takes every field whose
+    /// silence would change an answer with no word, as a marker left out would
+    /// move a match's length, and a later field with a true neutral value
+    /// joins by assignment. A host with no partition states the marker zero.
+    /// It checks nothing. Code outside this crate starts here: the record
+    /// gains fields, so no literal of it builds there.
+    #[inline]
+    #[must_use]
+    pub const fn of(tokens: Cow<'a, [u32]>, marker: usize) -> Self {
+        Self { tokens, marker }
+    }
 }
 
 #[cfg(feature = "in-process")]
@@ -448,6 +483,7 @@ impl fmt::Debug for TokenKey<'_> {
 /// It is never a field of a request's facts: no stage, trace or kept
 /// sample holds a client's text. Its `Debug` prints sizes alone.
 #[cfg(feature = "in-process")]
+#[non_exhaustive]
 pub struct TextKey<'a> {
     /// The text the tree is matched and written by: the prompt's text,
     /// behind the partition's marker where the request has one.
@@ -456,6 +492,21 @@ pub struct TextKey<'a> {
     /// the prompt: a match's length has them taken off. Zero with no
     /// partition.
     pub marker: usize,
+}
+
+#[cfg(feature = "in-process")]
+impl<'a> TextKey<'a> {
+    /// An entry's text and its marker's length in characters. It takes every
+    /// field whose silence would change an answer with no word, as a marker
+    /// left out would move a match's length, and a later field with a true
+    /// neutral value joins by assignment. A host with no partition states the
+    /// marker zero. It checks nothing. Code outside this crate starts here:
+    /// the record gains fields, so no literal of it builds there.
+    #[inline]
+    #[must_use]
+    pub const fn of(text: Cow<'a, str>, marker: usize) -> Self {
+        Self { text, marker }
+    }
 }
 
 #[cfg(feature = "in-process")]
@@ -487,7 +538,11 @@ impl fmt::Debug for TextKey<'_> {
 /// issue, the decode call's instant or its dispatch's, and its later words
 /// bear the first decision's instant, which is this lease's
 /// ([`Lifecycle::on_decision_issued`](crate::stages::Lifecycle::on_decision_issued)).
+///
+/// The record gains fields: this crate alone builds it, in a guard and for a
+/// lease a store holds, and a pattern of it outside this crate ends with `..`.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct HeldDecision<'a> {
     /// The pick the guard holds: the first decision's, or a decode call's
     /// once one picked.
@@ -514,7 +569,11 @@ pub struct HeldDecision<'a> {
 /// What a guard holds of a pair's decode side ([`HeldDecision::decode`]):
 /// what that side's lease does not share with the prefill side's, and
 /// where the side stands as the word finds it.
+///
+/// The record gains fields: this crate alone builds it, in a guard and for a
+/// lease a store holds, and a pattern of it outside this crate ends with `..`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HeldDecode {
     /// The pair's session under the decode phase
     /// ([`DecideOutcome::decode_session`]): a value of the decode side's

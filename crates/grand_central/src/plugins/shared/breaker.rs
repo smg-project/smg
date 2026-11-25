@@ -150,6 +150,18 @@ pub(crate) struct Latency {
     filled: usize,
 }
 
+/// What the ring did with one call ([`Latency::record`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    /// The call had no frame: it is no sample, and the ring is as it was.
+    Nothing,
+    /// The call is a sample, and the ring took it.
+    Sample,
+    /// The call is a sample that completed a window, and the window reads
+    /// slow: the ring took the sample and forgot the window.
+    SlowWindow,
+}
+
 impl Latency {
     pub(crate) const SAMPLES: usize = 128;
     pub(crate) const EVERY: usize = 64;
@@ -184,8 +196,9 @@ impl Latency {
 
     /// What a sample is: a charge of `micros` as a share of a frame of
     /// `frame_micros`, in the ring's unit. A call without a frame is none.
-    /// Whoever asks whether a call is a sample asks here.
-    pub(crate) fn share(micros: u32, frame_micros: u32) -> Option<u32> {
+    /// Whoever asks whether a call was a sample reads what
+    /// [`Latency::record`] says of it.
+    fn share(micros: u32, frame_micros: u32) -> Option<u32> {
         if frame_micros == 0 {
             return None;
         }
@@ -196,22 +209,34 @@ impl Latency {
     /// How many of the two marks a read holds a window to a sample of
     /// `share` is past: half the frame, where the median reads slow, and
     /// the frame, where the tail does.
-    pub(crate) fn marks(share: u32) -> u8 {
+    fn marks(share: u32) -> u8 {
         u8::from(share > Self::FRAME / 2) + u8::from(share > Self::FRAME)
     }
 
+    /// Whether a mark stands between two charges under a frame of
+    /// `frame_micros`: one is past a mark that the other is short of, so a
+    /// read holds the two differently. Without a frame neither is a sample,
+    /// and no mark stands between them. Only the WebAssembly kind asks, of
+    /// the two ends of a time nothing read: no other kind arms a thread.
+    #[cfg(feature = "wasm")]
+    pub(crate) fn mark_between(micros: u32, other_micros: u32, frame_micros: u32) -> bool {
+        Self::share(micros, frame_micros).map(Self::marks)
+            != Self::share(other_micros, frame_micros).map(Self::marks)
+    }
+
     /// Records one call of `micros` under a frame of `frame_micros`, when
-    /// it is a sample ([`Latency::share`]); `true` when this call completed
+    /// it is a sample, and says what it did with the call: nothing where
+    /// the call has no frame, and a slow window where this call completed
     /// a window and the window reads slow, which forgets the window.
-    pub(crate) fn record(&mut self, micros: u32, frame_micros: u32) -> bool {
+    pub(crate) fn record(&mut self, micros: u32, frame_micros: u32) -> Recorded {
         let Some(share) = Self::share(micros, frame_micros) else {
-            return false;
+            return Recorded::Nothing;
         };
         self.ring[self.next] = share;
         self.next = (self.next + 1) % Self::SAMPLES;
         self.filled = (self.filled + 1).min(Self::SAMPLES);
         if !self.next.is_multiple_of(Self::EVERY) || self.filled < 2 {
-            return false;
+            return Recorded::Sample;
         }
         let mut sorted = [0u32; Self::SAMPLES];
         sorted[..self.filled].copy_from_slice(&self.ring[..self.filled]);
@@ -222,11 +247,12 @@ impl Latency {
         let p50 = window[(self.filled.div_ceil(2)).saturating_sub(1)];
         let p99 = window[self.filled - 2];
         let slow = Self::marks(p50) >= 1 || Self::marks(p99) == 2;
-        if slow {
-            self.next = 0;
-            self.filled = 0;
+        if !slow {
+            return Recorded::Sample;
         }
-        slow
+        self.next = 0;
+        self.filled = 0;
+        Recorded::SlowWindow
     }
 }
 
@@ -234,7 +260,7 @@ impl Latency {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{Breaker, Latency};
+    use super::{Breaker, Latency, Recorded};
     use crate::plugins::shared::config::BreakerSpec;
 
     fn spec() -> BreakerSpec {
@@ -243,6 +269,11 @@ mod tests {
             window_micros: 1_000,
             cooldown_micros: 5_000,
         }
+    }
+
+    /// Whether the call the ring answers for completed a slow window.
+    fn slow(recorded: Recorded) -> bool {
+        recorded == Recorded::SlowWindow
     }
 
     #[test]
@@ -532,7 +563,7 @@ mod tests {
         let mut fast = Latency::new();
         let mut tripped = false;
         for _ in 0..Latency::SAMPLES {
-            tripped |= fast.record(10, 100);
+            tripped |= slow(fast.record(10, 100));
         }
         assert!(!tripped, "10 us calls under a 100 us frame are not slow");
 
@@ -542,7 +573,7 @@ mod tests {
             // One more than half the calls past half the frame: the median
             // lands on them.
             let micros = if i % 2 == 0 || i == 1 { 60 } else { 10 };
-            tripped |= half_slow.record(micros, 100);
+            tripped |= slow(half_slow.record(micros, 100));
         }
         assert!(tripped, "a p50 past half the frame is slow");
 
@@ -550,7 +581,7 @@ mod tests {
         let mut tripped = false;
         for i in 0..Latency::SAMPLES {
             let micros = if i == 5 { 500 } else { 10 };
-            tripped |= one_outlier.record(micros, 100);
+            tripped |= slow(one_outlier.record(micros, 100));
         }
         assert!(
             !tripped,
@@ -561,7 +592,7 @@ mod tests {
         let mut tripped = false;
         for i in 0..Latency::SAMPLES {
             let micros = if i == 5 || i == 9 { 100 } else { 10 };
-            tripped |= at_the_frame.record(micros, 100);
+            tripped |= slow(at_the_frame.record(micros, 100));
         }
         assert!(
             !tripped,
@@ -572,12 +603,12 @@ mod tests {
         let mut tripped = false;
         for i in 0..Latency::SAMPLES {
             let micros = if i == 5 || i == 9 { 500 } else { 10 };
-            tripped |= tail.record(micros, 100);
+            tripped |= slow(tail.record(micros, 100));
         }
         assert!(tripped, "two calls past the frame are the p99");
         let mut tripped_again = false;
         for _ in 0..Latency::SAMPLES {
-            tripped_again |= tail.record(10, 100);
+            tripped_again |= slow(tail.record(10, 100));
         }
         assert!(!tripped_again, "the window that read slow is forgotten");
 
@@ -587,12 +618,57 @@ mod tests {
             // Sixty microseconds is slow under a 100 us frame and nothing
             // under a 1,000 us one: each call against its own frame.
             let frame = if i % 2 == 0 { 1_000 } else { 100 };
-            tripped |= mixed.record(if frame == 1_000 { 60 } else { 10 }, frame);
+            tripped |= slow(mixed.record(if frame == 1_000 { 60 } else { 10 }, frame));
         }
         assert!(!tripped, "each sample is judged against its own frame");
 
         let mut unbudgeted = Latency::new();
-        assert!(!(0..Latency::SAMPLES).any(|_| unbudgeted.record(1_000, 0)));
+        assert!((0..Latency::SAMPLES).all(|_| unbudgeted.record(1_000, 0) == Recorded::Nothing));
+    }
+
+    /// The ring says what it did with a call: nothing where the call has no
+    /// frame, a sample where it took one, and a slow window at the call that
+    /// completed one. The slow window is forgotten: the next call is a
+    /// sample of another.
+    #[test]
+    fn a_record_says_what_the_ring_did_with_the_call() {
+        let mut ring = Latency::new();
+        assert_eq!(ring.record(900, 0), Recorded::Nothing);
+        // Nine times its frame, each call: sixty-three samples of a window
+        // still open, and the sixty-fourth completes it slow.
+        for sample in 1..Latency::EVERY {
+            assert_eq!(ring.record(900, 100), Recorded::Sample, "{sample}");
+        }
+        assert_eq!(ring.record(900, 100), Recorded::SlowWindow);
+        assert_eq!(ring.record(10, 100), Recorded::Sample);
+    }
+
+    /// A mark stands between two charges where one is past it and the other
+    /// is not, whichever of the two is named first: half the frame and the
+    /// frame, each at its edge.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn a_mark_stands_between_two_charges_on_its_two_sides() {
+        // Two charges, their frame, and whether a mark stands between them.
+        let table = [
+            (500, 0, 1_000, false),
+            (501, 500, 1_000, true),
+            (1_000, 501, 1_000, false),
+            (1_001, 1_000, 1_000, true),
+            (9_000, 1_001, 1_000, false),
+            (1_001, 0, 1_000, true),
+            // No frame, no sample, no mark.
+            (700, 5, 0, false),
+        ];
+        for (micros, other_micros, frame_micros, between) in table {
+            for (one, other) in [(micros, other_micros), (other_micros, micros)] {
+                assert_eq!(
+                    Latency::mark_between(one, other, frame_micros),
+                    between,
+                    "{one} and {other} under a frame of {frame_micros}"
+                );
+            }
+        }
     }
 
     /// A sample's frame is the decision's budget or the frames of the

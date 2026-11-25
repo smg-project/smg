@@ -580,12 +580,14 @@ impl InProcess {
         self.under(&document)
             .decide_encode_at(maker, items, placed, clock)
     }
+}
 
+impl Loaded<'_, '_> {
     /// [`Self::decide_encode_at`] with nothing its host hears of later: no
     /// lease is issued, no id is taken and no stage is told. For a host
     /// that files a pick's lease itself, as [`Self::decide_without_lease`]
-    /// is for a single request and for a pair. The wires' test stands in
-    /// it.
+    /// is for a single request and for a pair, under the document this
+    /// value holds. The wires' test stands in it.
     ///
     /// # Errors
     ///
@@ -598,25 +600,21 @@ impl InProcess {
         )
     )]
     pub(crate) fn decide_encode_without_lease(
-        &self,
+        self,
         maker: &impl RequestMaker,
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
         now: Instant,
     ) -> Result<Decision, DecisionRefused> {
-        let document = self.in_force();
-        let own = self.under(&document);
-        own.over_three(maker, placed, |lists, request, loads, placed| {
+        self.over_three(maker, placed, |lists, request, loads, placed| {
             let sends_to = |target: &_| maker.sends_to(target);
             let encoder = |place| maker.sends_to_encoder(place);
             decide(
-                own, lists, request, items, loads, placed, now, sends_to, encoder,
+                self, lists, request, items, loads, placed, now, sends_to, encoder,
             )
         })
     }
-}
 
-impl Loaded<'_, '_> {
     /// [`InProcess::decide_encode_at`] under the document this value
     /// holds: for a caller that reads that document further behind the
     /// decision, as the call that places a request does.

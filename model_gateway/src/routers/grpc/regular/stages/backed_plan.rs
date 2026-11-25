@@ -50,6 +50,10 @@ pub(crate) struct Inputs<'a> {
     /// The rendered prompt; it rides on the wire only when the request
     /// carries media (`helpers::wire_prompt_text`).
     pub processed_text: String,
+    /// A chat request's `return_prompt_text`: a request that sends no media
+    /// keeps the rendered prompt for its answer
+    /// (`ResponseState::prompt_text`).
+    pub return_prompt_text: bool,
     pub token_ids: Vec<u32>,
     /// The constraint as the request carries it, before the worker's shaping.
     pub tool_constraints: Option<(String, String)>,
@@ -96,7 +100,8 @@ pub(crate) fn build(
         function,
         id_prefix,
         model,
-        processed_text,
+        mut processed_text,
+        return_prompt_text,
         token_ids,
         tool_constraints,
         format_set_aside,
@@ -144,6 +149,12 @@ pub(crate) fn build(
     // The ids are the prompt; the text rides along only when the request
     // carries media (see `helpers::wire_prompt_text`).
     let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
+    // A request that asked for its rendered prompt and sends no media keeps
+    // the text the wire lets go: it moves to the response state, for the
+    // answer.
+    if return_prompt_text && !carries_media {
+        ctx.state.response.prompt_text = Some(std::mem::take(&mut processed_text));
+    }
     let mut proto_request = build_request(
         builder_client,
         request_id,

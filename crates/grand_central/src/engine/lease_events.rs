@@ -12,14 +12,15 @@
 //! [`single`] and [`pair`] are the one rule of a lease's words under either
 //! host. The host says who hears ([`Hearers`]). Behind a later document's
 //! start the stages that document kept hear a lease's words, and every
-//! count of sends in force takes its dispatch, under either host: a
-//! controller builds an engine object for each document, which keeps the
-//! standing one's stages, and a host that holds its decisions keeps one
-//! engine object across its documents ([`of_host`]).
+//! count of sends in force takes its dispatch, under either host. Each
+//! keeps one engine object across its documents. A host that holds its
+//! decisions names the hearers by the document in force ([`of_host`]), and
+//! a controller by the one its store's standing world holds.
 //!
-//! A single request its binding's sessions rule keeps from the profile is
-//! told to the session table at its dispatch, and to no stage ahead of its
-//! end ([`stages_hear`]).
+//! A request its binding's sessions rule keeps from the profile is told to
+//! the session table at its dispatch, and to no stage ahead of its end
+//! ([`stages_hear`]): a single request, and each side of a pair by that
+//! side's own word.
 
 use std::time::Instant;
 
@@ -34,8 +35,8 @@ use crate::{
     tracking::lease::{Lease, Said, Side},
 };
 
-/// Whether the stages hear the issue and the dispatch of a single
-/// request's `decision`, and the profile counts the request among its
+/// Whether the stages hear the issue and the dispatch of `side` of a
+/// request's `decision`, and the profile counts that side among its
 /// sends: of every pick but one its binding's sessions rule placed alone
 /// and keeps from the profile ([`RulePlaced::Untold`]). The rule places a
 /// request alone where it follows a pin of the key, and where its own
@@ -62,15 +63,27 @@ use crate::{
 /// the lease's record: the dispatch it tells off its file later follows it
 /// (`LeaseRecord::untold`).
 ///
-/// A pair's pick is read here by its one word, ahead of both sides' writes
-/// of where the prompt went (`in_process::pair`). No side's own word is
-/// read: each side keeps a verdict of its own, and a pick's one word does
-/// not say which side the rule placed.
+/// A pair's pick is read here a side at a time. Each side is placed by a
+/// decision of its own, under its own key, so the rule may place one side
+/// alone and leave the other to its stages: the pick states the prefill
+/// side's word, and its pairs the decode side's
+/// ([`Pair::decode_placing`](super::decision::Pair::decode_placing)). The
+/// askers are a pair's dispatch ([`pair`]), its two issues and a later
+/// decode's, and each side's write of where the prompt went
+/// (`in_process::pair`). A decode asked again states its own word of
+/// the decode side, and keeps the word of the pair it is held by where it
+/// names that pair's decode: the decision that put the request there
+/// stands. A gateway's sticky map places each role of a pair under that
+/// role's own key, once a request, and hands neither role's policy a
+/// request it placed. A single asks under [`Side::Single`].
 ///
 /// [`RulePlaced::Untold`]: crate::document::spec::RulePlaced::Untold
 #[inline]
-pub(crate) fn stages_hear(decision: &Decision) -> bool {
-    decision.pick().is_none_or(|pick| !pick.untold())
+pub(crate) fn stages_hear(decision: &Decision, side: Side) -> bool {
+    decision.pick().is_none_or(|pick| match side {
+        Side::Decode => !pick.decode_untold(),
+        Side::Single | Side::Prefill | Side::Encode => !pick.untold(),
+    })
 }
 
 /// Who hears a lease's words, as the lease's host says it. The rule tells
@@ -78,10 +91,9 @@ pub(crate) fn stages_hear(decision: &Decision) -> bool {
 /// is which.
 pub(crate) struct Hearers<'a, L> {
     /// The engine the lease was issued under, or behind a later document's
-    /// start what that document kept of its stages: its stages hear the
-    /// lease's words, and its session table where that stood at the issue
-    /// (`Engine::table_from`). A stage built since never heard the issue,
-    /// and hears no word of the lease. `None`: no stage hears.
+    /// start what that document kept of its stages: its session table and
+    /// its stages hear the lease's words. A stage built since never heard
+    /// the issue, and hears no word of the lease. `None`: no stage hears.
     pub issuing: Option<&'a Engine>,
     /// The engine whose counts of sends take a dispatch. A send is its
     /// host's, whatever document decided it: the standing engine counts
@@ -139,7 +151,7 @@ pub(crate) fn single<L: Fn(WorkerId, u16) -> bool + Copy>(
                 ..Target::default()
             };
             let (side, since) = (dispatch.side, dispatch.since_decision_micros);
-            let own = stages_hear(held.decision);
+            let own = stages_hear(held.decision, Side::Single);
             if own {
                 // The test goes to the count by value, with the worker and
                 // the rank it is asked of: a test of no size leaves the
@@ -199,7 +211,10 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
 /// controller's file of leases.
 ///
 /// - A dispatch is told on the side it names: the counts of sends, the
-///   session table, then the stages. The lease told is the side's as
+///   session table, then the stages. A side its sessions rule keeps from
+///   the profile is told to the session table alone, as a single is
+///   ([`stages_hear`]): no count takes it, and no stage hears it or the
+///   issue of a decode that stood chosen. The lease told is the side's as
 ///   issued, under the index the dispatch took, and the target is the
 ///   worker the side went to. A decode that stood chosen
 ///   ([`HeldDecode::chosen`](super::decision_engine::HeldDecode::chosen))
@@ -282,16 +297,24 @@ pub(crate) fn pair<L: Fn(WorkerId, u16) -> bool + Copy>(
                 ..lease
             };
             let since = dispatch.since_decision_micros;
-            // The test goes to the count by value, as a single's does.
-            let (listed, id, dp_rank) = (hearers.listed, target.id, target.dp_rank);
-            let listed = move || listed(id, dp_rank);
-            hearers
-                .sends
-                .dispatched_sent(&lease, &target, dispatch.side, since, listed);
+            // The side's own word: the rule may keep one side of a pair
+            // from the profile and leave the other to its stages.
+            let own = stages_hear(held.decision, dispatch.side);
+            if own {
+                // The test goes to the count by value, as a single's does.
+                let (listed, id, dp_rank) = (hearers.listed, target.id, target.dp_rank);
+                let listed = move || listed(id, dp_rank);
+                hearers
+                    .sends
+                    .dispatched_sent(&lease, &target, dispatch.side, since, listed);
+            }
             let Some(engine) = hearers.issuing else {
                 return;
             };
             engine.dispatched_table(&lease, &target, dispatch.side);
+            if !own {
+                return;
+            }
             if dispatch.side == Side::Decode && chosen {
                 // No call issued the side: this dispatch books it, so the
                 // stages hear its issue first, under the worker that serves.

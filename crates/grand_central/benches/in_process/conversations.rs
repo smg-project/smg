@@ -72,10 +72,7 @@ pub(super) struct Turn<'a> {
 /// partition. The runner's maker and the one call's request state the same.
 impl PromptEntry for Turn<'_> {
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
-        Some(TokenKey {
-            tokens: Cow::Borrowed(self.tokens),
-            marker: 0,
-        })
+        Some(TokenKey::of(Cow::Borrowed(self.tokens), 0))
     }
 }
 

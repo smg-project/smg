@@ -39,7 +39,8 @@
 //!   admitted, and the list's warming rows by the profile's own ruling
 //!   ([`WarmUpRule`]). It is a ruling read from the index and the worker
 //!   objects, never a copy of a worker's health or load. One decision reads
-//!   it again at most once a second, behind one atomic flag, and swaps it in
+//!   it again once its second is up, or once the index handed one of its
+//!   numbers on to another worker, behind one atomic flag, and swaps it in
 //!   by pointer. A decision loads the pointer and writes no shared word.
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
 //!   workers the index does not speak for, and to every worker by a request
@@ -99,7 +100,7 @@ use crate::{
         },
         warm_up::WarmUpState,
     },
-    tracking::prefix_predictor::PrefixPredictor,
+    tracking::{lease::Side, prefix_predictor::PrefixPredictor},
     Draw,
 };
 
@@ -107,7 +108,8 @@ use crate::{
 const NONE: u32 = u32::MAX;
 
 /// How long a list's table stands before one decision reads it again, in
-/// microseconds.
+/// microseconds. One whose numbers the index handed on is read again
+/// before that ([`Table::numbered`]).
 const TABLE_STANDS_MICROS: u64 = 1_000_000;
 
 /// The index numbers a table maps. An index hands its numbers out from zero
@@ -137,6 +139,15 @@ pub trait CacheIndex: Send + Sync {
     /// worker's first block, so a number says nothing of what was heard.
     fn worker_number(&self, address: &str) -> Option<u32>;
 
+    /// How many times the index gave a number one worker handed back to the
+    /// next worker that asked for one. A list's table reads it ahead of the
+    /// numbers and is read again once it moved, and a lookup it moved under
+    /// names nobody: a number that changed hands never names its former
+    /// worker. The default is an index that hands no number out twice.
+    fn numbers_reused(&self) -> u64 {
+        0
+    }
+
     /// How many blocks the index holds for the worker of `number`.
     fn worker_blocks(&self, number: u32) -> usize;
 
@@ -164,6 +175,10 @@ pub trait CacheIndex: Send + Sync {
 impl CacheIndex for ChainIndex {
     fn worker_number(&self, address: &str) -> Option<u32> {
         self.worker_id(address)
+    }
+
+    fn numbers_reused(&self) -> u64 {
+        self.ids_reused()
     }
 
     fn worker_blocks(&self, number: u32) -> usize {
@@ -397,6 +412,11 @@ pub struct Affinity {
     /// What the records that left the map had left out
     /// ([`Self::left_out`]). Written under the map's mutex.
     left_out: AtomicU64,
+    /// Where the next record made begins its count of leaves: past the
+    /// count of every record that left the map, so a write reads the count
+    /// its naming read in no record made since. Written under the map's
+    /// mutex.
+    left_past: AtomicU64,
     /// How many leaves were told ([`Self::leaves`]), each counted ahead of
     /// its records' own counts.
     leaves: AtomicU64,
@@ -489,13 +509,26 @@ impl Affinity {
                 (*record.taken.get_mut() == *taken).then(|| records.remove(model))?
             })
             .collect();
-        let left_out = left
-            .iter()
-            .map(|record| record.left_out.load(Ordering::Relaxed))
-            .sum();
-        self.left_out.fetch_add(left_out, Ordering::Relaxed);
+        self.count_gone(left.iter());
         // Freed once the mutex is given back, as at a sweep.
         drop(records);
+    }
+
+    /// Counts the records that left the map, under its mutex: what they
+    /// had left out stays in the total ([`Self::left_out`]), and the next
+    /// record made begins its count of leaves past theirs
+    /// ([`Self::left_past`]).
+    fn count_gone<'a>(&self, gone: impl Iterator<Item = &'a Arc<PrefixRecord>>) {
+        let (mut left_out, mut past) = (0, None);
+        for record in gone {
+            left_out += record.left_out.load(Ordering::Relaxed);
+            past = past.max(Some(record.left.load(Ordering::Relaxed)));
+        }
+        self.left_out.fetch_add(left_out, Ordering::Relaxed);
+        if let Some(past) = past {
+            self.left_past
+                .fetch_max(past.saturating_add(1), Ordering::Relaxed);
+        }
     }
 
     /// The work the records left waiting, a bounded step of each: the
@@ -508,9 +541,10 @@ impl Affinity {
     /// a write for it, and every worker it was written for was forgotten.
     /// So a model's record goes behind its last worker, and a record with
     /// no placement yet can go between two tables of its list. The model's
-    /// next table read makes a fresh record. A pick named from a record
-    /// that left writes to the fresh one or writes nothing: an entry is a
-    /// prediction, and the next request of the prefix writes it.
+    /// next table read makes a fresh record, whose count of leaves begins
+    /// past this one's: a pick named from a record that left writes
+    /// nothing, as behind a leave. An entry is a prediction, and the next
+    /// request of the prefix writes it.
     ///
     /// A write a thread keeps holds its record until the thread writes it
     /// on behind a pick, or until the thread ends. The record stays in the
@@ -533,11 +567,7 @@ impl Affinity {
                 lone
             })
             .collect();
-        let left_out = left
-            .iter()
-            .map(|(_, record)| record.left_out.load(Ordering::Relaxed))
-            .sum();
-        self.left_out.fetch_add(left_out, Ordering::Relaxed);
+        self.count_gone(left.iter().map(|(_, record)| record));
         // What left is freed once the mutex is given back, so the read of a
         // list's table waits for no free.
         drop(records);
@@ -574,7 +604,8 @@ impl Affinity {
             let record = if let Some(record) = records.get(model) {
                 Arc::clone(record)
             } else {
-                let record = Arc::new(PrefixRecord::new(bound));
+                let left = self.left_past.load(Ordering::Relaxed);
+                let record = Arc::new(PrefixRecord::new(bound, left));
                 records.insert(model.into(), Arc::clone(&record));
                 record
             };
@@ -602,9 +633,10 @@ struct PrefixRecord {
     bound: AtomicUsize,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
-    /// How many leaves were told. Written under the record's guard, a
-    /// reader's where the leave takes no place out: a write in parts stops
-    /// where it moved since its naming.
+    /// How many leaves were told, counted on from where the map's records
+    /// before this one stopped ([`Affinity::left_past`]). Written under the
+    /// record's guard, a reader's where the leave takes no place out: a
+    /// write in parts stops where it moved since its naming.
     left: AtomicU64,
     /// How many writes ended before the request's last block: a turn of
     /// theirs met a held lock, and their thread kept them no longer
@@ -686,12 +718,12 @@ impl PrefixRecord {
     /// A sweep's step.
     const SWEEP: usize = 64;
 
-    fn new(bound: usize) -> Self {
+    fn new(bound: usize, left: u64) -> Self {
         Self {
             predictor: RwLock::new(PrefixPredictor::new(bound)),
             bound: AtomicUsize::new(bound),
             sweeping: AtomicBool::new(false),
-            left: AtomicU64::new(0),
+            left: AtomicU64::new(left),
             left_out: AtomicU64::new(0),
             taken: AtomicU64::new(0),
         }
@@ -843,7 +875,8 @@ impl Drop for Reading<'_> {
 
 /// One list of workers as the affinity stages' rows are named from it, for
 /// the decisions of one model and phase: read in one pass over the list and
-/// standing for a second. It holds what the index and the worker objects
+/// standing for a second, or until the index hands one of its numbers on
+/// ([`Self::numbered`]). It holds what the index and the worker objects
 /// said at its read, as a ruling: who the index speaks for, and who warms.
 struct Table {
     /// The place the table answers for.
@@ -875,6 +908,10 @@ struct Table {
     column: Box<[AffinityFacts]>,
     /// The model's index of cache events, where it has one.
     index: Option<Arc<dyn CacheIndex>>,
+    /// The index's count of numbers handed out a second time
+    /// ([`CacheIndex::numbers_reused`]), read ahead of the numbers below:
+    /// they are the index's while it reads the same ([`Self::numbered`]).
+    reused: u64,
     /// Index number -> row of the list.
     row_of: Box<[u32]>,
     /// A bit an index number: a row of the list the index speaks for. The
@@ -993,6 +1030,7 @@ impl Table {
             states: engine.profile_reads_affinity(model, phase),
             column: Box::default(),
             index: None,
+            reused: 0,
             row_of: Box::default(),
             within: Box::default(),
             numbers: Box::default(),
@@ -1022,6 +1060,9 @@ impl Table {
             .indexes
             .get()
             .and_then(|indexes| indexes.index(registered));
+        // Ahead of the numbers: one that changes hands under this pass
+        // leaves the table a count the index has moved past.
+        table.reused = index.as_ref().map_or(0, |index| index.numbers_reused());
         let rows = workers.len();
         let mut numbers = vec![NONE; rows];
         let mut sizes = vec![0u32; rows];
@@ -1121,6 +1162,16 @@ impl Table {
     /// Whether the table answers for the decisions of `model` at `phase`.
     fn is_of(&self, model: &str, phase: Phase) -> bool {
         self.phase == phase && *self.model == *model
+    }
+
+    /// Whether the numbers the table read are still the index's: it handed
+    /// none out a second time since ([`CacheIndex::numbers_reused`]). The
+    /// count does not say which number it handed on: once it moved, any
+    /// number of the table may name a former worker at its new worker's
+    /// blocks.
+    fn numbered(&self) -> bool {
+        let index = self.index.as_ref();
+        index.is_none_or(|index| index.numbers_reused() == self.reused)
     }
 
     /// Whom the record of sent prefixes speaks for on a request hashed by
@@ -1319,6 +1370,11 @@ impl Table {
                 &mut |under| below(&mut draw, under),
                 kept,
             );
+            // A number handed on since the table read it holds its new
+            // worker's blocks: such a lookup names nobody.
+            if !self.numbered() {
+                kept.clear();
+            }
             for &(number, blocks) in kept.iter() {
                 let row = self.row_of.get(number as usize).copied().unwrap_or(NONE);
                 if row != NONE {
@@ -1592,6 +1648,11 @@ impl Table {
                 &mut |_| 0,
                 kept,
             );
+            // As where a decision is named its rows: no holder of a number
+            // handed on since the table read it.
+            if !self.numbered() {
+                kept.clear();
+            }
             for &(number, blocks) in kept.iter() {
                 let row = self.row_of.get(number as usize).copied().unwrap_or(NONE);
                 if let Some(entry) = column.get_mut(row as usize) {
@@ -1957,8 +2018,9 @@ struct Asked<'a> {
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
-/// the buffers have grown, but where a table is read (once a list, and then
-/// by one decision a second) and by a tree's own match and write.
+/// the buffers have grown, but where a table is read (once a list, then by
+/// one decision a second and by one behind a number the index handed on)
+/// and by a tree's own match and write.
 ///
 /// [`Engine::needs_for_phase`]: crate::engine::Engine::needs_for_phase
 /// [`RequestMaker::sends_to`]: crate::engine::RequestMaker::sends_to
@@ -2226,16 +2288,21 @@ pub(super) fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFact
 /// the request goes to ([`sent_target`]), which may be a later target.
 ///
 /// The rule's word is read through that one function at five places: the
-/// words of a single's lease, the record's two writes here, the store of a
+/// words of a lease, the record's two writes here, the store of a
 /// prompt in a lent tree ([`sent_address`]), the hand-over of a pin
 /// the keyed entry followed to this lookup, and a pair's two writes behind
-/// its pick, a side at a time. Under the rule's default word a request it
+/// its pick. Those two ask it a side at a time, each of its own side
+/// (`pair::record_sides`), and then name the target the request goes to
+/// ([`sent_to`]). A pair's first pick states what its prefill holds
+/// through here too ([`state`]): its first target is its prefill, and the
+/// word asked is the pick's own, which is the prefill side's, whatever
+/// placed its decode. Under the rule's default word a request it
 /// places is the profile's own, and its prompt is kept as any pick's. Under
 /// the other the rule keeps the request from the profile, as a gateway's
 /// sticky map hands a request it places to no policy: the policy's record
 /// never sees that request's prompt.
 pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
-    if !lease_events::stages_hear(decision) {
+    if !lease_events::stages_hear(decision, Side::Single) {
         return None;
     }
     decision.pick()?.targets.first()
@@ -2314,9 +2381,13 @@ impl PoolAffinity {
         let standing = self.table.load();
         let table = standing.as_deref();
         if let Some(table) = table.filter(|table| table.is_of(asked.model, asked.phase)) {
-            let stands = asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS;
+            // It stands for its second, while the index hands none of its
+            // numbers on.
+            let stands =
+                asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS && table.numbered();
             // One decision reads a table again; the others decide by the
-            // one that stands.
+            // one that stands, whose lookup names nobody once a number of
+            // it was handed on.
             if stands || self.reading.swap(true, Ordering::AcqRel) {
                 return with(table);
             }
@@ -2339,18 +2410,27 @@ impl PoolAffinity {
     }
 }
 
-/// The target a decision's request goes to: the first target of a pick the
-/// profile is told of ([`told_target`]) that the request's caller sends to
-/// (`sends_to`), asked best first. It is the worker a tree's match, the
-/// record's two writes and a pair's two writes behind its first pick keep
-/// the request's prefix for. `None` where the decision picked nobody, the
-/// binding's sessions rule keeps the request from the profile, or the
-/// caller sends to none of the pick's targets: nothing is stored.
+/// The target a single decision's request goes to: the first target of a
+/// pick the profile is told of ([`told_target`]) that the request's caller
+/// sends to (`sends_to`), asked best first. It is the worker a tree's
+/// match and the record's two writes keep the request's prefix for. `None`
+/// where the decision picked nobody, the binding's sessions rule keeps the
+/// request from the profile, or the caller sends to none of the pick's
+/// targets: nothing is stored.
 pub(super) fn sent_target(
     decision: &Decision,
     sends_to: impl Fn(&Target) -> bool,
 ) -> Option<&Target> {
     told_target(decision)?;
+    sent_to(decision, sends_to)
+}
+
+/// The first target of a decision's pick that the request's caller sends
+/// to (`sends_to`), asked best first, whatever the sessions rule says of
+/// the pick: a pair's two writes ask the rule's word of each side first
+/// (`pair::record_sides`). `None` where the decision picked nobody or the
+/// caller sends to none of the pick's targets.
+pub(super) fn sent_to(decision: &Decision, sends_to: impl Fn(&Target) -> bool) -> Option<&Target> {
     let mut targets = decision.pick()?.targets.iter();
     targets.find(|target| sends_to(target))
 }

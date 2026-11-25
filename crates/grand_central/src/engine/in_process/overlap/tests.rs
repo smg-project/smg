@@ -220,6 +220,12 @@ fn lending_both() -> (Affinity, Arc<TokenTree>, Arc<StringTree>) {
 /// Stores `hashes`, a prompt's blocks from its first, for the worker at
 /// `at`, as its event stream would.
 fn store(index: &ChainIndex, at: usize, hashes: &[u64]) {
+    stored(index, at, hashes);
+}
+
+/// [`store`], handing back the worker's number and the map of its blocks,
+/// which the end of its stream takes ([`ChainIndex::remove_worker`]).
+fn stored(index: &ChainIndex, at: usize, hashes: &[u64]) -> (u32, ChainBlockMap) {
     let number = index.intern_worker(&address(at)).expect("a number");
     let contents: Vec<ContentHash> = hashes.iter().map(|&hash| ContentHash(hash)).collect();
     let blocks: Vec<StoredBlock> = contents
@@ -230,9 +236,11 @@ fn store(index: &ChainIndex, at: usize, hashes: &[u64]) {
             content_hash,
         })
         .collect();
+    let mut map = ChainBlockMap::new();
     index
-        .apply_stored(number, &blocks, None, &mut ChainBlockMap::new())
+        .apply_stored(number, &blocks, None, &mut map)
         .expect("the blocks are stored");
+    (number, map)
 }
 
 /// The token ids of a prompt of `blocks` whole blocks, counted from `first`.
@@ -1870,6 +1878,75 @@ fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
     assert!(holders_behind(&|| bed.affinity.keep(&standing)).is_empty());
 }
 
+/// A worker that left behind a decision's read of the record is given no
+/// place where the write meets a record made anew: the list's table was
+/// read for a model whose profile reads no affinity, the record left the
+/// map, the worker left while the map held no record of its model, and the
+/// first model's next table made another. A record leaves at the timer's
+/// sweep once it holds no place, and with its places where the follow of
+/// a host's registry lets it go.
+#[test]
+fn a_worker_that_left_is_given_no_place_in_a_record_made_anew() {
+    let mut document = PolicySpec::preset("least_load").expect("the preset");
+    let reader = PolicySpec::preset("cache_aware").expect("the preset");
+    let mut binding = reader.bindings[0].clone();
+    binding.matcher.model = MODEL.into();
+    document.bindings.insert(0, binding);
+    document.profiles.extend(reader.profiles);
+    for let_go in [false, true] {
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let (affinity, _, _) = hosted(false);
+        let bed = Bed::new(affinity, spec, 4);
+        let asked = prompt(1_000, 4);
+        let facts = request(&asked, 7, NOW);
+        let other = RequestFacts {
+            model: "model-b",
+            ..facts
+        };
+        if let_go {
+            // The follow names a record that holds a place alone.
+            let (_, first) = bed.column(&facts, Phase::Single);
+            let first = first.expect("the record speaks for the list");
+            record_prefix(&bed.pool, Phase::Single, &facts, first, bed.ids[0]);
+        }
+        let (_, read) = bed.column(&facts, Phase::Single);
+        let read = read.expect("the record speaks for the list");
+        bed.column(&other, Phase::Single);
+        if let_go {
+            bed.affinity.let_go(&bed.affinity.unstated(|_| false));
+        } else {
+            bed.affinity.sweep();
+        }
+        assert!(bed.affinity.records.lock().is_empty(), "the record left");
+        bed.affinity.forget(bed.ids[2]);
+        bed.column(&facts, Phase::Single);
+        record_prefix(&bed.pool, Phase::Single, &facts, read, bed.ids[2]);
+        let behind = held(&bed.column(&facts, Phase::Single).0);
+        assert_eq!(behind, [(0, 0); 4], "let go: {let_go}");
+    }
+}
+
+/// Two records that leave the map in one sweep with unequal counts of
+/// leaves, four and one: the record made next begins past the greater,
+/// whichever of the two the map holds first.
+#[test]
+fn a_record_made_anew_begins_past_the_greatest_count_that_left() {
+    for (many, one) in [(MODEL, "model-b"), ("model-b", MODEL)] {
+        let (affinity, _, _) = hosted(false);
+        // Each record is the map's alone and holds no place.
+        drop(affinity.record_of(many, 8));
+        for worker in 1..=3 {
+            affinity.forget(WorkerId(worker));
+        }
+        drop(affinity.record_of(one, 8));
+        affinity.forget(WorkerId(4));
+        affinity.sweep();
+        assert!(affinity.records.lock().is_empty(), "the two left");
+        let anew = affinity.record_of(one, 8).left.load(Ordering::Relaxed);
+        assert_eq!(anew, 5, "{many} left with four");
+    }
+}
+
 /// A pin's answer made ahead of a leave and handed through the lookup
 /// behind it gives its worker no place; with no leave between it writes.
 #[test]
@@ -2380,6 +2457,122 @@ fn a_lists_table_stands_for_a_second() {
     store(index, 2, &hashes_of(&asked));
     assert!(bed.holders(&asked, NOW + SECOND + 1).is_empty());
     assert_eq!(bed.holders(&asked, NOW + 2 * SECOND), [(2, 4, 0)]);
+}
+
+/// A number of the index that one worker handed back and the next worker
+/// took names the new worker to the next decision: the list's table, which
+/// kept the number for the first, is read again before its second is up.
+#[test]
+fn a_number_that_changed_hands_names_its_new_worker() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("an index");
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = prompt(1_000, 4);
+    // Worker 0 holds another prompt under its number when the table is read.
+    let (number, map) = stored(&index, 0, &hashes_of(&prompt(5_000, 2)));
+    assert!(bed.holders(&asked, NOW).is_empty());
+    // Its stream ends and worker 1's opens: worker 1 takes the number and
+    // alone holds the asked prompt.
+    index.remove_worker(number, map);
+    store(&index, 1, &hashes_of(&asked));
+    assert_eq!(index.worker_id(&address(1)), Some(number));
+    assert_eq!(bed.holders(&asked, NOW), [(1, 4, 0)]);
+}
+
+/// A number that changes hands under a decision's own lookup names nobody
+/// to it: the table read the number for its former worker, and the lookup
+/// finds the blocks of its new one. The next decision reads the table again
+/// and names the new worker. A side's column holds nothing of the request
+/// under such a lookup, and the next column holds the new worker's blocks.
+#[test]
+fn a_number_handed_on_under_a_lookup_names_nobody() {
+    /// A chain index whose first lookup is met by a handoff: the stream of
+    /// worker 0 ends and worker 1 stores the asked prompt under its number.
+    struct HandedOn {
+        index: ChainIndex,
+        handoff: Mutex<Option<(u32, ChainBlockMap, Vec<u64>)>>,
+    }
+
+    impl CacheIndex for HandedOn {
+        fn worker_number(&self, address: &str) -> Option<u32> {
+            self.index.worker_id(address)
+        }
+
+        fn numbers_reused(&self) -> u64 {
+            self.index.ids_reused()
+        }
+
+        fn worker_blocks(&self, number: u32) -> usize {
+            self.index.worker_block_count(number)
+        }
+
+        fn deepest_into(
+            &self,
+            block_hashes: &[u64],
+            block_size: u32,
+            within: &[u64],
+            cap: usize,
+            below: &mut dyn FnMut(u32) -> u32,
+            kept: &mut Vec<(u32, u32)>,
+        ) {
+            if let Some((number, map, hashes)) = self.handoff.lock().take() {
+                self.index.remove_worker(number, map);
+                store(&self.index, 1, &hashes);
+            }
+            CacheIndex::deepest_into(
+                &self.index,
+                block_hashes,
+                block_size,
+                within,
+                cap,
+                below,
+                kept,
+            );
+        }
+    }
+
+    struct Lends(Arc<HandedOn>);
+
+    impl CacheIndexes for Lends {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            Some(Arc::clone(&self.0) as Arc<dyn CacheIndex>)
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            Some(BLOCK)
+        }
+    }
+
+    let asked = prompt(1_000, 4);
+    let handed_on = |spec: AppliedSpec| {
+        let index = ChainIndex::new();
+        // Worker 0 holds another prompt under its number when the table is
+        // read.
+        let (number, map) = stored(&index, 0, &hashes_of(&prompt(5_000, 2)));
+        let handed = Arc::new(HandedOn {
+            index,
+            handoff: Mutex::new(Some((number, map, hashes_of(&asked)))),
+        });
+        let bed = Bed::new(Affinity::default(), spec, 4);
+        bed.affinity
+            .set_indexes(Arc::new(Lends(Arc::clone(&handed))) as Arc<dyn CacheIndexes>);
+        (bed, handed, number)
+    };
+
+    let (bed, handed, number) = handed_on(preset("cache_aware"));
+    assert!(bed.holders(&asked, NOW).is_empty());
+    assert_eq!(handed.index.worker_id(&address(1)), Some(number));
+    assert_eq!(bed.holders(&asked, NOW), [(1, 4, 0)]);
+
+    // A side's column is filled by a lookup of its own.
+    let (bed, handed, number) = handed_on(paired());
+    let facts = request(&asked, 7, NOW);
+    assert_eq!(held(&bed.column(&facts, Phase::Prefill).0), [(0, 0); 4]);
+    assert_eq!(handed.index.worker_id(&address(1)), Some(number));
+    assert_eq!(
+        held(&bed.column(&facts, Phase::Prefill).0),
+        [(0, 0), (4, 0), (0, 0), (0, 0)]
+    );
 }
 
 /// A profile whose stages read no affinity is named no row: its decision

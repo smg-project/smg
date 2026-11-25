@@ -3,11 +3,6 @@
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
     any::Any,
     collections::HashMap,
@@ -19,8 +14,8 @@ use crate::{
     document::spec::{Assignment, Needs},
     engine::{
         decision::{
-            Decision, LiftedVeto, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets,
-            Trace, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
+            Decision, LiftedVeto, Overlap, Pick, Placing, Shed, ShedReason, Survivors, Target,
+            Targets, Trace, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
         },
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
@@ -842,6 +837,7 @@ pub trait Picker: Lifecycle + Debug {
 /// A pool as a picker that places over its workers by itself is handed it
 /// ([`Picker::pick_alone`]): its size and its own word.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct PoolWord<'a> {
     /// How many workers the pool holds, in an order that stands for as long
     /// as the pool does.
@@ -852,6 +848,19 @@ pub struct PoolWord<'a> {
     /// pool and no table is looked up. It starts at a position the caller
     /// drew.
     pub word: &'a AtomicU64,
+}
+
+impl<'a> PoolWord<'a> {
+    /// A pool's size and its own word. It takes every field whose silence
+    /// would change an answer with no word, and neither of these has a neutral
+    /// value: a later field with a true neutral value joins by assignment. A
+    /// program that implements [`Picker::pick_alone`] builds one to call its
+    /// picker. It checks nothing. Code outside this crate starts here: the
+    /// record gains fields, so no literal of it builds there.
+    #[must_use]
+    pub const fn of(rows: usize, word: &'a AtomicU64) -> Self {
+        Self { rows, word }
+    }
 }
 
 /// Per-decision state a stage set keeps across the stages of one profile
@@ -3271,7 +3280,10 @@ pub struct Binding {
     pub decode_shadow: Option<u16>,
     /// Sticky sessions: a keyed request stays on the worker its key was
     /// placed on (design 4.6), under the `single` plan and on each side of
-    /// a pair, by the side's own session.
+    /// a pair, by the side's own session. A document states the rule: code
+    /// outside this crate builds none ([`SessionRule`]), so a binding it
+    /// makes leaves this `None`, or takes the rule of a document's binding
+    /// ([`Engine::binding`]).
     pub sessions: Option<SessionRule>,
 }
 
@@ -3750,10 +3762,6 @@ pub struct Engine {
     /// made with it, or the one its host keeps across documents
     /// ([`Self::share_sessions`]).
     sessions: Arc<SessionTable>,
-    /// The generation from which a lease tells this engine's session
-    /// table: `0`, every lease, but on a view of generations older than
-    /// the table ([`Self::table_from`]).
-    sessions_from: u64,
     assignment: AssignmentStages,
     /// Per profile, what its stages ask of a decision beyond the profile's
     /// own run ([`Marks`]).
@@ -5396,7 +5404,6 @@ impl Engine {
             phase_needs,
             keyed,
             sessions,
-            sessions_from: 0,
             assignment: AssignmentStages::default(),
             marks,
             head_places,
@@ -5619,28 +5626,6 @@ impl Engine {
         hearing.sent_credits = counts.map(count).collect();
         hearing.sessions = Arc::clone(&self.sessions);
         hearing
-    }
-
-    /// This view tells its session table the leases issued under `first`
-    /// or a later generation, and no earlier one. `first` is the
-    /// generation the table was made under, where a host builds an engine
-    /// object for each of its documents: a lease of an earlier document
-    /// was issued over the table that left with that document's object,
-    /// and the claim its first decision made was made there. The table
-    /// matches a claim by its worker alone, so it would read that verdict
-    /// as a later decision's claim of the key on the same worker, and
-    /// withdraw it. The view's stages and its counts of sends hear such a
-    /// lease all the same.
-    ///
-    /// One side of such a lease claims in this table: a pair's decode that
-    /// a later call decides behind the new document, whose lease keeps the
-    /// pair's generation. Its words are skipped with the lease's others:
-    /// its dispatch confirms no claim and its refused commit takes none
-    /// back, and the claim stands for as long as the table holds the key.
-    #[cfg(feature = "in-process")]
-    pub(crate) fn table_from(mut self, first: u64) -> Self {
-        self.sessions_from = first;
-        self
     }
 
     /// The generations below this engine's own under which a profile or a
@@ -8552,9 +8537,12 @@ impl Engine {
                         trace,
                         session_verdict,
                     } = paired;
-                    // Each side's own verdict: the decode side's in the
-                    // first target's pair, the prefill side's as the pick's.
-                    targets.pair_under(prefill_target, *session_verdict);
+                    // Each side's own verdict and its own word of who
+                    // placed it: the decode side's verdict in the first
+                    // target's pair and its word in every pair, the
+                    // prefill side's as the pick's.
+                    let placed = prefill_pick.targets.placing();
+                    targets.pair_under(prefill_target, *session_verdict, placed);
                     // The pair's trace is the prefill's, with the mark of
                     // the veto the rule lifted for the decode side, or of
                     // the overload veto the prefill's own run was placed
@@ -9096,11 +9084,15 @@ impl Engine {
         // targets of a pair's first decision do. They are turned where the
         // decision stands, and its trace stays the decode's: taken out and
         // built beside it, the pick was copied twice. The decode side's
-        // verdict goes into the first target's pair, and the pick states
-        // none: this call decided no prefill.
+        // verdict goes into the first target's pair and its word of who
+        // placed it into every pair, and the pick states neither of a
+        // prefill: this call decided none. A host that holds the pair's
+        // first pick keeps that pick's word of the prefill side beside
+        // this one.
         if let Decision::Pick(pick) = &mut decision {
             let decode = std::mem::take(&mut pick.session_verdict);
-            pick.targets.pair_under(&target_of(prefill), decode);
+            pick.targets
+                .pair_under(&target_of(prefill), decode, Placing::Stages);
         } else if decode_cx.target_worker.is_some() {
             return target_missed(decision);
         }
@@ -9121,15 +9113,13 @@ impl Engine {
     /// otherwise. A dispatch is told in parts: the counts of sends, this
     /// table, then the stages ([`Self::dispatched_stages`]), so a stage's
     /// call that unwinds leaves the table's entry written. Every teller of
-    /// a dispatch keeps that order, the trait's own entry among them. A
-    /// view of generations older than its table writes nothing for a lease
-    /// of theirs ([`Self::table_from`]).
+    /// a dispatch keeps that order, the trait's own entry among them.
     pub(crate) fn dispatched_table(&self, lease: &Lease, target: &Target, side: Side) {
         let dispatched = match (side, target.pair) {
             (Side::Decode, Some(pair)) => pair.decode_id,
             _ => target.id,
         };
-        if lease.session_verdict != SessionVerdict::None && lease.generation >= self.sessions_from {
+        if lease.session_verdict != SessionVerdict::None {
             self.sessions
                 .dispatched(lease.session, lease.session_verdict, dispatched);
         }
@@ -9142,11 +9132,9 @@ impl Engine {
     /// ([`Self::released_stages`]). An engine in its host's process tells
     /// the table each side a pair's release ends ahead of any stage, a
     /// decode stated for later among them: no stage hears that side's end,
-    /// and the pair's first decision made its claim. A view of generations
-    /// older than its table takes back no claim for a lease of theirs
-    /// ([`Self::table_from`]).
+    /// and the pair's first decision made its claim.
     pub(crate) fn released_table(&self, lease: &Lease, reason: ReleaseReason) {
-        if reason == ReleaseReason::CommitFailed && lease.generation >= self.sessions_from {
+        if reason == ReleaseReason::CommitFailed {
             if let SessionVerdict::Claimed(claimed) = lease.session_verdict {
                 self.sessions
                     .move_claim(lease.session, claimed, WorkerId(0));
@@ -9206,6 +9194,9 @@ impl Engine {
 
     /// The stages' part of a dispatch: each profile's scorers and its
     /// picker hear it.
+    // In line at its callers: as a call it costs a pair's decision 41
+    // instructions, counted with Callgrind.
+    #[inline(always)]
     pub(crate) fn dispatched_stages(
         &self,
         lease: &Lease,
@@ -18307,6 +18298,121 @@ mod tests {
             (pair.decode_position, pair.decode_verdict),
             (2, DecodeVerdict::NONE)
         );
+    }
+
+    /// Under a sessions rule each side of a pair states who placed it, by
+    /// its own decision, and under the rule's word `untold` that it is
+    /// kept from the profile. A new key's pair is the stages' on both
+    /// sides under `delegate`. A key pinned on both sides follows both
+    /// pins, and its pair is the rule's on both. With the worker of its
+    /// prefill pin down the stages place the prefill beside a decode the
+    /// rule placed, and the other way round with the worker of its decode
+    /// pin down. A decode asked again states its own side's word in its
+    /// pairs and the stages for the prefill: the call decided none. A
+    /// request with no key is the stages' on both sides. Under the rule's
+    /// default word the same sides are the rule's, and none is kept from
+    /// the profile.
+    ///
+    /// A gateway's sticky map tags a key by its role
+    /// (`model_gateway/src/policies/registry.rs:762-769`) and selects a
+    /// pair's two roles apart
+    /// (`model_gateway/src/routers/common/placement.rs:3026`, `:3088`): a
+    /// role whose pin stands under its cap asks its policy nothing
+    /// (`registry.rs:794-797`), beside a role its policy places.
+    #[test]
+    fn each_side_of_a_pair_states_who_placed_it_under_the_rules_word() {
+        use decision::PlacedBy;
+
+        // Each side's word of a pick: the prefill side's, then the decode
+        // side's, which every pair of the pick states.
+        let words = |decision: &Decision| {
+            let pick = decision.pick().expect("a pair");
+            let mut pairs = pick.targets.iter().filter_map(|target| target.pair);
+            let decode = pairs.next().expect("a decode").decode_placing;
+            assert!(pairs.all(|pair| pair.decode_placing == decode));
+            assert_eq!(pick.decode_untold(), decode.untold());
+            [
+                (pick.placed_by(), pick.untold()),
+                (decode.placed_by(), decode.untold()),
+            ]
+        };
+        for kept in [RulePlaced::Untold, RulePlaced::Told] {
+            let rule = SessionRule {
+                rule_placed: kept,
+                inflight_cap: 0,
+                ..SESSIONS
+            };
+            let binding = Binding {
+                sessions: Some(rule),
+                ..pair_binding()
+            };
+            let profiles = vec![least_requests_profile()];
+            let engine = Engine::new(profiles, vec![binding], 1, Needs::default());
+            let mut scratch = Scratch::new();
+            let (pool, cx) = (PoolFacts::default(), Constraints::default());
+            let stages = (PlacedBy::Stages, false);
+            let ruled = (PlacedBy::Rule, kept == RulePlaced::Untold);
+            // The least loaded prefill is the second, the least loaded
+            // decode the third.
+            let mut rows = two_sides(&[5, 0, 5], &[5, 5, 0]);
+            let new = pair_request(Some(6));
+            let [prefills, decodes] = &rows;
+            let pools = PairPools {
+                prefills,
+                decodes,
+                ..PairPools::default()
+            };
+            let first = engine.decide_pair(&new, &pool, pools, &cx, &cx, &mut scratch);
+            assert_eq!(words(&first), [stages; 2], "{kept:?}: a new key");
+            // What each side states for a key pinned on both sides, with
+            // the worker of one side's pin down where `down` names one:
+            // of the key's next pair, and of its decode asked again
+            // behind the pinned prefill. Each form under a key of its own:
+            // a side the stages place is claimed for its key.
+            let downs = [None, Some(0), Some(1)];
+            let forms = downs
+                .into_iter()
+                .flat_map(|down| [(down, false), (down, true)]);
+            for (nth, (down, again)) in forms.enumerate() {
+                let case = format!("{kept:?}, side {down:?} down, again {again}");
+                let keyed = pair_request(Some(7 + nth as u64));
+                let (pinned, _) = pair_placed(&engine, &keyed, &rows, &mut scratch);
+                assert_eq!(pinned, (1, 2), "{case}");
+                if let Some(side) = down {
+                    rows[side][[1, 2][side]].health.healthy = false;
+                }
+                let [prefills, decodes] = &rows;
+                let pools = PairPools {
+                    prefills,
+                    decodes,
+                    ..PairPools::default()
+                };
+                let by = |side: usize| if down == Some(side) { stages } else { ruled };
+                let (held, scratch) = (prefills[1].id, &mut scratch);
+                let (decided, prefill) = if again {
+                    // The call decided no prefill: the stages' word.
+                    let decided =
+                        engine.decide_decode(&keyed, &pool, pools, held, None, &cx, scratch);
+                    (decided, stages)
+                } else {
+                    let decided = engine.decide_pair(&keyed, &pool, pools, &cx, &cx, scratch);
+                    (decided, by(0))
+                };
+                assert_eq!(words(&decided), [prefill, by(1)], "{case}");
+                if let Some(side) = down {
+                    rows[side][[1, 2][side]].health.healthy = true;
+                }
+            }
+            let [prefills, decodes] = &rows;
+            let pools = PairPools {
+                prefills,
+                decodes,
+                ..PairPools::default()
+            };
+            let plain = pair_request(None);
+            let unkeyed = engine.decide_pair(&plain, &pool, pools, &cx, &cx, &mut scratch);
+            assert_eq!(words(&unkeyed), [stages; 2], "{kept:?}: no key");
+        }
     }
 
     /// The profile's filters narrow the pool before the assignment places a

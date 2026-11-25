@@ -27,6 +27,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `ChatCompletionRequest.return_prompt_text` (a boolean, `false` unless sent, serialized only
+  when `true`), `ChatCompletionResponse.prompt_text` and
+  `ChatCompletionStreamResponse.prompt_text` (an optional string each, absent unless set): a chat
+  request asks for the prompt as rendered for the model, and the answer carries it. The gateway's
+  gRPC path fills it for a request that sends the worker no media (not where media travels with
+  the prompt, and not for a model served through the Harmony pipeline), at the top level of a
+  collected answer and on the first opening chunk of a stream.
+  Breaking for a caller that writes one of the three types as a whole literal: the literal names
+  the new field (a request literal that ends in `..Default::default()` does not).
 - `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
   map of its pairs), `responses::validate_metadata_pair_count` (its 16-pair bound alone, for a
   count read on its own), `responses::validate_input_message_role` (an input message's role in
@@ -412,6 +421,8 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `input_ids`, `input_embeds`), as `missing_required_parameter`; a body with both `text` and
   `input_ids` and an `input_embeds`-only body stay with the routers as today. The cross-field sampling rules (`min_new_tokens` above
   `max_new_tokens`, more than one structured-output constraint) name their field in `error.param`.
+- `SamplingParams::n` ends at 128, the upper bound `ChatCompletionRequest` and `CompletionRequest`
+  put on their `n`: a `/generate` body that asks more choices is refused as an `n` of zero is.
 - An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
   the request is written back for an upstream, as the HTTP router and the provider routers write
   it. The crate dropped all three while reading the message, so a replayed refused turn reached a

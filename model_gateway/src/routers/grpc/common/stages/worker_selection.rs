@@ -4039,6 +4039,103 @@ mod tests {
         assert_eq!(said()[3..], ["issued", "released Abandoned"]);
     }
 
+    /// The stage asks its guards the handle a request's stream tells
+    /// Grand Central its end through. Every sub-request of a batch takes
+    /// the handle of the batch's one placement. A stream that holds it
+    /// tells its end once, and one dropped before its end tells nothing. One
+    /// let go at its reader's own stop tells the worker's 200 through the
+    /// layer under its tracked layer. A selection the classic policies made
+    /// asks no guard, and its stream is left as it is.
+    #[tokio::test]
+    async fn a_requests_stream_tells_the_engine_its_end_through_the_stages_guards() {
+        use crate::routers::{
+            common::placement::{tests::hearing_engine_on, RequestEnd},
+            grpc::{
+                context::LoadGuards,
+                proto_wrapper::{FanoutStream, ProtoStream},
+                regular::streaming::tests::eof::{chunk, scripted_stream},
+            },
+        };
+
+        let model_id = "test-model-engine-stream-end";
+        let nothing = || ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+        let tracked = |stream: ProtoStream, selection: &WorkerSelection, guards: &LoadGuards| {
+            let worker = Arc::clone(selection.single().expect("a single worker"));
+            let mut stream = stream.tracked(worker, 0, false);
+            stream.report_through(selection.end(Some(guards)));
+            stream
+        };
+
+        let (classic, _policies) = stage_and_policies(model_id, 2);
+        let selection = WorkerSelection::Single {
+            worker: regular_pick(&classic, model_id, None),
+        };
+        let guards = LoadGuards::new(&selection, None);
+        assert!(!selection.tells_end());
+        assert!(selection.end(Some(&guards)).is_empty());
+        assert!(selection.end(None).is_empty());
+        let mut unreported = nothing();
+        unreported.report_through(RequestEnd::default());
+        assert!(matches!(unreported, ProtoStream::Fanout(_)));
+
+        let (stage, policies) = stage_and_policies(model_id, 2);
+        let heard = hearing_engine_on(&policies);
+        let said = || heard.lock().expect("the stage heard").clone();
+        let placed = || WorkerSelection::Single {
+            worker: regular_pick(&stage, model_id, None),
+        };
+
+        // A clean end of a batch's sub-request: the worker's 200, heard
+        // once the guards are gone.
+        let selection = placed();
+        assert!(selection.tells_end());
+        let guards = LoadGuards::scaled(&selection, None, 2);
+        let mut stream = tracked(nothing(), &selection, &guards);
+        assert!(stream.next().await.is_none());
+        drop(guards);
+        assert_eq!(said(), ["issued", "dispatched Single", "completed Ok 200"]);
+
+        // A failure and the end behind it: told once, as the failure.
+        let selection = placed();
+        let guards = LoadGuards::new(&selection, None);
+        let (failing, _server) = scripted_stream(vec![chunk(0, "a")], "13").await;
+        let mut stream = tracked(failing, &selection, &guards);
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(matches!(stream.next().await, Some(Err(_))));
+        assert!(stream.next().await.is_none());
+        drop((stream, guards));
+        assert_eq!(
+            said()[3..],
+            ["issued", "dispatched Single", "completed ServerError 500"]
+        );
+
+        // A stream dropped before its end: nobody tells it.
+        let selection = placed();
+        let guards = LoadGuards::new(&selection, None);
+        let (open, _server) = scripted_stream(vec![chunk(0, "a")], "0").await;
+        let mut stream = tracked(open, &selection, &guards);
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        drop((stream, guards));
+        assert_eq!(
+            said()[6..],
+            ["issued", "dispatched Single", "completed Cancelled"]
+        );
+
+        // A tracked stream let go at its reader's own stop: the layer
+        // under the tracked one tells the worker's 200.
+        let selection = placed();
+        let guards = LoadGuards::new(&selection, None);
+        let (open, _server) = scripted_stream(vec![chunk(0, "a")], "0").await;
+        let mut stream = tracked(open, &selection, &guards);
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        stream.abort_past_stop();
+        drop(guards);
+        assert_eq!(
+            said()[9..],
+            ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
     /// The stage states the request's completion budget to Grand Central
     /// as the answer's limit. The regular selection reads it off the context
     /// requirements it is handed, a first attempt's and a retry's alike, and

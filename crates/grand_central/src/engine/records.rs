@@ -157,8 +157,8 @@ impl DecisionClock {
     }
 
     /// The clock whose origin is `origin`: for a host that reads a clock of
-    /// its own and builds an engine for each of its documents, so one
-    /// instant reads alike on the host's clock and on every engine's.
+    /// its own, as a store does, so one instant reads alike on the host's
+    /// clock and on its engine's.
     #[must_use]
     #[cfg_attr(
         not(feature = "in-process"),

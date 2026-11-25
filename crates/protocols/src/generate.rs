@@ -589,7 +589,7 @@ mod tests {
     }
 
     /// The rules of `sampling_params` run on the request as the chat route's
-    /// run on its fields, with the chat route's lower bound on `n`, and an
+    /// run on its fields, with the chat route's bounds on `n`, and an
     /// empty `input_ids` is refused as the chat route refuses an empty
     /// `messages`; a request within the rules passes.
     #[test]
@@ -602,7 +602,7 @@ mod tests {
         let within = request(serde_json::json!({
             "model": "m",
             "text": "hi",
-            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 1, "max_new_tokens": 4}
+            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 128, "max_new_tokens": 4}
         }));
         assert!(
             within.validate().is_ok(),
@@ -613,6 +613,7 @@ mod tests {
             ("temperature", serde_json::json!(-1), "range"),
             ("top_p", serde_json::json!(2), "decimal_above_max_value"),
             ("n", serde_json::json!(0), "range"),
+            ("n", serde_json::json!(129), "range"),
         ] {
             let refused = request(serde_json::json!({
                 "model": "m",

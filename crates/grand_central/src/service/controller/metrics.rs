@@ -127,8 +127,8 @@ pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_grand_central_overload_flips_total";
 /// of a single request's lease or a pair's, the release of a lease the
 /// decision gives up) counts with the requests that got no decision.
 pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_grand_central_lifecycle_faults_total";
-/// Panics the engine held under its own catches, by `kind`, over
-/// every engine the store built: `decision` (a whole decision, a shadow's
+/// Panics the store's one engine held under its own catches, by
+/// `kind`: `decision` (a whole decision, a shadow's
 /// beside a live decision among them), `event` (a stage at a word the
 /// engine tells it) and `upkeep` (a step of the engine's upkeep). It is a
 /// gateway's family of that name, with one definition in both processes:
@@ -164,7 +164,7 @@ pub(crate) struct Metrics {
     outside: [Gauge; 2],
     overload_flips: Counter,
     lifecycle_faults: Counter,
-    /// The panics the store's engines held: `decision`, `event`, `upkeep`.
+    /// The panics the store's engine held: `decision`, `event`, `upkeep`.
     policy_faults: [Counter; 3],
     /// Held from a scrape's sample of the state to the end of its render:
     /// the gauges are written from one sample and read back whole.
@@ -556,13 +556,13 @@ impl Metrics {
 
     /// Sets the store's series from one read of its counts: the members
     /// outside a list, the lifecycle calls that panicked, and the panics
-    /// its engines held, by kind.
+    /// its engine held, by kind.
     fn observe_store(&self, counts: StoreStats) {
         let [engines, zones] = &self.outside;
         engines.set(f64::from(counts.outside.engines));
         zones.set(f64::from(counts.outside.zones));
         self.lifecycle_faults.absolute(counts.lifecycle_faults);
-        // The engines' counts are the store's own for its life, whichever
+        // The engine's counts stand for the store's life, whichever
         // document each rose under: each series is set to its count as read.
         let held = counts.engine_faults;
         let read = [held.decisions, held.events, held.upkeep];
@@ -979,13 +979,13 @@ mod tests {
         );
     }
 
-    /// The panics the store's engines held render as the engine's
+    /// The panics the store's engine held render as the engine's
     /// family, a series a kind, each at zero from the first scrape. Each is
     /// set to its count as its scrape's read answers it, under its own kind.
     /// The store's counts never fall. Were a read to answer less, the series
     /// would stay where it stood: a scraper reads a fall as a restart.
     #[test]
-    fn the_panics_the_stores_engines_held_render_by_kind_and_never_fall() {
+    fn the_panics_the_stores_engine_held_render_by_kind_and_never_fall() {
         let metrics = Metrics::new();
         let scraped = |held: [u64; 3]| {
             let [decisions, events, upkeep] = held;

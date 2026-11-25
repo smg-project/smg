@@ -261,19 +261,14 @@ pub(crate) struct SpecFile {
 }
 
 impl SpecFile {
-    /// The start: reads the file at `path` as it stands and applies its
-    /// document as the source's first. A file that cannot be read, or a
-    /// document that does not run, refuses the start.
-    pub(crate) fn start(
-        path: PathBuf,
-        generations: Arc<Generations>,
-    ) -> Result<Self, SpecRejected> {
-        Self::start_looking(path, generations, look)
-    }
-
-    /// The start of a replica under a shared lease: the file is read as it
-    /// stands and its document passed, never applied
-    /// ([`Generations::defer`]). A file that cannot be read, or a document
+    /// The start: reads the file at `path` as it stands and hands its
+    /// document to the door, which knows the start its replica makes
+    /// ([`Generations::start_with`]). A replica alone over its lease
+    /// applies the document as the source's first. A file that cannot be
+    /// read, or a document that does not run, refuses the start.
+    ///
+    /// A replica under a shared lease passes the document and never
+    /// applies it at the start. A file that cannot be read, or a document
     /// that does not run, refuses the start all the same. Until it leads,
     /// a replica that follows a leader runs what the leader's log gives
     /// it. Under its first lead the door applies these bytes where the
@@ -282,11 +277,11 @@ impl SpecFile {
     /// file as it stands then, though it never moved, while its document
     /// has not stood on this replica since the file took it: a replica
     /// that followed another document runs its own file's once it leads.
-    pub(crate) fn start_deferred(
+    pub(crate) fn start(
         path: PathBuf,
         generations: Arc<Generations>,
     ) -> Result<Self, SpecRejected> {
-        Self::start_by(path, generations, look, read, Generations::defer)
+        Self::start_looking(path, generations, look)
     }
 
     /// [`SpecFile::start`] with the look as its argument: the identity is
@@ -300,25 +295,13 @@ impl SpecFile {
         Self::start_reading(path, generations, look, read)
     }
 
-    /// [`SpecFile::start_looking`] with the descriptor read as its argument.
+    /// [`SpecFile::start_looking`] with the descriptor read as its
+    /// argument: the start's read, and the document handed to the door.
     fn start_reading(
-        path: PathBuf,
-        generations: Arc<Generations>,
-        look: impl FnMut(&Path) -> Seen,
-        read: impl FnMut(&Identity) -> Option<Result<Vec<u8>, SpecRejected>>,
-    ) -> Result<Self, SpecRejected> {
-        let apply = |door: &Generations, document, format| door.apply(document, format).map(drop);
-        Self::start_by(path, generations, look, read, apply)
-    }
-
-    /// The start's read, and the document handed to the door by `hand`: an
-    /// apply, or the pass alone of a replica under a shared lease.
-    fn start_by(
         path: PathBuf,
         generations: Arc<Generations>,
         mut look: impl FnMut(&Path) -> Seen,
         mut read: impl FnMut(&Identity) -> Option<Result<Vec<u8>, SpecRejected>>,
-        hand: impl FnOnce(&Generations, Vec<u8>, Format) -> Result<(), SpecRejected>,
     ) -> Result<Self, SpecRejected> {
         let format = Format::of(&path);
         // The look after the read has the word. A file that moved under its
@@ -335,7 +318,7 @@ impl SpecFile {
                 continue;
             };
             if look(&path) == found {
-                hand(&generations, document?, format)?;
+                generations.start_with(document?, format)?;
                 let took = generations.takes();
                 return Ok(Self {
                     path,
@@ -569,7 +552,7 @@ pub(crate) mod tests {
                 },
                 Validate,
             },
-            elector::{Elector, TickOutcome},
+            elector::{Elector, Fence, TickOutcome},
         },
         stages::StageRegistry,
         store::MemoryStore,
@@ -589,16 +572,27 @@ pub(crate) mod tests {
 
     /// [`bed`] with the validator of its generations.
     fn bed_validating(document: &[u8], validate: Validate) -> Bed {
+        bed_of(document, validate, None)
+    }
+
+    /// [`bed`] whose generations are built under `fence`, as a replica's
+    /// under a shared lease: its file's start passes the document and
+    /// applies none.
+    fn bed_under(document: &[u8], fence: Arc<Fence>) -> Bed {
+        bed_of(document, AppliedSpec::validate_digested, Some(fence))
+    }
+
+    fn bed_of(document: &[u8], validate: Validate, fence: Option<Arc<Fence>>) -> Bed {
         let dir = tempfile::tempdir().expect("a directory");
         let path = dir.path().join("policy.yaml");
         fs::write(&path, document).expect("the file");
         let store = Arc::new(MemoryStore::new());
         let catalog = Arc::new(StageRegistry::builtin());
-        let generations = Arc::new(Generations::validating(store, catalog, validate));
+        let generations = Generations::validating(store, catalog, validate, fence);
         Bed {
             dir,
             path,
-            generations,
+            generations: Arc::new(generations),
         }
     }
 
@@ -1818,12 +1812,11 @@ pub(crate) mod tests {
     /// and applies nothing.
     #[tokio::test(start_paused = true)]
     async fn the_watch_of_a_replica_that_follows_looks_and_applies_nothing() {
-        let bed = bed(LEAST_LOAD.as_bytes());
         let mut elector = election();
-        bed.generations.under(elector.fence());
+        let bed = bed_under(LEAST_LOAD.as_bytes(), elector.fence());
         let door = Arc::clone(&bed.generations);
         elector.at_take(move || door.at_take());
-        let file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+        let file = SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations))
             .expect("a file that runs");
         follow(&bed, &[RANDOM, &bound_to(1)]);
         let looks = Arc::new(AtomicUsize::new(0));
@@ -1906,12 +1899,10 @@ pub(crate) mod tests {
     /// refuses the other.
     #[test]
     fn a_start_under_a_shared_lease_passes_its_file_and_the_first_take_applies_it() {
-        let bed = bed(LEAST_LOAD.as_bytes());
-        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
-            .expect("a file that runs");
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         assert_eq!(bed.generation(), 0, "passed, not applied");
         assert_eq!(file.poll(), Look::Same, "no take, and the file never moved");
-        bed.generations.at_take();
+        elector.tick(Instant::now()).expect("a take");
         assert_eq!(bed.generation(), 1);
         assert_eq!(file.poll(), Look::Same, "the file's document stands");
 
@@ -1919,11 +1910,9 @@ pub(crate) mod tests {
         // old leader's document. The take applies none of the start's
         // bytes, and behind it the file is read though it never moved: the
         // new document stands as the next generation.
-        let bed = self::bed(LEAST_LOAD.as_bytes());
-        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
-            .expect("a file that runs");
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[RANDOM]);
-        bed.generations.at_take();
+        elector.tick(Instant::now()).expect("a take");
         assert_eq!(bed.generation(), 1, "the leader's, and none of the start's");
         assert_eq!(bed.answered().2, RANDOM.as_bytes());
         assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(2)));
@@ -1938,20 +1927,21 @@ pub(crate) mod tests {
         // A mount that lags: a standby's file holds the document it was
         // told at its join, and its leader applied another since. The take
         // brings nothing older back: the file is left for its next move.
-        let bed = self::bed(LEAST_LOAD.as_bytes());
-        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
-            .expect("a file that runs");
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[LEAST_LOAD]);
         follow(&bed, &[LEAST_LOAD, RANDOM]);
-        bed.generations.at_take();
+        elector.tick(Instant::now()).expect("a take");
         assert_eq!(file.poll(), Look::Same, "an older document of its leader's");
         assert_eq!((bed.generation(), bed.answered().2), (2, RANDOM.into()));
         replace(&bed.path, RANDOM.as_bytes());
         assert_eq!(settle(&mut file), Ok(ApplyOutcome::Unchanged(2)));
 
-        let unrun = self::bed(LEAST_LOAD.replace("healthy", "no-such-stage").as_bytes());
-        let refused = SpecFile::start_deferred(unrun.path.clone(), Arc::clone(&unrun.generations));
+        let mut elector = election();
+        let unrun = LEAST_LOAD.replace("healthy", "no-such-stage");
+        let unrun = bed_under(unrun.as_bytes(), elector.fence());
+        let refused = SpecFile::start(unrun.path.clone(), Arc::clone(&unrun.generations));
         assert!(refused.is_err(), "a stage this build lacks");
+        elector.tick(Instant::now()).expect("a take");
         unrun.generations.at_take();
         assert_eq!(unrun.generation(), 0);
     }
@@ -1961,10 +1951,9 @@ pub(crate) mod tests {
     /// file is one rejected state behind it.
     #[test]
     fn a_file_gone_bad_since_the_start_leaves_the_starts_document() {
-        let bed = bed(LEAST_LOAD.as_bytes());
         let mut elector = election();
-        bed.generations.under(elector.fence());
-        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+        let bed = bed_under(LEAST_LOAD.as_bytes(), elector.fence());
+        let mut file = SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations))
             .expect("a file that runs");
         replace(&bed.path, b"{ profiles");
         // A take with no step: the start's document waits under an open
@@ -2005,15 +1994,12 @@ pub(crate) mod tests {
         fs::write(&path, LEAST_LOAD).expect("the file");
         let store = Arc::new(MemoryStore::new());
         let catalog = Arc::new(StageRegistry::builtin());
-        let door = Arc::new(Generations::validating(
-            Arc::clone(&store),
-            catalog,
-            faulting_once,
-        ));
-        let awaits = || store.snapshot().spec().awaits_document();
         let mut elector = election();
-        door.under(elector.fence());
-        let mut file = SpecFile::start_deferred(path, Arc::clone(&door)).expect("a file that runs");
+        let fence = Some(elector.fence());
+        let door = Generations::validating(Arc::clone(&store), catalog, faulting_once, fence);
+        let door = Arc::new(door);
+        let awaits = || store.snapshot().spec().awaits_document();
+        let mut file = SpecFile::start(path, Arc::clone(&door)).expect("a file that runs");
         assert!(awaits(), "the start's document waits");
         let stepped = Arc::clone(&door);
         elector.at_take(move || stepped.at_take());
@@ -2032,10 +2018,9 @@ pub(crate) mod tests {
     /// take or behind none: its document has not stood there since.
     #[test]
     fn a_look_that_resumes_behind_a_lost_lead_shows_the_file_and_applies_nothing() {
-        let bed = bed(LEAST_LOAD.as_bytes());
         let mut elector = election();
-        bed.generations.under(elector.fence());
-        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+        let bed = bed_under(LEAST_LOAD.as_bytes(), elector.fence());
+        let mut file = SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations))
             .expect("a file that runs");
         let door = Arc::clone(&bed.generations);
         elector.at_take(move || door.at_take());
@@ -2070,10 +2055,9 @@ pub(crate) mod tests {
         // the file. Behind the renewal that opens the fence the watch
         // brings both: the start's document, then the file as it was shown.
         let deadline = Duration::from_secs(1);
-        let bed = self::bed(LEAST_LOAD.as_bytes());
         let mut elector = election_under(deadline);
-        bed.generations.under(elector.fence());
-        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+        let bed = bed_under(LEAST_LOAD.as_bytes(), elector.fence());
+        let mut file = SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations))
             .expect("a file that runs");
         let door = Arc::clone(&bed.generations);
         elector.at_take(move || door.at_take());
@@ -2112,10 +2096,9 @@ pub(crate) mod tests {
     #[test]
     fn a_file_shown_under_a_closed_fence_is_read_behind_the_renewal_that_opens_it() {
         let deadline = Duration::from_secs(30);
-        let bed = bed(LEAST_LOAD.as_bytes());
         let mut elector = election_under(deadline);
-        bed.generations.under(elector.fence());
-        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+        let bed = bed_under(LEAST_LOAD.as_bytes(), elector.fence());
+        let mut file = SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations))
             .expect("a file that runs");
         let door = Arc::clone(&bed.generations);
         elector.at_take(move || door.at_take());
@@ -2157,10 +2140,9 @@ pub(crate) mod tests {
     /// is open: the document is applied at once, by the loop's own clock.
     #[tokio::test(start_paused = true)]
     async fn the_loop_brings_the_starts_document_with_no_polls_sleep_ahead_of_it() {
-        let bed = bed(LEAST_LOAD.as_bytes());
         let mut elector = election();
-        bed.generations.under(elector.fence());
-        let file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+        let bed = bed_under(LEAST_LOAD.as_bytes(), elector.fence());
+        let file = SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations))
             .expect("a file that runs");
         // A take with no step of its own: the start's document waits under
         // an open fence.
@@ -2188,10 +2170,9 @@ pub(crate) mod tests {
     /// nothing. Behind a whole poll it looks.
     #[test]
     fn woken_at_a_leads_opening_the_watch_hands_over_the_starts_document_and_looks_at_nothing() {
-        let bed = bed(LEAST_LOAD.as_bytes());
         let mut elector = election();
-        bed.generations.under(elector.fence());
-        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+        let bed = bed_under(LEAST_LOAD.as_bytes(), elector.fence());
+        let mut file = SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations))
             .expect("a file that runs");
         // A take with no step of its own: the start's document waits under
         // an open fence.
@@ -2216,10 +2197,9 @@ pub(crate) mod tests {
     /// state stays unread, and the next looks read the file as it stands.
     #[test]
     fn a_look_whose_lead_changed_under_its_read_applies_nothing_and_reads_again() {
-        let bed = bed(LEAST_LOAD.as_bytes());
         let mut elector = election();
-        bed.generations.under(elector.fence());
-        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+        let bed = bed_under(LEAST_LOAD.as_bytes(), elector.fence());
+        let mut file = SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations))
             .expect("a file that runs");
         let door = Arc::clone(&bed.generations);
         elector.at_take(move || door.at_take());
@@ -2247,16 +2227,22 @@ pub(crate) mod tests {
         assert_eq!(bed.rejected(), 0);
     }
 
-    /// A replica under a shared lease that follows, over the file it
-    /// started with: its watch and its election, the take's step wired.
-    fn standby(bed: &Bed) -> (SpecFile, Elector) {
+    /// A replica under a shared lease that follows, over a file that holds
+    /// `document`: its bed, built under the fence of its election, its
+    /// watch and that election, the take's step wired.
+    fn standby(document: &[u8]) -> (Bed, SpecFile, Elector) {
+        standby_validating(document, AppliedSpec::validate_digested)
+    }
+
+    /// [`standby`] with the validator of its generations.
+    fn standby_validating(document: &[u8], validate: Validate) -> (Bed, SpecFile, Elector) {
         let mut elector = election();
-        bed.generations.under(elector.fence());
-        let file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+        let bed = bed_of(document, validate, Some(elector.fence()));
+        let file = SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations))
             .expect("a file that runs");
         let door = Arc::clone(&bed.generations);
         elector.at_take(move || door.at_take());
-        (file, elector)
+        (bed, file, elector)
     }
 
     /// The file moves to `document`, and the watch of a replica that
@@ -2278,8 +2264,7 @@ pub(crate) mod tests {
     #[test]
     fn a_numbered_file_above_the_generations_it_followed_runs_at_the_take() {
         let numbered = with_line(LEAST_LOAD, 10);
-        let bed = bed(&numbered);
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(&numbered);
         follow(&bed, &[LEAST_LOAD]);
         follow(&bed, &[LEAST_LOAD, RANDOM]);
         assert_eq!(bed.generation(), 2);
@@ -2295,8 +2280,7 @@ pub(crate) mod tests {
     /// refusal once, and the running generation stays.
     #[test]
     fn a_file_the_validator_refuses_is_told_at_the_take_though_its_digest_stands() {
-        let bed = bed(LEAST_LOAD.as_bytes());
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[LEAST_LOAD]);
         shown(
             &bed,
@@ -2335,8 +2319,7 @@ pub(crate) mod tests {
             }
             AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
         }
-        let bed = bed_validating(LEAST_LOAD.as_bytes(), entered_under);
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby_validating(LEAST_LOAD.as_bytes(), entered_under);
         follow(&bed, &[LEAST_LOAD]);
         DOOR.with(|door| *door.borrow_mut() = Some(Arc::clone(&bed.generations)));
         // The mount turns to the same document, and the look reads it.
@@ -2355,8 +2338,7 @@ pub(crate) mod tests {
     /// line 10: the take reads it and runs it under that number.
     #[test]
     fn a_file_that_gains_a_number_while_its_replica_follows_runs_at_the_take() {
-        let bed = bed(LEAST_LOAD.as_bytes());
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[LEAST_LOAD]);
         let numbered = with_line(LEAST_LOAD, 10);
         shown(&bed, &mut file, &numbered);
@@ -2371,8 +2353,7 @@ pub(crate) mod tests {
     /// older comes back. The file's next move is read as a leader's is.
     #[test]
     fn a_mount_one_step_behind_brings_nothing_older_back_at_a_take() {
-        let bed = bed(LEAST_LOAD.as_bytes());
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[LEAST_LOAD]);
         // The first change reaches this mount ahead of its leader's word of
         // it. The second reaches the leader's mount alone.
@@ -2395,8 +2376,7 @@ pub(crate) mod tests {
 
         // The same where the leader's word came first: the file takes the
         // document that stands, and its leader replaces it.
-        let bed = self::bed(LEAST_LOAD.as_bytes());
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[LEAST_LOAD, RANDOM]);
         shown(&bed, &mut file, RANDOM.as_bytes());
         follow(&bed, &[LEAST_LOAD, RANDOM, &bound_to(1)]);
@@ -2416,8 +2396,7 @@ pub(crate) mod tests {
     /// order of the hand and the generations tells the two apart.
     #[test]
     fn a_rollback_that_reaches_the_standby_first_runs_at_the_take() {
-        let bed = bed(LEAST_LOAD.as_bytes());
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[LEAST_LOAD]);
         shown(&bed, &mut file, RANDOM.as_bytes());
         follow(&bed, &[LEAST_LOAD, RANDOM]);
@@ -2437,8 +2416,7 @@ pub(crate) mod tests {
     #[test]
     fn a_file_a_standby_cannot_read_or_parse_is_told_once_at_the_take() {
         for gone in [false, true] {
-            let bed = bed(LEAST_LOAD.as_bytes());
-            let (mut file, mut elector) = standby(&bed);
+            let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
             follow(&bed, &[RANDOM]);
             if gone {
                 fs::remove_file(&bed.path).expect("the file goes");
@@ -2471,8 +2449,7 @@ pub(crate) mod tests {
     /// its own term.
     #[test]
     fn a_standbys_look_publishes_nothing_and_its_bytes_are_never_published() {
-        let bed = bed(LEAST_LOAD.as_bytes());
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[RANDOM]);
         shown(&bed, &mut file, bound_to(1).as_bytes());
         assert_eq!((bed.generation(), bed.answered().2), (1, RANDOM.into()));
@@ -2492,8 +2469,7 @@ pub(crate) mod tests {
     #[test]
     fn a_numbered_file_under_the_standing_generation_is_refused_at_the_take() {
         // No number: the older file comes back, as the next generation.
-        let bed = bed(LEAST_LOAD.as_bytes());
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[RANDOM, &bound_to(1)]);
         elector.tick(Instant::now()).expect("a take");
         assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(3)));
@@ -2501,8 +2477,7 @@ pub(crate) mod tests {
 
         // Numbered 1 under its leader's generation 2: refused, told once.
         let older = with_line(LEAST_LOAD, 1);
-        let bed = self::bed(&older);
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(&older);
         follow(&bed, &[RANDOM, &bound_to(1)]);
         elector.tick(Instant::now()).expect("a take");
         let refused = settle(&mut file);
@@ -2521,8 +2496,7 @@ pub(crate) mod tests {
     /// once.
     #[test]
     fn a_restless_file_is_told_by_no_look_of_a_replica_that_follows() {
-        let bed = bed(LEAST_LOAD.as_bytes());
-        let (mut file, mut elector) = standby(&bed);
+        let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
         follow(&bed, &[RANDOM]);
         // A writer that grows the file before every look.
         let mut writes = 0;
@@ -2551,8 +2525,7 @@ pub(crate) mod tests {
     #[test]
     fn a_file_a_leader_cannot_run_is_told_once_under_each_lead() {
         for gone in [false, true] {
-            let bed = bed(LEAST_LOAD.as_bytes());
-            let (mut file, mut elector) = standby(&bed);
+            let (bed, mut file, mut elector) = standby(LEAST_LOAD.as_bytes());
             elector.tick(Instant::now()).expect("a take");
             assert_eq!(bed.generation(), 1, "the start's document, at the take");
             assert_eq!(file.poll(), Look::Same);
@@ -2581,11 +2554,9 @@ pub(crate) mod tests {
     #[test]
     fn a_take_past_its_window_publishes_nothing_and_follows_any_number() {
         let deadline = Duration::from_secs(1);
-        let bed = bed(LEAST_LOAD.as_bytes());
         let mut elector = election_under(deadline);
-        bed.generations.under(elector.fence());
-        SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
-            .expect("a file that runs");
+        let bed = bed_under(LEAST_LOAD.as_bytes(), elector.fence());
+        SpecFile::start(bed.path.clone(), Arc::clone(&bed.generations)).expect("a file that runs");
         let door = Arc::clone(&bed.generations);
         elector.at_take(move || door.at_take());
         let late = Instant::now()

@@ -358,7 +358,11 @@ fn a_pair_is_placed_over_the_generation_that_stands() {
 /// under `prefill` and its decode side under `decode`, with the decode
 /// picked `when`. The settings hold no word for when a pair's decode is
 /// picked: it is the document's own (`plans.pd-pair.decode`).
-fn picked(when: DecodePick, prefill: PolicySettings, decode: PolicySettings) -> PolicySpec {
+pub(crate) fn picked(
+    when: DecodePick,
+    prefill: PolicySettings,
+    decode: PolicySettings,
+) -> PolicySpec {
     let settings = RoutingSettings {
         mode: ModeSettings::PrefillDecode {
             prefill_policy: None,
@@ -374,7 +378,7 @@ fn picked(when: DecodePick, prefill: PolicySettings, decode: PolicySettings) -> 
 
 /// The program under `document` over `fleet`, with a route that sends a
 /// pair's decode behind its prefill's answer.
-fn in_turn(
+pub(crate) fn in_turn(
     document: &PolicySpec,
     fleet: &[Arc<dyn Worker>],
     sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
@@ -600,6 +604,8 @@ fn a_prefill_that_answered_in_turn_holds_the_request_no_more() {
 }
 
 /// A prefill that fails in turn sends no decode: its attempt is one send.
+/// The failure here is a 429: any status from 400 up is a prefill's
+/// failure, and a decode goes out behind none of them.
 /// The decode is counted from the placement, so it holds the request while
 /// the prefill runs, and no more once the attempt is over. The retry states
 /// both workers of the failed attempt as tried, so the prefill steps aside
@@ -621,7 +627,7 @@ fn a_prefill_that_fails_in_turn_sends_no_decode() {
     let sends = move |worker: &dyn Worker| {
         counts.lock().expect("no case panicked").push(one.load());
         if worker.url() == failing {
-            500
+            429
         } else {
             200
         }
@@ -646,13 +652,48 @@ fn a_prefill_that_fails_in_turn_sends_no_decode() {
     assert_eq!(fleet[2].load(), 0, "every guard ended with its attempt");
 }
 
+/// A retry in turn states its tried workers at its second ask too. One
+/// prefill and two decodes under the policy that takes the lighter worker:
+/// the first decode is idle and the second holds a request, so the first
+/// attempt goes to the first decode, which fails. The retry's second ask
+/// names the second decode, since the first was tried: an ask that stated
+/// no tried worker would take the lighter first one again.
+///
+/// The gateway states a request's tried workers again at its second ask
+/// (`RequestAgain`,
+/// `model_gateway/src/routers/grpc/sequential_pd.rs:702-710`).
+#[test]
+fn a_retry_in_turn_names_the_decode_it_did_not_try_at_its_second_ask() {
+    let fewest = PolicySettings::PowerOfTwo {
+        load_metric: LoadMetricSetting::LeastRequests,
+    };
+    let document = picked(DecodePick::AfterPrefill, PolicySettings::RoundRobin, fewest);
+    let fleet = fleet(1, 2);
+    fleet[2].increment_load();
+    let failing = decode(0);
+    let sends = move |worker: &dyn Worker| if worker.url() == failing { 502 } else { 200 };
+    let (program, _loads, _task) = in_turn(&document, &fleet, sends);
+    let answer = program.serve(&PLAIN);
+    assert_eq!(
+        answer,
+        Answer {
+            sent: vec![prefill(0), decode(0), prefill(0), decode(1)],
+            status: 200,
+            unplaced: None,
+        }
+    );
+}
+
 /// The engine hears a decode asked again at its ask, its send and its end:
 /// the prefill is issued alone and dispatched, the decode is issued at the
 /// second ask, ahead of the prefill's end, and dispatched where its send is
 /// said, behind that end. The guard the program made at the placement told
-/// the engine nothing. Under a document that books both sides at once, a
-/// prefill that fails leaves a decode that was never sent: the engine hears
-/// it given up.
+/// the engine nothing. An ask whose own decision places nobody, since the
+/// one decode is not ready then, is answered that decision's shed and
+/// issues nothing: the first decision's decode is sent, and the engine
+/// hears its send ahead of the prefill's end. Under a document that books
+/// both sides at once, a prefill that fails leaves a decode that was never
+/// sent: the engine hears it given up.
 ///
 /// The gateway's stages hear a pair sent prefill first in this order: its
 /// case `a_decode_decided_behind_its_prefill_is_heard_behind_the_prefills_answer`
@@ -673,19 +714,26 @@ async fn the_engine_hears_a_decode_asked_again_at_its_ask_its_send_and_its_end()
         profile.score.push(ScoreSpec::from("hears"));
         let spec = AppliedSpec::validate_in(&document, &stages, &[]);
         let spec = spec.expect("the stages hold the scorer");
+        let fleet = fleet(1, 1);
         let fails = Arc::new(AtomicBool::new(false));
+        // Whether the next prefill's send leaves the decode not ready.
+        let stalls = Arc::new(AtomicBool::new(false));
         let (next, went) = (Arc::clone(&fails), Arc::clone(&heard));
+        let (stalled, one) = (Arc::clone(&stalls), Arc::clone(&fleet[1]));
         let sends = move |worker: &dyn Worker| {
             let mut words = went.lock().expect("no case panicked");
             words.push("went out".to_owned());
             let prefill = *worker.worker_type() == WorkerType::Prefill;
+            if prefill && stalled.swap(false, Ordering::Relaxed) {
+                one.set_status(WorkerStatus::NotReady);
+            }
             if prefill && next.swap(false, Ordering::Relaxed) {
                 500
             } else {
                 200
             }
         };
-        let (program, _loads, task) = started_as(Plan::Pair, spec, &fleet(1, 1), sends);
+        let (program, _loads, task) = started_as(Plan::Pair, spec, &fleet, sends);
         let program = program.in_turn();
         #[expect(
             clippy::disallowed_methods,
@@ -721,6 +769,30 @@ async fn the_engine_hears_a_decode_asked_again_at_its_ask_its_send_and_its_end()
             ],
         };
         assert_eq!(taken(&heard), served, "picked {when:?}");
+
+        // A second ask that takes no decode: the decode is not ready behind
+        // the prefill's send, so its own decision at the ask places nobody.
+        // The ask is answered that decision's shed (`Unplaced::Shed`) and
+        // issues nothing: an ask that named a decode it could not send to
+        // (`Unplaced::NoWorkers`) would issue a side and give it up. The
+        // first decision's decode is sent, and its send is heard ahead of
+        // the prefill's end.
+        if matches!(when, DecodePick::AfterPrefill) {
+            stalls.store(true, Ordering::Relaxed);
+            assert_eq!(program.serve(&PLAIN).status, 200);
+            fleet[1].set_status(WorkerStatus::Ready);
+            let none_taken = [
+                "issued Prefill",
+                "dispatched Prefill",
+                "went out",
+                "issued Decode",
+                "dispatched Decode",
+                "completed Prefill 200 Ok",
+                "went out",
+                "completed Decode 200 Ok",
+            ];
+            assert_eq!(taken(&heard), none_taken, "an ask that took none");
+        }
 
         // A prefill that fails: no decode is sent in that attempt.
         fails.store(true, Ordering::Relaxed);

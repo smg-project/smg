@@ -8,7 +8,7 @@
 //! ([`InProcess::place`]): it keeps the placement to the request's end
 //! and says when the request went out and how it ended.
 //!
-//! `program.rs` is the program. This file runs it four times, over workers
+//! `program.rs` is the program. This file runs it six times, over workers
 //! that serve nothing: a send is a line on the output. The first run is over
 //! three single workers, one of which answers every send with a server
 //! error, so a request that meets it is asked again past it. The second is
@@ -18,7 +18,11 @@
 //! request lends the three lists, one that carries an item states it, and
 //! the call names the item's encoder too. The fourth is over a pair whose
 //! decode goes out behind its prefill's answer: the program asks the engine
-//! for the decode again, behind that answer.
+//! for the decode again, behind that answer. The fifth is under a policy
+//! that places a routing key by a ring: the program lends its own
+//! (`ring.rs`), and a key goes to the worker that ring puts it on. The
+//! sixth is over workers on two wires: a retry stays on the wire of the
+//! worker its request went to first.
 //!
 //! `engine_load.rs` is a stage of the program's own, a scorer added in
 //! code. This file shows it once over records made by hand, as a program
@@ -38,6 +42,7 @@
 use std::{error::Error, sync::Arc};
 
 use engine_load::{decided_by_engine_load, stages};
+use http::{HeaderMap, HeaderValue};
 use program::{encode_settings, pair_settings, settings, Asked, Plan, Program};
 use smg_grand_central::{
     document::{AppliedSpec, DecodePick, PolicySettings, PolicySpec},
@@ -48,11 +53,12 @@ use smg_grand_central::{
 use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
     model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerStatus, WorkerType},
+    worker::{ConnectionMode, HealthCheckConfig, WorkerStatus, WorkerType},
 };
 
 mod engine_load;
 mod program;
+mod ring;
 
 /// The model the example's workers serve.
 const MODEL: &str = "model-a";
@@ -60,9 +66,9 @@ const MODEL: &str = "model-a";
 /// The worker that answers every send with a server error.
 const FAILING: &str = "http://worker-1:8000";
 
-/// A ready worker of `kind` at `address` that serves [`MODEL`], with no
-/// health checker behind it.
-fn worker(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
+/// A ready worker of `kind` at `address` that serves [`MODEL`], dialed over
+/// `transport`, with no health checker behind it.
+fn dialed(address: &str, kind: WorkerType, transport: ConnectionMode) -> Arc<dyn Worker> {
     let health = HealthCheckConfig {
         disable_health_check: true,
         ..HealthCheckConfig::default()
@@ -70,10 +76,16 @@ fn worker(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
     let worker = <BasicWorkerBuilder>::new(address)
         .model(ModelCard::new(MODEL))
         .worker_type(kind)
+        .connection_mode(transport)
         .health_config(health)
         .build();
     worker.set_status(WorkerStatus::Ready);
     Arc::new(worker)
+}
+
+/// [`dialed`] over HTTP.
+fn worker(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
+    dialed(address, kind, ConnectionMode::Http)
 }
 
 /// The example's network: a send is a line on the output.
@@ -171,6 +183,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     pairs(&asked).await?;
     encodes(&asked).await?;
     in_turn(&asked).await?;
+    by_ring().await?;
+    on_one_wire(&asked).await?;
     own_stage()
 }
 
@@ -278,6 +292,84 @@ async fn in_turn(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
     tokio::task::yield_now().await;
     for request in 1..=2 {
         println!("a pair's request {request}, sent in turn:");
+        let answer = program.serve(asked);
+        println!("  the client reads {}", answer.status);
+    }
+    Ok(())
+}
+
+/// The program under `consistent_hashing` over three single workers, none
+/// of them [`FAILING`], each request under a routing key its header names.
+/// The program lends its own ring with the request, so a key's requests go
+/// to the worker that ring puts the key on: the first of the ring's walk
+/// from where the key stands. No send fails here, so no request walks on.
+async fn by_ring() -> Result<(), Box<dyn Error>> {
+    let settings = settings(PolicySettings::ConsistentHashing);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let addresses = [
+        "http://worker-0:8000",
+        "http://worker-2:8000",
+        "http://worker-3:8000",
+    ];
+    for address in addresses {
+        let single = worker(address, WorkerType::Regular);
+        assert!(program.join(single), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    for key in ["session-a", "session-b"] {
+        let lists = program.published(MODEL).ok_or("the model's generation")?;
+        let walk: Vec<&str> = lists.ring().walked(key).collect();
+        println!("the routing key {key}, whose walk of the program's ring is {walk:?}:");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", HeaderValue::from_static(key));
+        let asked = Asked {
+            model: MODEL,
+            headers: Some(&headers),
+            items: &[],
+        };
+        for _ in 0..2 {
+            let answer = program.serve(&asked);
+            println!("  the client reads {}", answer.status);
+        }
+    }
+    Ok(())
+}
+
+/// The program over single workers on two wires: two dialed over gRPC, one
+/// of which answers every send with a server error, and one over HTTP. A
+/// retry stays on the wire of the worker its request went to first, since
+/// the request a route keeps for a retry was built for that wire. So a
+/// request that meets the failing worker is asked again at the other
+/// worker over gRPC, and not at the one over HTTP, whose turn it is.
+async fn on_one_wire(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let settings = settings(PolicySettings::RoundRobin);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let fleet = [
+        (FAILING, ConnectionMode::Grpc),
+        ("http://worker-4:8000", ConnectionMode::Http),
+        ("http://worker-5:8000", ConnectionMode::Grpc),
+    ];
+    for (address, transport) in fleet {
+        let single = dialed(address, WorkerType::Regular, transport);
+        assert!(program.join(single), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    for request in 1..=3 {
+        println!("request {request}, over two wires:");
         let answer = program.serve(asked);
         println!("  the client reads {}", answer.status);
     }

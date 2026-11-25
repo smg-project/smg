@@ -21,9 +21,9 @@ use super::{Loaded, SpecHandle};
 use crate::{
     document::spec::{AppliedSpec, BindingSpec, Match, PolicySpec},
     engine::{
-        decision::{Target, Targets},
-        decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
-        framework::{Picker, TieBand},
+        decision::{Decision, Target, Targets},
+        decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},
+        framework::{EncodeItems, EncodePlaced, Picker, TieBand},
         in_process::{
             membership::tests::{handed, id, registry, remove},
             single::tests::{
@@ -34,6 +34,7 @@ use crate::{
         },
         list_cell::PublishedList,
         prompt_hashes::HashSeeds,
+        shadow::Shadowed,
         view::{Candidate, RequestFacts, WorkerId},
     },
     policies::random::Random,
@@ -54,6 +55,51 @@ impl InProcess {
     /// It is never freed.
     pub(crate) fn standing_spec(&self) -> &'static AppliedSpec {
         &self.loaded().document.spec
+    }
+
+    /// [`Loaded::decide_without_lease`] under the document in force, for a
+    /// case of an engine by itself: no world hands it a document.
+    pub(crate) fn decide_without_lease(
+        &self,
+        maker: &impl RequestMaker,
+        now: Instant,
+    ) -> Result<(Decision, Option<Shadowed>), DecisionRefused> {
+        let document = self.in_force();
+        self.under(&document).decide_without_lease(maker, now)
+    }
+
+    /// [`Loaded::decide_decode_without_lease`] under the document in
+    /// force, for a case of an engine by itself.
+    pub(crate) fn decide_decode_without_lease(
+        &self,
+        maker: &impl RequestMaker,
+        held: &Target,
+        now: Instant,
+    ) -> Result<Decision, DecisionRefused> {
+        let document = self.in_force();
+        self.under(&document)
+            .decide_decode_without_lease(maker, held, now)
+    }
+
+    /// [`Loaded::decide_encode_without_lease`] under the document in
+    /// force, for a case of an engine by itself.
+    pub(crate) fn decide_encode_without_lease(
+        &self,
+        maker: &impl RequestMaker,
+        items: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+        now: Instant,
+    ) -> Result<Decision, DecisionRefused> {
+        let document = self.in_force();
+        self.under(&document)
+            .decide_encode_without_lease(maker, items, placed, now)
+    }
+
+    /// [`Loaded::count_shadow`] under the document in force, for a case of
+    /// an engine by itself.
+    pub(crate) fn count_shadow(&self, said: Option<Shadowed>) {
+        let document = self.in_force();
+        self.under(&document).count_shadow(said);
     }
 }
 

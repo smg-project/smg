@@ -63,7 +63,7 @@ impl PromptEntry for PlacementInputs<'_> {
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
         let (tokens, marker) =
             CacheNamespace::keyed_tokens(self.cache_namespace, self.tokens?, page);
-        Some(TokenKey { tokens, marker })
+        Some(TokenKey::of(tokens, marker))
     }
 
     fn text_key(&self) -> Option<TextKey<'_>> {
@@ -71,7 +71,7 @@ impl PromptEntry for PlacementInputs<'_> {
             return None;
         }
         let (text, marker) = CacheNamespace::keyed_text(self.cache_namespace, self.text?);
-        Some(TextKey { text, marker })
+        Some(TextKey::of(text, marker))
     }
 }
 

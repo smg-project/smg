@@ -22,7 +22,11 @@
 //! (`caller/pair.rs`), and an encode request, whose items go to encoders
 //! ahead of its pair (`caller/encode.rs`). The example's own stage
 //! (`examples/in_process/engine_load.rs`) is taken in beside the program,
-//! and its cases decide over records made by hand (`caller/stage.rs`).
+//! and its cases decide over records made by hand (`caller/stage.rs`). The
+//! program's own ring (`examples/in_process/ring.rs`) is taken in too: its
+//! cases read the ring a generation holds and expect the sends its walk
+//! says (`caller/lent_ring.rs`). The wire a retry stays on has its cases
+//! beside them (`caller/demand.rs`).
 //!
 //! [`InProcess::place`]: smg_grand_central::engine::InProcess::place
 
@@ -34,14 +38,20 @@ use program::{encode_settings, pair_settings, settings, Plan, Program};
 use smg_grand_central::document::{AppliedSpec, PolicySettings, RoutingSettings};
 use smg_worker::{identity::basic::Worker, load::state::TestFeed, test_support::ready_worker};
 
+#[path = "caller/demand.rs"]
+mod demand;
 #[path = "caller/encode.rs"]
 mod encode;
 #[path = "../examples/in_process/engine_load.rs"]
 mod engine_load;
+#[path = "caller/lent_ring.rs"]
+mod lent_ring;
 #[path = "caller/pair.rs"]
 mod pair;
 #[path = "../examples/in_process/program.rs"]
 mod program;
+#[path = "../examples/in_process/ring.rs"]
+mod ring;
 #[path = "caller/single.rs"]
 mod single;
 #[path = "caller/stage.rs"]
