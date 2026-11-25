@@ -390,11 +390,11 @@ one of them.
 
 A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). Either form is read into values first, and the document is built from those values by one typed read.
 
-So a YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map must stand, and reads as a key left out where the field may be null, as each block of a binding may, a list item with nothing in it is refused in a list of the spec's own, and a tag is refused.
+So a YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map must stand, a list item with nothing in it is refused in a list of the spec's own, and a tag is refused. A key with nothing under it reads as a key left out where the field may be null, as a binding's `overload`, `routing_key`, `sessions`, `shadow`, `canary` and `admission` may.
 
 A number reads one way in both forms and in every build: a whole number of 64 bits as itself, and any other as the nearest double. The crate's manifest asks the JSON library for its exact reading (`float_roundtrip`). A field of single precision takes the number by a cast, so one that rounds past the largest single reads as infinite there and the spec's check refuses it by its field.
 
-A key written twice is refused by name in both forms. Three numbers read apart, by the forms' own rules: a zero written `-0`, a number past a double, and a YAML whole number in hex, octal or binary. A field's refusal names it by its path, and a file that does not read is refused by its line and column. A document past 128 KiB (`MAX_DOCUMENT_BYTES`) is refused by its size, unread.
+A key written twice is refused by name in both forms. Three numbers read apart, by the forms' own rules: a zero written `-0`, a number past a double, and a YAML whole number in hex, octal or binary. A field that the typed read refuses is named by its path. A document that does not read into values is refused in the words of its form's reader, with a line and column where the reader has them. A document past 128 KiB (`MAX_DOCUMENT_BYTES`) is refused by its size, unread.
 
 ### 3.5 The stage interfaces
 
@@ -1212,6 +1212,10 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    Where no worker of the list is eligible, the request takes the full path.
 2. If no stage of the document needs lease events, that is all. No request is built, no clock is
    read, no lease exists, and the host owes the engine nothing more.
+
+   Under a document that keeps a sample (decision 7) the engine asks the maker the request's id
+   behind the pick, which a maker that holds the id answers with no request made, and reads the
+   clock for a place it keeps.
 
 **The full path**, in logical order (the code interleaves some steps to save work):
 
@@ -2327,6 +2331,12 @@ request ──> route (HTTP or gRPC, any family)
 - **Each request.** Three of the four functions ask the engine. They fill `PlaceRequest` from the inputs
   they already take. A route names the answer's type and makes its load guard from the answer, in the places it made one before.
 
+  The gateway observes classic's match ratio series from a placement that states what share of the
+  request's blocks its worker holds (`Placement::overlap`): once for a single request, and once for
+  a pair, of its prefill. A pick states that share only where its own profile reads who holds the
+  prompt, whatever the profile's name. Classic observes a `cache_aware` selection that it decides by
+  events or in a tree, so both sides of a pair where both run that policy.
+
   Where the engine places no worker for a request, the gateway names the client's answer itself,
   by classic's own judgement of the pool. The engine's word for the refusal goes to a log line
   and no further: at `debug`, or at `warn` where the engine refused the decision itself. One word
@@ -2631,7 +2641,10 @@ breaker and its stalled bit on the worker object, and the count of requests in f
 the store steps for each lease on file. A record made of a worker object states one protocol and
 no zone.
 The asking gateway's reach, its wires and its standing vetoes are stated to the engine as places of
-the list. The store keeps one engine object for its life and puts each document it applies in force
+the list. Where the gateway dials a worker of that list, and its frame hints a subset of 0 or states
+wires that no worker the gateway dials shares, the controller sheds the frame itself, with no
+endpoint under `subset-hint` or `wires`, and the engine is asked for no decision.
+The store keeps one engine object for its life and puts each document it applies in force
 on it, by `InProcess::apply`, the call of a host that keeps one engine (section 8.1, step 6). The
 session pins, the record of sent
 prompts and the stages of a profile whose name and text did not change stand, with what they hold,
