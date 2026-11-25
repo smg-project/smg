@@ -831,12 +831,12 @@ fn validate_chat_parts(
              media parts are taken in user and tool messages"
         )
     };
-    // The kind and the role of the first media part in a system, developer
-    // or root message, and three sets of modalities, a bit each: those of
-    // such parts, those the messages walked carry, and those two messages
-    // carry.
-    let mut left_to_caller = None;
-    let (mut left_modalities, mut carried, mut shared) = (0_u8, 0_u8, 0_u8);
+    // The first media part of each modality in a system, developer or root
+    // message, in message order: its kind, its role and its modality's bit.
+    // And two sets of modalities, a bit each: those the messages walked
+    // carry, and those two messages carry.
+    let mut left: Vec<(&str, &str, u8)> = Vec::new();
+    let (mut carried, mut shared) = (0_u8, 0_u8);
     for message in messages {
         let content = match message {
             ChatMessage::System { content, .. }
@@ -899,8 +899,9 @@ fn validate_chat_parts(
                                 if assistant || template_request.is_none() {
                                     return Err(refusal(kind, role));
                                 }
-                                left_to_caller = left_to_caller.or(Some((kind, role)));
-                                left_modalities |= bit;
+                                if left.iter().all(|&(_, _, seen)| seen != bit) {
+                                    left.push((kind, role, bit));
+                                }
                             }
                             in_message |= bit;
                         }
@@ -911,11 +912,12 @@ fn validate_chat_parts(
         shared |= carried & in_message;
         carried |= in_message;
     }
-    match left_to_caller {
-        Some((kind, role)) if left_modalities & shared != 0 => Err(refusal(kind, role)),
-        Some((kind, role)) => Ok(Some(refusal(kind, role))),
-        None => Ok(None),
+    // The refusal names the first such part another message's part stands
+    // beside; with none, the first such part is left to the caller.
+    if let Some(&(kind, role, _)) = left.iter().find(|&&(_, _, bit)| shared & bit != 0) {
+        return Err(refusal(kind, role));
     }
+    Ok(left.first().map(|&(kind, role, _)| refusal(kind, role)))
 }
 
 /// The wire name (`type`) and the modality of a media content part; `None`

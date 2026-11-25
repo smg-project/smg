@@ -163,6 +163,21 @@ fn a_media_part_outside_user_and_tool_messages_is_refused_or_left_to_the_caller(
         validate_chat_template_content_parts(&mixed),
         Ok(Some(_))
     ));
+    // The refusal names the part another message's part stands beside, not
+    // an earlier part of another modality, which alone is left to the caller.
+    let named = request(json!([
+        {"role": "system", "content": [audio]},
+        {"role": "developer", "content": [image]},
+        {"role": "user", "content": [image]}
+    ]));
+    assert_eq!(
+        validate_chat_template_content_parts(&named),
+        Err(
+            "Unsupported chat content part type \"image_url\" in a developer message for \
+             gRPC backends: media parts are taken in user and tool messages"
+                .to_string()
+        )
+    );
     let taken = request(json!([
         {"role": "system", "content": [{"type": "text", "text": "you see"}]},
         {"role": "user", "content": [image]},
