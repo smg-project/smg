@@ -148,6 +148,10 @@ impl<G: Generation> Objects<G> {
             return self.moved(store, &row.facts.key, change);
         }
         self.put(store, row, built);
+        // The old life left with this write: the keeper forgets its row.
+        if let MembershipChange::Replaced { old, .. } = change {
+            self.forget_one(self.keeper_clock(), old);
+        }
         // The object's status leads. One laid in another's place took the
         // standing object's there, and the table is told it. A new object
         // is built in the status its row starts in.
@@ -172,6 +176,7 @@ impl<G: Generation> Objects<G> {
         if !store.follow_objects(change, None, Some(row.revision)) {
             return self.moved(store, &row.facts.key, change);
         }
+        self.forget_one(self.keeper_clock(), row.id);
         Some(change)
     }
 
@@ -323,16 +328,18 @@ pub(super) mod tests {
             self.objects.registry().get_id_by_url(url)
         }
 
-        /// The row under `url` where the journal's last word, the table and
-        /// the object agree on it, each fact and the status. No follow is
-        /// run: the holder's place stands behind the store.
+        /// The row under `url` where the journal's last word, the object
+        /// and the table agree on it, each fact and the status. The journal
+        /// is told the row the write handed, which the object read back
+        /// states, and the table takes it. No follow is run: the holder's
+        /// place stands behind the store.
         pub(crate) fn one_row(&self, url: &str) -> WorkerRow {
             let (_, told, _) = self.last();
             let table = self.store.by_key(url).expect("the table holds the row");
             let object = self.object(url).expect("the object stands with no follow");
             let read = self.objects.row_of(&object).expect("the object's row");
-            assert_eq!(told.as_ref(), Some(&table), "the journal against the table");
-            assert_eq!(read, table, "the object against the table");
+            assert_eq!(told.as_ref(), Some(&read), "the journal against the object");
+            assert_eq!(table, read, "the table against the object");
             let end = Some(self.store.epoch());
             assert_ne!(self.objects.read_to(), end, "no follow laid it");
             table
@@ -630,7 +637,9 @@ pub(super) mod tests {
     /// tells the journal nothing. The registry holds what the other writer
     /// left under the key when the write answers, with no follow: the row
     /// whose object a removal took out has one anew, and where that writer
-    /// left the key's next life, the old life's object is gone.
+    /// left the key's next life, the old life's object is gone. A row that
+    /// writer moved in place is laid in its object's place: the object
+    /// keeps its id in the registry.
     #[test]
     fn a_write_over_a_row_another_writer_moved_is_refused_and_reads_it() {
         type Write = fn(&Replica, WorkerRow) -> Option<MembershipChange>;
@@ -687,7 +696,8 @@ pub(super) mod tests {
                 replica.upsert(facts(1, "gold")).expect("registered");
                 // The holder's read, in its turn: the row off the object.
                 let turn = objects.read_to.lock();
-                let read = replica.object(A).and_then(|object| objects.row_of(&object));
+                let stood = replica.object(A);
+                let read = stood.as_ref().and_then(|object| objects.row_of(object));
                 let read = read.expect("the row read");
                 other(store, &read);
                 let told = replica.told.0.lock().len();
@@ -702,6 +712,11 @@ pub(super) mod tests {
                 let laid = objects.row_of(&object);
                 assert_eq!(laid, Some(left), "{what}, {how}: the registry");
                 assert_eq!(objects.len(), 1, "{what}, {how}: the key's one object");
+                // In place, but behind a removal: it took the object out
+                // ahead of the store's word.
+                if how == "moved in place" && what != "a removal" {
+                    assert_eq!(Some(object), stood, "{what}, {how}: in its place");
+                }
             }
         }
     }

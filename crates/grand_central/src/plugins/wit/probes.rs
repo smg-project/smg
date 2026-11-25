@@ -100,6 +100,9 @@ wit! {
     // Host-only: the ring a caller lends names its workers by address,
     // and a guest is shown rows.
     Option<&dyn LentRing> => "host-only",
+    // Host-only: a pair's decode side's own places on that ring stay
+    // with the ring, in process.
+    Option<&[u64]> => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that
@@ -215,12 +218,12 @@ pub(crate) fn all() -> Vec<Probe> {
             budget_micros, headers, media, seed, block_size, prompt_chars, prompt_bytes, now_micros,
             session_counted, affinity, named,
             model_fingerprint, signal_cells, client_key, ring, ring_positions,
-            session_key_from_rid,
+            decode_ring_positions, session_key_from_rid,
         } host [
             prompt_chars, prompt_bytes, now_micros,
             session_counted,
             affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions,
-            session_key_from_rid
+            decode_ring_positions, session_key_from_rid
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),

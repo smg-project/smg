@@ -1716,6 +1716,55 @@ fn test_evict_by_size_shared_budget_lru_tenants() {
     }
 }
 
+/// A size pass that waits below a node holds no shard of the root's child
+/// map. The tree is the root, a node `P` and its child `C`, one page each,
+/// under one tenant. The test holds the write guard of `P`'s stamp map,
+/// which the collection reads before it leaves `P`. A further handle of `C`
+/// says the collection has passed the root's children, and the held guard
+/// keeps it below the root through the probe: there a writer must find the
+/// root's edge to `P` free, as an insert under the root takes that shard. A
+/// walk that asks a child under the guard that names it kept the shard for
+/// as long as it was below. Once the guard is released the pass queues `C`
+/// alone: `P` holds the tenant above a child that holds it too.
+#[test]
+fn a_collection_that_waits_below_the_root_leaves_its_edges_free() {
+    let tree = TokenTree::new();
+    let prompt = make_tokens(1, 2);
+    tree.insert_tokens(&prompt[..PAGE_SIZE], "tenant1");
+    tree.insert_tokens(&prompt, "tenant1");
+    let (edge, parent) = {
+        let first = tree.root.children.iter().next().unwrap();
+        (*first.key(), Arc::clone(first.value()))
+    };
+    let child = Arc::clone(parent.children.iter().next().unwrap().value());
+    let handles = Arc::strong_count(&child);
+    let until = Instant::now() + Duration::from_secs(60);
+
+    let (reached, free, leaves) = thread::scope(|scope| {
+        let held = parent.tenant_last_access_time.get_mut("tenant1").unwrap();
+        let collector = scope.spawn(|| {
+            let mut leaves = Vec::new();
+            tree.collect_all_tenant_leaves(&tree.root, &mut leaves);
+            leaves
+        });
+        while Arc::strong_count(&child) == handles && Instant::now() < until {
+            thread::yield_now();
+        }
+        let reached = Arc::strong_count(&child) > handles;
+        let free = !tree.root.children.try_get_mut(&edge).is_locked();
+        drop(held);
+        (reached, free, collector.join().unwrap())
+    });
+
+    assert!(reached, "the collection never reached the child");
+    assert!(
+        free,
+        "the root's edge stayed locked while the collection waited below it"
+    );
+    assert_eq!(leaves.len(), 1);
+    assert!(Arc::ptr_eq(&leaves[0].0, &child) && leaves[0].1.as_ref() == "tenant1");
+}
+
 #[test]
 fn test_evict_by_size_under_budget_is_noop() {
     let tree = TokenTree::new();

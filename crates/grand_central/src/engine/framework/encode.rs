@@ -47,7 +47,7 @@
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
     run_profile, shed, Buffers, ClassBits, Engine, PairPools, Plan, Profile, Scratch, Set,
-    AFFINITY_COLUMN,
+    ShedOver, AFFINITY_COLUMN,
 };
 use crate::{
     engine::{
@@ -222,9 +222,6 @@ impl EncodeItems<'_> {
 pub struct EncodePlaced {
     encoders: Vec<Target>,
     one: bool,
-    /// Whether the decision shed the request as saturated over its
-    /// encoders ([`Self::shed_over_encoders`]).
-    shed_over_encoders: bool,
 }
 
 impl EncodePlaced {
@@ -248,29 +245,10 @@ impl EncodePlaced {
         self.one
     }
 
-    /// Whether the decision shed the request as saturated over its
-    /// encoders: the overload veto left none of the encoders that take the
-    /// request, and the pair was not decided. No other answer says so, a
-    /// shed made over one of the pair's own lists neither. The engine's
-    /// one placement call reads it: a route's rule is asked of no encoder,
-    /// so such a shed stands and no rule is asked behind it.
-    #[cfg_attr(
-        not(feature = "in-process"),
-        expect(
-            dead_code,
-            reason = "the one reader is the engine over worker lists, built under `in-process`"
-        )
-    )]
-    pub(crate) fn shed_over_encoders(&self) -> bool {
-        self.shed_over_encoders
-    }
-
-    /// Empties the list and keeps its room, and takes back what the last
-    /// decision said of its shed.
+    /// Empties the list and keeps its room.
     pub(crate) fn clear(&mut self) {
         self.encoders.clear();
         self.one = false;
-        self.shed_over_encoders = false;
     }
 
     /// The room for the encoders an answer read from a link names, with
@@ -891,6 +869,9 @@ impl Engine {
         placed: &mut EncodePlaced,
     ) -> Decision {
         placed.clear();
+        // The word of the list a shed is made over is this decision's: one
+        // an earlier decision left goes here ([`Scratch::shed_over`]).
+        scratch.shed_over = None;
         // The encode side's buffers leave the scratch for the decision: the
         // pair entry takes the scratch whole while they hold its pools.
         let mut side = scratch.encode.take().unwrap_or_default();
@@ -899,11 +880,8 @@ impl Engine {
             placed,
         );
         scratch.encode = Some(side);
-        // A decision that is no pick names no encoder. What the pass said
-        // of its shed stays for the decision's caller.
         if decision.pick().is_none() {
-            placed.encoders.clear();
-            placed.one = false;
+            placed.clear();
         }
         decision
     }
@@ -1020,9 +998,11 @@ impl Engine {
             // value's, or its prompt's heads': no item is placed by them.
             // A key's run is stated the key's own place, on the ring lent
             // for the items, where that run is made below. The passes
-            // over the encoders ahead of it read no ring.
+            // over the encoders ahead of it read no ring. The decode
+            // side's own places are that side's alone.
             ring: None,
             ring_positions: &[],
+            decode_ring_positions: None,
             // The word says how the request's own key came. An item's key
             // is its content's, whatever handed the request's: it leads
             // the item under every form of the ring.
@@ -1113,7 +1093,7 @@ impl Engine {
                 if let Some(stage) = saturated {
                     // The pair is not decided, and the decision says so to
                     // its caller.
-                    placed.shed_over_encoders = true;
+                    scratch.shed_over = Some(ShedOver::Encoders);
                     return turned_away(ShedReason::Saturated, stage, bare);
                 }
                 return gap(encode_gap(&encode, &wanted, any_member));
@@ -1301,6 +1281,19 @@ impl Engine {
         // twice.
         let mut pair = self.decide_pair(facts, pool, admitted, cx, decode_cx, scratch);
         let Decision::Pick(pick) = &mut pair else {
+            // The pair's decision judged the rows it was handed. Where
+            // either list is a part of the one the request's caller lent,
+            // its word goes, whichever list it names. A word of the
+            // list that was cut was counted over the part. A word of the
+            // prefills counts the prefills that pair with a decode the
+            // decision was handed, and a cut of the decodes changes which
+            // those are. A word of the decodes behind a cut of the
+            // prefills alone was counted over the whole decode list, and
+            // goes too: the call's routine holds the rule's prefills to
+            // no part.
+            if !every_prefill || !every_decode {
+                scratch.shed_over = None;
+            }
             return pair;
         };
         if !every_prefill || !every_decode {

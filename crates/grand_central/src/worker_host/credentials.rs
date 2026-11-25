@@ -55,6 +55,9 @@ use crate::{engine::view::WorkerId, store::WorkerFacts};
 ///
 /// The holder forgets by itself. Each of its reads of the store drops the
 /// rows it finds gone from the keeper, and an entry goes with its last row.
+/// A write of the holder's own that takes a row out drops that row, and
+/// the lay-again an answer asks for drops each bound row that holds no
+/// object. Neither reads the store.
 /// The holder reads the keeper's clock ahead of the store: a row bound
 /// behind that read may have been written behind it, and stays. Once the
 /// clock is past the last forgetting, the next read forgets again whatever

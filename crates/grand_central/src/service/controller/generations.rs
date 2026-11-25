@@ -77,9 +77,9 @@ use crate::{
     document::{
         operator::{
             above, over_bound, Checked, DocumentManager, DryRun, EnforceOutcome, EnforceRefused,
-            Held, Line,
+            Entered, Held, Line,
         },
-        spec::{AppliedSpec, Digest, OverloadSwitch},
+        spec::{AppliedSpec, Digest, OverloadSwitch, PolicySpec, SpecError},
     },
     service::{elector::Fence, proto},
     stages::registry::StageRegistry,
@@ -203,48 +203,102 @@ impl Deref for Generations {
     }
 }
 
+/// Why a controller's document says the overload switch once, behind the
+/// word the first binding says: the reason of [`one_switch`]'s refusal.
+macro_rules! one_word {
+    ($first:literal) => {
+        concat!(
+            "the ",
+            $first,
+            " bindings[0] says, by its block or the block's default: a controller builds its \
+             workers with one default set of overload thresholds, so the bindings of its \
+             document say one word"
+        )
+    };
+}
+
+/// A controller's pass of a document: the stock pass, then one word of the
+/// overload switch. A controller builds its workers with one default set
+/// of overload thresholds, so the bindings of its document say the switch
+/// once. A document whose bindings differ is refused by the path of the
+/// first binding that differs from the first, with its value
+/// ([`OverloadSwitch::differs`]), as a gateway refuses it at its start.
+/// Every pass of the door runs this: a source's hand, a dry run, a
+/// rollback, a spec store's bind, and a leader's generation that a standby
+/// follows.
+fn one_switch(
+    document: &PolicySpec,
+    digest: Digest,
+    catalog: &StageRegistry,
+    denied_headers: &[&str],
+) -> Result<AppliedSpec, SpecError> {
+    let applied = AppliedSpec::validate_digested(document, digest, catalog, denied_headers)?;
+    let Some((at, says)) = OverloadSwitch::differs(&document.bindings) else {
+        return Ok(applied);
+    };
+    let reason = if says {
+        one_word!("false")
+    } else {
+        one_word!("true")
+    };
+    Err(SpecError::BadField {
+        path: format!("bindings[{at}].overload.enabled"),
+        value: says.to_string(),
+        reason,
+    })
+}
+
+/// The hook of a controller's door ([`DocumentManager::telling`]): it
+/// states the overload switch that stands in the store on `holder`
+/// ([`Objects::state_overload_switch`]): on where every binding leaves it
+/// on, off where every binding switches it off. The door's pass refuses
+/// bindings that differ. A document of such bindings that stands past the
+/// pass keeps the default on, as the unbound start does.
+///
+/// An object the word lays again took its standing object's status, and
+/// the holder settles that status with the table's behind each lay, under
+/// the replica's own word of its lead, read by `fence` as the door reads it
+/// ([`Generations::lead`]): a leader's table is told the object's status,
+/// and a replica that does not lead writes no row.
+fn states_on(holder: Arc<Objects<Members>>, fence: Arc<OnceLock<Arc<Fence>>>) -> Entered {
+    Box::new(move |store: &MemoryStore| {
+        let switch = store.with_snapshot(|world| world.spec().overload_switch());
+        let leads = || lead_under(&fence).is_some();
+        holder.state_overload_switch(store, switch != OverloadSwitch::Off, &leads);
+    })
+}
+
 impl Generations {
-    /// The door of a replica that keeps worker objects. Each generation
-    /// that enters states its overload switch on `holder`, the word that
-    /// stands in `store` by then ([`Objects::state_overload_switch`]): on
-    /// where every binding leaves it on and where the bindings differ, off
-    /// where every binding switches it off. The door's hook does it, once
-    /// a generation, behind the store's entry and outside the document
-    /// lock ([`DocumentManager::enter`]). It runs under the door's lock,
-    /// which comes ahead of the holder's turn: the holder says the order
-    /// of the locks once, at its turn ([`Objects`]). So an apply returns
-    /// behind the rows its word changed, and two entries in a row leave
-    /// the rows of the last word. A panic inside the hook leaves the
-    /// generation in force and the rows it had not laid under the old
-    /// word. A document that a host applies through the store's own entry
-    /// passes no door, and no word is stated for it.
-    ///
-    /// An object the word lays again took its standing object's status,
-    /// and the holder settles that status with the table's behind each
-    /// lay, under this replica's own word of its lead
-    /// ([`Generations::lead`]): a leader's table is told the object's
-    /// status, and a replica that does not lead writes no row.
+    /// The door of a replica that keeps worker objects. Its pass refuses a
+    /// document whose bindings differ on the overload switch
+    /// ([`one_switch`]). Each generation that enters states its overload
+    /// switch on `holder` ([`states_on`]). The door's hook does it, once a
+    /// generation, behind the store's entry and outside the document lock
+    /// ([`DocumentManager::enter`]). It runs under the door's lock, which
+    /// comes ahead of the holder's turn: the holder says the order of the
+    /// locks once, at its turn ([`Objects`]). So an apply returns behind
+    /// the rows its word changed, and two entries in a row leave the rows
+    /// of the last word. A panic inside the hook leaves the generation in
+    /// force and the rows it had not laid under the old word. A document
+    /// that a host applies through the store's own entry passes no door,
+    /// and no word is stated for it.
     pub(crate) fn stating(
         store: Arc<MemoryStore>,
         catalog: Arc<StageRegistry>,
         holder: Arc<Objects<Members>>,
     ) -> Self {
         let fence = Arc::new(OnceLock::new());
-        let under = Arc::clone(&fence);
-        let entered = move |store: &MemoryStore| {
-            let switch = store.with_snapshot(|world| world.spec().overload_switch());
-            let leads = || lead_under(&under).is_some();
-            holder.state_overload_switch(store, switch != OverloadSwitch::Off, &leads);
-        };
-        let door = DocumentManager::new(store, catalog, Vec::new()).telling(Box::new(entered));
-        Self::over(door, fence)
+        let door = DocumentManager::validating(store, catalog, Vec::new(), one_switch);
+        let entered = states_on(holder, Arc::clone(&fence));
+        Self::over(door.telling(entered), fence)
     }
 
-    /// A door that states nothing on a holder, for a case.
+    /// A door with a controller's pass that states nothing on a holder, for
+    /// a case.
     #[cfg(test)]
     pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<StageRegistry>) -> Self {
         Self::over(
-            DocumentManager::new(store, catalog, Vec::new()),
+            DocumentManager::validating(store, catalog, Vec::new(), one_switch),
             Arc::default(),
         )
     }
@@ -999,13 +1053,10 @@ pub(crate) mod tests {
         bound_to, faulting, long_text_under_aliases, padded, with_line, LEAST_LOAD, RANDOM,
     };
     use crate::{
-        document::{
-            operator::{
-                needs_rows,
-                test_support::{document_of, standing, stock},
-                ApplyCounts, NotHeld, OnFile,
-            },
-            spec::{PolicySpec, SpecError},
+        document::operator::{
+            needs_rows,
+            test_support::{document_of, standing, stock},
+            ApplyCounts, NotHeld, OnFile,
         },
         engine::view::WorkerId,
         service::{
@@ -2003,6 +2054,27 @@ pub(crate) mod tests {
         assert_eq!(generations.apply_counts(), applied(3, 0));
     }
 
+    /// A rollback to a generation on file whose bindings differ on the
+    /// overload switch is refused in the refusal's words, and the standing
+    /// generation stays. An older build wrote that generation: this
+    /// build's bind lists it by its digest and passes the newest alone.
+    #[test]
+    fn a_rollback_to_a_generation_whose_bindings_differ_on_the_overload_switch_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let older = switched(Some(false), None);
+        std::fs::write(dir.path().join(name_of(1, "yaml")), older).expect("the older build's");
+        std::fs::write(dir.path().join(name_of(2, "yaml")), RANDOM).expect("the newest");
+        let (store, generations) = generations();
+        bind(&generations, dir.path());
+        let own = standing(&store);
+        assert_eq!(own.0, 2);
+
+        let refused = roll_back(&generations, 1).expect_err("its bindings differ");
+        assert_eq!(refused.to_string(), DIFFERS);
+        assert_eq!(standing(&store), own, "the standing generation stays");
+        assert_eq!(names(dir.path()).len(), 2, "no file is written");
+    }
+
     /// The read call answers a generation on file by its number, with the
     /// digest it ran under and its file's time, while the door's lock is
     /// held: it waits on no apply. A generation that is not on file is not
@@ -2218,6 +2290,73 @@ pub(crate) mod tests {
         told.document = push(LEAST_LOAD, "yaml");
         followed(&standby, &told).expect("above its own");
         assert_eq!(standing(&store).0, 2);
+    }
+
+    /// The words a controller refuses bindings that differ on the overload
+    /// switch in: here the second binding says on, by the block's default,
+    /// where the first says off.
+    const DIFFERS: &str = "bindings[1].overload.enabled = true is not the false bindings[0] says, by its block or the block's default: a controller builds its workers with one default set of overload thresholds, so the bindings of its document say one word";
+
+    /// A controller's door refuses a document whose bindings differ on the
+    /// overload switch, by the path of the first binding that differs and
+    /// in the words a start ends on. An apply leaves the standing
+    /// generation, and a dry run answers what the apply would. Bindings
+    /// that say one word pass, by their blocks or by none.
+    #[test]
+    fn a_document_whose_bindings_differ_on_the_overload_switch_is_refused_in_its_words() {
+        let (store, door) = generations();
+        yaml(&door, switched(Some(false), Some(false))).expect("every binding off");
+        yaml(&door, switched(None, None)).expect("no block");
+        yaml(&door, switched(Some(true), None)).expect("one word, by a block and by none");
+        let own = standing(&store);
+        assert_eq!(own.0, 3);
+
+        let refused = yaml(&door, switched(Some(false), None)).expect_err("they differ");
+        assert_eq!(refused.to_string(), DIFFERS);
+        let SpecRejected::Invalid(invalid) = &refused else {
+            panic!("the pass refuses it: {refused:?}");
+        };
+        assert_eq!(invalid.field_path(), "bindings[1].overload.enabled");
+        // The other way round, the second binding says off.
+        let refused = yaml(&door, switched(None, Some(false))).expect_err("they differ");
+        let other = DIFFERS.replace("true is not the false", "false is not the true");
+        assert_eq!(refused.to_string(), other);
+        assert_eq!(standing(&store), own, "the standing generation stays");
+
+        let differs = switched(Some(false), None);
+        let dry = door.dry_run("", differs.as_bytes(), Format::Yaml);
+        let would = dry.expect("no guard").would_run;
+        assert_eq!(
+            would.map_err(|refused| refused.to_string()),
+            Err(DIFFERS.to_owned())
+        );
+        assert_eq!(standing(&store), own, "a dry run applies nothing");
+    }
+
+    /// A standby does not follow a leader's generation whose bindings
+    /// differ on the overload switch. A leader of an older build took the
+    /// document. This build's pass refuses it, and the standby keeps its
+    /// own generation. A later generation that says one word is followed.
+    #[test]
+    fn a_standby_does_not_follow_a_generation_whose_bindings_differ_on_the_overload_switch() {
+        // The older build's door: the stock pass, which takes the document.
+        let led = Arc::new(MemoryStore::new());
+        let stock_pass = AppliedSpec::validate_digested;
+        let leader = Generations::validating(Arc::clone(&led), stock(), stock_pass);
+        yaml(&leader, RANDOM).expect("a valid document");
+        yaml(&leader, switched(Some(false), None)).expect("the older build takes it");
+        assert_eq!(standing(&led).0, 2);
+
+        let (store, standby) = generations();
+        yaml(&standby, RANDOM).expect("a valid document");
+        let own = standing(&store);
+        let refused = followed(&standby, &sent(&leader)).expect_err("its bindings differ");
+        assert_eq!(refused.path, "generation.document");
+        assert_eq!(standing(&store), own, "the standby keeps its own");
+
+        yaml(&leader, switched(Some(false), Some(false))).expect("every binding off");
+        followed(&standby, &sent(&leader)).expect("above its own");
+        assert_eq!(standing(&store).0, 3);
     }
 
     #[test]
@@ -2880,11 +3019,11 @@ pub(crate) mod tests {
     /// the holder before the apply returns. Every binding off leaves a
     /// worker that names no threshold none, and on again the start's. The
     /// same word under another document lays no object again. Bindings
-    /// that differ keep the start's, either one first. Two entries in a
-    /// row leave the rows of the last word, and a row that comes behind
-    /// them is built by it. A status that moved on the standing object
-    /// with no word to the table stands in the table when the apply
-    /// returns: this replica leads, and the lay settles the two.
+    /// that differ are refused at the pass, so no word is stated. Two
+    /// entries in a row leave the rows of the last word, and a row that
+    /// comes behind them is built by it. A status that moved on the
+    /// standing object with no word to the table stands in the table when
+    /// the apply returns: this replica leads, and the lay settles the two.
     #[test]
     fn an_applied_document_states_its_overload_switch_on_the_holder() {
         let (a, b) = ("http://a:8000", "http://b:8000");
@@ -2910,12 +3049,11 @@ pub(crate) mod tests {
         yaml(&door, other).expect("off again");
         assert!(Arc::ptr_eq(&object(&holder, a), &off));
 
-        // Bindings that differ keep the start's, either one first.
-        yaml(&door, switched(Some(false), None)).expect("a controller refuses none");
-        assert_eq!(stated(&holder, a), START);
-        let differ = object(&holder, a);
-        yaml(&door, switched(None, Some(false))).expect("the other one first");
-        assert!(Arc::ptr_eq(&object(&holder, a), &differ), "on stands");
+        // Bindings that differ are refused at the pass: no generation
+        // enters, and the word and its objects stand.
+        let other = switched_by("round-robin", Some(false), None);
+        yaml(&door, other).expect_err("they differ");
+        assert!(Arc::ptr_eq(&object(&holder, a), &off));
 
         // Two entries in a row: the rows of the last word.
         yaml(&door, switched(Some(false), Some(false))).expect("off");
@@ -2923,7 +3061,33 @@ pub(crate) mod tests {
         assert_eq!(stated(&holder, a), START);
         register(&store, &holder, b);
         assert_eq!(stated(&holder, b), START, "built by the word that stands");
-        assert_eq!(standing(&store).0, 7);
+        assert_eq!(standing(&store).0, 5);
+    }
+
+    /// A document whose bindings differ on the overload switch does not
+    /// pass a controller's door. Where one stands past the pass, under a
+    /// door with the stock pass, the hook keeps the start's default on,
+    /// either binding first: it reads such a document as the unbound start.
+    #[test]
+    fn a_document_past_the_pass_whose_bindings_differ_keeps_the_starts_default() {
+        let a = "http://a:8000";
+        let none = OverloadThresholds::default();
+        let store = Arc::new(MemoryStore::new());
+        let holder = Objects::new(Arc::new(WorkerRegistry::new())).with_overload_thresholds(START);
+        let holder = Arc::new(holder);
+        let stock_pass = AppliedSpec::validate_digested;
+        let door = DocumentManager::validating(Arc::clone(&store), stock(), Vec::new(), stock_pass);
+        let fence = Arc::new(OnceLock::new());
+        let entered = states_on(Arc::clone(&holder), Arc::clone(&fence));
+        let door = Generations::over(door.telling(entered), fence);
+        register(&store, &holder, a);
+        yaml(&door, switched(Some(false), Some(false))).expect("every binding off");
+        assert_eq!(stated(&holder, a), none);
+        yaml(&door, switched(Some(false), None)).expect("the stock pass takes it");
+        assert_eq!(stated(&holder, a), START, "the default is back on");
+        let differ = object(&holder, a);
+        yaml(&door, switched(None, Some(false))).expect("the other one first");
+        assert!(Arc::ptr_eq(&object(&holder, a), &differ), "on stands");
     }
 
     /// A spec store's bind, an enforce and a rollback each enter a

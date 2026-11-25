@@ -732,7 +732,8 @@ fn a_pair_that_names_its_worker_under_a_capped_sessions_rule_goes_there_or_nowhe
 /// and the placement stands on the decode the request named. A pair that
 /// names no worker is decided again as before, and so is one held to its
 /// prefill alone: it names no decode. A pair whose decode alone is named,
-/// behind a prefill of another profile, books it so as well.
+/// behind a prefill of another profile, books it so as well. The placement
+/// says which it is ahead of each call ([`Placement::decode_chosen`]).
 ///
 /// The classic router picks a pair's decode once, with its prefill
 /// (`P:2884-2920`), and sends that decode behind the prefill's answer.
@@ -757,7 +758,9 @@ fn a_pair_held_to_the_decode_it_names_books_it_with_its_prefill() {
         let mut placement = engine.place(&request).expect("a placement");
         let first = lists.places(&placement);
         placement.sent(Side::Prefill);
+        let chosen = placement.decode_chosen();
         let answer = placement.decode_again(&request);
+        assert_eq!(chosen, answer.is_ok(), "the placement's word ahead of it");
         (first, answer, lists.places(&placement))
     };
     let again = |carried: &[(&str, &str)]| again_under(engine, carried);

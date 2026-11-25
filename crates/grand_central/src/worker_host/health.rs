@@ -134,8 +134,8 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            membership::life, HealthPolicy, WorkerFacts, WorkerPatch, WorkerStatus as RowStatus,
-            WorkersStore,
+            membership::life, HealthPolicy, Registrant, WorkerFacts, WorkerPatch,
+            WorkerStatus as RowStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
     };
@@ -154,19 +154,17 @@ mod tests {
         fn new(success_threshold: u32, probes: bool) -> Option<Self> {
             let store = Arc::new(MemoryStore::new());
             let objects = Arc::new(Objects::new(Arc::new(WorkerRegistry::new())));
-            let row = store
-                .upsert(WorkerFacts {
-                    key: URL.to_string(),
-                    models: vec![MODEL.to_string()],
-                    health: HealthPolicy {
-                        success_threshold,
-                        probes,
-                        ..HealthPolicy::default()
-                    },
-                    ..WorkerFacts::default()
-                })
-                .id();
-            objects.follow(store.as_ref());
+            let facts = WorkerFacts {
+                key: URL.to_string(),
+                models: vec![MODEL.to_string()],
+                health: HealthPolicy {
+                    success_threshold,
+                    probes,
+                    ..HealthPolicy::default()
+                },
+                ..WorkerFacts::default()
+            };
+            let row = objects.upsert(&store, facts, Registrant::Control)?.id();
             let id = objects.object(row)?;
             let revision = objects.registry().get(&id)?.revision();
             Some(Self {
@@ -318,11 +316,11 @@ mod tests {
             priority: Some(1),
             ..WorkerPatch::default()
         };
-        assert!(replica.store.patch(row.id, patch, row.revision).is_some());
         assert!(replica.object().set_stall(Some(StallReason::Wedged)));
         // The holder lays the row's next revision in the object's place.
         // The replacement takes its running state, the veto with the rest.
-        replica.objects.follow(replica.store.as_ref());
+        let (store, objects) = (&replica.store, &replica.objects);
+        assert!(objects.patch(store, row.id, patch, row.revision).is_some());
         assert_ne!(replica.object().revision(), replica.revision);
         assert_eq!(replica.object().stall_reason(), Some(StallReason::Wedged));
     }

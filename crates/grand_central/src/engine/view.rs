@@ -1349,8 +1349,25 @@ pub struct RequestFacts<'a> {
     /// other reads the first. The one call states them by the profile's
     /// word: a routing value's own entry under the plain ring, and under
     /// the prefix form what the lender answers for each head
-    /// ([`LentRing::head_position`]). In-process only: no frame carries it.
+    /// ([`LentRing::head_position`]). Where a pair's decode side is stated
+    /// places of its own ([`Self::decode_ring_positions`]) this is the
+    /// prefill side's list. In-process only: no frame carries it.
     pub ring_positions: &'a [u64],
+    /// Where the request stands on the lent ring for a pair's decode side,
+    /// where the pair's two sides read that ring by two words: one places
+    /// a routing value by its own text and the other by the request's
+    /// heads, or the two cut a prompt by two rules. Each side is then
+    /// stated what a single request of its own profile is stated:
+    /// [`Self::ring_positions`] is the prefill side's list, this the
+    /// decode side's, and an empty list leaves that side's stage to its
+    /// own ring. `None` for every other request: the one list is both
+    /// sides'. It is the word of what makes the request to the function
+    /// that makes each side's facts
+    /// ([`PairPools`](crate::engine::PairPools)), and no stage's to read:
+    /// a side's own facts hold that side's list in
+    /// [`Self::ring_positions`] and `None` here. In-process only: no
+    /// frame carries it.
+    pub decode_ring_positions: Option<&'a [u64]>,
     /// The request's own id handed [`Self::session_key`]: a `rid` source
     /// of the binding's `routing_key` block, and no header. The prefix
     /// form of a ring places no request by such a key. It names the
@@ -1675,8 +1692,9 @@ pub struct Constraints<'a> {
     /// side's places as they are stated, so under a number it sees the
     /// lent decodes alone: a host that states a number as above meets it
     /// only where the fleet changes between its read and the decision's.
-    /// `None`: the request names no decode so. In-process only: a
-    /// controller's served decision reads a pair's frame for no number.
+    /// `None`: the request names no decode so. No frame carries the field:
+    /// a controller states it for a pair's frame whose decode side alone
+    /// reads the number the frame names its worker by.
     pub target_worker: Option<u32>,
 }
 
@@ -1928,16 +1946,17 @@ mod tests {
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
     /// The signal cells are one word, for every signal, and the client's
-    /// key is one word more. The ring a caller lends is two words, and
-    /// where the request stands on it two more. A text's two lengths are
-    /// one word: its characters fill what was spare, and its bytes take
-    /// the word. The word that says the request's own id handed its
-    /// session key is one byte of what is spare. A field the facts gain
-    /// beyond the spare bytes moves this number and carries the decision
-    /// bench's cells that copy the facts (`benches/decision.rs`).
+    /// key is one word more. The ring a caller lends is two words, where
+    /// the request stands on it two more, and a pair's decode side's own
+    /// places there two more. A text's two lengths are one word: its
+    /// characters fill what was spare, and its bytes take the word. The
+    /// word that says the request's own id handed its session key is one
+    /// byte of what is spare. A field the facts gain beyond the spare
+    /// bytes moves this number and carries the decision bench's cells
+    /// that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 304);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 320);
     }
 
     #[test]

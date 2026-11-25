@@ -14,10 +14,13 @@
 //! What the program asks of the engine stands in one place, the methods of
 //! its `Engine`. Each method beside `place` is a call the host contract
 //! still owes a program, and leaves that list with the change that pays it.
+//! A pair's decode asked again is asked of the placement `place` answered,
+//! where that placement says its decode still stands chosen.
 //!
-//! One module a plan holds the plan's cases. A single request
-//! (`caller/single.rs`) and a pair of a prefill worker and a decode worker
-//! (`caller/pair.rs`) are served so far. The example's own stage
+//! One module a plan holds the plan's cases: a single request
+//! (`caller/single.rs`), a pair of a prefill worker and a decode worker
+//! (`caller/pair.rs`), and an encode request, whose items go to encoders
+//! ahead of its pair (`caller/encode.rs`). The example's own stage
 //! (`examples/in_process/engine_load.rs`) is taken in beside the program,
 //! and its cases decide over records made by hand (`caller/stage.rs`).
 //!
@@ -27,10 +30,12 @@
 
 use std::{future::Future, sync::Arc};
 
-use program::{pair_settings, settings, Plan, Program};
+use program::{encode_settings, pair_settings, settings, Plan, Program};
 use smg_grand_central::document::{AppliedSpec, PolicySettings, RoutingSettings};
 use smg_worker::{identity::basic::Worker, load::state::TestFeed, test_support::ready_worker};
 
+#[path = "caller/encode.rs"]
+mod encode;
 #[path = "../examples/in_process/engine_load.rs"]
 mod engine_load;
 #[path = "caller/pair.rs"]
@@ -125,4 +130,14 @@ fn under_pairs(
     sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
 ) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
     under_settings(&pair_settings(policy), fleet, sends)
+}
+
+/// The program under the document a gateway means that routes to pairs
+/// behind encoders, the pair's two sides under `policy`.
+fn under_encode(
+    policy: PolicySettings,
+    fleet: &[Arc<dyn Worker>],
+    sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
+) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
+    under_settings(&encode_settings(policy), fleet, sends)
 }

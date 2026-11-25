@@ -37,7 +37,7 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_grand_central::{
-    engine::{Role, WireModes, WorkerId},
+    engine::{WireModes, WorkerId},
     service::{
         controller::{
             Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
@@ -2074,7 +2074,9 @@ async fn a_standby_passes_its_probes_only_while_it_is_synced_with_its_leader() {
 /// A row its leader wrote reaches the published world of a standby that
 /// still follows. The standby's applier leaves the followed row's build
 /// owed, and no write of the standby's own comes behind it: its own serve
-/// pays the publication, as a leader's serve pays its own.
+/// pays the publication, as a leader's serve pays its own. The row is on
+/// file with its build owed from the applier's one hold of the table, so a
+/// read that finds the row and no build owed found the build paid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -2087,13 +2089,16 @@ async fn a_followed_row_reaches_the_published_world_of_a_standby() {
     let port = leader.replication.port();
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     standby.reads(State::Follower).await;
-    let members = |replica: &Replica| replica.store.snapshot().members("model-a", Role::Single);
-    assert_eq!(members(&standby), None, "no row is written yet");
+    let published = |replica: &Replica| {
+        let on_file = replica.store.by_key("http://a:8000").is_some();
+        on_file && replica.store.publish_due().is_none()
+    };
+    assert!(!published(&standby), "no row is written yet");
 
     // One row on the leader, and no write behind it on either replica.
     lays(&leader, facts("http://a:8000", 1, 0));
     let deadline = Instant::now() + Duration::from_secs(10);
-    while members(&standby) != Some(1) {
+    while !published(&standby) {
         assert!(
             Instant::now() < deadline,
             "the standby published no followed row within 10 s"

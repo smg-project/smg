@@ -151,15 +151,16 @@ impl Bed {
     }
 
     fn row(&self, url: &str, labels: BTreeMap<String, String>) -> Option<WorkerRow> {
-        self.store.upsert(WorkerFacts {
+        let facts = WorkerFacts {
             key: url.to_owned(),
             engine: url.to_owned(),
             models: vec!["model".to_owned()],
             dp_size: 1,
             labels,
             ..WorkerFacts::default()
-        });
-        self.workers.objects().follow(&*self.store);
+        };
+        let objects = self.workers.objects();
+        objects.upsert(&self.store, facts, Registrant::Control)?;
         self.store.by_key(url)
     }
 
@@ -506,8 +507,9 @@ async fn a_row_the_provider_registered_is_not_asked_again_and_one_it_no_longer_l
     };
     assert_eq!(url, "worker:8000");
     assert_eq!(guards, [(id, revision)]);
-    assert!(bed.store.remove(row.id, row.revision).is_some());
-    bed.workers.objects().follow(&*bed.store);
+    let objects = bed.workers.objects();
+    let removed = objects.remove(&bed.store, row.id, row.revision);
+    assert!(removed.is_some());
     assert!(
         bed.stays_at(2).await,
         "a removal was queued for the unlabelled row"

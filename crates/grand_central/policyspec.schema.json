@@ -1582,7 +1582,7 @@
       ]
     },
     "OverloadSpec": {
-      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. A gateway that runs a supplied document in its own\nprocess reads the switch where it builds its workers' default\nthresholds, and its routes read one shed word, both from that document:\nit refuses one whose bindings differ on either word. With no document\nsupplied it reads its own two settings. A controller that judges on its\nworker objects reads the switch there too, at each document that takes\nforce: its default is off where every binding switches it off, and\nbindings that differ keep it on.",
+      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. A gateway that runs a supplied document in its own\nprocess reads the switch where it builds its workers' default\nthresholds, and its routes read one shed word, both from that document:\nit refuses one whose bindings differ on either word. With no document\nsupplied it reads its own two settings. A controller that judges on its\nworker objects reads the switch there too, at each document that takes\nforce: its default is off where every binding switches it off. It\nrefuses a document whose bindings differ on the switch, as a gateway\ndoes.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1718,7 +1718,7 @@
           "default": "original"
         },
         "rule_placed": {
-          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A controller keeps the word on the lease it\nfiles, and tells such a request off its file by it all the same.",
+          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A controller keeps the word on the lease it\nfiles, and tells such a request off its file by it all the same.",
           "$ref": "#/$defs/RulePlaced"
         }
       },

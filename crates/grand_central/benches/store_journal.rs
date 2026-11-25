@@ -3,7 +3,7 @@
 //! one binary:
 //!
 //! - `policy_store_journal/status_write/<plain|journaled|told>/<n>`: one
-//!   status flip of a member, published at once; `told` is the journaled
+//!   status flip of a member, which publishes nothing; `told` is the journaled
 //!   write on a log with a listener of the watched kinds, as a controller
 //!   with a watch open has: the write's telling is in the cell. Under the
 //!   `worker-host` feature `followed` is that write with the worker
@@ -129,7 +129,7 @@ fn status_write(c: &mut Criterion) {
     group.finish();
 }
 
-/// One status flip of the pool's middle member, published at once.
+/// One status flip of the pool's middle member: no world is published.
 fn flips(group: &mut BenchmarkGroup<'_, WallTime>, kind: &str, n: usize, pool: &Pool) {
     let id = pool.ids[n / 2];
     let mut ready = true;

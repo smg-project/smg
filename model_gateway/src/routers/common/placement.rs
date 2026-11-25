@@ -134,7 +134,9 @@ pub(crate) type CandidateFilter<'a> = &'a (dyn Fn(&dyn Worker) -> bool + Sync);
 /// The read of a model's pair index as it stands now, for a pair's decode
 /// asked again behind its prefill ([`decode_again`]). The read costs a
 /// snapshot and an index, so a route hands it as a call: Grand
-/// Central's arm alone makes it, once, and a classic pair reads nothing.
+/// Central's arm alone makes it, once, for a decode that stands chosen. A
+/// classic pair reads nothing, and so does a decode booked with its
+/// prefill.
 pub(crate) type PairsAgain<'a> = &'a dyn Fn() -> Arc<PdPairIndex>;
 
 /// What a route states of its request for Grand Central alone: the
@@ -526,7 +528,8 @@ impl RequestEnd {
     /// The request ended with `status`, as the reader of its answer took
     /// it. `answered` says whether the worker itself answered the request:
     /// at a route's account, whether the answer carries the worker's mark
-    /// ([`super::attempt_ledger::UpstreamAnswer`]).
+    /// ([`super::attempt_ledger::UpstreamAnswer`]) or is the route's
+    /// refusal of a body the worker gave over the limit.
     ///
     /// The outcome is made behind the handle's test: an empty handle pays
     /// that test, and nothing is asked or classed for it.
@@ -556,10 +559,10 @@ fn reported(end: &SideEnd, status: u16, answered: bool) {
 /// status under 400 is a success, 408 and 504 a timeout, any other 4xx the
 /// client's error. A 5xx follows whether the worker answered the request.
 /// Where it did, the 5xx is the server's error, whoever wrote the status:
-/// the worker's own, or the 502 the Decisions adapter makes of an answer
-/// it cannot map. Where no answer of the worker stands, the 5xx is a
-/// failed connection. One refusal differs: the router's refusal of a
-/// worker's body over its limit carries no mark, on the Decisions route
+/// the worker's own, the 502 the Decisions adapter makes of an answer it
+/// cannot map, or the 502 a route makes of a worker's body over its limit,
+/// which carries no mark and is known by its code. Where no answer of the
+/// worker stands, the 5xx is the router's own, on the Decisions route
 /// too, so it reads as a failed connection.
 fn transport_class(status: u16, answered: bool) -> TransportClass {
     match status {
@@ -830,10 +833,9 @@ impl Placed {
 
     /// The request this answer placed ended with `status`, as the route
     /// that keeps the answer takes it at its attempt's account. `answered`
-    /// says whether the answer carries the worker's mark
-    /// ([`super::attempt_ledger::UpstreamAnswer`]): it is asked only where
-    /// Grand Central hears the outcome. A classic answer pays the test
-    /// of its one empty word.
+    /// says whether the worker itself answered ([`RequestEnd::report`]):
+    /// it is asked only where Grand Central hears the outcome. A
+    /// classic answer pays the test of its one empty word.
     ///
     /// It needs the guard made by [`Self::guard_keeping_end`]: behind any
     /// other guard the answer keeps no handle, and this says nothing.
@@ -973,7 +975,10 @@ impl ByEngine {
     /// the request stated for the engine alone at the first decision is
     /// stated again as this answer kept it ([`Stated`]). A side
     /// that a guard took already was sent: it is asked nothing, and the
-    /// pair index is not read.
+    /// pair index is not read. Nor is a side whose decode does not stand
+    /// chosen ([`PlacementSide::decode_chosen`]): the engine booked that
+    /// decode with its prefill, under a document that asks no decode again
+    /// or behind a hold of the request, and would refuse the call by name.
     #[inline(never)]
     #[expect(
         clippy::too_many_arguments,
@@ -996,6 +1001,13 @@ impl ByEngine {
         let Some(side) = held.as_mut() else {
             return (None, ahead);
         };
+        // A decode the engine booked with its prefill does not stand
+        // chosen: the document asks no decode again, or a hold of the
+        // request booked the pair whole. The engine would refuse the call
+        // by name, so none is made: the first decode stands.
+        if !side.decode_chosen() {
+            return (None, ahead);
+        }
         let pairs = pairs();
         let asked = with_pair_request(
             engine,
@@ -2740,7 +2752,12 @@ fn pair_by_engine(
 /// it decides its dispatch's shape ([`Placed::owed_behind_prefill`]), so a
 /// classic pair states no request again. The front is whole without that:
 /// always inlined, a classic answer pays the one test of its pointer here,
-/// and its pair index is not read.
+/// and its pair index is not read. Nor is a request stated again for a
+/// decode the engine booked with its prefill: the engine's arm asks the
+/// decode's side whether it stands chosen
+/// ([`PlacementSide::decode_chosen`]) before it reads the pair index, so
+/// the decode is decided again where the document asks it and nowhere
+/// else.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
@@ -8623,6 +8640,136 @@ pub(crate) mod tests {
         assert_eq!(engine.classic_made_or_asked(), 0);
     }
 
+    /// A pair whose two sides read the model's ring by two words is placed
+    /// where its two classic policies place it. Classic reads the model's
+    /// one ring once for a pair and hands it to both policies (lines 3016
+    /// to 3031 and 3098 to 3101 of this file at a06805492), and each walks
+    /// it from its own place: the ring policy from its key's text
+    /// (`find_by_consistent_hash`,
+    /// `model_gateway/src/policies/consistent_hashing.rs`, lines 84 to
+    /// 140), the prefix policy from a head of the request
+    /// (`select_worker_impl` and `find_worker_with_load_balance`,
+    /// `model_gateway/src/policies/prefix_hash.rs`, lines 282 to 413), and
+    /// two prefix policies of two depths from two heads of one prompt. The
+    /// engine states each side its own places on the ring the gateway
+    /// lends. Three pairs: the ring policy ahead of the prefix policy, the
+    /// reverse, and two prefix policies that cut a prompt at two depths.
+    /// Each request carries what both policies place by: a prompt, and a
+    /// routing key or its client's address.
+    #[test]
+    fn the_engine_places_a_pair_of_two_ring_words_where_its_classic_policies_do() {
+        use crate::{
+            config::{RouterConfig, RoutingMode},
+            policies::PolicyFactory,
+        };
+
+        let prefix = |prefix_token_count: usize| PolicyConfig::PrefixHash {
+            prefix_token_count,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: vec![],
+        };
+        let fleet: Vec<(String, WorkerType)> = (0..8)
+            .flat_map(|at| {
+                [
+                    (format!("grpc://p{at}:1"), WorkerType::Prefill),
+                    (format!("grpc://d{at}:1"), WorkerType::Decode),
+                ]
+            })
+            .collect();
+        let listed: Vec<_> = fleet
+            .iter()
+            .map(|(url, role)| (url.as_str(), *role, Some("NixlConnector")))
+            .collect();
+        // A prompt of the set that carries no routing key is sent by a
+        // client of its own: the ring policy places it by that address.
+        let requests: Vec<Prefixed> = prefix_placed()
+            .into_iter()
+            .enumerate()
+            .map(|(at, (name, tokens, text, mut headers))| {
+                if headers.is_empty() {
+                    let client = format!("10.0.1.{at}").parse().expect("a header value");
+                    headers.insert("x-forwarded-for", client);
+                }
+                (name, tokens, text, headers)
+            })
+            .collect();
+        for (pair, prefill, decode) in [
+            (
+                "the ring ahead of the prefix",
+                PolicyConfig::ConsistentHashing,
+                prefix(256),
+            ),
+            (
+                "the prefix ahead of the ring",
+                prefix(256),
+                PolicyConfig::ConsistentHashing,
+            ),
+            ("two depths", prefix(256), prefix(128)),
+        ] {
+            let settings = RouterConfig {
+                mode: RoutingMode::PrefillDecode {
+                    prefill_urls: vec![],
+                    decode_urls: vec![],
+                    prefill_policy: Some(prefill.clone()),
+                    decode_policy: Some(decode.clone()),
+                },
+                policy: prefill.clone(),
+                ..Default::default()
+            };
+            let registry = pd_registry(&listed);
+            let classic = PolicyRegistry::new(prefill.clone());
+            classic.set_prefill_policy(PolicyFactory::create_from_config(&prefill));
+            classic.set_decode_policy(PolicyFactory::create_from_config(&decode));
+            let engine = PolicyRegistry::for_engine(
+                settings.policy.clone(),
+                settings.routing_key_override.clone(),
+            );
+            let document = settings.policy_document().expect("the settings' document");
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            engine_on(&engine, spec);
+            let placed = |policies: &PolicyRegistry, inputs: PlacementInputs<'_>| {
+                let pairs = pairs_of(&registry, policies);
+                let placed = select_pair(
+                    &registry,
+                    policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    None,
+                    inputs,
+                    Stated::nothing,
+                );
+                let placed = placed.expect("a pair is open");
+                (
+                    placed.prefill.url().to_owned(),
+                    placed.decode.url().to_owned(),
+                )
+            };
+            let mut prefills = std::collections::BTreeSet::new();
+            let mut decodes = std::collections::BTreeSet::new();
+            for (name, tokens, text, headers) in &requests {
+                let inputs = PlacementInputs {
+                    tokens: tokens.as_deref(),
+                    text: text.as_deref(),
+                    headers: Some(headers),
+                    ..Default::default()
+                };
+                let by_classic = placed(&classic, inputs);
+                assert_eq!(placed(&engine, inputs), by_classic, "{pair}: {name}");
+                prefills.insert(by_classic.0);
+                decodes.insert(by_classic.1);
+            }
+            assert!(
+                prefills.len() > 3,
+                "{pair}: the prefills spread: {prefills:?}"
+            );
+            assert!(decodes.len() > 3, "{pair}: the decodes spread: {decodes:?}");
+            assert!(registry.get_routing_snapshot(MODEL).hash_ring_is_filled());
+            assert_eq!(engine.classic_made_or_asked(), 0, "{pair}");
+        }
+    }
+
     /// A model's first prompts, before a ring is kept for it, go where the
     /// `prefix_hash` policy sends them with no ring: to the worker with the
     /// fewest requests. The engine is lent a ring that holds no worker and
@@ -9896,6 +10043,19 @@ pub(crate) mod tests {
         pair: &PlacedPair,
         ahead: WorkerLoadGuard,
     ) -> (Option<Placed>, WorkerLoadGuard) {
+        let pairs = || pairs_of(registry, policies);
+        asked_again_over(registry, policies, &pairs, rule, pair, ahead)
+    }
+
+    /// [`asked_again`] over the caller's own read of the pair index.
+    fn asked_again_over(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        pairs: PairsAgain<'_>,
+        rule: Option<CandidateFilter<'_>>,
+        pair: &PlacedPair,
+        ahead: WorkerLoadGuard,
+    ) -> (Option<Placed>, WorkerLoadGuard) {
         let inputs = PlacementInputs {
             candidate_filter: rule,
             ..Default::default()
@@ -9904,7 +10064,7 @@ pub(crate) mod tests {
             registry,
             policies,
             MODEL,
-            &|| pairs_of(registry, policies),
+            pairs,
             None,
             inputs,
             &pair.decode,
@@ -10153,14 +10313,27 @@ pub(crate) mod tests {
     }
 
     /// A document that picks a pair's decode with its prefill booked the
-    /// decode at the pair's one decision. The engine refuses the ask as a
-    /// decode that is not chosen, which is no failure of the request: the
-    /// guard handed in is the guard to keep, the ask says nothing, and the
-    /// route sends the first decode. The engine hears that decode's
-    /// dispatch at its send and its end at the guard's drop. Every pair is
-    /// placed so under the stock document.
+    /// decode at the pair's one decision, so that decode does not stand
+    /// chosen and its ask is answered at the answer's own test: the pair
+    /// index is not read and no request is stated again, where a decode
+    /// that stands chosen reads the index once. It is no failure of the
+    /// request: the guard handed in is the guard to keep, the ask says
+    /// nothing, and the route sends the first decode. The engine hears
+    /// that decode's dispatch at its send and its end at the guard's drop.
+    /// Every pair is placed so under the stock document.
     #[test]
     fn a_decode_booked_with_its_prefill_answers_the_ask_as_the_first_decode_standing() {
+        // The pair index is read once for each request an ask states again.
+        let reads = std::cell::Cell::new(0_usize);
+        let asked =
+            |registry: &WorkerRegistry, policies: &PolicyRegistry, pair: &PlacedPair, ahead| {
+                let counted = || {
+                    reads.set(reads.get() + 1);
+                    pairs_of(registry, policies)
+                };
+                asked_again_over(registry, policies, &counted, None, pair, ahead)
+            };
+
         let registry = one_pair();
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let heard = hearing_pairs_on(&policies, false);
@@ -10178,15 +10351,22 @@ pub(crate) mod tests {
             ]
         );
 
-        let (moved, guard) = asked_again(&registry, &policies, None, &pair, ahead);
+        let (moved, guard) = asked(&registry, &policies, &pair, ahead);
         assert!(moved.is_none());
         assert!(guard.counts(pair.decode.worker()));
         assert_eq!(said().len(), 4, "the ask says nothing");
+        assert_eq!(reads.get(), 0, "no request is stated for this decode");
 
         let guard = pair.decode.sent(guard);
         assert_eq!(said()[4..], ["dispatched Decode"]);
         drop(guard);
         assert_eq!(said()[5..], ["completed Cancelled"]);
         assert_eq!(pair.decode.load(), 0);
+
+        // A decode that stands chosen is decided again by one request.
+        let (registry, policies, _heard, pair, ahead) = a_pair_behind_its_prefill();
+        let (_moved, guard) = asked(&registry, &policies, &pair, ahead);
+        assert_eq!(reads.get(), 1, "the one request reads the pair index");
+        drop(guard);
     }
 }

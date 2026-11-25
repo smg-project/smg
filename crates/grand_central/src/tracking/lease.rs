@@ -238,7 +238,9 @@ pub enum ReleaseReason {
 }
 
 /// The time a gateway has to name a lease's dispatch: the design's default.
-/// A lease still issued past it is released as abandoned.
+/// A lease still issued past it is released as abandoned. A pair's decode
+/// side that was issued with its prefill has that time from the prefill's
+/// end: a controller's file holds it while the prefill is dispatched.
 pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What a gateway's `Dispatched` report says beside its lease.

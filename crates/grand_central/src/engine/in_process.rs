@@ -88,6 +88,8 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::Ro
 
 pub(crate) use self::document::Loaded;
 pub use self::document::SpecHandle;
+#[cfg(feature = "controller")]
+pub(crate) use self::document::StoodAt;
 // The count of a request that names its worker, for a controller's served
 // decision: the one the one call counts by.
 #[cfg(feature = "controller")]
@@ -396,12 +398,18 @@ impl InProcess {
     /// caller's data. A program has its engine by [`Self::start`], which
     /// builds it here and makes every hand-over.
     #[must_use]
-    pub fn new(mut spec: AppliedSpec) -> Self {
+    pub fn new(spec: AppliedSpec) -> Self {
+        Self::over(spec, 0)
+    }
+
+    /// [`Self::new`], whose session table hears an older request's lease
+    /// from the generation `first` on ([`Engine::table_from`]).
+    fn over(mut spec: AppliedSpec, first: u64) -> Self {
         // The table takes the document's two times where the document's
         // engine takes the pointer.
         let sessions = Arc::new(SessionTable::new(0).with_shards(shards_for_this_host()));
         spec.share_sessions(Arc::clone(&sessions));
-        let document = InForce::of(spec);
+        let document = InForce::of(spec, first);
         Self {
             applied: AtomicU64::new(document.applied),
             document: ArcSwap::from_pointee(document),
@@ -430,12 +438,19 @@ impl InProcess {
     /// engine the host builds counts there, and the three readers of each
     /// ([`DecisionEngine::faults`], [`Self::unheard`],
     /// [`Self::upkeep_faults`]) answer the counts of them all.
+    ///
+    /// The engine's session table is made with it, so a lease of an earlier
+    /// document tells that table nothing: the claim its first decision
+    /// made was made in the table of the engine its host built for that
+    /// document ([`Engine::table_from`]). The stages kept hear the lease
+    /// ([`Self::stood_at`]).
     #[must_use]
     pub(crate) fn with_origin(spec: AppliedSpec, origin: Instant, held: Arc<HeldFaults>) -> Self {
+        let first = spec.generation();
         Self {
             clock: DecisionClock::from_origin(origin),
             held,
-            ..Self::new(spec)
+            ..Self::over(spec, first)
         }
     }
 
@@ -562,6 +577,23 @@ impl InProcess {
         let _held = self.telling.lock();
         self.hears(self.document.load().spec.engine(), word, |engine| {
             self.word_caught(|| engine.on_membership(word));
+        });
+    }
+
+    /// [`Self::on_membership`] for what the document in force built new:
+    /// the stages and the counts of sends made under its own generation,
+    /// and its session table ([`Engine::hearing`]). A store says the list
+    /// of its members through this at the document's apply: what the
+    /// document kept of the standing one heard each member as it came, and
+    /// is told nothing again. The word passes the same locks and the same
+    /// catch: a stage that panics at the list is held and counted.
+    pub(crate) fn on_membership_built_new(&self, word: &Membership<'_>) {
+        let _held = self.telling.lock();
+        let document = self.document.load();
+        let own = document.spec.generation();
+        let new = document.spec.engine().hearing(|made| made == own);
+        self.hears(&new, word, |new| {
+            self.word_caught(|| new.on_membership(word));
         });
     }
 

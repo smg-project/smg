@@ -65,9 +65,11 @@
 //! its report and where it hears a word.
 //!
 //! **Who holds the prompt.** A side whose phase reads affinity is handed
-//! its own list's column for the decision ([`overlap::column`]): what each
-//! worker of the side holds of the request, by the host's index of cache
-//! events and by the record of sent prefixes, read at the side's phase.
+//! its own list's column for the decision ([`overlap::side_column`]): what
+//! each worker of the side holds of the request, by the host's index of
+//! cache events and by the record of sent prefixes, read at the side's
+//! phase. The record is read by the side's own profile's word of it: for
+//! every worker where that profile reads sent prefixes alone.
 //! Behind a pick its profile is told of, each side's record keeps where
 //! the prompt went ([`overlap::record_by_column`]). A pair's first pick
 //! states what its prefill holds of the request, by the prefills' column
@@ -107,7 +109,7 @@
 )]
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt,
     sync::{atomic::Ordering, Arc},
     time::Instant,
@@ -121,7 +123,7 @@ use crate::{
         decision::{shed, Decision, Pick, ShadowKind, ShedReason, Target, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         demands::{Demands, UnmetDemand},
-        framework::{Engine, PairPools, PairSide, Scratch, ShadowRows},
+        framework::{Engine, PairPools, PairSide, Scratch, ShadowRows, ShedOver},
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
@@ -687,8 +689,14 @@ impl<'a> PairLists<'a> {
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
             // A stage asked for a decision from inside its own, on this
-            // thread: that decision takes buffers of its own.
-            Err(_) => decide(&mut Buffers::default()),
+            // thread: that decision takes buffers of its own, and its word
+            // of a shed is kept for its call ([`said_apart`]).
+            Err(_) => {
+                let mut own = Buffers::default();
+                let decision = decide(&mut own);
+                said_apart(&own.scratch);
+                decision
+            }
         });
         // The thread's list goes back for its next retry.
         if let Some(tried) = tried {
@@ -701,13 +709,17 @@ impl<'a> PairLists<'a> {
 /// A pair's two columns of who holds the prompt, the prefills' first, and
 /// what each fill read of the record of sent prefixes. A side whose phase
 /// reads affinity is handed its own list's column, read at the side's
-/// phase ([`overlap::column`]). A side whose phase reads none pays one
-/// test and keeps an empty column. `prefill` is `None` for the decode
+/// phase and by the side's own profile's word of the record
+/// ([`overlap::side_column`], [`Engine::side_reads_sent_alone`]): one
+/// lookup of the pair's binding a side. A side whose phase reads none pays
+/// one test and keeps an empty column. `prefill` is `None` for the decode
 /// asked again, which fills no column of the prefills.
 ///
 /// A pair's decision and an encode request's fill their columns here, so
 /// the two read one way.
-#[inline]
+// In line at its two callers: as a call it costs a pair's decision whose
+// sides read no affinity 25 instructions, counted with Callgrind.
+#[inline(always)]
 pub(super) fn side_columns(
     engine: Loaded<'_, '_>,
     facts: &RequestFacts<'_>,
@@ -724,13 +736,17 @@ pub(super) fn side_columns(
             return None;
         }
         let (workers, ids) = (side.workers(), records.ids());
-        overlap::column(
+        // The side's own profile's word, whichever profile its pool's
+        // table read its word of the record from.
+        let alone = spec.engine().side_reads_sent_alone(facts.model, phase);
+        overlap::side_column(
             kept,
             side.affinity(),
             spec,
             workers,
             ids,
             phase,
+            alone,
             facts,
             column,
         )
@@ -861,6 +877,39 @@ thread_local! {
     /// The calling thread's own buffers, so a pair's decision allocates
     /// nothing after a thread's first decisions over lists of a size.
     pub(super) static BUFFERS: RefCell<Buffers> = RefCell::new(Buffers::default());
+
+    /// The word of the list it shed over that the thread's last decision
+    /// on buffers of its own left ([`said_apart`]).
+    static SAID_APART: Cell<Option<ShedOver>> = const { Cell::new(None) };
+}
+
+/// Keeps the word of a decision made on buffers of its own, with `scratch`:
+/// the list it shed its request over as saturated, where it says one
+/// ([`Scratch::shed_over`]). A stage asked for that decision from inside
+/// another of this thread, which holds the thread's buffers, and the
+/// scratch goes with the decision: its call reads the word here
+/// ([`shed_over`]). Out of line: a decision on the thread's buffers runs
+/// none of it.
+#[cold]
+#[inline(never)]
+pub(super) fn said_apart(scratch: &Scratch) {
+    SAID_APART.set(scratch.shed_over());
+}
+
+/// The list the calling thread's last pair's decision or encode decision
+/// shed its request over as saturated, by that decision's own word
+/// ([`Scratch::shed_over`]). The call that asked for the decision reads it
+/// behind that decision's shed as saturated and behind nothing else, ahead
+/// of anything else it asks on this thread ([`place`](super::place)): a
+/// request answered ahead of its decision leaves the word of the decision
+/// before.
+pub(super) fn shed_over() -> Option<ShedOver> {
+    BUFFERS.with(|buffers| match buffers.try_borrow() {
+        Ok(buffers) => buffers.scratch.shed_over(),
+        // The call stands inside a decision of this thread, which holds
+        // the buffers: its own decision was made on buffers of its own.
+        Err(_) => SAID_APART.get(),
+    })
 }
 
 /// Writes on the two lists' records what a pair's decision reads beside a
@@ -1036,8 +1085,11 @@ fn decide_shadowed(
 /// [`SHADOW_FLOOR`] of the request's stated budget, and where the engine's
 /// run says none. That run says none where the side's shadow profile would
 /// be handed another column than the side's pool carries
-/// ([`Engine::side_apart`]), beside a pair a lifted veto placed, and beside
-/// a side its binding's sessions rule or its picker's assignment placed.
+/// ([`Engine::side_apart`]), beside a pair the pair's default made or a
+/// weighing prefill profile's lift alone placed, and beside a side its
+/// binding's sessions rule or its picker's assignment placed. Beside a
+/// pair whose decode side the binding's all-vetoed rule steered, the
+/// decode's shadow is put to that rule and compared.
 /// So the kinds a side counts add up to the decisions its pair's profiles
 /// made.
 ///
@@ -1089,8 +1141,9 @@ fn side_shadows(
                 said(kind, first)
             }
             // The engine's run says none for a profile of another column,
-            // beside a pair a lifted veto placed, and beside a side its
-            // rule or its picker's assignment placed.
+            // beside a pair the default made or the weighing lift alone
+            // placed, and beside a side its rule or its picker's
+            // assignment placed.
             Ok(None) => said(ShadowKind::Skipped, None),
             // The shadow panicked: counted where it was caught.
             Err(_) => None,
@@ -1203,7 +1256,7 @@ fn later_shadow(
     let first = first_decode(held);
     let ran = own.caught(|| {
         let cx = &decode_cx;
-        Ok(engine.shadow_decode_later(at, facts, pool, pools, held.id, first, pick, cx, scratch))
+        Ok(engine.shadow_decode_later(at, facts, pool, pools, held.id, first, cx, scratch))
     });
     match ran {
         Ok(Some(shadow)) => {
@@ -1632,8 +1685,9 @@ pub(super) fn issued(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeSet, sync::Arc, time::Duration};
+    use std::{cell::RefCell, collections::BTreeSet, sync::Arc, thread, time::Duration};
 
+    use kv_index::{request_prefix_hashes, ChainBlockMap, ChainIndex, ContentHash, StoredBlock};
     use parking_lot::Mutex;
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -3516,6 +3570,49 @@ mod tests {
         };
         assert_eq!(placed(0), (2, 1));
         assert_eq!(placed(3), (0, 2));
+    }
+
+    /// Each side of a pair whose two sides read the lent ring by two words
+    /// is placed from its own places: the prefill side from the request's
+    /// list, the decode side from the list stated for it
+    /// ([`RequestFacts::decode_ring_positions`]), as each of the gateway's
+    /// two policies walks the pair's one ring from its own place
+    /// (`model_gateway/src/routers/common/placement.rs`, lines 3016 to 3031
+    /// and 3098 to 3101 at a06805492). The plain ring ahead of the prefix
+    /// form, and the reverse. A decode side stated no list of its own reads
+    /// the request's one list. One stated an empty list is placed by its
+    /// stage's own ring, and the prefill side keeps its place.
+    #[test]
+    fn each_side_of_a_pair_of_two_ring_words_places_from_its_own_places() {
+        let address = |at: &str| format!("grpc://{at}:9000");
+        let model = "decode-1 prefill-2 decode-0 prefill-0 prefill-1 decode-2";
+        let ring = InOrder(model.split(' ').map(address).collect());
+        let (plain, prefix) = ("consistent_hashing", "prefix_hash");
+        for (prefill, decode) in [(plain, prefix), (prefix, plain)] {
+            let document = PolicySpec::pair_presets(prefill, decode);
+            let spec = AppliedSpec::validate(&document.expect("the pair presets"));
+            let host = Host::under((spec.expect("a valid document"), Arc::default()), 3, 3);
+            let placed = |position: u64, decode_ring_positions: Option<&[u64]>| {
+                let classes = every(3, 3);
+                let positions = [position];
+                // The host's own request over its two lists, every pair open.
+                let Asks(mut request, lists, _) = host.asks(&classes, false);
+                request.facts = RequestFacts {
+                    ring: Some(&ring),
+                    ring_positions: &positions,
+                    decode_ring_positions,
+                    ..keyed()
+                };
+                let now = Instant::now();
+                host.picked(&lists.decide(&host.engine, None, now, &mut request, None))
+            };
+            // The prefill from the first place and the decode from the
+            // fourth, then the reverse.
+            assert_eq!(placed(0, Some(&[3])), (2, 2), "{prefill}, {decode}");
+            assert_eq!(placed(3, Some(&[0])), (0, 1), "{prefill}, {decode}");
+            assert_eq!(placed(0, None), (2, 1), "{prefill}, {decode}");
+            assert_eq!(placed(0, Some(&[])).0, 2, "{prefill}, {decode}");
+        }
     }
 
     /// The stock presets of a pair as a document in force, round robin for
@@ -5754,6 +5851,98 @@ mod tests {
         the_decode_stays_and_the_prefills_turn(&host_of(document, 4, 4));
     }
 
+    /// A host's indexes of cache events: one chain index for every model,
+    /// of blocks of the sixteen tokens [`prompt`] hashes by.
+    struct Indexes(Arc<ChainIndex>);
+
+    impl overlap::CacheIndexes for Indexes {
+        fn index(&self, _: &str) -> Option<Arc<dyn overlap::CacheIndex>> {
+            Some(Arc::clone(&self.0) as Arc<dyn overlap::CacheIndex>)
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            Some(16)
+        }
+    }
+
+    /// A host of four prefills that take turns and four decodes under
+    /// `cache_aware`, behind a binding of the decode phase alone listed
+    /// ahead of the pair's, `cache_aware` too. The host's index of cache
+    /// events holds a block of another prompt for every decode. Where
+    /// `pair_alone`, the pair's decode profile reads sent prefixes alone
+    /// (`source: predictor`) and the binding ahead reads cache events too:
+    /// the decodes' pool keeps the word of the binding ahead. Where not,
+    /// the two stand the other way round.
+    fn decodes_with_blocks(pair_alone: bool) -> Host {
+        use crate::document::spec::{AffinitySource, ScoreSpec, ScoreStage};
+
+        let pair = PolicySpec::pair_presets("round_robin", "cache_aware");
+        let mut document = pair.expect("the pair presets");
+        let stock = PolicySpec::preset("cache_aware").expect("a preset");
+        let mut ahead = stock.bindings[0].clone();
+        ahead.matcher.phase = vec![Phase::Decode];
+        ahead.profile = Some("ahead".into());
+        document.bindings.insert(0, ahead);
+        let aware = stock.profiles.into_values().next();
+        let aware = aware.expect("the preset's profile");
+        document.profiles.insert("ahead".into(), aware);
+        let alone = if pair_alone { "decode" } else { "ahead" };
+        let profile = document.profiles.get_mut(alone).expect("the profile");
+        for stage in &mut profile.score {
+            if let ScoreSpec::Params(ScoreStage::PrefixAffinity(prefix)) = stage {
+                prefix.source = Some(AffinitySource::Predictor);
+            }
+        }
+        let host = host_of(document, 4, 4);
+        let spec = host.engine.spec();
+        let engine = spec.engine();
+        assert_eq!(
+            engine.side_reads_sent_alone(MODEL, Phase::Decode),
+            pair_alone
+        );
+        let pools_word = engine.pool_record_for(MODEL, Phase::Decode);
+        assert_eq!(pools_word, Some(!pair_alone), "the binding ahead's");
+        let index = Arc::new(ChainIndex::new());
+        for (at, decode) in host.decodes.iter().enumerate() {
+            let number = index.intern_worker(decode.url()).expect("a number");
+            let content_hash = ContentHash(at as u64 + 1);
+            let blocks: Vec<StoredBlock> = request_prefix_hashes(&[content_hash])
+                .into_iter()
+                .map(|seq_hash| StoredBlock {
+                    seq_hash,
+                    content_hash,
+                })
+                .collect();
+            let stored = index.apply_stored(number, &blocks, None, &mut ChainBlockMap::new());
+            stored.expect("the block is stored");
+        }
+        host.engine.affinity().set_indexes(Arc::new(Indexes(index)));
+        host
+    }
+
+    /// A pair's decode side reads the record of sent prefixes by its own
+    /// profile's word, whichever profile its pool keeps the record for.
+    /// The index of cache events holds a block for every decode, and a
+    /// binding of the decode phase alone is listed ahead of the pair's.
+    /// Where the pair's decode profile reads sent prefixes alone, a
+    /// prompt's decode stays, at the pair's first decision and at the
+    /// decode asked again: that side is handed what it sent to a worker
+    /// with a block, and its pick is written there. Where the binding
+    /// ahead reads alone and the pair's decode profile reads cache events
+    /// too, that side reads the index for those workers, as before: a
+    /// prompt the index holds for none of them takes its draws.
+    #[test]
+    fn a_pairs_decode_side_reads_the_record_by_its_own_profiles_word() {
+        the_decode_stays_and_the_prefills_turn(&decodes_with_blocks(true));
+
+        let host = decodes_with_blocks(false);
+        let sent = prompt(&host, 1_000);
+        let decodes: BTreeSet<usize> = (1..33)
+            .map(|seed| host.picked(&decide_prompt(&host, &sent, seed, None)).1)
+            .collect();
+        assert!(decodes.len() > 1, "{decodes:?}");
+    }
+
     /// Each side's column is its own list's, whatever the lists' sizes:
     /// over two prefills and four decodes a prompt sent to a pair goes to
     /// that pair again under any draw.
@@ -6013,5 +6202,50 @@ mod tests {
         assert_eq!(asked(&capped_host(1, 1)), 1, "a capped rule");
         assert_eq!(asked(&ruled_host(u16::MAX, 1, 1)), 0, "a rule with no cap");
         assert_eq!(asked(&Host::of(1, 1)), 0, "no rule");
+    }
+
+    /// A pick of a decode that holds the whole prompt past the eight rows a
+    /// read keeps moves no count of writes left out through the pair's own
+    /// decision too: the decode side's write is handed the decode side's
+    /// column. Ten decodes are each sent the prompt once. Then, while a
+    /// reader holds the record, a thread of its own picks the ninth and the
+    /// tenth and ends: a write it had kept would be left out there, as the
+    /// write of a prompt no decode was sent is.
+    #[test]
+    fn a_pick_of_a_ninth_decode_holder_leaves_nothing_out() {
+        let pair = PolicySpec::pair_presets("round_robin", "cache_aware");
+        let host = host_of(pair.expect("the pair presets"), 2, 10);
+        // One instant for every decision: the list's table is read once.
+        let now = Instant::now();
+        let decide_among = |sent: &PromptHashes, decode: u32| {
+            let (prefills, class) = (host.prefills.len(), [decode]);
+            let classes =
+                PartnerClasses::number(host.decodes.len(), (0..prefills).map(|_| &class[..]));
+            let Asks(mut request, lists, _) = host.asks(&classes, false);
+            request.facts = facts();
+            sent.write_to(&mut request.facts);
+            let decision = lists.decide(&host.engine, None, now, &mut request, None);
+            assert_eq!(host.picked(&decision).1, decode as usize);
+        };
+        let sent = prompt(&host, 1_000);
+        (0..10).for_each(|decode| decide_among(&sent, decode));
+        let affinity = host.engine.affinity();
+        let left_out_behind = |sent: &PromptHashes, decodes: &[u32]| {
+            affinity.while_held(|| {
+                thread::scope(|scope| {
+                    let picks = scope.spawn(|| {
+                        for &decode in decodes {
+                            decide_among(sent, decode);
+                        }
+                    });
+                    picks.join().expect("the picks");
+                });
+            });
+            affinity.left_out()
+        };
+        assert_eq!(left_out_behind(&sent, &[8, 9]), 0);
+        // The count is live in this setup: every block of a prompt no
+        // decode was sent is still to add, and its write meets the reader.
+        assert_eq!(left_out_behind(&prompt(&host, 2_000), &[9]), 1);
     }
 }

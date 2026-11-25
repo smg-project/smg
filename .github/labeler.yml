@@ -9,7 +9,6 @@ documentation:
   - changed-files:
       - any-glob-to-any-file:
           - '**/*.md'
-          - 'docs/**/*'
 
 dependencies:
   - changed-files:
@@ -92,6 +91,14 @@ kv-index:
   - changed-files:
       - any-glob-to-any-file: 'crates/kv_index/**/*'
 
+grand-central:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'crates/grand_central/**/*'
+          - 'examples/grand-central/**/*'
+          - '**/*grand-central*'
+          - '**/*grand_central*'
+
 mesh:
   - changed-files:
       - any-glob-to-any-file: 'crates/mesh/**/*'
@@ -104,22 +111,22 @@ model-gateway:
 
 openai:
   - changed-files:
-      - any-glob-to-any-file: 'model_gateway/src/routers/openai/**/*'
+      - any-glob-to-any-file: 'crates/external_router/src/openai/**/*'
 
 anthropic:
   - changed-files:
-      - any-glob-to-any-file: 'model_gateway/src/routers/anthropic/**/*'
+      - any-glob-to-any-file: 'crates/external_router/src/anthropic/**/*'
 
 gemini:
   - changed-files:
-      - any-glob-to-any-file: 'model_gateway/src/routers/gemini/**/*'
+      - any-glob-to-any-file: 'crates/external_router/src/gemini/**/*'
 
 realtime-api:
   - changed-files:
       - any-glob-to-any-file:
           - 'crates/protocols/src/realtime_*'
           - 'crates/protocols/src/builders/realtime/**/*'
-          - 'model_gateway/src/routers/openai/realtime/**/*'
+          - 'crates/external_router/src/realtime/**/*'
 
 benchmarks:
   - changed-files:

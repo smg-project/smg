@@ -166,10 +166,6 @@ const READS_KEPT_LOADS: bool = false;
 /// placed anew at its first request behind an apply.
 const KEEPS_PINS_ACROSS_AN_APPLY: bool = false;
 
-/// A controller's decisions read no cache event yet: a prompt is not sent
-/// to the worker whose events say it holds the blocks.
-const READS_CACHE_EVENTS: bool = false;
-
 const MODEL: &str = "fleet-model";
 
 /// The model of the engines whose load reports count resident tokens.
@@ -1426,12 +1422,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             let pick = picked(&mut harness, ask)
                 .await
                 .expect("a pick answers an ask over a ready fleet");
-            if READS_CACHE_EVENTS {
-                assert_eq!(
-                    pick.engine, busy,
-                    "a prompt goes to the engine that holds its blocks: {pick:?}"
-                );
-            }
+            assert_eq!(
+                pick.engine, busy,
+                "a prompt goes to the engine that holds its blocks: {pick:?}"
+            );
             let pick = picked(&mut harness, nth("unheld", n))
                 .await
                 .expect("a pick answers an ask over a ready fleet");

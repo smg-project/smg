@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use super::{Entry, Event, Log, LogPositionLost};
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
-    engine::view::{Health, Role, WorkerId},
+    engine::view::{Role, WorkerId},
     store::{
         identity, GatewayId, HealthSink, Journal, LeasesStore, MembershipChange, MembershipTail,
         MemoryStore, OutsideLists, Position, StoreCheckpoint, WorkerFacts, WorkerPatch, WorkerRow,
@@ -671,19 +671,17 @@ fn later() -> Instant {
     Instant::now() + Duration::from_secs(READS.fetch_add(1, Ordering::SeqCst) + 1)
 }
 
-/// What the store's world holds of each worker on file at `at`: the id,
-/// width and health bits of its published row, by id. A worker no pool
-/// lists has none.
-fn pool(store: &MemoryStore, at: Instant) -> Vec<(WorkerId, u16, Health)> {
+/// The workers on file that the store's world names as members at `at`,
+/// by id: each holds a slot there. A world holds no row of a worker, and
+/// the rows of record are compared whole by the checkpoint.
+fn pool(store: &MemoryStore, at: Instant) -> Vec<WorkerId> {
     store.publish(at);
     let world = store.snapshot();
     let on_file = store.checkpoint().rows;
     let mut ids: Vec<WorkerId> = on_file.iter().map(|row| row.id).collect();
     ids.sort_unstable();
-    ids.into_iter()
-        .filter_map(|id| world.first_row_of(id))
-        .map(|row| (row.id, row.dp_size, row.health))
-        .collect()
+    ids.retain(|&id| world.booked_of(id).is_some());
+    ids
 }
 
 #[test]

@@ -74,6 +74,14 @@ pub trait LentRing: fmt::Debug + Send + Sync {
     /// head: one recipe's place is never read under the other form. A ring
     /// that holds no worker answers too, as [`Self::position`] does.
     ///
+    /// A pair whose two sides read the ring by two forms is asked both
+    /// questions, each for the side of its form
+    /// ([`RequestFacts::decode_ring_positions`]). Under `None` the side of
+    /// the prefix form states no place and its stage's own ring places it:
+    /// the other side keeps its key's place, and the ring stays lent.
+    ///
+    /// [`RequestFacts::decode_ring_positions`]: crate::engine::RequestFacts::decode_ring_positions
+    ///
     /// [`RequestFacts::ring_positions`]: crate::engine::RequestFacts::ring_positions
     fn head_position(&self, head: Head<'_>) -> Option<u64> {
         let _ = head;

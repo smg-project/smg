@@ -148,8 +148,8 @@ mod tests {
             elector::{ElectError, Elector},
         },
         store::{
-            GatewayId, HealthPolicy, MemoryStore, Reachability, WorkerFacts, WorkerStatus,
-            WorkersStore,
+            GatewayId, HealthPolicy, MemoryStore, Reachability, Registrant, WorkerFacts,
+            WorkerStatus, WorkersStore,
         },
     };
 
@@ -242,12 +242,12 @@ mod tests {
             })
         }
 
-        /// Writes the row of `facts` through the store's own entry and has
-        /// the holder follow it, as a host that writes its store does.
+        /// Writes the row of `facts` through the holder, as a registration
+        /// call does.
         fn register(&self, facts: WorkerFacts) -> WorkerId {
-            let row = self.store.upsert(facts).id();
-            self.workers.holder().follow(&*self.store);
-            row
+            let holder = self.workers.holder();
+            let written = holder.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write").id()
         }
 
         /// Takes the lease: the term the fence opens under.

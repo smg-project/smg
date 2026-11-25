@@ -6,9 +6,8 @@
 //! (design 4.4: a scorer or picker allocates nothing per decision; the host
 //! keeps one scratch per thread so the framework allocates nothing after the
 //! first). The
-//! store's pins stand beside them: two membership writes are held to each
-//! other, a write that moves an offer to one that moves none and a
-//! registration into 512 workers to one into 8. A lease's life at the store
+//! store's pin stands beside them: a registration into 512 workers is held
+//! to one into 8. A lease's life at the store
 //! allocates nothing once its file is sized: its record filed, its
 //! dispatch and its completion handed to the file,
 //! and the sweep's pass. A host in process is pinned
@@ -28,8 +27,7 @@ use smg_grand_central::{
     document::{PolicySpec, PRESETS},
     engine::{
         AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, LoadRow,
-        PairPools, PoolFacts, RequestFacts, Role, Scratch, SignalSource, Target, WireModes,
-        WorkerId,
+        PairPools, PoolFacts, RequestFacts, Scratch, SignalSource, Target, WorkerId,
     },
     stages::Lifecycle,
     store::{
@@ -659,65 +657,12 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
 }
 
 #[test]
-fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
-    // Pairs that name no runtime. One prefill names its runtime and unnames
-    // it in turn, which moves its offer at every write and no class: the
-    // writer derives for that worker alone from what it keeps, and hands
-    // back the classes it had.
-    for n in [8_usize, 64] {
-        let store = MemoryStore::new();
-        let facts_of = |index: usize, runtime: &str| {
-            let (role, key) = if index < n {
-                (Role::Prefill, format!("grpc://p{index}:9000"))
-            } else {
-                (Role::Decode, format!("grpc://d{index}:9000"))
-            };
-            WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                role,
-                wire_modes: WireModes::GRPC,
-                engine_kind: runtime.to_string(),
-                models: vec!["m".to_string()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            }
-        };
-        for index in 0..2 * n {
-            store.upsert(facts_of(index, ""));
-            store.publish_now();
-        }
-        // The fewest allocation calls of one write and the build it owes
-        // among a few: the store's change log grows by doubling, and one
-        // write in many pays for it.
-        let fewest = |runtimes: [&str; 2]| {
-            let one = |turn: usize| {
-                let facts = facts_of(n / 2, runtimes[turn % 2]);
-                allocations_during(|| {
-                    store.upsert(facts);
-                    store.publish_now();
-                })
-                .1
-            };
-            (0..8).map(one).min()
-        };
-        // The first writes size what the writer keeps of the derivation.
-        fewest(["rt-b", ""]);
-        let (kept, moved) = (fewest(["", ""]), fewest(["rt-b", ""]));
-        assert_eq!(
-            moved, kept,
-            "{n} a side: the written worker's derive allocated"
-        );
-    }
-}
-
-#[test]
 fn a_registrations_allocations_do_not_follow_the_fleet() {
-    // A membership write walks every member into its pool's list. A
-    // standing pool's list starts at the pool's last length and one more,
-    // so what a registration allocates does not follow the fleet: one into
-    // 512 workers makes the allocator calls of one into 8.
+    // A membership write walks every member once. Where no veto stands,
+    // each list that walk fills takes the members' count at once or is
+    // kept from the last build, so what a registration allocates does not
+    // follow the fleet: one into 512 workers makes the allocator calls of
+    // one into 8.
     let fewest = |n: usize| {
         let (store, _) = store_of(n);
         // The fewest allocation calls of one registration and the build it

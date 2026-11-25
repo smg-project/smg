@@ -62,6 +62,12 @@ pub(in crate::engine) struct InForce {
     /// No stage and no count, over the engine's session table: what hears
     /// a word older than every stage the document kept.
     table: Engine,
+    /// The generation the engine's session table hears leases from, in
+    /// each of the views above ([`Engine::table_from`]): `0`, every lease,
+    /// where one engine object takes each document of its host, and the
+    /// object's first generation where its host builds one for each
+    /// document ([`InProcess::with_origin`]).
+    first: u64,
     /// The kinds of event the document takes ([`Lifecycle::hears`]), read
     /// once, here. A document that takes no word on a lease
     /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
@@ -124,18 +130,23 @@ pub(in crate::engine) struct InForce {
 
 impl InForce {
     /// What the engine holds of `spec`, under the next number of the
-    /// process.
-    pub(super) fn of(spec: AppliedSpec) -> Self {
+    /// process. `first` is the generation its session table hears an
+    /// older request's lease from ([`Self::first`]).
+    pub(super) fn of(spec: AppliedSpec, first: u64) -> Self {
         let samples = spec.engine().explain_sample() != 0;
         let hears = spec.engine().hears();
         let hears_beside_table = spec.engine().hears_beside_table();
         let needs = spec.needs();
         let any_shadow = spec.engine().seat_flags() & SHADOWS != 0;
         let engine = spec.engine();
-        let kept = |since| (since, engine.hearing(|made| made <= since));
+        let kept = |since| {
+            let stood = engine.hearing(|made| made <= since);
+            (since, stood.table_from(first))
+        };
         Self {
             older: engine.kept_since().into_iter().map(kept).collect(),
-            table: engine.hearing(|_| false),
+            table: engine.hearing(|_| false).table_from(first),
+            first,
             hears,
             hears_beside_table,
             leases_or_samples: hears.intersects(EventSet::LEASE) || samples,
@@ -153,8 +164,9 @@ impl InForce {
 
     /// What hears a word of a lease issued under `generation`, an earlier
     /// one than the document's: the stages the document kept that stood
-    /// under that generation, and the session table. A stage built since
-    /// hears none of it: it never heard that lease's issue. The lease's
+    /// under that generation, and the session table where it stood then
+    /// too ([`Self::first`]). A stage built since hears none of it: it
+    /// never heard that lease's issue. The lease's
     /// dispatch is counted apart, by every count of sends in force
     /// ([`lease_events::of_host`](crate::engine::lease_events::of_host)).
     pub(super) fn stood_at(&self, generation: u64) -> &Engine {
@@ -381,7 +393,7 @@ impl InProcess {
         let ids = self.members.standing_ids();
         spec.share_sessions(Arc::clone(&self.sessions));
         spec.keep_from(&standing.spec);
-        let next = Arc::new(InForce::of(spec));
+        let next = Arc::new(InForce::of(spec, standing.first));
         // The stages built new hear the workers that stand before a
         // decision reads them: each as joined, then the list of them, as
         // the task's whole read of the registry says it. A stage kept
@@ -462,6 +474,42 @@ impl InProcess {
             object: self,
             document,
         }
+    }
+
+    /// What hears a word of a lease issued under `generation`, an earlier
+    /// one than the document in force ([`StoodAt`]). It is what a guard's
+    /// earlier lease is told to ([`DecisionEngine::say`]). A store reads it
+    /// here for a lease on its file. One read of the document
+    /// ([`Self::in_force`]), held with the value.
+    ///
+    /// [`DecisionEngine::say`]: crate::engine::DecisionEngine::say
+    #[cfg(feature = "controller")]
+    pub(crate) fn stood_at(&self, generation: u64) -> StoodAt {
+        StoodAt {
+            document: self.in_force(),
+            generation,
+        }
+    }
+}
+
+/// What hears a word of a lease issued under an earlier generation than
+/// the document in force, for as long as the value is held
+/// ([`InProcess::stood_at`]). It holds one entry's read of the
+/// document ([`AtEntry`]), so it stays on its thread: its holder keeps it
+/// for one telling, in a function that does not wait.
+#[cfg(feature = "controller")]
+pub(crate) struct StoodAt {
+    document: AtEntry,
+    generation: u64,
+}
+
+#[cfg(feature = "controller")]
+impl StoodAt {
+    /// The stages and the counts of sends the document kept that stood
+    /// under the generation, over the session table
+    /// ([`InForce::stood_at`]).
+    pub(crate) fn engine(&self) -> &Engine {
+        self.document.stood_at(self.generation)
     }
 }
 

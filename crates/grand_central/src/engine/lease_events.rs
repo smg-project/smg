@@ -10,12 +10,12 @@
 //! A controller keeps a file of leases and lends a lease back from it in
 //! the same form (`Sides::with_held_single`, `Sides::with_held_pair`), so
 //! [`single`] and [`pair`] are the one rule of a lease's words under either
-//! host. The host says who hears ([`Hearers`]): a controller's word may
-//! come behind a later document's start, where the engine that issued the
-//! lease is gone and the standing one counts the send. A host that holds
-//! its decisions keeps one engine object across its documents: behind a
-//! later document the stages that document kept hear the lease's words,
-//! and every count of sends in force takes its dispatch ([`of_host`]).
+//! host. The host says who hears ([`Hearers`]). Behind a later document's
+//! start the stages that document kept hear a lease's words, and every
+//! count of sends in force takes its dispatch, under either host: a
+//! controller builds an engine object for each document, which keeps the
+//! standing one's stages, and a host that holds its decisions keeps one
+//! engine object across its documents ([`of_host`]).
 //!
 //! A single request its binding's sessions rule keeps from the profile is
 //! told to the session table at its dispatch, and to no stage ahead of its
@@ -77,10 +77,11 @@ pub(crate) fn stages_hear(decision: &Decision) -> bool {
 /// them in its one order ([`single`], [`pair`]): a host says which engine
 /// is which.
 pub(crate) struct Hearers<'a, L> {
-    /// The engine the lease was issued under, where it still stands: its
-    /// session table and its stages hear the lease's words. `None` behind
-    /// a later document's start: that document's stages never heard the
-    /// issue, and hear no word of the lease.
+    /// The engine the lease was issued under, or behind a later document's
+    /// start what that document kept of its stages: its stages hear the
+    /// lease's words, and its session table where that stood at the issue
+    /// (`Engine::table_from`). A stage built since never heard the issue,
+    /// and hears no word of the lease. `None`: no stage hears.
     pub issuing: Option<&'a Engine>,
     /// The engine whose counts of sends take a dispatch. A send is its
     /// host's, whatever document decided it: the standing engine counts
@@ -225,9 +226,9 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
 /// The hearers are a single's ([`Hearers`]). The counts of sends are those
 /// of the engine that counts its host's sends, and a count asks the host's
 /// test of a rank it does not know. The session table and the stages are
-/// those of the engine that issued the lease: behind a later document's
-/// start none of them hears a word of it, a chosen decode's issue among
-/// them.
+/// those its host names as the issuing engine's ([`Hearers::issuing`]):
+/// where it names none, none of them hears a word of the lease, a chosen
+/// decode's issue among them.
 ///
 /// Every word behind a side's issue carries the instant of the pair's first
 /// decision, as a lease on file does. The decode's end names the index its

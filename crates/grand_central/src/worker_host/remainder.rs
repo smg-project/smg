@@ -247,7 +247,7 @@ mod tests {
     use crate::{
         engine::{
             demands::DemandFacts,
-            view::{Role, WireModes},
+            view::{Role, WireModes, WorkerId},
         },
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
@@ -255,7 +255,7 @@ mod tests {
             GatewayId, HealthPolicy, MemoryStore, Overload, Reachability, Registrant, Signals,
             WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore as _,
         },
-        worker_host::{Members, Objects},
+        worker_host::{objects::stand, Members, Objects},
     };
 
     fn holder() -> Objects<Members> {
@@ -316,10 +316,15 @@ mod tests {
         assert_eq!(read, stood, "{case}");
     }
 
-    /// Follow `store`, then hold every row of it against the row its object
-    /// and its remainder state. Return how many rows were held.
+    /// Write the row `facts` state through the holder: the row's id.
+    fn laid(objects: &Objects<Members>, store: &MemoryStore, facts: WorkerFacts) -> WorkerId {
+        let written = objects.upsert(store, facts, Registrant::Control);
+        written.expect("the store takes the write").id()
+    }
+
+    /// Hold every row of `store` against the row its object and its
+    /// remainder state. Return how many rows were held.
     fn read_back(store: &MemoryStore, objects: &Objects<Members>, case: &str) -> usize {
-        objects.follow(store);
         let (_, rows) = store.all_rows();
         for stood in &rows {
             let object = objects.object(stood.id).expect("the row's object");
@@ -496,7 +501,7 @@ mod tests {
             let fleet = fleet();
             let rows = fleet.len();
             for facts in fleet {
-                store.upsert(facts);
+                laid(&objects, &store, facts);
             }
             assert_eq!(read_back(&store, &objects, case), rows);
         }
@@ -509,20 +514,21 @@ mod tests {
     fn a_rows_maker_its_status_and_its_later_lives_read_back() {
         const URL: &str = "http://w:8000";
         let store = MemoryStore::new();
-        let objects = holder().with_status_followed();
+        let objects = holder();
         let maker = Registrant::provider("found", "one").expect("a maker");
-        let id = store.upsert_by(at(URL), maker).id();
-        store.upsert(at("http://control:8000"));
+        let written = objects.upsert(&store, at(URL), maker);
+        let id = written.expect("the store takes the write").id();
+        laid(&objects, &store, at("http://control:8000"));
         assert_eq!(read_back(&store, &objects, "two makers"), 2);
 
+        // A status stands on the object, and the store is told it.
         for status in [
             WorkerStatus::Ready,
             WorkerStatus::NotReady,
             WorkerStatus::Failed,
             WorkerStatus::Draining,
         ] {
-            let revision = store.get(id).expect("the row").revision;
-            store.set_status(id, status, revision).expect("a move");
+            stand(&objects, &store, id, status);
             read_back(&store, &objects, &format!("{status:?}"));
         }
 
@@ -535,7 +541,7 @@ mod tests {
                 waiting_requests: None,
             }),
         };
-        store.patch(id, patch, revision).expect("a patch");
+        objects.patch(&store, id, patch, revision).expect("a patch");
         read_back(&store, &objects, "a patch");
         let object = objects.object(id).expect("the row's object");
         let first = objects.remainder(&object).expect("the remainder");
@@ -543,20 +549,19 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &again), "one remainder a row laid");
         assert!(first.standing.revision > revision);
 
-        let next = store
-            .upsert(WorkerFacts {
-                incarnation: 2,
-                vision: true,
-                ..at(URL)
-            })
-            .id();
+        let next = WorkerFacts {
+            incarnation: 2,
+            vision: true,
+            ..at(URL)
+        };
+        let next = laid(&objects, &store, next);
         assert_ne!(next, id);
         assert_eq!(read_back(&store, &objects, "another life"), 2);
         assert_eq!(objects.object(id), None);
 
         let object = objects.object(next).expect("the row's object");
         let revision = store.get(next).expect("the row").revision;
-        store.remove(next, revision).expect("a removal");
+        objects.remove(&store, next, revision).expect("a removal");
         assert_eq!(read_back(&store, &objects, "a removal"), 1);
         assert_eq!(objects.row_of(&object), None);
         assert_eq!(objects.remainder(&object), None);
@@ -572,7 +577,8 @@ mod tests {
         let registry = Arc::new(WorkerRegistry::new());
         let objects = Objects::new(Arc::clone(&registry));
         let first = Registrant::provider("found", "one").expect("a maker");
-        let id = store.upsert_by(at(URL), first).id();
+        let written = objects.upsert(&store, at(URL), first);
+        let id = written.expect("the store takes the write").id();
         assert_eq!(read_back(&store, &objects, "the first history"), 1);
         let object = objects.object(id).expect("the row's object");
         let built = registry.get(&object).expect("the object");
@@ -581,7 +587,7 @@ mod tests {
         let other = MemoryStore::new();
         let second = Registrant::provider("found", "two").expect("a maker");
         assert_eq!(other.upsert_by(at(URL), second.clone()).id(), id);
-        assert!(store.restore_from(other.checkpoint()));
+        assert!(objects.restore_from(&store, other.checkpoint()));
         assert_eq!(read_back(&store, &objects, "another history"), 1);
 
         let after = objects.remainder(&object).expect("the remainder");
@@ -747,14 +753,14 @@ mod tests {
         for (fact, change) in moves() {
             let store = MemoryStore::new();
             let objects = holder().with_host_local_unchecked();
-            let id = store.upsert(stated()).id();
+            let id = laid(&objects, &store, stated());
             assert_eq!(read_back(&store, &objects, fact), 1);
             let object = objects.object(id).expect("the row's object");
 
             let mut facts = stated();
             change(&mut facts);
             assert_ne!(facts, stated(), "{fact}: the fact moved");
-            assert_eq!(store.upsert(facts).id(), id, "{fact}: one life");
+            assert_eq!(laid(&objects, &store, facts), id, "{fact}: one life");
             assert_eq!(read_back(&store, &objects, fact), 1);
             let again = objects.object(id);
             assert_eq!(again.as_ref(), Some(&object), "{fact}: the object's id");
@@ -762,18 +768,18 @@ mod tests {
 
         let store = MemoryStore::new();
         let objects = holder().with_host_local_unchecked();
-        let id = store.upsert(stated()).id();
+        let id = laid(&objects, &store, stated());
         let beside = WorkerFacts {
             key: "grpc://engine:9000@2".to_owned(),
             ..stated()
         };
-        assert_ne!(store.upsert(beside).id(), id);
+        assert_ne!(laid(&objects, &store, beside), id);
         assert_eq!(read_back(&store, &objects, "key"), 2);
         let next = WorkerFacts {
             incarnation: 4,
             ..stated()
         };
-        assert_ne!(store.upsert(next).id(), id);
+        assert_ne!(laid(&objects, &store, next), id);
         assert_eq!(read_back(&store, &objects, "incarnation"), 2);
         assert_eq!(objects.object(id), None);
     }

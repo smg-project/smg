@@ -2202,8 +2202,9 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// it refuses one whose bindings differ on either word. With no document
 /// supplied it reads its own two settings. A controller that judges on its
 /// worker objects reads the switch there too, at each document that takes
-/// force: its default is off where every binding switches it off, and
-/// bindings that differ keep it on.
+/// force: its default is off where every binding switches it off. It
+/// refuses a document whose bindings differ on the switch, as a gateway
+/// does.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
@@ -2271,23 +2272,34 @@ pub enum OverloadSwitch {
     /// Every binding says off.
     Off,
     /// The bindings differ. What becomes of the default then is the rule
-    /// of the host that reads the word.
+    /// of the host that reads the word: a controller refuses the document
+    /// where it is handed one, by the first binding that differs.
     Differ,
 }
 
 impl OverloadSwitch {
     /// The word `bindings` say, taken together.
     fn of(bindings: &[BindingSpec]) -> Self {
-        let on =
-            |binding: &&BindingSpec| binding.overload.as_ref().is_none_or(|block| block.enabled);
-        let ons = bindings.iter().filter(on).count();
-        if ons == bindings.len() {
-            Self::On
-        } else if ons == 0 {
-            Self::Off
-        } else {
-            Self::Differ
+        match (Self::differs(bindings), bindings.first().map(Self::says)) {
+            (Some(_), _) => Self::Differ,
+            (None, Some(false)) => Self::Off,
+            (None, _) => Self::On,
         }
+    }
+
+    /// Whether `binding` says on, by its block or by the block's default.
+    fn says(binding: &BindingSpec) -> bool {
+        binding.overload.as_ref().is_none_or(|block| block.enabled)
+    }
+
+    /// The first of `bindings` that says another word than the first one
+    /// does: its place and its word. None where they say one word. The
+    /// one reading of the bindings' words: [`OverloadSwitch::Differ`] is
+    /// the word of the bindings this names a place in.
+    pub(crate) fn differs(bindings: &[BindingSpec]) -> Option<(usize, bool)> {
+        let first = Self::says(bindings.first()?);
+        let mut words = bindings.iter().map(Self::says).enumerate();
+        words.find(|&(_, says)| says != first)
     }
 }
 
@@ -2390,7 +2402,7 @@ pub struct SessionsSpec {
     /// Whether a single request this rule placed alone is the profile's
     /// own (default `told`). Under `untold` no stage hears that request's
     /// issue or its dispatch, it is none of the profile's sends, and
-    /// neither the engine's record of sent prefixes nor a lent token tree
+    /// neither the engine's record of sent prefixes nor a lent tree
     /// takes its prompt. The session table still hears its dispatch,
     /// and the stages its completion and its release. A pair's sides are
     /// told under either word. A controller keeps the word on the lease it
@@ -6032,8 +6044,8 @@ impl AppliedSpec {
         self.decode_pick
     }
 
-    /// The lists this generation declares, as a store reads them when it
-    /// writes a worker's row.
+    /// The lists this generation declares: a worker's candidate row is
+    /// written under them, and a store counts the members outside them.
     #[must_use]
     pub fn lists(&self) -> &ViewLists {
         &self.lists
@@ -6048,8 +6060,8 @@ impl AppliedSpec {
     }
 }
 
-/// The lists a generation declares, as a store reads them when it writes a
-/// worker's row ([`Candidate`](crate::engine::view::Candidate)): the row names its
+/// The lists a generation declares, as the writer of a worker's candidate
+/// row ([`Candidate`](crate::engine::view::Candidate)) reads them: the row names its
 /// engine family and its zone by a position from 1, and holds one bit for
 /// each label selector the worker meets. Built once, at validation.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -9720,6 +9732,51 @@ mod tests {
         let no_binding = AppliedSpec::validate(&unbound).expect("the document validates");
         assert_eq!(no_binding.overload_switch(), OverloadSwitch::On);
         assert_eq!(AppliedSpec::unbound().overload_switch(), OverloadSwitch::On);
+    }
+
+    /// The first binding that says another word than the first one does is
+    /// handed by its place and its word, and none where the bindings say
+    /// one word. It is the one reading of the bindings' words: a document
+    /// has a place to name exactly where its word is that they differ.
+    #[test]
+    fn the_first_binding_that_differs_on_the_overload_switch_is_handed_by_its_place() {
+        let heads = [
+            r#"{"match":{"model":"chat/*"},"profile":"p""#,
+            r#"{"match":{"model":"code/*"},"profile":"p""#,
+            r#"{"profile":"p""#,
+        ];
+        let document = |words: [Option<bool>; 3]| {
+            let bindings = heads.iter().zip(words).map(|(head, word)| {
+                let block = word.map_or_else(String::new, |enabled| {
+                    format!(r#","overload":{{"enabled":{enabled}}}"#)
+                });
+                format!("{head}{block}}}")
+            });
+            let bindings: Vec<_> = bindings.collect();
+            doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"pick":"best"}}}},"bindings":[{}]}}"#,
+                bindings.join(",")
+            ))
+        };
+        let (on, off) = (Some(true), Some(false));
+        let cases = [
+            ([None, None, None], None),
+            ([off, off, off], None),
+            ([on, None, on], None),
+            ([None, off, off], Some((1, false))),
+            ([off, off, None], Some((2, true))),
+            ([off, on, None], Some((1, true))),
+            ([on, None, off], Some((2, false))),
+        ];
+        for (words, place) in cases {
+            let document = document(words);
+            let differs = OverloadSwitch::differs(&document.bindings);
+            assert_eq!(differs, place, "{words:?}");
+            let applied = AppliedSpec::validate(&document).expect("the document validates");
+            let differ = applied.overload_switch() == OverloadSwitch::Differ;
+            assert_eq!(differ, place.is_some(), "{words:?}");
+        }
+        assert_eq!(OverloadSwitch::differs(&[]), None, "no binding");
     }
 
     #[test]
