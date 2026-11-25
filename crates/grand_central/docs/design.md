@@ -1180,7 +1180,7 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 
    | Picker | Its rule |
    |---|---|
-   | round robin | It takes the next turn of the list's counter and takes the worker it lands on if that worker is eligible. Where it is not, the engine reads the list once and the rotation picks among the eligible workers. A thread's first turns of a list are single steps of the counter, 64 for each worker; past them the thread takes 61 turns at once (67 where 61 divides the list's size, one where 67 does too) and plays them in order, for four lists at a time. |
+   | round robin | It adds one to the list's counter and takes the worker it lands on if that worker is eligible. Where it is not, the engine reads the list once and the rotation picks among the eligible workers. |
    | `random` | It draws a position below the list's size from the calling thread's own draw sequence, and again while the worker drawn is not eligible, eight draws at most. Past them the engine reads the list once and draws among the eligible workers. |
    | `passthrough` | It takes the first eligible worker in the list's order. |
 
@@ -1286,12 +1286,6 @@ On the short path a decision allocates only for what is kept for later decisions
 - the calling thread's list of the eligible workers, where the engine reads the list once (step 1);
 - the sample's ring, at the first decision a document keeps (decision 7).
 
-Under round robin not every decision writes the list's
-counter: past a thread's first turns of a list, 64 for each worker, the thread takes 61 turns of the
-counter in one write (67 where 61 divides the list's size, one where 67 does too), and between two
-such writes a pick whose turn the filters keep writes the thread's own run alone. A thread keeps
-such runs for four lists; a fifth writes the counter on every pick until one of the four places
-goes unused.
 A draw that looked up load reports counts them toward its
 list's conversion where it takes the list's claim, which it tries and never waits for.
 
@@ -3085,7 +3079,7 @@ All seventeen at a glance. An answer can be as short as the numbers with their l
 | 11 | The crate in CI and in the published set | closed inside the crate: the feature `controller` takes the engine's feature; (a) out of the published set until stage 3, and as it went (b): the crate stayed in it | CI's run of the kept engine's tests; stage 0 |
 | 12 | The last report of a worker whose load call fails | (a) the engine alone reads it, about 40 seconds at most at the default poll | rule 6, for the documents whose stages read load reports |
 | 13 | Where a capped sessions rule moves a pair's prefill pin | (a) where the pair forms | rule 6, for a pair under a sessions rule that states a cap |
-| 14 | Round robin's order across deciding threads | recorded, the answer is open: (a) a thread takes a list's turns in runs | rule 6, for `round_robin` where several threads decide |
+| 14 | Round robin's order across deciding threads | recorded, the answer is open: (b) every pick takes one step of the counter | rule 6, for `round_robin` where several threads decide |
 | 15 | The workers a session's first request reads | recorded, the answer is open: (a) the workers its turn asks about | rule 6, for a sessions rule that leaves a new key to round robin |
 | 16 | `least_load`'s count of a request that is never sent | decided 2026-11-24: (a) the engine counts a send at its dispatch | rule 6, for `least_load` where a route refuses a request behind its selection |
 | 17 | The pick among workers that tie at the fewest requests | decided 2026-11-25: (a) the engine draws among them | rule 6, for `prefix_hash` where it places a request by load |
@@ -3344,26 +3338,27 @@ Classic's round robin takes one step of its list's counter at every pick
 workers in one order. Where every worker can take a request, the picks of two workers differ by one
 at most.
 
-The engine's round robin takes single steps too for a thread's first turns of a list, 64 for each
-worker. Past them the thread takes a run of the counter's turns in one write, 61 as a rule, and
-plays them in order (section 5.6; `row_of` in `policies/round_robin.rs`). Between two such writes a
-pick whose turn the filters keep writes no word that the deciding threads share.
+The engine's round robin takes one step of its list's counter at every pick too
+(`policies/round_robin.rs`), so requests decided on any threads take the list's workers in one
+order as well, one after the other as the list holds them. The two start a list at workers of
+their own: classic starts its first list at that list's first worker, the engine starts each list
+at a drawn worker.
 
-So where several threads decide, the engine's picks follow no one order: inside a run a thread
-takes the list's workers one after the other. Where the filters keep every worker and the counter
-has not wrapped, the picks of two workers differ by one at most, and by one more for each run that
-is not played out: the run a deciding thread holds, and each run that was left behind. Where one
-thread alone has decided over a list, it takes the list's workers in the order single steps give,
-for as long as the list keeps its place among the thread's four. A list made anew where a dropped
-list of the same size stood first plays the turns the thread had left of that one, fewer than one
-run.
+The other form takes a thread's turns of a list in runs: single steps for the thread's first turns,
+64 for each worker, and past them a run of the counter's turns in one write, 61 as a rule, played
+in order. Between two such writes a pick whose turn the filters keep writes no word that the
+deciding threads share. Where several threads decide, the picks then follow no one order: inside a
+run a thread takes the list's workers one after the other, so two requests decided at one moment
+can go to one worker while another worker has none. Where the filters keep every worker and the
+counter has not wrapped, each worker still takes its even share, to within one pick and one more
+for each run that is not played out.
 
 | Option | Cost |
 |---|---|
-| (a) A thread takes a list's turns in runs. | Where several threads decide, the order of the picks differs from classic's, and the even share is bounded as above and not exact. |
-| (b) Every pick takes one step of the counter, as classic does. | The two agree. Every pick writes one word that all deciding threads share, and a decision slows as deciding threads are added, by the count of the change that took the runs. |
+| (a) A thread takes a list's turns in runs. | Where several threads decide, the order of the picks differs from classic's: requests decided together can share a worker while another has none, and the even share is bounded as above and not exact. |
+| (b) Every pick takes one step of the counter, as classic does. | The two agree. Every pick writes one word that all deciding threads share, and a decision slows as deciding threads are added. |
 
-**Recorded, not decided.** (a) is on main. The maintainer's answer is open.
+**Recorded, not decided.** (b) is on main. The maintainer's answer is open.
 
 ### Decision 15: the workers a session's first request reads
 
