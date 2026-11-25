@@ -137,9 +137,9 @@ fn own_failure(response: &Response) -> Option<PdSide> {
         .map(|&OwnFailure(side)| side)
 }
 
-/// The status a side's call that failed below HTTP is recorded with on the
-/// route that sends both sides at once: the gateway's 504 for the request's
-/// own timeout, else the 502. The side's end is told with it.
+/// The status recorded for a side's call that failed below HTTP, on the
+/// route that sends both sides at once. It is the gateway's 504 for the
+/// request's own timeout, else the 502. The side's end is told with it.
 fn below_http_status(e: &reqwest::Error) -> StatusCode {
     if is_request_timeout(e) {
         StatusCode::GATEWAY_TIMEOUT
@@ -1836,9 +1836,10 @@ impl PDRouter {
                     // Through the request's charges: retried attempts whose
                     // drains all fail charge the worker once.
                     charges.record_outcome(prefill.as_ref(), drained.as_u16());
-                    // The drain owns the prefill's guard to its end, and tells
-                    // the prefill's end through it: the status it charges,
-                    // the worker's own where the body was read to its end.
+                    // The drain owns the prefill's guard to its end, and
+                    // tells the prefill's end through it. It tells the
+                    // status it charges: the worker's own where the body
+                    // was read to its end.
                     prefill_guard
                         .end()
                         .report(drained.as_u16(), || drained.is_success());
@@ -2694,9 +2695,9 @@ impl PDRouter {
             header_utils::insert_routed_worker_id(response.headers_mut(), decode.redacted_url());
             // The decode's answer read whole is told here for every shape,
             // through its guard, with the status the route records on its
-            // worker. A status of 500 and over is the route's own, made of a
-            // body it gave up: one over the limit is the worker's answer
-            // still, and one whose read failed is not.
+            // worker. A status of 500 and over is the route's own, made of
+            // a body it gave up. A body over the limit is the worker's
+            // answer still, and one whose read failed is not.
             RequestEnd::of(&decode_guard)
                 .report(response.status().as_u16(), || worker_answered(&response));
             if let Some(ledger) = outcome_ledger {
@@ -9708,12 +9709,12 @@ mod tests {
         worker
     }
 
-    /// A streamed pair tells both ends from tasks of their own: the
-    /// prefill's drain through the guard it owns, and the decode's relay
-    /// through the handle the route asked of the decode's guard, behind the
-    /// body's last byte. A decode stream cut behind its good head is told as
-    /// a failed connection, as the relay accounts it, and leaves the prefill
-    /// its own answer.
+    /// A streamed pair tells both ends from tasks of their own. The
+    /// prefill's drain tells through the guard it owns. The decode's relay
+    /// tells through the handle the route asked of the decode's guard,
+    /// behind the body's last byte. A decode stream cut behind its good
+    /// head is told as a failed connection, as the relay accounts it, and
+    /// leaves the prefill its own answer.
     #[tokio::test]
     async fn the_engine_hears_both_ends_of_a_streamed_pair() {
         for (cut, decode_end) in [
@@ -9745,13 +9746,14 @@ mod tests {
     }
 
     /// Each side of a pair is told its own answer where its route records
-    /// that side, row by row on both dispatch shapes: the status its worker
-    /// answered, as the worker's own, or the status the route made of its
-    /// failed call, as no answer of the worker's. A side the gateway dropped
-    /// is told by nobody: a decode that was never sent is released, and the
-    /// partner of a side that failed first ends with no status. Where both
-    /// sides go out at once and the decode fails, the prefill's server never
-    /// answers, so the prefill is in flight when it is dropped.
+    /// that side, row by row on both dispatch shapes. It is told the status
+    /// its worker answered, as the worker's own. Or it is told the status
+    /// the route made of its failed call, as no answer of the worker's. A
+    /// side the gateway dropped is told by nobody: a decode that was never
+    /// sent is released, and the partner of a side that failed first ends
+    /// with no status. Where both sides go out at once and the decode
+    /// fails, the prefill's server never answers, so the prefill is in
+    /// flight when it is dropped.
     #[tokio::test]
     async fn the_engine_hears_each_sides_own_answer_where_a_side_fails() {
         use Fault::{CutAfterHead, Refuses, Unreachable};
@@ -9936,14 +9938,14 @@ mod tests {
     }
 
     /// The request's own timeout on a pair. One behind the other, the side
-    /// whose call met it is told the timeout, a prefill that had answered
+    /// whose call met it is told the timeout. A prefill that had answered
     /// was told its answer, and a decode that was never sent is released.
     /// Both at once, the engine hears the timeout on the decode always, as
-    /// the attempt records it. On the prefill it hears the timeout where the
-    /// prefill's own call met it, the prefill's own answer where it had
-    /// answered, and nothing where the prefill was still in flight. The
-    /// breaker's record differs in those last two: the attempt's 504 is
-    /// recorded on both workers.
+    /// the attempt records it. On the prefill it hears the timeout where
+    /// the prefill's own call met it, and the prefill's own answer where it
+    /// had answered. It hears nothing where the prefill was still in
+    /// flight. The breaker's record differs in those last two: the
+    /// attempt's 504 is recorded on both workers.
     #[tokio::test]
     async fn the_engine_hears_the_requests_own_timeout_by_what_each_side_had_done() {
         use std::time::Duration;
@@ -10021,7 +10023,7 @@ mod tests {
     /// on that side: the worker answered, and the route refused what it
     /// gave. One behind the other the prefill's handoff is over
     /// the limit and the decode is never sent. Both at once the decode's
-    /// body is over it behind a good prefill, or the prefill's body is,
+    /// body is over it behind a good prefill. Or the prefill's body is,
     /// which the route reads whole where the request asks for logprobs, and
     /// the decode is dropped.
     #[tokio::test]
@@ -10098,8 +10100,8 @@ mod tests {
         }
     }
 
-    /// A prefill's body the route reads whole, where the request asks for
-    /// logprobs, and that its worker cuts short is told as a failed
+    /// The route reads a prefill's body whole where the request asks for
+    /// logprobs. One that its worker cuts short is told as a failed
     /// connection: the refusal is the route's own, and no answer of the
     /// worker's stands. The decode is dropped.
     #[tokio::test]
@@ -10134,7 +10136,7 @@ mod tests {
         );
     }
 
-    /// A fan-out of more than one answer sends no prefill: the route lets
+    /// A fan-out of more than one answer sends no prefill. The route lets
     /// the prefill's guard go unsent and tells its end nothing, and the
     /// decode is told its own answer.
     #[tokio::test]
@@ -10176,9 +10178,9 @@ mod tests {
     }
 
     /// A MoRI-IO pair written concurrently tells the side that answered and
-    /// leaves the side it dropped to nobody: a decode that refuses, or whose
-    /// call fails, while its prefill is in flight, and a prefill that
-    /// refuses while its decode is.
+    /// leaves the side it dropped to nobody. The rows: a decode that
+    /// refuses, or whose call fails, while its prefill is in flight, and a
+    /// prefill that refuses while its decode is.
     #[tokio::test]
     async fn the_engine_hears_the_side_that_answered_of_a_pair_written_concurrently() {
         use Fault::{Refuses, Unreachable};
@@ -10230,11 +10232,11 @@ mod tests {
         }
     }
 
-    /// The count route places one prefill worker and keeps its answer to its
-    /// end: the engine hears the count's outcome beside each record on the
-    /// worker, the worker's own status where it answered, a failed
-    /// connection where its call failed below HTTP, and the server's error
-    /// where its answer was over the payload limit.
+    /// The count route places one prefill worker and keeps its answer to
+    /// its end. The engine hears the count's outcome beside each record on
+    /// the worker. It hears the worker's own status where it answered, and
+    /// a failed connection where its call failed below HTTP. It hears the
+    /// server's error where its answer was over the payload limit.
     #[tokio::test]
     async fn the_engine_hears_a_count_requests_outcome() {
         // (the worker's fault, a payload limit under its answer, the end)

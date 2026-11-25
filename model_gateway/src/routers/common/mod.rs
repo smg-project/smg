@@ -653,16 +653,15 @@ pub mod bench_support {
         Some(went)
     }
 
-    /// [`route_pair`] on a route that tells each side's end, with both
-    /// loads standing where they are, shown to an opaque reader: the
-    /// prefill's as a pair route holds it with no admission bound
-    /// ([`hold_unbounded`]), the decode's as its guard. Under
-    /// [`Ended::Answer`] each side is told through its guard, as a pair
-    /// read whole. Under [`Ended::Streamed`] the prefill is told through
-    /// its guard, and the decode's reader reports through the handle
-    /// asked of the decode's guard. A pair route keeps no answer, and
-    /// the gRPC stage's forms are a single request's: every other form
-    /// ends as [`Ended::Passed`] does.
+    /// [`route_pair`] on a route that tells each side's end. Both loads
+    /// stand where they are, shown to an opaque reader: the prefill's as a
+    /// pair route holds it with no admission bound ([`hold_unbounded`]),
+    /// the decode's as its guard. Under [`Ended::Answer`] each side is told
+    /// through its guard, as a pair read whole. Under [`Ended::Streamed`]
+    /// the prefill is told through its guard, and the decode's reader
+    /// reports through the handle asked of the decode's guard. A pair route
+    /// keeps no answer, and the gRPC stage's forms are a single request's:
+    /// every other form ends as [`Ended::Passed`] does.
     pub fn route_pair_ended(
         registry: &WorkerRegistry,
         policies: &PolicyRegistry,

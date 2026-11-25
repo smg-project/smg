@@ -110,11 +110,11 @@
 //! answer read whole: the route reports through the answer it keeps past
 //! its guard. It is counted against `kept`, which keeps that answer and
 //! reports nothing. A pair route tells each side through that side's own
-//! guard: `answer` is a pair read whole, and under `streamed` the prefill
-//! is told through its guard while the decode's reader reports through
-//! the handle asked of the decode's guard. Both are counted against
-//! `passed`. A pair route keeps no answer, so a pair cell takes no `kept`,
-//! and none of the forms below, which are a single request's.
+//! guard. `answer` is a pair read whole. Under `streamed` the prefill is
+//! told through its guard, and the decode's reader reports through the
+//! handle asked of the decode's guard. Both are counted against `passed`. A
+//! pair route keeps no answer, so a pair cell takes no `kept`, and none of
+//! the forms below, which are a single request's.
 //!
 //! `told` is a single request of the gRPC execution stage, behind a
 //! dispatch that answered: the stage asks its selection whether the request
