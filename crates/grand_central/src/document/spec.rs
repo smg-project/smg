@@ -2754,8 +2754,9 @@ pub struct PolicySpec {
         "propertyNames" = { "pattern": SIGNAL_NAME_PATTERN }
     ))]
     pub signals: BTreeMap<String, SignalSpec>,
-    /// The profiles by name.
+    /// The profiles by name, each of at least one character.
     #[serde(deserialize_with = "keyed_once")]
+    #[schemars(extend("propertyNames" = { "minLength": 1 }))]
     pub profiles: BTreeMap<String, ProfileSpec>,
     /// The plans' rules.
     #[serde(default, skip_serializing_if = "is_default")]
@@ -4238,6 +4239,14 @@ fn check_profile(
     depth: &mut HashDepth,
     sent_credits: &mut Vec<Arc<DispatchCredit>>,
 ) -> Result<Option<BuiltProfile>, SpecError> {
+    // The empty label is the engine's word for no profile.
+    if name.is_empty() {
+        return Err(SpecError::BadField {
+            path: "profiles".to_owned(),
+            value: format!("{name:?}"),
+            reason: "a profile name of at least one character",
+        });
+    }
     let catalog = from.catalog;
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
@@ -10381,6 +10390,14 @@ mod tests {
             refused("apiVersion: smg.policy/v9\nprofiles:\n  default:\n    pick: random\n"),
             "apiVersion"
         );
+        let unnamed: PolicySpec = serde_yaml::from_str(
+            "apiVersion: smg.policy/v1\nprofiles:\n  \"\":\n    pick: random\n",
+        )
+        .expect("a document");
+        assert!(matches!(
+            unnamed.validate(),
+            Err(SpecError::BadField { path, .. }) if path == "profiles"
+        ));
     }
 
     #[test]
