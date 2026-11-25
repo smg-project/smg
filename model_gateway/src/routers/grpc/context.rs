@@ -23,6 +23,7 @@ use openai_protocol::{
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_grpc_client::RequestDeadline;
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerLoadGuard};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
@@ -55,18 +56,21 @@ use super::{
 };
 use crate::{
     config::ParserChoice,
-    middleware::TenantRequestMeta,
+    middleware::{RequestStarted, TenantRequestMeta},
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
         common::{
-            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
-            prefill_admission::PrefillLoadGuard, sse::SseSender,
+            attempt_ledger::AttemptLedger,
+            pd_admission::PdAdmissionGuard,
+            placement::{Placed, RequestEnd, SharedEnd},
+            prefill_admission::{PrefillAhead, PrefillLoadGuard},
+            snapshot::WorkerRegistry,
+            sse::SseSender,
         },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
-    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
     workflow::TokenizerLoadFailures,
 };
 
@@ -360,8 +364,9 @@ pub(crate) struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     /// Prefill admission slot, taken during PD/EPD worker selection and
-    /// handed to the dispatch that runs the Prefill side.
-    pub pd_prefill_guard: Option<PrefillLoadGuard>,
+    /// handed to the dispatch that runs the Prefill side, which says the
+    /// prefill's send.
+    pub pd_prefill_guard: Option<PrefillAhead>,
 
     // Response processing state seeded during ingress (stop decoder, router
     // stop obligations, derived skip_special_tokens).
@@ -378,8 +383,10 @@ pub(crate) struct RoutingSnapshot {
     /// Captured when the prompt has no token ids, or when a configured policy
     /// reads request text next to them.
     pub routing_text: Option<String>,
-    /// rid-derived sticky key, derived once at first selection.
-    pub rid_key: Option<String>,
+    /// The body's `rid`, kept at first selection where a retry reads it: the
+    /// sticky key derives from it again. It stands in the derived key's
+    /// place, so the dispatch context keeps its size class.
+    pub rid: Option<String>,
     /// The request's cache namespace, derived once at first selection.
     pub cache_namespace: Option<CacheNamespace>,
     /// The request carries pixel media (an image or a video), noted at first
@@ -483,9 +490,9 @@ pub(crate) struct DispatchContext {
     /// its last reader and takes it.
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
-    /// Prefill admission slot for the next PD/EPD dispatch; a retry's
-    /// reselection refills it.
-    pub pd_prefill_guard: Option<PrefillLoadGuard>,
+    /// Prefill admission slot for the next PD/EPD dispatch, held ahead of
+    /// the prefill's send; a retry's reselection refills it.
+    pub pd_prefill_guard: Option<PrefillAhead>,
     pub response: ResponseState,
 }
 
@@ -1002,15 +1009,22 @@ pub(crate) struct EncodeWorkerAssignment {
 
 /// Worker selection (Step 2)
 pub(crate) enum WorkerSelection {
-    Single {
-        worker: Arc<dyn Worker>,
-    },
+    /// The one worker of a single request, as its placement answered it: the
+    /// request's load guard is made from the answer ([`LoadGuards::new`]).
+    Single { worker: Placed },
     /// Disaggregated prefill/decode selection. EPD layers per-item encode
     /// assignments on top; plain PD leaves `encode_assignments` unset.
+    ///
+    /// The decode is kept as its placement answered it: its load guard is
+    /// made from the answer ([`LoadGuards::new`],
+    /// [`LoadGuards::behind_prefill`]). The prefill's load is a plain guard
+    /// of its worker, held where the Prefill admission took its slot. What
+    /// its answer owes its send goes with that load ([`PrefillAhead`]), and
+    /// the dispatch says the send where the prefill goes out.
     Disaggregated {
         encode_assignments: Option<Vec<EncodeWorkerAssignment>>,
         prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
+        decode: Placed,
         runtime_type: RuntimeType,
     },
 }
@@ -1083,20 +1097,96 @@ impl Drop for StreamSpan {
 }
 
 impl LoadGuards {
+    /// The guards of an attempt whose every side goes out with the dispatch
+    /// that follows: each is made from its placement's answer, which says
+    /// the dispatch where Grand Central placed the request.
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
+                _guard: worker.guard(routing_key),
             },
             WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
-                _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
+                _decode: decode.guard(routing_key),
             },
         }
+    }
+
+    /// [`Self::new`] for a pair whose decode is owed its ask and its send
+    /// behind its prefill ([`Placed::owed_behind_prefill`]): one request of
+    /// a sequential dispatch that Grand Central placed. A classic
+    /// pair's takes [`Self::new`]. The decode's guard is made
+    /// ahead of its send ([`Placed::ahead`]): the decode is counted from
+    /// here, and the dispatch says its send where the decode goes out
+    /// ([`Self::map_decode`], in `execute_sequential_pd`).
+    pub fn behind_prefill(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
+        match selection {
+            WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
+                _decode: decode.ahead(routing_key),
+            },
+            single @ WorkerSelection::Single { .. } => Self::new(single, routing_key),
+        }
+    }
+
+    /// Hands the decode's guard of a pair to `with` and keeps the guard it
+    /// answers in its place: for the decode asked again, which may move the
+    /// guard to another worker, and for the decode's send. The first decode
+    /// guard of a batch takes the call. Guards that hold no decode's are
+    /// left as they are.
+    pub(crate) fn map_decode(&mut self, with: impl FnOnce(WorkerLoadGuard) -> WorkerLoadGuard) {
+        let Some(held) = self.decode_guards() else {
+            return;
+        };
+        // The decode's guard is moved out for the call and back, where it
+        // stands: the placeholder counts nothing and allocates nothing.
+        let empty = Self::Batch {
+            _guards: Vec::new(),
+        };
+        *held = match std::mem::replace(held, empty) {
+            Self::Disaggregated { _decode } => Self::Disaggregated {
+                _decode: with(_decode),
+            },
+            other => other,
+        };
+    }
+
+    /// The guards that hold a pair's decode guard, under whatever rides
+    /// with them: the first of a batch.
+    fn decode_guards(&mut self) -> Option<&mut Self> {
+        match self {
+            Self::Disaggregated { .. } => Some(self),
+            Self::Batch { _guards } => _guards.iter_mut().find_map(Self::decode_guards),
+            Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => {
+                _guards.decode_guards()
+            }
+            Self::Single { .. } => None,
+        }
+    }
+
+    /// The decode moved to another worker behind its prefill: `claim` is
+    /// what that worker's gate seated for the dispatch, `None` where its
+    /// engine reports no window. It takes the place of the claim at the
+    /// first decode's gate, which is let go here.
+    pub(crate) fn claim_moved(&mut self, claim: Option<PdAdmissionGuard>) {
+        let guards = std::mem::replace(
+            self,
+            Self::Batch {
+                _guards: Vec::new(),
+            },
+        );
+        let guards = match guards {
+            Self::Admitted { _guards, .. } => *_guards,
+            guards => guards,
+        };
+        *self = Self::admitted(claim, guards);
     }
 
     /// Bind an admission claim to the dispatch's guards, so the rooms it
     /// reserved outlive nothing else. `None` (the engine reports no window)
     /// returns the guards untouched.
+    // Always in line: on every request's path, and the call cost more than the body.
+    #[inline(always)]
     pub fn admitted(admission: Option<PdAdmissionGuard>, guards: Self) -> Self {
         match admission {
             Some(admission) => Self::Admitted {
@@ -1125,6 +1215,20 @@ impl LoadGuards {
                     .map(|_| Self::new(selection, routing_key))
                     .collect(),
             }
+        }
+    }
+
+    /// The handle on the end of the single request these guards count
+    /// ([`RequestEnd::of`]), asked of its guard under whatever rides with
+    /// it. A batch's sub-requests are one placement: the first guard made
+    /// from its answer keeps Grand Central's side of it, and that guard
+    /// is asked. A pair's guards hand the empty handle.
+    pub(crate) fn end(&self) -> RequestEnd {
+        match self {
+            Self::Single { _guard } => RequestEnd::of(_guard),
+            Self::Batch { _guards } => _guards.first().map_or_else(RequestEnd::default, Self::end),
+            Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => _guards.end(),
+            Self::Disaggregated { .. } => RequestEnd::default(),
         }
     }
 }
@@ -1161,6 +1265,14 @@ pub(crate) struct ResponseState {
     /// `None` for the shapes whose response carries the engine's counters
     /// unchanged (completion, generate, decisions, embeddings, classify).
     pub engine_counts: Option<TokenCounts>,
+
+    /// The rendered prompt of a chat request that asked for it
+    /// (`return_prompt_text`), kept by request building where the wire lets
+    /// the text go, which is where no media travels with the prompt
+    /// (`backed_plan::build`), and taken by the answer. Here and
+    /// not on the response spec: every attempt but the last dispatches a
+    /// clone of the spec, and the text is moved to the answer, never copied.
+    pub prompt_text: Option<String>,
 
     /// Responses API iteration result (Harmony only, for tool loop
     /// orchestration). Behind a pointer: the field is empty on every other
@@ -1555,7 +1667,7 @@ fn expected_shape(shape: &str) -> ! {
 impl WorkerSelection {
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
-            Self::Single { worker } => Some(worker),
+            Self::Single { worker } => Some(worker.worker()),
             Self::Disaggregated { .. } => None,
         }
     }
@@ -1564,12 +1676,42 @@ impl WorkerSelection {
     /// prefill and decode sides.
     pub fn workers(&self) -> impl Iterator<Item = &Arc<dyn Worker>> {
         let (first, second) = match self {
-            Self::Single { worker } => (worker, None),
+            Self::Single { worker } => (worker.worker(), None),
             Self::Disaggregated {
                 prefill, decode, ..
-            } => (prefill, Some(decode)),
+            } => (prefill, Some(decode.worker())),
         };
         std::iter::once(first).chain(second)
+    }
+
+    /// The handle a single request tells Grand Central its end through
+    /// ([`RequestEnd`]), asked of `guards`, the attempt's
+    /// ([`LoadGuards::end`]). The answer's one word is tested first
+    /// ([`Placed::end_of`]): a request the classic policies placed walks no
+    /// guards and takes the empty handle. Every sub-request of a batch
+    /// takes the handle of the batch's one placement. A pair takes the
+    /// empty handle: nobody tells the engine a pair's end yet.
+    #[inline]
+    pub(crate) fn end(&self, guards: Option<&LoadGuards>) -> RequestEnd {
+        match self {
+            Self::Single { worker } => {
+                worker.end_of(|| guards.map_or_else(RequestEnd::default, LoadGuards::end))
+            }
+            Self::Disaggregated { .. } => RequestEnd::default(),
+        }
+    }
+
+    /// Whether this selection's request tells Grand Central its end:
+    /// the test [`Self::end`] makes ahead of its guards, for a place that
+    /// holds no guards or would make something for the report alone. True
+    /// for a single request whose answer says so ([`Placed::tells_end`]). A
+    /// request the classic policies placed and a pair tell none.
+    #[inline]
+    pub(crate) fn tells_end(&self) -> bool {
+        match self {
+            Self::Single { worker } => worker.tells_end(),
+            Self::Disaggregated { .. } => false,
+        }
     }
 
     /// The engines (base URLs) this selection dispatches to: the one worker,
@@ -1582,14 +1724,14 @@ impl WorkerSelection {
     /// the request's ledger (one failure charge per request per worker).
     pub fn record_outcome(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
-            Self::Single { worker } => ledger.record_outcome(worker.as_ref(), status_code),
+            Self::Single { worker } => ledger.record_outcome(&**worker, status_code),
             Self::Disaggregated {
                 prefill, decode, ..
             } => {
                 // EPD encode dispatch is asynchronous and supervised by
                 // RequestExecution; this records only the prefill/decode side.
                 ledger.record_outcome(prefill.as_ref(), status_code);
-                ledger.record_outcome(decode.as_ref(), status_code);
+                ledger.record_outcome(&**decode, status_code);
             }
         }
     }
@@ -1609,7 +1751,7 @@ impl WorkerSelection {
                 ledger.record_outcome(prefill.as_ref(), status);
             }
             if let Some(status) = decode_status {
-                ledger.record_outcome(decode.as_ref(), status);
+                ledger.record_outcome(&**decode, status);
             }
         }
     }
@@ -1630,7 +1772,7 @@ impl WorkerSelection {
     pub fn record_outcome_decode(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
             Self::Disaggregated { decode, .. } => {
-                ledger.record_outcome(decode.as_ref(), status_code);
+                ledger.record_outcome(&**decode, status_code);
             }
             Self::Single { .. } => {
                 debug!("record_outcome_decode called on Single worker selection, ignoring");
@@ -1646,7 +1788,7 @@ impl WorkerSelection {
         match self {
             Self::Disaggregated {
                 prefill, decode, ..
-            } => Some((prefill, decode)),
+            } => Some((prefill, decode.worker())),
             Self::Single { .. } => None,
         }
     }
@@ -1659,8 +1801,34 @@ impl WorkerSelection {
     }
 
     pub fn decode_worker(&self) -> Option<&Arc<dyn Worker>> {
+        self.decode().map(Placed::worker)
+    }
+
+    /// A pair's decode as its placement answered it, which its load guard
+    /// is made from.
+    pub(crate) fn decode(&self) -> Option<&Placed> {
         match self {
             Self::Disaggregated { decode, .. } => Some(decode),
+            Self::Single { .. } => None,
+        }
+    }
+
+    /// This pair with `decode` in its decode's place: the selection of a
+    /// dispatch whose decode moved behind its prefill
+    /// (`placement::decode_again`). `None` for a single worker's.
+    pub(crate) fn with_decode(&self, decode: Placed) -> Option<Self> {
+        match self {
+            Self::Disaggregated {
+                encode_assignments,
+                prefill,
+                runtime_type,
+                ..
+            } => Some(Self::Disaggregated {
+                encode_assignments: encode_assignments.clone(),
+                prefill: Arc::clone(prefill),
+                decode,
+                runtime_type: *runtime_type,
+            }),
             Self::Single { .. } => None,
         }
     }
@@ -1848,6 +2016,85 @@ impl ExecutionResult {
             }
         }
     }
+
+    /// From here on the result tells Grand Central its request's end
+    /// through `end`, the handle the execution plan asked of the attempt's
+    /// guards ([`WorkerSelection::end`]). The one worker's stream tells its
+    /// own end ([`ProtoStream::report_through`]). The streams of a batch
+    /// share its one placement's end ([`SharedEnd`]): the first failure one
+    /// of them meets stands, and the worker's 200 is told once every stream
+    /// ended well. An embedding is its answers, in hand
+    /// and all good: the worker's 200 is told here, the status the circuit
+    /// breaker sampled for them, and nothing for an embedding of no answer,
+    /// which the breaker took no sample of.
+    pub(crate) fn report_through(&mut self, end: RequestEnd) {
+        match self {
+            Self::Single { stream, .. } => stream.report_through(end),
+            // Nobody tells the engine a pair's end yet. The change that
+            // makes a pair's two sides tell theirs turns this arm on.
+            Self::PrefillDecode { .. } => {}
+            Self::Embedding { responses } => {
+                if !responses.is_empty() {
+                    end.report(200, || true);
+                }
+            }
+            Self::Batch { results } if !end.is_empty() => {
+                let shared = SharedEnd::among(end);
+                for result in results {
+                    match result {
+                        Self::Single { stream, .. } => {
+                            stream.put_report_layer(RequestEnd::default(), Some(shared.reader()));
+                        }
+                        // A single request's batch holds its streams alone.
+                        // A result of another kind takes no share of the
+                        // end: the batch's good end does not wait on it.
+                        Self::PrefillDecode { .. }
+                        | Self::Embedding { .. }
+                        | Self::Batch { .. } => {}
+                    }
+                }
+            }
+            Self::Batch { .. } => {}
+        }
+    }
+}
+
+/// A request's wait ahead of the dispatch its answer's clocks start at, as
+/// [`dispatch_wait`] reads it; `None` when no entry stamp is in scope.
+pub(crate) type DispatchWait = Option<std::time::Duration>;
+
+/// The wait of the request whose answering attempt was dispatched at
+/// `dispatched` (the single RPC's dispatch, the prefill dispatch of a pair):
+/// the time since its entry at the edge ([`RequestStarted`]). The body read,
+/// auth, admission, tokenizing, templating and worker selection are in it,
+/// and so are a refused attempt with its backoff and an encode call that
+/// runs ahead of the pair.
+///
+/// The stamp is scoped to the request's future. The streaming entry points
+/// run inside it, so they read the wait there, against the dispatch instant
+/// their stream's clocks start at, and hand it to the reading they build:
+/// the response body drives that reading once the request's future has
+/// returned, outside the scope. A collected answer is built inside the
+/// request's future, so its processor reads the wait where it makes the
+/// answer's records, against the dispatch its generation clock starts at.
+///
+/// A Responses tool loop puts each of its generations under a stamp: the
+/// first turn's under the request's own, a later turn's under one taken
+/// where that turn starts (the streamed loop dispatches from a task of its
+/// own and carries the request's stamp there; the collected loop runs in the
+/// request's future). A later turn's wait is therefore the gateway's time
+/// from the turn's start to its dispatch, with none of the generations and
+/// tool calls before it.
+///
+/// `None` when no stamp is in scope. Behind the edge every streaming entry
+/// point that reads the wait runs under one, and so does every collected
+/// answer but a background Responses request's: its generations run in a
+/// task of its own, outside the request's scope, and record no wait. A
+/// pipeline a test runs bare has none, on any turn of a tool loop either,
+/// and its answer records its other families alone.
+pub(crate) fn dispatch_wait(dispatched: Instant) -> DispatchWait {
+    let entered = RequestStarted::current()?;
+    Some(dispatched.saturating_duration_since(entered))
 }
 
 /// Timing context threaded from PD execution into the streaming layer so the
@@ -1995,7 +2242,9 @@ mod tests {
     /// prefill worker to gRPC.
     #[test]
     fn a_disaggregated_selections_wire_is_the_prefill_sides() {
-        use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+        use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let worker = |url: &str, mode: ConnectionMode, role: WorkerType| -> Arc<dyn Worker> {
             Arc::new(
@@ -2010,7 +2259,7 @@ mod tests {
             |prefill: Arc<dyn Worker>, decode: Arc<dyn Worker>| WorkerSelection::Disaggregated {
                 encode_assignments: None,
                 prefill,
-                decode,
+                decode: decode.into(),
                 runtime_type: RuntimeType::TokenSpeed,
             };
 
@@ -2074,7 +2323,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_worker_selection_is_one_failure_whichever_stage_reads_it() {
-        use crate::worker::{BasicWorkerBuilder, WorkerType};
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let mut slot: Option<WorkerSelection> = None;
         let failure = failure_of(stage_output(slot.as_ref(), "a_stage"));
@@ -2158,14 +2409,16 @@ mod tests {
         WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: Arc::clone(prefill),
-            decode: Arc::clone(decode),
+            decode: Arc::clone(decode).into(),
             runtime_type: RuntimeType::Sglang,
         }
     }
 
     #[test]
     fn disaggregated_load_guards_hold_decode_only() {
-        use crate::worker::{BasicWorkerBuilder, WorkerType};
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://prefill-load")
@@ -2193,9 +2446,10 @@ mod tests {
 
     #[tokio::test]
     async fn batch_prompts_preserve_phase_load_semantics() {
-        use crate::{
-            routers::common::prefill_admission::PrefillAdmission,
-            worker::{BasicWorkerBuilder, WorkerType},
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::{
+            common::prefill_admission::PrefillAdmission, grpc::backend_client::BasicWorkerBuilder,
         };
 
         let prefill: Arc<dyn Worker> = Arc::new(
@@ -2461,7 +2715,9 @@ mod tests {
 
     #[test]
     fn load_guards_report_completion_for_each_side_they_hold() {
-        use crate::worker::{BasicWorkerBuilder, RequestCompletionSink, WorkerType};
+        use smg_worker::identity::basic::{RequestCompletionSink, WorkerType};
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         #[derive(Debug, Default)]
         struct CompletionSpy(std::sync::Mutex<Vec<String>>);
         impl RequestCompletionSink for CompletionSpy {
@@ -2494,7 +2750,7 @@ mod tests {
         // The regular gRPC path: one guard, one completion when the stream ends.
         drop(LoadGuards::new(
             &WorkerSelection::Single {
-                worker: Arc::clone(&single),
+                worker: Arc::clone(&single).into(),
             },
             None,
         ));
@@ -2521,12 +2777,71 @@ mod tests {
         let before = spy.0.lock().unwrap().len();
         drop(LoadGuards::scaled(
             &WorkerSelection::Single {
-                worker: Arc::clone(&single),
+                worker: Arc::clone(&single).into(),
             },
             None,
             3,
         ));
         assert_eq!(spy.0.lock().unwrap().len(), before + 3);
+    }
+
+    /// The handle on a request's end is asked of its guard under whatever
+    /// rides with the guards: the dispatch's upstream span, an admission
+    /// claim. A request told through that handle hears its outcome.
+    #[test]
+    fn the_guards_hand_a_requests_end_under_what_rides_with_them() {
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::{
+            common::{
+                pd_admission::{try_admit_decode, Tried},
+                placement::tests::heard_request,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
+        };
+
+        // A ride takes the guards and hands them back under itself.
+        type Ride = Box<dyn FnOnce(LoadGuards) -> LoadGuards>;
+
+        let window = [("max_running_requests".to_string(), "1".to_string())];
+        let windowed: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://windowed")
+                .worker_type(WorkerType::Decode)
+                .labels(window.into_iter().collect())
+                .build(),
+        );
+        let Tried::Claimed(claim) = try_admit_decode(&windowed, 1) else {
+            panic!("a free room is claimed");
+        };
+        let rides: [(&str, Ride); 2] = [
+            (
+                "the upstream span",
+                Box::new(|guards| LoadGuards::traced(tracing::Span::none(), guards)),
+            ),
+            (
+                "an admission claim",
+                Box::new(move |guards| LoadGuards::admitted(Some(claim), guards)),
+            ),
+        ];
+        for (ride, under) in rides {
+            let (heard, guard, end) = heard_request();
+            drop(end);
+            let guards = under(LoadGuards::Single { _guard: guard });
+            assert!(
+                matches!(
+                    guards,
+                    LoadGuards::Traced { .. } | LoadGuards::Admitted { .. }
+                ),
+                "{ride}"
+            );
+            guards.end().report(200, || true);
+            drop(guards);
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                ["issued", "dispatched Single", "completed Ok 200"],
+                "{ride}"
+            );
+        }
     }
 
     /// The client-shape mismatch answers an executor takes from the

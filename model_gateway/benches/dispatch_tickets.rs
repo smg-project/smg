@@ -21,10 +21,8 @@ use std::{
 };
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use smg::{
-    routers::grpc::dispatch_ticket_life,
-    worker::{BasicWorkerBuilder, Worker},
-};
+use smg::routers::grpc::{backend_client::BasicWorkerBuilder, dispatch_ticket_life};
+use smg_worker::identity::basic::Worker;
 
 /// The prompt each request books. The backlog's arithmetic is not what the
 /// cell measures, so any size that is not empty serves.

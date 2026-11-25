@@ -11,11 +11,11 @@ use axum::{
 use openai_protocol::{chat::ChatCompletionRequest, validated::ValidatedJson};
 use serde_json::{json, Value};
 use smg_grpc_client::{sglang_proto, SglangSchedulerClient, VllmEngineClient};
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
 use super::*;
-use crate::{
-    routers::grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
-    worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
+use crate::routers::grpc::{
+    backend_client::BasicWorkerBuilder, context::ExecutionPlanKind, proto_wrapper::ProtoRequest,
 };
 
 fn worker_with_defaults(url: &str, defaults_json: Option<&str>) -> WorkerSelection {
@@ -24,7 +24,7 @@ fn worker_with_defaults(url: &str, defaults_json: Option<&str>) -> WorkerSelecti
         builder = builder.label(DEFAULT_SAMPLING_PARAMS_LABEL, json);
     }
     WorkerSelection::Single {
-        worker: Arc::new(builder.build()),
+        worker: Arc::new(builder.build()).into(),
     }
 }
 
@@ -200,7 +200,7 @@ fn labelled_pair(prefill_json: Option<&str>, decode_json: Option<&str>) -> Worke
     WorkerSelection::Disaggregated {
         encode_assignments: None,
         prefill: side("grpc://prefill:30000", WorkerType::Prefill, prefill_json),
-        decode: side("grpc://decode:30000", WorkerType::Decode, decode_json),
+        decode: side("grpc://decode:30000", WorkerType::Decode, decode_json).into(),
         runtime_type: RuntimeType::Sglang,
     }
 }

@@ -712,19 +712,7 @@ where
             .into_iter()
             .map(|frame| Ok::<_, Status>(http_body::Frame::data(frame))),
     )));
-    let mut request = HttpRequest::builder()
-        .method(Method::POST)
-        .uri(path)
-        .version(Version::HTTP_2)
-        .body(body)
-        .map_err(|error| Status::internal(format!("framed request: {error}")))?;
-    let request_headers = request.headers_mut();
-    *request_headers = headers;
-    request_headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
-    request_headers.insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/grpc"),
-    );
+    let request = call_request(path, headers, body)?;
     let mut channel = channel.clone();
     poll_fn(|cx| GrpcService::<tonic::body::Body>::poll_ready(&mut channel, cx))
         .await
@@ -733,6 +721,37 @@ where
         .await
         .map_err(Status::from_error)?;
     response_stream(response)
+}
+
+/// The request of a framed call: a POST of `body` to the method's `path`
+/// over HTTP/2, the caller's headers under the two every call carries.
+///
+/// The path is a constant of this crate and is read where it stands. A
+/// request builder that is given a path as text parses a copy of it on the
+/// heap, and the channel's clone of that copy, taken to put the origin in
+/// front of it, turns the copy into a shared buffer: two allocations a call
+/// for a path that never changes. The bytes of a constant are neither
+/// copied nor counted. A path that does not parse is the call's internal
+/// status, as it was.
+fn call_request<B>(
+    path: &'static str,
+    headers: http::HeaderMap,
+    body: B,
+) -> Result<HttpRequest<B>, Status> {
+    let path = http::uri::PathAndQuery::from_maybe_shared(Bytes::from_static(path.as_bytes()))
+        .map_err(|error| Status::internal(format!("framed request: {error}")))?;
+    let mut request = HttpRequest::new(body);
+    *request.method_mut() = Method::POST;
+    *request.uri_mut() = http::Uri::from(path);
+    *request.version_mut() = Version::HTTP_2;
+    let request_headers = request.headers_mut();
+    *request_headers = headers;
+    request_headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+    request_headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc"),
+    );
+    Ok(request)
 }
 
 /// The response of a framed call as a stream of `R`, read as tonic's own
@@ -1794,5 +1813,44 @@ mod tests {
             let (len, body) = joined(&frames_of(&req));
             assert_eq!(len as usize, body.len());
         }
+    }
+
+    /// The request line of a framed call: the method path is the constant's
+    /// own bytes, so a call neither copies the path nor counts its clones,
+    /// and the caller's headers sit under the two every call carries.
+    #[test]
+    fn the_call_request_reads_its_path_in_place() {
+        const PATH: &str = "/package.Service/Method";
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("r-1"));
+        let request = call_request(PATH, headers, ()).expect("the path parses");
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.version(), Version::HTTP_2);
+        assert_eq!(request.uri().path(), PATH);
+        assert!(
+            std::ptr::eq(request.uri().path().as_ptr(), PATH.as_ptr()),
+            "the request's path is a copy on the heap, not the constant's own bytes"
+        );
+        // The channel's clone, taken to put the origin in front of the path.
+        let cloned = request.uri().path_and_query().cloned().expect("a path");
+        assert!(std::ptr::eq(cloned.as_str().as_ptr(), PATH.as_ptr()));
+        assert_eq!(request.headers()["x-request-id"], "r-1");
+        assert_eq!(request.headers()[http::header::TE], "trailers");
+        assert_eq!(
+            request.headers()[http::header::CONTENT_TYPE],
+            "application/grpc"
+        );
+    }
+
+    #[test]
+    fn a_path_that_does_not_parse_is_the_call_s_internal_status() {
+        let status = call_request("/a path", http::HeaderMap::new(), ())
+            .expect_err("a space is not a path character");
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(
+            status.message().starts_with("framed request: "),
+            "{}",
+            status.message()
+        );
     }
 }

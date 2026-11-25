@@ -40,6 +40,7 @@ fn ctx(return_logprob: bool) -> GenerateStreamContext {
         backend_type: "test",
         model: MODEL.to_string(),
         expected_choices: 1,
+        dispatch_wait: None,
     }
 }
 

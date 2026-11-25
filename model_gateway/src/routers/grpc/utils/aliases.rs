@@ -32,8 +32,12 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// the name a downstream launcher passes for a model family whose table has no older parser
 /// (`muse` for `muse_spark`), so that the launcher's flags read with the table, or an engine's
 /// exact name for a table (`llama4_pythonic` for `llama4`, whose generic legacy name `pythonic`
-/// is in [`UNANSWERED`] while another family carries it).
-pub const ALIASES: [(&str, Table); 19] = [
+/// is in [`UNANSWERED`] while another family carries it). One row names a family, not a format:
+/// `minimax` reads with the table of the family's current line (`minimax_m3`), though the
+/// legacy reasoning parser of that name reads the M2 line's thought; a deployment of that line
+/// names its table by the table's own name, `minimax_m2`, where the registry does not list
+/// its model: alone, the name gives way to the registry ([`gives_way`]).
+pub const ALIASES: [(&str, Table); 21] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
     ("qwen_coder", Table::Qwen3Tagged),
@@ -47,8 +51,13 @@ pub const ALIASES: [(&str, Table); 19] = [
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
     ("llama4_pythonic", Table::Llama4),
-    ("minimax", Table::MinimaxM2),
+    ("minimax", Table::MinimaxM3),
     ("muse", Table::MuseSpark),
+    // Command A's and Command R v01's calls, and Command A's thought. Where the table reads
+    // otherwise than the legacy parsers of the two names read: `docs/tables.md`, the
+    // Command table.
+    ("cohere", Table::Command),
+    ("cohere_cmd", Table::Command),
     ("kimik2", Table::KimiK2),
     ("kimi_thinking", Table::KimiK2),
     ("kimi_k25", Table::KimiK2),
@@ -69,7 +78,7 @@ pub const ALIASES: [(&str, Table); 19] = [
 /// the next source decides: after a worker's labels the registry's table for a model it
 /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
 /// keeps the legacy parsers either way).
-pub const UNANSWERED: [(&str, &str); 12] = [
+pub const UNANSWERED: [(&str, &str); 9] = [
     (
         "passthrough",
         "leaves its channel as written, which no table reads for: the way back to the \
@@ -109,16 +118,28 @@ pub const UNANSWERED: [(&str, &str); 12] = [
          every family that names pythonic has a table; llama4_pythonic names the Llama 4 \
          table exactly",
     ),
-    (
-        "kimi",
-        "a thought between `◁think▷` and `◁/think▷`, which no table reads: the Kimi K2 \
-         line's table reads `<think>`",
-    ),
     ("step3", "Step 3's calls and thought: no table"),
     ("sarashina", "Sarashina's calls: no table"),
-    ("cohere", "Command R and Command A's calls: no table"),
-    ("cohere_cmd", "Command R and Command A's thought: no table"),
 ];
+
+/// The legacy reasoning parsers' names that give way where they stand alone ([`gives_way`]): a
+/// table answers to each, and before the table came each selected nothing, its parser reading
+/// the thought beside whatever read the calls. A source that names one and no tool-call parser
+/// still selects nothing while another reader is left: the registry's table reads a model it
+/// knows, and what the next source's names select reads the others. The name's table reads
+/// where nothing else does, in the place of the legacy parsers. `minimax`, a family's name with
+/// two lines, joined them so that the registry, which tells the lines apart, reads a model of
+/// either line it lists; alone, it selected the M2 line's table before.
+pub const GIVING_WAY: [&str; 3] = ["kimi", "cohere_cmd", "minimax"];
+
+/// Whether `name` is a reasoning parser's that gives way where it stands alone
+/// (`GIVING_WAY`).
+pub fn gives_way(name: &str) -> bool {
+    let name = name.trim();
+    GIVING_WAY
+        .iter()
+        .any(|legacy| legacy.eq_ignore_ascii_case(name))
+}
 
 #[cfg(test)]
 mod tests {

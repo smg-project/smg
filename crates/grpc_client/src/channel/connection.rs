@@ -30,7 +30,7 @@ use tokio::{
 use tonic::codegen::{http::Uri, Bytes};
 use tracing::{debug, info, warn};
 
-use super::BoxError;
+use super::{keep_alive_timeout_status, BoxError};
 
 /// HTTP/2 keepalive: a ping every 30 seconds, answered within 10. The
 /// interval is bounded from below by the engines' gRPC servers, not by how
@@ -84,6 +84,15 @@ const _: () = assert!((STREAM_WINDOW as usize) * 255 * 4 <= (CONNECTION_WINDOW a
 /// the same; h2 left to itself advertises nothing and decodes up to 16 MiB.
 pub(super) const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 
+/// The header table the connection advertises in its SETTINGS: how much of
+/// the peer's response headers its encoder may keep indexed, held for as
+/// long as the connection lives. A peer that dates its responses fills the
+/// protocol's 4,096 with dates; 1,024 holds a response's two constant
+/// headers and 14 dates. The cost is on the wire: h2's encoder indexes no
+/// entry over three quarters of the table (768 bytes), so a long
+/// `grpc-message` is sent in full on every identical error.
+pub(super) const HEADER_TABLE_SIZE: u32 = 1024;
+
 /// How many streams the connection opens before the peer's SETTINGS have
 /// arrived. hyper's bound; h2 left to itself opens any number, and a burst
 /// of calls right after a dial could run past the peer's limit and have its
@@ -123,7 +132,7 @@ impl End {
             return Box::new(error);
         }
         if self.keep_alive_timed_out.load(Ordering::Acquire) {
-            return Box::new(tonic::Status::unavailable("keep-alive timed out"));
+            return Box::new(keep_alive_timeout_status());
         }
         Box::new(TransportError(error))
     }
@@ -144,6 +153,21 @@ impl std::error::Error for TransportError {
         Some(&self.0)
     }
 }
+
+/// The keep-alive timeout of a connection this side dropped: the peer
+/// answered no ping. It is the source of the status each call on that
+/// connection ends with, which tells that status from an `UNAVAILABLE` the
+/// worker answered ([`super::is_keep_alive_timeout`]).
+#[derive(Debug)]
+pub(super) struct KeepAliveTimeout;
+
+impl fmt::Display for KeepAliveTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("keep-alive timed out")
+    }
+}
+
+impl std::error::Error for KeepAliveTimeout {}
 
 /// A dial's failure with the peer it came from. Its text names the peer: the
 /// log line of a failed call on a gateway with many workers says which one
@@ -341,6 +365,7 @@ where
         .initial_window_size(stream_window)
         .initial_connection_window_size(connection_window)
         .max_header_list_size(MAX_HEADER_LIST_SIZE)
+        .header_table_size(HEADER_TABLE_SIZE)
         .initial_max_send_streams(INITIAL_MAX_SEND_STREAMS)
         .enable_push(false)
         .handshake(io)

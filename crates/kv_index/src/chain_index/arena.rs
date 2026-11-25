@@ -113,6 +113,21 @@ impl WordArena {
         &self.words(at, 1)[0]
     }
 
+    /// A freed block of `list`, for its next life. A release fence ahead of the first store this
+    /// thread makes in it: a reader that still holds the block from its last life, reads one of
+    /// those stores and then passes its acquire fence reads, in its check of its run's version,
+    /// the step that took the block off that run. That step stands ahead of the block's push:
+    /// in its own thread, or through the count's decrement, which acquires and releases, where
+    /// two runs shared an array. The list hands the block from its push to this pop in order.
+    /// A later holder's stores are not this fence's. The rule for a holder that did not take
+    /// the block: write it by release, by a read-modify-write behind a store of the taker's,
+    /// or behind the start of a step.
+    fn freed(list: &SegQueue<u32>) -> Option<u32> {
+        let block = list.pop()?;
+        fence(Ordering::Release);
+        Some(block)
+    }
+
     /// Fresh words inside one chunk.
     pub(super) fn bump(&self, count: usize) -> u32 {
         debug_assert!(0 < count && count <= WORD_CHUNK);
@@ -199,7 +214,7 @@ impl WordArena {
         // classes do not fill while others bump (churn moves arrays between classes as runs
         // grow and die).
         let (class, recycled) = (wanted..ARRAY_CLASSES.min(wanted + ARRAY_FIT_SPAN + 1))
-            .find_map(|class| self.free_arrays[class].pop().map(|start| (class, start)))
+            .find_map(|class| Self::freed(&self.free_arrays[class]).map(|start| (class, start)))
             .unwrap_or((wanted, 0));
         let capacity = class_capacity(class);
         let start = if recycled == 0 {
@@ -249,7 +264,7 @@ impl WordArena {
 
     pub(super) fn alloc_table(&self, slots: usize) -> u32 {
         let class = table_class(slots);
-        let recycled = self.free_tables[class].pop();
+        let recycled = Self::freed(&self.free_tables[class]);
         let table = recycled.unwrap_or_else(|| self.bump(2 + 2 * slots));
         for word in self.words(table + 2, 2 * slots) {
             word.store(0, Ordering::Relaxed);
@@ -514,7 +529,7 @@ impl WordArena {
 
     pub(super) fn alloc_partials(&self, slots: usize) -> u32 {
         let class = table_class(slots);
-        let recycled = self.free_partials[class].pop();
+        let recycled = Self::freed(&self.free_partials[class]);
         let table = recycled.unwrap_or_else(|| self.bump(2 + slots));
         for word in self.words(table + 2, slots) {
             word.store(0, Ordering::Relaxed);
@@ -601,8 +616,10 @@ impl WordArena {
             return false;
         }
         self.partial_set(table, used, worker, cutoff);
+        // A release store, as the entry's: a later holder puts into a table it did not take,
+        // and a reader of the life before may read this word first.
         self.word(table)
-            .store(slots as u64 | ((used as u64 + 1) << 32), Ordering::Relaxed);
+            .store(slots as u64 | ((used as u64 + 1) << 32), Ordering::Release);
         self.word(table + 1).fetch_add(1, Ordering::Relaxed);
         true
     }
@@ -621,7 +638,7 @@ impl WordArena {
 
     pub(super) fn alloc_forwards(&self, slots: usize) -> u32 {
         let class = table_class(slots);
-        let recycled = self.free_tables[class].pop();
+        let recycled = Self::freed(&self.free_tables[class]);
         let table = recycled.unwrap_or_else(|| self.bump(2 + 2 * slots));
         self.word(table + 1).store(0, Ordering::Relaxed);
         self.word(table).store(slots as u64, Ordering::Release);

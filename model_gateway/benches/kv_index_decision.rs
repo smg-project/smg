@@ -58,20 +58,27 @@ use criterion::Criterion;
 use kv_index::{compute_content_hash, compute_request_content_hashes, request_prefix_hashes};
 use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
-    policies::{cost, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
-    worker::{
-        kv::event_monitor::bench_support::IndexFeed,
-        load::state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, KvEventMonitor, KvIndex, Worker, WorkerType,
+    policies::{
+        cost,
+        kv_index::{
+            event_monitor::{bench_support::IndexFeed, KvEventMonitor},
+            index_backend::KvIndex,
+        },
+        CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo,
     },
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
 };
+use smg_worker::{
+    identity::basic::{Worker, WorkerType},
+    load::state::{one_rank_load, TestFeed},
+};
 
 /// The exactness tests' stream generator, by path: the mock engine's streams
 /// through the relay's decoder and normalizer.
-#[path = "../src/worker/kv/index_backend/mock_streams.rs"]
+#[path = "../src/policies/kv_index/index_backend/mock_streams.rs"]
 #[expect(
     dead_code,
     reason = "the bench takes the payloads; the exactness tests the checkpoints and prompts too"

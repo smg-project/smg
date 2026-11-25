@@ -110,6 +110,7 @@ pub(crate) async fn build_chat_backed_plan(
             id_prefix,
             model: &chat_request.model,
             processed_text,
+            return_prompt_text: chat_request.return_prompt_text,
             token_ids,
             tool_constraints,
             format_set_aside,

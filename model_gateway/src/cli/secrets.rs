@@ -2,11 +2,11 @@
 //! serving key, the tenant keys, the control-plane keys, the store URLs):
 //! the names of their sources and the one resolution rule, with the
 //! environment lookup as a parameter. A file is read by the library's rules
-//! (`smg::config::secrets`), the ones a reload of the keys reads it by.
+//! (`crate::config::secrets`), the ones a reload of the keys reads it by.
 
 use std::path::{Path, PathBuf};
 
-use smg::{
+use crate::{
     config::{
         secrets::{
             entries_of, SecretFile, API_KEY_FILE, CONTROL_PLANE_API_KEYS_FILE, TENANT_API_KEYS_FILE,

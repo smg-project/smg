@@ -15,9 +15,10 @@ use smg::{
     config::{PolicyConfig, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
     policies::PolicyRegistry,
-    routers::{error::extract_error_code_from_response, RouterFactory},
+    routers::{
+        common::snapshot::WorkerRegistry, error::extract_error_code_from_response, RouterFactory,
+    },
     tenant::TenantKey,
-    worker::WorkerRegistry,
 };
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,

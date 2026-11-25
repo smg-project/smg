@@ -335,7 +335,12 @@ impl Roles {
 
     /// The ASCII characters holding any of `bits`, as a bit per code.
     pub(super) fn ascii_members(&self, bits: Bits) -> u128 {
-        self.bytes
+        Self::ascii_members_of(&self.bytes, bits)
+    }
+
+    /// [`Self::ascii_members`] of the byte table `bytes`.
+    fn ascii_members_of(bytes: &[Bits; 256], bits: Bits) -> u128 {
+        bytes
             .iter()
             .take(128)
             .enumerate()
@@ -358,6 +363,33 @@ impl Roles {
             .iter()
             .all(|&(start, held)| held & bits != 0 || start > u32::from(char::MAX));
         in_plane && above
+    }
+
+    /// Whether some character holds a bit of `one` and a bit of `other`
+    /// at once. Every entry of the tables is the bits of a code point, so
+    /// they are read as they stand; it is asked once per pattern.
+    pub(super) fn some_char_holds_both(&self, one: Bits, other: Bits) -> bool {
+        let both = |held: Bits| held & one != 0 && held & other != 0;
+        self.bytes.iter().any(|&held| both(held))
+            || self.rows.iter().any(|&held| both(held))
+            || self.above.iter().any(|&(_, held)| both(held))
+    }
+
+    /// Takes `bits` from every character that holds a bit of `of`: a role
+    /// such a character never plays in its scanner (see `cased`). The word
+    /// scans are named again from the byte table.
+    pub(super) fn clear_where(&mut self, of: Bits, bits: Bits) {
+        let clear = |held: &mut Bits| {
+            if *held & of != 0 {
+                *held &= !bits;
+            }
+        };
+        self.bytes.iter_mut().for_each(clear);
+        self.rows.iter_mut().for_each(clear);
+        self.above.iter_mut().for_each(|(_, held)| clear(held));
+        for (slot, scan) in self.scans.iter_mut().enumerate() {
+            *scan = WordScan::of(Self::ascii_members_of(&self.bytes, 1 << slot));
+        }
     }
 
     /// The role bits of the character at `pos`, a character boundary, and

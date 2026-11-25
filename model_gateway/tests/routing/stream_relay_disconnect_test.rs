@@ -18,13 +18,19 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
-use openai_protocol::transcription::{AudioFile, TranscriptionRequest};
+use openai_protocol::{
+    model_card::ModelCard,
+    transcription::{AudioFile, TranscriptionRequest},
+};
 use serde_json::json;
 use smg::{
-    routers::{pd_router::PDRouter, router::Router as HttpRouter, RouterTrait},
+    routers::{
+        grpc::backend_client::BasicWorkerBuilder, pd_router::PDRouter,
+        router::Router as HttpRouter, RouterTrait,
+    },
     tenant::{RouteRequestMeta, TenantKey},
-    worker::{BasicWorkerBuilder, ModelCard, Worker, WorkerType},
 };
+use smg_worker::identity::basic::{Worker, WorkerType};
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 
 use super::streaming_chat_request;

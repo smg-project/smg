@@ -32,11 +32,12 @@ use smg::{
     middleware::TenantRequestMeta,
     observability::metrics_server::start_metrics_server,
     routers::{
-        factory::router_ids, gateway::Gateway, http::router::Router as HttpRouter, RouterTrait,
+        factory::router_ids, gateway::Gateway, grpc::backend_client::BasicWorkerBuilder,
+        http::router::Router as HttpRouter, RouterTrait,
     },
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
@@ -151,7 +152,7 @@ fn completion() -> CompletionRequest {
 #[tokio::test]
 async fn every_dispatch_moves_the_worker_request_counter() {
     let handle = recorder();
-    let (metrics_addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let (metrics_addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
 

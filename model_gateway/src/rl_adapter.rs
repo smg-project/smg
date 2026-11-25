@@ -14,12 +14,17 @@ use smg_rl::{
     resolve_control_url, CallFailure, RankReply, RlControlCalls, RlState, RlWorkerInfo,
     RlWorkerView,
 };
+use smg_worker::{
+    connection::http_client::WorkerHttpClientCache, identity::basic::Worker, registry::WorkerId,
+};
 use tracing::warn;
 
 use crate::{
     config::RouterConfig,
-    routers::grpc::backend_client::{connected_backend_client, get_backend_client, BackendClient},
-    worker::{registry::WorkerId, Worker, WorkerHttpClientCache, WorkerRegistry},
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::backend_client::{connected_backend_client, get_backend_client, BackendClient},
+    },
 };
 
 /// Label an engine (or an operator) sets to name the worker's RL control app.
@@ -238,7 +243,10 @@ mod tests {
     use openai_protocol::worker::ConnectionMode;
 
     use super::*;
-    use crate::{config::RouterConfig, server::http_client, worker::BasicWorkerBuilder};
+    use crate::{
+        config::RouterConfig, routers::grpc::backend_client::BasicWorkerBuilder,
+        server::http_client,
+    };
 
     fn view_with(config: &RouterConfig, workers: Vec<Arc<dyn Worker>>) -> RegistryRlView {
         let registry = Arc::new(WorkerRegistry::new());

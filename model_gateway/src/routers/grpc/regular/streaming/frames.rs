@@ -95,6 +95,9 @@ pub(crate) struct ChatChunkFrame {
 }
 
 impl ChatChunkFrame {
+    /// The head's end: the key every chunk's choices follow.
+    const CHOICES: &'static [u8] = b",\"choices\":[";
+
     pub(crate) fn new(
         request_id: &str,
         model: &str,
@@ -112,7 +115,7 @@ impl ChatChunkFrame {
             head.extend_from_slice(b",\"system_fingerprint\":");
             push_json(&mut head, system_fingerprint);
         }
-        head.extend_from_slice(b",\"choices\":[");
+        head.extend_from_slice(Self::CHOICES);
         Self { head }
     }
 
@@ -127,6 +130,27 @@ impl ChatChunkFrame {
     ) {
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
+        let serialized = serde_json::to_writer(FrameSink(buffer), choice);
+        Self::close_chunk(buffer, start, serialized, usage, emit_usage_null);
+    }
+
+    /// [`Self::write_chunk`] for the chunk that carries the rendered prompt:
+    /// `prompt_text` is the key ahead of `choices`, where the struct has it,
+    /// so the head goes in up to that key, then the prompt, then the chunk
+    /// as every other is written.
+    pub(super) fn write_chunk_with_prompt<C: Serialize>(
+        &self,
+        buffer: &mut BytesMut,
+        prompt_text: &str,
+        choice: &C,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head[..self.head.len() - Self::CHOICES.len()]);
+        buffer.extend_from_slice(b",\"prompt_text\":");
+        push_json(FrameSink(buffer), prompt_text);
+        buffer.extend_from_slice(Self::CHOICES);
         let serialized = serde_json::to_writer(FrameSink(buffer), choice);
         Self::close_chunk(buffer, start, serialized, usage, emit_usage_null);
     }
@@ -325,8 +349,12 @@ fn push_logprobs_view(
                 if at > 0 {
                     buffer.extend_from_slice(b",");
                 }
-                let text = decode(token_id);
-                push_logprob_token(buffer, &text, logprob, Some(text.as_bytes()));
+                let text: &str = if token_id == position.token_id {
+                    &token
+                } else {
+                    &decode(token_id)
+                };
+                push_logprob_token(buffer, text, logprob, Some(text.as_bytes()));
                 buffer.extend_from_slice(b"}");
             }
             buffer.extend_from_slice(b"]}");
@@ -387,8 +415,8 @@ pub(super) fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &
 /// A generate choice's text so far as the contents of its JSON string: the
 /// bytes serde writes between the quotes, escaped once as each chunk arrives.
 /// Every event of a generate stream carries the choice's whole text, and the
-/// stream only appends to it (each chunk is decoded on its own and pushed),
-/// so the escaped form is extended in step and never rewritten, and an event
+/// stream only appends to it (each decoded delta is pushed), so the escaped
+/// form is extended in step and never rewritten, and an event
 /// copies the text into its frame instead of escaping it again (serde's
 /// escape walked every byte of the answer on every event, a cost growing
 /// with the square of the answer's length). The bytes are serde's own:

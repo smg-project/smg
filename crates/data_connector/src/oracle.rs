@@ -865,12 +865,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
 
                 let (sql, binds) = create_item_sql(&table, &columns);
-                let named: Vec<(&str, &dyn ToSql)> = binds
-                    .iter()
-                    .map(String::as_str)
-                    .zip(params.iter().copied())
-                    .collect();
-                match conn.execute_named(&sql, &named) {
+                match conn.execute_named(&sql, &named_binds(&binds, &params)) {
                     Ok(stmt) => stmt.row_count().map_err(map_oracle_error),
                     // ORA-00001: a concurrent create of the same id won the
                     // insert between this MERGE's probe and its own insert;
@@ -935,12 +930,8 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
 
                 let (sql, binds) = link_sql(&table, &columns);
-                let named: Vec<(&str, &dyn ToSql)> = binds
-                    .iter()
-                    .map(String::as_str)
-                    .zip(params.iter().copied())
-                    .collect();
-                conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                conn.execute_named(&sql, &named_binds(&binds, &params))
+                    .map_err(map_oracle_error)?;
                 Ok(())
             })
             .await
@@ -1600,6 +1591,17 @@ impl ResponseRow {
     }
 }
 
+/// The named binds of a statement built here (`merge_on_id_sql`, `link_sql`,
+/// `update_if_open_sql`): each bind name with its value, in the columns'
+/// order.
+fn named_binds<'a>(binds: &'a [String], params: &[&'a dyn ToSql]) -> Vec<(&'a str, &'a dyn ToSql)> {
+    binds
+        .iter()
+        .map(String::as_str)
+        .zip(params.iter().copied())
+        .collect()
+}
+
 /// The statement that stores a response, with the names of its binds in the
 /// columns' order: a merge on the id (the first column, the table's primary
 /// key) that inserts a new row or updates every other column of the
@@ -1850,12 +1852,7 @@ impl ResponseStorage for OracleResponseStorage {
                 let (columns, params) = row.columns_and_binds(s, &extra_cols);
 
                 let (sql, binds) = store_response_sql(&table, &columns);
-                let named: Vec<(&str, &dyn ToSql)> = binds
-                    .iter()
-                    .map(String::as_str)
-                    .zip(params.iter().copied())
-                    .collect();
-                conn.execute_named(&sql, &named)
+                conn.execute_named(&sql, &named_binds(&binds, &params))
                     .map(|_| ())
                     .map_err(map_oracle_error)
             })
@@ -1883,12 +1880,9 @@ impl ResponseStorage for OracleResponseStorage {
                 let (columns, params) = row.columns_and_binds(s, &extra_cols);
                 let open = oracle_open_predicate_for(s);
                 let (sql, binds) = update_if_open_sql(&table, &columns, open.as_deref());
-                let named: Vec<(&str, &dyn ToSql)> = binds
-                    .iter()
-                    .map(String::as_str)
-                    .zip(params.iter().copied())
-                    .collect();
-                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                let stmt = conn
+                    .execute_named(&sql, &named_binds(&binds, &params))
+                    .map_err(map_oracle_error)?;
                 stmt.row_count().map_err(map_oracle_error)
             })
             .await
@@ -1918,9 +1912,9 @@ impl ResponseStorage for OracleResponseStorage {
                 let (sql, binds) =
                     update_if_open_sql(&table, &[s.col("id"), s.col("raw_response")], Some(&open));
                 let params: Vec<&dyn ToSql> = vec![&id_str, &json_raw_response];
-                let named: Vec<(&str, &dyn ToSql)> =
-                    binds.iter().map(String::as_str).zip(params).collect();
-                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                let stmt = conn
+                    .execute_named(&sql, &named_binds(&binds, &params))
+                    .map_err(map_oracle_error)?;
                 stmt.row_count().map_err(map_oracle_error)
             })
             .await

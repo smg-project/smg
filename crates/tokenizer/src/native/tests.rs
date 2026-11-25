@@ -197,7 +197,7 @@ const POOL: &[char] = &[
     '\u{7F}',
 ];
 
-fn pseudo_random(state: &mut u64) -> u64 {
+pub(super) fn pseudo_random(state: &mut u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
     *state ^= *state << 17;
@@ -2548,6 +2548,13 @@ fn anchored_digit_stages_cut_digit_runs_as_the_library_does() {
 #[test]
 fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
     let mut state = 0x5A5A_1234_5678_9ABCu64;
+    // Two pools for the whole test: every thread of each calls at once.
+    let pools = [3, 7].map(|threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("pool")
+    });
     for shape in shapes() {
         let tokenizer = tokenizer_of(&shape, &mut state);
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
@@ -2559,14 +2566,27 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
             .chain(shape.stripped.iter().map(|(s, _, _, _)| *s))
             .collect();
         let mut compared = 0;
-        for _ in 0..3 {
-            let text = long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES);
+        for round in 0..3 {
+            // The third text has a handful of units, which the threads take
+            // as their own: fewer than the larger pool has threads. The
+            // others have thousands.
+            let text = if round < 2 {
+                long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES)
+            } else {
+                let piece = long_text(&mut state, &[], 3 * PARALLEL_MIN_BYTES / 8);
+                [piece.as_str(); 3].join(&format!(" {} ", added.first().unwrap_or(&"")))
+            };
             let units = native.units(&text, true, true).as_slice().len();
             assert!(
                 units >= 4,
                 "{}: {units} units for {} bytes",
                 shape.name,
                 text.len()
+            );
+            assert!(
+                round < 2 || units < 7,
+                "{}: {units} units, every thread has its own",
+                shape.name
             );
             let pooled = native
                 .encode_with(Some(tokenizer.get_model()), &text, true, false)
@@ -2576,6 +2596,19 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
                 .expect("serial");
             compared += 1;
             assert_eq!(pooled, serial, "{}: the pool changed the ids", shape.name);
+            for pool in &pools {
+                for ids in pool.broadcast(|_| {
+                    native.encode_with(Some(tokenizer.get_model()), &text, true, false)
+                }) {
+                    assert_eq!(
+                        ids.expect("pooled"),
+                        serial,
+                        "{}: {} callers at once",
+                        shape.name,
+                        pool.current_num_threads()
+                    );
+                }
+            }
             let reference = tokenizer
                 .encode(text.as_str(), false)
                 .expect("encode")
@@ -2591,12 +2624,51 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
     }
 }
 
+/// Unit k of a long text is pool thread k's own: a thread takes its own unit
+/// before a free one. Thread 0 of a pool of two is held while thread 1 reads
+/// both units of a text whose second unit alone is not ASCII: the unit thread
+/// 1 read last is the first.
+#[test]
+fn a_pool_thread_takes_its_own_unit_of_a_long_text_first() {
+    use std::sync::{Barrier, Mutex};
+    let tokenizer = tokenizer_of(&shapes()[0], &mut 0x5A5A_1234_5678_9ABC);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let model = tokenizer.get_model();
+    let text = "xy ".repeat(24 << 10) + "я";
+    assert_eq!(native.units(&text, true, true).as_slice().len(), 2);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .expect("pool");
+    // Thread 1 holds `reading` from before the two meet until it returns or
+    // unwinds, and thread 0 waits for it inside its own callback: it can
+    // neither take a unit nor outlast a panic of thread 1.
+    let (met, reading) = (Barrier::new(2), Mutex::new(()));
+    let last_was_ascii = pool.broadcast(|context| {
+        if context.index() == 0 {
+            met.wait();
+            drop(reading.lock());
+            return false;
+        }
+        let _held = reading.lock();
+        met.wait();
+        let ids = native.encode_with(Some(model), &text, true, false);
+        ids.expect("pooled");
+        native.thread_piece_cache().borrow().unit_ascii
+    });
+    assert!(last_was_ascii[1], "thread 1 read the second unit first");
+}
+
 /// The added-token search through the tokens' prefixes finds what the
 /// automaton's unanchored leftmost-longest search finds: the same ranges and
 /// the same tokens, on texts made of the tokens, their prefixes, other text
-/// and characters sharing a token's first bytes; for a set of ASCII first
-/// bytes only (the automaton's own search), one with a token in fullwidth
-/// bars among `<` tokens (the chain shape), one of tokens beyond ASCII only,
+/// and characters sharing a token's first bytes; for a set of one first byte
+/// (the automaton's own search), one with `/t` (the split search, from a
+/// text's second lone slash on), one of two first bytes with the common one
+/// last (`ed`), one whose token holds two places of the search past its
+/// start (`aaaab`: the automaton's own search again), one with a token in
+/// fullwidth bars among `<` tokens (the chain shape), one of tokens beyond
+/// ASCII only,
 /// one with more than three first bytes (tab and newline runs, `<`, `[` and
 /// runs of a mark beyond ASCII), one whose prefixes stand whole (every
 /// token shorter than the prefix length), one the library declines as it
@@ -2606,8 +2678,11 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
 /// and one cut to thirteen-byte prefixes for the narrow searcher.
 #[test]
 fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
-    let sets: [(&[&str], bool); 5] = [
+    let sets: [(&[&str], bool); 8] = [
         (&["<a>", "<ab>", "<abc>", "<|x|>", "<"], false),
+        (&["<a>", "<ab>", "/t", "[b]"], true),
+        (&["<a>", "ed", "eda"], true),
+        (&["aaaab", "c"], false),
         (
             &[
                 "<a>",
@@ -2652,6 +2727,9 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
         "<t>",
         "<t",
         "</tx",
+        "/t",
+        "/",
+        "//",
         "<u3>",
         "<u1",
         "<\u{FF5C}x",
@@ -2985,6 +3063,9 @@ fn ids_match_tokenizers_on_random_text_for_every_shape() {
 
 #[test]
 fn fixed_texts_match_tokenizers_for_every_shape() {
+    // One all-ASCII unit that opens as short pieces: the lean scan leaves it
+    // at a piece's end and the encoder hands the rest to the block pass.
+    let handed = "let x = a[1]; // one, two\n".repeat(64);
     let texts = [
         "",
         " ",
@@ -3008,6 +3089,7 @@ fn fixed_texts_match_tokenizers_for_every_shape() {
         "a\tb\u{A0}c\u{3000}d\u{2028}e",
         "<｜begin▁of▁sentence｜>hello<｜User｜>q<｜tool▁call▁begin｜>x<｜fim▁hole｜>",
         "[e~[hello]~b] and [e~ half",
+        handed.as_str(),
     ];
     let mut state = 0x7777_1111_2222_3333u64;
     for shape in shapes() {
@@ -4023,6 +4105,949 @@ fn the_seed_answers_a_vocabulary_piece_before_the_model_does() {
     assert_eq!(caches, [(2, 0)]);
 }
 
+/// A byte-level encoder for the tests of the waiting pieces: "xy" is an
+/// entry the one merge reaches (one id from the seed), "ab" an entry no
+/// merge reaches (the seed holds the two ids the model gives it), and "xyq"
+/// is no entry (merged into two ids).
+fn waiting_fixture() -> (HfTokenizer, NativeEncoder) {
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    let xy = vocab.len() as u32;
+    vocab.insert("xy".to_owned(), xy);
+    let ab = vocab.len() as u32;
+    vocab.insert("ab".to_owned(), ab);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .build()
+        .expect("bpe");
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let native = seeded(&tokenizer);
+    (tokenizer, native)
+}
+
+/// Probes the thread's table for `piece`, a piece it does not hold, and
+/// hands the miss to `NativeEncoder::seeded`, as the probe of a piece does.
+fn miss(native: &NativeEncoder, piece: &[u8], ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
+    let key = ShortPieceKey::of(piece).expect("a short piece");
+    let vacancy = cache.packed.lookup(key, ids).expect("a miss");
+    native.seeded(vacancy, ids, cache)
+}
+
+/// A miss close behind another takes a hole of one id and waits; the answer
+/// writes the seed's id into the hole, and the thread's table has learned
+/// the piece.
+#[test]
+fn a_miss_close_behind_another_waits_and_takes_its_id_at_its_hole() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let xy = model.token_to_id("xy").expect("xy");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7, 8, 9];
+    cache.last_miss = 2;
+    assert!(miss(&native, b"xy", &mut ids, &mut cache), "it waits");
+    assert_eq!(ids, [7, 8, 9, 0], "a hole of one id");
+    assert_eq!(cache.waiting.len(), 1);
+    assert_eq!(
+        cache.packed.len(),
+        0,
+        "nothing is learned before the answer"
+    );
+    ids.push(10);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, 8, 9, xy, 10]);
+    assert!(cache.waiting.is_empty());
+    assert_eq!(cache.packed.len(), 1, "the piece is learned");
+    let key = ShortPieceKey::of(b"xy").expect("key");
+    assert!(cache.packed.ids_into(key, &mut ids));
+    assert_eq!(ids, [7, 8, 9, xy, 10, xy]);
+}
+
+/// An answer that is not one id moves the ids behind its own hole and
+/// leaves the holes before it where they are: the seed's two ids of an
+/// entry no merge reaches, and the two ids of a merged piece.
+#[test]
+fn an_answer_of_several_ids_moves_only_the_ids_behind_its_hole() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"ab", &mut ids, &mut cache));
+    ids.push(8);
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    ids.push(9);
+    assert_eq!(ids, [7, 0, 8, 0, 0, 9]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(
+        ids,
+        [7, id("a"), id("b"), 8, id("xy"), id("xy"), id("q"), 9]
+    );
+    assert_eq!(cache.packed.len(), 3);
+}
+
+/// A piece met twice while it waits takes its ids at both holes: the later
+/// hole's answer is learned, and the earlier hole reads it from the
+/// thread's table, so the piece is merged once.
+#[test]
+fn a_piece_that_waits_twice_takes_its_ids_at_both_holes() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert!(
+        miss(&native, b"xyq", &mut ids, &mut cache),
+        "not learned yet"
+    );
+    assert_eq!(ids, [7, 0, 0, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q"), id("xy"), id("xy"), id("q")]);
+    assert_eq!(cache.packed.len(), 2);
+}
+
+/// A piece the seed holds that is met twice while it waits is learned once:
+/// the later hole's answer takes the vacancy, the earlier hole's copy is
+/// refused on the taken slot, and its insert finds the piece stored.
+#[test]
+fn a_seeded_piece_that_waits_twice_is_learned_once() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert!(miss(&native, b"q", &mut ids, &mut cache));
+    assert!(
+        miss(&native, b"xy", &mut ids, &mut cache),
+        "not learned yet"
+    );
+    assert_eq!(ids, [7, 0, 0, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q"), id("xy")]);
+    assert_eq!(cache.packed.len(), 2);
+}
+
+/// The answers of one group that are not one id wait in the scratch list
+/// for the one pass, each with its own ids: a piece merged after the seed
+/// gave the two ids of a later hole is placed and learned with its own.
+#[test]
+fn answers_of_several_ids_in_one_group_keep_their_own_ids() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    ids.push(8);
+    assert!(miss(&native, b"ab", &mut ids, &mut cache));
+    ids.push(9);
+    assert_eq!(ids, [7, 0, 8, 0, 9]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q"), 8, id("a"), id("b"), 9]);
+    assert_eq!(cache.packed.len(), 2);
+    for (piece, learned) in [
+        (&b"xyq"[..], [id("xy"), id("q")]),
+        (&b"ab"[..], [id("a"), id("b")]),
+    ] {
+        let key = ShortPieceKey::of(piece).expect("key");
+        ids.clear();
+        assert!(cache.packed.ids_into(key, &mut ids));
+        assert_eq!(ids, learned);
+    }
+}
+
+/// An answer of no id closes its hole, and the other pieces take their ids
+/// where they belong. No encoder that waits gives such an answer (its table
+/// has a token for every byte): here the merge table is taken away.
+#[test]
+fn a_waiting_piece_with_no_id_has_its_hole_closed() {
+    let (tokenizer, mut native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    native.merges = None;
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    assert!(miss(&native, b"ab", &mut ids, &mut cache));
+    ids.push(8);
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert_eq!(ids, [7, 0, 0, 8, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("a"), id("b"), 8, id("xy")]);
+}
+
+/// A thread at its share clears its table when it learns a piece. The
+/// pieces that still wait are answered all the same: each asks the table as
+/// it is at its own answer.
+#[test]
+fn a_table_cleared_while_pieces_wait_answers_every_one_of_them() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    cache.share = 1;
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    for piece in [&b"xy"[..], b"ab", b"xyq", b"q"] {
+        assert!(miss(&native, piece, &mut ids, &mut cache));
+    }
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(
+        ids,
+        [7, id("xy"), id("a"), id("b"), id("xy"), id("q"), id("q")]
+    );
+    assert_eq!(
+        cache.packed.len(),
+        1,
+        "cleared at every piece after the first"
+    );
+}
+
+/// A miss far behind the last one stands alone: the seed answers it where
+/// it is met and nothing waits; a piece the seed does not hold is left to
+/// the slow call, with no hole. The miss close behind it waits.
+#[test]
+fn a_miss_that_stands_alone_is_answered_where_it_is_met() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let xy = model.token_to_id("xy").expect("xy");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7; WAITING_GAP + 1];
+    cache.last_miss = 0;
+    assert!(
+        miss(&native, b"xy", &mut ids, &mut cache),
+        "the seed answered"
+    );
+    assert_eq!(ids.len(), WAITING_GAP + 2);
+    assert_eq!(ids.last(), Some(&xy));
+    assert!(cache.waiting.is_empty());
+    assert_eq!(cache.packed.len(), 1);
+    cache.last_miss = 0;
+    assert!(
+        !miss(&native, b"xyq", &mut ids, &mut cache),
+        "the slow call's"
+    );
+    assert_eq!(ids.len(), WAITING_GAP + 2, "no hole");
+    assert!(cache.waiting.is_empty());
+    assert!(
+        miss(&native, b"ab", &mut ids, &mut cache),
+        "close behind: it waits"
+    );
+    assert_eq!(cache.waiting.len(), 1);
+}
+
+/// A miss far behind the last one, while pieces wait, waits with them and
+/// has them all answered there, itself the last of them.
+#[test]
+fn a_miss_far_behind_the_last_one_has_the_waiting_pieces_answered() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert_eq!(cache.waiting.len(), 1);
+    ids.resize(ids.len() + WAITING_GAP + 1, 8);
+    assert!(miss(&native, b"ab", &mut ids, &mut cache), "answered");
+    assert!(cache.waiting.is_empty());
+    let mut expected = vec![7, id("xy")];
+    expected.resize(expected.len() + WAITING_GAP + 1, 8);
+    expected.extend([id("a"), id("b")]);
+    assert_eq!(ids, expected);
+    assert_eq!(cache.packed.len(), 2, "both are learned");
+}
+
+/// As many pieces as are answered together are answered at the last of
+/// them, and the answer gives each piece the ids the model gives it.
+#[test]
+fn as_many_pieces_as_are_answered_together_are_answered_at_the_last() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    let words: Vec<String> = (0..WAITING_PIECES as u32).map(word).collect();
+    let (last, waiting) = words.split_last().expect("words");
+    for piece in waiting {
+        assert!(miss(&native, piece.as_bytes(), &mut ids, &mut cache));
+    }
+    assert_eq!(cache.waiting.len(), WAITING_PIECES - 1);
+    assert!(miss(&native, last.as_bytes(), &mut ids, &mut cache));
+    assert!(cache.waiting.is_empty());
+    let mut expected = vec![7];
+    for piece in &words {
+        expected.extend(model.tokenize(piece).expect("tokens").iter().map(|t| t.id));
+    }
+    assert_eq!(ids, expected);
+}
+
+/// The waiting pieces are answered with no model at hand, so a miss waits
+/// only where the table merges every short piece. Where it lacks a byte's
+/// token, and where `ignore_merges` keeps the whole-piece lookup (a
+/// vocabulary with gaps in its ids), a miss close behind another takes no
+/// hole: it is left to the slow call, which has the model.
+#[test]
+fn a_miss_does_not_wait_where_a_short_piece_may_need_the_model() {
+    for (gone, ignore_merges) in [(Some(0x0B), false), (None, true)] {
+        let mut vocab = Vocab::default();
+        for (id, c) in bytes_char().iter().enumerate() {
+            if Some(id) != gone {
+                vocab.insert(c.to_string(), id as u32);
+            }
+        }
+        // Beyond the ids the seed reads: the seed does not hold it.
+        vocab.insert("xy".to_owned(), 300);
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+            .ignore_merges(ignore_merges)
+            .build()
+            .expect("bpe");
+        let mut tokenizer = HfTokenizer::new(bpe);
+        tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+        tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+        let native = seeded(&tokenizer);
+        assert!(!native.misses_wait, "{gone:?} {ignore_merges}");
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        let mut ids = vec![7, 8, 9];
+        cache.last_miss = 2;
+        assert!(
+            !miss(&native, b"xy", &mut ids, &mut cache),
+            "the slow call's"
+        );
+        assert_eq!(ids, [7, 8, 9], "no hole");
+        assert!(cache.waiting.is_empty());
+    }
+}
+
+/// A young thread's close miss waits. A thread whose table has outgrown its
+/// reservation has its misses answered where they are met, however close
+/// together they come.
+#[test]
+fn a_thread_whose_table_outgrew_its_reservation_does_not_wait() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(
+        miss(&native, b"xy", &mut ids, &mut cache),
+        "young: it waits"
+    );
+    assert_eq!(ids, [7, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy")]);
+    let share = cache.share;
+    let mut pieces = 0u32;
+    while cache.packed.slots() <= THREAD_BACKING_SLOTS {
+        let piece = format!("{pieces:07}");
+        let key = ShortPieceKey::of(piece.as_bytes()).expect("key");
+        assert!(cache.packed.insert(key, &[1], share));
+        pieces += 1;
+    }
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(
+        miss(&native, b"ab", &mut ids, &mut cache),
+        "the seed answered"
+    );
+    assert_eq!(ids, [7, id("a"), id("b")]);
+    assert!(cache.waiting.is_empty());
+}
+
+/// A thread whose table is past [`ASK_AHEAD_SLOTS`] holds the pieces of a
+/// unit cut by blocks and answers them [`ASK_AHEAD`] at a time, in the
+/// order they were cut, also where the lean scan hands the rest of a unit
+/// over: new text and the same text read again take the library's ids.
+#[test]
+fn a_table_past_the_near_caches_answers_held_pieces_in_the_order_cut() {
+    let mut state = 0x4153_4B5F_4148_4541u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "cl100k-ignore-merges")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    {
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        cache.packed = ShortPieceTable::for_entries(ASK_AHEAD_SLOTS);
+        assert!(cache.packed.slots() > ASK_AHEAD_SLOTS);
+    }
+    // All ASCII: the lean scan leaves it to the block pass at a piece's end.
+    let handed = "let x = a[1]; // one, two\n".repeat(64);
+    // Stretches of ASCII, so the unit is cut by blocks; not all ASCII, so
+    // the lean scan does not take it.
+    let mixed: String = (0..600u32)
+        .map(|item| {
+            let head = if item.is_multiple_of(20) {
+                "caf\u{e9} "
+            } else {
+                ""
+            };
+            format!("{head}item {item} costs {}, ", item * 37 % 1000)
+        })
+        .collect();
+    // Both texts reach the block pass, or no piece is held.
+    let pattern = &native.stages[0].pattern;
+    let left = pattern.for_each_match::<true, _>(&handed, false, |_, _| {});
+    assert!(pattern.by_blocks(&handed[left..]).is_some());
+    assert!(pattern.by_blocks(&mixed).is_some());
+    for (cut, text) in [("handed over", handed), ("by blocks", mixed)] {
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        for lap in ["new text", "read again"] {
+            let ids = native
+                .encode_with(Some(tokenizer.get_model()), &text, false, false)
+                .expect("serial");
+            assert_eq!(ids, reference, "{cut}, {lap}");
+        }
+    }
+}
+
+/// `callers` threads have called `native`, none of them a thread of a pool.
+fn callers_join(native: &NativeEncoder, callers: usize) {
+    native.threads.store(callers, Ordering::Relaxed);
+    native.callers.store(callers, Ordering::Relaxed);
+}
+
+/// A thread that has cleared its table asks what the threads have merged
+/// before it merges a piece: its miss waits however far behind the last
+/// one it falls, takes the learned ids and keeps the piece in its own
+/// table. A thread that has not cleared merges the piece and asks nothing.
+#[test]
+fn a_thread_that_has_cleared_takes_what_the_threads_have_merged() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let key = ShortPieceKey::of(b"xyq").expect("key");
+    // Ids no merge gives tell the learned table's answer from a merge.
+    native.learned_pieces().learn(key, &[5, 6, 7]);
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(
+        miss(&native, b"xyq", &mut ids, &mut cache),
+        "young and close: it waits"
+    );
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q")], "a young thread merges");
+    let share = cache.share;
+    cache.clear_short(share);
+    drop(cache);
+    // Cleared, but too few threads call: as a young thread.
+    assert!(!native.piece_cache_for_call().shares);
+    callers_join(&native, LEARNED_FROM_THREADS);
+    let mut cache = native.piece_cache_for_call();
+    assert!(cache.shares);
+    let mut ids = vec![7; WAITING_GAP + 1];
+    cache.last_miss = 0;
+    assert!(
+        miss(&native, b"xyq", &mut ids, &mut cache),
+        "cleared: it waits, far behind the last miss"
+    );
+    assert_eq!(cache.waiting.len(), 1);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids[WAITING_GAP + 1..], [5, 6, 7]);
+    let mut kept = Vec::new();
+    assert!(cache.packed.ids_into(key, &mut kept), "kept by the thread");
+    assert_eq!(kept, [5, 6, 7]);
+}
+
+/// What a thread that has cleared has to merge it tells the learned table;
+/// what the seed answered is the seed's and is not told.
+#[test]
+fn a_thread_that_has_cleared_tells_what_it_merges() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let share = cache.share;
+    cache.clear_short(share);
+    drop(cache);
+    callers_join(&native, LEARNED_FROM_THREADS);
+    let mut cache = native.piece_cache_for_call();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    for piece in [&b"xyq"[..], b"xy"] {
+        assert!(miss(&native, piece, &mut ids, &mut cache));
+    }
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q"), id("xy")]);
+    let learned = native.learned_pieces();
+    let told = |piece: &[u8]| {
+        let key = ShortPieceKey::of(piece).expect("key");
+        let part = learned.read(key).expect("no writer");
+        let mut ids = Vec::new();
+        part.probe(key).ok().map(|entry| {
+            part.append(entry, &mut ids);
+            ids
+        })
+    };
+    assert_eq!(told(b"xyq"), Some(vec![id("xy"), id("q")]));
+    assert_eq!(told(b"xy"), None);
+}
+
+/// A thread keeps its whole share while fewer than `LEARNED_FROM_THREADS`
+/// threads call and a quarter of it from then on, whether it has cleared
+/// or not; only a thread that has cleared shares what it merges.
+/// The learned table is made at the first ask, for twice what the threads
+/// that have encoded by then keep themselves, and threads that join later
+/// share it as it was made.
+#[test]
+fn a_thread_keeps_a_quarter_of_its_share_once_enough_threads_call() {
+    let (_, native) = waiting_fixture();
+    assert_eq!(native.piece_cache_for_call().share, PIECE_CACHE_CAPACITY);
+    // Enough threads: a quarter, for a thread that has not cleared too.
+    callers_join(&native, LEARNED_FROM_THREADS);
+    assert_eq!(
+        native.piece_cache_for_call().share,
+        PIECE_CACHE_CAPACITY / GROWN_SHARE_PART
+    );
+    assert!(!native.piece_cache_for_call().shares, "it has not cleared");
+    callers_join(&native, 1);
+    native
+        .thread_piece_cache()
+        .borrow_mut()
+        .clear_short(PIECE_CACHE_CAPACITY);
+    assert_eq!(
+        native.piece_cache_for_call().share,
+        PIECE_CACHE_CAPACITY,
+        "too few threads call"
+    );
+    callers_join(&native, LEARNED_FROM_THREADS);
+    assert_eq!(
+        native.piece_cache_for_call().share,
+        PIECE_CACHE_CAPACITY / GROWN_SHARE_PART
+    );
+    assert!(
+        native.learned.get().is_none(),
+        "no table before the first ask"
+    );
+    assert_eq!(
+        native.learned_pieces().entries(),
+        LEARNED_FROM_THREADS * PIECE_CACHE_CAPACITY / 2
+    );
+    callers_join(&native, 16);
+    assert_eq!(
+        native.learned_pieces().entries(),
+        LEARNED_FROM_THREADS * PIECE_CACHE_CAPACITY / 2
+    );
+}
+
+/// Only a miss that waits asks the learned table. The sentencepiece path
+/// waits by its own rule on a far seed with `misses_wait` off, so its threads
+/// do not share; a byte-level table that lacks a byte's token does not wait.
+/// However many threads call, each keeps its whole share, one that has
+/// cleared merges for itself and encodes as it did, and no learned table is
+/// made.
+#[test]
+fn a_thread_keeps_its_whole_share_where_no_miss_asks_the_learned_table() {
+    let mut state = 0x5EED_5EED_5EED_5EEDu64;
+    let sentencepiece = sentencepiece_tokenizer(&sentencepiece_shapes()[0], &mut state);
+    // A byte-level vocabulary with no token for the vertical tab.
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        if id != 0x0B {
+            vocab.insert(c.to_string(), id as u32);
+        }
+    }
+    vocab.insert("xy".to_owned(), 300);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .build()
+        .expect("bpe");
+    let mut lacking = HfTokenizer::new(bpe);
+    lacking.with_pre_tokenizer(Some(byte_level(true)));
+    lacking.with_decoder(Some(ByteLevelDecoder::default()));
+    let text: String = (0..2_000).map(|i| format!(" {}", word(i))).collect();
+    for tokenizer in [&sentencepiece, &lacking] {
+        let native = seeded(tokenizer);
+        let model = tokenizer.get_model();
+        assert!(!native.misses_wait);
+        let few = native
+            .encode_with(Some(model), &text, false, false)
+            .expect("ids");
+        callers_join(&native, LEARNED_FROM_THREADS);
+        native
+            .thread_piece_cache()
+            .borrow_mut()
+            .clear_short(PIECE_CACHE_CAPACITY);
+        let cache = native.piece_cache_for_call();
+        assert_eq!((cache.share, cache.shares), (PIECE_CACHE_CAPACITY, false));
+        drop(cache);
+        let many = native
+            .encode_with(Some(model), &text, false, false)
+            .expect("ids");
+        assert_eq!(many, few);
+        assert!(native.learned.get().is_none(), "no table is made");
+    }
+}
+
+/// A long text has the thread's table read back only when the one before
+/// it started longer ago than that one is given to encode, and within the
+/// band: not the first, not one that follows at once, not one after a rest.
+/// A long text is noted for the next one only while more threads are
+/// inside a long text than there are processors, and it leaves the count
+/// when it returns.
+#[test]
+fn a_long_text_reads_the_table_back_after_a_lost_processor() {
+    let mut cache = PieceCache::with_share(1);
+    let bytes = 8192;
+    let given = READ_BACK_BASE + READ_BACK_PER_BYTE * 8192;
+    let first = Instant::now();
+    assert!(!cache.reads_back(first, bytes), "none before it");
+    let at_once = first + given;
+    assert!(!cache.reads_back(at_once, bytes), "it follows at once");
+    let waited = at_once + given + Duration::from_micros(1);
+    assert!(cache.reads_back(waited, bytes), "the thread waited");
+    let rested = waited + READ_BACK_WITHIN;
+    assert!(!cache.reads_back(rested, bytes), "the thread rested");
+
+    let (tokenizer, mut native) = waiting_fixture();
+    native.processors = 1;
+    let text = "xy ".repeat(READ_BACK_MIN_BYTES);
+    for (others, noted) in [(1, true), (0, false)] {
+        native.inside.store(others, Ordering::Relaxed);
+        native
+            .encode(Some(tokenizer.get_model()), &text, false)
+            .expect("ids");
+        let last_long = native.thread_piece_cache().borrow().last_long;
+        assert_eq!(last_long.is_some(), noted, "{others} more inside");
+        assert_eq!(native.inside.load(Ordering::Relaxed), others);
+    }
+}
+
+/// Threads that share at one time encode as a young thread does: sixteen
+/// threads encode the same texts of many distinct pieces through a learned
+/// table small enough that every part of it fills and is set down while
+/// they read it and write to it. Each clears before every text, and a text
+/// holds fewer pieces than the asks a thread judges (`ASKS_JUDGED`), so no
+/// thread rests and each tells the table all it merges.
+#[test]
+fn threads_that_share_at_one_time_encode_as_a_young_thread_does() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let texts: Vec<String> = (0..20_000)
+        .step_by(ASKS_JUDGED as usize / 2)
+        .map(|from| {
+            (from..from + ASKS_JUDGED / 2)
+                .map(|i| format!(" {}", word(i)))
+                .collect()
+        })
+        .collect();
+    let young: Vec<Vec<u32>> = texts
+        .iter()
+        .map(|text| {
+            native
+                .encode_with(Some(model), text, false, false)
+                .expect("ids")
+        })
+        .collect();
+    // 64 entries a part: the pieces of the texts fill each many times over.
+    let small = LearnedPieces::for_entries(64 * 64);
+    assert!(native.learned.set(small).is_ok(), "no table yet");
+    let threads = 2 * LEARNED_FROM_THREADS;
+    let all_called = std::sync::Barrier::new(threads);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let share = native.piece_cache_for_call().share;
+                all_called.wait();
+                for _ in 0..2 {
+                    for (text, young) in texts.iter().zip(&young) {
+                        native.thread_piece_cache().borrow_mut().clear_short(share);
+                        let ids = native
+                            .encode_with(Some(model), text, false, false)
+                            .expect("ids");
+                        assert!(native.piece_cache_for_call().shares);
+                        assert_eq!(&ids, young);
+                    }
+                }
+            });
+        }
+    });
+    let learned = native.learned_pieces();
+    assert_eq!(learned.entries(), 64 * 64, "the table made by hand");
+    let set_down = |i| {
+        let key = ShortPieceKey::of(word(i).as_bytes()).expect("key");
+        matches!(learned.read(key), Some(learned_pieces::PartRead::Full(_)))
+    };
+    assert!((0..2_000).all(set_down), "every part was set down");
+}
+
+/// The ids of a text do not depend on who merged its pieces: a thread that
+/// has cleared encodes it as it did before, the first time, when it tells
+/// the learned table what it merges, and the second, when it is told.
+#[test]
+fn a_thread_that_has_cleared_encodes_as_it_did_before() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let text: String = (0..5_000).map(|i| format!(" {}", word(i))).collect();
+    let young = native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    assert!(
+        native.learned.get().is_none(),
+        "a young thread asks nothing"
+    );
+    callers_join(&native, LEARNED_FROM_THREADS);
+    for _ in 0..2 {
+        {
+            let mut cache = native.thread_piece_cache().borrow_mut();
+            let share = cache.share;
+            cache.clear_short(share);
+        }
+        let cleared = native
+            .encode_with(Some(model), &text, false, false)
+            .expect("ids");
+        assert_eq!(cleared, young);
+        assert!(native.learned.get().is_some(), "a cleared thread asked");
+    }
+}
+
+/// A thread the learned table does not answer rests, though the table takes
+/// what the thread tells it: after the asks it judges it shares no more and
+/// encodes as a young thread does; it asks again once it has merged
+/// `ASKS_RESTED` pieces by itself, and at once after a clear.
+#[test]
+fn a_thread_the_learned_table_does_not_answer_rests_and_asks_again() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let words = |from: u32, len: usize| -> String {
+        (from..from + len as u32)
+            .map(|i| format!(" {}", word(i)))
+            .collect()
+    };
+    let encode = |text: &str| {
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids")
+    };
+    let few = words(20_000, 2 * ASKS_JUDGED as usize);
+    let many = words(30_000, ASKS_RESTED);
+    let again = words(40_000, 2 * ASKS_JUDGED as usize);
+    let young = (encode(&few), encode(&many), encode(&again));
+    callers_join(&native, LEARNED_FROM_THREADS);
+    let clear = || {
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        let share = cache.share;
+        cache.clear_short(share);
+    };
+    clear();
+    assert!(native.piece_cache_for_call().shares);
+    // No ask is of use: the table holds none of the words, and takes them.
+    assert_eq!(encode(&few), young.0);
+    assert!(!native.piece_cache_for_call().shares, "the thread rests");
+    assert_eq!(encode(&many), young.1);
+    assert!(native.piece_cache_for_call().shares, "it asks again");
+    assert_eq!(encode(&again), young.2);
+    assert!(!native.piece_cache_for_call().shares, "it rests again");
+    clear();
+    assert!(native.piece_cache_for_call().shares, "a clear ends a rest");
+}
+
+/// A thread rests where the learned table answers under one ask in two, and
+/// not where it answers more: of words the table holds and words nobody has
+/// merged, one held in three rests the thread and two in three do not.
+#[test]
+fn a_thread_rests_where_the_learned_table_answers_under_one_ask_in_two() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let spaced = |i: u32| format!(" {}", word(i));
+    let encode = |text: &str| {
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids")
+    };
+    // Three words for each ask a thread judges: `held` of every three are
+    // of the words from 20,000 on, the others of those from `new` on.
+    let mixed = |held: u32, new: u32| -> String {
+        (0..3 * ASKS_JUDGED)
+            .map(|i| spaced(if i % 3 < held { 20_000 + i } else { new + i }))
+            .collect()
+    };
+    let (most, third) = (mixed(2, 30_000), mixed(1, 40_000));
+    let young = (encode(&most), encode(&third));
+    callers_join(&native, LEARNED_FROM_THREADS);
+    let clear = || {
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        let share = cache.share;
+        cache.clear_short(share);
+    };
+    // The table holds the words from 20,000 on: a thread that clears before
+    // it has asked `ASKS_JUDGED` times judges nothing and tells all it
+    // merges.
+    for from in (20_000..20_000 + 3 * ASKS_JUDGED).step_by(ASKS_JUDGED as usize / 2) {
+        clear();
+        encode(
+            &(from..from + ASKS_JUDGED / 2)
+                .map(spaced)
+                .collect::<String>(),
+        );
+    }
+    clear();
+    assert_eq!(encode(&most), young.0);
+    assert!(native.piece_cache_for_call().shares, "two asks in three");
+    clear();
+    assert_eq!(encode(&third), young.1);
+    assert!(!native.piece_cache_for_call().shares, "one ask in three");
+}
+
+/// The threads of a pool, which encode the cuts of a caller's long text, do
+/// not count toward `LEARNED_FROM_THREADS`: behind one caller a pool of any
+/// width leaves the encoder as it was, the whole share and nothing shared.
+/// The eighth thread that calls turns the rule on, for the threads of the
+/// pool too.
+#[test]
+fn the_threads_of_a_pool_do_not_count_as_callers() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let short = " xy ab xyq";
+    let width = 2 * LEARNED_FROM_THREADS;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(width)
+        .build()
+        .expect("a pool");
+    // This thread calls with a text it encodes itself, so it is counted,
+    // and every thread of the pool encodes for it.
+    native
+        .encode_with(Some(model), short, false, false)
+        .expect("ids");
+    let joined = pool.broadcast(|_| native.piece_cache_for_call().share);
+    assert_eq!(joined.len(), width);
+    let threads = width + 1;
+    assert_eq!(native.threads.load(Ordering::Relaxed), threads);
+    assert_eq!(native.callers.load(Ordering::Relaxed), 1);
+    let whole = PIECE_CACHE_TOTAL_CAPACITY / threads;
+    assert_eq!(native.piece_cache_for_call().share, whole);
+    native.thread_piece_cache().borrow_mut().clear_short(whole);
+    assert!(
+        !native.piece_cache_for_call().shares,
+        "one caller, a wide pool: as it was"
+    );
+    assert!(pool
+        .broadcast(|_| native.piece_cache_for_call().share)
+        .iter()
+        .all(|share| *share == whole));
+    // Seven more threads call, each alive until all of them have: a thread
+    // that had ended could hand its place to the next.
+    let more = LEARNED_FROM_THREADS - 1;
+    let all_called = std::sync::Barrier::new(more);
+    std::thread::scope(|scope| {
+        for _ in 0..more {
+            scope.spawn(|| {
+                native
+                    .encode_with(Some(model), short, false, false)
+                    .expect("ids");
+                all_called.wait();
+            });
+        }
+    });
+    let threads = threads + more;
+    assert_eq!(native.threads.load(Ordering::Relaxed), threads);
+    assert_eq!(native.callers.load(Ordering::Relaxed), LEARNED_FROM_THREADS);
+    let quarter = PIECE_CACHE_TOTAL_CAPACITY / threads / GROWN_SHARE_PART;
+    let cache = native.piece_cache_for_call();
+    assert_eq!((cache.share, cache.shares), (quarter, true));
+    drop(cache);
+    assert!(pool
+        .broadcast(|_| native.piece_cache_for_call().share)
+        .iter()
+        .all(|share| *share == quarter));
+}
+
+/// Nor is a caller counted whose every text is long enough to be cut for
+/// the pool: the pool's threads take the piece caches and the caller takes
+/// none. Eight such callers at one time leave the encoder as it was: no
+/// caller is counted, no learned table is made, and each of them gets the
+/// ids one thread gets.
+#[test]
+fn callers_of_long_texts_alone_are_not_counted() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let mut state = 0x5EED_0000_0000_0008u64;
+    let text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
+    let one = native
+        .encode_with(Some(model), &text, true, false)
+        .expect("ids");
+    let together = std::sync::Barrier::new(LEARNED_FROM_THREADS);
+    std::thread::scope(|scope| {
+        for _ in 0..LEARNED_FROM_THREADS {
+            scope.spawn(|| {
+                together.wait();
+                let ids = native
+                    .encode_with(Some(model), &text, true, false)
+                    .expect("ids");
+                assert!(ids == one, "a caller's ids are not those of one thread");
+            });
+        }
+    });
+    // The pool's threads encoded every cut and took the piece caches.
+    assert!(native.threads.load(Ordering::Relaxed) > 0);
+    assert_eq!(native.callers.load(Ordering::Relaxed), 0);
+    assert!(native.learned.get().is_none(), "no table is made");
+}
+
+/// A waiting piece is merged under its own flag, not the flag of the unit
+/// being encoded when its answer comes, and that unit's flag is as it was.
+#[test]
+fn a_waiting_piece_is_merged_under_its_own_ascii_flag() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let piece = "x\u{e9}";
+    let spelled: String = piece
+        .bytes()
+        .map(|b| native.alphabet[usize::from(b)])
+        .collect();
+    let mut expected = vec![7];
+    expected.extend(
+        model
+            .tokenize(&spelled)
+            .expect("tokens")
+            .iter()
+            .map(|t| t.id),
+    );
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, piece.as_bytes(), &mut ids, &mut cache));
+    cache.unit_ascii = true;
+    native.answer_waiting(&mut ids, &mut cache);
+    assert!(
+        cache.unit_ascii,
+        "the flag of the unit being encoded is as it was"
+    );
+    assert_eq!(ids, expected);
+}
+
 /// Distinct words for distinct `i`: distinct pieces.
 fn word(mut i: u32) -> String {
     let mut word = String::new();
@@ -4158,6 +5183,91 @@ fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
     assert_eq!(slots, ShortPieceTable::slots_for(share));
     assert!(len <= share, "{len} <= {share}");
     assert_eq!(native.encode(Some(model), "a few words", false), Ok(short));
+}
+
+/// At the full share a thread counts its packed table by its slots, apart
+/// from its wide table and its map: it keeps a share of packed pieces and
+/// one more, at the start of a call and when it learns the next. Under a
+/// share cut for more threads the one count over the three tiers clears
+/// them, as it did.
+#[test]
+fn a_thread_at_the_full_share_counts_its_packed_table_by_its_slots() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let model = tokenizer.get_model();
+    // The threads counted, and the clears of a thread that holds a share of
+    // packed pieces and one more, and learns the next.
+    for (threads, clears) in [(1, 0), (32, 1)] {
+        let native = seeded(&tokenizer);
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        native.threads.store(threads, Ordering::Relaxed);
+        let share = native.piece_cache_share();
+        for i in 0..=share as u32 {
+            let key = ShortPieceKey::of(word(i).as_bytes()).expect("key");
+            assert!(cache.packed.insert(key, &[1], share));
+        }
+        drop(cache);
+        native
+            .encode_with(Some(model), " one more piece", false, false)
+            .expect("ids");
+        let cache = native.thread_piece_cache().borrow();
+        assert_eq!(cache.clears, clears, "{threads} threads");
+    }
+}
+
+/// A thread's second call reads the merge table through; its first does
+/// not, unless its text has `READ_AT_ONCE_BYTES`.
+#[test]
+fn a_thread_reads_the_merge_table_at_its_second_call_or_before_a_long_first_text() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let tokenizer = tokenizer_of(&shapes()[0], &mut state);
+    let model = tokenizer.get_model();
+    let native = seeded(&tokenizer);
+    let left_after = |text: &str| {
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids");
+        native.thread_piece_cache().borrow().calls_to_read
+    };
+    assert_eq!(left_after(" one more piece"), 1, "the first call");
+    assert_eq!(left_after(" one more piece"), 0, "the second call reads");
+    let long = " one more piece".repeat(READ_AT_ONCE_BYTES / 15 + 1);
+    let on_a_new_thread =
+        std::thread::scope(|scope| scope.spawn(|| left_after(&long)).join().expect("a thread"));
+    assert_eq!(on_a_new_thread, 0, "a long first text has the read first");
+}
+
+/// A load's rehearsal encodes on a cache of its own (the loading thread,
+/// which may never encode, counts toward no thread's share), and its read
+/// of the merge table stands in for the loading thread's own while it is
+/// fresh, and for no other thread's.
+#[test]
+fn a_rehearsal_reads_for_the_loading_thread_and_makes_no_cache_of_it() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let tokenizer = tokenizer_of(&shapes()[0], &mut state);
+    let model = tokenizer.get_model();
+    let mut native = seeded(&tokenizer);
+    native.rehearse(Some(model));
+    assert_eq!(native.threads.load(Ordering::Relaxed), 0);
+    // The load's stamp an hour ahead: fresh whatever the pace of the test.
+    let (loader, read_at) = native.load_read.take().expect("the load's stamp");
+    let fresh = read_at + Duration::from_secs(3600);
+    native.load_read = OnceLock::from((loader, fresh));
+    assert!(!native.load_read_holds(fresh + LOAD_READ_HOLDS), "later");
+    let reads_after_two_calls = || {
+        for _ in 0..2 {
+            native
+                .encode_with(Some(model), " one more piece", false, false)
+                .expect("ids");
+        }
+        let merges = native.merges.as_ref().expect("a merge table");
+        merges.reads.load(Ordering::Relaxed)
+    };
+    assert_eq!(reads_after_two_calls(), 1, "the load's read stands in");
+    let elsewhere =
+        std::thread::scope(|scope| scope.spawn(reads_after_two_calls).join().expect("a thread"));
+    assert_eq!(elsewhere, 2, "another thread reads the table itself");
 }
 
 /// A thread whose share fell (threads joined) since it last read it is
@@ -4351,6 +5461,20 @@ fn letters(len: usize, i: u32) -> String {
 /// What the long tier accounts for one entry.
 fn long_entry_bytes(piece: &[u8], ids: &[u32]) -> usize {
     LONG_PIECE_ENTRY_BYTES + piece.len() + size_of_val(ids)
+}
+
+/// How many distinct long pieces of 80 bytes take more than `share` bytes
+/// of the long tier whatever their ids are: an entry takes at least its
+/// piece and its slot.
+fn long_pieces_past(share: usize) -> u32 {
+    u32::try_from(share / (LONG_PIECE_ENTRY_BYTES + 80) + 1).expect("a count of pieces")
+}
+
+/// That many distinct long pieces of 80 bytes, one a line.
+fn long_lines(pieces: u32) -> String {
+    (0..pieces)
+        .map(|i| format!("{}\n", letters(80, i)))
+        .collect()
 }
 
 /// A piece of 16 to 32 bytes is kept in the wide table when its ids fit an
@@ -4580,15 +5704,15 @@ fn long_pieces_stay_within_their_byte_share() {
     let tokenizer = tokenizer_of(shape, &mut state);
     let native = seeded(&tokenizer);
     let model = tokenizer.get_model();
-    // Distinct long pieces worth more than one thread's share: each
-    // entry takes its 80 bytes, its ids (at least 27, the model merges
-    // pairs) and its slot, so 16,000 of them are over 3 MB.
-    let words = 16_000u32;
-    let text: String = (0..words)
-        .map(|i| format!("{}\n", letters(80, i)))
-        .collect();
-    native.encode(Some(model), &text, false).expect("ids");
+    // Distinct long pieces worth more than the share of a thread that
+    // encodes alone, which is the whole bound of a thread.
+    let words = long_pieces_past(LONG_PIECE_BYTES_CAPACITY);
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &long_lines(words), false, false)
+        .expect("ids");
     let share = native.long_piece_bytes_share();
+    assert_eq!(share, LONG_PIECE_BYTES_CAPACITY);
     let cache = native
         .piece_cache
         .get()
@@ -4601,6 +5725,123 @@ fn long_pieces_stay_within_their_byte_share() {
         .sum();
     assert_eq!(cache.long_bytes, accounted);
     assert!(cache.long_bytes <= share, "{} > {share}", cache.long_bytes);
+    assert!(cache.long.len() < words as usize, "{}", cache.long.len());
+    assert!(!cache.long.is_empty());
+}
+
+/// A thread's long tier holds a text whose long pieces take more than
+/// 2 MiB, the bound before `LONG_PIECE_BYTES_CAPACITY` grew, and less than
+/// the 8 MiB it is now: one pass keeps every piece, and a second pass
+/// finds each in the cache, so it adds nothing (a long piece that misses
+/// is added to `long_bytes` when it is kept). The sizes are written out
+/// here, where the other tests of the tier take theirs from the constants.
+#[test]
+fn a_text_of_two_to_eight_mebibytes_of_long_pieces_is_cached_whole() {
+    let mut state = 0x6B6B_8A8A_A9A9_C8C8u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    // More than 2 MiB whatever the ids are, and under 8 MiB even were
+    // every byte of a piece an id (432 bytes an entry then).
+    let words = long_pieces_past(2 << 20);
+    let text = long_lines(words);
+    let long = |native: &NativeEncoder| -> (usize, usize) {
+        let cache = native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow();
+        (cache.long.len(), cache.long_bytes)
+    };
+    // On this thread, not the pool: the test reads this thread's cache.
+    let first = native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    let (entries, bytes) = long(&native);
+    assert_eq!(entries, words as usize, "the tier was cleared");
+    assert!(bytes > 2 << 20, "{bytes}");
+    assert!(bytes < 8 << 20, "{bytes}");
+    let again = native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    assert!(again == first, "the ids of the second pass differ");
+    assert_eq!(long(&native), (entries, bytes), "a long piece missed");
+}
+
+/// The two bounds of the long tier, by their constants: a thread's share is
+/// `LONG_PIECE_BYTES_CAPACITY` while the total holds that for every thread
+/// that encodes, and more threads share `LONG_PIECE_BYTES_TOTAL`, all of it
+/// and never more among them.
+#[test]
+fn the_long_share_is_a_threads_bound_until_the_threads_share_the_total() {
+    let mut state = 0x4F4F_6E6E_8D8D_ACACu64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let full = LONG_PIECE_BYTES_TOTAL / LONG_PIECE_BYTES_CAPACITY;
+    for threads in [0, 1, full] {
+        native.threads.store(threads, Ordering::Relaxed);
+        let share = native.long_piece_bytes_share();
+        assert_eq!(share, LONG_PIECE_BYTES_CAPACITY, "{threads} threads");
+    }
+    for threads in [full + 1, 2 * full, 64 * full, 4_096 * full] {
+        native.threads.store(threads, Ordering::Relaxed);
+        let share = native.long_piece_bytes_share();
+        assert!(
+            share < LONG_PIECE_BYTES_CAPACITY,
+            "{share} at {threads} threads"
+        );
+        assert!(
+            threads * share <= LONG_PIECE_BYTES_TOTAL,
+            "{share} at {threads} threads"
+        );
+        assert!(
+            threads * (share + 1) > LONG_PIECE_BYTES_TOTAL,
+            "{share} at {threads} threads"
+        );
+    }
+}
+
+/// A thread among more threads than hold the full bound each stays within
+/// its share of the total, which is under the bound of a thread.
+#[test]
+fn long_pieces_stay_within_a_share_of_the_total() {
+    let mut state = 0x5A5A_7979_9898_B7B7u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let counted = 64 * (LONG_PIECE_BYTES_TOTAL / LONG_PIECE_BYTES_CAPACITY);
+    native.threads.store(counted, Ordering::Relaxed);
+    let words = long_pieces_past(native.long_piece_bytes_share());
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &long_lines(words), false, false)
+        .expect("ids");
+    // This thread counts from its first encode on: the share it kept to
+    // is the total among one thread more.
+    let threads = native.threads.load(Ordering::Relaxed);
+    assert_eq!(threads, counted + 1);
+    let share = native.long_piece_bytes_share();
+    assert!(share < LONG_PIECE_BYTES_CAPACITY, "{share}");
+    let cache = native
+        .piece_cache
+        .get()
+        .expect("this thread's cache")
+        .borrow();
+    let accounted: usize = cache
+        .long
+        .iter()
+        .map(|(piece, ids)| long_entry_bytes(piece, ids))
+        .sum();
+    assert_eq!(cache.long_bytes, accounted);
+    assert!(cache.long_bytes <= share, "{} > {share}", cache.long_bytes);
+    assert!(
+        threads * cache.long_bytes <= LONG_PIECE_BYTES_TOTAL,
+        "{} at {threads} threads",
+        cache.long_bytes
+    );
     assert!(cache.long.len() < words as usize, "{}", cache.long.len());
     assert!(!cache.long.is_empty());
 }
@@ -4625,11 +5866,12 @@ fn a_thread_whose_long_tier_outgrew_its_share_makes_it_anew_at_its_next_encode()
             .long_held_bytes()
     };
     let head: String = (0..20).map(|i| format!("{}\n", letters(80, i))).collect();
-    let text: String = (0..16_000)
-        .map(|i| format!("{}\n", letters(80, i)))
-        .collect();
+    let text = long_lines(long_pieces_past(LONG_PIECE_BYTES_CAPACITY));
     let before = native.encode(Some(model), &head, false).expect("ids");
-    native.encode(Some(model), &text, false).expect("ids");
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
     let share = native.long_piece_bytes_share();
     let grown = held(&native);
     assert!(grown <= 4 * share, "{grown} for a share of {share}");
@@ -4676,10 +5918,11 @@ fn a_long_tier_made_anew_for_a_smaller_share_keeps_what_the_next_calls_add() {
     };
     let text: String = (0..64).map(|i| format!("{}\n", letters(80, i))).collect();
     let before = native.encode(Some(model), &text, false).expect("ids");
-    let fill: String = (0..16_000)
-        .map(|i| format!("{}\n", letters(80, i)))
-        .collect();
-    native.encode(Some(model), &fill, false).expect("ids");
+    let fill = long_lines(long_pieces_past(LONG_PIECE_BYTES_CAPACITY));
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &fill, false, false)
+        .expect("ids");
     let (_, slots, grown) = long(&native);
     // Threads join until four times the share is just above the map's
     // slots: the tier holds more than that, and a clear in place would keep
@@ -5172,7 +6415,11 @@ fn an_ascii_free_line_splits_into_its_pieces_in_one_pass() {
 /// pair inside a word becomes the next token), the byte tokens ranked
 /// first or, as in a file whose byte tokens are not its first lines, last.
 fn tiktoken_ranks(state: &mut u64, merges: usize, bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
-    let corpus = random_text(state, 6000, &[]);
+    tiktoken_ranks_of(&random_text(state, 6000, &[]), merges, bytes_last)
+}
+
+/// [`tiktoken_ranks`] learnt from `corpus`.
+fn tiktoken_ranks_of(corpus: &str, merges: usize, bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
     let mut symbols: Vec<Vec<u8>> = corpus.bytes().map(|b| vec![b]).collect();
     let mut tokens: Vec<Vec<u8>> = Vec::new();
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -5275,6 +6522,102 @@ fn a_tiktoken_vocabulary_encodes_on_the_direct_path_as_its_own_encoder_does() {
             Ok(own.encode_ordinary(&long))
         );
     }
+}
+
+/// The Kimi template on the direct path cuts shaped text as the file's own
+/// encoder does. The direct path reads the template's matches by the scanner
+/// of the cased template behind its opening run; the file's encoder runs the
+/// pattern itself. The vocabulary is learnt from text of the same parts, so
+/// tokens span the edges the template cuts at (an ideograph and the letter,
+/// the digit or the mark beside it, a radical and the punctuation beside
+/// it): a piece cut elsewhere merges to other ids. The parts are every class
+/// the template tells apart: ideographs of the plane and above it, the Han
+/// characters that are no letters (iteration marks, numerals, radicals),
+/// kana and CJK punctuation, letter runs of every case structure with
+/// marks, digits, white space and line ends, punctuation, the clitics in
+/// both cases, and those side by side, with the special tokens among them,
+/// whole and cut. One text in sixteen is encoded again cut at every
+/// character, from the start and to the end, and one is long enough for
+/// the thread pool.
+#[test]
+fn the_kimi_template_encodes_shaped_text_as_the_files_own_encoder_does() {
+    const SPECIALS: [&str; 4] = ["[BOS]", "[EOS]", "<|im_end|>", "<|reserved_token_1|>"];
+    const PARTS: &[&str] = &[
+        "中", "中文", "汉字", "漢字", "㐀", "豈", "𠀀", "々", "〻", "〇", "〡", "⺀", "⿕", "あ",
+        "ア", "ー", "。", "、", "a", "word", "Word", "WORD", "wORD", "iPhone", "McDonald", "HTTPd",
+        "é", "É", "ß", "ſ", "ǅx", "ʰa", "я", "Я", "ก", "ा", "\u{301}", "1", "22", "333", "4444",
+        "٣", "²", " ", "  ", "\t", "\n", "\n\n", "\r\n", "\u{A0}", "\u{3000}", ".", ",", "!", "?",
+        "-", "(", ")", "\"", "/", "...", "，", "😀", "\u{200D}", "\u{FFFD}", "'", "'s", "'S", "'t",
+        "'re", "'RE", "'ve", "'m", "'ll", "'LL", "'d", "'x", "’s", "中A", "A中", "a中b", "中1",
+        "1〇", "〇1", "!⺀", "⺀!", "⺀a", " 中", "中 ", "中's", "中\n",
+    ];
+    let shaped = |state: &mut u64, parts: usize, specials: &[&str]| -> String {
+        let mut text = String::new();
+        for _ in 0..parts {
+            let roll = pseudo_random(state);
+            if !specials.is_empty() && roll.is_multiple_of(13) {
+                let special = specials[(roll / 13) as usize % specials.len()];
+                // Whole, or cut so that only a prefix of it stands.
+                let cut = if roll.is_multiple_of(3) {
+                    special.len() / 2
+                } else {
+                    special.len()
+                };
+                text.push_str(&special[..cut]);
+            } else {
+                text.push_str(PARTS[(roll % PARTS.len() as u64) as usize]);
+            }
+        }
+        text
+    };
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let ranks = tiktoken_ranks_of(&shaped(&mut state, 2500, &[]), 600, false);
+    let next = ranks.len() as u32 + 7;
+    let specials: Vec<(String, u32)> = SPECIALS
+        .iter()
+        .enumerate()
+        .map(|(i, special)| ((*special).to_owned(), next + i as u32))
+        .collect();
+    let native =
+        NativeEncoder::from_ranks(&ranks, KIMI_K2_PATTERN, &specials).expect("the direct path");
+    assert!(native.stages[0].pattern.has_scanner());
+    let own = CoreBPE::new(
+        ranks.clone(),
+        specials.iter().cloned().collect(),
+        KIMI_K2_PATTERN,
+    )
+    .expect("the file's encoder");
+    let same = |text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        assert_eq!(
+            native.encode(None, text, false),
+            Ok(own.encode_with_special_tokens(text)),
+            "{text:?}"
+        );
+        assert_eq!(
+            native.encode_plain(None, text, true),
+            Ok(own.encode_ordinary(text)),
+            "plain: {text:?}"
+        );
+    };
+    for round in 0..2000 {
+        let text = shaped(&mut state, 1 + round % 40, &SPECIALS);
+        same(&text);
+        if round % 16 == 0 {
+            for (cut, _) in text.char_indices() {
+                same(&text[..cut]);
+                same(&text[cut..]);
+            }
+        }
+    }
+    let mut long = String::new();
+    while long.len() < 3 * PARALLEL_MIN_BYTES {
+        long.push_str(&shaped(&mut state, 24, &SPECIALS));
+        long.push(' ');
+    }
+    same(&long);
 }
 
 /// Characters of the pool the sentencepiece vocabulary below has no token
@@ -5659,6 +7002,53 @@ fn ids_match_tokenizers_on_random_text_for_every_sentencepiece_shape() {
     }
 }
 
+/// A sentencepiece miss of a young thread close behind another waits only on
+/// a far seed (`NEAR_SEED_SLOTS`): there it takes a hole and is answered from
+/// its character symbols; on the near seed it is answered where it is met.
+#[test]
+fn a_sentencepiece_miss_waits_only_on_a_far_seed() {
+    let mut state = 0x5EA7_ED0F_A125_EED5u64;
+    let tokenizer = sentencepiece_tokenizer(&sentencepiece_shapes()[0], &mut state);
+    let model = tokenizer.get_model();
+    let mut far = seeded(&tokenizer);
+    assert!(far.seed.slots() <= NEAR_SEED_SLOTS);
+    // A test vocabulary's seed is near: an empty table of far size stands in.
+    far.seed = ShortPieceTable::for_entries(NEAR_SEED_SLOTS);
+    let mut cache = far.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    let key = ShortPieceKey::of(b" zq").expect("a short piece");
+    let vacancy = cache.packed.lookup(key, &mut ids).expect("a miss");
+    assert!(
+        far.seeded_raw(vacancy, &mut ids, &mut cache),
+        "far: it waits"
+    );
+    assert_eq!(ids, [7, 0]);
+    assert_eq!(cache.waiting.len(), 1);
+    far.answer_waiting(&mut ids, &mut cache);
+    let mut expected = vec![7];
+    expected.extend(
+        model
+            .tokenize(&format!("{WORD_MARKER}zq"))
+            .expect("the model tokenizes")
+            .iter()
+            .map(|token| token.id),
+    );
+    assert_eq!(ids, expected, "the character-symbol merge answers");
+
+    let near = seeded(&tokenizer);
+    let mut cache = near.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    let vacancy = cache.packed.lookup(key, &mut ids).expect("a miss");
+    assert!(
+        !near.seeded_raw(vacancy, &mut ids, &mut cache),
+        "near: it answers in place"
+    );
+    assert_eq!(ids, [7]);
+    assert!(cache.waiting.is_empty());
+}
+
 #[test]
 fn fixed_texts_match_tokenizers_for_every_sentencepiece_shape() {
     let mut state = 0xF1DE_D5EE_D000_0001u64;
@@ -5683,6 +7073,9 @@ fn fixed_texts_match_tokenizers_for_every_sentencepiece_shape() {
             "a\u{0}b\u{7F}c",
             "the\u{2581}",
             "\u{2581}\u{2581}the",
+            // A unit with no cut (the byte token `<0x11>` bridges `1` to `1`),
+            // long enough for the walk that encodes the marker's piece first.
+            &"1".repeat(257),
         ] {
             for special in [false, true] {
                 let expected = tokenizer
@@ -5774,6 +7167,32 @@ fn a_long_sentencepiece_text_encodes_the_same_on_the_pool_as_in_one_piece() {
             );
         }
     }
+}
+
+/// The walk tests the pairs of a text 64 at a time: under every alignment
+/// of the text to those blocks the pieces end at its cuts, the cut between
+/// the last pair of a block and the first of the next too.
+#[test]
+fn the_sentencepiece_pieces_end_at_every_cut_under_each_alignment_to_a_block() {
+    let mut state = 0x0B10_C5EA_4064_5EEDu64;
+    let model = ModelWrapper::BPE(sentencepiece_model(&mut state));
+    let chars = CharSymbols::from_model(&model, Marker::Never, None).expect("the path takes it");
+    let text = random_text(&mut state, 200, &[]);
+    let mut cuts_between_blocks = 0;
+    for from in 0..64 {
+        let text = &text.as_bytes()[from..];
+        let mut pieces = Vec::new();
+        chars.pieces(text, |start, end| pieces.push((start, end)));
+        let mut cut = Vec::new();
+        let mut start = 0;
+        for end in (1..=text.len()).filter(|&p| p == text.len() || chars.cuts_at(text, p)) {
+            cut.push((start, end));
+            start = end;
+        }
+        assert_eq!(pieces, cut, "from byte {from}");
+        cuts_between_blocks += usize::from(chars.cuts_at(text, 65));
+    }
+    assert!(cuts_between_blocks > 0);
 }
 
 #[test]
@@ -5959,7 +7378,7 @@ fn fuzz_text(state: &mut u64, fixtures: &[String]) -> String {
 
 /// The pieces of `stages` applied in turn by their match ranges, as byte
 /// ranges: the walk the encoder made before the scanners.
-fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
+pub(super) fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
     fn walk(stages: &[Stage], text: &str, offset: usize, out: &mut Vec<(usize, usize)>) {
         if text.is_empty() {
             return;
@@ -6006,7 +7425,7 @@ fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
 
 /// Holds the scanner of each of `patterns` against the pattern's program:
 /// the same match ranges on every fixture text, on the fuzz inputs and on
-/// two all-ASCII forms of each fuzz input.
+/// three all-ASCII forms of each fuzz input.
 fn scanner_differential(patterns: &[&str]) {
     let fixtures = fixture_texts();
     let rounds = fuzz_rounds();
@@ -6024,16 +7443,27 @@ fn scanner_differential(patterns: &[&str]) {
             );
             for words in [false, true] {
                 let mut each = Vec::new();
-                parsed
+                let stopped = parsed
                     .for_each_match::<false, _>(text, words, |start, end| each.push((start, end)));
                 assert_eq!(
-                    each, expected,
+                    (&each, stopped),
+                    (&expected, text.len()),
                     "for_each_match words={words}: pattern {pattern:?} text {text:?}"
                 );
             }
             if text.is_ascii() {
                 let mut each = Vec::new();
-                parsed.for_each_match::<true, _>(text, false, |start, end| each.push((start, end)));
+                let stopped = parsed
+                    .for_each_match::<true, _>(text, false, |start, end| each.push((start, end)));
+                // Where the lean scan left, the block pass reads the rest,
+                // as the encoder does.
+                if stopped < text.len() {
+                    let rest = &text[stopped..];
+                    let reader = parsed.by_blocks(rest).expect("a reader by blocks");
+                    reader.for_each_match(rest, false, |start, end| {
+                        each.push((stopped + start, stopped + end));
+                    });
+                }
                 assert_eq!(
                     each, expected,
                     "for_each_match of an all-ASCII text: pattern {pattern:?} text {text:?}"
@@ -6058,6 +7488,12 @@ fn scanner_differential(patterns: &[&str]) {
                 .flat_map(|c| std::iter::repeat_n(c, 1 + pseudo_random(&mut state) as usize % 12))
                 .collect();
             check(&runs);
+            // Long enough that the lean scan may leave for the block pass
+            // anywhere in its head (`block::MIN_BYTES` bytes past `block::HEAD`).
+            if !ascii.is_empty() {
+                let long = block::HEAD + block::MIN_BYTES;
+                check(&ascii.repeat(1 + long / ascii.len()));
+            }
         }
     }
 }

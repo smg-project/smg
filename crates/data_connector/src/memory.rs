@@ -371,6 +371,11 @@ impl ConversationItemInner {
         item_id: &ConversationItemId,
         added_at: DateTime<Utc>,
     ) {
+        // A link lives and dies with its item (an eviction unlinks through the item), so none
+        // is written for an item the bound has already dropped.
+        if !self.items.contains_key(item_id) {
+            return;
+        }
         let key: LinkKey = (added_at, item_id.0.clone());
         let links = self.links.entry(conversation_id.clone()).or_default();
         let rev = self.rev_index.entry(conversation_id.clone()).or_default();
@@ -550,9 +555,8 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         params: ListParams,
     ) -> ConversationItemResult<Vec<ConversationItem>> {
         let store = self.inner.read();
-        let map = match store.links.get(conversation_id) {
-            Some(m) => m,
-            None => return Ok(Vec::new()),
+        let Some(map) = store.links.get(conversation_id) else {
+            return Ok(Vec::new());
         };
 
         let after_key: Option<LinkKey> = if let Some(after_id) = &params.after {
@@ -1006,6 +1010,21 @@ impl ResponseStorage for MemoryResponseStorage {
         // Reverse to get chronological order (oldest first)
         chain.responses.reverse();
 
+        Ok(chain)
+    }
+
+    async fn get_response_chain_for(
+        &self,
+        response_id: &ResponseId,
+        tenant: Option<&str>,
+    ) -> ResponseResult<ResponseChain> {
+        // One pass under one lock, as for the whole chain (one snapshot, one
+        // depth limit); the cut is made on what that pass holds.
+        let mut chain = self.get_response_chain(response_id, None).await?;
+        if chain.responses.last().is_some_and(|head| is_unstored(head)) {
+            chain.responses.clear();
+        }
+        chain.responses = visible_chain(chain.responses, tenant);
         Ok(chain)
     }
 
@@ -2163,6 +2182,48 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A link is written only for an item the store holds: the bound may have
+    /// dropped the item since its create, and a link without its item would
+    /// never be removed.
+    #[tokio::test]
+    async fn a_link_is_written_only_for_an_item_the_store_holds() {
+        let config = MemoryConfig {
+            max_responses: 10,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let store = MemoryConversationItemStorage::with_config(&config);
+        let conversation: ConversationId = "conv_a".into();
+        let first = store
+            .create_item(make_item("message", Some("user"), json!([])))
+            .await
+            .unwrap();
+        // The second create drops the first: the bound is one item.
+        let second = store
+            .create_item(make_item("message", Some("user"), json!([])))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .link_items(
+                &conversation,
+                &[
+                    (first.id.clone(), now),
+                    (second.id.clone(), now + TimeDelta::microseconds(1)),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(!store
+            .is_item_linked(&conversation, &first.id)
+            .await
+            .unwrap());
+        assert!(store
+            .is_item_linked(&conversation, &second.id)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

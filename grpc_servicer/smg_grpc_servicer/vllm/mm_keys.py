@@ -55,7 +55,9 @@ def mm_identity_hashes(batches) -> list:
 
 
 def modality_name(mm_proto) -> str:
-    """vLLM's name for the batch's modality: ``video`` or ``image``."""
+    """vLLM's name for the batch's modality; unspecified keeps the image default."""
+    if mm_proto.modality == common_pb2.AUDIO:
+        return "audio"
     return "video" if mm_proto.modality == common_pb2.VIDEO else "image"
 
 

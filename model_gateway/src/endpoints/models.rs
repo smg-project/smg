@@ -33,17 +33,22 @@ use axum::{
     Json,
 };
 use futures::future::select_all;
-use openai_protocol::{messages, model_card::ModelCard, models::ListModelsResponse};
+use openai_protocol::{
+    messages, model_card::ModelCard, models::ListModelsResponse, worker::ProviderType,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use smg_external_router::{known, ExternalRouterSpec};
+use smg_worker::identity::{basic::RuntimeType, endpoint::Endpoint};
 use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
     middleware::{into_messages_envelope, AuthConfig},
-    routers::{common::header_utils::apply_provider_headers, error, provider_support},
-    worker::{identity::endpoint::Endpoint, ProviderType, RuntimeType, WorkerRegistry},
+    routers::{
+        common::{header_utils::apply_provider_headers, snapshot::WorkerRegistry},
+        error, provider_support,
+    },
 };
 
 /// The API family a models request speaks, read from its headers.
@@ -522,13 +527,15 @@ mod tests {
 
     use axum::http::{Request, StatusCode, Uri};
     use openai_protocol::worker::WorkerSpec;
+    use smg_worker::{
+        identity::basic::{Worker, WorkerType},
+        test_support::no_health_check,
+    };
 
     use super::*;
     use crate::{
-        config::types::TenantApiKeyEntry,
-        middleware::test_support::json_of,
-        server::http_client,
-        worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
+        config::types::TenantApiKeyEntry, middleware::test_support::json_of,
+        routers::grpc::backend_client::BasicWorkerBuilder, server::http_client,
     };
 
     /// An inventory with no model in it answers the gateway's JSON error

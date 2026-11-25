@@ -189,6 +189,8 @@ class ShardTableTests(unittest.TestCase):
             for name in sorted(closure(members, script("packages", row["shard"]).split())):
                 crate = members[name]["dir"]
                 probes = ["Cargo.toml", "src/lib.rs", "src/main.rs"]
+                if crate == "model_gateway":
+                    probes.append("src/cli/mod.rs")
                 # The target directories cargo discovers, where the crate has Rust sources in them.
                 probes += [
                     f"{d}/probe.rs"
@@ -222,12 +224,12 @@ class ShardTableTests(unittest.TestCase):
         self.assertFalse(filter_matches(filters["rust-multimodal"], "crates/tokenizer/src/lib.rs"))
         self.assertFalse(filter_matches(filters["rust-gateway"], "docs/README.md"))
 
-    def test_the_kv_filter_covers_the_source_the_policy_crates_test_reads(self):
-        # The policy controller's binary test holds its allocator settings to
+    def test_the_kv_filter_covers_the_source_the_grand_central_crates_test_reads(self):
+        # Grand Central's binary test holds its allocator settings to
         # the gateway's constant, read from this file by path: a change there
         # can change its result, so it runs the kv shard.
         path = "model_gateway/src/observability/metrics.rs"
-        test = REPO / "crates" / "policy_controller" / "tests" / "binary.rs"
+        test = REPO / "crates" / "grand_central" / "tests" / "binary.rs"
         self.assertIn(f'"/../../{path}"', test.read_text())
         filters = path_filters()
         self.assertTrue(filter_matches(filters["rust-kv"], path), path)
@@ -259,7 +261,7 @@ class ShardTableTests(unittest.TestCase):
             self.assertFalse(filter_matches(filters["rust-gateway"], path), path)
 
     def test_the_kv_shard_builds_the_example_policy_plugin_and_requires_it(self):
-        # The policy crate's tests load the example plugin as its own build
+        # The Grand Central crate's tests load the example plugin as its own build
         # line wrote it: the shard that runs them builds it first, requires
         # it, and runs on a change to the example or to the tool's installer.
         row = next(r for r in shard_table() if r["shard"] == "kv")
@@ -299,7 +301,7 @@ class ShardTableTests(unittest.TestCase):
     def test_the_kv_shard_turns_on_every_feature_a_policy_test_target_requires(self):
         # cargo skips a test target whose required features are off, in
         # silence: the shard's line turns each of them on.
-        manifest = tomllib.loads((REPO / "crates/policy_controller/Cargo.toml").read_text())
+        manifest = tomllib.loads((REPO / "crates/grand_central/Cargo.toml").read_text())
         package = manifest["package"]["name"]
         line = next(
             text
@@ -338,7 +340,7 @@ class ShardTableTests(unittest.TestCase):
         step = step.split("\n      - name:", 1)[0]
         for line in (
             "if: contains(matrix.needs, 'policy-import')",
-            "bash examples/policy-controller/own-repository.sh "
+            "bash examples/grand-central/own-repository.sh "
             '"${RUNNER_TEMP}/own-controller" --snapshot',
             'cd "${RUNNER_TEMP}/own-controller"',
             "cargo test",
@@ -346,14 +348,14 @@ class ShardTableTests(unittest.TestCase):
             self.assertIn(line, step)
         filters = path_filters()
         for path in (
-            "examples/policy-controller/own-repository.sh",
-            "examples/policy-controller/src/main.rs",
-            "crates/policy_controller/build.rs",
+            "examples/grand-central/own-repository.sh",
+            "examples/grand-central/src/main.rs",
+            "crates/grand_central/build.rs",
         ):
             self.assertTrue(filter_matches(filters["rust-kv"], path), path)
 
     def test_the_example_controllers_script_writes_a_repository_of_its_own(self):
-        example = REPO / "examples" / "policy-controller"
+        example = REPO / "examples" / "grand-central"
         own = example / "own-repository.sh"
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "own"
@@ -365,7 +367,7 @@ class ShardTableTests(unittest.TestCase):
             # The crate by git from the source it is handed, and no key the
             # workspace alone resolves.
             self.assertEqual(
-                manifest["dependencies"]["smg-policy-controller"],
+                manifest["dependencies"]["smg-grand-central"],
                 {"git": "file:///a/checkout", "features": ["controller"]},
             )
             self.assertNotIn("workspace", text)
@@ -400,8 +402,8 @@ class ShardTableTests(unittest.TestCase):
             # decisions: a feature the tests alone turn on, in the example's
             # manifest and in the copy's.
             client = {"git": "file:///a/checkout", "features": ["client"]}
-            self.assertEqual(dev["smg-policy-controller"], client)
-            ours = own_manifest["dev-dependencies"]["smg-policy-controller"]
+            self.assertEqual(dev["smg-grand-central"], client)
+            ours = own_manifest["dev-dependencies"]["smg-grand-central"]
             self.assertEqual(ours["features"], ["client"])
             # The release profile the stock controller is built with, without
             # its per-package entries: a copy with none builds on cargo's
@@ -434,7 +436,7 @@ class ShardTableTests(unittest.TestCase):
             line = next(
                 entry
                 for entry in (plain / "Cargo.toml").read_text().splitlines()
-                if entry.startswith("smg-policy-controller")
+                if entry.startswith("smg-grand-central")
             )
             self.assertIn(line, (example / "README.md").read_text())
             # With --snapshot the source is a repository of one revision
@@ -459,7 +461,7 @@ class ShardTableTests(unittest.TestCase):
             )
             source = Path(tmp) / "snap-source"
             named = tomllib.loads((snap / "Cargo.toml").read_text())["dependencies"]
-            self.assertEqual(named["smg-policy-controller"]["git"], f"file://{source}")
+            self.assertEqual(named["smg-grand-central"]["git"], f"file://{source}")
             for args, expected in (
                 (("rev-list", "--count", "HEAD"), "1"),
                 (("status", "--short"), ""),
@@ -469,8 +471,8 @@ class ShardTableTests(unittest.TestCase):
                 )
                 self.assertEqual(read.stdout.strip(), expected, args)
             for name in (
-                "crates/policy_controller/Cargo.toml",
-                "crates/grpc_client/proto/common.proto",
+                "crates/grand_central/Cargo.toml",
+                "crates/worker/proto/common.proto",
             ):
                 self.assertTrue((source / name).is_file(), name)
         # A directory inside the checkout is refused and never made: the

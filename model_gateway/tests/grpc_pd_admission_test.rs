@@ -22,9 +22,9 @@ use smg::{
     middleware::TenantRequestMeta,
     routers::{common::pd_admission, RouterTrait},
     tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
 };
 use smg_test_harness as common;
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
 const MODEL: &str = "pd-admission-test-model";
 /// How long the canned mock holds each request before answering, so that a

@@ -10,12 +10,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use openai_protocol::worker::{RuntimeType, WorkerType};
-use smg::{
-    config::RouterConfig,
-    observability::metrics_server::start_metrics_server,
-    worker::{KvEventMonitor, ModelCard, SubscriptionKind},
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{RuntimeType, WorkerType},
 };
+use smg::{
+    config::RouterConfig, observability::metrics_server::start_metrics_server,
+    policies::kv_index::event_monitor::KvEventMonitor,
+};
+use smg_worker::{identity::basic::Worker, kv_events::SubscriptionKind};
 
 use crate::{
     common::grpc_harness::{grpc_test_context, grpc_worker, serve_mock_worker_with},
@@ -49,9 +52,10 @@ async fn start_realistic_worker() -> u16 {
 #[tokio::test]
 async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
     let handle = recorder();
-    let (metrics_addr, _metrics_server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
-        .await
-        .expect("metrics server binds an ephemeral port");
+    let (metrics_addr, _metrics_server) =
+        start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
+            .await
+            .expect("metrics server binds an ephemeral port");
 
     let mut ports = Vec::with_capacity(WORKERS);
     for _ in 0..WORKERS {
@@ -79,7 +83,7 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
     let mut urls = Vec::with_capacity(WORKERS);
     for port in &ports {
         let url = format!("grpc://127.0.0.1:{port}");
-        let worker: Arc<dyn smg::worker::Worker> = Arc::new(
+        let worker: Arc<dyn Worker> = Arc::new(
             grpc_worker(
                 *port,
                 WorkerType::Regular,

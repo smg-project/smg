@@ -39,31 +39,39 @@ use criterion::{
 };
 use kv_index::{compute_content_hash, request_prefix_hashes};
 use metrics_exporter_prometheus::PrometheusHandle;
-use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{HealthCheckConfig, WorkerLoadResponse},
+};
 use smg::{
     config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
     observability::metrics::{start_prometheus, PrometheusConfig},
     policies::{
         cost::{build, CandidateInputs, RequestInputs, POLICY_NAMES},
         hash_ring::HashRing,
+        kv_index::{
+            event_monitor::{bench_support::IndexFeed, KvEventMonitor},
+            index_backend::KvIndex,
+        },
         CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
         LoadBalancingPolicy, ManualPolicy, NamedList, PassthroughPolicy, PolicyRegistry,
         PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
         SelectWorkerInfo,
     },
     routers::{
-        common::bench_support::{process_trace_configured, PairPath, RegularPath},
-        grpc::SelectionBench,
-    },
-    worker::{
-        kv::event_monitor::bench_support::IndexFeed,
-        load::state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, ConnectionMode, KvEventMonitor, KvIndex, ModelCard, RuntimeType,
-        Worker, WorkerRegistry, WorkerType,
+        common::{
+            bench_support::{process_trace_configured, PairPath, RegularPath},
+            snapshot::WorkerRegistry,
+        },
+        grpc::{backend_client::BasicWorkerBuilder, SelectionBench},
     },
 };
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
+};
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    load::state::{one_rank_load, TestFeed},
 };
 
 const BLOCK_SIZE: usize = 16;
@@ -493,9 +501,19 @@ fn skipped_under_a_process_trace(group: &str) -> bool {
 /// of this file's list: a placement counts its selection on a kept handle, as a serving
 /// process does. With no recorder the count builds its key on every placement, a form no
 /// serving process runs. The handle is the one a serving process's upkeep drains.
+///
+/// It is drained twice where it starts. The first two drains each replay what the start
+/// described into one of the two copies the recorder keeps of its descriptions, hashed
+/// under a random seed: paid in a cell's first two batches, a batch of two placements
+/// counted 170 thousand instructions more, and not the same number in two processes.
 fn count_as_a_serving_process() -> &'static PrometheusHandle {
     static RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
-    RECORDER.get_or_init(|| start_prometheus(PrometheusConfig::default()))
+    RECORDER.get_or_init(|| {
+        let recorder = start_prometheus(PrometheusConfig::default());
+        recorder.run_upkeep();
+        recorder.run_upkeep();
+        recorder
+    })
 }
 
 /// Placements timed between two drains of the recorder. The recorder holds every

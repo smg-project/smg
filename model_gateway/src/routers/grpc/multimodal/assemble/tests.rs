@@ -251,6 +251,80 @@ fn a_single_whole_wire_item_moves_its_own_bytes_into_the_payload() {
     }
 }
 
+/// With shared memory off, the items of a wire batch in the worker's dtype
+/// are its own rows of the batch's allocation, where each was a written copy.
+#[test]
+fn the_items_of_a_wire_batch_view_its_allocation() {
+    use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;
+
+    fn inline(item: &TokenSpeedMultimodalItem) -> &[u8] {
+        match &item.encoder_input.storage {
+            TokenSpeedTensorStorage::Inline(bytes) => bytes.as_slice(),
+            other => panic!("an inline payload expected, got {other:?}"),
+        }
+    }
+    // The sixteen wire bytes of two items, in `shape`.
+    let wire = |shape: [usize; 2]| {
+        let mut input = single_image_wire_intermediate().preprocessed.encoder_input;
+        if let EncoderInput::Wire { shape: own, .. } = &mut input {
+            *own = shape.to_vec();
+        }
+        input
+    };
+    // Where each item's payload starts in the batch's sixteen bytes, `None`
+    // for storage of its own; every payload is what the borrowed path writes.
+    let offsets = |input: EncoderInput, batched: bool, shm_enabled: bool| {
+        let mut two = two_image_intermediate();
+        two.preprocessed.encoder_input = input;
+        if batched {
+            two.field_layouts.encoder_input = FieldLayout::Batched;
+        }
+        let start = match two.preprocessed.encoder_input.view() {
+            EncoderInputView::Wire { bytes, .. } => bytes.as_ptr(),
+            _ => panic!("a wire input expected"),
+        };
+        let options = || {
+            vec![TokenSpeedAssemblyOptions {
+                shm_enabled,
+                shm_min_bytes: usize::MAX,
+                encoder_input_dtype: "bfloat16".into(),
+                skip_pixel_values: false,
+            }]
+        };
+        let written = assemble_tokenspeed_batches(std::slice::from_ref(&two), options()).unwrap();
+        let owned = assemble_tokenspeed_batches_owned(vec![two], options()).unwrap();
+        owned
+            .items
+            .iter()
+            .zip(&written.items)
+            .map(|(item, written)| {
+                assert_eq!(item.encoder_input.shape, written.encoder_input.shape);
+                assert_eq!(inline(item), inline(written));
+                (0..16).find(|&offset| start.wrapping_add(offset) == inline(item).as_ptr())
+            })
+            .collect::<Vec<_>>()
+    };
+    // The rows by flat sizes, and the rows of a batched layout.
+    assert_eq!(offsets(wire([4, 2]), false, false), [Some(0), Some(8)]);
+    assert_eq!(offsets(wire([2, 4]), true, false), [Some(0), Some(8)]);
+    // The rows of a wire that is shared already, in an allocation of exactly
+    // its sixteen bytes.
+    let mut whole = wire([4, 2]);
+    assert!(whole.share_wire(usize::MAX));
+    assert_eq!(offsets(whole, false, false), [Some(0), Some(8)]);
+    // Written from views into storage of their own: a layout that does not
+    // cover the wire, shared memory on, and a part of a larger shared wire.
+    assert_eq!(offsets(wire([4, 2]), true, false), [None, None]);
+    assert_eq!(offsets(wire([4, 2]), false, true), [None, None]);
+    let mut twice = wire([8, 2]);
+    if let EncoderInput::Wire { bytes, .. } = &mut twice {
+        bytes.extend_from_within(..);
+    }
+    assert!(twice.share_wire(usize::MAX));
+    let part = twice.split_axis0(&[4, 4]).unwrap().swap_remove(0);
+    assert_eq!(offsets(part, false, false), [None, None]);
+}
+
 /// Two items share one tensor: both are written from views, nothing moves.
 #[test]
 fn a_batch_of_two_items_keeps_its_encoder_input() {
@@ -567,7 +641,7 @@ fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
             encoder_input_dtype: "bfloat16".into(),
             skip_pixel_values: false,
         },
-        None,
+        Vec::new(),
     )
     .unwrap();
 
@@ -929,6 +1003,125 @@ fn media_the_engine_would_not_read_in_full_is_refused() {
 }
 
 #[test]
+fn nemotron_audio_reaches_vllm_with_native_lengths_and_prompt_bindings() {
+    use llm_multimodal::{ModelMetadata, ModelRegistry, PreProcessorConfig, Tokenizer};
+
+    struct AudioTokenizer;
+    impl Tokenizer for AudioTokenizer {
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            (token == "<|audio|>").then_some(131072)
+        }
+        fn id_to_token(&self, _id: u32) -> Option<String> {
+            None
+        }
+        fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+            None
+        }
+    }
+
+    let config = serde_json::json!({
+        "model_type": "nemotron3_5_transcribe",
+        "audio_config": {
+            "preprocessor": {"sample_rate": 16000, "hop_length": 160, "n_fft": 512},
+            "asr_encoder": {"subsampling_factor": 8}
+        }
+    });
+    let registry = ModelRegistry::new();
+    let metadata = ModelMetadata {
+        model_id: "nemotron-transcribe",
+        tokenizer: &AudioTokenizer,
+        config: &config,
+    };
+    let spec = registry.lookup(&metadata).unwrap();
+    let processor = spec
+        .audio_processor(&config, &PreProcessorConfig::default())
+        .unwrap()
+        .unwrap();
+    let audios: Vec<_> = [(1, "short"), (1440, "long")]
+        .into_iter()
+        .map(|(length, hash)| {
+            Arc::new(AudioClip::new(
+                bytes::Bytes::new(),
+                DecodedAudio {
+                    samples: vec![0.25; length],
+                    sample_rate: 16000,
+                },
+                AudioSource::InlineBytes,
+                hash.to_string(),
+            ))
+        })
+        .collect();
+
+    // A vision worker's pixel-normalization setting must not reinterpret audio.
+    for device_normalizes in [false, true] {
+        let preprocessed = processor.preprocess(&audios).unwrap();
+        let bindings = preprocessed
+            .feature_token_counts
+            .iter()
+            .enumerate()
+            .map(|(item, &length)| PromptBinding {
+                item_index: item,
+                prompt_ordinal: item,
+                structural: PlaceholderRange {
+                    offset: 10 + item,
+                    length,
+                },
+                patches: vec![],
+            })
+            .collect();
+        let intermediate = PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Audios(audios.clone()),
+            bindings,
+            placeholder_token_id: Some(
+                spec.placeholder_token_id(&metadata)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            field_layouts: spec.encoder_field_layouts_for(Modality::Audio),
+            keep_on_cpu_keys: spec.keep_on_cpu_keys_for(Modality::Audio),
+            encoder_input_key: spec.encoder_input_key_for(Modality::Audio),
+        };
+        validate_precomputed_batch(&intermediate).unwrap();
+        let assembled = assemble_vllm(
+            intermediate,
+            &VllmAssembly {
+                encoder_dtype: "bfloat16".into(),
+                device_normalizes,
+                shm_enabled: false,
+                shm_min_bytes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(assembled.modality, common::Modality::Audio);
+        assert_eq!(assembled.encoder_input_key.as_deref(), Some("audio_signal"));
+        assert_eq!(assembled.pixel_values_shape, [2, 1440]);
+        assert_eq!(assembled.pixel_values_dtype, "bfloat16");
+        assert_eq!(assembled.pixel_values.len(), 2 * 1440 * size_of::<u16>());
+        assert_eq!(assembled.mm_hashes, ["short", "long"]);
+        assert_eq!(assembled.mm_placeholders, [(10, 1), (11, 2)]);
+        assert_eq!(assembled.im_token_id, Some(131072));
+        assert_eq!(assembled.keep_on_cpu_keys, ["audio_signal_length"]);
+        assert!(assembled
+            .batched_keys
+            .iter()
+            .any(|key| key == "audio_signal"));
+        assert!(assembled
+            .batched_keys
+            .iter()
+            .any(|key| key == "audio_signal_length"));
+        let lengths = &assembled.model_specific_tensors["audio_signal_length"];
+        assert_eq!(lengths.dtype, "int64");
+        assert_eq!(lengths.shape, [2]);
+        assert_eq!(
+            lengths.data,
+            [160i64.to_le_bytes(), 1440i64.to_le_bytes()].concat()
+        );
+    }
+}
+
+#[test]
 fn assemble_tokenspeed_splits_audio_items_as_bfloat16_by_default() {
     let mut model_specific = HashMap::new();
     model_specific.insert(
@@ -1114,10 +1307,11 @@ fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
 #[cfg(target_os = "linux")]
 fn an_inline_encode_assembly_writes_no_shared_memory() {
     use openai_protocol::worker::{TransportMode, WorkerSpec};
+    use smg_worker::identity::basic::Worker;
 
-    use crate::{
-        routers::grpc::proto_wrapper::{mm_shm_dev_writable, TokenSpeedTensorStorage},
-        worker::{BasicWorkerBuilder, Worker},
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder,
+        proto_wrapper::{mm_shm_dev_writable, TokenSpeedTensorStorage},
     };
 
     if !mm_shm_dev_writable() {
@@ -1131,7 +1325,9 @@ fn an_inline_encode_assembly_writes_no_shared_memory() {
         })
         .build(),
     );
-    let workers = WorkerSelection::Single { worker };
+    let workers = WorkerSelection::Single {
+        worker: worker.into(),
+    };
     let intermediate = MultimodalIntermediate::try_new(vec![single_image_intermediate()]).unwrap();
 
     let inline = assemble_tokenspeed_for_encode(&intermediate, Some(&workers), true).unwrap();
@@ -1452,7 +1648,7 @@ fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
 /// unknown or absent labels retain float32 and integer metadata stays intact.
 #[test]
 fn sglang_assembly_honors_worker_dtype_for_all_batches() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     for (label, expected, width) in [
         (None, "float32", 4),
@@ -1469,7 +1665,7 @@ fn sglang_assembly_honors_worker_dtype_for_all_batches() {
             builder = builder.label("multimodal_encoder_dtype", dtype);
         }
         let workers = WorkerSelection::Single {
-            worker: Arc::new(builder.build()),
+            worker: Arc::new(builder.build()).into(),
         };
         let expected_image =
             assemble_sglang_with_dtype(single_image_intermediate(), expected).unwrap();

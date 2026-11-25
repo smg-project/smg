@@ -9,24 +9,22 @@ use openai_protocol::{
 };
 use tracing::{error, warn};
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            common::stages::PipelineStage,
-            context::{PreparationOutput, RequestContext},
-            regular::{
-                stages::{
-                    reading,
-                    rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
-                },
-                symphony,
+use crate::routers::{
+    common::snapshot::RoutingPool,
+    error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{PreparationOutput, RequestContext},
+        regular::{
+            stages::{
+                reading,
+                rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
             },
-            spec::MessagesResponseSpec,
-            utils::{self, message_utils},
+            symphony,
         },
+        spec::MessagesResponseSpec,
+        utils::{self, message_utils},
     },
-    worker::RoutingPool,
 };
 
 /// Message API preparation stage
@@ -123,14 +121,16 @@ impl MessagePreparationStage {
             Err(e) => {
                 // As in the chat preparation: one WARN and the mark only for
                 // a refusal typed as the request's own; every other failure
-                // keeps ERROR and stays unmarked.
+                // keeps ERROR and stays unmarked, the one that is the
+                // template's own whatever the request holds answered in the
+                // server's class.
                 let refused = e.is_refusal();
                 if refused {
                     warn!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
                 } else {
                     error!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
                 }
-                let answer = error::bad_request("process_messages_failed", String::from(e));
+                let answer = e.answer();
                 return Err(if refused {
                     utils::reported(answer)
                 } else {
@@ -244,17 +244,6 @@ impl MessagePreparationStage {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
-
-    use crate::routers::grpc::utils::message_utils::invalid_multimodal_request;
-
-    #[test]
-    fn invalid_multimodal_input_maps_to_bad_request() {
-        let response = invalid_multimodal_request("unsupported audio modality");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
     /// A byte-level tokenizer over `template`, in a directory the caller keeps
     /// alive for as long as the tokenizer is used.
     fn byte_tokenizer_with_template(
@@ -299,12 +288,16 @@ mod tests {
 
         use crate::{
             config::ParserChoice,
-            routers::grpc::{
-                common::stages::PipelineStage,
-                context::{PreparationOutput, RequestContext},
-                regular::stages::{messages::MessagePreparationStage, testing::components_over},
+            routers::{
+                common::snapshot::WorkerRegistry,
+                grpc::{
+                    common::stages::PipelineStage,
+                    context::{PreparationOutput, RequestContext},
+                    regular::stages::{
+                        messages::MessagePreparationStage, testing::components_over,
+                    },
+                },
             },
-            worker::WorkerRegistry,
         };
 
         const MODEL: &str = "effort-model";
@@ -367,12 +360,16 @@ mod tests {
 
         use crate::{
             config::ParserChoice,
-            routers::grpc::{
-                common::stages::PipelineStage,
-                context::{PreparationOutput, RequestContext},
-                regular::stages::{messages::MessagePreparationStage, testing::components_over},
+            routers::{
+                common::snapshot::WorkerRegistry,
+                grpc::{
+                    common::stages::PipelineStage,
+                    context::{PreparationOutput, RequestContext},
+                    regular::stages::{
+                        messages::MessagePreparationStage, testing::components_over,
+                    },
+                },
             },
-            worker::WorkerRegistry,
         };
 
         let (_dir, tokenizer) = byte_tokenizer_with_template(
@@ -447,15 +444,17 @@ mod tests {
 
         use crate::{
             config::ParserChoice,
-            routers::grpc::{
-                common::stages::PipelineStage,
-                context::{PreparationOutput, RequestContext},
-                regular::{
-                    stages::{messages::MessagePreparationStage, testing::components_over},
-                    symphony,
+            routers::{
+                common::snapshot::WorkerRegistry,
+                grpc::{
+                    common::stages::PipelineStage,
+                    context::{PreparationOutput, RequestContext},
+                    regular::{
+                        stages::{messages::MessagePreparationStage, testing::components_over},
+                        symphony,
+                    },
                 },
             },
-            worker::WorkerRegistry,
         };
 
         const MODEL: &str = "format-model";

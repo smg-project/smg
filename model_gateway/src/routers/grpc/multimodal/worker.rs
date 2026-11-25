@@ -20,6 +20,10 @@ use llm_multimodal::{
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm, WorkerMediaFault};
+use smg_worker::{
+    connection::http_client::build_with,
+    identity::basic::{RuntimeType, WorkerType},
+};
 use tracing::{info, warn};
 
 use super::{
@@ -36,10 +40,7 @@ use super::{
     process::process_multimodal_plan,
     RegistryTokenizer,
 };
-use crate::{
-    routers::grpc::proto_wrapper::vllm_mm_identity,
-    worker::{connection::http_client::build_with, RuntimeType},
-};
+use crate::routers::grpc::proto_wrapper::vllm_mm_identity;
 
 /// A worker serves one model: the config registry's one key.
 const CONFIG_KEY: &str = "worker";
@@ -657,6 +658,9 @@ impl WorkerMediaPipeline {
             drain_fetches_on_error: true,
             inflight: None,
             video_frame_budget: settings.video_frame_budget,
+            // The worker processes its own requests' media: no router's
+            // mode applies.
+            pixels_go_to: WorkerType::Regular,
         };
         // Only processors with a pixel-less Decode metadata contract advertise reuse.
         let sglang_identity_key = if spec_name == "glm53_flash"
@@ -993,7 +997,8 @@ fn apply_processor_kwargs(
 /// fetch or decode failure is the media's, by the connector's own reading of
 /// it (the request's, or its host's for now) and under the connector's code
 /// (the verdict the router-side pipeline answers directly, see
-/// `multimodal::processing_failed_response`); a bad part or a prompt the
+/// `multimodal::processing_failed_response`); an image size the processor's
+/// rule refuses is the request's media too; a bad part or a prompt the
 /// anchors do not fit or an item above the engine's encoder budget the
 /// caller's; anything else ours.
 fn classify(error: anyhow::Error) -> WorkerMediaError {
@@ -1006,6 +1011,14 @@ fn classify(error: anyhow::Error) -> WorkerMediaError {
     }
     if let Some(fetch) = media_verdict(&error) {
         return classify_fetch(fetch, message);
+    }
+    // The request's media, as a decoder's refusal of it is.
+    if super::process::ImageSizeRefused::is(&error) {
+        return WorkerMediaError::Media {
+            fault: WorkerMediaFault::Client,
+            code: MediaErrorCode::InvalidRequest,
+            message,
+        };
     }
     match error
         .chain()
@@ -2083,6 +2096,17 @@ mod tests {
             WorkerMediaError::Invalid(message)
                 if message.contains("192001 feature tokens (900 sampled frames)")
                     && message.contains("192000-token encoder budget")
+        ));
+        // A size the processor's rule refuses is the request's media.
+        let size = anyhow::Error::new(super::super::process::ImageSizeRefused("thin".into()))
+            .context("Failed to process the plan");
+        assert!(matches!(
+            classify(size),
+            WorkerMediaError::Media {
+                fault: WorkerMediaFault::Client,
+                code: MediaErrorCode::InvalidRequest,
+                ..
+            }
         ));
     }
     /// SGLang follows its day-0 source geometry and advertises pixel-less Decode reuse.

@@ -7,20 +7,22 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use llm_multimodal::{
     registry::{ModelRegistryError, RegistryResult},
-    EncoderDtype, MediaConnector, MediaConnectorConfig, Modality, ModelProcessorSpec,
-    ModelRegistry, PreProcessorConfig, TransparencyPolicy, VisionPreProcessor,
+    AudioPreProcessor, EncoderDtype, MediaConnector, MediaConnectorConfig, Modality,
+    ModelProcessorSpec, ModelRegistry, PreProcessorConfig, TransparencyPolicy, VisionPreProcessor,
 };
 use openai_protocol::worker::MmProcessingMode;
 use parking_lot::RwLock;
+use smg_worker::{connection::http_client::build_with, identity::basic::WorkerType};
 use tracing::{debug, warn};
 
 use super::{
     inflight::MultimodalInflight,
     pixel_cache::{pixel_cache_with_budget, PixelCache},
+    plan::DeploymentFault,
     process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
-use crate::{observability::metrics::Metrics, worker::connection::http_client::build_with};
+use crate::observability::metrics::Metrics;
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug)]
@@ -34,6 +36,7 @@ pub(crate) struct MultimodalModelConfig {
     /// The vision processors built from these configs, by the name of the
     /// spec that built them (see [`Self::vision_processors`]).
     vision_processors: DashMap<&'static str, Arc<VisionProcessors>>,
+    audio_processors: DashMap<&'static str, AudioProcessor>,
     /// The pixel cache's fingerprints of these configs, one per tokenizer,
     /// model, wire dtype and transparency policy a request named (see
     /// [`Self::image_fingerprint`]).
@@ -77,6 +80,7 @@ impl MultimodalModelConfig {
             preprocessor_config,
             video_preprocessor_config,
             vision_processors: DashMap::new(),
+            audio_processors: DashMap::new(),
             image_fingerprints: RwLock::new(Vec::new()),
         }
     }
@@ -130,6 +134,21 @@ impl MultimodalModelConfig {
             .entry(spec.name())
             .or_insert_with(|| Arc::new(VisionProcessors::build(spec, self)))
             .clone()
+    }
+
+    /// Builds `spec`'s audio processor once per config, caching errors too.
+    pub(crate) fn audio_processor(
+        &self,
+        spec: &dyn ModelProcessorSpec,
+    ) -> Result<Arc<dyn AudioPreProcessor>> {
+        // `DashMap::entry` takes a shard write lock even on hits.
+        if let Some(cached) = self.audio_processors.get(spec.name()) {
+            return cached.processor();
+        }
+        self.audio_processors
+            .entry(spec.name())
+            .or_insert_with(|| AudioProcessor::build(spec, self))
+            .processor()
     }
 
     /// These configs with `processors` standing for what `spec` would build.
@@ -236,6 +255,46 @@ impl fmt::Debug for VisionProcessors {
     }
 }
 
+struct AudioProcessor {
+    spec: &'static str,
+    built: RegistryResult<Option<Arc<dyn AudioPreProcessor>>>,
+}
+
+impl AudioProcessor {
+    fn build(spec: &dyn ModelProcessorSpec, model_config: &MultimodalModelConfig) -> Self {
+        let config = preprocessor_config_for(model_config, Modality::Audio);
+        Self {
+            spec: spec.name(),
+            built: spec
+                .audio_processor(&model_config.config, config)
+                .map(|processor| processor.map(Arc::from)),
+        }
+    }
+
+    fn processor(&self) -> Result<Arc<dyn AudioPreProcessor>> {
+        match &self.built {
+            Ok(Some(processor)) => Ok(Arc::clone(processor)),
+            Ok(None) => Err(anyhow::anyhow!(
+                "No audio processor registered for model spec: {}",
+                self.spec
+            )),
+            Err(error) => Err(anyhow::anyhow!(
+                "The audio processor of model spec {} cannot be built: {error}",
+                self.spec
+            )),
+        }
+    }
+}
+
+impl fmt::Debug for AudioProcessor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioProcessor")
+            .field("spec", &self.spec)
+            .field("built", &self.built.as_ref().map(Option::is_some))
+            .finish()
+    }
+}
+
 /// Shared cache of multimodal model configuration files keyed by tokenizer UUID.
 ///
 /// Sources of data:
@@ -294,16 +353,37 @@ impl MultimodalConfigRegistry {
             tokenizer_source,
         ))
         .await
-        .with_context(|| {
-            format!("Failed to resolve model config directory for '{tokenizer_source}'")
+        .map_err(|error| {
+            // This sentence is the client's: the source's path stays in the
+            // cause under it, which only the log writes.
+            let sentence = if llm_multimodal::hub::LocalSourceWithoutConfig::is(&error) {
+                "Failed to resolve model config directory: the model's local source has no config.json"
+                    .to_string()
+            } else {
+                format!("Failed to resolve model config directory for '{tokenizer_source}'")
+            };
+            error.context(sentence)
         })?;
 
+        // From here the configuration is one this gateway holds, in the
+        // model's directory or in its hub cache: a failure to read or parse
+        // it is the deployment's own whatever the request holds, and carries
+        // the mark the preparation's stage answers by. Failures to resolve
+        // the directory left above, unmarked.
         let config_path = base_dir.join("config.json");
         let config: serde_json::Value = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config.json at {}", config_path.display()))
+            .with_context(|| {
+                DeploymentFault(format!(
+                    "Failed to read config.json at {}",
+                    config_path.display()
+                ))
+            })
             .and_then(|s| {
                 serde_json::from_str(&s).with_context(|| {
-                    format!("Failed to parse config.json at {}", config_path.display())
+                    DeploymentFault(format!(
+                        "Failed to parse config.json at {}",
+                        config_path.display()
+                    ))
                 })
             })?;
 
@@ -514,6 +594,10 @@ pub(crate) struct MultimodalComponents {
     /// the way its loader does (the worker-side pipeline knows it; `None`
     /// keeps each spec's own constant).
     pub video_frame_budget: Option<usize>,
+    /// The role whose workers take a request's pixels in the router's mode
+    /// (`Mode::pixels_go_to`); the regular workers unless the router says
+    /// otherwise.
+    pub pixels_go_to: WorkerType,
 }
 
 impl MultimodalComponents {
@@ -605,12 +689,13 @@ impl MultimodalComponents {
             drain_fetches_on_error: false,
             inflight,
             video_frame_budget: None,
+            pixels_go_to: WorkerType::Regular,
         })
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         fs,
         sync::atomic::{AtomicU16, Ordering},
@@ -662,6 +747,99 @@ mod tests {
         assert_eq!(hashes.get(), 5);
     }
 
+    #[test]
+    fn a_config_builds_its_audio_processor_once_and_keeps_its_refusal() {
+        use bytes::Bytes;
+        use llm_multimodal::{audio::DecodedAudio, AudioClip, AudioSource, ModelMetadata};
+        use llm_tokenizer::mock::MockTokenizer;
+
+        let mock = MockTokenizer::new();
+        let tokenizer = super::super::RegistryTokenizer(&mock);
+        let registry = ModelRegistry::default();
+        let lookup = |config: &serde_json::Value| {
+            registry
+                .lookup(&ModelMetadata {
+                    model_id: "test",
+                    tokenizer: &tokenizer,
+                    config,
+                })
+                .unwrap()
+        };
+
+        let omni = serde_json::json!({"model_type": "qwen3_omni_moe"});
+        let spec = lookup(&omni);
+        let config_160 = MultimodalModelConfig::new(
+            omni.clone(),
+            PreProcessorConfig::from_json(r#"{"hop_length": 160}"#).unwrap(),
+            None,
+        );
+        let gate = std::sync::Barrier::new(4);
+        let concurrent: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    s.spawn(|| {
+                        gate.wait();
+                        config_160.audio_processor(spec).unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let first = &concurrent[0];
+        assert!(concurrent[1..].iter().all(|p| Arc::ptr_eq(first, p)));
+        assert!(Arc::ptr_eq(
+            first,
+            &config_160.audio_processor(spec).unwrap()
+        ));
+
+        let config_320 = MultimodalModelConfig::new(
+            omni,
+            PreProcessorConfig::from_json(r#"{"hop_length": 320}"#).unwrap(),
+            None,
+        );
+        let reloaded = config_320.audio_processor(spec).unwrap();
+        assert!(!Arc::ptr_eq(first, &reloaded));
+        let clip = [Arc::new(AudioClip::new(
+            Bytes::new(),
+            DecodedAudio {
+                samples: vec![0.1; 16_000],
+                sample_rate: 16_000,
+            },
+            AudioSource::InlineBytes,
+            String::new(),
+        ))];
+        assert_ne!(
+            first.preprocess(&clip).unwrap().feature_token_counts,
+            reloaded.preprocess(&clip).unwrap().feature_token_counts,
+        );
+
+        for (raw, expected) in [
+            (
+                serde_json::json!({"model_type": "llava"}),
+                "No audio processor registered for model spec: llava",
+            ),
+            (
+                serde_json::json!({"model_type": "muse_spark"}),
+                "No audio processor registered for model spec: muse_spark",
+            ),
+            (
+                serde_json::json!({
+                    "model_type": "NemotronH_Nano_Omni_Reasoning_V3",
+                    "sound_config": {"subsampling_factor": 4}
+                }),
+                "The audio processor of model spec nemotron_omni cannot be built: ",
+            ),
+        ] {
+            let spec = lookup(&raw);
+            let cfg = MultimodalModelConfig::new(raw, PreProcessorConfig::default(), None);
+            let cold = cfg.audio_processor(spec).err().unwrap().to_string();
+            let warm = cfg.audio_processor(spec).err().unwrap().to_string();
+            assert_eq!(cold, warm);
+            assert!(cold.starts_with(expected), "{cold}");
+            assert!(format!("{cfg:?}").contains("AudioProcessor"));
+        }
+    }
+
     #[tokio::test]
     async fn registry_get_or_load_reads_from_local_dir_and_caches() {
         let tmp = TempDir::new().unwrap();
@@ -709,8 +887,8 @@ mod tests {
     /// A Hub that answers `status` to every file request, so a checkpoint's
     /// processor-config fetches fail or are refused without a network: the
     /// Hub client asks for a file its cache lacks with one GET and reads the
-    /// status before anything else.
-    async fn hub_answering(status: Arc<AtomicU16>) -> String {
+    /// status before anything else. Shared with the pipeline's tests.
+    pub(crate) async fn hub_answering(status: Arc<AtomicU16>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -768,7 +946,7 @@ mod tests {
     /// back when the test ends, so a failing assertion leaves no other test on
     /// this Hub. The variables are process-wide, so the tests that set them
     /// take turns: the guard holds the turn until the variables are restored.
-    struct HubEnv {
+    pub(crate) struct HubEnv {
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
         _turn: tokio::sync::MutexGuard<'static, ()>,
     }
@@ -776,7 +954,7 @@ mod tests {
     static HUB_ENV_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     impl HubEnv {
-        async fn set(home: &Path, endpoint: &str) -> Self {
+        pub(crate) async fn set(home: &Path, endpoint: &str) -> Self {
             let turn = HUB_ENV_TURN.lock().await;
             let previous = ["HF_HOME", "HF_ENDPOINT"]
                 .into_iter()
@@ -937,6 +1115,45 @@ mod tests {
             "the error names the file and the Hub's answer: {gated}"
         );
         assert!(reg.get("tok-uuid-gated").is_none(), "nothing is cached");
+    }
+
+    /// A source that names a path and has no `config.json` on this host fails
+    /// where it stands, a path that is not here (a worker's host has it) as a
+    /// directory that is: the client's sentence leaves the path to the chain
+    /// the log writes, and the Hub is not asked. The Hub's address is a
+    /// loopback port with no listener, so a lookup would end as a failed fetch.
+    #[tokio::test]
+    async fn registry_get_or_load_does_not_ask_the_hub_for_a_local_source() {
+        let home = TempDir::new().unwrap();
+        let _env = HubEnv::set(home.path(), "http://127.0.0.1:9").await;
+        let model_dir = TempDir::new().unwrap();
+
+        for (source, said) in [
+            (model_dir.path().join("worker-only"), "is not on this host"),
+            (model_dir.path().to_path_buf(), "no config.json in"),
+        ] {
+            let source = source.to_string_lossy().into_owned();
+            let failed = MultimodalConfigRegistry::new()
+                .get_or_load("tok-uuid-local", &source)
+                .await
+                .expect_err("a local source without config.json fails the request");
+            assert!(
+                !failed.to_string().contains(&source),
+                "the client's sentence names the path: {failed:#}"
+            );
+            assert!(
+                !llm_multimodal::hub::HubFetchError::is(&failed),
+                "the Hub was asked: {failed:#}"
+            );
+            assert!(
+                format!("{failed:#}").contains(&source),
+                "the log's chain names the path: {failed:#}"
+            );
+            assert!(
+                format!("{failed:#}").contains(said),
+                "the log's sentence: {failed:#}"
+            );
+        }
     }
 
     /// A Hub that takes the connection and never answers holds a fetch only

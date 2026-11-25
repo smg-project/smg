@@ -1,0 +1,1401 @@
+{
+  "recorded_from": "d92647556e91a3601ef647f12ae5784df2080dc3",
+  "policy": "bucket",
+  "rows": [
+    {
+      "name": "a-size-goes-to-the-owner-of-its-range-in-an-even-split-of-four",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 4,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 0
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1023
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1024
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2047
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2048
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 3071
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 3072
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 4096
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100000
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          1,
+          1,
+          2,
+          2,
+          3,
+          3,
+          3
+        ]
+      }
+    },
+    {
+      "name": "an-even-split-of-three-leaves-the-rest-of-the-span-to-the-last",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 3,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1364
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1365
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2729
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2730
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "a-request-is-sized-by-its-tokens-then-by-its-text-then-at-zero",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 4,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "text": 1023
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "text": 1024
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "text": 3072
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100,
+            "text": 3500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          3,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "an-owner-that-is-not-ready-hands-its-size-to-the-worker-below-then-above",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 4,
+      "steps": [
+        {
+          "ready": [
+            true,
+            false,
+            true,
+            true
+          ]
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        },
+        {
+          "ready": [
+            false,
+            false,
+            true,
+            true
+          ]
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "ready": [
+            true,
+            true,
+            true,
+            false
+          ]
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 3500
+          }
+        },
+        {
+          "ready": [
+            false,
+            false,
+            false,
+            true
+          ]
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          2,
+          2,
+          2,
+          3
+        ]
+      }
+    },
+    {
+      "name": "a-worker-tried-already-hands-its-size-on-as-one-not-ready-does",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 4,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500,
+            "tried": [
+              1
+            ]
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500,
+            "tried": [
+              0,
+              1
+            ]
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 3500,
+            "tried": [
+              3
+            ]
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          2,
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "the-balance-rule-spills-a-size-to-the-least-booked-worker",
+      "config": {
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 3,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          2,
+          0,
+          1,
+          2,
+          0
+        ]
+      }
+    },
+    {
+      "name": "the-balance-rule-spills-under-the-defaults-of-the-policy-by-name",
+      "config": {
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.0001,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 3,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          2,
+          0,
+          1,
+          2,
+          0
+        ]
+      }
+    },
+    {
+      "name": "a-difference-at-the-absolute-threshold-does-not-spill",
+      "config": {
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 2,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 64
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 0
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 0
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "the-relative-part-holds-a-spill-back-under-a-ratio-of-1-5",
+      "config": {
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 2,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2048
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2048
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 3000
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2100
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          1,
+          0,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "the-relative-part-lets-the-same-bookings-spill-under-a-ratio-of-1-0001",
+      "config": {
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.0001,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 2,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2048
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2048
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 3000
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2100
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          1,
+          0,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "the-balance-rule-weighs-the-workers-offered-and-no-other",
+      "config": {
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 3,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "ready": [
+            true,
+            false,
+            true
+          ]
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "ready": [
+            true,
+            true,
+            true
+          ]
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "the-first-request-after-a-quiet-interval-is-weighed-by-the-bookings-it-ends",
+      "config": {
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 2,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 1000,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 2000,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 12000,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 12100,
+            "tokens": 100
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          0,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "an-interval-s-end-cuts-the-ranges-again-by-the-sizes-seen",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 3,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 4000,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 401
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 1500
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          0,
+          1,
+          0,
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "name": "a-cut-waits-until-a-worker-s-share-moved-by-more-than-a-factor-of-two",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 3,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 400
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 7000,
+            "tokens": 500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 10001,
+            "tokens": 300
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 13000,
+            "tokens": 20000
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 15001,
+            "tokens": 300
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 15001,
+            "tokens": 301
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 15001,
+            "tokens": 20001
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          1,
+          2,
+          0,
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "fewer-sizes-than-workers-leave-a-worker-without-a-range",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 3,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 200
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 200
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 200
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 150
+          }
+        },
+        {
+          "ready": [
+            false,
+            true,
+            true
+          ]
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 150
+          }
+        },
+        {
+          "ready": [
+            true,
+            true,
+            false
+          ]
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 5000
+          }
+        },
+        {
+          "ready": [
+            false,
+            true,
+            false
+          ]
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 5000
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          0,
+          0,
+          2,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "a-worker-that-joins-splits-the-span-again-until-the-next-cut",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 2,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 3000
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 1500
+          }
+        },
+        "join",
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 1500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 3000
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 10001,
+            "tokens": 1500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 10001,
+            "tokens": 1501
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1,
+          1,
+          2,
+          0,
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "a-worker-that-leaves-hands-its-range-to-the-worker-below",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 3,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        },
+        {
+          "leave": 1
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2730
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 1500
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 5001,
+            "tokens": 1501
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "the-first-worker-s-range-goes-to-the-worker-above-when-it-leaves",
+      "config": {
+        "balance_abs_threshold": 1000000000,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "prefill",
+      "workers": 3,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "leave": 0
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 100
+          }
+        },
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 2730
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "a-pool-nobody-listed-is-drawn-from",
+      "config": {
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "bucket_adjust_interval_secs": 5
+      },
+      "pool": "regular",
+      "workers": 4,
+      "steps": [
+        {
+          "pick": {
+            "at_ms": 0,
+            "tokens": 1500
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            1513,
+            1469,
+            1507,
+            1511
+          ]
+        }
+      }
+    }
+  ]
+}

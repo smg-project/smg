@@ -13,7 +13,26 @@ use smg_data_connector::{
     StorageFactoryConfig,
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
+use smg_grand_central::{
+    document::{AppliedSpec, PolicySpec},
+    engine::{CacheIndexes, InProcess, Members, WorkerData},
+    stages::StageRegistry,
+};
 use smg_mcp::McpOrchestrator;
+#[cfg(any(test, feature = "test-util"))]
+use smg_worker::load::state::LoadReceiver;
+use smg_worker::{
+    connection::{
+        engine::EngineConnector,
+        http_client::{
+            build_client, connect_timeout_secs_below, pool_idle_timeout, WorkerHttpClientCache,
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+        },
+    },
+    health::liveness,
+    settings::RegistrationSettings,
+    workflow::WorkflowHost,
+};
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info};
@@ -23,32 +42,28 @@ use crate::{
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::PolicyRegistry,
+    policies::{kv_index::event_monitor::KvEventMonitor, EngineCaches, PolicyRegistry},
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
         common::{
-            openai_bridge::FormatRegistry, overload, pd_admission,
-            prefill_admission::PrefillAdmission, realtime::RealtimeRegistry,
+            openai_bridge::FormatRegistry,
+            overload, pd_admission,
+            prefill_admission::PrefillAdmission,
+            realtime::RealtimeRegistry,
+            snapshot::{ModelWorkerSnapshot, WorkerMonitor, WorkerRegistry},
         },
         gateway::Gateway,
         grpc::{
-            backend_client::BackendConnector,
+            backend_client::{BackendConnector, Fronting},
             multimodal::MultimodalConfigRegistry,
-            regular::symphony::{check_names, named_table},
+            regular::symphony::{check_names, named_table, names_template},
             utils::{Names, ALIASES},
         },
     },
     server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{
-        connection::http_client::{
-            build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS,
-        },
-        health::liveness,
-        KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
-    },
-    workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
+    workflow::{data::RegistrationNotes, JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
 /// Error type for AppContext builder
@@ -101,6 +116,7 @@ pub struct AppContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
+    engine_connector: Arc<dyn EngineConnector>,
     pub prefill_admission: Option<Arc<PrefillAdmission>>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub gateway: Option<Arc<Gateway>>,
@@ -119,6 +135,8 @@ pub struct AppContext {
     /// Worker-directed HTTP clients, shared across workers with the same
     /// effective connection config.
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
+    /// What the worker crate's registration steps read of the configuration.
+    pub registration_settings: RegistrationSettings,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
@@ -200,6 +218,7 @@ pub struct AppContextBuilder {
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
+    engine_connector: Arc<dyn EngineConnector>,
     policy_registry: Option<Arc<PolicyRegistry>>,
     gateway: Option<Arc<Gateway>>,
     response_storage: Option<Arc<dyn ResponseStorage>>,
@@ -216,6 +235,30 @@ pub struct AppContextBuilder {
     webrtc_stun_server: Option<String>,
 }
 
+/// The context hosts the worker crate's workflow steps: they read the
+/// registry, the worker clients, the registration's settings and the engine
+/// connector through this and nothing else of the gateway.
+impl WorkflowHost for AppContext {
+    type Generation = ModelWorkerSnapshot;
+    type RegistrationNotes = RegistrationNotes;
+
+    fn worker_registry(&self) -> &Arc<WorkerRegistry> {
+        &self.worker_registry
+    }
+
+    fn worker_client_cache(&self) -> &WorkerHttpClientCache {
+        &self.worker_client_cache
+    }
+
+    fn registration_settings(&self) -> &RegistrationSettings {
+        &self.registration_settings
+    }
+
+    fn engine_connector(&self) -> Arc<dyn EngineConnector> {
+        Arc::clone(&self.engine_connector)
+    }
+}
+
 impl AppContext {
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
@@ -229,12 +272,35 @@ impl AppContext {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
+        Self::from_config_with_extensions(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::from_config`] over what a host added: its worker connector,
+    /// and the table of policy stages its policy document may name. With no
+    /// table the document is checked against the stock one.
+    pub(crate) fn from_config_with_extensions(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        connector: Option<Arc<dyn EngineConnector>>,
+        policy_stages: Option<StageRegistry>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
-            Box::pin(AppContextBuilder::from_config(
+            Box::pin(AppContextBuilder::from_config_with_extensions(
                 router_config,
                 request_timeout_secs,
                 webrtc_bind_addr,
                 webrtc_stun_server,
+                connector,
+                policy_stages,
             ))
             .await?
             .build()
@@ -277,8 +343,19 @@ fn has_https_worker(config: &RouterConfig) -> bool {
     }
 }
 
+/// The whole seconds the overload shed advertises as Retry-After under a
+/// load monitor that polls every `interval`. The header carries no
+/// fraction, so an interval with one is raised to the next second.
+fn shed_retry_after_secs(interval: Duration) -> u64 {
+    interval.as_secs() + u64::from(interval.subsec_nanos() != 0)
+}
+
 impl AppContextBuilder {
     pub fn new() -> Self {
+        Self::new_with_connector(None)
+    }
+
+    fn new_with_connector(connector: Option<Arc<dyn EngineConnector>>) -> Self {
         Self {
             client: None,
             router_config: None,
@@ -288,6 +365,9 @@ impl AppContextBuilder {
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             worker_registry: None,
+            // A host's connector is wrapped once: the gateway fronts each
+            // gRPC connection it makes.
+            engine_connector: connector.map_or_else(BackendConnector::shared, Fronting::around),
             policy_registry: None,
             gateway: None,
             response_storage: None,
@@ -446,7 +526,7 @@ impl AppContextBuilder {
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
         // The configuration's liveness budgets (the stall, wedge and stale
-        // thresholds and the warm-up slice, see `worker::health::liveness`) take
+        // thresholds and the warm-up slice, see `smg_worker::health::liveness`) take
         // effect for every context built from it, the server's and a test's
         // alike. They are process-wide and the first call wins, so a
         // constructor that builds the policy registry itself configures them
@@ -497,17 +577,19 @@ impl AppContextBuilder {
             );
             return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
+        // `hf` names no table either, but selects the response template's, so it is not warned
+        // of here.
         if router_config.parser == ParserChoice::Symphony
             && names.tool.is_some()
             && named_table(&names).is_none()
+            && !names_template(&names)
         {
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
                 "The configured tool-call parser name selects no Symphony table, so under \
-                 --parser symphony every model the registry does not know is read by the legacy \
-                 parsers (the registry's table reads the models it knows, a worker's own labels \
-                 aside); a table's name, a legacy name that reads a table's format (qwen, \
+                 --parser symphony every model, the registry's included, is read by the legacy \
+                 parsers (a worker's own labels aside); a table's name, a legacy name that reads a table's format (qwen, \
                  qwen_xml, ...), a launcher's name for a family whose table has no older \
                  parser (muse), or an engine's exact name for a table (llama4_pythonic), reads \
                  those models with that table"
@@ -541,6 +623,12 @@ impl AppContextBuilder {
         {
             start_prefill_admission_notifier(&worker_registry, admission)?;
         }
+        // The hash rings are filled where a membership change is heard, off
+        // the request path. Where no runtime is entered nothing warms them,
+        // and the first reader of a generation fills its ring.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            policy_registry.keep_rings_warm(&worker_registry, &runtime);
+        }
 
         // Create WorkerService from the already-built components
         let worker_service = Arc::new(WorkerService::new(
@@ -552,13 +640,13 @@ impl AppContextBuilder {
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
             router_config.worker_http_client_settings(),
         ));
+        let registration_settings = router_config.registration_settings();
         let gateway_auth = AuthConfig::with_tenant_keys(
             router_config.api_key.clone(),
             &router_config.tenant_api_keys,
         );
 
         let rl = rl_adapter::build_rl_state(&worker_registry, &worker_client_cache, &router_config);
-
         Ok(AppContext {
             gateway_auth,
             client: self
@@ -576,6 +664,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
+            engine_connector: self.engine_connector,
             prefill_admission,
             policy_registry,
             gateway: self.gateway,
@@ -602,6 +691,7 @@ impl AppContextBuilder {
             wasm_manager: self.wasm_manager,
             worker_service,
             worker_client_cache,
+            registration_settings,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
             rl,
@@ -619,6 +709,38 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
+        Box::pin(Self::from_config_with_extensions(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+            None,
+        ))
+        .await
+    }
+
+    async fn from_config_with_extensions(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        connector: Option<Arc<dyn EngineConnector>>,
+        policy_stages: Option<StageRegistry>,
+    ) -> Result<Self, String> {
+        // The policy document comes first, checked against the stages the
+        // host registered: ahead of the stores, the storage hooks and every
+        // listener, so a document that is refused ends the start in its own
+        // words. The engine is started last, from the document that was
+        // checked here.
+        let policy = Self::policy_in_force(&router_config, policy_stages.as_ref())?;
+        // The overload veto's two words are read once below, where the
+        // registration settings are made and the registry's shed word is set.
+        // A supplied document this gateway refuses for them ends the start
+        // here, behind the document's own check and in the same form.
+        router_config
+            .supplied_overload_words()
+            .map_err(|refused| format!("Grand Central: {refused}"))?;
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -631,7 +753,7 @@ impl AppContextBuilder {
         // registry is built below (the first call wins; `build` keeps its
         // call for a context assembled without this constructor).
         liveness::configure_from(router_config.worker_liveness_budgets());
-        Ok(Self::new()
+        Ok(Self::new_with_connector(connector)
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
             .maybe_rate_limit_manager(&router_config)?
@@ -649,6 +771,7 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor()
+            .with_engine(policy)?
             .webrtc_bind_addr(
                 webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
             )
@@ -676,10 +799,7 @@ impl AppContextBuilder {
         // Idle pooled connections must expire before the backend server's
         // keep-alive closes them (the engines' default: 5s), or checkout races
         // the server's FIN and non-idempotent sends fail.
-        let pool_idle_timeout = match config.upstream_pool_idle_timeout_secs {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        };
+        let pool_idle_timeout = pool_idle_timeout(config.upstream_pool_idle_timeout_secs);
         // mTLS client identity and CA certificates for verifying worker TLS
         // (both loaded during config creation), parsed once: the builder
         // closure runs again if the first build fails for want of a root store.
@@ -714,7 +834,7 @@ impl AppContextBuilder {
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
                 // Below the request timeout, as the worker clients keep it
-                // (`worker::connection::http_client::connect_timeout_secs_below`): a dark
+                // (`smg_worker::connection::http_client::connect_timeout_secs_below`): a dark
                 // external host fails as a connect timeout, not as the
                 // request's own (except under a 1 s request timeout, where the
                 // two timers race).
@@ -811,20 +931,16 @@ impl AppContextBuilder {
     /// Create worker registry
     fn with_worker_registry(mut self) -> Self {
         self.worker_registry = Some(Arc::new(
-            WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
+            WorkerRegistry::new().with_engine_connector(Arc::clone(&self.engine_connector)),
         ));
         self
     }
 
-    /// Create policy registry
+    /// Create policy registry: the one that makes no classic policy where
+    /// the configuration runs Grand Central
+    /// ([`PolicyRegistry::of_config`]).
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(
-            PolicyRegistry::with_override(
-                config.policy.clone(),
-                config.routing_key_override.clone(),
-            )
-            .with_pd_pairing_mode(config.pd_pairing_mode),
-        ));
+        self.policy_registry = Some(Arc::new(PolicyRegistry::of_config(config)));
         self
     }
 
@@ -873,31 +989,234 @@ impl AppContextBuilder {
             .as_ref()
             .ok_or_else(|| "policy_registry must be set before load monitor".to_string())?
             .clone();
-        let monitor = Arc::new(WorkerMonitor::new(
-            self.worker_registry
-                .as_ref()
-                .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
-                .clone(),
+        let registry = self
+            .worker_registry
+            .as_ref()
+            .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
+            .clone();
+        let interval = config.load_monitor_interval_secs;
+        let (engine_metrics, conditional) = (config.engine_metrics, config.disable_load_monitoring);
+        // The monitor's snapshot feeds every policy that consumes it; the
+        // monitor polls every group by default, conditionally under
+        // `--disable-load-monitoring`.
+        let monitor = WorkerMonitor::new(
+            registry,
             Arc::clone(&policy_registry),
-            config.load_monitor_interval_secs,
-            config.engine_metrics,
-            config.disable_load_monitoring,
-        ));
+            interval,
+            engine_metrics,
+            conditional,
+        );
+        // An interval stated in milliseconds takes the place of the seconds.
+        let monitor = Arc::new(match config.load_monitor_interval_ms {
+            Some(millis) => monitor.with_interval(Duration::from_millis(millis)),
+            None => monitor,
+        });
+        policy_registry.set_load_receiver(Some(monitor.subscribe()));
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
-        overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
+        overload::set_shed_retry_after_secs(shed_retry_after_secs(config.load_monitor_interval()));
+        // The shed word in force: a supplied document's own where Grand
+        // Central runs one, else the configuration's.
         if let Some(registry) = self.worker_registry.as_ref() {
-            registry.set_overload_shed(config.worker_overload_shed);
+            registry.set_overload_shed(config.overload_words_in_force().shed);
         }
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
-        // Wire the backend load-snapshot feed into every policy that consumes
-        // it; the monitor polls every group by default, conditionally under
-        // `--disable-load-monitoring`.
-        policy_registry.set_load_receiver(Some(monitor.subscribe()));
         self.worker_monitor = Some(monitor);
         Ok(self)
+    }
+
+    /// The policy document this process runs under Grand Central
+    /// (`grand_central: on`), with its checked form: the document in
+    /// force, which is the one the routing settings mean or a supplied one,
+    /// validated against `stages`. A host's table holds the stock stages and
+    /// the host's own, so a supplied document may name both. With no table
+    /// the document is validated against the stock one. `None` where the
+    /// configuration leaves the classic policies in place.
+    ///
+    /// A document that is refused ends the start with the refusal's own
+    /// words, before a store is opened and before the gateway listens.
+    ///
+    /// The classic policies stay in place with the option off, and with it
+    /// on in a gateway whose every router is one provider's
+    /// (`RouterConfig::engine_decides`). That gateway places its
+    /// requests by no routing policy, so the option moves nothing there,
+    /// and this start says so in one log line.
+    fn policy_in_force(
+        config: &RouterConfig,
+        stages: Option<&StageRegistry>,
+    ) -> Result<Option<(PolicySpec, AppliedSpec)>, String> {
+        if !config.grand_central {
+            return Ok(None);
+        }
+        if !config.engine_decides() {
+            info!(
+                "Grand Central on and placing no request: mode = {} places its requests by no routing policy",
+                config.mode_type()
+            );
+            return Ok(None);
+        }
+        let document = config
+            .policy_document_in_force()
+            .map_err(|refused| format!("Grand Central: {refused}"))?;
+        let checked = match stages {
+            Some(stages) => config.hosted_policy(&document, stages),
+            None => config.hosted_policy(&document, &StageRegistry::builtin()),
+        };
+        checked
+            .map(|spec| Some((document, spec)))
+            .map_err(|refused| format!("Grand Central: {refused}"))
+    }
+
+    /// Starts Grand Central over `policy`, where the configuration runs
+    /// Grand Central: the document [`Self::policy_in_force`]
+    /// answered, with its checked form. It is the last step of the start,
+    /// so the engine is handed where this process keeps its workers' data,
+    /// each once: the worker registry, the load monitor's channel, and the
+    /// cache-event monitor with the trees the engine is lent
+    /// ([`Self::engine_caches`]).
+    fn with_engine(self, policy: Option<(PolicySpec, AppliedSpec)>) -> Result<Self, String> {
+        let Some((document, spec)) = policy else {
+            return Ok(self);
+        };
+        let unset = |field: &str| format!("{field} must be set before Grand Central");
+        let policies = self
+            .policy_registry
+            .as_ref()
+            .ok_or_else(|| unset("policy_registry"))?;
+        let registry = self
+            .worker_registry
+            .as_ref()
+            .ok_or_else(|| unset("worker_registry"))?;
+        let monitor = self
+            .worker_monitor
+            .as_ref()
+            .ok_or_else(|| unset("worker_monitor"))?;
+        let cache_events = self
+            .kv_event_monitor
+            .as_ref()
+            .ok_or_else(|| unset("kv_event_monitor"))?;
+        let events = Some(cache_events);
+        let data = WorkerData {
+            registry: Arc::clone(registry) as Arc<dyn Members>,
+            loads: Some(monitor.subscribe()),
+            cache_indexes: Self::engine_caches(&document, &spec, events, policies, registry),
+        };
+        Self::start_engine(spec, data, policies)?;
+        Ok(self)
+    }
+
+    /// What the engine is handed of this process's caches, as one object
+    /// ([`EngineCaches`]): `events`, the cache-event monitor where the
+    /// process keeps one, and the trees the engine is lent.
+    ///
+    /// With the engine on no classic policy object is built, so no policy
+    /// keeps the trees of the prompts this process sent. The start asks the
+    /// registry for them in a policy's place
+    /// ([`PolicyRegistry::lend_trees`]), and only where `spec`, the
+    /// checked form of `document`, reads the prefixes sent to each worker:
+    /// the document's own word, whatever the settings name the policy. The
+    /// trees take the document's numbers too: its block size, and each
+    /// model's `index` entry. They follow `workers`, the registry the engine
+    /// is handed: a worker it lost is taken out of them. `None` where the
+    /// process keeps neither a monitor nor trees.
+    fn engine_caches(
+        document: &PolicySpec,
+        spec: &AppliedSpec,
+        events: Option<&Arc<KvEventMonitor>>,
+        policies: &PolicyRegistry,
+        workers: &WorkerRegistry,
+    ) -> Option<Arc<dyn CacheIndexes>> {
+        let trees = spec
+            .needs()
+            .sent_prefixes
+            .then(|| policies.lend_trees(document, spec.block_size(), workers));
+        let caches = EngineCaches::of(events.cloned(), trees)?;
+        Some(Arc::new(caches) as Arc<dyn CacheIndexes>)
+    }
+
+    /// Starts the Grand Central that places every request of this process:
+    /// one engine, by the Grand Central crate's one start call, over the checked
+    /// document ([`Self::policy_in_force`]) and `data`, where this process
+    /// keeps its workers' data. The engine's task follows the registry's
+    /// events and tells the document's stages a worker that joined or was
+    /// removed, and it keeps the newest load snapshot at hand. It is
+    /// spawned on the runtime this context is built on, and the placement
+    /// functions find the engine through `policies`.
+    fn start_engine(
+        spec: AppliedSpec,
+        data: WorkerData,
+        policies: &PolicyRegistry,
+    ) -> Result<(), String> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            format!("Grand Central: the engine's task needs a Tokio runtime: {error}")
+        })?;
+        // One engine for the life of the process: its placements borrow it.
+        let (engine, task) = InProcess::start(spec, data);
+        // The engine's task keeps nothing a shutdown waits for: its upkeep,
+        // its load snapshot and its follow of the registry end with the
+        // runtime.
+        runtime.spawn(task);
+        policies.set_engine(engine);
+        Ok(())
+    }
+
+    /// Grand Central's start for a context a test builds by hand, field
+    /// by field, where no builder step of this file runs: the start's own
+    /// two steps, in their order and with nothing added (`policy_in_force`,
+    /// then `start_engine`). It is not a second start. `stages` is
+    /// the table a host would bring, where the test brings one, and a
+    /// configuration that leaves Grand Central off starts nothing.
+    /// The engine is handed the test's worker registry and its load
+    /// monitor's channel. Such a context keeps no cache-event monitor, so
+    /// the engine is handed none, and the trees it is lent where its
+    /// document reads them (`engine_caches`).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn start_engine_by_hand(
+        config: &RouterConfig,
+        stages: Option<&StageRegistry>,
+        policies: &PolicyRegistry,
+        registry: &Arc<WorkerRegistry>,
+        monitor: &WorkerMonitor,
+    ) -> Result<(), String> {
+        if let Some((document, spec)) = Self::policy_in_force(config, stages)? {
+            let data = WorkerData {
+                registry: Arc::clone(registry) as Arc<dyn Members>,
+                loads: Some(monitor.subscribe()),
+                cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
+            };
+            Self::start_engine(spec, data, policies)?;
+        }
+        Ok(())
+    }
+
+    /// Grand Central's start for a bench, which builds no context and
+    /// keeps no load monitor: the start's own two steps, in their order and
+    /// with nothing added (`policy_in_force` over the stock stages, then
+    /// `start_engine`), as [`Self::start_engine_by_hand`] runs
+    /// them for a test. The engine is handed the bench's worker registry and
+    /// `loads`, the channel of the load feed the bench publishes where a
+    /// monitor would. A bench keeps no cache-event monitor, so the engine is
+    /// handed none, and the trees it is lent where its document reads
+    /// them (`engine_caches`). A configuration that leaves Grand
+    /// Central off starts nothing.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn start_engine_for_bench(
+        config: &RouterConfig,
+        policies: &PolicyRegistry,
+        registry: &Arc<WorkerRegistry>,
+        loads: Option<LoadReceiver>,
+    ) -> Result<(), String> {
+        if let Some((document, spec)) = Self::policy_in_force(config, None)? {
+            let data = WorkerData {
+                registry: Arc::clone(registry) as Arc<dyn Members>,
+                loads,
+                cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
+            };
+            Self::start_engine(spec, data, policies)?;
+        }
+        Ok(())
     }
 
     /// Create worker job queue OnceLock container
@@ -1017,18 +1336,23 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
+    use smg_worker::{
+        connection::engine::NO_ENGINE_CONNECTOR,
+        identity::basic::{ConnectionMode, Worker, WorkerType},
+        kv_events::SubscriptionKind,
+        test_support::RefusedAddress,
+    };
     use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::common::prefill_admission::{
-            test_support::select_worker, PrefillAdmissionAttempt,
-        },
-        worker::{
-            connection::engine::NO_ENGINE_CONNECTOR,
-            test_support::{worker_of, RefusedAddress},
-            BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
+        routers::{
+            common::{
+                prefill_admission::{test_support::select_worker, PrefillAdmissionAttempt},
+                snapshot::test_support::worker_of,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
         },
     };
 
@@ -1051,11 +1375,11 @@ mod tests {
     }
 
     /// Child-process body of the root-store test below (see
-    /// `worker::connection::http_client::no_root_store`); a no-op unless the case
+    /// `smg_worker::connection::http_client::no_root_store`); a no-op unless the case
     /// variable is set.
     #[test]
     fn child_with_client_without_native_roots() {
-        use crate::worker::connection::http_client::no_root_store;
+        use smg_worker::connection::http_client::no_root_store;
 
         if std::env::var(no_root_store::CASE).is_err() {
             return;
@@ -1071,7 +1395,7 @@ mod tests {
         ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
     )]
     fn the_gateway_client_builds_without_a_native_root_store() {
-        use crate::worker::connection::http_client::no_root_store;
+        use smg_worker::connection::http_client::no_root_store;
 
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_with_client_without_native_roots"),
@@ -1265,6 +1589,46 @@ mod tests {
         assert!(cache_aware.has_load_receiver_for_test());
     }
 
+    /// The load monitor is built with the interval the configuration states
+    /// in milliseconds, over its seconds, and with the seconds where it
+    /// states no milliseconds.
+    #[test]
+    fn the_worker_monitor_takes_its_interval_in_milliseconds_over_the_seconds() {
+        let built_with = |millis: Option<u64>| {
+            let config = RouterConfig {
+                load_monitor_interval_secs: 5,
+                load_monitor_interval_ms: millis,
+                ..config_with_policy(PolicyConfig::RoundRobin)
+            };
+            AppContextBuilder::new()
+                .with_client(&config, 5)
+                .expect("client builds")
+                .with_worker_registry()
+                .with_policy_registry(&config)
+                .with_worker_monitor(&config)
+                .expect("worker monitor builds")
+                .worker_monitor
+                .expect("the worker monitor")
+                .interval()
+        };
+        assert_eq!(built_with(Some(250)), Duration::from_millis(250));
+        assert_eq!(built_with(None), Duration::from_secs(5));
+    }
+
+    /// The shed's Retry-After is the poll interval in whole seconds: an
+    /// interval with a fraction is raised to the next second, and whole
+    /// seconds read as they are.
+    #[test]
+    fn the_sheds_retry_after_raises_a_fraction_to_the_next_second() {
+        for (millis, seconds) in [(100, 1), (250, 1), (1_000, 1), (1_500, 2), (10_000, 10)] {
+            assert_eq!(
+                shed_retry_after_secs(Duration::from_millis(millis)),
+                seconds,
+                "{millis} ms"
+            );
+        }
+    }
+
     /// Every policy gets the monitor: a cache-aware one for its indexes, any
     /// other for the load stream of its gRPC workers, which the policies'
     /// load feed reads in place of the poll.
@@ -1320,6 +1684,443 @@ mod tests {
             monitor.upgrade().is_none(),
             "the worker monitor outlives its context"
         );
+    }
+
+    /// The start lends Grand Central the gateway's own token trees
+    /// where the document in force reads the prefixes sent to each worker,
+    /// and makes none under a document that reads none. Under `cache_aware`
+    /// a conversation's next turns then go back to the worker its first turn
+    /// was sent to, and the model's tree holds the conversation for that
+    /// worker alone.
+    ///
+    /// The classic policy keeps such a tree itself and reads it the same
+    /// way (`model_gateway/src/policies/cache_aware.rs`,
+    /// `select_worker_with_tokens`).
+    #[tokio::test]
+    async fn the_start_lends_the_engine_the_token_trees_its_document_reads() {
+        use std::time::Instant;
+
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::routers::common::{
+            placement::{select_single, PlacementInputs, Stated},
+            snapshot::{test_support::grpc_worker, RoutingPool},
+        };
+
+        let started = |policy: PolicyConfig| async {
+            let mut config = config_with_policy(policy);
+            config.grand_central = true;
+            config.health_check.disable_health_check = true;
+            let context = AppContext::from_config(config, 30, None, None).await;
+            context.expect("a context")
+        };
+        let plain = started(PolicyConfig::RoundRobin).await;
+        assert!(plain.policy_registry.engine().is_some());
+        assert!(plain.policy_registry.lent_trees().is_none());
+
+        let context = started(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)).await;
+        let trees = context.policy_registry.lent_trees();
+        let trees = trees.expect("the start made the trees");
+        for at in 0..4 {
+            let url = format!("grpc://w{at}:9000");
+            let worker = grpc_worker(&url, "m", RuntimeType::Vllm, &[]);
+            context.worker_registry.register(worker).expect("a worker");
+        }
+        let turn = |said: &[u32]| {
+            let inputs = PlacementInputs {
+                tokens: Some(said),
+                ..PlacementInputs::default()
+            };
+            let placed = select_single(
+                &context.worker_registry,
+                &context.policy_registry,
+                "m",
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            placed.expect("a worker").into_worker().url().to_owned()
+        };
+        let mut said: Vec<u32> = (0..256).collect();
+        let first = turn(&said);
+        for next in 1..8_u32 {
+            said.extend(next * 1_000_000..next * 1_000_000 + 16);
+            assert_eq!(turn(&said), first, "turn {next}");
+        }
+        let tree = trees.token_tree("m");
+        let held: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+        assert_eq!(held, [first.as_str()]);
+
+        // The start made the trees with the task that follows the context's
+        // own registry: the worker that leaves it is taken out of them.
+        let registry = &context.worker_registry;
+        registry.remove_by_url(&first).expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while !tree.get_tenant_token_counts().is_empty() {
+            assert!(Instant::now() < bound, "the trees' task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // The trees take the document's numbers. The document the settings
+        // mean states the settings' block size. A supplied document states
+        // its own, whatever policy the settings name.
+        let mut paged = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+        if let PolicyConfig::CacheAware { block_size, .. } = &mut paged {
+            *block_size = 8;
+        }
+        let supplied = config_with_policy(paged.clone()).policy_document();
+        let by_settings = started(paged).await.policy_registry.lent_trees();
+        let by_settings = by_settings.expect("the start made the trees");
+        assert_eq!(by_settings.token_tree("m").page_size(), 8);
+        let mut config = RouterConfig {
+            grand_central: true,
+            policy_spec: Some(supplied.expect("the settings' document")),
+            ..RouterConfig::default()
+        };
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None).await;
+        let by_document = context.expect("a context").policy_registry.lent_trees();
+        let by_document = by_document.expect("the supplied document reads sent prefixes");
+        assert_eq!(by_document.token_tree("m").page_size(), 8);
+
+        // The start a test makes by hand lends the trees by the same rule.
+        let mut config = config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        config.grand_central = true;
+        let policies = Arc::new(PolicyRegistry::of_config(&config));
+        let registry = Arc::new(WorkerRegistry::new());
+        let monitor =
+            WorkerMonitor::new(Arc::clone(&registry), Arc::clone(&policies), 1, false, true);
+        let by_hand =
+            AppContextBuilder::start_engine_by_hand(&config, None, &policies, &registry, &monitor);
+        by_hand.expect("the settings' own document");
+        assert!(policies.lent_trees().is_some());
+    }
+
+    /// A model whose index of cache events holds no block is decided in the
+    /// token tree the gateway lends, and its list leaves the tree once the
+    /// index holds a block. A gRPC model's index stands from the enrolment
+    /// of its first worker, so the gateway answers the engine no index
+    /// while it holds none (`KvEventMonitor`'s `CacheIndexes::index`).
+    /// Until the first cache event a conversation's turns are stored in the
+    /// tree and return by it. The engine reads the index again when it
+    /// reads its table of the list again, a second at most behind the
+    /// block, and from then on no prompt is written to the tree.
+    ///
+    /// The classic policy reads an index that holds no block as no index
+    /// and then reads its own token tree
+    /// (`model_gateway/src/policies/cache_aware.rs:1800`, `event_index_for`).
+    /// It asks at each request, so it leaves its tree with the block.
+    #[tokio::test]
+    async fn a_model_whose_index_holds_no_block_is_decided_in_the_lent_tree() {
+        use std::time::Instant;
+
+        use kv_index::{ContentHash, SequenceHash, StoredBlock};
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::{
+            policies::kv_index::index_backend::{KvIndex, WorkerBlocks},
+            routers::common::{
+                placement::{select_single, PlacementInputs, Stated},
+                snapshot::{test_support::grpc_worker, RoutingPool},
+            },
+        };
+
+        let mut config = config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        config.grand_central = true;
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None).await;
+        let context = context.expect("a context");
+        let trees = context.policy_registry.lent_trees();
+        let tree = trees.expect("the start made the trees").token_tree("m");
+        // The model's index as the enrolment of its first worker leaves it.
+        let monitor = context.kv_event_monitor.as_ref();
+        let index = Arc::new(KvIndex::chain());
+        monitor
+            .expect("the monitor")
+            .set_index("m", Arc::clone(&index));
+        for at in 0..4 {
+            let url = format!("grpc://w{at}:9000");
+            let worker = grpc_worker(&url, "m", RuntimeType::Vllm, &[]);
+            context.worker_registry.register(worker).expect("a worker");
+        }
+        let turn = |said: &[u32]| {
+            let inputs = PlacementInputs {
+                tokens: Some(said),
+                ..PlacementInputs::default()
+            };
+            let placed = select_single(
+                &context.worker_registry,
+                &context.policy_registry,
+                "m",
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            placed.expect("a worker").into_worker().url().to_owned()
+        };
+        let mut said: Vec<u32> = (0..256).collect();
+        let first = turn(&said);
+        for next in 1..8_u32 {
+            said.extend(next * 1_000_000..next * 1_000_000 + 16);
+            assert_eq!(turn(&said), first, "turn {next}");
+        }
+        let held: Vec<String> = tree.get_tenant_token_counts().into_keys().collect();
+        assert_eq!(held, [first.as_str()]);
+
+        // A worker's first event stores a block.
+        let worker = index.intern_worker("grpc://w0:9000").expect("a number");
+        let block = StoredBlock {
+            seq_hash: SequenceHash(1),
+            content_hash: ContentHash(101),
+        };
+        let stored = index.apply_stored(worker, &[block], None, &mut WorkerBlocks::default());
+        stored.expect("a block stored");
+        // Each prompt is one no worker was sent. While the list reads the
+        // tree the prompt is written there, and once the list left the tree
+        // no count moves.
+        let counted = || tree.get_tenant_token_counts().into_values().sum::<usize>();
+        let bound = Instant::now() + Duration::from_secs(60);
+        let mut prompt = 100_u32;
+        loop {
+            let before = counted();
+            prompt += 1;
+            let fresh: Vec<u32> = (prompt * 1_000_000..prompt * 1_000_000 + 64).collect();
+            turn(&fresh);
+            if counted() == before {
+                break;
+            }
+            assert!(Instant::now() < bound, "the list never left the tree");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The start lends Grand Central the gateway's own string trees
+    /// beside its token trees. Under `cache_aware` a conversation whose
+    /// requests hold their prompt as text goes back, turn after turn, to
+    /// the worker its first turn was sent to, and the model's string tree
+    /// holds the whole conversation for that worker alone. No token tree
+    /// takes a prompt of text, and the worker that leaves the registry is
+    /// taken out of the string tree too.
+    ///
+    /// The classic policy keeps such a tree itself and reads it the same
+    /// way (`model_gateway/src/policies/cache_aware.rs`,
+    /// `select_worker_with_text`).
+    #[tokio::test]
+    async fn the_start_lends_the_engine_the_string_trees_a_request_of_text_reads() {
+        use std::{fmt::Write as _, time::Instant};
+
+        use kv_index::TenantId;
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::routers::common::{
+            placement::{select_single, PlacementInputs, Stated},
+            snapshot::{test_support::grpc_worker, RoutingPool},
+        };
+
+        let mut config = config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        config.grand_central = true;
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None).await;
+        let context = context.expect("a context");
+        let trees = context.policy_registry.lent_trees();
+        let trees = trees.expect("the start made the trees");
+        for at in 0..4 {
+            let url = format!("grpc://w{at}:9000");
+            let worker = grpc_worker(&url, "m", RuntimeType::Vllm, &[]);
+            context.worker_registry.register(worker).expect("a worker");
+        }
+        let turn = |said: &str| {
+            let inputs = PlacementInputs {
+                text: Some(said),
+                ..PlacementInputs::default()
+            };
+            let placed = select_single(
+                &context.worker_registry,
+                &context.policy_registry,
+                "m",
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+                Stated::nothing,
+            );
+            placed.expect("a worker").into_worker().url().to_owned()
+        };
+        // A first turn of sixteen windows of text, 64 bytes a window by the
+        // settings' block size, and each next turn one window more.
+        let mut said: String = (0..16).map(|window| format!("{window:<64}")).collect();
+        let first = turn(&said);
+        for next in 1..8 {
+            let words = format!("turn {next}");
+            write!(said, "{words:<64}").expect("a string takes its words");
+            assert_eq!(turn(&said), first, "turn {next}");
+        }
+        let tree = trees.string_tree("m");
+        let found = tree.match_prefix_with_counts(&said);
+        assert_eq!(found.matched_char_count, said.chars().count());
+        assert_eq!(found.matched_tenants, [TenantId::from(first.as_str())]);
+        let tokens = trees.token_tree("m").get_tenant_token_counts();
+        assert!(tokens.is_empty(), "no token tree takes a prompt of text");
+
+        // The trees' task takes the worker that leaves out of the string
+        // tree, as out of the token tree.
+        let registry = &context.worker_registry;
+        registry.remove_by_url(&first).expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while !tree.get_tenant_char_count().is_empty() {
+            assert!(Instant::now() < bound, "the trees' task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A context built on a runtime starts the task that fills the hash
+    /// rings: the ring of a generation is filled with no request to read it.
+    #[tokio::test]
+    async fn a_context_built_on_a_runtime_fills_the_hash_rings_itself() {
+        use openai_protocol::UNKNOWN_MODEL_ID;
+
+        use crate::routers::common::snapshot::WorkerRegistryExt as _;
+
+        let mut config = RouterConfig::builder()
+            .round_robin_policy()
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("a context");
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://ring:8080")
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        context.worker_registry.register(worker).expect("a worker");
+
+        let bound = std::time::Instant::now() + Duration::from_secs(30);
+        while !context
+            .worker_registry
+            .get_routing_snapshot(UNKNOWN_MODEL_ID)
+            .hash_ring_is_filled()
+        {
+            assert!(
+                std::time::Instant::now() < bound,
+                "no task filled the ring of the generation"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A gateway whose one router is a provider's, with Grand
+    /// Central on.
+    fn a_providers_gateway_with_the_option_on() -> RouterConfig {
+        let mut config = RouterConfig {
+            mode: crate::config::RoutingMode::OpenAI {
+                worker_urls: Vec::new(),
+            },
+            grand_central: true,
+            ..RouterConfig::default()
+        };
+        config.health_check.disable_health_check = true;
+        config
+    }
+
+    /// A gateway whose one router is a provider's places its requests by no
+    /// routing policy, so Grand Central's option moves nothing
+    /// there. The gateway starts, no engine runs, the registry keeps the
+    /// classic policies, and the pairing mode is the configuration's own.
+    #[tokio::test]
+    async fn a_providers_gateway_starts_with_the_option_on_and_runs_no_engine() {
+        use crate::config::PdPairingMode;
+
+        let config = RouterConfig {
+            pd_pairing_mode: PdPairingMode::Strict,
+            ..a_providers_gateway_with_the_option_on()
+        };
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("the gateway starts");
+        let registry = &context.policy_registry;
+        assert!(registry.engine().is_none(), "no engine runs");
+        assert!(registry.keeps_classic_policies());
+        assert_eq!(registry.pd_pairing_mode(), PdPairingMode::Strict);
+    }
+
+    /// A supplied document is never dropped in silence: beside a provider's
+    /// mode alone the start refuses it in the Grand Central crate's words, which
+    /// name the mode.
+    #[tokio::test]
+    async fn a_document_supplied_to_a_providers_gateway_is_refused_at_the_start() {
+        use smg_grand_central::document::PolicySpec;
+
+        let config = RouterConfig {
+            policy_spec: Some(PolicySpec::preset("round_robin").expect("a preset")),
+            ..a_providers_gateway_with_the_option_on()
+        };
+        let words = config
+            .policy_document()
+            .expect_err("the mode has no document")
+            .to_string();
+        assert!(words.contains("openai"), "{words}");
+
+        let refused = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect_err("the start is refused");
+        assert_eq!(refused, format!("Grand Central: {words}"));
+    }
+
+    /// Under the multi-router setting a provider's mode has the regular
+    /// document: the engine starts, and it decides for the gateway's
+    /// self-hosted routers.
+    #[tokio::test]
+    async fn a_providers_mode_beside_other_routers_starts_the_engine() {
+        let config = RouterConfig {
+            enable_igw: true,
+            ..a_providers_gateway_with_the_option_on()
+        };
+        let regular = RouterConfig {
+            mode: RouterConfig::default().mode,
+            ..config.clone()
+        };
+        assert_eq!(
+            config.policy_document_in_force(),
+            regular.policy_document_in_force(),
+            "the regular document"
+        );
+
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("the gateway starts");
+        let registry = &context.policy_registry;
+        assert!(registry.engine().is_some(), "the engine runs");
+        assert!(!registry.keeps_classic_policies());
+    }
+
+    /// The start says that the option moves nothing, once. The option's
+    /// other readers say nothing.
+    #[traced_test]
+    #[tokio::test]
+    async fn the_start_alone_says_once_that_the_option_moves_nothing() {
+        use crate::config::validation::ConfigValidator;
+
+        const LINE: &str = "Grand Central on and placing no request: mode = openai";
+        let config = a_providers_gateway_with_the_option_on();
+        assert!(PolicyRegistry::of_config(&config).keeps_classic_policies());
+        assert_eq!(config.pd_pairing_in_force(), config.pd_pairing_mode);
+        ConfigValidator::validate_policy_document(&config).expect("no document to refuse");
+        assert!(!logs_contain(LINE), "a reader other than the start said it");
+
+        AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("the gateway starts");
+        logs_assert(|lines: &[&str]| {
+            match lines.iter().filter(|line| line.contains(LINE)).count() {
+                1 => Ok(()),
+                said => Err(format!("the start said the line {said} times")),
+            }
+        });
     }
 
     #[test]
@@ -1425,7 +2226,7 @@ policy:
             .expect("the registry");
         let mut spec = WorkerSpec::new(format!("grpc://{}", refused.addr()));
         spec.connection_mode = ConnectionMode::Grpc;
-        registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
+        registry.on_remote_worker_state(&smg_worker::registry::RemoteWorkerState {
             worker_id: "peer-w1".to_string(),
             model_id: "m".to_string(),
             url: spec.url.clone(),
@@ -1585,13 +2386,15 @@ mod effective_max_concurrent_requests_tests {
     }
 }
 
-/// The test fixture shared by the modules that drive a workflow step or a
-/// discovery pass against an `AppContext` built by hand.
+/// The test fixture shared by the modules whose cases need an `AppContext`
+/// built by hand.
 #[cfg(test)]
 pub(crate) mod testing {
     use std::sync::Arc;
 
-    use super::{AppContext, ToolParserFactory};
+    use smg_worker::connection::http_client::WorkerHttpClientCache;
+
+    use super::{AppContext, BackendConnector, ToolParserFactory};
     use crate::{
         admin::worker_service::WorkerService,
         config::RouterConfig,
@@ -1599,11 +2402,10 @@ pub(crate) mod testing {
         observability::inflight_tracker::InFlightRequestTracker,
         policies::PolicyRegistry,
         routers::{
-            common::{openai_bridge, realtime::RealtimeRegistry},
+            common::{openai_bridge, realtime::RealtimeRegistry, snapshot::WorkerRegistry},
             grpc::multimodal::MultimodalConfigRegistry,
         },
         server::http_client,
-        worker::{WorkerHttpClientCache, WorkerRegistry},
     };
 
     /// An `AppContext` over `router_config` and `worker_registry`: in-memory
@@ -1628,6 +2430,7 @@ pub(crate) mod testing {
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
+            engine_connector: BackendConnector::shared(),
             prefill_admission: None,
             policy_registry: Arc::new(
                 PolicyRegistry::with_override(
@@ -1659,6 +2462,7 @@ pub(crate) mod testing {
             worker_client_cache: Arc::new(WorkerHttpClientCache::new(
                 router_config.worker_http_client_settings(),
             )),
+            registration_settings: router_config.registration_settings(),
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 job_queue,
@@ -1671,5 +2475,79 @@ pub(crate) mod testing {
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         })
+    }
+
+    /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
+    /// accepted and queued but never processed, so a test observes what is
+    /// *submitted* without spawning workflow background tasks.
+    /// [`live_app_context`] is the one whose jobs run.
+    pub(crate) fn create_test_app_context() -> Arc<AppContext> {
+        let router_config = RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .build_unchecked();
+
+        // Note: Using uninitialized queue for tests to avoid spawning background workers
+        // Jobs submitted during tests will queue but not be processed
+        app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
+    }
+
+    /// An `AppContext` whose jobs run: a live job queue and workflow engines, so
+    /// a test observes what the registry *ends up with* once its jobs run.
+    /// Regular routing with round-robin, a five-second startup window for an
+    /// engine slow to answer its probes, and no drain wait on removal.
+    /// [`create_test_app_context`] is the one whose jobs never run.
+    pub(crate) fn live_app_context() -> Arc<AppContext> {
+        use std::sync::OnceLock;
+
+        use llm_tokenizer::registry::TokenizerRegistry;
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+
+        use crate::{
+            config::{HealthCheckConfig, PolicyConfig, RoutingMode},
+            workflow::{JobQueue, JobQueueConfig, WorkflowEngines},
+        };
+
+        let config = RouterConfig::builder()
+            .mode(RoutingMode::Regular {
+                worker_urls: vec![],
+            })
+            .policy(PolicyConfig::RoundRobin)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .health_check_config(HealthCheckConfig {
+                drain_settle_secs: 0,
+                ..HealthCheckConfig::default()
+            })
+            .build_unchecked();
+        let context = Arc::new(
+            AppContext::builder()
+                .router_config(config.clone())
+                .client(http_client())
+                .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
+                .worker_registry(Arc::new(WorkerRegistry::new()))
+                .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
+                .response_storage(Arc::new(MemoryResponseStorage::new()))
+                .conversation_storage(Arc::new(MemoryConversationStorage::new()))
+                .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+                .worker_job_queue(Arc::new(OnceLock::new()))
+                .workflow_engines(Arc::new(OnceLock::new()))
+                .mcp_orchestrator(Arc::new(OnceLock::new()))
+                .build()
+                .unwrap(),
+        );
+        context
+            .worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&context),
+            ))
+            .ok();
+        context
+            .workflow_engines
+            .set(WorkflowEngines::new(&context.router_config))
+            .ok();
+        context
     }
 }

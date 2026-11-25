@@ -11,10 +11,8 @@
 
 use std::collections::BTreeSet;
 
-use smg::{
-    observability::{metrics::Metrics, metrics_server::start_metrics_server},
-    worker::metrics::Metrics as WorkerMetrics,
-};
+use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
+use smg_worker::metrics::writers::{Metrics as WorkerMetrics, WorkerHandles};
 
 use crate::metrics::recorder;
 
@@ -31,7 +29,7 @@ fn families(body: &str, marker: &str) -> BTreeSet<String> {
 #[tokio::test]
 async fn every_smg_family_has_help_text() {
     let handle = recorder();
-    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
 
@@ -45,7 +43,7 @@ async fn every_smg_family_has_help_text() {
     Metrics::record_worker_manual_policy_branch("vacant");
     Metrics::record_worker_consistent_hashing_policy_branch("routing_key_hit");
     Metrics::record_worker_prefix_hash_policy_branch("ring_hit");
-    WorkerMetrics::set_worker_routing_keys_active(worker, 1);
+    WorkerMetrics::set_worker_routing_keys_active(&WorkerHandles::new(worker), 1);
     Metrics::record_pd_admission_wait();
     Metrics::record_pd_admission_shed();
     Metrics::record_worker_overload_shed("selection");

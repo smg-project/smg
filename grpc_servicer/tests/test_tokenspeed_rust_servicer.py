@@ -1103,7 +1103,7 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
         rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
     supervised: dict = {}
@@ -1155,7 +1155,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
         lambda args: {"server_args_json": "{}", "data_parallel_size": 2},
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
 
     def fake_launch(headless):
@@ -1238,7 +1238,7 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
     )
     monkeypatch.setattr(rust, "_model_config", lambda args: model_config)
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.setattr(rust, "launch_scheduler_ranks", lambda headless, **_: "engine-handle")
 
@@ -1327,7 +1327,7 @@ def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str, *, in_process: bo
         rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
 
@@ -1555,7 +1555,8 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     _run_serve_rust(monkeypatch, tmp_path)
     recorded = _run_serve_rust.recorded
     assert recorded["server"].ready == [] and recorded["server"].serving == []
-    assert recorded["supervise_kwargs"] == {}
+    assert "warmup" not in recorded["supervise_kwargs"]
+    assert recorded["supervise_kwargs"]["linger_secs"] == rust_lifecycle.DRAIN_LINGER_SECS
 
 
 def test_serve_rust_refuses_a_warm_up_knob_it_cannot_read_before_the_server_binds(
@@ -1862,7 +1863,7 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
         rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
 

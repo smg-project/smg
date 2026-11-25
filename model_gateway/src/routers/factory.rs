@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use smg_external_router::{builtin_routers, spec_for_backend};
+use smg_worker::identity::basic::ConnectionMode;
 
 use super::{
     external::ExternalRouterAdapter,
@@ -16,8 +17,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
-    policies::{DPRankLoadPolicy, MinimumTokensPolicy, PolicyFactory},
-    worker::ConnectionMode,
+    policies::{DPRankLoadPolicy, MinimumTokensPolicy, Side},
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -153,7 +153,9 @@ impl RouterFactory {
         );
 
         let config = ctx.router_config.clone();
-        if config.dp_minimum_tokens_scheduler {
+        // The rank policy is a classic policy object: none is built for a
+        // registry made for Grand Central.
+        if config.dp_minimum_tokens_scheduler && ctx.policy_registry.keeps_classic_policies() {
             let mini_tokens_policy = MinimumTokensPolicy::new(
                 ctx.worker_monitor
                     .as_ref()
@@ -188,13 +190,15 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
-
-        ctx.policy_registry.set_prefill_policy(prefill_policy);
-        ctx.policy_registry.set_decode_policy(decode_policy);
+        let registry = &ctx.policy_registry;
+        registry.set_side_policy(
+            Side::Prefill,
+            prefill_policy_config.unwrap_or(main_policy_config),
+        );
+        registry.set_side_policy(
+            Side::Decode,
+            decode_policy_config.unwrap_or(main_policy_config),
+        );
     }
 
     /// Register the encode/prefill/decode policies for a gRPC EPD deployment.
@@ -208,10 +212,10 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) {
         let default_encode_policy = PolicyConfig::ConsistentHashing;
-        let encode_policy = PolicyFactory::create_from_config(
+        ctx.policy_registry.set_side_policy(
+            Side::Encode,
             encode_policy_config.unwrap_or(&default_encode_policy),
         );
-        ctx.policy_registry.set_encode_policy(encode_policy);
         Self::set_pd_policies(
             prefill_policy_config,
             decode_policy_config,

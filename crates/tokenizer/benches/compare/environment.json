@@ -1,0 +1,25 @@
+{
+  "release": "1.16.0",
+  "commit": "378df2a52016d173f74289b7836e9aa11a4022c0",
+  "previous": {
+    "tag": "v1.15.0",
+    "commit": "82c0f1fcd0ec44e29bb5dcb80ede1cd4c7a17eb3"
+  },
+  "measured": {
+    "from": "2026-11-18T23:40Z",
+    "to": "2026-11-19T01:06Z"
+  },
+  "load_memory_measured": {
+    "from": "2026-11-19T02:49Z",
+    "to": "2026-11-19T03:12Z"
+  },
+  "toolchain": "1.100.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "rounds": {
+    "encode": 3,
+    "encode_on_edge_cells": 8,
+    "edge_cells": 27,
+    "decode_streaming_batch": 3,
+    "load_memory": 1
+  }
+}

@@ -56,14 +56,16 @@ impl TraceService for TestOtelCollector {
     }
 }
 
-/// A collector serving on `port` until `shutdown_rx` fires.
+/// A collector serving until `shutdown_rx` fires, and the port it serves on:
+/// a port of the system's choice, bound here. A port picked first and bound
+/// afterwards can be handed to another process in between.
 #[expect(clippy::disallowed_methods, reason = "test infrastructure")]
 pub async fn start_collector(
-    port: u16,
     shutdown_rx: oneshot::Receiver<()>,
-) -> Result<TestOtelCollector, Box<dyn std::error::Error>> {
+) -> Result<(TestOtelCollector, u16), Box<dyn std::error::Error>> {
     // Bound before this returns: an exporter may connect at once.
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
+    let port = listener.local_addr()?.port();
     let collector = TestOtelCollector::new();
     let collector_clone = collector.clone();
 
@@ -76,5 +78,5 @@ pub async fn start_collector(
             .await;
     });
 
-    Ok(collector)
+    Ok((collector, port))
 }

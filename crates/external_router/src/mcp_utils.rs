@@ -146,6 +146,7 @@ pub async fn connect_mcp_servers(
                             server_key,
                             allowed_tools: input.allowed_tools.clone(),
                             list_error: connected.list_error,
+                            pool_key: Some(connected.pool_key),
                         });
                     }
                 }
@@ -170,6 +171,7 @@ pub async fn connect_mcp_servers(
                 server_key: input.label.clone(),
                 allowed_tools: input.allowed_tools.clone(),
                 list_error: mcp_orchestrator.list_error_for_server(&input.label),
+                pool_key: None,
             });
         }
     }
@@ -328,6 +330,7 @@ pub async fn ensure_mcp_servers(
                     server_key: server_name,
                     allowed_tools: None,
                     list_error,
+                    pool_key: None,
                 });
             }
         } else {
@@ -387,6 +390,22 @@ pub async fn ensure_request_mcp_routing(
     format_registry: &FormatRegistry,
     tools: &[ResponseTool],
 ) -> Result<Option<Vec<McpServerBinding>>, Response> {
+    for (idx, tool) in tools.iter().enumerate() {
+        if tool.allows_direct_calls() {
+            continue;
+        }
+        let gateway_managed = matches!(tool, ResponseTool::Mcp(_))
+            || openai_bridge::builtin_type_for_response_tool(tool)
+                .is_some_and(|kind| mcp_orchestrator.find_builtin_server(kind).is_some());
+        if gateway_managed {
+            return Err(error::bad_request(
+                "tool_not_supported",
+                format!(
+                    "Invalid 'tools[{idx}].allowed_callers': gateway-managed tools must allow the 'direct' caller."
+                ),
+            ));
+        }
+    }
     match ensure_request_mcp_client(mcp_orchestrator, format_registry, tools).await {
         Some(servers) => Ok(Some(servers)),
         None if tools
@@ -1545,6 +1564,7 @@ mod tests {
             server_key: "conf".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         };
         McpToolSession::new(orchestrator, vec![conf], "test-request")
             .execute_tool(ToolExecutionInput {
@@ -1843,6 +1863,8 @@ mod tests {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })];
 
         let routing = collect_builtin_routing(&orchestrator, &format_registry, Some(&tools));

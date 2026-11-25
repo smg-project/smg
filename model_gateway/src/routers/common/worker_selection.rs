@@ -6,21 +6,23 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{http::HeaderValue, response::Response};
 use futures_util::future::join_all;
-use openai_protocol::models::ListModelsResponse;
+use openai_protocol::{models::ListModelsResponse, worker::ProviderType};
 use smg_external_router::ExternalRouterSpec;
+use smg_worker::{
+    health::overload::STAGE_SELECTION,
+    identity::{
+        basic::{RuntimeType, Worker},
+        endpoint::Endpoint,
+    },
+};
 
-use crate::{
-    routers::{
-        common::{
-            header_utils::{apply_provider_headers, extract_auth_header},
-            overload,
-        },
-        error,
+use crate::routers::{
+    common::{
+        header_utils::{apply_provider_headers, extract_auth_header},
+        overload,
+        snapshot::{WorkerRegistry, WorkerRegistryExt},
     },
-    worker::{
-        health::overload::STAGE_SELECTION, identity::endpoint::Endpoint, ProviderType, RuntimeType,
-        Worker, WorkerRegistry,
-    },
+    error,
 };
 
 /// Holds references to shared infrastructure needed for worker selection.
@@ -323,9 +325,10 @@ async fn refresh_worker_models(
 mod tests {
     use openai_protocol::worker::WorkerSpec;
     use smg_external_router::known;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
 
     use super::*;
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     // Wildcard model support (no `.models()`), so `supports_model` is always true;
     // this isolates the realtime-capability gate.
@@ -521,7 +524,7 @@ mod tests {
         let slashed = worker(&format!("http://{addr}/"), false);
         let registry = WorkerRegistry::new();
         registry.register(Arc::clone(&slashed)).unwrap();
-        let published = || registry.get_routing_snapshot(crate::worker::UNKNOWN_MODEL_ID);
+        let published = || registry.get_routing_snapshot(openai_protocol::UNKNOWN_MODEL_ID);
         let before = published();
         assert!(
             refresh_worker_models(&registry, &slashed, None).await,

@@ -15,23 +15,29 @@ use llm_multimodal::{
 };
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    labels::SUPPORTS_VISION_LABEL,
+};
 
 use super::{
-    capability::{runtime_supports_modality, SUPPORTS_VISION_LABEL},
+    capability::runtime_supports_modality,
     config::MultimodalComponents,
     plan::{MediaPlan, PlaceholderTokens},
 };
 use crate::{
     observability::metrics::Metrics,
     routers::{
-        common::placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
+        common::{
+            placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
+            snapshot::WorkerRegistry,
+        },
         error,
         grpc::{
             common::stages::pd_protocol::{EncodeHandoff, PdProtocol},
             context::WorkerSelection,
         },
     },
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
 };
 
 /// Worker label carrying the advertised backend (`GetServerInfo.mm_processor`).
@@ -623,7 +629,7 @@ pub(crate) fn ensure_selection_supports_media_refs(
 ) -> Result<(), MmRefsError> {
     let needs_pipeline = pin == PipelinePin::Only;
     let workers: Vec<&dyn Worker> = match workers {
-        WorkerSelection::Single { worker } => vec![worker.as_ref()],
+        WorkerSelection::Single { worker } => vec![&**worker],
         WorkerSelection::Disaggregated {
             encode_assignments: Some(assignments),
             ..
@@ -633,7 +639,7 @@ pub(crate) fn ensure_selection_supports_media_refs(
             .collect(),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
-        } => vec![prefill.as_ref(), decode.as_ref()],
+        } => vec![prefill.as_ref(), &**decode],
     };
     if !workers
         .iter()
@@ -862,10 +868,11 @@ fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
             | MediaContentPart::AudioUrl { url, .. } => {
                 // The reference is forwarded as written and every byte cap reads
                 // the scheme at offset zero: nothing is trimmed here either, so a
-                // url that is empty or begins with a control character, a space
-                // or any whitespace (the leading set a URL parser strips) is an
-                // invalid URL, echoed by a bounded prefix.
-                if url.is_empty() || url.starts_with(|c: char| c <= ' ' || c.is_whitespace()) {
+                // url that is empty or begins with a control character (DEL and
+                // the C1 range among them) or any whitespace is an invalid URL,
+                // echoed by a bounded prefix. No scheme begins with one.
+                if url.is_empty() || url.starts_with(|c: char| c.is_control() || c.is_whitespace())
+                {
                     return Err(refused(
                         index,
                         MediaConnectorError::InvalidUrl(echoed_url(url)),
@@ -963,6 +970,9 @@ pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, M
 mod tests {
     use std::sync::Arc;
 
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
+
     use super::*;
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -970,13 +980,11 @@ mod tests {
         not(target_env = "musl")
     ))]
     use crate::routers::grpc::testing::bytes_allocated_during;
-    use crate::{
-        routers::grpc::multimodal::{
-            config::MultimodalConfigRegistry, settings::MultimodalSettings,
-        },
-        worker::{
-            test_support::{no_health_check, registry_with},
-            BasicWorkerBuilder, ModelCard, WorkerType,
+    use crate::routers::{
+        common::snapshot::test_support::registry_with,
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            multimodal::{config::MultimodalConfigRegistry, settings::MultimodalSettings},
         },
     };
 
@@ -1232,6 +1240,14 @@ mod tests {
             (
                 image_url("\u{1}data:image/png;base64,AQ=="),
                 "invalid media URL: \u{1}data:image/png;base64,AQ==",
+            ),
+            (
+                image_url("\u{7f}data:image/png;base64,AQ=="),
+                "invalid media URL: \u{7f}data:image/png;base64,AQ==",
+            ),
+            (
+                image_url("\u{9b}https://a/1.png"),
+                "invalid media URL: \u{9b}https://a/1.png",
             ),
             (
                 image_url("data:image/png,%89PNG%0D%0A"),
@@ -1861,10 +1877,9 @@ mod tests {
             "{err}"
         );
 
-        // Audio is the worker's alone on this runtime: a hinted request that
-        // also carries it keeps the cheap refusal instead of a fetch and a
-        // decode that worker selection would refuse, while the same audio
-        // without a hint still forwards.
+        // vLLM also accepts the router's audio tensors. A hinted request
+        // carrying audio is processed locally so its image hint takes effect;
+        // the same audio without a hint still forwards.
         let audio = MediaContentPart::AudioUrl {
             url: "https://a/x.wav".to_string().into(),
             uuid: None,
@@ -1872,15 +1887,17 @@ mod tests {
         let mut with_audio = expandable_placeholders();
         with_audio.insert(Modality::Audio, "<|audio_pad|>".to_string());
         with_audio.set_worker_expandable(Modality::Audio, true);
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &plan(vec![hinted_image("https://a/1.png", 504), audio.clone()]),
-            &with_audio,
-        )
-        .expect_err("the router cannot serve audio to this worker");
-        assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
+        assert_eq!(
+            resolve_mm_processing(
+                &components,
+                &registry,
+                MODEL,
+                &plan(vec![hinted_image("https://a/1.png", 504), audio.clone()]),
+                &with_audio,
+            )
+            .expect("the router can apply the hint and serve audio"),
+            MmProcessing::Router
+        );
         assert_eq!(
             resolve_mm_processing(
                 &components,
@@ -1948,7 +1965,7 @@ mod tests {
     fn selection_check_requires_every_worker_and_scheme() {
         let plan_https = plan(vec![image_url("https://a/1.png")]);
         let single = WorkerSelection::Single {
-            worker: capable("grpc://127.0.0.1:9600"),
+            worker: capable("grpc://127.0.0.1:9600").into(),
         };
         ensure_selection_supports_media_refs(&single, &plan_https, PipelinePin::Any)
             .expect("capable single");
@@ -1959,7 +1976,8 @@ mod tests {
                 RuntimeType::Vllm,
                 ConnectionMode::Grpc,
                 &[],
-            ),
+            )
+            .into(),
         };
         assert_eq!(
             ensure_selection_supports_media_refs(&plain, &plan_https, PipelinePin::Any),
@@ -1979,7 +1997,8 @@ mod tests {
                 RuntimeType::Vllm,
                 ConnectionMode::Grpc,
                 &[],
-            ),
+            )
+            .into(),
             runtime_type: RuntimeType::Vllm,
         };
         assert_eq!(
@@ -2001,7 +2020,7 @@ mod tests {
         let mixed = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: file_prefill,
-            decode: capable("grpc://127.0.0.1:9605"),
+            decode: capable("grpc://127.0.0.1:9605").into(),
             runtime_type: RuntimeType::Vllm,
         };
         ensure_selection_supports_media_refs(&mixed, &plan_https, PipelinePin::Any)
@@ -2024,7 +2043,7 @@ mod tests {
         let half = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: capable("grpc://127.0.0.1:9607"),
-            decode: silent_decode,
+            decode: silent_decode.into(),
             runtime_type: RuntimeType::Vllm,
         };
         assert_eq!(
@@ -2213,10 +2232,10 @@ mod tests {
             uuid: None,
         }]);
         let pipeline_single = WorkerSelection::Single {
-            worker: pipeline_worker("grpc://127.0.0.1:9730"),
+            worker: pipeline_worker("grpc://127.0.0.1:9730").into(),
         };
         let engine_single = WorkerSelection::Single {
-            worker: capable("grpc://127.0.0.1:9731"),
+            worker: capable("grpc://127.0.0.1:9731").into(),
         };
         ensure_selection_supports_media_refs(&pipeline_single, &image, PipelinePin::Only)
             .expect("the pipeline worker takes the unopted model");
@@ -2230,7 +2249,7 @@ mod tests {
         let half = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: pipeline_worker("grpc://127.0.0.1:9732"),
-            decode: capable("grpc://127.0.0.1:9733"),
+            decode: capable("grpc://127.0.0.1:9733").into(),
             runtime_type: RuntimeType::Vllm,
         };
         assert_eq!(

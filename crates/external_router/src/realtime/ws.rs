@@ -59,38 +59,33 @@ pub async fn handle_realtime_ws(
 
     // Use user auth if available, fall back to worker's API key
     let effective_auth = auth_header.or_else(|| extract_auth_header(None, worker.api_key()));
-    let auth_str = match effective_auth {
-        Some(v) => match v.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                Metrics::record_router_error(
-                    labels.router,
-                    labels.backend,
-                    metrics_labels::CONNECTION_WEBSOCKET,
-                    &model,
-                    metrics_labels::ENDPOINT_REALTIME,
-                    metrics_labels::ERROR_VALIDATION,
-                    metrics_labels::REASON_INVALID_REQUEST,
-                );
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "Authorization header contains invalid UTF-8 characters",
-                )
-                    .into_response();
-            }
-        },
-        None => {
-            Metrics::record_router_error(
-                labels.router,
-                labels.backend,
-                metrics_labels::CONNECTION_WEBSOCKET,
-                &model,
-                metrics_labels::ENDPOINT_REALTIME,
-                metrics_labels::ERROR_VALIDATION,
-                metrics_labels::REASON_INVALID_REQUEST,
-            );
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
+    let Some(auth_value) = effective_auth else {
+        Metrics::record_router_error(
+            labels.router,
+            labels.backend,
+            metrics_labels::CONNECTION_WEBSOCKET,
+            &model,
+            metrics_labels::ENDPOINT_REALTIME,
+            metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Ok(auth_str) = auth_value.to_str().map(str::to_owned) else {
+        Metrics::record_router_error(
+            labels.router,
+            labels.backend,
+            metrics_labels::CONNECTION_WEBSOCKET,
+            &model,
+            metrics_labels::ENDPOINT_REALTIME,
+            metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "Authorization header contains invalid UTF-8 characters",
+        )
+            .into_response();
     };
 
     let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {

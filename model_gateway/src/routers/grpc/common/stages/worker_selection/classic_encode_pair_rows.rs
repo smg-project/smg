@@ -5,7 +5,7 @@
 //! of requests. The row records what the gateway's own worker selection
 //! answered at each request: the pair it picked, the encoders it offered the
 //! request's items, the key each item was placed by and the encoder that took
-//! it, or the name of its refusal. The policy controller crate replays the
+//! it, or the name of its refusal. The Grand Central crate replays the
 //! rows through its own decision.
 //!
 //! A worker is named by its place in its list. An encoder's `handoff` is the
@@ -29,8 +29,8 @@
 //! This file is an ignored test of the gateway crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
-//! recorded from. The sheets the policy controller crate replays are in
-//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
+//! recorded from. The sheets the Grand Central crate replays are in
+//! `crates/grand_central/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
@@ -43,14 +43,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use openai_protocol::worker::WorkerStatus;
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde::{Serialize, Serializer};
+use smg_worker::{identity::basic::ConnectionMode, test_support::no_health_check};
 
 use super::*;
 use crate::{
     config::types::PolicyConfig,
     policies::PolicyFactory,
-    worker::{test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard},
+    routers::{common::snapshot::WorkerRegistryExt, grpc::backend_client::BasicWorkerBuilder},
 };
 
 const MODEL: &str = "m";
@@ -337,6 +338,9 @@ fn refusal(failure: EpdSelectionFailure) -> Answer {
         EpdSelectionFailure::DecodeVisionUnsupported => named("decode_vision_unsupported"),
         EpdSelectionFailure::EncodeNotSupported => named("encode_not_supported"),
         EpdSelectionFailure::EncodeVisionUnsupported => named("encode_vision_unsupported"),
+        // The recorder does not start Grand Central, so no row of its sheet
+        // records this refusal. It has its name all the same.
+        EpdSelectionFailure::EncodeUnderGrandCentral => named("encode_under_grand_central"),
         EpdSelectionFailure::Placement(failure) => Answer::Refused {
             name: "placement",
             role: Some(format!("{:?}", failure.role).to_lowercase()),
@@ -398,6 +402,10 @@ impl LoadBalancingPolicy for Watched {
 
     fn name(&self) -> &'static str {
         self.inner.name()
+    }
+
+    fn honors_routing_key(&self) -> bool {
+        self.inner.honors_routing_key()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

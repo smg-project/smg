@@ -6,13 +6,16 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::future::join_all;
+use smg_grpc_client::tokenspeed_encoder::TokenSpeedEncoderClient;
 use tokio::sync::Semaphore;
 use tracing::{debug, error};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+use super::forget_cache_events::forget_cache_events;
 use crate::{
     policies::PolicyRegistry,
-    worker::WorkerRegistry,
+    routers::common::snapshot::WorkerRegistry,
     workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
@@ -59,7 +62,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         let workers_to_remove = context
             .data
             .actual_workers_to_remove
@@ -71,17 +74,24 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             workers_to_remove.len()
         );
 
-        for worker in workers_to_remove {
-            // Remove from KV event monitor (stops subscription, removes from indexer)
-            if let Some(ref monitor) = app_context.kv_event_monitor {
-                monitor.on_worker_removed(worker.url()).await;
-            }
+        // The batch's KV cleanups start together: the monitor's own bound on
+        // index purges decides how many run at once.
+        join_all(
+            workers_to_remove
+                .iter()
+                .map(|worker| forget_cache_events(app_context, worker.url())),
+        )
+        .await;
 
+        for worker in workers_to_remove {
             // Drop the state the policies keep on the worker (a load-aware
             // policy's dispatch tally) so it does not leak under churn.
             app_context
                 .policy_registry
                 .remove_worker_from_policies(worker.url());
+            // Its pooled encode connections go too: the pool is keyed by
+            // this URL and outlived the worker otherwise.
+            TokenSpeedEncoderClient::forget_cached(worker.url());
         }
 
         // The removed workers' URLs leave their models' trees too, those of

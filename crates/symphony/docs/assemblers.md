@@ -124,7 +124,9 @@ the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the
 markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
 `{` at the first byte as one call alone and every further object after it, behind a `;` or behind
 whitespace alone, as another call, and carries the family's call marker the output may open with
-(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does; `Forced` (a
+(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does;
+`FramedObjectOrList` (Command) reads as `ObjectOrList` with no marker between a table's markers,
+where text in place of the calls is malformed as under `Framed`; `Forced` (a
 required call's list under the request's JSON schema) reads as `ObjectOrList` with no marker and
 differs at the end of the stream alone, where the engine held the output to the list and no byte of
 an open one is prose: the separators held after a call, an object cut before its arguments began and
@@ -142,11 +144,12 @@ under every framing.
 The JSON family so reads as one object reader with the framings around it, each stated once:
 none, where a table's markers frame one object (`CallSyntax::Json`, the JSON assembler itself); a
 header (`json::named`, whose `After` says what the JSON after the marker is); a list (`json::list`,
-whose `Framing` says what is around the objects). The lone object between markers is not a framing
-of the list reader: the engine, not the reader, reports what follows the object there
-(`Engine::wrapping`, per piece), where the list reader holds the whitespace after a lone object
-across pieces and reads a `;`, another object or prose after it; folding it in would change those
-events, or put a branch on the busiest JSON path for no reader fewer. The forced call
+whose `Framing` says what is around the objects). The one object a table's markers frame
+(`CallSyntax::Json`) is not a framing of the list reader: the engine, not the reader, reports what
+follows the object there (`Engine::wrapping`, per piece), where the list reader, between Command's
+markers too (`FramedObjectOrList`), holds the whitespace after a lone object across pieces and
+reads a `;`, another object or prose after it; folding it in would change those events, or put a
+branch on the busiest JSON path for no reader fewer. The forced call
 (`json::forced`) reads through the value reader (`json::arguments`), which ends where the value is
 whole and holds the strings a caller types, not at an object's brace: a different reader by design,
 named by the request rather than framed.
@@ -163,6 +166,9 @@ never read as something they are not, never shown as the answer, and never vanis
 Inside a value only `</parameter>` is a tag; `<function=`, `<parameter=` and `</function>` there
 are the value's text (the engine's parser ends a value at the next `<parameter=` or `</function>`
 as well, a tolerance to judge with adversarial fixtures rather than port).
+The structural tag is narrower than the reader there: under a tag, a value written as text does
+not hold `<parameter` and cannot go on over the next parameter's tag. A bare `<` remains text, and
+the reader's rule is unchanged for a worker that takes no grammar.
 
 Two endings. `Assembler::close` is for a block the model ended before `</function>` (its own closing
 marker came, or the next call began): the call is over as far as the model is concerned, so after
@@ -362,20 +368,28 @@ What the syntax says, and what the assembler does with it:
   the object is the call's arguments as the model wrote it, read by the JSON family's arguments
   reader (`json::named_arguments`, Mistral's): every byte a fragment for as long as the bytes keep
   it a JSON prefix, `Malformed { InvalidArguments }` at the first that does not and the model's
-  bytes as written after it, a tag inside it its text, the values the model's JSON and not typed
-  by the request's tools. The newlines around it are the template's, dropped, and the invoke's
-  close is the call's end. An object the invoke's close, the cut or the stop found open stays as
-  written, and the reader's `Malformed` event of no bytes says it is no whole value, no brace made
-  up; an object closed before a cut or a stop is whole, as the JSON assembler ends one. A word or
-  a tag after the object is text where the syntax has tags, refused as below, its event inside the
-  call after the object's fragments, which stay whole as the model closed them; an object after a
-  parameter is refused whole, and that call gets no close. The family's reference encoder never
-  writes the shape, and its parser refuses it (`Tool name format error`); the serving engines'
-  parser for the family (SGLang's DSML detector) reads it, the object as written, and the
-  structural tag it builds for a call writes it (the invoke tag, the parameters' schema, the
-  invoke's close), so an engine that constrains a call that way gets it back. Before, the object
-  was refused as text between tags, and the call reached the client with no arguments. The other
-  spellings (MiniMax M2, dots3, MiniCPM5, XTML) keep refusing it.
+  bytes as written after it, a parameter tag inside it its text, the values the model's JSON and
+  not typed by the request's tools. Only the two parameter tags are the object's text: they are
+  the tags the assembler scans for. The invoke's close, the next invoke's opening and the block's
+  close are the table's terminals, and any of them ends the call where it stands, inside one of
+  the object's strings too, as it does inside a parameter's value: the object then ends as one the
+  stream cut, and the table reads what follows the tag from where it stands, after the next
+  invoke's opening the next call. The newlines around the object are the template's, dropped, and
+  the invoke's close is the call's end. An object a terminal, the cut or the stop found open stays
+  as written, no brace made up, and one `Malformed` event of no bytes says it is no whole value:
+  the reader's at the first byte that is no JSON where it refused the object, else the one at
+  the call's end; an object that closed whole before a cut or a stop stays whole, as the
+  JSON assembler ends one. A word or a tag after the object is text where the syntax has tags,
+  refused as below, and the call it stands in is no whole call, as a call of parameter tags the
+  syntax refused bytes in is none: the closing brace of an object that closed whole, held back
+  until the call ends, is refused with the text, and the arguments stay the strict JSON prefix the
+  fragments wrote. An object after a parameter is refused whole, and that call gets no close. The
+  family's reference encoder never writes the shape, and its parser refuses it
+  (`Tool name format error`); one serving engine's parser for the family reads it, the object as
+  written, and the structural tag that engine builds for a call writes it (the invoke tag, the
+  parameters' schema, the invoke's close), so an engine that constrains a call that way gets it
+  back. Before, the object was refused as text between tags, and the call reached the client with
+  no arguments. The other spellings (MiniMax M2, dots3, MiniCPM5, XTML) keep refusing it.
 - **A tag ends at `>`, or at a marker** (`TagEnd`): XTML's `<|sep|>` is a token of its own
   and may arrive in pieces, so the scanner holds it like the other tags, and inside a value it
   is the value's text. XTML's call tag carries the model's count of the turn's calls,
@@ -624,12 +638,23 @@ What the syntax says, and what the assembler does with it:
   tagged syntax, since no member can be written for it. Before this the held bytes left as the
   word's text at both ends, and a chat client read `city="Par` as content next to a call whose
   arguments stopped at the member before. Outside a call the two endings differ: at the close a
-  name that never got its `(` comes back as `Malformed` with its own reason and the list's
-  wrapping before any call is dropped; at the stream's end what was held comes back as
-  `Malformed { UnterminatedRegion }`.
+  name that never got its `(` comes back as `Malformed`, a lone name or a word of prose as the
+  rule below has it, and the list's wrapping before any call is dropped; at the stream's end
+  what was held comes back as `Malformed { UnterminatedRegion }`.
 - **Python's whitespace is allowed** between a name and its `(`, around the `=`, and around a
   value, as the old parser's regular expression allowed it; a name or a key is the text less
   that whitespace.
+- **A name no `(` follows is a lone name or a word of prose.** A row is the words that
+  whitespace alone separates on one line. Every word of a row of two or more leaves as
+  `Malformed { TextBetweenCalls }`, as free text between calls does, the last one whatever ends
+  it (`sunny]`). A row of one word leaves as `Malformed { NameWithoutACall }`: a name alone on
+  its line, before a `,` or at the region's end, and a word that a character no name holds
+  parts from its neighbours (the `I` of `I'm`, `get_weather: Paris`, the `Enjoy` of
+  `sunny! Enjoy`), so that a tool named and not called keeps its own reason. Such a character
+  ends the row before it and leaves as text itself (a `,` or a bracket as the list's wrapping),
+  and the whitespace after it is dropped: a sentence it parts is one stretch of text a row, not
+  one stretch. The three pythonic tables share the rule: the list between markers (`olmo3`,
+  `lfm2.5`) and the turn's bare list once a call opened it (`llama4`).
 - **A list bare in the turn** (`Assembler::bare`, which the engine picks for a table no row of
   which enters the arguments state, as it picks the bare JSON list): a `[` is held with the name
   after it until a `(` says it opens a list, or anything else gives it back as content. At the
@@ -648,7 +673,13 @@ What the syntax says, and what the assembler does with it:
   of every value): the text between a value's double quotes, as written and with no escape
   decoded, is typed by the kind the request's tool declares for the parameter, through the value
   module's `json`, or by its text where none is declared; a bare value, a single-quoted Python
-  string included, reads as under the other dialects.
+  string included, reads as under the other dialects. One escape is the model's own: a `"` right
+  after a backslash, with more of the value after it, is a quote the model escaped, and the
+  value is typed from its text with the quote alone (`"5\" screen"` is `5" screen`, at the cost
+  of a value meant to hold that backslash), save a list or an object the literal reader takes
+  as written, which keeps its text. The stream's end right after such a backslash, or after its
+  quote, holds both back, since the next character decides between the escape and the value's
+  last character; a value with such a quote under a kind that is no string is held whole.
 - **A parameter without a value is reported and skipped.** `key=` followed by the comma or the
   call's `)` is a member Python refuses and the templates never write: its bytes, the separator
   before it, the key, the `=` and the whitespace around them, come back as

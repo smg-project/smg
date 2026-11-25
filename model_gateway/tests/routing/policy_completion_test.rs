@@ -14,11 +14,14 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
+use openai_protocol::model_card::ModelCard;
 use smg::{
-    routers::{router::Router as HttpRouter, RouterTrait},
+    routers::{
+        grpc::backend_client::BasicWorkerBuilder, router::Router as HttpRouter, RouterTrait,
+    },
     tenant::{RouteRequestMeta, TenantKey},
-    worker::{BasicWorkerBuilder, ModelCard, RequestCompletionSink, Worker},
 };
+use smg_worker::identity::basic::{RequestCompletionSink, Worker};
 use tokio::{net::TcpListener, time::timeout};
 
 use super::streaming_chat_request;

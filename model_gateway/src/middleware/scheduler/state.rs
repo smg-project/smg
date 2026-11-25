@@ -4,15 +4,15 @@
 use std::{sync::Arc, time::Duration};
 
 use smg_external_router::metrics::BoundedLabels;
+use smg_worker::load::capacity::{CapacityTrackerSettings, WorkerCapacity};
 use tracing::{error, info};
 
 use super::{
     Class, PriorityScheduler, SchedulerSettings, StaticTenantPolicyResolver, TenantPolicyResolver,
 };
 use crate::{
-    config::types::RouterConfig,
-    middleware::token_bucket::TokenBucket,
-    worker::{CapacityTrackerSettings, WorkerCapacity, WorkerRegistry},
+    config::types::RouterConfig, middleware::token_bucket::TokenBucket,
+    routers::common::snapshot::WorkerRegistry,
 };
 
 /// How often the metrics sampler refreshes the capacity / autoscaling gauges.
@@ -206,7 +206,7 @@ mod tests {
     use tokio::time::{sleep, Duration};
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     #[tokio::test]
     async fn priority_mode_applies_capacity_changes_after_startup() {

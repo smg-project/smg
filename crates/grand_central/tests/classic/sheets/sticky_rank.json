@@ -1,0 +1,264 @@
+{
+  "recorded_from": "615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc",
+  "policy": "sticky_rank",
+  "rows": [
+    {
+      "name": "a-key-takes-one-rank-on-every-request",
+      "ranks": 8,
+      "pinnable": null,
+      "steps": [
+        {
+          "pick": {
+            "key": "conv-0"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-1"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-2"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-0"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-1"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-2"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4,
+          5,
+          7,
+          4,
+          5,
+          7
+        ]
+      }
+    },
+    {
+      "name": "a-request-with-no-key-takes-no-rank",
+      "ranks": 8,
+      "pinnable": null,
+      "steps": [
+        {
+          "pick": {
+            "key": null
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-0"
+          }
+        },
+        {
+          "pick": {
+            "key": null
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          null,
+          4,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a-worker-of-one-engine-takes-no-rank",
+      "ranks": 1,
+      "pinnable": null,
+      "steps": [
+        {
+          "pick": {
+            "key": "conv-0"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-1"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a-worker-that-names-no-count-takes-no-rank-where-its-connection-says-none",
+      "ranks": null,
+      "pinnable": null,
+      "steps": [
+        {
+          "pick": {
+            "key": "conv-0"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-1"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "the-connection-s-ranks-stand-where-the-worker-names-no-count",
+      "ranks": null,
+      "pinnable": 4,
+      "steps": [
+        {
+          "pick": {
+            "key": "conv-0"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-2"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-0"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-2"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          3,
+          0,
+          3
+        ]
+      }
+    },
+    {
+      "name": "a-key-whose-rank-the-connection-places-no-pin-on-takes-none",
+      "ranks": 8,
+      "pinnable": 4,
+      "steps": [
+        {
+          "pick": {
+            "key": "conv-0"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-1"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-2"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-3"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-4"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-5"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-6"
+          }
+        },
+        {
+          "pick": {
+            "key": "conv-7"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          3,
+          3
+        ]
+      }
+    },
+    {
+      "name": "every-key-keeps-one-rank",
+      "ranks": 8,
+      "pinnable": null,
+      "keys": {
+        "count": 512,
+        "pairs": true
+      },
+      "outcome": {
+        "counts": {
+          "draws": 512,
+          "counts": [
+            512,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "the-keys-spread-over-the-ranks",
+      "ranks": 8,
+      "pinnable": null,
+      "keys": {
+        "count": 4096,
+        "pairs": false
+      },
+      "outcome": {
+        "counts": {
+          "draws": 4096,
+          "counts": [
+            545,
+            537,
+            536,
+            532,
+            513,
+            497,
+            487,
+            449
+          ]
+        }
+      }
+    }
+  ]
+}

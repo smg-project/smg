@@ -1,4 +1,4 @@
-use smg::worker::load::metrics_aggregator::{aggregate_metrics, MetricPack};
+use smg_worker::load::metrics_aggregator::{aggregate_metrics, MetricPack};
 
 #[test]
 fn test_aggregate_simple() {

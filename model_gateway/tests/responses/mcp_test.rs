@@ -252,6 +252,7 @@ async fn test_tool_execution_with_mock() {
             server_key: "mock_server".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }],
         "test-request-1",
     );
@@ -324,6 +325,7 @@ async fn test_web_search_transform_handles_openai_search_response_with_mock() {
             server_key: "openai_search_server".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }],
         "test-request-openai-search",
     );
@@ -400,6 +402,7 @@ async fn test_web_search_transform_sets_action_query_for_brave_search_with_mock(
             server_key: "brave_response_server".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }],
         "test-request-brave",
     );
@@ -466,6 +469,7 @@ async fn test_concurrent_tool_execution() {
             server_key: "mock_server".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }],
         "test-concurrent",
     );
@@ -490,6 +494,61 @@ async fn test_concurrent_tool_execution() {
         );
     }
 
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_connects_at_once_for_one_server_share_one_pooled_connection() {
+    let mock_server = create_mock_server().await;
+    let manager = McpOrchestrator::new(McpConfig {
+        servers: vec![],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
+        policy: Default::default(),
+    })
+    .await
+    .unwrap();
+    let server = McpServerConfig {
+        name: "dynamic".to_string(),
+        transport: McpTransport::Streamable {
+            url: mock_server.url(),
+            token: None,
+            headers: HashMap::new(),
+        },
+        proxy: None,
+        required: false,
+        tools: None,
+        builtin_type: None,
+        builtin_tool_name: None,
+        internal: false,
+    };
+    let key = McpOrchestrator::server_key(&server);
+    // An entry under the server's key that no listing brings back: it stays
+    // unless the key is cleared.
+    manager.tool_inventory().insert_entry(ToolEntry::new(
+        QualifiedToolName::new(&key, "marker"),
+        Tool::new("marker", "a marker", Arc::new(serde_json::Map::new())),
+    ));
+
+    // Neither connect finds the server pooled: each looks before the other
+    // has connected.
+    let (first, second) = tokio::join!(
+        manager.connect_dynamic_server(server.clone()),
+        manager.connect_dynamic_server(server),
+    );
+    first.unwrap();
+    second.unwrap();
+
+    assert!(
+        manager.has_tool(&key, "marker"),
+        "no connection left the pool, so the server's key is not cleared"
+    );
+    assert!(
+        manager.has_tool(&key, "brave_web_search"),
+        "the server's tools are listed"
+    );
     manager.shutdown().await;
 }
 
@@ -530,6 +589,7 @@ async fn test_tool_execution_errors() {
             server_key: "mock_server".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }],
         "test-error",
     );
@@ -661,6 +721,9 @@ async fn an_eviction_keeps_the_tools_of_a_server_that_is_still_pooled() {
         listed,
         "the tools of a server that a pooled connection still serves"
     );
+    // Three pooled connections were opened and one left: the pool counts
+    // them, the count of configured servers' connections does not.
+    assert_eq!(manager.metrics().snapshot().active_connections, 0);
     manager.shutdown().await;
 }
 
@@ -904,6 +967,7 @@ async fn test_complete_workflow() {
             server_key: "integration_test".to_string(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }],
         "test-workflow",
     );
@@ -975,6 +1039,7 @@ async fn internal_mcp_visibility_preserves_namespaced_client_function() {
             server_key: "internal".into(),
             allowed_tools: None,
             list_error: None,
+            pool_key: None,
         }],
         "visibility-test",
     );

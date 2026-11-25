@@ -18,8 +18,10 @@ use serde_json::{json, Value};
 use smg::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    routers::{factory::router_ids, gateway::Gateway, RouterFactory},
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker},
+    routers::{
+        factory::router_ids, gateway::Gateway, grpc::backend_client::BasicWorkerBuilder,
+        RouterFactory,
+    },
 };
 use smg_grpc_client::{
     common_proto,
@@ -28,6 +30,7 @@ use smg_grpc_client::{
         sglang_scheduler_server::{SglangScheduler, SglangSchedulerServer},
     },
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request as GrpcRequest, Response as GrpcResponse, Status};

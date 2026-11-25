@@ -1,0 +1,430 @@
+{
+  "recorded_from": "7526c6664e4916620fad715f204d35968568e3ee",
+  "policy": "pair-bound",
+  "rows": [
+    {
+      "name": "bound-every-prefill-at-capacity-and-no-decode-ready",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "decode",
+              "why": "unavailable"
+            }
+          },
+          {
+            "none": {
+              "role": "decode",
+              "why": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "bound-the-prefill-at-capacity-has-the-only-open-partner",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "bound-the-second-prefill-at-capacity-has-the-only-open-partner",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "bound-every-prefill-at-capacity-and-every-decode-over",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "over",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "bound-every-prefill-at-capacity-and-every-decode-over-under-shedding",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": true,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "over",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "decode",
+              "why": "overloaded"
+            }
+          },
+          {
+            "none": {
+              "role": "decode",
+              "why": "overloaded"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "bound-every-prefill-at-capacity-and-every-decode-stalled",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "stalled",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "stalled",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "bound-the-only-ready-prefill-at-capacity",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "bound-a-prefill-with-room-and-an-open-partner-takes-the-request",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -23,7 +23,7 @@ use super::adapters::{
 };
 use crate::{
     policies::{as_cache_aware, CacheAwarePolicy, PolicyRegistry, TreeHandle, TreeKind},
-    worker::WorkerRegistry,
+    routers::common::snapshot::WorkerRegistry,
 };
 
 /// Buffer budget for the broadcast tenant-delta namespace (`td:`). Undersized
@@ -285,17 +285,19 @@ impl TreeHandle for PolicyRegistryTreeHandle {
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
+    use openai_protocol::UNKNOWN_MODEL_ID;
     use parking_lot::RwLock;
     use smg_mesh::{gossip::NodeState, WorkerState};
+    use smg_worker::{
+        identity::basic::{Worker, WorkerType},
+        test_support::no_health_check,
+    };
     use tokio::time::sleep;
 
     use super::*;
     use crate::{
-        config::types::PolicyConfig,
-        policies::SelectWorkerInfo,
-        worker::{
-            test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType, UNKNOWN_MODEL_ID,
-        },
+        config::types::PolicyConfig, policies::SelectWorkerInfo,
+        routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
     fn empty_cluster_state() -> ClusterState {

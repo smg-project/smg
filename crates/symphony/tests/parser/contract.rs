@@ -333,6 +333,10 @@ fn kimi_k2() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::KimiK2.format(), Declared::default()))
 }
 
+fn kimi() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Kimi.format(), Declared::default()))
+}
+
 fn mistral() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Mistral.format(), Declared::default()))
 }
@@ -346,6 +350,10 @@ fn llama_nemotron() -> Box<dyn Parser> {
         Table::LlamaNemotron.format(),
         Declared::default(),
     ))
+}
+
+fn command() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Command.format(), Declared::default()))
 }
 
 fn function_gemma() -> Box<dyn Parser> {
@@ -571,6 +579,11 @@ fn gpt_oss_template() -> Box<dyn Parser> {
             .stop_tokens(["<|return|>", "<|endoftext|>", "<|call|>"]),
         Declared::default(),
     ))
+}
+
+/// The crate's own gpt-oss table, which no registry row lists yet.
+fn gpt_oss_table() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::gpt_oss(), Declared::default()))
 }
 
 fn space() -> Class {
@@ -967,6 +980,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::KimiK2),
     },
     Subject {
+        name: "kimi",
+        new: kimi,
+        outputs: KIMI_OUTPUTS,
+        table: Some(Table::Kimi),
+    },
+    Subject {
         name: "plain",
         new: plain,
         outputs: PLAIN_OUTPUTS,
@@ -1087,6 +1106,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::LlamaNemotron),
     },
     Subject {
+        name: "command",
+        new: command,
+        outputs: COMMAND_OUTPUTS,
+        table: Some(Table::Command),
+    },
+    Subject {
         name: "function gemma",
         new: function_gemma,
         outputs: FUNCTION_GEMMA_OUTPUTS,
@@ -1102,6 +1127,12 @@ const FORMATS: &[Subject] = &[
         name: "gpt-oss test template, its calls as a shape",
         new: gpt_oss_template,
         outputs: GPT_OSS_OUTPUTS,
+        table: None,
+    },
+    Subject {
+        name: "gpt-oss table, not listed yet",
+        new: gpt_oss_table,
+        outputs: GPT_OSS_TABLE_OUTPUTS,
         table: None,
     },
     Subject {
@@ -1213,6 +1244,29 @@ const GPT_OSS_OUTPUTS: &[&str] = &[
     "<|channel|>commentary to=functions.get_weather<|message|>{\"city\": \"Paris\", \"days\": ,}",
 ];
 
+/// The gpt-oss table: a call under either order of its header and on the analysis channel, a
+/// preamble, the model's own tools under either order, a recipient that is no function, a header
+/// with no channel, a marker that names no tool, a header the end leaves unfinished, a call a
+/// start marker ends, and nothing.
+const GPT_OSS_TABLE_OUTPUTS: &[&str] = &[
+    "<|channel|>analysis<|message|>User asks for the weather.<|end|><|start|>assistant\
+     <|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
+     {\"city\": \"Paris\", \"days\": 3}",
+    " to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Par",
+    "<|channel|>analysis to=functions.get-weather.v2 <|constrain|>json<|message|>{}",
+    "<|channel|>commentary<|message|>Looking it up.<|end|><|start|>assistant<|channel|>final\
+     <|message|>Done.",
+    " to=python<|channel|>analysis<|message|>print(1)<|end|><|start|>assistant<|channel|>final\
+     <|message|>Done.",
+    "<|channel|>analysis to=browser.search code<|message|>{\"query\": \"x\"}",
+    "<|channel|>commentary to=repo_browser.print_tree <|constrain|>json<|message|>{\"path\": \".\"}",
+    "<|message|>Plain.<|end|> after",
+    "<|channel|>commentary to=functions.<|channel|>final<|message|>Hi",
+    "<|channel|>commentary to=functions.get_weather json",
+    "<|channel|>commentary to=functions.get_weather json<|message|><|start|>assistant",
+    "",
+];
+
 /// Calls on abstract tags: a call its trailer closes, terminals whose header does not match (in
 /// the content, in a thought, twice in a row), a close the trailer does not end at, a call cut
 /// short, a value the reader refuses before the trailer closes the call, a call the stop closes
@@ -1309,6 +1363,17 @@ const MUSE_SPARK_OUTPUTS: &[&str] = &[
     "<atem:invoke id=\"1\">text</atem:invoke> to=user<|message|>Hi",
     " to=self<|message|>A thought cut<|eom|><|start|>assistant to=us",
     "unframed text",
+];
+
+/// The Kimi table: a thought between the older pair and the answer, a call behind such a
+/// thought, the answer alone, a thought cut, text before a thought, and the line's own pair.
+const KIMI_OUTPUTS: &[&str] = &[
+    "◁think▷The user greets me.◁/think▷Hello!",
+    "◁think▷Need the weather.◁/think▷<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "Hello!",
+    "◁think▷The user gre",
+    "First. ◁think▷Then a thought.◁/think▷Then the rest.",
+    "<think>a plan</think>Sure.",
 ];
 
 /// The Kimi K2 table: a thought and a call; two calls; content and a call with no arguments; a
@@ -1590,6 +1655,18 @@ const MISTRAL_OUTPUTS: &[&str] = &[
     // A trailing comma and a value left out, at a call its object's brace closes.
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", }",
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": ,}[TOOL_CALLS]get_stock_price[ARGS]{}",
+];
+
+/// Command's turn: the thought, the list of calls and the answer, each between its own markers;
+/// an answer with no marker, the list cut, and prose where the list should be.
+const COMMAND_OUTPUTS: &[&str] = &[
+    "<|START_THINKING|>The user asks about Paris.<|END_THINKING|><|START_ACTION|>[\n    \
+     {\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}},\n    \
+     {\"tool_call_id\": \"1\", \"tool_name\": \"get_stock_price\", \"parameters\": {}}\n]<|END_ACTION|>",
+    "<|START_THINKING|>No tool is needed.<|END_THINKING|><|START_RESPONSE|>Hello!<|END_RESPONSE|>",
+    "Hello!",
+    "<|START_ACTION|>[\n    {\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \"parameters\": {\"city\": \"Par",
+    "<|START_ACTION|>not a list<|END_ACTION|>",
 ];
 
 /// Llama Nemotron's calls: one JSON list between `<TOOLCALL>` and `</TOOLCALL>`, content before
@@ -1930,9 +2007,10 @@ const DSML_OUTPUTS: &[&str] = &[
      </｜DSML｜ calls>",
     "</think>Sure. \n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n\
      </｜DSML｜ calls>",
-    // An invoke whose arguments are one JSON object in place of the parameter tags, as the
-    // serving engines' parsers read it: whole, with a closing tag inside a string, cut short, and
-    // a fault inside it and after it.
+    // An invoke whose arguments are one JSON object in place of the parameter tags, as one
+    // serving engine's parser reads it: whole, with a parameter's closing tag inside a string, cut
+    // short, with a fault inside it and after it, and with the invoke's close, the next invoke's
+    // opening or the block's close inside a string, which ends the call there.
     "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n{\"city\": \"Paris\", \
      \"days\": 3}\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ parameter> <｜DSML｜\"}\
@@ -1944,6 +2022,12 @@ const DSML_OUTPUTS: &[&str] = &[
      </｜DSML｜ calls>",
     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n{\"a\": 1} more\n</｜DSML｜ invoke>\n\
      </｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ invoke> y\", \"b\": 3}\
+     </｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x <｜DSML｜ invoke name=\"g\">\
+     {\"b\": 3}</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ calls> y\"}\
+     </｜DSML｜ invoke>\n</｜DSML｜ calls>",
 ];
 
 /// Outputs in the tagged syntax: the recorded shapes, and the cuts and faults the assembler
@@ -2074,11 +2158,13 @@ const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
     "Hello!",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par</｜DSML｜tool_calls>",
-    // An invoke whose arguments are one JSON object, whole, cut short, and with a fault after it.
+    // An invoke whose arguments are one JSON object, whole, cut short, with a fault after it, and
+    // with the invoke's close inside a string, which ends the call there.
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"location\": \"Paris\"}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Par",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Paris\"}</｜DSML｜par",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Paris\"} more</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"x </｜DSML｜invoke> y\"}</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
 ];
 
 /// DeepSeek V3.2's DSML as its reference encoder renders it (the thought the prompt opens written
@@ -2103,10 +2189,12 @@ const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
     "<think>still thinking",
     "Hello!",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
-    // An invoke whose arguments are one JSON object, whole, cut short, and with a fault after it.
+    // An invoke whose arguments are one JSON object, whole, cut short, with a fault after it, and
+    // with the invoke's close inside a string, which ends the call there.
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"location\": \"Paris\"}\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Par",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Paris\"} more</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"x </｜DSML｜invoke> y\"}</｜DSML｜invoke>\n</｜DSML｜function_calls>",
 ];
 
 /// DeepSeek V3.1's calls as its chat template renders them (the thought the prompt opens written
@@ -2577,7 +2665,7 @@ fn check_well_formed(subject: &Subject, text: &str, cuts: &[usize], events: &[Ev
                     }
                 }
             }
-            Event::ToolCallEnd { index, source } => {
+            Event::ToolCallEnd { index, source, .. } => {
                 assert!(
                     started.contains(index),
                     "{}: before the call's start",

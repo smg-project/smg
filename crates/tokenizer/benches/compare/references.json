@@ -1,0 +1,34 @@
+{
+  "fastokens": {
+    "adapter": "harness/fastokens-tok",
+    "repository": "https://github.com/vllm-project/vllm",
+    "commit": "46f36fa294559d080edc61a09e5b57826218a2bf",
+    "crate": "rust/src/tokenizer",
+    "versions": {
+      "fastokens": "0.3.5",
+      "riptoken": "0.3.0",
+      "tekken": "0.2.0",
+      "tiktoken-rs": "0.9.1",
+      "tokenizers": "0.22.2"
+    }
+  },
+  "v1": {
+    "adapter": "harness/smg-tok",
+    "feature": "tokenizers-v1",
+    "versions": {
+      "tokenizers": "1.0.0-rc.3"
+    }
+  },
+  "tokenizers": {
+    "adapter": "harness/hf-tok",
+    "versions": {
+      "tokenizers": "0.23.2"
+    }
+  },
+  "tiktoken-rs": {
+    "adapter": "harness/tt-tok",
+    "versions": {
+      "tiktoken-rs": "0.12.1"
+    }
+  }
+}

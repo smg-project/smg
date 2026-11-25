@@ -13,18 +13,20 @@ use tool_parser::ParserFactory as ToolParserFactory;
 
 use crate::{
     config::ParserChoice,
-    routers::grpc::{
-        backend_client::BackendClient,
-        client::GrpcClient,
-        common::stages::helpers::{IdStamp, SamplingBaseline, ToolConstraintStamp},
-        context::{AttemptStamp, ExecutionPlan, SharedComponents},
-        multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
-        proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
-        regular::symphony::template::Templates,
-        test_engine::mock_engine,
-        utils::ParserResolver,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{
+            backend_client::BackendClient,
+            client::GrpcClient,
+            common::stages::helpers::{IdStamp, SamplingBaseline, ToolConstraintStamp},
+            context::{AttemptStamp, ExecutionPlan, SharedComponents},
+            multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
+            proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
+            regular::symphony::template::Templates,
+            test_engine::mock_engine,
+            utils::ParserResolver,
+        },
     },
-    worker::WorkerRegistry,
 };
 
 /// The gateway's shared components over `tokenizer_registry` and `worker_registry`,

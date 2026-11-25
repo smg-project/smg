@@ -21,14 +21,14 @@
 //! tests `a_control_spelling_typed_into_a_message_stays_text` and
 //! `encode_reads_a_special_spelling_as_its_token` pin the two readings.
 
-use std::{collections::HashMap, path::Path};
+use std::{borrow::Cow, collections::HashMap, path::Path};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
-use crate::traits::TokenIdType;
+use crate::{tiktoken::RankFile, traits::TokenIdType};
 
 /// The file name of the layout: a checkpoint directory ships the vocabulary
 /// under it.
@@ -39,6 +39,16 @@ pub(crate) const BOS: &str = "<s>";
 pub(crate) const EOS: &str = "</s>";
 pub(crate) const UNK: &str = "<unk>";
 pub(crate) const PAD: &str = "<pad>";
+
+/// The split pattern of the real files. A test proves it against the own
+/// encoder, so a load with it skips that check (see `SHIPPED_PATTERNS` in
+/// `tiktoken.rs`).
+pub(crate) const PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// The most special ids a configuration may name: a bound of this reader,
+/// beyond the checks of the reference reader. A load keeps a slot for every
+/// special id the configuration names. The files in use name 1,000.
+const MAX_SPECIAL_TOKENS: usize = 1 << 16;
 
 /// The special tokens of a file that lists none: the reference reader's
 /// list for the versions up to v7, which predate the `special_tokens` block.
@@ -81,9 +91,10 @@ pub(crate) fn has_tekken_file(dir: &Path) -> bool {
 /// The file as written: the configuration block, the ranked tokens and the
 /// special tokens; the image, audio and model-settings blocks are not read.
 #[derive(Deserialize)]
-struct File {
+struct File<'a> {
     config: Config,
-    vocab: Vec<Token>,
+    #[serde(borrow)]
+    vocab: Vec<Token<'a>>,
     #[serde(default)]
     special_tokens: Option<Vec<SpecialToken>>,
 }
@@ -100,9 +111,12 @@ struct Config {
 /// A ranked token; its `token_str` is a rendering of the bytes, null where
 /// they are not UTF-8, and is not read.
 #[derive(Deserialize)]
-struct Token {
+struct Token<'a> {
     rank: u32,
-    token_bytes: String,
+    // Borrowed from the file's text; owned only where the writer escaped a
+    // character.
+    #[serde(borrow)]
+    token_bytes: Cow<'a, str>,
 }
 
 /// A special token; its `is_control` flag reaches neither the encoder nor
@@ -115,8 +129,9 @@ struct SpecialToken {
 
 /// What the file gives the tokenizer.
 pub(crate) struct Vocabulary {
-    /// Token bytes to id: the rank plus the special-token count.
-    pub(crate) ranks: FxHashMap<Vec<u8>, u32>,
+    /// The tokens in rank order, each with its id: the rank plus the
+    /// special-token count.
+    pub(crate) ranks: RankFile,
     /// The split pattern the ranks were trained under.
     pub(crate) pattern: String,
     /// Special token spellings to id: the file's list, and a filler for
@@ -134,15 +149,254 @@ impl Vocabulary {
 /// Reads the file at `path`.
 pub(crate) fn read(path: &Path) -> Result<Vocabulary> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let file: File = serde_json::from_slice(&bytes)
-        .with_context(|| format!("{} is not a tekken vocabulary file", path.display()))?;
+    // One UTF-8 check of the whole file in place of one a string; a file
+    // that is not UTF-8 in a place the reader skips is read as before.
+    let file: File = match std::str::from_utf8(&bytes) {
+        Ok(text) => match written_layout(text) {
+            Some(file) => Ok(file),
+            None => serde_json::from_str(text),
+        },
+        Err(_) => serde_json::from_slice(&bytes),
+    }
+    .with_context(|| format!("{} is not a tekken vocabulary file", path.display()))?;
     vocabulary(file).with_context(|| format!("{} is not a valid tekken vocabulary", path.display()))
 }
 
+/// The file whose ranked tokens are written as the reference writer writes
+/// them: objects of `rank` (a plain integer), `token_bytes` (a string
+/// without an escape) and `token_str` (a string or null), in that order.
+/// The array is walked here, at a fraction of the JSON reader's pass over
+/// it; the text around it goes through the JSON reader with an empty array
+/// in its place. `None` for any other shape and for a text the JSON reader
+/// would refuse: the caller hands it the whole file, so every file reads as
+/// before and every error keeps its text.
+fn written_layout(text: &str) -> Option<File<'_>> {
+    let mut walk = Walk { text, at: 0 };
+    walk.take(b"{")?;
+    loop {
+        walk.take(b"\"")?;
+        let key = walk.plain_string()?;
+        walk.take(b":")?;
+        walk.space();
+        if key == "vocab" {
+            break;
+        }
+        walk.skip_value()?;
+        walk.take(b",")?;
+    }
+    let start = walk.at;
+    walk.take(b"[")?;
+    let mut vocab = Vec::new();
+    if walk.take(b"]").is_none() {
+        // A writer repeats the text between two values byte for byte: it is
+        // walked token by token once and compared after that.
+        let mut seams = [None; 3];
+        walk.take(b"{")?;
+        walk.take(b"\"rank\"")?;
+        walk.take(b":")?;
+        loop {
+            let rank = walk.integer()?;
+            walk.seam(&mut seams[0], |walk| {
+                walk.take(b",")?;
+                walk.take(b"\"token_bytes\"")?;
+                walk.take(b":")?;
+                walk.take(b"\"")
+            })?;
+            let token_bytes = Cow::Borrowed(walk.plain_string()?);
+            walk.seam(&mut seams[1], |walk| {
+                walk.take(b",")?;
+                walk.take(b"\"token_str\"")?;
+                walk.take(b":")
+            })?;
+            if walk.take(b"\"").is_some() {
+                walk.skipped_string()?;
+            } else {
+                walk.take(b"null")?;
+            }
+            vocab.push(Token { rank, token_bytes });
+            let next = walk.seam(&mut seams[2], |walk| {
+                walk.take(b"}")?;
+                walk.take(b",")?;
+                walk.take(b"{")?;
+                walk.take(b"\"rank\"")?;
+                walk.take(b":")
+            });
+            if next.is_none() {
+                break;
+            }
+        }
+        walk.take(b"}")?;
+        walk.take(b"]")?;
+    }
+    let around = [text.get(..start)?, "[]", text.get(walk.at..)?].concat();
+    let File {
+        config,
+        special_tokens,
+        ..
+    } = serde_json::from_str(&around).ok()?;
+    Some(File {
+        config,
+        vocab,
+        special_tokens,
+    })
+}
+
+/// A position in the file's text for [`written_layout`]. Every method
+/// answers `None` where the JSON reader would refuse the text, or might.
+struct Walk<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl<'a> Walk<'a> {
+    fn rest(&self) -> &'a [u8] {
+        self.text.as_bytes().get(self.at..).unwrap_or_default()
+    }
+
+    fn space(&mut self) {
+        let space = |byte: &&u8| matches!(byte, b' ' | b'\n' | b'\r' | b'\t');
+        self.at += self.rest().iter().take_while(space).count();
+    }
+
+    /// Passes `token` and the white space in front of it.
+    fn take(&mut self, token: &[u8]) -> Option<()> {
+        self.space();
+        self.rest()
+            .starts_with(token)
+            .then(|| self.at += token.len())
+    }
+
+    /// Passes the text between two values: by a compare where `seam`, the
+    /// text `tokens` passed at this place last, stands here again, else by
+    /// `tokens`.
+    fn seam(
+        &mut self,
+        seam: &mut Option<&'a [u8]>,
+        tokens: impl Fn(&mut Self) -> Option<()>,
+    ) -> Option<()> {
+        let (from, rest) = (self.at, self.rest());
+        match *seam {
+            Some(seam) if rest.starts_with(seam) => self.at += seam.len(),
+            _ => {
+                if tokens(self).is_none() {
+                    self.at = from;
+                    return None;
+                }
+                *seam = rest.get(..self.at - from);
+            }
+        }
+        Some(())
+    }
+
+    /// The rest of a string that has no escape; ends past its quote.
+    fn plain_string(&mut self) -> Option<&'a str> {
+        let rest = self.rest();
+        let len = rest
+            .iter()
+            .position(|byte| matches!(byte, b'"' | b'\\' | 0..=0x1f))?;
+        let string = self.text.get(self.at..self.at + len)?;
+        (rest.get(len) == Some(&b'"')).then(|| {
+            self.at += len + 1;
+            string
+        })
+    }
+
+    /// Passes the rest of a string that is not read, its escapes checked as
+    /// the JSON reader checks them.
+    fn skipped_string(&mut self) -> Option<()> {
+        let bytes = self.text.as_bytes();
+        let mut at = self.at;
+        loop {
+            match *bytes.get(at)? {
+                b'"' => break,
+                b'\\' => match *bytes.get(at + 1)? {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => at += 2,
+                    b'u' => {
+                        // The code unit of the four hex digits at `at`.
+                        let unit = |at: usize| {
+                            let hex = bytes.get(at..at + 4)?;
+                            hex.iter().try_fold(0u32, |unit, &digit| {
+                                Some((unit << 4) | char::from(digit).to_digit(16)?)
+                            })
+                        };
+                        at += match unit(at + 2)? {
+                            // A high half right before a low half is one
+                            // character to every version of the JSON
+                            // reader; whether any other half is an error
+                            // is its rule and changed between its versions.
+                            0xD800..=0xDBFF
+                                if matches!(bytes.get(at + 6..at + 8), Some(b"\\u"))
+                                    && matches!(unit(at + 8), Some(0xDC00..=0xDFFF)) =>
+                            {
+                                12
+                            }
+                            0xD800..=0xDFFF => return None,
+                            _ => 6,
+                        };
+                    }
+                    _ => return None,
+                },
+                0..=0x1f => return None,
+                _ => at += 1,
+            }
+        }
+        self.at = at + 1;
+        Some(())
+    }
+
+    /// A number of digits alone, without a leading zero, that fits a rank.
+    fn integer(&mut self) -> Option<u32> {
+        self.space();
+        let rest = self.rest();
+        let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+        let number = rest.get(..digits)?;
+        if number.is_empty() || (digits > 1 && number.first() == Some(&b'0')) {
+            return None;
+        }
+        self.at += digits;
+        number.iter().try_fold(0u32, |value, digit| {
+            value.checked_mul(10)?.checked_add(u32::from(digit - b'0'))
+        })
+    }
+
+    /// Passes a value in front of the array; the JSON reader checks it
+    /// when it reads the text around the array.
+    fn skip_value(&mut self) -> Option<()> {
+        let mut depth = 0usize;
+        loop {
+            match *self.rest().first()? {
+                b',' | b'}' | b']' if depth == 0 => return Some(()),
+                b'"' => {
+                    self.at += 1;
+                    self.skipped_string()?;
+                    continue;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                _ => {}
+            }
+            self.at += 1;
+        }
+    }
+}
+
+/// The ids by their token. A token the file lists twice is refused here,
+/// where the map is built, as the reference reader refuses it.
+pub(crate) fn by_token(tokens: &RankFile) -> Result<FxHashMap<&[u8], TokenIdType>> {
+    let mut ranks = FxHashMap::with_capacity_and_hasher(tokens.ranks.len(), Default::default());
+    for (index, (token, id)) in tokens.tokens().enumerate() {
+        if ranks.insert(token, id).is_some() {
+            bail!("token {index} repeats an earlier token's bytes");
+        }
+    }
+    Ok(ranks)
+}
+
 /// The vocabulary of a parsed file, checked as the reference reader checks
-/// it: the ranks in order, the first 256 tokens the single bytes, no token
-/// twice, the special tokens distinct and inside their block.
-fn vocabulary(file: File) -> Result<Vocabulary> {
+/// it: the ranks in order, the first 256 tokens the single bytes, the
+/// special tokens distinct and inside their block ([`by_token`] refuses a
+/// token listed twice).
+fn vocabulary(file: File<'_>) -> Result<Vocabulary> {
     let File {
         config,
         vocab,
@@ -166,7 +420,18 @@ fn vocabulary(file: File) -> Result<Vocabulary> {
     }
     let offset = TokenIdType::try_from(num_special)
         .context("default_num_special_tokens does not fit an id")?;
-    let mut ranks = FxHashMap::with_capacity_and_hasher(inner, Default::default());
+    if num_special > MAX_SPECIAL_TOKENS {
+        bail!(
+            "default_num_special_tokens {num_special} is above the bound of {MAX_SPECIAL_TOKENS}"
+        );
+    }
+    // Four characters of base64 decode to three bytes at the most.
+    let bytes = vocab
+        .iter()
+        .take(inner)
+        .map(|token| token.token_bytes.len().div_ceil(4) * 3)
+        .sum();
+    let mut ranks = RankFile::with_capacity(inner, bytes);
     for (index, token) in vocab.into_iter().take(inner).enumerate() {
         let rank = u32::try_from(index).context("more ranks than ids")?;
         if token.rank != rank {
@@ -175,18 +440,17 @@ fn vocabulary(file: File) -> Result<Vocabulary> {
                 token.rank
             );
         }
-        let bytes = STANDARD
-            .decode(&token.token_bytes)
+        let start = ranks.bytes.len();
+        STANDARD
+            .decode_vec(token.token_bytes.as_bytes(), &mut ranks.bytes)
             .with_context(|| format!("token {index}: token_bytes is not base64"))?;
-        if u8::try_from(index).is_ok_and(|byte| bytes.as_slice() != [byte]) {
+        if u8::try_from(index).is_ok_and(|byte| ranks.bytes[start..] != [byte]) {
             bail!("token {index} is not the byte {index:#04x}");
         }
         let id = rank
             .checked_add(offset)
             .context("an id past the id range")?;
-        if ranks.insert(bytes, id).is_some() {
-            bail!("token {index} repeats an earlier token's bytes");
-        }
+        ranks.end_token(id)?;
     }
     let listed: Vec<SpecialToken> = match special_tokens {
         Some(listed) => listed,
@@ -260,9 +524,6 @@ pub(crate) mod testing {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::{json, Value};
 
-    /// The split pattern of the real files.
-    pub(crate) const PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-
     pub(crate) const MERGES: [&str; 4] = ["he", "ll", "hell", "hello"];
 
     /// The file text: the 256 bytes and `merges` ranked in order, `specials`
@@ -288,7 +549,7 @@ pub(crate) mod testing {
             .collect();
         let mut file = json!({
             "config": {
-                "pattern": PATTERN,
+                "pattern": super::PATTERN,
                 "num_vocab_tokens": vocab.len(),
                 "default_vocab_size": vocab_size,
                 "default_num_special_tokens": num_special,
@@ -518,6 +779,84 @@ mod tests {
         );
     }
 
+    /// The reader skips a ranked token's `token_str`: a byte that is not
+    /// UTF-8 there does not stop the load; in a field it reads, the file is
+    /// refused.
+    #[test]
+    fn a_file_that_is_not_utf8_where_the_reader_skips_still_loads() {
+        let text = testing::minimal();
+        let dir = testing::dir_with(&text);
+        let path = dir.path().join(FILE_NAME);
+        let whole = read(&path).unwrap().ranks;
+
+        let mut bytes = text.clone().into_bytes();
+        bytes[text.find("\"token_str\":\"A\"").unwrap() + 13] = 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read(&path).unwrap().ranks, whole);
+
+        let mut bytes = text.clone().into_bytes();
+        bytes[text.find("\"token_bytes\":\"QQ==\"").unwrap() + 15] = 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let Err(error) = read(&path) else {
+            panic!("a token whose bytes are not UTF-8 loaded");
+        };
+        assert!(
+            format!("{error:#}").contains("is not a tekken vocabulary file"),
+            "{error:#}"
+        );
+    }
+
+    /// The walk over the ranked tokens reads the vocabulary the JSON reader
+    /// reads; a token written any other way sends the file to the JSON
+    /// reader, which reads or refuses it as before.
+    #[test]
+    fn the_walk_reads_the_ranked_tokens_as_the_json_reader_does() {
+        let compact = testing::minimal();
+        let edit = |from: &str, to: &str| {
+            let text = compact.replacen(from, to, 1);
+            assert_ne!(text, compact, "{from} is not in the file");
+            text
+        };
+        let value: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        // A file, and whether the walk takes it.
+        let files = [
+            (compact.clone(), true),
+            (serde_json::to_string_pretty(&value).unwrap(), true),
+            (edit(r#""\u0007""#, r#""\ud83d\ude00""#), true),
+            (edit(r#""\u0007""#, r#""\ud83d""#), false),
+            (edit(r#""\u0007""#, "\"\u{7}\""), false),
+            (
+                edit(
+                    r#""rank":7,"token_bytes":"Bw==""#,
+                    r#""token_bytes":"Bw==","rank":7"#,
+                ),
+                false,
+            ),
+            (edit(r#""rank":7,"#, r#""rank":07,"#), false),
+            (edit(r#""rank":7,"#, r#""rank":7.0,"#), false),
+            (edit(r#""rank":7,"#, r#""rank":4294967296,"#), false),
+            (edit(r#""Bw==""#, r#""Bw=\u003d""#), false),
+            (edit(r#""hello"}]"#, r#""hello"},]"#), false),
+        ];
+        for (row, (text, walked)) in files.into_iter().enumerate() {
+            assert_eq!(written_layout(&text).is_some(), walked, "row {row}");
+            let loaded = read(&testing::dir_with(&text).path().join(FILE_NAME));
+            match (loaded, serde_json::from_str::<File>(&text)) {
+                (Ok(loaded), Ok(file)) => {
+                    let parsed = vocabulary(file).unwrap();
+                    assert_eq!(loaded.ranks, parsed.ranks, "row {row}");
+                    assert_eq!(loaded.specials, parsed.specials, "row {row}");
+                    assert_eq!(loaded.pattern, parsed.pattern, "row {row}");
+                }
+                (Err(loaded), Err(parsed)) => {
+                    let loaded = format!("{loaded:#}");
+                    assert!(loaded.ends_with(&parsed.to_string()), "row {row}: {loaded}");
+                }
+                (loaded, _) => panic!("row {row}: one reader refuses (read: {})", loaded.is_ok()),
+            }
+        }
+    }
+
     #[test]
     fn the_reader_refuses_a_file_whose_layout_breaks_the_rules() {
         let refused = |text: String, reason: &str| {
@@ -558,6 +897,30 @@ mod tests {
         refused(
             testing::tekken_json(&testing::MERGES, Some(&[(0, "<unk>")]), 3, 300, "v13"),
             "the configuration needs 297",
+        );
+        refused(
+            testing::tekken_json(
+                &testing::MERGES,
+                Some(&[(0, "<unk>")]),
+                MAX_SPECIAL_TOKENS + 1,
+                MAX_SPECIAL_TOKENS + 261,
+                "v13",
+            ),
+            "default_num_special_tokens 65537 is above the bound of 65536",
+        );
+        // `hello` rewritten as `he`, a token the file lists already: the
+        // reader passes it; the load refuses it and names the file as the
+        // reader names it.
+        let dir = testing::dir_with(&minimal.replacen("aGVsbG8=", "aGU=", 1));
+        let path = dir.path().join(FILE_NAME);
+        let Err(error) = TiktokenTokenizer::from_tekken_file(&path) else {
+            panic!("a file that lists a token twice loaded");
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(
+            error.contains("repeats an earlier token's bytes"),
+            "{error}"
         );
         assert!(is_tekken_file(Path::new("/m/tekken.json")));
         assert!(is_tekken_file(Path::new("tekken_240911.json")));

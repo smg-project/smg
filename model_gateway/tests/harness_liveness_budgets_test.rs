@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use smg::config::RouterConfig;
 use smg_test_harness as common;
+use smg_worker::health::liveness;
 
 #[tokio::test]
 async fn a_built_context_applies_its_configurations_liveness_budgets() {
@@ -26,7 +27,7 @@ async fn a_built_context_applies_its_configurations_liveness_budgets() {
 
     let _context = common::create_test_context_with_mock_tokenizer(config, "budget-test").await;
 
-    let budgets = smg::worker::liveness_budgets();
+    let budgets = liveness::budgets();
     assert_eq!(
         (budgets.stall, budgets.wedge, budgets.stale),
         (

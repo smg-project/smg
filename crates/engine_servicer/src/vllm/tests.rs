@@ -1996,6 +1996,9 @@ async fn structured_output_backend_follows_the_launcher_config() {
     ));
     let status = h.client.generate(request).await.expect_err("refused");
     assert_eq!(status.code(), Code::InvalidArgument);
+    // The refusal crosses the wire under its trailer, which a router answers
+    // as the request's 400 rather than a failure of the worker.
+    assert!(smg_grpc_client::is_constraint_refusal(&status));
     assert!(
         status.message().contains("`multipleOf` at its root"),
         "{}",
@@ -2017,6 +2020,7 @@ async fn structured_output_backend_follows_the_launcher_config() {
     ));
     let status = h.client.generate(request).await.expect_err("refused");
     assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(smg_grpc_client::is_constraint_refusal(&status));
     assert!(
         status.message().contains(
             "`uniqueItems` at `/format/tags/0/content/json_schema/properties/tags` (inside the \
@@ -3509,7 +3513,7 @@ async fn embed_answers_from_the_engines_pooling_output() {
     let mut h = harness(pooling_model_info(), None).await;
     let (response, request) = tokio::join!(
         h.client
-            .embed(embed_request("emb-1", vec![101, 7592, 2088, 102])),
+            .embed(embed_request("emb-1", vec![101, 592, 88, 102])),
         async {
             answer_supported_tasks(&mut h.engine_in, &mut h.engine_out, &["embed"]).await;
             let request = recv_add(&mut h.engine_in).await;
@@ -3521,7 +3525,7 @@ async fn embed_answers_from_the_engines_pooling_output() {
         }
     );
     assert_eq!(request.request_id, "emb-1");
-    assert_eq!(request.prompt_token_ids, Some(vec![101, 7592, 2088, 102]));
+    assert_eq!(request.prompt_token_ids, Some(vec![101, 592, 88, 102]));
     assert!(request.sampling_params.is_none());
     assert_eq!(request.pooling_params, Some(PoolingParams::embed()));
     let response = response.expect("embed").into_inner();
@@ -5036,6 +5040,7 @@ fn decode_side_on(connector: &str) -> VllmModelInfo {
     model.kv_connector = connector.to_string();
     model.kv_role = "kv_consumer".to_string();
     model.kv_engine_id = "decode-engine".to_string();
+    model.pd_local_tail = 1;
     model.runs_mooncake = connector == "MooncakeConnector";
     model
 }
@@ -6077,9 +6082,9 @@ async fn a_request_that_is_not_the_warm_ups_is_refused_while_readiness_is_held()
 
 /// A data-parallel engine whose ranks were launched independently: each
 /// rank's handshake says a data-parallel size of one while the servicer
-/// serves two. `GetServerInfo` advertises the two (the gateway expands the
-/// worker into that many rank workers under `--dp-aware`) and the
-/// zero-filled `GetLoads` before the first snapshot names both ranks.
+/// serves two. `GetServerInfo` advertises the two (the gateway registers
+/// the worker as that many rank workers) and the zero-filled `GetLoads`
+/// before the first snapshot names both ranks.
 #[tokio::test]
 async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
     let mut model = model_info();

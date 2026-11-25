@@ -1,0 +1,1016 @@
+use std::{
+    sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
+    time::{Duration, Instant},
+};
+
+use parking_lot::Mutex;
+use tracing::info;
+
+use crate::{
+    identity::endpoint::Endpoint,
+    metrics::writers::{Metrics, WorkerHandles},
+    metrics_labels,
+};
+
+/// Circuit breaker configuration
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures to open the circuit
+    pub failure_threshold: u32,
+    /// Success threshold to close circuit from half-open
+    pub success_threshold: u32,
+    /// Duration to wait before attempting half-open
+    pub timeout_duration: Duration,
+    /// A closed circuit's failure later than this after the last one starts
+    /// a new streak; zero is no window
+    pub window_duration: Duration,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            success_threshold: 2,
+            timeout_duration: Duration::from_secs(30),
+            window_duration: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Circuit breaker state constants for atomic storage
+const STATE_CLOSED: u8 = 0;
+const STATE_OPEN: u8 = 1;
+const STATE_HALF_OPEN: u8 = 2;
+
+/// The failure streak word holds the streak's count in its low 32 bits (the
+/// count stops at their maximum) and, above them, the low 32 bits of a time
+/// in milliseconds: they tell a gap of up to 49 days, and a longer one reads
+/// as its remainder.
+const STREAK_COUNT_BITS: u32 = 32;
+const STREAK_COUNT_MAX: u64 = (1 << STREAK_COUNT_BITS) - 1;
+
+/// Circuit breaker state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal operation - requests are allowed
+    Closed,
+    /// Circuit is open - requests are rejected
+    Open,
+    /// Testing if service has recovered - limited requests allowed
+    HalfOpen,
+}
+
+impl std::fmt::Display for CircuitState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CircuitState::Closed => write!(f, "Closed"),
+            CircuitState::Open => write!(f, "Open"),
+            CircuitState::HalfOpen => write!(f, "HalfOpen"),
+        }
+    }
+}
+
+impl CircuitState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CircuitState::Closed => "closed",
+            CircuitState::Open => "open",
+            CircuitState::HalfOpen => "half_open",
+        }
+    }
+
+    pub fn as_int(self) -> u8 {
+        match self {
+            CircuitState::Closed => STATE_CLOSED,
+            CircuitState::Open => STATE_OPEN,
+            CircuitState::HalfOpen => STATE_HALF_OPEN,
+        }
+    }
+
+    fn from_int(v: u8) -> Self {
+        match v {
+            STATE_CLOSED => CircuitState::Closed,
+            STATE_OPEN => CircuitState::Open,
+            STATE_HALF_OPEN => CircuitState::HalfOpen,
+            _ => CircuitState::Closed, // Default to closed for safety
+        }
+    }
+}
+
+/// Get current time as milliseconds since an arbitrary epoch.
+/// Uses Instant for monotonic time, converting to ms for atomic storage.
+#[inline]
+fn now_ms() -> u64 {
+    // Use a static reference point for consistent timing
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u64
+}
+
+/// Circuit breaker implementation using lock-free atomics for hot paths.
+///
+/// This implementation avoids RwLock contention by using atomic operations
+/// for state checks (the most common operation). Only state transitions
+/// and the record of a failure use compare-and-swap, which is still
+/// lock-free. The one mutex serializes the state gauge writes a transition
+/// makes, so the gauge cannot end up behind the state; the check and record
+/// paths never take it.
+#[derive(Debug)]
+pub struct CircuitBreaker {
+    /// Circuit state stored as atomic u8 (0=Closed, 1=Open, 2=HalfOpen)
+    state: AtomicU8,
+    /// The failure streak in one word, so that a failure commits both parts
+    /// at once: its count in the low `STREAK_COUNT_BITS` bits and above them
+    /// the time of its last failure (from now_ms()). Zero is no streak.
+    failure_streak: AtomicU64,
+    consecutive_successes: AtomicU32,
+    total_failures: AtomicU64,
+    total_successes: AtomicU64,
+    /// Last failure time in milliseconds (from now_ms())
+    last_failure_time_ms: AtomicU64,
+    /// Last state change time in milliseconds (from now_ms())
+    last_state_change_ms: AtomicU64,
+    config: CircuitBreakerConfig,
+    /// The handles of the series it writes; they carry its metric label.
+    metrics: WorkerHandles,
+    /// Serializes the state gauge writes (see `publish_state_gauge`).
+    gauge_lock: Mutex<()>,
+}
+
+impl CircuitBreaker {
+    /// Create a new circuit breaker with default configuration
+    pub fn new() -> Self {
+        Self::with_config_and_label(CircuitBreakerConfig::default(), String::new())
+    }
+
+    /// Create a new circuit breaker with custom configuration and metric
+    /// label.
+    ///
+    /// Construction writes no series. A worker's breaker publishes where the
+    /// worker enters a registry: [`Self::publish_zero_counters`], then
+    /// [`Self::publish_metrics`].
+    pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
+        Self {
+            state: AtomicU8::new(STATE_CLOSED),
+            failure_streak: AtomicU64::new(0),
+            consecutive_successes: AtomicU32::new(0),
+            total_failures: AtomicU64::new(0),
+            total_successes: AtomicU64::new(0),
+            last_failure_time_ms: AtomicU64::new(0),
+            last_state_change_ms: AtomicU64::new(now_ms()),
+            config,
+            metrics: WorkerHandles::new(metric_label),
+            gauge_lock: Mutex::new(()),
+        }
+    }
+
+    /// Get the metric label
+    pub fn metric_label(&self) -> &str {
+        self.metrics.url()
+    }
+
+    /// Get the configuration used to create this circuit breaker.
+    pub fn config(&self) -> &CircuitBreakerConfig {
+        &self.config
+    }
+
+    /// Check if a request can be executed (lock-free hot path)
+    #[inline]
+    pub fn can_execute(&self) -> bool {
+        let state = self.state();
+        match state {
+            CircuitState::Closed => true,
+            CircuitState::Open => false,
+            CircuitState::HalfOpen => true,
+        }
+    }
+
+    /// Get the current state (lock-free)
+    #[inline]
+    pub fn state(&self) -> CircuitState {
+        self.check_and_update_state_returning()
+    }
+
+    /// The state as stored, without the timeout check [`Self::state`] runs:
+    /// for a reader that must not move the breaker (a comparison around a
+    /// record, a gauge of the state as it is). An open breaker past its
+    /// timeout still reads open here; the routing decision's read moves it.
+    #[inline]
+    pub fn peek_state(&self) -> CircuitState {
+        CircuitState::from_int(self.state.load(Ordering::Acquire))
+    }
+
+    /// Check and update state, returning the current state (lock-free)
+    #[inline]
+    fn check_and_update_state_returning(&self) -> CircuitState {
+        let current_state_int = self.state.load(Ordering::Acquire);
+        let current_state = CircuitState::from_int(current_state_int);
+
+        if current_state == CircuitState::Open {
+            let last_change_ms = self.last_state_change_ms.load(Ordering::Acquire);
+            let elapsed_ms = now_ms().saturating_sub(last_change_ms);
+            let timeout_ms = self.config.timeout_duration.as_millis() as u64;
+
+            if elapsed_ms >= timeout_ms {
+                if self.cas_open_to_half_open("timeout") {
+                    return CircuitState::HalfOpen;
+                }
+                // Another thread already transitioned, re-read the state
+                return CircuitState::from_int(self.state.load(Ordering::Acquire));
+            }
+        }
+        current_state
+    }
+
+    /// Record the outcome of a request
+    pub fn record_outcome(&self, success: bool) {
+        if success {
+            self.record_success();
+        } else {
+            self.record_failure();
+        }
+
+        let outcome_str = if success {
+            metrics_labels::CB_SUCCESS
+        } else {
+            metrics_labels::CB_FAILURE
+        };
+        Metrics::record_worker_cb_outcome(&self.metrics, outcome_str);
+        self.publish_gauge_metrics();
+    }
+
+    /// Record a successful request
+    pub fn record_success(&self) {
+        self.total_successes.fetch_add(1, Ordering::Relaxed);
+        self.failure_streak.store(0, Ordering::Release);
+        let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+        let current_state = CircuitState::from_int(self.state.load(Ordering::Acquire));
+
+        match current_state {
+            CircuitState::HalfOpen => {
+                if successes >= self.config.success_threshold {
+                    self.transition_to(CircuitState::Closed);
+                }
+            }
+            CircuitState::Closed => {}
+            CircuitState::Open => {
+                tracing::warn!(
+                    worker_url = %Endpoint::redacted_str(self.metric_label()),
+                    "Success recorded while circuit is open"
+                );
+            }
+        }
+    }
+
+    /// Record a failed request
+    pub fn record_failure(&self) {
+        self.total_failures.fetch_add(1, Ordering::Relaxed);
+        self.consecutive_successes.store(0, Ordering::Release);
+        // A closed circuit's failure later than the window after the last one
+        // starts a new streak. One swap commits the count with the time, and
+        // every round reads the clock and the state after the word it builds
+        // on, so a failure never counts into a streak that ran out or that
+        // another failure restarted.
+        let mut streak = self.failure_streak.load(Ordering::Acquire);
+        let (now, failures) = loop {
+            let now = now_ms();
+            let gap =
+                now.wrapping_sub(streak >> STREAK_COUNT_BITS) & (u64::MAX >> STREAK_COUNT_BITS);
+            let count = if self.peek_state() == CircuitState::Closed
+                && !self.config.window_duration.is_zero()
+                && Duration::from_millis(gap) > self.config.window_duration
+            {
+                1
+            } else {
+                ((streak & STREAK_COUNT_MAX) + 1).min(STREAK_COUNT_MAX)
+            };
+            match self.failure_streak.compare_exchange_weak(
+                streak,
+                (now << STREAK_COUNT_BITS) | count,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break (now, count),
+                // Lost to another record on this breaker in the round, or a spurious miss.
+                Err(seen) => streak = seen,
+            }
+        };
+
+        // The later time stays: a recorder that was delayed does not rewind it.
+        self.last_failure_time_ms.fetch_max(now, Ordering::AcqRel);
+
+        let current_state = CircuitState::from_int(self.state.load(Ordering::Acquire));
+
+        match current_state {
+            CircuitState::Closed => {
+                if failures >= u64::from(self.config.failure_threshold) {
+                    self.transition_to(CircuitState::Open);
+                }
+            }
+            CircuitState::HalfOpen => {
+                self.transition_to(CircuitState::Open);
+            }
+            CircuitState::Open => {}
+        }
+    }
+
+    /// Move to `new_state` by a swap: the counters' own moves (a trip, a
+    /// close, a reset). A swap onto the same state is no transition and
+    /// leaves no trace.
+    fn transition_to(&self, new_state: CircuitState) {
+        let old_state =
+            CircuitState::from_int(self.state.swap(new_state.as_int(), Ordering::AcqRel));
+        if old_state != new_state {
+            self.entered(old_state, new_state, None);
+        }
+    }
+
+    /// The bookkeeping of a state the circuit has just entered, whichever
+    /// path moved it: the change's timestamp, the counters the new state
+    /// starts with (an open circuit keeps its failure streak, a closed one
+    /// and a trial start clean), the transition log line (with a `cause`
+    /// field only when something other than the counters moved the
+    /// circuit), the transition counter, and the gauges.
+    fn entered(&self, from: CircuitState, to: CircuitState, cause: Option<&'static str>) {
+        self.last_state_change_ms.store(now_ms(), Ordering::Release);
+        match to {
+            CircuitState::Closed | CircuitState::HalfOpen => {
+                self.failure_streak.store(0, Ordering::Release);
+                self.consecutive_successes.store(0, Ordering::Release);
+            }
+            CircuitState::Open => {
+                self.consecutive_successes.store(0, Ordering::Release);
+            }
+        }
+
+        let (from, to) = (from.as_str(), to.as_str());
+        // An absent `cause` records no field: the line reads as before.
+        info!(
+            worker_url = %Endpoint::redacted_str(self.metric_label()),
+            from,
+            to,
+            cause,
+            "Circuit breaker state transition: {from} -> {to}"
+        );
+        Metrics::record_worker_cb_transition(self.metric_label(), from, to);
+        self.publish_state_gauge();
+        self.publish_gauge_metrics();
+    }
+
+    /// Get the number of consecutive failures
+    pub fn consecutive_failures(&self) -> u32 {
+        (self.failure_streak.load(Ordering::Acquire) & STREAK_COUNT_MAX) as u32
+    }
+
+    /// Get the number of consecutive successes
+    pub fn consecutive_successes(&self) -> u32 {
+        self.consecutive_successes.load(Ordering::Acquire)
+    }
+
+    /// Get total failures
+    pub fn total_failures(&self) -> u64 {
+        self.total_failures.load(Ordering::Relaxed)
+    }
+
+    /// Get total successes
+    pub fn total_successes(&self) -> u64 {
+        self.total_successes.load(Ordering::Relaxed)
+    }
+
+    /// Get time since last failure
+    pub fn time_since_last_failure(&self) -> Option<Duration> {
+        let last_ms = self.last_failure_time_ms.load(Ordering::Acquire);
+        if last_ms == 0 {
+            None
+        } else {
+            let elapsed_ms = now_ms().saturating_sub(last_ms);
+            Some(Duration::from_millis(elapsed_ms))
+        }
+    }
+
+    /// Get time since last state change
+    pub fn time_since_last_state_change(&self) -> Duration {
+        let last_ms = self.last_state_change_ms.load(Ordering::Acquire);
+        let elapsed_ms = now_ms().saturating_sub(last_ms);
+        Duration::from_millis(elapsed_ms)
+    }
+
+    /// Reset the circuit breaker to closed state. A circuit that is closed
+    /// already makes no transition, so the counters are zeroed and the gauges
+    /// published here as well.
+    pub fn reset(&self) {
+        self.transition_to(CircuitState::Closed);
+        self.failure_streak.store(0, Ordering::Release);
+        self.consecutive_successes.store(0, Ordering::Release);
+        self.publish_gauge_metrics();
+    }
+
+    /// Put an open circuit on trial now instead of at its timeout, because
+    /// the worker's health has returned: the failures that opened it belong
+    /// to an outage the probes have seen end. The trial is the one the
+    /// timeout would have started (`Self::cas_open_to_half_open`):
+    /// requests flow again, `success_threshold` successes close the circuit
+    /// and one failure reopens it for a full timeout. A circuit that is not
+    /// open is left alone. Returns whether the circuit moved.
+    pub fn try_half_open(&self) -> bool {
+        self.cas_open_to_half_open("health returned")
+    }
+
+    /// Forget the failure streak a closed circuit has banked: the worker's
+    /// health returned, so those failures belong to an outage that is over,
+    /// and the first failure after the return must not open the circuit on
+    /// their account. A circuit that is open or on trial is left alone.
+    pub fn clear_failure_streak(&self) {
+        if CircuitState::from_int(self.state.load(Ordering::Acquire)) != CircuitState::Closed {
+            return;
+        }
+        self.failure_streak.store(0, Ordering::Release);
+        self.publish_gauge_metrics();
+    }
+
+    /// The open -> half_open transition, by the timeout or by the worker's
+    /// health returning (`cause`): the trial starts with clean counters.
+    /// Returns false when the circuit was not open (another thread may have
+    /// moved it first).
+    fn cas_open_to_half_open(&self, cause: &'static str) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                STATE_OPEN,
+                STATE_HALF_OPEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.entered(CircuitState::Open, CircuitState::HalfOpen, Some(cause));
+        true
+    }
+
+    /// Get circuit breaker statistics
+    pub fn stats(&self) -> CircuitBreakerStats {
+        CircuitBreakerStats {
+            state: self.state(),
+            consecutive_failures: self.consecutive_failures(),
+            consecutive_successes: self.consecutive_successes(),
+            total_failures: self.total_failures(),
+            total_successes: self.total_successes(),
+            time_since_last_failure: self.time_since_last_failure(),
+            time_since_last_state_change: self.time_since_last_state_change(),
+        }
+    }
+
+    /// Publish at zero every counter this breaker can move: each transition
+    /// its state machine can make, and the health readmissions. The families
+    /// are then on the first scrape, and `increase()` sees the first trip. A
+    /// counter that has moved keeps its count.
+    pub fn publish_zero_counters(&self) {
+        for (from, to) in [
+            (CircuitState::Closed, CircuitState::Open),
+            (CircuitState::Open, CircuitState::HalfOpen),
+            (CircuitState::Open, CircuitState::Closed),
+            (CircuitState::HalfOpen, CircuitState::Closed),
+            (CircuitState::HalfOpen, CircuitState::Open),
+        ] {
+            Metrics::init_worker_cb_transition(self.metric_label(), from.as_str(), to.as_str());
+        }
+        Metrics::init_worker_cb_health_readmissions(self.metric_label());
+    }
+
+    /// Publish this breaker's state and counts to the per-worker gauges.
+    ///
+    /// Construction writes none of them, and neither does the adoption of a
+    /// live breaker by a replacement: the worker that holds the breaker
+    /// calls this where it enters a registry.
+    pub fn publish_metrics(&self) {
+        self.publish_state_gauge();
+        self.publish_gauge_metrics();
+    }
+
+    /// Write the state gauge from a fresh read of the state. The writes are
+    /// serialized so the last one always carries the latest state: two
+    /// transitions in quick succession, or a transition racing
+    /// [`Self::publish_metrics`], could otherwise land the older value last.
+    fn publish_state_gauge(&self) {
+        let _guard = self.gauge_lock.lock();
+        let state = CircuitState::from_int(self.state.load(Ordering::Acquire));
+        Metrics::set_worker_cb_state(self.metric_label(), state.as_int());
+    }
+
+    fn publish_gauge_metrics(&self) {
+        Metrics::set_worker_cb_consecutive_failures(&self.metrics, self.consecutive_failures());
+        Metrics::set_worker_cb_consecutive_successes(&self.metrics, self.consecutive_successes());
+    }
+}
+
+impl Clone for CircuitBreaker {
+    fn clone(&self) -> Self {
+        Self {
+            state: AtomicU8::new(self.state.load(Ordering::Acquire)),
+            failure_streak: AtomicU64::new(self.failure_streak.load(Ordering::Acquire)),
+            consecutive_successes: AtomicU32::new(
+                self.consecutive_successes.load(Ordering::Acquire),
+            ),
+            total_failures: AtomicU64::new(self.total_failures.load(Ordering::Relaxed)),
+            total_successes: AtomicU64::new(self.total_successes.load(Ordering::Relaxed)),
+            last_failure_time_ms: AtomicU64::new(self.last_failure_time_ms.load(Ordering::Acquire)),
+            last_state_change_ms: AtomicU64::new(self.last_state_change_ms.load(Ordering::Acquire)),
+            config: self.config.clone(),
+            metrics: WorkerHandles::new(self.metric_label()),
+            gauge_lock: Mutex::new(()),
+        }
+    }
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Circuit breaker statistics
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerStats {
+    pub state: CircuitState,
+    pub consecutive_failures: u32,
+    pub consecutive_successes: u32,
+    pub total_failures: u64,
+    pub total_successes: u64,
+    pub time_since_last_failure: Option<Duration>,
+    pub time_since_last_state_change: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use tracing_test::traced_test;
+
+    use super::*;
+
+    /// Every transition line names the worker and carries both states as
+    /// fields, so a transition in a fleet's log can be attributed to its
+    /// worker without a scrape of `smg_worker_cb_transitions_total`.
+    #[traced_test]
+    #[test]
+    fn transition_logs_name_the_worker_and_both_states() {
+        let worker_url = "grpc://[fd00::1]:50051";
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_duration: Duration::ZERO,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, worker_url.to_string());
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.transition_to(CircuitState::Open);
+        cb.record_success();
+
+        for (from, to) in [
+            ("closed", "open"),
+            ("open", "half_open"),
+            ("half_open", "closed"),
+        ] {
+            assert!(
+                logs_contain(&format!("Circuit breaker state transition: {from} -> {to}")),
+                "{from} -> {to} not logged"
+            );
+            // String fields render quoted in the text format.
+            assert!(logs_contain(&format!(r#"from="{from}" to="{to}""#)));
+        }
+        assert!(logs_contain("Success recorded while circuit is open"));
+        logs_assert(|lines: &[&str]| {
+            let breaker_lines: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("Circuit breaker") || line.contains("circuit is open"))
+                .collect();
+            if breaker_lines.len() != 5 {
+                return Err(format!("expected 5 breaker lines, got {breaker_lines:?}"));
+            }
+            match breaker_lines
+                .iter()
+                .find(|line| !line.contains(&format!("worker_url={worker_url}")))
+            {
+                Some(line) => Err(format!("breaker line without the worker: {line}")),
+                None => Ok(()),
+            }
+        });
+        // The cause is a field of the line only when something other than
+        // the counters moved the circuit: the timeout's trial carries it, a
+        // trip by the counters does not.
+        logs_assert(|lines: &[&str]| {
+            let line_of = |from: &str, to: &str| {
+                lines
+                    .iter()
+                    .find(|line| line.contains(&format!(r#"from="{from}" to="{to}""#)))
+                    .copied()
+                    .ok_or_else(|| format!("no {from} -> {to} line"))
+            };
+            let trial = line_of("open", "half_open")?;
+            if !trial.contains(r#"cause="timeout""#) {
+                return Err(format!("the trial's line names no cause: {trial}"));
+            }
+            let trip = line_of("closed", "open")?;
+            if trip.contains("cause=") {
+                return Err(format!("a trip by the counters names a cause: {trip}"));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_circuit_breaker_initial_state() {
+        let cb = CircuitBreaker::new();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.can_execute());
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 0);
+    }
+
+    #[test]
+    fn test_circuit_opens_on_threshold() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_failure();
+
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(!cb.can_execute());
+        assert_eq!(cb.consecutive_failures(), 3);
+    }
+
+    #[test]
+    fn test_circuit_half_open_after_timeout() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_duration: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_failure();
+        // As stored: `state()` moves an open circuit past its timeout to
+        // half-open, and a slow host can be past it here.
+        assert_eq!(cb.peek_state(), CircuitState::Open);
+
+        thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert!(cb.can_execute());
+    }
+
+    #[test]
+    fn test_circuit_closes_on_success_threshold() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2,
+            timeout_duration: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_failure();
+        // As stored: `state()` moves an open circuit past its timeout to
+        // half-open, and a slow host can be past it here.
+        assert_eq!(cb.peek_state(), CircuitState::Open);
+
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.can_execute());
+    }
+
+    #[test]
+    fn test_circuit_reopens_on_half_open_failure() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_duration: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_failure();
+        // As stored: `state()` moves an open circuit past its timeout to
+        // half-open, and a slow host can be past it here.
+        assert_eq!(cb.peek_state(), CircuitState::Open);
+
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        cb.record_failure();
+
+        assert_eq!(cb.peek_state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_success_resets_failure_count() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.consecutive_failures(), 2);
+
+        cb.record_success();
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 1);
+
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_manual_reset() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        cb.reset();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 0);
+    }
+
+    /// The worker's health returned long before the timeout: the open
+    /// circuit goes on trial at once, under the half-open rules.
+    #[test]
+    fn try_half_open_puts_an_open_circuit_on_trial() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2,
+            timeout_duration: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(!cb.can_execute());
+
+        assert!(cb.try_half_open());
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert!(cb.can_execute());
+        assert_eq!(cb.consecutive_failures(), 0);
+        assert_eq!(cb.consecutive_successes(), 0);
+
+        // One failure during the trial reopens the circuit for a full
+        // timeout, which no request shortens.
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(!cb.can_execute());
+
+        // The next trial closes on the success threshold like any other.
+        assert!(cb.try_half_open());
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.can_execute());
+    }
+
+    /// A failed trial reopens the circuit with a timestamp of its own: the
+    /// timeout that follows runs from the reopen, not from the trip or the
+    /// trial before it.
+    #[test]
+    fn a_failed_trial_reopens_the_circuit_with_its_own_timestamp() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_duration: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_failure();
+        assert!(cb.try_half_open());
+        let trial_started_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+
+        // A lower bound: the millisecond clock has moved on by the failure,
+        // however slow the host.
+        thread::sleep(Duration::from_millis(5));
+        cb.record_failure();
+
+        assert_eq!(cb.peek_state(), CircuitState::Open);
+        assert!(cb.last_state_change_ms.load(Ordering::Acquire) > trial_started_ms);
+    }
+
+    /// Only an open circuit has a trial to start.
+    #[test]
+    fn try_half_open_leaves_a_circuit_that_is_not_open_alone() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_duration: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        assert!(!cb.try_half_open());
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        cb.record_failure();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert!(!cb.try_half_open());
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn a_failure_later_than_the_window_starts_a_new_streak() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            window_duration: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config.clone(), String::new());
+        cb.record_failure();
+        thread::sleep(Duration::from_millis(150));
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            CircuitState::Closed,
+            "a failure outside the window opened the circuit"
+        );
+        assert_eq!(cb.consecutive_failures(), 1);
+
+        // An open circuit keeps its streak past the window.
+        cb.transition_to(CircuitState::Open);
+        thread::sleep(Duration::from_millis(150));
+        cb.record_failure();
+        assert_eq!(cb.consecutive_failures(), 2);
+
+        // A window of zero is no window.
+        let config = CircuitBreakerConfig {
+            window_duration: Duration::ZERO,
+            ..config
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+        cb.record_failure();
+        thread::sleep(Duration::from_millis(5));
+        cb.record_failure();
+        assert_eq!(cb.consecutive_failures(), 2);
+    }
+
+    /// The worker's health returned while its circuit was still closed: the
+    /// failures the outage banked are forgotten, so the first failure after
+    /// the return does not open the circuit on their account.
+    #[test]
+    fn clear_failure_streak_forgets_a_closed_circuits_banked_failures() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            timeout_duration: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.consecutive_failures(), 2);
+
+        cb.clear_failure_streak();
+        assert_eq!(cb.consecutive_failures(), 0);
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // An open circuit keeps its count: the streak that opened it is the
+        // record of why, and a trial clears it on its own.
+        cb.clear_failure_streak();
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(cb.consecutive_failures(), 3);
+    }
+
+    #[test]
+    fn test_stats() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_success();
+        cb.record_failure();
+        cb.record_failure();
+
+        let stats = cb.stats();
+        assert_eq!(stats.state, CircuitState::Open);
+        assert_eq!(stats.consecutive_failures, 2);
+        assert_eq!(stats.consecutive_successes, 0);
+        assert_eq!(stats.total_failures, 2);
+        assert_eq!(stats.total_successes, 1);
+    }
+
+    #[test]
+    fn test_clone() {
+        let cb1 = CircuitBreaker::new();
+        cb1.record_failure();
+
+        let cb2 = cb1.clone();
+        assert_eq!(cb2.consecutive_failures(), 1);
+
+        cb1.record_failure();
+        assert_eq!(cb1.consecutive_failures(), 2);
+        assert_eq!(cb2.consecutive_failures(), 1); // cb2 is unchanged
+    }
+
+    #[test]
+    fn test_thread_safety() {
+        use std::sync::Arc;
+
+        let cb = Arc::new(CircuitBreaker::new());
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let cb_clone = Arc::clone(&cb);
+            let handle = thread::spawn(move || {
+                for _ in 0..100 {
+                    cb_clone.record_failure();
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(cb.total_failures(), 1000);
+    }
+
+    /// The swap path (a trip, a close) and the CAS path (the trial) leave
+    /// the same bookkeeping behind: a fresh state-change timestamp and the
+    /// counters the entered state starts with.
+    #[test]
+    fn both_entry_paths_leave_the_same_bookkeeping() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_duration: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, "worker".to_string());
+        // A lower bound: the millisecond clock has moved on by the next state
+        // change, however slow the host.
+        let tick = Duration::from_millis(5);
+
+        cb.record_success();
+        let built_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+        thread::sleep(tick);
+        cb.record_failure(); // the swap path: closed -> open keeps the failure streak
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(
+            (cb.consecutive_failures(), cb.consecutive_successes()),
+            (1, 0)
+        );
+        let opened_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+        assert!(opened_ms > built_ms);
+
+        thread::sleep(tick);
+        assert!(cb.time_since_last_state_change() >= tick);
+        assert!(cb.try_half_open()); // the CAS path: open -> half_open starts clean
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert_eq!(
+            (cb.consecutive_failures(), cb.consecutive_successes()),
+            (0, 0)
+        );
+        let trial_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+        assert!(trial_ms > opened_ms);
+
+        thread::sleep(tick);
+        cb.record_success(); // the swap path again: half_open -> closed starts clean
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(
+            (cb.consecutive_failures(), cb.consecutive_successes()),
+            (0, 0)
+        );
+        assert!(cb.last_state_change_ms.load(Ordering::Acquire) > trial_ms);
+    }
+}

@@ -33,7 +33,11 @@ pub(crate) fn convert_proto_logprobs(
             .iter()
             .take(requested.unwrap_or(usize::MAX))
             .map(|(token_id, logprob)| {
-                let text = decode_token(token_id);
+                let text = if token_id == position.token_id {
+                    token_text.clone()
+                } else {
+                    decode_token(token_id)
+                };
                 let bytes = Some(text.as_bytes().to_vec());
                 TopLogProb {
                     token: text,
@@ -413,14 +417,19 @@ mod tests {
 
     #[test]
     fn the_logprobs_object_carries_content_and_refusal() {
-        let proto = proto();
+        let mut proto = proto();
+        proto.top_logprobs[0].values[0] = -0.5;
         let value = serde_json::to_value(convert_proto_logprobs(
             ProtoOutputLogProbs::Vllm(&proto),
             None,
-            |id| format!("t{id}"),
+            |id| format!("é{id}"),
         ))
         .expect("serialize");
-        assert_eq!(value["content"][0]["token"], "t1", "{value}");
+        assert_eq!(value["content"][0]["token"], "é1", "{value}");
+        assert_eq!(
+            value["content"][0]["top_logprobs"][0],
+            serde_json::json!({"token": "é1", "logprob": -0.5, "bytes": [195, 169, 49]})
+        );
         assert_eq!(
             value.get("refusal"),
             Some(&serde_json::Value::Null),

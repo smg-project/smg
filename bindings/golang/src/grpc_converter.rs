@@ -85,7 +85,7 @@ pub struct GrpcResponseConverterHandle {
 /// * Pointer to GrpcResponseConverterHandle on success, null on failure
 ///
 /// # Safety
-/// - `tokenizer_handle` must be a valid pointer returned by `sgl_tokenizer_create`
+/// - `tokenizer_handle` must be a valid pointer returned by `sgl_tokenizer_create_from_file`
 /// - `model` and `request_id` must be valid null-terminated C strings
 /// - `tools_json`, `tool_choice_json`, `stop`, `stop_token_ids` may be null
 /// - `error_out` may be null; if non-null, must point to writable memory
@@ -663,6 +663,7 @@ impl GrpcResponseConverterHandle {
             created: self.created,
             model: self.model.clone(),
             system_fingerprint: self.system_fingerprint.clone(),
+            prompt_text: None,
             choices: vec![ChatStreamChoice {
                 index,
                 delta,

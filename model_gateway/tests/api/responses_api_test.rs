@@ -15,8 +15,8 @@ use smg::{
     endpoints::conversations,
     routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
-    worker::test_support::RefusedAddress,
 };
+use smg_worker::test_support::RefusedAddress;
 
 use crate::common::{
     create_test_context, create_test_context_with_mcp_config,
@@ -124,6 +124,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -141,6 +143,11 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -314,6 +321,8 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -331,6 +340,11 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -450,6 +464,8 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -467,6 +483,11 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -554,6 +575,8 @@ async fn test_non_streaming_mcp_approval_holds_for_a_tool_listed_under_another_l
                 .then(|| McpAllowedTools::List(vec!["brave_web_search".to_string()])),
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })
     };
     let mut seen = Vec::new();
@@ -650,6 +673,8 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -667,6 +692,11 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -754,6 +784,8 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         allowed_tools: None,
         connector_id: None,
         defer_loading: None,
+        allowed_callers: None,
+        tunnel_id: None,
     });
 
     let req1 = ResponsesRequest {
@@ -790,6 +822,11 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -847,6 +884,11 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -942,6 +984,8 @@ async fn test_final_response_hides_internal_mcp_error_details() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -959,6 +1003,11 @@ async fn test_final_response_hides_internal_mcp_error_details() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -1334,6 +1383,11 @@ fn test_responses_request_creation() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -1384,6 +1438,11 @@ fn test_responses_request_sglang_extensions() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         // SGLang-specific extensions:
         top_k: 10,
@@ -1540,6 +1599,11 @@ fn test_json_serialization() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.1,
@@ -1626,6 +1690,8 @@ async fn test_multi_turn_loop_with_mcp() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1643,6 +1709,11 @@ async fn test_multi_turn_loop_with_mcp() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.0,
@@ -1779,6 +1850,8 @@ async fn test_max_tool_calls_limit() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1796,6 +1869,11 @@ async fn test_max_tool_calls_limit() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.0,
@@ -1957,6 +2035,8 @@ async fn test_streaming_with_mcp_tool_calls() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1974,6 +2054,11 @@ async fn test_streaming_with_mcp_tool_calls() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.0,
@@ -2275,6 +2360,8 @@ async fn test_streaming_multi_turn_with_mcp() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -2292,6 +2379,11 @@ async fn test_streaming_multi_turn_with_mcp() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.0,
@@ -3095,6 +3187,8 @@ fn mcp_request(
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         ..Default::default()
     }
@@ -3387,6 +3481,59 @@ async fn a_failed_upstream_status_ends_the_stream_with_the_typed_error_event() {
         "data: {\"type\":\"error\",\"code\":\"overloaded\",\"message\":\"busy, try again\",\
          \"param\":null,\"sequence_number\":0}\n\n"
     );
+    server.abort();
+    mcp.stop().await;
+}
+
+/// A tool call that fails, streamed (the tool server that always fails behind
+/// an upstream that asks for the tool on every turn, a limit of one): the
+/// call that ran and failed and the call past the limit close alike, each
+/// under `response.mcp_call.failed` and then its `response.output_item.done`
+/// with a `failed` item. No `response.mcp_call.completed` is sent for a call
+/// that failed. The gateway's own tool loop closes a failed call under the
+/// same event (`a_failed_mcp_call_closes_under_the_failed_event` in the
+/// Responses stream contract tests).
+#[tokio::test]
+async fn a_streamed_mcp_call_that_failed_closes_under_the_failed_event() {
+    let mut mcp = MockFailingMCPServer::start("the tool is down")
+        .await
+        .expect("start failing mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let (router, _ctx, _dir) = external_router_with_mcp_yaml(&upstream, &mcp_yaml, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, false),
+    )
+    .await;
+
+    let events = frame_events(&body);
+    // Each call's close: its sub-event, and the status of the item behind it.
+    let closes: Vec<(&str, &str)> = events
+        .windows(2)
+        .filter(|pair| {
+            pair[1]["type"] == "response.output_item.done" && pair[1]["item"]["type"] == "mcp_call"
+        })
+        .map(|pair| {
+            (
+                pair[0]["type"].as_str().unwrap_or_default(),
+                pair[1]["item"]["status"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        closes,
+        [
+            ("response.mcp_call.failed", "failed"),
+            ("response.mcp_call.failed", "failed")
+        ],
+        "the call that ran and failed, then the call past the limit: {body}"
+    );
+    assert!(!body.contains("response.mcp_call.completed"), "{body}");
     server.abort();
     mcp.stop().await;
 }
@@ -3802,6 +3949,249 @@ async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
     );
     assert!(event["param"].is_null(), "{body}");
     mcp.stop().await;
+}
+
+/// The most the gateway reads of an upstream's error body.
+const ERROR_BODY_BOUND: usize = smg_external_router::upstream_body::MAX_ERROR_RESPONSE_SIZE;
+
+/// The API's error envelope as an upstream writes it, its message `len` bytes
+/// long.
+fn refusal_with_a_message_of(len: usize) -> String {
+    format!(
+        r#"{{"error":{{"message":"{}","type":"invalid_request_error","code":"invalid_prompt"}}}}"#,
+        "x".repeat(len)
+    )
+}
+
+/// What a client reads of one request through an OpenAI-mode gateway whose
+/// upstream answers every request with status 400 and `refusal`: the status,
+/// the content type and the whole body. The request carries an MCP tool (the
+/// tool loop) or none (the plain path), and is streamed or not.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn answer_to_a_refusal(
+    refusal: String,
+    tools: bool,
+    stream: bool,
+) -> (StatusCode, String, String) {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(axum::routing::post(move || {
+        let refusal = refusal.clone();
+        async move {
+            (
+                StatusCode::BAD_REQUEST,
+                [(CONTENT_TYPE, "application/json")],
+                refusal,
+            )
+        }
+    }))
+    .await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+    let request = if tools {
+        mcp_request(&mcp.url(), None, stream, false)
+    } else {
+        ResponsesRequest {
+            input: ResponseInput::Text("say something".to_string()),
+            model: "mock-model".to_string(),
+            store: Some(false),
+            stream: Some(stream),
+            ..Default::default()
+        }
+    };
+    let response = router
+        .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+        .await;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    server.abort();
+    mcp.stop().await;
+    (
+        status,
+        content_type,
+        String::from_utf8(bytes.to_vec()).expect("utf-8"),
+    )
+}
+
+/// The gateway's own error envelope in `body`: its type, code and message.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn envelope_of(body: &str) -> (String, String, String) {
+    let envelope: serde_json::Value = serde_json::from_str(body).expect("an error envelope");
+    let field = |name: &str| {
+        envelope["error"][name]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    (field("type"), field("code"), field("message"))
+}
+
+/// The gateway's own envelope where an upstream error body past the bound
+/// would have stood, under the upstream's status 400.
+fn too_large_envelope() -> (String, String, String) {
+    (
+        "invalid_request_error".to_string(),
+        "upstream_error".to_string(),
+        "Upstream error response too large".to_string(),
+    )
+}
+
+/// The plain non-streamed path passes an upstream's error body on under the
+/// upstream's status, as it came. A body past the bound is not passed on: the
+/// client reads the upstream's status with the gateway's own error envelope.
+#[tokio::test]
+async fn the_plain_path_passes_on_an_upstream_error_body_within_the_bound_only() {
+    let within = refusal_with_a_message_of(16);
+    let (status, content_type, body) = answer_to_a_refusal(within.clone(), false, false).await;
+    assert_eq!(
+        (status, content_type.as_str(), body.as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            within.as_str()
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, content_type, body) = answer_to_a_refusal(past, false, false).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, content_type.as_str(), envelope_of(&body)),
+        (
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            too_large_envelope()
+        ),
+        "past the bound"
+    );
+}
+
+/// The plain streamed path answers an upstream's refusal before any stream
+/// begins, the same way: the body as it came within the bound, the gateway's
+/// own error envelope past it.
+#[tokio::test]
+async fn the_plain_streamed_path_passes_on_an_upstream_error_body_within_the_bound_only() {
+    let within = refusal_with_a_message_of(16);
+    let (status, content_type, body) = answer_to_a_refusal(within.clone(), false, true).await;
+    assert_eq!(
+        (status, content_type.as_str(), body.as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            within.as_str()
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, content_type, body) = answer_to_a_refusal(past, false, true).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, content_type.as_str(), envelope_of(&body)),
+        (
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            too_large_envelope()
+        ),
+        "past the bound"
+    );
+}
+
+/// The non-streamed tool loop fails on an upstream error status with a
+/// message that names the status and carries the body. Past the bound the
+/// message says the error body was too large, where the body stood.
+#[tokio::test]
+async fn the_tool_loop_carries_an_upstream_error_body_within_the_bound_only() {
+    let within = refusal_with_a_message_of(16);
+    let (status, _, body) = answer_to_a_refusal(within.clone(), true, false).await;
+    assert_eq!(
+        (status, envelope_of(&body)),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            (
+                "server_error".to_string(),
+                "upstream_error".to_string(),
+                format!("upstream error 400 Bad Request: {within}")
+            )
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, _, body) = answer_to_a_refusal(past, true, false).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, envelope_of(&body)),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            (
+                "server_error".to_string(),
+                "upstream_error".to_string(),
+                "upstream error 400 Bad Request: Upstream error response too large".to_string()
+            )
+        ),
+        "past the bound"
+    );
+}
+
+/// The streamed tool loop ends the stream with the one typed error event on
+/// an upstream error status: the upstream's own code and message when the
+/// body carries them. Past the bound the event names the status and says the
+/// error body was too large, where the body stood.
+#[tokio::test]
+async fn the_streamed_tool_loop_carries_an_upstream_error_body_within_the_bound_only() {
+    let (status, _, body) = answer_to_a_refusal(refusal_with_a_message_of(16), true, true).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            StatusCode::OK,
+            "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"xxxxxxxxxxxxxxxx\",\
+             \"param\":null,\"sequence_number\":0}\n\n"
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, _, body) = answer_to_a_refusal(past, true, true).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            StatusCode::OK,
+            "data: {\"type\":\"error\",\"code\":\"invalid_request_error\",\"message\":\"Upstream error 400 \
+             Bad Request: Upstream error response too large\",\"param\":null,\"sequence_number\":0}\n\n"
+        ),
+        "past the bound"
+    );
 }
 
 /// The Conversations routes refuse a body the way the typed routes do: in

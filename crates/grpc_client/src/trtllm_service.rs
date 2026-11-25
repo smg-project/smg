@@ -674,6 +674,13 @@ fn refuse_logit_bias(bias: Option<&HashMap<String, f32>>) -> Result<(), String> 
 // The measured input capacity stays absent when the servicer reports none.
 crate::impl_rank_load_conversions!(proto);
 
+/// TRT-LLM reports liveness via a free-form status string whose only healthy
+/// value is `"OK"` (per `trtllm_service.proto`); anything else is an error
+/// description and must be treated as unhealthy.
+pub fn status_healthy(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("ok")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,5 +1247,17 @@ mod tests {
             );
         }
         assert_eq!(TrtllmServiceClient::guide_of(None), None);
+    }
+
+    #[test]
+    fn status_healthy_matches_ok_exactly() {
+        assert!(status_healthy("ok"));
+        assert!(status_healthy("OK"));
+        assert!(status_healthy("  OK  "));
+
+        assert!(!status_healthy("not ok"));
+        assert!(!status_healthy("checking"));
+        assert!(!status_healthy("degraded"));
+        assert!(!status_healthy(""));
     }
 }

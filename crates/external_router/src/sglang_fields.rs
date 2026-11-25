@@ -106,6 +106,29 @@ pub fn is_stripped_sglang_default(field: &str, raw_json: &str) -> bool {
     }
 }
 
+/// Whether the strip could change `compact_json`, an object in serde_json's
+/// compact rendering: true when a listed name is followed by a literal that
+/// [`is_stripped_sglang_default`] drops (a literal is known by its first
+/// byte). A nested or quoted match errs towards true, never towards false.
+pub fn may_carry_stripped_sglang_default(compact_json: &[u8]) -> bool {
+    memchr::memchr_iter(b':', compact_json).any(|colon| {
+        let raw = match compact_json.get(colon + 1) {
+            Some(b'n') => "null",
+            Some(b't') => "true",
+            Some(b'f') => "false",
+            _ => return false,
+        };
+        compact_json[..colon]
+            .strip_suffix(b"\"")
+            .is_some_and(|key| {
+                let name = &key[memchr::memrchr(b'"', key).map_or(0, |quote| quote + 1)..];
+                SGLANG_FIELDS
+                    .iter()
+                    .any(|field| field.as_bytes() == name && is_stripped_sglang_default(field, raw))
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -228,6 +251,11 @@ mod tests {
                     is_stripped_sglang_default(field, raw),
                     value_stripped,
                     "field={field} raw={raw}"
+                );
+                assert_eq!(
+                    may_carry_stripped_sglang_default(format!("{{\"{field}\":{raw}}}").as_bytes()),
+                    value_stripped,
+                    "scan field={field} raw={raw}"
                 );
             }
         }

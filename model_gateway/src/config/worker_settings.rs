@@ -7,23 +7,31 @@
 
 use std::time::Duration;
 
-use super::types::RouterConfig;
-use crate::worker::{
+use smg_worker::{
     connection::http_client::WorkerHttpClientSettings,
-    health::{liveness::Budgets, overload::OverloadThresholds},
+    health::{
+        circuit_breaker::CircuitBreakerConfig, liveness::Budgets, overload::OverloadThresholds,
+    },
+    settings::RegistrationSettings,
 };
+
+use super::types::RouterConfig;
 
 impl RouterConfig {
     /// Gateway-level thresholds: the `--worker-overload-*` values, which
     /// default to [`DEFAULT_WAITING_REQUESTS`] and
-    /// [`DEFAULT_TOKEN_USAGE_CEILING`]. `--disable-worker-overload-protection`
-    /// (`worker_overload_protection: false`) switches both off whatever the
-    /// thresholds say; per-worker `overload` blocks still apply on top.
+    /// [`DEFAULT_TOKEN_USAGE_CEILING`]. The overload switch in force
+    /// (`RouterConfig::overload_words_in_force`) switches both off whatever
+    /// the thresholds say: `--disable-worker-overload-protection`
+    /// (`worker_overload_protection: false`), or, where Grand
+    /// Central runs a supplied document, that document's
+    /// `overload.enabled: false`. Per-worker `overload` blocks still apply
+    /// on top.
     ///
-    /// [`DEFAULT_WAITING_REQUESTS`]: crate::worker::health::overload::DEFAULT_WAITING_REQUESTS
-    /// [`DEFAULT_TOKEN_USAGE_CEILING`]: crate::worker::health::overload::DEFAULT_TOKEN_USAGE_CEILING
+    /// [`DEFAULT_WAITING_REQUESTS`]: smg_worker::health::overload::DEFAULT_WAITING_REQUESTS
+    /// [`DEFAULT_TOKEN_USAGE_CEILING`]: smg_worker::health::overload::DEFAULT_TOKEN_USAGE_CEILING
     pub fn worker_overload_thresholds(&self) -> OverloadThresholds {
-        if !self.worker_overload_protection {
+        if !self.overload_words_in_force().protection {
             return OverloadThresholds::default();
         }
         OverloadThresholds {
@@ -34,7 +42,8 @@ impl RouterConfig {
 
     /// Every liveness budget this configuration carries: the stall, wedge and
     /// stale thresholds and the warm-up slice. The one place the budgets are
-    /// read from a configuration; `worker::configure_liveness` applies them.
+    /// read from a configuration; `smg_worker::health::liveness::configure_from`
+    /// applies them.
     pub fn worker_liveness_budgets(&self) -> Budgets {
         Budgets {
             stall: Duration::from_secs(self.worker_stall_secs),
@@ -60,12 +69,123 @@ impl RouterConfig {
             pool_idle_timeout_secs: self.upstream_pool_idle_timeout_secs,
         }
     }
+
+    /// The settings the worker's detection and creation steps read.
+    pub fn registration_settings(&self) -> RegistrationSettings {
+        let breaker = self.effective_circuit_breaker_config();
+        RegistrationSettings {
+            upstream_http2: self.upstream_http2,
+            health_check_timeout_secs: self.health_check.timeout_secs,
+            startup_timeout_secs: self.worker_startup_timeout_secs,
+            startup_delay_secs: self.worker_startup_delay_secs,
+            startup_check_interval_secs: self.worker_startup_check_interval_secs,
+            model_path: self.model_path.clone(),
+            model_aliases: self.model_aliases.clone(),
+            retry: self.effective_retry_config(),
+            retries_enabled: !self.disable_retries,
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: breaker.failure_threshold,
+                success_threshold: breaker.success_threshold,
+                timeout_duration: Duration::from_secs(breaker.timeout_duration_secs),
+                window_duration: Duration::from_secs(breaker.window_duration_secs),
+            },
+            circuit_breaker_enabled: !self.disable_circuit_breaker,
+            overload_defaults: self.worker_overload_thresholds(),
+            health: self.health_check.to_protocol_config(),
+            health_endpoint: self.health_check.endpoint.clone(),
+            zmq_startup_timeout_secs: self.zmq_startup_timeout_secs,
+            request_timeout_secs: self.request_timeout_secs,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use openai_protocol::worker::HttpPoolConfig;
+    use smg_grand_central::document::{OverloadSpec, PolicySpec};
+    use smg_worker::{
+        connection::http_client::WorkerHttpClientCache,
+        health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+    };
+
     use super::*;
-    use crate::worker::health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+
+    #[test]
+    fn the_registration_settings_carry_what_the_creation_reads() {
+        use crate::config::{
+            CircuitBreakerConfig as RouterCircuitBreakerConfig, HealthCheckConfig, RetryConfig,
+        };
+
+        let config = RouterConfig {
+            model_path: Some("/models/a".to_string()),
+            model_aliases: [("alias".to_string(), "a".to_string())].into(),
+            retry: RetryConfig {
+                max_retries: 11,
+                initial_backoff_ms: 19,
+                max_backoff_ms: 29,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.1,
+            },
+            disable_retries: true,
+            circuit_breaker: RouterCircuitBreakerConfig {
+                failure_threshold: 13,
+                success_threshold: 7,
+                timeout_duration_secs: 21,
+                window_duration_secs: 39,
+            },
+            disable_circuit_breaker: true,
+            worker_overload_protection: true,
+            worker_overload_waiting_requests: Some(12),
+            worker_overload_token_usage: Some(0.4),
+            health_check: HealthCheckConfig {
+                endpoint: "/live".to_string(),
+                timeout_secs: 11,
+                check_interval_secs: 17,
+                failure_threshold: 5,
+                success_threshold: 4,
+                disable_health_check: true,
+                drain_settle_secs: 9,
+                ..HealthCheckConfig::default()
+            },
+            zmq_startup_timeout_secs: 43,
+            request_timeout_secs: 47,
+            ..RouterConfig::default()
+        };
+        let settings = config.registration_settings();
+        let breaker = config.effective_circuit_breaker_config();
+
+        assert_eq!(settings.model_path, config.model_path);
+        assert_eq!(settings.model_aliases, config.model_aliases);
+        assert_eq!(settings.retry, config.effective_retry_config());
+        assert_eq!(settings.retries_enabled, !config.disable_retries);
+        assert_eq!(
+            settings.circuit_breaker,
+            CircuitBreakerConfig {
+                failure_threshold: breaker.failure_threshold,
+                success_threshold: breaker.success_threshold,
+                timeout_duration: Duration::from_secs(breaker.timeout_duration_secs),
+                window_duration: Duration::from_secs(breaker.window_duration_secs),
+            }
+        );
+        assert_eq!(
+            settings.circuit_breaker_enabled,
+            !config.disable_circuit_breaker
+        );
+        assert_eq!(
+            settings.overload_defaults,
+            config.worker_overload_thresholds()
+        );
+        assert_eq!(settings.health, config.health_check.to_protocol_config());
+        assert_eq!(settings.health_endpoint, config.health_check.endpoint);
+        assert_eq!(
+            settings.zmq_startup_timeout_secs,
+            config.zmq_startup_timeout_secs
+        );
+        assert_eq!(settings.request_timeout_secs, config.request_timeout_secs);
+    }
 
     fn gateway_config(
         protection: bool,
@@ -116,6 +236,42 @@ mod tests {
         assert!(!off.is_enabled());
     }
 
+    /// Where Grand Central runs a supplied document, the document's
+    /// switch decides the default thresholds. Bindings that switch the
+    /// overload block off leave the worker objects no default threshold
+    /// whatever the two threshold settings say, as disabling protection
+    /// does with no document, and a block that is on leaves the two
+    /// settings standing. With the option off the document is not read.
+    #[test]
+    fn a_supplied_documents_switch_decides_the_default_thresholds() {
+        let under = |enabled: bool, grand_central: bool| {
+            let mut document = PolicySpec::preset("round_robin").expect("a stock policy");
+            document.bindings[0].overload = Some(OverloadSpec {
+                enabled,
+                ..OverloadSpec::default()
+            });
+            RouterConfig {
+                grand_central,
+                policy_spec: Some(document),
+                ..gateway_config(true, Some(32), Some(0.9))
+            }
+        };
+        let stated = OverloadThresholds {
+            waiting_requests: Some(32),
+            token_usage: Some(0.9),
+        };
+        assert_eq!(under(true, true).worker_overload_thresholds(), stated);
+        assert_eq!(
+            under(false, true).worker_overload_thresholds(),
+            OverloadThresholds::default()
+        );
+        assert_eq!(
+            under(false, true).registration_settings().overload_defaults,
+            OverloadThresholds::default()
+        );
+        assert_eq!(under(false, false).worker_overload_thresholds(), stated);
+    }
+
     /// Each liveness budget comes from its own field.
     #[test]
     fn each_liveness_budget_reads_its_own_field() {
@@ -162,5 +318,40 @@ mod tests {
         assert!(settings.upstream_http2);
         assert_eq!(settings.request_timeout_secs, 21);
         assert_eq!(settings.pool_idle_timeout_secs, 22);
+    }
+
+    #[test]
+    fn entry_lives_exactly_as_long_as_worker_handles() {
+        let cache =
+            WorkerHttpClientCache::new(RouterConfig::default().worker_http_client_settings());
+        let handle = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
+        let probe = Arc::downgrade(&handle);
+        let worker_a = BasicWorkerBuilder::new("http://a:1")
+            .http_client(handle.clone())
+            .build();
+        let worker_b = BasicWorkerBuilder::new("http://b:1")
+            .http_client(handle)
+            .build();
+
+        drop(worker_a);
+        assert!(
+            probe.upgrade().is_some(),
+            "entry survives while another worker holds it"
+        );
+
+        drop(worker_b);
+        assert!(
+            probe.upgrade().is_none(),
+            "last worker drop releases the entry"
+        );
+
+        // The dead entry cannot be upgraded, so the next get rebuilds.
+        let rebuilt = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
+        assert!(probe.upgrade().is_none());
+        drop(rebuilt);
     }
 }

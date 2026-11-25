@@ -122,6 +122,8 @@ logger = logging.getLogger(__name__)
 SERVICER_IMPL_ENV = "SMG_TOKENSPEED_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_SECS"
+# How long the engine stays up after the drain's last stream (default 1 s).
+DRAIN_LINGER_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_LINGER_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS"
 SILENCE_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_SILENCE_TIMEOUT_SECS"
@@ -843,6 +845,7 @@ class TokenSpeedLauncher(RustLauncher):
     ipc_prefix = "tokenspeed-servicer"
     handshake_port_env = HANDSHAKE_PORT_ENV
     drain_secs_env = DRAIN_SECS_ENV
+    drain_linger_secs_env = DRAIN_LINGER_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
     silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV

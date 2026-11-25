@@ -88,6 +88,27 @@ impl MediaPlan {
         counts
     }
 
+    /// The source class of the plan's media, read over every modality:
+    /// `none` for a plan without media, `inline` when every item is a
+    /// `data:` URL or carried bytes, `remote` when every item is a fetched
+    /// URL, `hybrid` for a mix. The class is the request's, not one
+    /// modality's: inline images beside a fetched clip are `hybrid`.
+    pub(crate) fn source_class(&self) -> &'static str {
+        let (mut inline, mut remote) = (0, 0);
+        for &modality in self.modalities() {
+            // The sources in the order `source_counts` writes them.
+            let [(_, url), (_, data_url), (_, bytes)] = self.source_counts(modality);
+            remote += url;
+            inline += data_url + bytes;
+        }
+        match (inline > 0, remote > 0) {
+            (false, false) => "none",
+            (true, false) => "inline",
+            (false, true) => "remote",
+            (true, true) => "hybrid",
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.parts.is_empty()
     }
@@ -242,8 +263,8 @@ pub(crate) async fn prepare_placeholder_tokens(
 /// image override the model's spec does not take, media for a model with no
 /// media spec on the router. The stage that finds it in a failure's chain
 /// writes one WARN and marks its answer; every other failure of the
-/// preparation is the deployment's (the model's files, its vocabulary) and
-/// keeps the stage's ERROR line.
+/// preparation keeps the stage's ERROR line, the ones a site marks as the
+/// deployment's own ([`DeploymentFault`]) among them.
 #[derive(Debug)]
 pub(crate) struct RequestRefusal(String);
 
@@ -255,7 +276,7 @@ impl RequestRefusal {
 
     /// `message` as the failure for a registry `error`: this refusal for a
     /// variant the request brings (a modality the spec does not take, more
-    /// items than its limit), a plain failure for every other variant: one
+    /// items than its limit), a deployment fault for every other variant: one
     /// about the model's files, or one no request can bring (a modality
     /// counted twice, when the plan counts each modality once).
     fn of_registry(error: &ModelRegistryError, message: String) -> anyhow::Error {
@@ -266,7 +287,7 @@ impl RequestRefusal {
         ) {
             Self(message).into()
         } else {
-            anyhow::anyhow!(message)
+            DeploymentFault(message).into()
         }
     }
 }
@@ -278,6 +299,35 @@ impl fmt::Display for RequestRefusal {
 }
 
 impl std::error::Error for RequestRefusal {}
+
+/// A failure of the placeholder preparation that its site knows as the
+/// deployment's own, whatever the request holds: a `config.json` this
+/// gateway holds and cannot read or parse, a spec's media limits or its
+/// placeholder token that the model's files do not resolve, a vocabulary
+/// without the token. The stage that finds it in a failure answers in the
+/// server's class ([`super::preparation_fault_response`]). A failure with
+/// neither this mark nor [`RequestRefusal`] keeps the 400 it had. That
+/// includes unclassified failures while resolving the model's configuration
+/// directory, such as an absent or inaccessible configuration and local
+/// client or cache setup failures.
+#[derive(Debug)]
+pub(crate) struct DeploymentFault(pub(crate) String);
+
+impl DeploymentFault {
+    /// Whether `error` carries this mark: as its root, or as the context a
+    /// site put on a cause it keeps.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+impl fmt::Display for DeploymentFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeploymentFault {}
 
 /// `prepare_placeholder_tokens` with the deployment-wide limit override (the
 /// `SMG_*_MAX_COUNT` variables, read once per process) passed in: a test
@@ -341,7 +391,10 @@ async fn prepare_placeholder_tokens_with_env(
         );
     }
     let spec_limits = spec.modality_limits(&metadata).map_err(|error| {
-        anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
+        DeploymentFault(format!(
+            "reading the {} spec's media limits: {error}",
+            spec.name()
+        ))
     })?;
     // The router's own limits, capped by the engine's where its workers
     // advertise one; the refusal names the limit and what set it.
@@ -373,14 +426,16 @@ async fn prepare_placeholder_tokens_with_env(
             // The validation above has accepted the modality, so a failure
             // here is about the spec or the model's files, never the request.
             .map_err(|error| {
-                anyhow::anyhow!(
+                DeploymentFault(format!(
                     "model {} supports {modality} but its placeholder token could not be resolved: {error}",
                     spec.name()
-                )
+                ))
             })?;
         anyhow::ensure!(
             tokenizer.token_to_id(&token).is_some(),
-            "{modality} placeholder token '{token}' is missing from the tokenizer vocabulary"
+            DeploymentFault(format!(
+                "{modality} placeholder token '{token}' is missing from the tokenizer vocabulary"
+            ))
         );
         if let Some(marker) = spec.rendered_marker_for(modality) {
             placeholders.add_rendered_marker(marker.to_string(), token.clone());
@@ -497,6 +552,7 @@ pub(crate) mod tests {
 
     use llm_multimodal::PreProcessorConfig;
     use llm_tokenizer::mock::MockTokenizer;
+    use smg_worker::identity::basic::RuntimeType;
 
     use super::{
         super::{
@@ -506,7 +562,7 @@ pub(crate) mod tests {
         },
         *,
     };
-    use crate::worker::{RuntimeType, WorkerRegistry};
+    use crate::routers::common::snapshot::WorkerRegistry;
 
     /// The tokens a spec resolves for a modality, as `(text, id)` pairs, the
     /// anchor first.
@@ -1035,6 +1091,93 @@ pub(crate) mod tests {
         ));
     }
 
+    /// An image part at `url`.
+    fn image_at(url: &str) -> MediaContentPart {
+        MediaContentPart::ImageUrl {
+            url: url.to_string().into(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }
+    }
+
+    /// An image part that carries its bytes.
+    fn image_bytes() -> MediaContentPart {
+        MediaContentPart::ImageData {
+            data: vec![1, 2, 3],
+            mime_type: Some("image/png".to_string()),
+            uuid: None,
+            detail: None,
+        }
+    }
+
+    /// An audio part at `url`.
+    fn audio_at(url: &str) -> MediaContentPart {
+        MediaContentPart::AudioUrl {
+            url: url.to_string().into(),
+            uuid: None,
+        }
+    }
+
+    /// A plan's source class is `none` without media, `inline` for `data:`
+    /// URLs and carried bytes, `remote` for fetched URLs and `hybrid` for a
+    /// mix, read over every modality: the class is the request's.
+    #[test]
+    fn a_plans_source_class_is_none_inline_remote_or_hybrid_over_every_modality() {
+        assert_eq!(MediaPlan::new([]).source_class(), "none");
+        assert_eq!(
+            MediaPlan::new([
+                image_at("data:image/png;base64,aGVsbG8="),
+                image_bytes(),
+                audio_at("data:audio/wav;base64,aGVsbG8="),
+            ])
+            .source_class(),
+            "inline",
+            "a data: URL and carried bytes, over two modalities"
+        );
+        assert_eq!(
+            MediaPlan::new([
+                image_at("https://example.com/a.png"),
+                audio_at("https://example.com/a.wav"),
+            ])
+            .source_class(),
+            "remote",
+            "fetched URLs alone, over two modalities"
+        );
+        assert_eq!(
+            MediaPlan::new([image_at("https://example.com/a.png"), image_bytes()]).source_class(),
+            "hybrid",
+            "one of each in one modality"
+        );
+        assert_eq!(
+            MediaPlan::new([image_bytes(), audio_at("https://example.com/a.wav")]).source_class(),
+            "hybrid",
+            "inline images beside a fetched clip: the class is not the images' alone"
+        );
+    }
+
+    /// The images a request is observed with are the plan's image items:
+    /// text is no media, and a part of another modality changes the class,
+    /// not the count.
+    #[test]
+    fn a_plan_counts_its_images_apart_from_its_source_class() {
+        let text = || MediaContentPart::Text {
+            text: "hi".to_string(),
+        };
+
+        let plan = MediaPlan::new([image_bytes(), text()]);
+        assert_eq!(plan.count(Modality::Image), 1);
+        assert_eq!(plan.source_class(), "inline");
+
+        let plan = MediaPlan::new([image_bytes(), audio_at("https://example.com/a.wav")]);
+        assert_eq!(plan.count(Modality::Image), 1);
+        assert_eq!(plan.source_class(), "hybrid");
+
+        let plan = MediaPlan::new([text()]);
+        assert_eq!(plan.count(Modality::Image), 0);
+        assert_eq!(plan.source_class(), "none");
+    }
+
     #[test]
     fn rendered_anchor_validation_is_exact_per_modality() {
         let plan = MediaPlan::new([
@@ -1099,8 +1242,9 @@ pub(crate) mod tests {
     /// A registry holding one worker of `runtime` for model "m".
     fn fleet(runtime: RuntimeType) -> WorkerRegistry {
         use openai_protocol::model_card::ModelCard;
+        use smg_worker::identity::basic::{ConnectionMode, WorkerType};
 
-        use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let registry = WorkerRegistry::new();
         registry
@@ -1281,35 +1425,52 @@ pub(crate) mod tests {
         assert!(message.contains("--mm-processing worker"), "{message}");
     }
 
-    /// Only a registry refusal the request brings is typed as the request's:
-    /// a modality the spec does not take, more items than its limit. A config
+    /// Registry failures the request brings are typed as the request's: a
+    /// modality the spec does not take, or more items than its limit. A config
     /// field the model's files lack, a token its vocabulary lacks and a
-    /// modality counted twice (the plan counts each once) are not.
+    /// modality counted twice (the plan counts each once) are typed as the
+    /// deployment's.
     #[test]
-    fn only_a_registry_refusal_the_request_brings_is_typed_as_the_requests() {
+    fn registry_failures_are_typed_by_who_can_fix_them() {
         let typed = |error: ModelRegistryError| {
-            RequestRefusal::is(&RequestRefusal::of_registry(&error, error.to_string()))
+            let error = RequestRefusal::of_registry(&error, error.to_string());
+            (RequestRefusal::is(&error), DeploymentFault::is(&error))
         };
-        assert!(typed(ModelRegistryError::UnsupportedModality {
-            spec: "s",
-            modality: Modality::Audio,
-        }));
-        assert!(typed(ModelRegistryError::ModalityLimitExceeded {
-            spec: "s",
-            modality: Modality::Image,
-            limit: 1,
-            requested: 2,
-        }));
-        assert!(!typed(ModelRegistryError::MissingConfigField {
-            field: "image_token_id".to_string(),
-        }));
-        assert!(!typed(ModelRegistryError::TokenNotFound {
-            token: "<image>".to_string(),
-        }));
-        assert!(!typed(ModelRegistryError::DuplicateModality {
-            spec: "s",
-            modality: Modality::Image,
-        }));
+        assert_eq!(
+            typed(ModelRegistryError::UnsupportedModality {
+                spec: "s",
+                modality: Modality::Audio,
+            }),
+            (true, false)
+        );
+        assert_eq!(
+            typed(ModelRegistryError::ModalityLimitExceeded {
+                spec: "s",
+                modality: Modality::Image,
+                limit: 1,
+                requested: 2,
+            }),
+            (true, false)
+        );
+        assert_eq!(
+            typed(ModelRegistryError::MissingConfigField {
+                field: "image_token_id".to_string(),
+            }),
+            (false, true)
+        );
+        assert_eq!(
+            typed(ModelRegistryError::TokenNotFound {
+                token: "<image>".to_string(),
+            }),
+            (false, true)
+        );
+        assert_eq!(
+            typed(ModelRegistryError::DuplicateModality {
+                spec: "s",
+                modality: Modality::Image,
+            }),
+            (false, true)
+        );
     }
 
     /// A chat request with one image part, its `max_long_side_pixel` as `cap`.
@@ -1389,6 +1550,8 @@ pub(crate) mod tests {
         for config in [
             serde_json::json!({"model_type": "inkling2"}),
             serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
+            serde_json::json!({"model_type": "inkling2_loop"}),
+            serde_json::json!({"architectures": ["Inkling2LoopForConditionalGeneration"]}),
         ] {
             let components = image_components(config);
             for cap in [0, 504, u32::MAX] {
@@ -1409,6 +1572,8 @@ pub(crate) mod tests {
         for config in [
             serde_json::json!({"model_type": "inkling2"}),
             serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
+            serde_json::json!({"model_type": "inkling2_loop"}),
+            serde_json::json!({"architectures": ["Inkling2LoopForConditionalGeneration"]}),
         ] {
             let components = image_components(config);
             for cap in [None, Some(serde_json::Value::Null)] {

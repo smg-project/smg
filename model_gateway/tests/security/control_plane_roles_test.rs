@@ -29,6 +29,7 @@ const READ_ROUTES: &[(&str, &str)] = &[
     ("GET", "/inflight"),
     ("GET", "/workers"),
     ("GET", "/get_loads"),
+    ("GET", "/policy/explain/no-such-request"),
     ("GET", "/v1/tokenizers"),
     ("GET", "/wasm"),
 ];

@@ -20,18 +20,21 @@ use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
 use openai_protocol::{
+    model_card::ModelCard,
     transcription::{AudioFile, TranscriptionRequest},
     worker::HealthCheckConfig,
 };
 use smg::{
-    routers::{router::Router as HttpRouter, RouterTrait},
-    tenant::{RouteRequestMeta, TenantKey},
-    worker::{
-        health::circuit_breaker::CircuitState, BasicWorkerBuilder, CircuitBreakerConfig, ModelCard,
-        Worker,
+    routers::{
+        grpc::backend_client::BasicWorkerBuilder, router::Router as HttpRouter, RouterTrait,
     },
+    tenant::{RouteRequestMeta, TenantKey},
 };
 use smg_external_router::{error::extract_error_code_from_response, retry::is_retryable_response};
+use smg_worker::{
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    identity::basic::Worker,
+};
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 
 use crate::common::{test_app::create_test_app_context_with_config, TestRouterConfig};

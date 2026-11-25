@@ -35,6 +35,10 @@ use std::{fmt, sync::Arc};
 use axum::http::StatusCode;
 use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
 use smg_grpc_client::{is_constraint_failure, is_request_timeout};
+use smg_worker::identity::{
+    basic::{ConnectionModeExt, Worker, WorkerTypeExt},
+    endpoint::Endpoint,
+};
 use tracing::{error, warn};
 
 use super::{
@@ -49,10 +53,6 @@ use crate::{
     routers::{
         error::error_type_for_status,
         grpc::context::{DispatchMetadata, WorkerSelection},
-    },
-    worker::{
-        identity::{basic::WorkerTypeExt, endpoint::Endpoint},
-        ConnectionModeExt, Worker,
     },
 };
 
@@ -558,15 +558,15 @@ mod tests {
 
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use openai_protocol::worker::WorkerType;
+    use smg_worker::{
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        identity::basic::ConnectionMode,
+        test_support::{no_health_check, RefusedAddress},
+    };
 
     use super::*;
-    use crate::{
-        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
-        worker::{
-            health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::{no_health_check, RefusedAddress},
-            BasicWorkerBuilder, ConnectionMode,
-        },
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder, proto_wrapper::ENGINE_ERROR_MESSAGE,
     };
 
     fn dispatch() -> DispatchMetadata {
@@ -614,7 +614,7 @@ mod tests {
         let handle = recorder.handle();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -914,7 +914,7 @@ mod tests {
         let handle = recorder.handle();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -956,7 +956,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: Arc::clone(&prefill),
-            decode: Arc::clone(&decode),
+            decode: Arc::clone(&decode).into(),
             runtime_type: Default::default(),
         };
         let source =
@@ -987,7 +987,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: worker(),
-            decode: worker(),
+            decode: worker().into(),
             runtime_type: Default::default(),
         };
         let source =
@@ -1050,7 +1050,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill,
-            decode: Arc::clone(&decode),
+            decode: Arc::clone(&decode).into(),
             runtime_type: Default::default(),
         };
         let source =
@@ -1149,7 +1149,9 @@ mod tests {
         let (live_source, _) = pd_source_with(prefill_on(live));
         let refused = RefusedAddress::reserve();
         let (dead_source, _) = pd_source_with(prefill_on(refused.port()));
-        let single = WorkerSelection::Single { worker: worker() };
+        let single = WorkerSelection::Single {
+            worker: worker().into(),
+        };
         let single_source =
             StreamSource::new(Some(&single), &dispatch(), metrics_labels::ENDPOINT_CHAT);
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -1199,7 +1201,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -1268,7 +1270,7 @@ mod tests {
         let selection = WorkerSelection::Disaggregated {
             encode_assignments: None,
             prefill: Arc::clone(&prefill),
-            decode: Arc::clone(&decode),
+            decode: Arc::clone(&decode).into(),
             runtime_type: Default::default(),
         };
         let source =
@@ -1306,7 +1308,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
@@ -1445,7 +1447,7 @@ mod tests {
         let handle = recorder.handle();
         let worker = worker();
         let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
+            worker: Arc::clone(&worker).into(),
         };
         let source =
             StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);

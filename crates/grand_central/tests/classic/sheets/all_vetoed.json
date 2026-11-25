@@ -1,0 +1,4283 @@
+{
+  "recorded_from": "342e02185362a5f7fc3b1c2faff76e15233b3ae2",
+  "policy": "all_vetoed",
+  "rows": [
+    {
+      "name": "random-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "random",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "passthrough-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "passthrough",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "power-of-two-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "power_of_two",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "least-load-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "least_load",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "cache-aware-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "cache_aware",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "manual-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "manual",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "prefix-hash-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "prefix_hash",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "bucket-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "bucket",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "random-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "random",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "passthrough-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "passthrough",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "power-of-two-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "power_of_two",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "least-load-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "least_load",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "cache-aware-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "cache_aware",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "manual-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "manual",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "consistent_hashing",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "prefix-hash-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "prefix_hash",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "bucket-a-pool-over-on-every-worker-is-shed-under-shedding",
+      "policy": "bucket",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "round-robin-equal-loads-over-on-every-worker-are-drawn",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        },
+        {
+          "in_flight": 5,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3029,
+            2971,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "least-load-equal-loads-over-on-every-worker-are-drawn",
+      "policy": "least_load",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        },
+        {
+          "in_flight": 5,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3000,
+            3000,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "manual-equal-loads-over-on-every-worker-are-drawn",
+      "policy": "manual",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        },
+        {
+          "in_flight": 5,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3029,
+            2971,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "consistent-hashing-equal-loads-over-on-every-worker-are-drawn",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        },
+        {
+          "in_flight": 5,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2958,
+            3042,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "round-robin-one-worker-under-its-thresholds-takes-every-request",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "over"
+        },
+        {
+          "in_flight": 9,
+          "state": "free"
+        },
+        {
+          "in_flight": 0,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-one-worker-under-its-thresholds-takes-every-request-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "over"
+        },
+        {
+          "in_flight": 9,
+          "state": "free"
+        },
+        {
+          "in_flight": 0,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-worker-that-is-down-is-never-the-fewest-in-flight",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "down"
+        },
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            1,
+            3
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-doubted-worker-is-passed-over-for-one-over-its-thresholds",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            1,
+            3
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-with-nothing-ready-finds-no-worker",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "down"
+        },
+        {
+          "in_flight": 0,
+          "state": "down"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-tried-worker-is-taken-again-when-it-holds-the-fewest",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": [
+              1
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": [
+              1,
+              2
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "least-load-a-tried-worker-is-taken-again-when-it-holds-the-fewest",
+      "policy": "least_load",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": [
+              1
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "manual-a-key-goes-to-the-fewest-in-flight-and-returns-to-its-worker",
+      "policy": "manual",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 1,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        },
+        {
+          "in_flight": 3,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        },
+        {
+          "states": [
+            "over",
+            "over",
+            "over"
+          ]
+        },
+        {
+          "loads": [
+            9,
+            2,
+            3
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        },
+        {
+          "states": [
+            "free",
+            "free",
+            "free"
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "manual-a-key-is-shed-with-every-worker-over-under-shedding",
+      "policy": "manual",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 1,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        },
+        {
+          "in_flight": 3,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        },
+        {
+          "states": [
+            "over",
+            "over",
+            "over"
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        },
+        {
+          "states": [
+            "free",
+            "free",
+            "free"
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          3,
+          0
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-keeps-its-worker-over-its-thresholds-beside-free-workers",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "over"
+        },
+        {
+          "in_flight": 4,
+          "state": "free"
+        },
+        {
+          "in_flight": 0,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-keeps-its-worker-with-every-worker-over",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "over"
+        },
+        {
+          "in_flight": 4,
+          "state": "over"
+        },
+        {
+          "in_flight": 0,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-leaves-its-worker-over-its-thresholds-under-shedding",
+      "policy": "consistent_hashing",
+      "shed": true,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "over"
+        },
+        {
+          "in_flight": 4,
+          "state": "free"
+        },
+        {
+          "in_flight": 0,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-is-shed-with-every-worker-over-under-shedding",
+      "policy": "consistent_hashing",
+      "shed": true,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "over"
+        },
+        {
+          "in_flight": 4,
+          "state": "over"
+        },
+        {
+          "in_flight": 0,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-passes-to-the-next-member-when-its-worker-is-down",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "down"
+        },
+        {
+          "in_flight": 4,
+          "state": "free"
+        },
+        {
+          "in_flight": 0,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-retry-that-tried-the-keys-worker-passes-the-key-on",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "over"
+        },
+        {
+          "in_flight": 4,
+          "state": "free"
+        },
+        {
+          "in_flight": 0,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": [
+              0
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-keeps-its-worker-when-the-next-member-is-over-too",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "over"
+        },
+        {
+          "in_flight": 4,
+          "state": "over"
+        },
+        {
+          "in_flight": 0,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-passes-to-a-next-member-over-its-thresholds-when-its-worker-is-down",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "down"
+        },
+        {
+          "in_flight": 4,
+          "state": "over"
+        },
+        {
+          "in_flight": 0,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-keyed-request-leaves-a-worker-over-its-thresholds",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "over"
+        },
+        {
+          "in_flight": 3,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "random-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "random",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "random-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "random",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "passthrough-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "passthrough",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "passthrough-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "passthrough",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "power-of-two-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "power_of_two",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "power-of-two-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "power_of_two",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "least-load-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "least_load",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "least-load-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "least_load",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "cache-aware-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "cache_aware",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "cache-aware-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "cache_aware",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "manual-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "manual",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "manual-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "manual",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "consistent_hashing",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "prefix-hash-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "prefix_hash",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "prefix-hash-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "prefix_hash",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "bucket-a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+      "policy": "bucket",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "bucket-a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+      "policy": "bucket",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-equal-loads-doubted-on-every-worker-are-drawn",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 5,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3010,
+            2990,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "consistent-hashing-equal-loads-doubted-on-every-worker-are-drawn",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 5,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3087,
+            2913,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "round-robin-a-doubted-worker-under-its-thresholds-beside-one-over-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "over"
+        },
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            1,
+            3
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-over-on-every-worker-some-doubted-too-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled_over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-doubted-and-over-on-every-worker-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled_over"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled_over"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled_over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-doubted-and-over-on-every-worker",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled_over"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled_over"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled_over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-worker-over-alone-beside-the-doubted-ones",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "stalled_over"
+        },
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 5,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "round-robin-doubted-workers-over-their-thresholds-or-not",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "stalled_over"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 0,
+          "state": "down"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-doubted-worker-over-its-thresholds-beside-one-under-them-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "stalled_over"
+        },
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-worker-that-is-down-beside-the-doubted-ones",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "down"
+        },
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            1,
+            3
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-worker-free-of-both-vetoes-beside-the-doubted-ones",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 9,
+          "state": "free"
+        },
+        {
+          "in_flight": 0,
+          "state": "stalled_over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-worker-free-of-both-vetoes-beside-the-doubted-ones-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 9,
+          "state": "free"
+        },
+        {
+          "in_flight": 0,
+          "state": "stalled_over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-tried-worker-among-the-doubted",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": [
+              1
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": [
+              1,
+              2
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "manual-a-key-while-every-worker-is-doubted",
+      "policy": "manual",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 1,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        },
+        {
+          "in_flight": 3,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        },
+        {
+          "states": [
+            "stalled",
+            "stalled",
+            "stalled"
+          ]
+        },
+        {
+          "loads": [
+            9,
+            2,
+            3
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        },
+        {
+          "states": [
+            "free",
+            "free",
+            "free"
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-whose-worker-is-doubted-beside-free-members",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 4,
+          "state": "free"
+        },
+        {
+          "in_flight": 0,
+          "state": "free"
+        },
+        {
+          "in_flight": 2,
+          "state": "free"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-with-every-worker-doubted",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 4,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 0,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-whose-worker-is-doubted-beside-members-over-their-thresholds",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 4,
+          "state": "over"
+        },
+        {
+          "in_flight": 0,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-key-whose-worker-is-doubted-beside-members-over-their-thresholds-under-shedding",
+      "policy": "consistent_hashing",
+      "shed": true,
+      "ring_key": "k1",
+      "workers": [
+        {
+          "in_flight": 5,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 4,
+          "state": "over"
+        },
+        {
+          "in_flight": 0,
+          "state": "over"
+        },
+        {
+          "in_flight": 2,
+          "state": "over"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "random-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "random",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "random-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "random",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "passthrough-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "passthrough",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "passthrough-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "passthrough",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "power-of-two-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "power_of_two",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "power-of-two-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "power_of_two",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "least-load-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "least_load",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "least-load-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "least_load",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "cache-aware-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "cache_aware",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "cache-aware-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "cache_aware",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "manual-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "manual",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "manual-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "manual",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "consistent_hashing",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "prefix-hash-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "prefix_hash",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "prefix-hash-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "prefix_hash",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "bucket-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "bucket",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "bucket-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "bucket",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-doubted-worker-among-open-breakers",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 9,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-doubted-worker-among-open-breakers-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 9,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-worker-over-its-thresholds-among-open-breakers",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 9,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-worker-over-its-thresholds-among-open-breakers-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 9,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3,
+          3
+        ]
+      }
+    }
+  ]
+}

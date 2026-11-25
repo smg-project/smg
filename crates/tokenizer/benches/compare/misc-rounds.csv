@@ -1,0 +1,769 @@
+family,cell,arm,round,rc,full_ns_per_token_p50,inc_ns_per_token_p50,step_ns_p50,first_delta_ns_p50,stream_step_ns_p50,stream_step_ns_p99,stream_first_delta_wall_ns_p50,stream_first_delta_own_ns_p50,batch_tokens,batch_loop_tok_per_s_p50,batch_api_tok_per_s_p50,backend
+bert-base-uncased,batch1000,fastokens,1,0,,,,,,,,,926769.000,1264643.135,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,batch1000,fastokens,2,0,,,,,,,,,926769.000,1259003.000,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,batch1000,fastokens,3,0,,,,,,,,,926769.000,1271464.529,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,batch1000,smg-1.15.0,1,0,,,,,,,,,926769.000,1293538.711,1245764.049,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,batch1000,smg-1.15.0,2,0,,,,,,,,,926769.000,1308436.739,1251926.791,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,batch1000,smg-1.15.0,3,0,,,,,,,,,926769.000,1313024.924,1267412.279,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,batch1000,smg-1.16.0,1,0,,,,,,,,,926769.000,9934088.740,9887445.674,smg hf:native [nativex1]
+bert-base-uncased,batch1000,smg-1.16.0,2,0,,,,,,,,,926769.000,9897551.258,9897793.639,smg hf:native [nativex1]
+bert-base-uncased,batch1000,smg-1.16.0,3,0,,,,,,,,,926769.000,9993743.026,9734376.347,smg hf:native [nativex1]
+bert-base-uncased,batch1000,v1,1,0,,,,,,,,,926769.000,9765352.788,9758628.960,smg hf:native [nativex1]
+bert-base-uncased,batch1000,v1,2,0,,,,,,,,,926769.000,9865700.837,9904942.926,smg hf:native [nativex1]
+bert-base-uncased,batch1000,v1,3,0,,,,,,,,,926769.000,9818382.349,9932753.822,smg hf:native [nativex1]
+bert-base-uncased,dec2048,fastokens,1,0,582.510,1995.934,1893.000,1342.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,dec2048,fastokens,2,0,559.824,1792.819,1692.000,1172.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,dec2048,fastokens,3,0,556.581,1793.901,1702.000,1191.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,dec2048,smg-1.15.0,1,0,691.960,2257.986,2163.000,1583.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,dec2048,smg-1.15.0,2,0,697.917,2228.708,2133.000,1554.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,dec2048,smg-1.15.0,3,0,693.230,2244.226,2144.000,1602.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,dec2048,smg-1.16.0,1,0,6.587,96.970,50.000,230.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec2048,smg-1.16.0,2,0,6.553,96.183,50.000,210.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec2048,smg-1.16.0,3,0,6.606,95.596,50.000,211.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec2048,v1,1,0,6.387,96.402,50.000,210.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec2048,v1,2,0,6.558,96.075,50.000,211.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec2048,v1,3,0,6.925,96.295,50.000,210.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec32768,fastokens,1,0,555.500,1789.753,1652.000,1151.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,dec32768,fastokens,2,0,544.729,1783.596,1653.000,1162.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,dec32768,fastokens,3,0,543.383,1777.617,1652.000,1152.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,dec32768,smg-1.15.0,1,0,681.831,2536.708,2133.000,1442.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,dec32768,smg-1.15.0,2,0,664.703,2240.820,2123.000,1432.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,dec32768,smg-1.15.0,3,0,670.366,2237.953,2113.000,1552.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,dec32768,smg-1.16.0,1,0,7.357,102.016,50.000,210.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec32768,smg-1.16.0,2,0,7.386,102.372,50.000,200.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec32768,smg-1.16.0,3,0,7.555,102.956,50.000,210.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec32768,v1,1,0,7.591,102.729,50.000,200.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec32768,v1,2,0,7.741,102.353,50.000,200.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,dec32768,v1,3,0,7.688,102.439,50.000,200.000,,,,,,,,smg hf:native [nativex1]
+bert-base-uncased,stream64,fastokens,1,0,,,,,1692.000,2404.000,1493.000,1442.000,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,stream64,fastokens,2,0,,,,,1693.000,3266.000,1472.000,1422.000,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,stream64,fastokens,3,0,,,,,1693.000,2434.000,1552.000,1492.000,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+bert-base-uncased,stream64,smg-1.15.0,1,0,,,,,2093.000,2945.000,1713.000,1653.000,,,,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,stream64,smg-1.15.0,2,0,,,,,2083.000,2694.000,1733.000,1682.000,,,,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,stream64,smg-1.15.0,3,0,,,,,2113.000,2644.000,1732.000,1673.000,,,,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,stream64,smg-1.16.0,1,0,,,,,50.000,180.000,320.000,261.000,,,,smg hf:native [nativex1]
+bert-base-uncased,stream64,smg-1.16.0,2,0,,,,,50.000,170.000,311.000,251.000,,,,smg hf:native [nativex1]
+bert-base-uncased,stream64,smg-1.16.0,3,0,,,,,50.000,161.000,370.000,310.000,,,,smg hf:native [nativex1]
+bert-base-uncased,stream64,v1,1,0,,,,,50.000,171.000,320.000,260.000,,,,smg hf:native [nativex1]
+bert-base-uncased,stream64,v1,2,0,,,,,50.000,161.000,311.000,260.000,,,,smg hf:native [nativex1]
+bert-base-uncased,stream64,v1,3,0,,,,,50.000,160.000,320.000,261.000,,,,smg hf:native [nativex1]
+deepseek-v3.2,batch1000,fastokens,1,0,,,,,,,,,639899.000,41124920.983,,fastokens-stack fastokens
+deepseek-v3.2,batch1000,fastokens,2,0,,,,,,,,,639899.000,41048442.626,,fastokens-stack fastokens
+deepseek-v3.2,batch1000,fastokens,3,0,,,,,,,,,639899.000,40056947.434,,fastokens-stack fastokens
+deepseek-v3.2,batch1000,smg-1.15.0,1,0,,,,,,,,,639899.000,43730448.891,43120201.236,smg hf:native [nativex1]
+deepseek-v3.2,batch1000,smg-1.15.0,2,0,,,,,,,,,639899.000,46707049.338,45657533.005,smg hf:native [nativex1]
+deepseek-v3.2,batch1000,smg-1.15.0,3,0,,,,,,,,,639899.000,45924708.623,43633796.027,smg hf:native [nativex1]
+deepseek-v3.2,batch1000,smg-1.16.0,1,0,,,,,,,,,639899.000,56290378.227,54053266.414,smg hf:native [nativex1]
+deepseek-v3.2,batch1000,smg-1.16.0,2,0,,,,,,,,,639899.000,57093858.292,57126224.156,smg hf:native [nativex1]
+deepseek-v3.2,batch1000,smg-1.16.0,3,0,,,,,,,,,639899.000,56666111.133,55994971.558,smg hf:native [nativex1]
+deepseek-v3.2,batch1000,v1,1,0,,,,,,,,,639899.000,10671700.991,10506578.107,smg hf:v1 [v1x1]
+deepseek-v3.2,batch1000,v1,2,0,,,,,,,,,639899.000,10983908.626,10639993.712,smg hf:v1 [v1x1]
+deepseek-v3.2,batch1000,v1,3,0,,,,,,,,,639899.000,11102483.929,10900535.178,smg hf:v1 [v1x1]
+deepseek-v3.2,dec2048,fastokens,1,0,31.846,340.391,270.000,280.000,,,,,,,,fastokens-stack fastokens
+deepseek-v3.2,dec2048,fastokens,2,0,31.899,347.124,271.000,291.000,,,,,,,,fastokens-stack fastokens
+deepseek-v3.2,dec2048,fastokens,3,0,31.841,342.918,270.000,280.000,,,,,,,,fastokens-stack fastokens
+deepseek-v3.2,dec2048,smg-1.15.0,1,0,8.812,89.610,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec2048,smg-1.15.0,2,0,8.940,89.277,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec2048,smg-1.15.0,3,0,8.837,89.175,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec2048,smg-1.16.0,1,0,8.626,89.899,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec2048,smg-1.16.0,2,0,8.230,89.532,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec2048,smg-1.16.0,3,0,8.367,89.243,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec2048,v1,1,0,9.874,89.864,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v3.2,dec2048,v1,2,0,9.840,89.620,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v3.2,dec2048,v1,3,0,9.854,89.385,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v3.2,dec32768,fastokens,1,0,42.132,357.339,271.000,230.000,,,,,,,,fastokens-stack fastokens
+deepseek-v3.2,dec32768,fastokens,2,0,43.807,355.739,280.000,230.000,,,,,,,,fastokens-stack fastokens
+deepseek-v3.2,dec32768,fastokens,3,0,44.895,350.655,280.000,230.000,,,,,,,,fastokens-stack fastokens
+deepseek-v3.2,dec32768,smg-1.15.0,1,0,15.536,98.132,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec32768,smg-1.15.0,2,0,15.479,98.084,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec32768,smg-1.15.0,3,0,15.381,98.663,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec32768,smg-1.16.0,1,0,15.265,98.333,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec32768,smg-1.16.0,2,0,15.069,99.671,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec32768,smg-1.16.0,3,0,15.261,98.966,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v3.2,dec32768,v1,1,0,16.062,97.767,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v3.2,dec32768,v1,2,0,16.119,97.555,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v3.2,dec32768,v1,3,0,16.030,99.484,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v3.2,stream64,fastokens,1,0,,,,,241.000,601.000,1082.000,1031.000,,,,fastokens-stack fastokens
+deepseek-v3.2,stream64,fastokens,2,0,,,,,241.000,581.000,942.000,892.000,,,,fastokens-stack fastokens
+deepseek-v3.2,stream64,fastokens,3,0,,,,,241.000,601.000,1022.000,972.000,,,,fastokens-stack fastokens
+deepseek-v3.2,stream64,smg-1.15.0,1,0,,,,,50.000,200.000,110.000,61.000,,,,smg hf:native [nativex1]
+deepseek-v3.2,stream64,smg-1.15.0,2,0,,,,,50.000,200.000,111.000,70.000,,,,smg hf:native [nativex1]
+deepseek-v3.2,stream64,smg-1.15.0,3,0,,,,,50.000,210.000,111.000,70.000,,,,smg hf:native [nativex1]
+deepseek-v3.2,stream64,smg-1.16.0,1,0,,,,,50.000,170.000,111.000,61.000,,,,smg hf:native [nativex1]
+deepseek-v3.2,stream64,smg-1.16.0,2,0,,,,,50.000,170.000,110.000,61.000,,,,smg hf:native [nativex1]
+deepseek-v3.2,stream64,smg-1.16.0,3,0,,,,,50.000,170.000,111.000,70.000,,,,smg hf:native [nativex1]
+deepseek-v3.2,stream64,v1,1,0,,,,,50.000,150.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+deepseek-v3.2,stream64,v1,2,0,,,,,41.000,160.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+deepseek-v3.2,stream64,v1,3,0,,,,,41.000,150.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,batch1000,fastokens,1,0,,,,,,,,,639899.000,44639128.116,,fastokens-stack fastokens
+deepseek-v4.1-flash,batch1000,fastokens,2,0,,,,,,,,,639899.000,46439798.570,,fastokens-stack fastokens
+deepseek-v4.1-flash,batch1000,fastokens,3,0,,,,,,,,,639899.000,46101851.462,,fastokens-stack fastokens
+deepseek-v4.1-flash,batch1000,smg-1.15.0,1,0,,,,,,,,,639899.000,39693347.784,40218986.723,smg hf:native [nativex1]
+deepseek-v4.1-flash,batch1000,smg-1.15.0,2,0,,,,,,,,,639899.000,41015267.587,41852747.298,smg hf:native [nativex1]
+deepseek-v4.1-flash,batch1000,smg-1.15.0,3,0,,,,,,,,,639899.000,42410002.705,41628644.716,smg hf:native [nativex1]
+deepseek-v4.1-flash,batch1000,smg-1.16.0,1,0,,,,,,,,,639899.000,52954499.940,48112974.463,smg hf:native [nativex1]
+deepseek-v4.1-flash,batch1000,smg-1.16.0,2,0,,,,,,,,,639899.000,49520530.777,47811990.913,smg hf:native [nativex1]
+deepseek-v4.1-flash,batch1000,smg-1.16.0,3,0,,,,,,,,,639899.000,55223848.524,54195366.513,smg hf:native [nativex1]
+deepseek-v4.1-flash,batch1000,v1,1,0,,,,,,,,,639899.000,10182565.619,9809807.781,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,batch1000,v1,2,0,,,,,,,,,639899.000,10794855.338,10196808.918,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,batch1000,v1,3,0,,,,,,,,,639899.000,10105349.419,10215236.601,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,dec2048,fastokens,1,0,31.641,336.019,260.000,280.000,,,,,,,,fastokens-stack fastokens
+deepseek-v4.1-flash,dec2048,fastokens,2,0,31.538,336.708,261.000,290.000,,,,,,,,fastokens-stack fastokens
+deepseek-v4.1-flash,dec2048,fastokens,3,0,31.547,338.302,261.000,280.000,,,,,,,,fastokens-stack fastokens
+deepseek-v4.1-flash,dec2048,smg-1.15.0,1,0,9.326,92.349,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec2048,smg-1.15.0,2,0,9.932,89.542,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec2048,smg-1.15.0,3,0,9.526,89.400,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec2048,smg-1.16.0,1,0,8.900,92.036,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec2048,smg-1.16.0,2,0,8.582,90.911,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec2048,smg-1.16.0,3,0,8.142,89.537,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec2048,v1,1,0,9.952,89.292,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,dec2048,v1,2,0,9.414,89.673,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,dec2048,v1,3,0,9.761,90.271,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,dec32768,fastokens,1,0,39.653,337.674,261.000,230.000,,,,,,,,fastokens-stack fastokens
+deepseek-v4.1-flash,dec32768,fastokens,2,0,40.100,372.022,270.000,230.000,,,,,,,,fastokens-stack fastokens
+deepseek-v4.1-flash,dec32768,fastokens,3,0,40.979,356.811,270.000,230.000,,,,,,,,fastokens-stack fastokens
+deepseek-v4.1-flash,dec32768,smg-1.15.0,1,0,15.579,98.319,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec32768,smg-1.15.0,2,0,16.330,98.524,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec32768,smg-1.15.0,3,0,16.271,98.692,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec32768,smg-1.16.0,1,0,15.471,99.382,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec32768,smg-1.16.0,2,0,15.169,98.905,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec32768,smg-1.16.0,3,0,15.277,99.058,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,dec32768,v1,1,0,15.857,97.755,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,dec32768,v1,2,0,16.242,98.390,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,dec32768,v1,3,0,15.968,100.065,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,stream64,fastokens,1,0,,,,,240.000,551.000,741.000,691.000,,,,fastokens-stack fastokens
+deepseek-v4.1-flash,stream64,fastokens,2,0,,,,,240.000,561.000,811.000,761.000,,,,fastokens-stack fastokens
+deepseek-v4.1-flash,stream64,fastokens,3,0,,,,,240.000,561.000,791.000,741.000,,,,fastokens-stack fastokens
+deepseek-v4.1-flash,stream64,smg-1.15.0,1,0,,,,,50.000,200.000,111.000,61.000,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,stream64,smg-1.15.0,2,0,,,,,50.000,200.000,111.000,70.000,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,stream64,smg-1.15.0,3,0,,,,,50.000,190.000,111.000,70.000,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,stream64,smg-1.16.0,1,0,,,,,50.000,160.000,111.000,61.000,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,stream64,smg-1.16.0,2,0,,,,,40.000,160.000,110.000,60.000,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,stream64,smg-1.16.0,3,0,,,,,41.000,160.000,110.000,60.000,,,,smg hf:native [nativex1]
+deepseek-v4.1-flash,stream64,v1,1,0,,,,,50.000,160.000,121.000,70.000,,,,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,stream64,v1,2,0,,,,,50.000,160.000,121.000,71.000,,,,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,stream64,v1,3,0,,,,,40.000,150.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+gemma-3-1b-it,batch1000,fastokens,1,0,,,,,,,,,480963.000,7504074.511,,fastokens-stack fastokens
+gemma-3-1b-it,batch1000,fastokens,2,0,,,,,,,,,480963.000,7098244.187,,fastokens-stack fastokens
+gemma-3-1b-it,batch1000,fastokens,3,0,,,,,,,,,480963.000,7383278.428,,fastokens-stack fastokens
+gemma-3-1b-it,batch1000,smg-1.15.0,1,0,,,,,,,,,480963.000,35233332.564,33126715.094,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,batch1000,smg-1.15.0,2,0,,,,,,,,,480963.000,26823906.635,33443657.218,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,batch1000,smg-1.15.0,3,0,,,,,,,,,480963.000,27234613.383,26609226.887,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,batch1000,smg-1.16.0,1,0,,,,,,,,,480963.000,37453122.565,36070643.302,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,batch1000,smg-1.16.0,2,0,,,,,,,,,480963.000,44844729.728,47300618.456,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,batch1000,smg-1.16.0,3,0,,,,,,,,,480963.000,43129974.060,33116897.872,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,batch1000,v1,1,0,,,,,,,,,480963.000,2643867.207,2615999.428,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,batch1000,v1,2,0,,,,,,,,,480963.000,2373233.199,2584162.701,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,batch1000,v1,3,0,,,,,,,,,480963.000,2614885.600,2583952.160,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,dec2048,fastokens,1,0,98.325,631.717,560.000,811.000,,,,,,,,fastokens-stack fastokens
+gemma-3-1b-it,dec2048,fastokens,2,0,105.049,695.369,621.000,861.000,,,,,,,,fastokens-stack fastokens
+gemma-3-1b-it,dec2048,fastokens,3,0,104.985,627.247,551.000,791.000,,,,,,,,fastokens-stack fastokens
+gemma-3-1b-it,dec2048,smg-1.15.0,1,0,15.977,104.564,50.000,251.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec2048,smg-1.15.0,2,0,15.776,144.797,80.000,341.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec2048,smg-1.15.0,3,0,16.021,104.570,50.000,260.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec2048,smg-1.16.0,1,0,16.119,105.558,50.000,251.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec2048,smg-1.16.0,2,0,15.737,112.213,50.000,260.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec2048,smg-1.16.0,3,0,15.854,105.127,51.000,260.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec2048,v1,1,0,16.402,104.633,50.000,251.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,dec2048,v1,2,0,16.657,105.298,51.000,250.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,dec2048,v1,3,0,16.539,108.951,50.000,251.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,dec32768,fastokens,1,0,177.132,731.109,611.000,471.000,,,,,,,,fastokens-stack fastokens
+gemma-3-1b-it,dec32768,fastokens,2,0,176.695,721.098,601.000,461.000,,,,,,,,fastokens-stack fastokens
+gemma-3-1b-it,dec32768,fastokens,3,0,173.685,714.466,601.000,471.000,,,,,,,,fastokens-stack fastokens
+gemma-3-1b-it,dec32768,smg-1.15.0,1,0,31.108,125.794,70.000,210.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec32768,smg-1.15.0,2,0,30.947,127.126,70.000,211.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec32768,smg-1.15.0,3,0,31.513,125.051,70.000,220.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec32768,smg-1.16.0,1,0,32.187,126.453,70.000,220.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec32768,smg-1.16.0,2,0,31.928,126.369,70.000,220.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec32768,smg-1.16.0,3,0,31.603,125.243,70.000,221.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,dec32768,v1,1,0,31.885,125.165,70.000,230.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,dec32768,v1,2,0,32.117,125.762,70.000,211.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,dec32768,v1,3,0,31.948,124.963,70.000,221.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,stream64,fastokens,1,0,,,,,611.000,1222.000,802.000,751.000,,,,fastokens-stack fastokens
+gemma-3-1b-it,stream64,fastokens,2,0,,,,,561.000,1142.000,701.000,651.000,,,,fastokens-stack fastokens
+gemma-3-1b-it,stream64,fastokens,3,0,,,,,561.000,1171.000,711.000,661.000,,,,fastokens-stack fastokens
+gemma-3-1b-it,stream64,smg-1.15.0,1,0,,,,,60.000,280.000,421.000,362.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,stream64,smg-1.15.0,2,0,,,,,60.000,271.000,411.000,360.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,stream64,smg-1.15.0,3,0,,,,,80.000,331.000,470.000,411.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,stream64,smg-1.16.0,1,0,,,,,51.000,181.000,390.000,331.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,stream64,smg-1.16.0,2,0,,,,,60.000,210.000,391.000,341.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,stream64,smg-1.16.0,3,0,,,,,51.000,190.000,391.000,340.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,stream64,v1,1,0,,,,,60.000,190.000,391.000,340.000,,,,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,stream64,v1,2,0,,,,,60.000,190.000,391.000,340.000,,,,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,stream64,v1,3,0,,,,,60.000,190.000,390.000,331.000,,,,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,batch1000,fastokens,1,0,,,,,,,,,480963.000,8285656.707,,fastokens-stack fastokens
+gemma-4-e2b-it,batch1000,fastokens,2,0,,,,,,,,,480963.000,7894366.757,,fastokens-stack fastokens
+gemma-4-e2b-it,batch1000,fastokens,3,0,,,,,,,,,480963.000,8417719.146,,fastokens-stack fastokens
+gemma-4-e2b-it,batch1000,smg-1.15.0,1,0,,,,,,,,,480963.000,30844594.454,29972628.087,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,batch1000,smg-1.15.0,2,0,,,,,,,,,480963.000,35505135.205,32245920.812,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,batch1000,smg-1.15.0,3,0,,,,,,,,,480963.000,31090565.770,28823277.960,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,batch1000,smg-1.16.0,1,0,,,,,,,,,480963.000,47623894.776,44702370.839,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,batch1000,smg-1.16.0,2,0,,,,,,,,,480963.000,45719233.603,46634626.246,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,batch1000,smg-1.16.0,3,0,,,,,,,,,480963.000,47788812.444,40740580.113,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,batch1000,v1,1,0,,,,,,,,,480963.000,2663363.812,2566695.908,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,batch1000,v1,2,0,,,,,,,,,480963.000,2651410.318,2593148.154,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,batch1000,v1,3,0,,,,,,,,,480963.000,2561362.751,2538830.989,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,dec2048,fastokens,1,0,101.968,622.674,550.000,791.000,,,,,,,,fastokens-stack fastokens
+gemma-4-e2b-it,dec2048,fastokens,2,0,104.330,633.541,561.000,821.000,,,,,,,,fastokens-stack fastokens
+gemma-4-e2b-it,dec2048,fastokens,3,0,109.195,628.962,551.000,771.000,,,,,,,,fastokens-stack fastokens
+gemma-4-e2b-it,dec2048,smg-1.15.0,1,0,15.713,102.912,50.000,270.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec2048,smg-1.15.0,2,0,15.336,102.912,50.000,251.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec2048,smg-1.15.0,3,0,15.292,104.902,50.000,250.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec2048,smg-1.16.0,1,0,15.718,104.540,50.000,250.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec2048,smg-1.16.0,2,0,15.551,106.120,50.000,250.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec2048,smg-1.16.0,3,0,15.718,104.540,50.000,250.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec2048,v1,1,0,16.158,104.208,50.000,241.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,dec2048,v1,2,0,16.510,105.729,50.000,251.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,dec2048,v1,3,0,16.153,104.217,50.000,241.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,dec32768,fastokens,1,0,159.813,707.146,581.000,471.000,,,,,,,,fastokens-stack fastokens
+gemma-4-e2b-it,dec32768,fastokens,2,0,139.775,719.295,602.000,501.000,,,,,,,,fastokens-stack fastokens
+gemma-4-e2b-it,dec32768,fastokens,3,0,167.036,705.287,601.000,460.000,,,,,,,,fastokens-stack fastokens
+gemma-4-e2b-it,dec32768,smg-1.15.0,1,0,31.859,133.604,70.000,220.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec32768,smg-1.15.0,2,0,30.915,125.327,70.000,211.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec32768,smg-1.15.0,3,0,30.933,123.981,70.000,230.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec32768,smg-1.16.0,1,0,31.174,131.001,70.000,221.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec32768,smg-1.16.0,2,0,31.572,126.026,70.000,220.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec32768,smg-1.16.0,3,0,30.925,126.492,70.000,221.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,dec32768,v1,1,0,31.514,125.273,70.000,230.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,dec32768,v1,2,0,43.502,140.648,70.000,231.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,dec32768,v1,3,0,31.510,138.011,70.000,220.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,stream64,fastokens,1,0,,,,,571.000,1221.000,681.000,631.000,,,,fastokens-stack fastokens
+gemma-4-e2b-it,stream64,fastokens,2,0,,,,,551.000,1172.000,681.000,621.000,,,,fastokens-stack fastokens
+gemma-4-e2b-it,stream64,fastokens,3,0,,,,,551.000,1162.000,661.000,611.000,,,,fastokens-stack fastokens
+gemma-4-e2b-it,stream64,smg-1.15.0,1,0,,,,,60.000,270.000,421.000,370.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,stream64,smg-1.15.0,2,0,,,,,60.000,271.000,410.000,351.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,stream64,smg-1.15.0,3,0,,,,,60.000,280.000,411.000,361.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,stream64,smg-1.16.0,1,0,,,,,51.000,180.000,390.000,331.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,stream64,smg-1.16.0,2,0,,,,,51.000,190.000,421.000,370.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,stream64,smg-1.16.0,3,0,,,,,51.000,191.000,381.000,330.000,,,,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,stream64,v1,1,0,,,,,60.000,200.000,391.000,340.000,,,,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,stream64,v1,2,0,,,,,60.000,190.000,391.000,331.000,,,,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,stream64,v1,3,0,,,,,60.000,191.000,391.000,340.000,,,,smg hf:v1+bytefallback [v1x1]
+glm-5.3-flash,batch1000,fastokens,1,0,,,,,,,,,792823.000,58374193.347,,fastokens-stack fastokens
+glm-5.3-flash,batch1000,fastokens,2,0,,,,,,,,,792823.000,59170933.883,,fastokens-stack fastokens
+glm-5.3-flash,batch1000,fastokens,3,0,,,,,,,,,792823.000,59659295.707,,fastokens-stack fastokens
+glm-5.3-flash,batch1000,smg-1.15.0,1,0,,,,,,,,,792823.000,48037557.882,47016061.141,smg hf:native [nativex1]
+glm-5.3-flash,batch1000,smg-1.15.0,2,0,,,,,,,,,792823.000,45054725.298,46469605.229,smg hf:native [nativex1]
+glm-5.3-flash,batch1000,smg-1.15.0,3,0,,,,,,,,,792823.000,47983118.276,47763258.709,smg hf:native [nativex1]
+glm-5.3-flash,batch1000,smg-1.16.0,1,0,,,,,,,,,792823.000,56178845.353,50316483.914,smg hf:native [nativex1]
+glm-5.3-flash,batch1000,smg-1.16.0,2,0,,,,,,,,,792823.000,55750091.572,53564470.923,smg hf:native [nativex1]
+glm-5.3-flash,batch1000,smg-1.16.0,3,0,,,,,,,,,792823.000,53469675.251,54274287.638,smg hf:native [nativex1]
+glm-5.3-flash,batch1000,v1,1,0,,,,,,,,,792823.000,13869558.383,13622192.175,smg hf:v1 [v1x1]
+glm-5.3-flash,batch1000,v1,2,0,,,,,,,,,792823.000,14243150.071,14005066.408,smg hf:v1 [v1x1]
+glm-5.3-flash,batch1000,v1,3,0,,,,,,,,,792823.000,13839184.129,13544380.596,smg hf:v1 [v1x1]
+glm-5.3-flash,dec2048,fastokens,1,0,25.401,290.675,221.000,280.000,,,,,,,,fastokens-stack fastokens
+glm-5.3-flash,dec2048,fastokens,2,0,25.342,293.438,230.000,280.000,,,,,,,,fastokens-stack fastokens
+glm-5.3-flash,dec2048,fastokens,3,0,25.122,294.401,230.000,280.000,,,,,,,,fastokens-stack fastokens
+glm-5.3-flash,dec2048,smg-1.15.0,1,0,7.057,87.458,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec2048,smg-1.15.0,2,0,7.443,87.712,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec2048,smg-1.15.0,3,0,7.164,87.502,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec2048,smg-1.16.0,1,0,6.685,87.737,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec2048,smg-1.16.0,2,0,6.504,87.713,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec2048,smg-1.16.0,3,0,6.499,87.483,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec2048,v1,1,0,6.842,87.776,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+glm-5.3-flash,dec2048,v1,2,0,6.622,87.537,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+glm-5.3-flash,dec2048,v1,3,0,6.900,88.036,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+glm-5.3-flash,dec32768,fastokens,1,0,37.172,348.322,250.000,240.000,,,,,,,,fastokens-stack fastokens
+glm-5.3-flash,dec32768,fastokens,2,0,38.141,357.989,260.000,240.000,,,,,,,,fastokens-stack fastokens
+glm-5.3-flash,dec32768,fastokens,3,0,37.251,334.403,251.000,240.000,,,,,,,,fastokens-stack fastokens
+glm-5.3-flash,dec32768,smg-1.15.0,1,0,14.728,105.567,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec32768,smg-1.15.0,2,0,14.306,100.607,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec32768,smg-1.15.0,3,0,14.514,100.069,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec32768,smg-1.16.0,1,0,13.572,100.205,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec32768,smg-1.16.0,2,0,13.788,100.512,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec32768,smg-1.16.0,3,0,13.751,101.391,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+glm-5.3-flash,dec32768,v1,1,0,14.357,99.204,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+glm-5.3-flash,dec32768,v1,2,0,14.705,99.317,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+glm-5.3-flash,dec32768,v1,3,0,14.391,99.356,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+glm-5.3-flash,stream64,fastokens,1,0,,,,,240.000,611.000,411.000,361.000,,,,fastokens-stack fastokens
+glm-5.3-flash,stream64,fastokens,2,0,,,,,240.000,601.000,411.000,360.000,,,,fastokens-stack fastokens
+glm-5.3-flash,stream64,fastokens,3,0,,,,,240.000,611.000,411.000,360.000,,,,fastokens-stack fastokens
+glm-5.3-flash,stream64,smg-1.15.0,1,0,,,,,50.000,180.000,120.000,70.000,,,,smg hf:native [nativex1]
+glm-5.3-flash,stream64,smg-1.15.0,2,0,,,,,50.000,190.000,130.000,80.000,,,,smg hf:native [nativex1]
+glm-5.3-flash,stream64,smg-1.15.0,3,0,,,,,50.000,190.000,130.000,80.000,,,,smg hf:native [nativex1]
+glm-5.3-flash,stream64,smg-1.16.0,1,0,,,,,41.000,160.000,110.000,61.000,,,,smg hf:native [nativex1]
+glm-5.3-flash,stream64,smg-1.16.0,2,0,,,,,40.000,160.000,110.000,60.000,,,,smg hf:native [nativex1]
+glm-5.3-flash,stream64,smg-1.16.0,3,0,,,,,41.000,160.000,110.000,60.000,,,,smg hf:native [nativex1]
+glm-5.3-flash,stream64,v1,1,0,,,,,50.000,151.000,121.000,70.000,,,,smg hf:v1 [v1x1]
+glm-5.3-flash,stream64,v1,2,0,,,,,41.000,160.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+glm-5.3-flash,stream64,v1,3,0,,,,,41.000,160.000,130.000,70.000,,,,smg hf:v1 [v1x1]
+gpt-oss-20b,batch1000,fastokens,1,0,,,,,,,,,480408.000,34397516.833,,fastokens-stack fastokens
+gpt-oss-20b,batch1000,fastokens,2,0,,,,,,,,,480408.000,33471485.681,,fastokens-stack fastokens
+gpt-oss-20b,batch1000,fastokens,3,0,,,,,,,,,480408.000,34638536.951,,fastokens-stack fastokens
+gpt-oss-20b,batch1000,smg-1.15.0,1,0,,,,,,,,,480408.000,32405075.586,31225079.743,smg hf:native [nativex1]
+gpt-oss-20b,batch1000,smg-1.15.0,2,0,,,,,,,,,480408.000,31979846.375,32332115.560,smg hf:native [nativex1]
+gpt-oss-20b,batch1000,smg-1.15.0,3,0,,,,,,,,,480408.000,31175097.301,33169580.245,smg hf:native [nativex1]
+gpt-oss-20b,batch1000,smg-1.16.0,1,0,,,,,,,,,480408.000,34860541.652,33778120.397,smg hf:native [nativex1]
+gpt-oss-20b,batch1000,smg-1.16.0,2,0,,,,,,,,,480408.000,33911752.980,36899518.156,smg hf:native [nativex1]
+gpt-oss-20b,batch1000,smg-1.16.0,3,0,,,,,,,,,480408.000,38434466.406,37821231.056,smg hf:native [nativex1]
+gpt-oss-20b,batch1000,v1,1,0,,,,,,,,,480408.000,8100808.943,7817175.135,smg hf:v1 [v1x1]
+gpt-oss-20b,batch1000,v1,2,0,,,,,,,,,480408.000,7810734.043,7607552.356,smg hf:v1 [v1x1]
+gpt-oss-20b,batch1000,v1,3,0,,,,,,,,,480408.000,7859987.357,8235938.214,smg hf:v1 [v1x1]
+gpt-oss-20b,dec2048,fastokens,1,0,31.489,336.043,261.000,290.000,,,,,,,,fastokens-stack fastokens
+gpt-oss-20b,dec2048,fastokens,2,0,31.650,341.342,261.000,280.000,,,,,,,,fastokens-stack fastokens
+gpt-oss-20b,dec2048,fastokens,3,0,31.440,332.243,260.000,281.000,,,,,,,,fastokens-stack fastokens
+gpt-oss-20b,dec2048,smg-1.15.0,1,0,9.482,91.512,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec2048,smg-1.15.0,2,0,8.988,89.165,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec2048,smg-1.15.0,3,0,9.081,89.160,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec2048,smg-1.16.0,1,0,8.441,88.930,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec2048,smg-1.16.0,2,0,8.504,88.920,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec2048,smg-1.16.0,3,0,8.108,89.003,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec2048,v1,1,0,9.238,89.302,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+gpt-oss-20b,dec2048,v1,2,0,9.105,89.125,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+gpt-oss-20b,dec2048,v1,3,0,8.998,89.341,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+gpt-oss-20b,dec32768,fastokens,1,0,43.213,404.819,280.000,230.000,,,,,,,,fastokens-stack fastokens
+gpt-oss-20b,dec32768,fastokens,2,0,43.031,351.670,270.000,230.000,,,,,,,,fastokens-stack fastokens
+gpt-oss-20b,dec32768,fastokens,3,0,42.564,394.848,280.000,230.000,,,,,,,,fastokens-stack fastokens
+gpt-oss-20b,dec32768,smg-1.15.0,1,0,16.310,102.779,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec32768,smg-1.15.0,2,0,16.101,100.307,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec32768,smg-1.15.0,3,0,16.200,99.885,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec32768,smg-1.16.0,1,0,16.026,101.861,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec32768,smg-1.16.0,2,0,15.668,99.880,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec32768,smg-1.16.0,3,0,15.959,100.304,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+gpt-oss-20b,dec32768,v1,1,0,16.832,101.341,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+gpt-oss-20b,dec32768,v1,2,0,16.511,100.178,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+gpt-oss-20b,dec32768,v1,3,0,18.893,122.013,60.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+gpt-oss-20b,stream64,fastokens,1,0,,,,,241.000,672.000,651.000,591.000,,,,fastokens-stack fastokens
+gpt-oss-20b,stream64,fastokens,2,0,,,,,241.000,681.000,611.000,560.000,,,,fastokens-stack fastokens
+gpt-oss-20b,stream64,fastokens,3,0,,,,,250.000,691.000,631.000,581.000,,,,fastokens-stack fastokens
+gpt-oss-20b,stream64,smg-1.15.0,1,0,,,,,50.000,190.000,111.000,70.000,,,,smg hf:native [nativex1]
+gpt-oss-20b,stream64,smg-1.15.0,2,0,,,,,50.000,190.000,120.000,70.000,,,,smg hf:native [nativex1]
+gpt-oss-20b,stream64,smg-1.15.0,3,0,,,,,50.000,201.000,111.000,70.000,,,,smg hf:native [nativex1]
+gpt-oss-20b,stream64,smg-1.16.0,1,0,,,,,50.000,160.000,110.000,60.000,,,,smg hf:native [nativex1]
+gpt-oss-20b,stream64,smg-1.16.0,2,0,,,,,41.000,160.000,110.000,60.000,,,,smg hf:native [nativex1]
+gpt-oss-20b,stream64,smg-1.16.0,3,0,,,,,41.000,170.000,110.000,60.000,,,,smg hf:native [nativex1]
+gpt-oss-20b,stream64,v1,1,0,,,,,50.000,170.000,121.000,71.000,,,,smg hf:v1 [v1x1]
+gpt-oss-20b,stream64,v1,2,0,,,,,50.000,160.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+gpt-oss-20b,stream64,v1,3,0,,,,,50.000,170.000,121.000,71.000,,,,smg hf:v1 [v1x1]
+kimi-k3,batch1000,fastokens,1,0,,,,,,,,,700148.000,4819895.650,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,batch1000,fastokens,2,0,,,,,,,,,700148.000,4873031.400,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,batch1000,fastokens,3,0,,,,,,,,,700148.000,4797829.844,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,batch1000,smg-1.15.0,1,0,,,,,,,,,700148.000,15694223.514,15406448.648,smg tiktoken [nativex1]
+kimi-k3,batch1000,smg-1.15.0,2,0,,,,,,,,,700148.000,16093612.292,15777662.745,smg tiktoken [nativex1]
+kimi-k3,batch1000,smg-1.15.0,3,0,,,,,,,,,700148.000,15671082.128,16093411.054,smg tiktoken [nativex1]
+kimi-k3,batch1000,smg-1.16.0,1,0,,,,,,,,,700148.000,24172633.456,23018578.510,smg tiktoken [nativex1]
+kimi-k3,batch1000,smg-1.16.0,2,0,,,,,,,,,700148.000,24923923.347,23447038.259,smg tiktoken [nativex1]
+kimi-k3,batch1000,smg-1.16.0,3,0,,,,,,,,,700148.000,23892198.529,23528998.216,smg tiktoken [nativex1]
+kimi-k3,batch1000,v1,1,0,,,,,,,,,700148.000,24488296.666,24405607.683,smg tiktoken [nativex1]
+kimi-k3,batch1000,v1,2,0,,,,,,,,,700148.000,24821489.675,23814596.704,smg tiktoken [nativex1]
+kimi-k3,batch1000,v1,3,0,,,,,,,,,700148.000,26274050.216,26177621.511,smg tiktoken [nativex1]
+kimi-k3,dec2048,fastokens,1,0,9.135,271.516,211.000,220.000,,,,,,,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,dec2048,fastokens,2,0,9.219,268.541,210.000,220.000,,,,,,,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,dec2048,fastokens,3,0,9.081,269.828,211.000,220.000,,,,,,,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,dec2048,smg-1.15.0,1,0,7.703,91.728,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec2048,smg-1.15.0,2,0,7.683,91.492,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec2048,smg-1.15.0,3,0,7.536,91.884,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec2048,smg-1.16.0,1,0,6.939,91.987,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec2048,smg-1.16.0,2,0,6.852,91.443,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec2048,smg-1.16.0,3,0,7.096,91.214,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec2048,v1,1,0,7.644,91.268,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec2048,v1,2,0,7.634,91.322,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec2048,v1,3,0,7.644,91.356,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec32768,fastokens,1,0,20.662,326.833,240.000,200.000,,,,,,,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,dec32768,fastokens,2,0,20.978,333.218,250.000,191.000,,,,,,,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,dec32768,fastokens,3,0,20.746,305.982,221.000,190.000,,,,,,,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,dec32768,smg-1.15.0,1,0,14.725,101.775,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec32768,smg-1.15.0,2,0,14.606,99.322,41.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec32768,smg-1.15.0,3,0,15.006,100.278,41.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec32768,smg-1.16.0,1,0,14.605,99.538,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec32768,smg-1.16.0,2,0,15.852,102.378,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec32768,smg-1.16.0,3,0,14.315,101.299,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec32768,v1,1,0,14.957,101.229,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec32768,v1,2,0,14.851,99.935,41.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,dec32768,v1,3,0,15.134,100.169,41.000,50.000,,,,,,,,smg tiktoken [nativex1]
+kimi-k3,stream64,fastokens,1,0,,,,,210.000,450.000,411.000,361.000,,,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,stream64,fastokens,2,0,,,,,211.000,481.000,421.000,371.000,,,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,stream64,fastokens,3,0,,,,,280.000,541.000,491.000,440.000,,,,fastokens-stack tiktoken(auto: riptoken first)
+kimi-k3,stream64,smg-1.15.0,1,0,,,,,40.000,150.000,130.000,80.000,,,,smg tiktoken [nativex1]
+kimi-k3,stream64,smg-1.15.0,2,0,,,,,40.000,160.000,140.000,90.000,,,,smg tiktoken [nativex1]
+kimi-k3,stream64,smg-1.15.0,3,0,,,,,40.000,150.000,130.000,80.000,,,,smg tiktoken [nativex1]
+kimi-k3,stream64,smg-1.16.0,1,0,,,,,40.000,150.000,130.000,80.000,,,,smg tiktoken [nativex1]
+kimi-k3,stream64,smg-1.16.0,2,0,,,,,40.000,140.000,130.000,80.000,,,,smg tiktoken [nativex1]
+kimi-k3,stream64,smg-1.16.0,3,0,,,,,40.000,140.000,130.000,80.000,,,,smg tiktoken [nativex1]
+kimi-k3,stream64,v1,1,0,,,,,40.000,140.000,130.000,80.000,,,,smg tiktoken [nativex1]
+kimi-k3,stream64,v1,2,0,,,,,40.000,150.000,120.000,70.000,,,,smg tiktoken [nativex1]
+kimi-k3,stream64,v1,3,0,,,,,40.000,141.000,121.000,70.000,,,,smg tiktoken [nativex1]
+llama-2-bytefallback,batch1000,fastokens,1,0,,,,,,,,,1217557.000,27965670.468,,fastokens-stack fastokens
+llama-2-bytefallback,batch1000,fastokens,2,0,,,,,,,,,1217557.000,28230628.545,,fastokens-stack fastokens
+llama-2-bytefallback,batch1000,fastokens,3,0,,,,,,,,,1217557.000,28166277.497,,fastokens-stack fastokens
+llama-2-bytefallback,batch1000,smg-1.15.0,1,0,,,,,,,,,1217557.000,66415447.112,61188876.117,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,batch1000,smg-1.15.0,2,0,,,,,,,,,1217557.000,67954677.273,66085915.810,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,batch1000,smg-1.15.0,3,0,,,,,,,,,1217557.000,67009187.286,66183420.761,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,batch1000,smg-1.16.0,1,0,,,,,,,,,1217557.000,71894605.494,70464389.225,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,batch1000,smg-1.16.0,2,0,,,,,,,,,1217557.000,71976151.501,69797335.225,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,batch1000,smg-1.16.0,3,0,,,,,,,,,1217557.000,71946541.170,72892576.698,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,batch1000,v1,1,0,,,,,,,,,1217557.000,14099125.867,13938751.221,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,batch1000,v1,2,0,,,,,,,,,1217557.000,14334993.744,14024924.770,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,batch1000,v1,3,0,,,,,,,,,1217557.000,14194968.506,14012571.295,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,dec2048,fastokens,1,0,153.399,761.711,731.000,971.000,,,,,,,,fastokens-stack fastokens
+llama-2-bytefallback,dec2048,fastokens,2,0,103.469,757.256,671.000,981.000,,,,,,,,fastokens-stack fastokens
+llama-2-bytefallback,dec2048,fastokens,3,0,103.884,747.361,661.000,982.000,,,,,,,,fastokens-stack fastokens
+llama-2-bytefallback,dec2048,smg-1.15.0,1,0,13.370,118.717,50.000,270.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec2048,smg-1.15.0,2,0,13.218,119.162,50.000,291.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec2048,smg-1.15.0,3,0,13.268,119.054,50.000,280.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec2048,smg-1.16.0,1,0,13.532,119.832,50.000,270.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec2048,smg-1.16.0,2,0,13.972,119.353,50.000,300.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec2048,smg-1.16.0,3,0,13.532,123.891,50.000,261.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec2048,v1,1,0,14.817,120.395,50.000,251.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,dec2048,v1,2,0,14.309,122.771,50.000,270.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,dec2048,v1,3,0,14.559,122.649,50.000,250.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,dec32768,fastokens,1,0,122.301,773.027,661.000,611.000,,,,,,,,fastokens-stack fastokens
+llama-2-bytefallback,dec32768,fastokens,2,0,184.926,779.099,671.000,621.000,,,,,,,,fastokens-stack fastokens
+llama-2-bytefallback,dec32768,fastokens,3,0,118.691,778.051,671.000,611.000,,,,,,,,fastokens-stack fastokens
+llama-2-bytefallback,dec32768,smg-1.15.0,1,0,20.337,135.838,70.000,231.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec32768,smg-1.15.0,2,0,20.256,131.329,60.000,220.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec32768,smg-1.15.0,3,0,20.259,131.664,60.000,220.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec32768,smg-1.16.0,1,0,20.970,131.527,60.000,240.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec32768,smg-1.16.0,2,0,20.803,132.431,60.000,230.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec32768,smg-1.16.0,3,0,21.056,131.523,60.000,220.000,,,,,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,dec32768,v1,1,0,21.285,132.346,60.000,231.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,dec32768,v1,2,0,20.969,134.117,61.000,230.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,dec32768,v1,3,0,21.399,133.212,60.000,221.000,,,,,,,,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,stream64,fastokens,1,0,,,,,691.000,1372.000,892.000,842.000,,,,fastokens-stack fastokens
+llama-2-bytefallback,stream64,fastokens,2,0,,,,,702.000,1492.000,1052.000,1001.000,,,,fastokens-stack fastokens
+llama-2-bytefallback,stream64,fastokens,3,0,,,,,711.000,1433.000,922.000,871.000,,,,fastokens-stack fastokens
+llama-2-bytefallback,stream64,smg-1.15.0,1,0,,,,,60.000,291.000,390.000,331.000,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,stream64,smg-1.15.0,2,0,,,,,60.000,290.000,391.000,341.000,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,stream64,smg-1.15.0,3,0,,,,,60.000,290.000,390.000,331.000,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,stream64,smg-1.16.0,1,0,,,,,60.000,270.000,391.000,341.000,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,stream64,smg-1.16.0,2,0,,,,,90.000,401.000,520.000,461.000,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,stream64,smg-1.16.0,3,0,,,,,60.000,271.000,401.000,350.000,,,,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,stream64,v1,1,0,,,,,60.000,290.000,410.000,351.000,,,,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,stream64,v1,2,0,,,,,60.000,300.000,410.000,351.000,,,,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,stream64,v1,3,0,,,,,60.000,281.000,401.000,350.000,,,,smg hf:v1+bytefallback [v1x1]
+llama-3.2-1b,batch1000,fastokens,1,0,,,,,,,,,619765.000,50448067.302,,fastokens-stack fastokens
+llama-3.2-1b,batch1000,fastokens,2,0,,,,,,,,,619765.000,50844945.007,,fastokens-stack fastokens
+llama-3.2-1b,batch1000,fastokens,3,0,,,,,,,,,619765.000,50781508.293,,fastokens-stack fastokens
+llama-3.2-1b,batch1000,smg-1.15.0,1,0,,,,,,,,,619765.000,37552975.832,34901305.888,smg hf:native [nativex1]
+llama-3.2-1b,batch1000,smg-1.15.0,2,0,,,,,,,,,619765.000,40112533.726,38784156.297,smg hf:native [nativex1]
+llama-3.2-1b,batch1000,smg-1.15.0,3,0,,,,,,,,,619765.000,37727424.358,38664534.653,smg hf:native [nativex1]
+llama-3.2-1b,batch1000,smg-1.16.0,1,0,,,,,,,,,619765.000,45871138.637,44333313.209,smg hf:native [nativex1]
+llama-3.2-1b,batch1000,smg-1.16.0,2,0,,,,,,,,,619765.000,42831997.655,44757365.703,smg hf:native [nativex1]
+llama-3.2-1b,batch1000,smg-1.16.0,3,0,,,,,,,,,619765.000,45134810.903,43167425.378,smg hf:native [nativex1]
+llama-3.2-1b,batch1000,v1,1,0,,,,,,,,,619765.000,12579509.558,11763285.714,smg hf:v1 [v1x1]
+llama-3.2-1b,batch1000,v1,2,0,,,,,,,,,619765.000,12171619.471,11366688.777,smg hf:v1 [v1x1]
+llama-3.2-1b,batch1000,v1,3,0,,,,,,,,,619765.000,12773141.270,12604820.862,smg hf:v1 [v1x1]
+llama-3.2-1b,dec2048,fastokens,1,0,30.276,326.448,260.000,280.000,,,,,,,,fastokens-stack fastokens
+llama-3.2-1b,dec2048,fastokens,2,0,29.982,328.418,261.000,280.000,,,,,,,,fastokens-stack fastokens
+llama-3.2-1b,dec2048,fastokens,3,0,29.938,325.083,260.000,280.000,,,,,,,,fastokens-stack fastokens
+llama-3.2-1b,dec2048,smg-1.15.0,1,0,8.998,89.082,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec2048,smg-1.15.0,2,0,8.490,88.891,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec2048,smg-1.15.0,3,0,8.558,88.133,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec2048,smg-1.16.0,1,0,7.810,89.512,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec2048,smg-1.16.0,2,0,7.746,88.515,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec2048,smg-1.16.0,3,0,7.941,89.057,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec2048,v1,1,0,8.920,88.847,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-3.2-1b,dec2048,v1,2,0,9.262,88.529,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-3.2-1b,dec2048,v1,3,0,8.670,89.003,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-3.2-1b,dec32768,fastokens,1,0,41.498,385.807,270.000,240.000,,,,,,,,fastokens-stack fastokens
+llama-3.2-1b,dec32768,fastokens,2,0,40.513,347.547,261.000,241.000,,,,,,,,fastokens-stack fastokens
+llama-3.2-1b,dec32768,fastokens,3,0,40.520,360.682,270.000,240.000,,,,,,,,fastokens-stack fastokens
+llama-3.2-1b,dec32768,smg-1.15.0,1,0,15.162,97.154,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec32768,smg-1.15.0,2,0,15.426,97.499,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec32768,smg-1.15.0,3,0,15.252,97.789,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec32768,smg-1.16.0,1,0,15.173,109.277,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec32768,smg-1.16.0,2,0,14.579,97.399,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec32768,smg-1.16.0,3,0,14.392,98.561,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-3.2-1b,dec32768,v1,1,0,15.722,98.436,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-3.2-1b,dec32768,v1,2,0,15.566,96.999,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-3.2-1b,dec32768,v1,3,0,15.879,97.644,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-3.2-1b,stream64,fastokens,1,0,,,,,240.000,621.000,431.000,371.000,,,,fastokens-stack fastokens
+llama-3.2-1b,stream64,fastokens,2,0,,,,,240.000,611.000,420.000,361.000,,,,fastokens-stack fastokens
+llama-3.2-1b,stream64,fastokens,3,0,,,,,241.000,651.000,421.000,371.000,,,,fastokens-stack fastokens
+llama-3.2-1b,stream64,smg-1.15.0,1,0,,,,,50.000,180.000,110.000,60.000,,,,smg hf:native [nativex1]
+llama-3.2-1b,stream64,smg-1.15.0,2,0,,,,,50.000,191.000,120.000,70.000,,,,smg hf:native [nativex1]
+llama-3.2-1b,stream64,smg-1.15.0,3,0,,,,,50.000,181.000,110.000,60.000,,,,smg hf:native [nativex1]
+llama-3.2-1b,stream64,smg-1.16.0,1,0,,,,,40.000,150.000,120.000,70.000,,,,smg hf:native [nativex1]
+llama-3.2-1b,stream64,smg-1.16.0,2,0,,,,,41.000,150.000,120.000,70.000,,,,smg hf:native [nativex1]
+llama-3.2-1b,stream64,smg-1.16.0,3,0,,,,,40.000,140.000,120.000,70.000,,,,smg hf:native [nativex1]
+llama-3.2-1b,stream64,v1,1,0,,,,,40.000,160.000,130.000,80.000,,,,smg hf:v1 [v1x1]
+llama-3.2-1b,stream64,v1,2,0,,,,,41.000,151.000,130.000,71.000,,,,smg hf:v1 [v1x1]
+llama-3.2-1b,stream64,v1,3,0,,,,,50.000,160.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+llama-4-scout,batch1000,fastokens,1,0,,,,,,,,,524155.000,38065919.682,,fastokens-stack fastokens
+llama-4-scout,batch1000,fastokens,2,0,,,,,,,,,524155.000,37329653.699,,fastokens-stack fastokens
+llama-4-scout,batch1000,fastokens,3,0,,,,,,,,,524155.000,37529665.803,,fastokens-stack fastokens
+llama-4-scout,batch1000,smg-1.15.0,1,0,,,,,,,,,524155.000,32558880.604,31463017.876,smg hf:native [nativex1]
+llama-4-scout,batch1000,smg-1.15.0,2,0,,,,,,,,,524155.000,32410005.819,34631271.816,smg hf:native [nativex1]
+llama-4-scout,batch1000,smg-1.15.0,3,0,,,,,,,,,524155.000,35752353.927,34315143.633,smg hf:native [nativex1]
+llama-4-scout,batch1000,smg-1.16.0,1,0,,,,,,,,,524155.000,39379026.141,41626858.856,smg hf:native [nativex1]
+llama-4-scout,batch1000,smg-1.16.0,2,0,,,,,,,,,524155.000,40260642.834,37516543.733,smg hf:native [nativex1]
+llama-4-scout,batch1000,smg-1.16.0,3,0,,,,,,,,,524155.000,40926894.948,40890385.402,smg hf:native [nativex1]
+llama-4-scout,batch1000,v1,1,0,,,,,,,,,524155.000,8123017.278,7898608.363,smg hf:v1 [v1x1]
+llama-4-scout,batch1000,v1,2,0,,,,,,,,,524155.000,7776271.497,7618913.365,smg hf:v1 [v1x1]
+llama-4-scout,batch1000,v1,3,0,,,,,,,,,524155.000,8106394.222,7798815.193,smg hf:v1 [v1x1]
+llama-4-scout,dec2048,fastokens,1,0,32.839,348.014,261.000,281.000,,,,,,,,fastokens-stack fastokens
+llama-4-scout,dec2048,fastokens,2,0,32.707,352.347,261.000,280.000,,,,,,,,fastokens-stack fastokens
+llama-4-scout,dec2048,fastokens,3,0,32.882,360.034,270.000,280.000,,,,,,,,fastokens-stack fastokens
+llama-4-scout,dec2048,smg-1.15.0,1,0,9.370,91.268,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec2048,smg-1.15.0,2,0,9.277,89.454,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec2048,smg-1.15.0,3,0,9.018,90.407,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec2048,smg-1.16.0,1,0,8.148,89.243,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec2048,smg-1.16.0,2,0,8.089,89.199,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec2048,smg-1.16.0,3,0,8.181,89.185,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec2048,v1,1,0,9.438,89.605,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-4-scout,dec2048,v1,2,0,9.267,89.380,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-4-scout,dec2048,v1,3,0,9.497,89.268,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-4-scout,dec32768,fastokens,1,0,45.351,433.615,300.000,341.000,,,,,,,,fastokens-stack fastokens
+llama-4-scout,dec32768,fastokens,2,0,47.112,442.581,291.000,321.000,,,,,,,,fastokens-stack fastokens
+llama-4-scout,dec32768,fastokens,3,0,43.586,388.526,280.000,330.000,,,,,,,,fastokens-stack fastokens
+llama-4-scout,dec32768,smg-1.15.0,1,0,16.605,104.113,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec32768,smg-1.15.0,2,0,16.607,100.465,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec32768,smg-1.15.0,3,0,17.835,102.077,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec32768,smg-1.16.0,1,0,16.058,100.971,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec32768,smg-1.16.0,2,0,16.081,100.155,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec32768,smg-1.16.0,3,0,16.565,100.326,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+llama-4-scout,dec32768,v1,1,0,17.093,106.339,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-4-scout,dec32768,v1,2,0,17.314,102.189,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-4-scout,dec32768,v1,3,0,17.185,100.279,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+llama-4-scout,stream64,fastokens,1,0,,,,,260.000,732.000,561.000,511.000,,,,fastokens-stack fastokens
+llama-4-scout,stream64,fastokens,2,0,,,,,250.000,651.000,551.000,501.000,,,,fastokens-stack fastokens
+llama-4-scout,stream64,fastokens,3,0,,,,,241.000,631.000,470.000,411.000,,,,fastokens-stack fastokens
+llama-4-scout,stream64,smg-1.15.0,1,0,,,,,50.000,210.000,111.000,70.000,,,,smg hf:native [nativex1]
+llama-4-scout,stream64,smg-1.15.0,2,0,,,,,50.000,210.000,120.000,70.000,,,,smg hf:native [nativex1]
+llama-4-scout,stream64,smg-1.15.0,3,0,,,,,50.000,211.000,111.000,70.000,,,,smg hf:native [nativex1]
+llama-4-scout,stream64,smg-1.16.0,1,0,,,,,50.000,160.000,110.000,61.000,,,,smg hf:native [nativex1]
+llama-4-scout,stream64,smg-1.16.0,2,0,,,,,50.000,171.000,110.000,60.000,,,,smg hf:native [nativex1]
+llama-4-scout,stream64,smg-1.16.0,3,0,,,,,50.000,170.000,110.000,60.000,,,,smg hf:native [nativex1]
+llama-4-scout,stream64,v1,1,0,,,,,41.000,160.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+llama-4-scout,stream64,v1,2,0,,,,,50.000,160.000,121.000,71.000,,,,smg hf:v1 [v1x1]
+llama-4-scout,stream64,v1,3,0,,,,,50.000,160.000,121.000,71.000,,,,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,batch1000,fastokens,1,0,,,,,,,,,788109.000,37939008.673,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,batch1000,fastokens,2,0,,,,,,,,,788109.000,39668897.096,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,batch1000,fastokens,3,0,,,,,,,,,788109.000,38866413.652,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,batch1000,smg-1.15.0,1,0,,,,,,,,,788109.000,29737615.798,29595272.651,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,batch1000,smg-1.15.0,2,0,,,,,,,,,788109.000,30616426.207,29090293.675,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,batch1000,smg-1.15.0,3,0,,,,,,,,,788109.000,29953406.850,29111450.443,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,batch1000,smg-1.16.0,1,0,,,,,,,,,788109.000,39424235.648,38591813.017,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,batch1000,smg-1.16.0,2,0,,,,,,,,,788109.000,37899002.548,38528785.284,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,batch1000,smg-1.16.0,3,0,,,,,,,,,788109.000,40235034.038,39909048.312,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,batch1000,v1,1,0,,,,,,,,,788109.000,10797072.551,10478969.045,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,batch1000,v1,2,0,,,,,,,,,788109.000,10698242.170,10528687.721,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,batch1000,v1,3,0,,,,,,,,,788109.000,10521566.843,10447268.838,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,dec2048,fastokens,1,0,28.785,324.228,260.000,281.000,,,,,,,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,dec2048,fastokens,2,0,28.486,313.308,250.000,280.000,,,,,,,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,dec2048,fastokens,3,0,28.144,316.461,250.000,280.000,,,,,,,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,dec2048,smg-1.15.0,1,0,8.382,88.114,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec2048,smg-1.15.0,2,0,8.157,88.343,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec2048,smg-1.15.0,3,0,8.177,88.324,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec2048,smg-1.16.0,1,0,7.619,88.094,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec2048,smg-1.16.0,2,0,7.428,88.622,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec2048,smg-1.16.0,3,0,7.708,88.554,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec2048,v1,1,0,7.986,87.752,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,dec2048,v1,2,0,8.285,90.471,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,dec2048,v1,3,0,8.539,88.011,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,dec32768,fastokens,1,0,37.501,335.452,260.000,240.000,,,,,,,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,dec32768,fastokens,2,0,37.461,363.759,271.000,240.000,,,,,,,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,dec32768,fastokens,3,0,37.869,347.597,260.000,240.000,,,,,,,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,dec32768,smg-1.15.0,1,0,14.775,101.307,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec32768,smg-1.15.0,2,0,15.007,100.829,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec32768,smg-1.15.0,3,0,14.918,101.721,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec32768,smg-1.16.0,1,0,14.694,101.278,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec32768,smg-1.16.0,2,0,14.701,101.063,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec32768,smg-1.16.0,3,0,14.359,102.323,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,dec32768,v1,1,0,15.463,100.167,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,dec32768,v1,2,0,15.308,99.962,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,dec32768,v1,3,0,15.114,101.815,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,stream64,fastokens,1,0,,,,,240.000,621.000,411.000,360.000,,,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,stream64,fastokens,2,0,,,,,250.000,701.000,430.000,371.000,,,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,stream64,fastokens,3,0,,,,,241.000,651.000,411.000,361.000,,,,fastokens-stack fastokens
+mimo-v2.6-flash-rl,stream64,smg-1.15.0,1,0,,,,,50.000,171.000,130.000,80.000,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,stream64,smg-1.15.0,2,0,,,,,50.000,200.000,140.000,90.000,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,stream64,smg-1.15.0,3,0,,,,,50.000,180.000,130.000,80.000,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,stream64,smg-1.16.0,1,0,,,,,40.000,150.000,121.000,70.000,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,stream64,smg-1.16.0,2,0,,,,,41.000,151.000,120.000,70.000,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,stream64,smg-1.16.0,3,0,,,,,41.000,160.000,121.000,70.000,,,,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,stream64,v1,1,0,,,,,40.000,150.000,130.000,71.000,,,,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,stream64,v1,2,0,,,,,50.000,160.000,121.000,70.000,,,,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,stream64,v1,3,0,,,,,40.000,160.000,130.000,71.000,,,,smg hf:v1 [v1x1]
+minimax-m3,batch1000,fastokens,1,0,,,,,,,,,589859.000,27000272.676,,fastokens-stack fastokens
+minimax-m3,batch1000,fastokens,2,0,,,,,,,,,589859.000,26697745.443,,fastokens-stack fastokens
+minimax-m3,batch1000,fastokens,3,0,,,,,,,,,589859.000,27496051.975,,fastokens-stack fastokens
+minimax-m3,batch1000,smg-1.15.0,1,0,,,,,,,,,589859.000,24222616.182,22876548.802,smg hf:native [nativex1]
+minimax-m3,batch1000,smg-1.15.0,2,0,,,,,,,,,589859.000,25134405.338,24461814.088,smg hf:native [nativex1]
+minimax-m3,batch1000,smg-1.15.0,3,0,,,,,,,,,589859.000,24309538.854,24172738.206,smg hf:native [nativex1]
+minimax-m3,batch1000,smg-1.16.0,1,0,,,,,,,,,589859.000,31316144.624,31468209.511,smg hf:native [nativex1]
+minimax-m3,batch1000,smg-1.16.0,2,0,,,,,,,,,589859.000,31274810.432,31223230.597,smg hf:native [nativex1]
+minimax-m3,batch1000,smg-1.16.0,3,0,,,,,,,,,589859.000,29278195.897,28796133.952,smg hf:native [nativex1]
+minimax-m3,batch1000,v1,1,0,,,,,,,,,589859.000,7456887.560,7382274.234,smg hf:v1 [v1x1]
+minimax-m3,batch1000,v1,2,0,,,,,,,,,589859.000,7273191.927,7282058.841,smg hf:v1 [v1x1]
+minimax-m3,batch1000,v1,3,0,,,,,,,,,589859.000,7479067.805,7298967.134,smg hf:v1 [v1x1]
+minimax-m3,dec2048,fastokens,1,0,24.500,294.265,230.000,280.000,,,,,,,,fastokens-stack fastokens
+minimax-m3,dec2048,fastokens,2,0,24.358,295.086,230.000,281.000,,,,,,,,fastokens-stack fastokens
+minimax-m3,dec2048,fastokens,3,0,24.374,294.382,230.000,280.000,,,,,,,,fastokens-stack fastokens
+minimax-m3,dec2048,smg-1.15.0,1,0,6.817,94.955,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec2048,smg-1.15.0,2,0,7.047,94.520,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec2048,smg-1.15.0,3,0,6.964,94.397,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec2048,smg-1.16.0,1,0,6.558,94.892,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec2048,smg-1.16.0,2,0,6.939,94.843,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec2048,smg-1.16.0,3,0,6.621,95.111,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec2048,v1,1,0,7.120,94.120,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+minimax-m3,dec2048,v1,2,0,6.920,94.291,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+minimax-m3,dec2048,v1,3,0,7.008,94.256,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+minimax-m3,dec32768,fastokens,1,0,37.704,333.075,252.000,231.000,,,,,,,,fastokens-stack fastokens
+minimax-m3,dec32768,fastokens,2,0,41.704,365.886,261.000,240.000,,,,,,,,fastokens-stack fastokens
+minimax-m3,dec32768,fastokens,3,0,38.103,335.885,260.000,231.000,,,,,,,,fastokens-stack fastokens
+minimax-m3,dec32768,smg-1.15.0,1,0,15.070,104.370,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec32768,smg-1.15.0,2,0,14.618,100.918,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec32768,smg-1.15.0,3,0,15.056,100.688,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec32768,smg-1.16.0,1,0,14.683,100.678,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec32768,smg-1.16.0,2,0,14.842,100.728,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec32768,smg-1.16.0,3,0,14.882,101.091,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+minimax-m3,dec32768,v1,1,0,15.405,101.246,50.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+minimax-m3,dec32768,v1,2,0,15.215,100.226,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+minimax-m3,dec32768,v1,3,0,15.146,100.155,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+minimax-m3,stream64,fastokens,1,0,,,,,240.000,551.000,490.000,440.000,,,,fastokens-stack fastokens
+minimax-m3,stream64,fastokens,2,0,,,,,240.000,561.000,481.000,431.000,,,,fastokens-stack fastokens
+minimax-m3,stream64,fastokens,3,0,,,,,241.000,560.000,491.000,441.000,,,,fastokens-stack fastokens
+minimax-m3,stream64,smg-1.15.0,1,0,,,,,50.000,170.000,120.000,70.000,,,,smg hf:native [nativex1]
+minimax-m3,stream64,smg-1.15.0,2,0,,,,,50.000,180.000,120.000,70.000,,,,smg hf:native [nativex1]
+minimax-m3,stream64,smg-1.15.0,3,0,,,,,50.000,171.000,120.000,70.000,,,,smg hf:native [nativex1]
+minimax-m3,stream64,smg-1.16.0,1,0,,,,,40.000,140.000,130.000,80.000,,,,smg hf:native [nativex1]
+minimax-m3,stream64,smg-1.16.0,2,0,,,,,40.000,140.000,121.000,71.000,,,,smg hf:native [nativex1]
+minimax-m3,stream64,smg-1.16.0,3,0,,,,,40.000,140.000,121.000,80.000,,,,smg hf:native [nativex1]
+minimax-m3,stream64,v1,1,0,,,,,50.000,170.000,121.000,71.000,,,,smg hf:v1 [v1x1]
+minimax-m3,stream64,v1,2,0,,,,,50.000,161.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+minimax-m3,stream64,v1,3,0,,,,,50.000,170.000,120.000,70.000,,,,smg hf:v1 [v1x1]
+mistral-tekken,batch1000,fastokens,1,0,,,,,,,,,505333.000,1298421.637,,fastokens-stack tekken
+mistral-tekken,batch1000,fastokens,2,0,,,,,,,,,505333.000,1355638.189,,fastokens-stack tekken
+mistral-tekken,batch1000,fastokens,3,0,,,,,,,,,505333.000,1350496.574,,fastokens-stack tekken
+mistral-tekken,batch1000,smg-1.15.0,1,0,,,,,,,,,505333.000,35166942.644,35273714.667,smg tiktoken [nativex1]
+mistral-tekken,batch1000,smg-1.15.0,2,0,,,,,,,,,505333.000,36506132.529,31830628.526,smg tiktoken [nativex1]
+mistral-tekken,batch1000,smg-1.15.0,3,0,,,,,,,,,505333.000,35157750.449,34040012.085,smg tiktoken [nativex1]
+mistral-tekken,batch1000,smg-1.16.0,1,0,,,,,,,,,505333.000,35362117.183,37718440.859,smg tiktoken [nativex1]
+mistral-tekken,batch1000,smg-1.16.0,2,0,,,,,,,,,505333.000,37192408.946,35810629.769,smg tiktoken [nativex1]
+mistral-tekken,batch1000,smg-1.16.0,3,0,,,,,,,,,505333.000,39405937.938,37960866.127,smg tiktoken [nativex1]
+mistral-tekken,batch1000,v1,1,0,,,,,,,,,505333.000,37535605.616,39654826.999,smg tiktoken [nativex1]
+mistral-tekken,batch1000,v1,2,0,,,,,,,,,505333.000,35709303.839,33875400.430,smg tiktoken [nativex1]
+mistral-tekken,batch1000,v1,3,0,,,,,,,,,505333.000,40061732.104,34530154.753,smg tiktoken [nativex1]
+mistral-tekken,dec2048,fastokens,1,134,,,,,,,,,,,,
+mistral-tekken,dec2048,fastokens,2,134,,,,,,,,,,,,
+mistral-tekken,dec2048,fastokens,3,134,,,,,,,,,,,,
+mistral-tekken,dec2048,smg-1.15.0,1,0,8.700,88.803,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec2048,smg-1.15.0,2,0,8.329,88.999,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec2048,smg-1.15.0,3,0,8.836,88.984,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec2048,smg-1.16.0,1,0,7.556,89.067,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec2048,smg-1.16.0,2,0,7.849,89.048,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec2048,smg-1.16.0,3,0,7.580,89.160,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec2048,v1,1,0,8.386,89.664,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec2048,v1,2,0,8.524,88.642,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec2048,v1,3,0,8.524,88.954,40.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec32768,fastokens,1,134,,,,,,,,,,,,
+mistral-tekken,dec32768,fastokens,2,134,,,,,,,,,,,,
+mistral-tekken,dec32768,fastokens,3,134,,,,,,,,,,,,
+mistral-tekken,dec32768,smg-1.15.0,1,0,16.495,111.376,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec32768,smg-1.15.0,2,0,16.091,98.691,41.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec32768,smg-1.15.0,3,0,16.099,98.525,41.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec32768,smg-1.16.0,1,0,15.593,98.680,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec32768,smg-1.16.0,2,0,15.614,98.802,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec32768,smg-1.16.0,3,0,15.273,101.128,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec32768,v1,1,0,16.243,101.741,41.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec32768,v1,2,0,15.880,97.966,50.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,dec32768,v1,3,0,16.236,98.867,41.000,50.000,,,,,,,,smg tiktoken [nativex1]
+mistral-tekken,stream64,fastokens,1,0,,,,,341.000,701.000,1422.000,1372.000,,,,fastokens-stack tekken
+mistral-tekken,stream64,fastokens,2,0,,,,,340.000,671.000,1332.000,1271.000,,,,fastokens-stack tekken
+mistral-tekken,stream64,fastokens,3,0,,,,,341.000,681.000,1302.000,1242.000,,,,fastokens-stack tekken
+mistral-tekken,stream64,smg-1.15.0,1,0,,,,,41.000,160.000,120.000,70.000,,,,smg tiktoken [nativex1]
+mistral-tekken,stream64,smg-1.15.0,2,0,,,,,50.000,170.000,120.000,70.000,,,,smg tiktoken [nativex1]
+mistral-tekken,stream64,smg-1.15.0,3,0,,,,,40.000,170.000,121.000,70.000,,,,smg tiktoken [nativex1]
+mistral-tekken,stream64,smg-1.16.0,1,0,,,,,40.000,170.000,240.000,190.000,,,,smg tiktoken [nativex1]
+mistral-tekken,stream64,smg-1.16.0,2,0,,,,,40.000,170.000,241.000,190.000,,,,smg tiktoken [nativex1]
+mistral-tekken,stream64,smg-1.16.0,3,0,,,,,40.000,171.000,241.000,190.000,,,,smg tiktoken [nativex1]
+mistral-tekken,stream64,v1,1,0,,,,,40.000,161.000,250.000,190.000,,,,smg tiktoken [nativex1]
+mistral-tekken,stream64,v1,2,0,,,,,40.000,160.000,270.000,211.000,,,,smg tiktoken [nativex1]
+mistral-tekken,stream64,v1,3,0,,,,,40.000,170.000,240.000,190.000,,,,smg tiktoken [nativex1]
+qwen3.6-27b,batch1000,fastokens,1,0,,,,,,,,,518516.000,24388691.729,,fastokens-stack fastokens
+qwen3.6-27b,batch1000,fastokens,2,0,,,,,,,,,518516.000,24732281.906,,fastokens-stack fastokens
+qwen3.6-27b,batch1000,fastokens,3,0,,,,,,,,,518516.000,24202808.139,,fastokens-stack fastokens
+qwen3.6-27b,batch1000,smg-1.15.0,1,0,,,,,,,,,518516.000,22976895.794,22377721.609,smg hf:native [nativex1]
+qwen3.6-27b,batch1000,smg-1.15.0,2,0,,,,,,,,,518516.000,23283798.972,22254471.015,smg hf:native [nativex1]
+qwen3.6-27b,batch1000,smg-1.15.0,3,0,,,,,,,,,518516.000,22239547.231,21179001.274,smg hf:native [nativex1]
+qwen3.6-27b,batch1000,smg-1.16.0,1,0,,,,,,,,,518516.000,31821376.690,31165319.797,smg hf:native [nativex1]
+qwen3.6-27b,batch1000,smg-1.16.0,2,0,,,,,,,,,518516.000,31511557.609,31220511.526,smg hf:native [nativex1]
+qwen3.6-27b,batch1000,smg-1.16.0,3,0,,,,,,,,,518516.000,30454034.797,30742523.157,smg hf:native [nativex1]
+qwen3.6-27b,batch1000,v1,1,0,,,,,,,,,518516.000,3906057.522,3969658.049,smg hf:v1 [v1x1]
+qwen3.6-27b,batch1000,v1,2,0,,,,,,,,,518516.000,4025876.651,3944149.823,smg hf:v1 [v1x1]
+qwen3.6-27b,batch1000,v1,3,0,,,,,,,,,518516.000,3988092.454,3960856.064,smg hf:v1 [v1x1]
+qwen3.6-27b,dec2048,fastokens,1,0,32.838,346.429,260.000,280.000,,,,,,,,fastokens-stack fastokens
+qwen3.6-27b,dec2048,fastokens,2,0,32.809,345.462,251.000,280.000,,,,,,,,fastokens-stack fastokens
+qwen3.6-27b,dec2048,fastokens,3,0,32.892,348.381,260.000,280.000,,,,,,,,fastokens-stack fastokens
+qwen3.6-27b,dec2048,smg-1.15.0,1,0,9.359,88.774,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec2048,smg-1.15.0,2,0,8.930,89.229,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec2048,smg-1.15.0,3,0,8.969,88.632,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec2048,smg-1.16.0,1,0,8.171,88.446,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec2048,smg-1.16.0,2,0,8.294,88.603,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec2048,smg-1.16.0,3,0,8.313,88.466,40.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec2048,v1,1,0,9.219,88.378,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+qwen3.6-27b,dec2048,v1,2,0,10.005,88.906,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+qwen3.6-27b,dec2048,v1,3,0,9.194,88.294,40.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+qwen3.6-27b,dec32768,fastokens,1,0,41.701,349.995,270.000,240.000,,,,,,,,fastokens-stack fastokens
+qwen3.6-27b,dec32768,fastokens,2,0,41.223,354.460,270.000,240.000,,,,,,,,fastokens-stack fastokens
+qwen3.6-27b,dec32768,fastokens,3,0,41.445,350.901,270.000,240.000,,,,,,,,fastokens-stack fastokens
+qwen3.6-27b,dec32768,smg-1.15.0,1,0,16.498,99.171,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec32768,smg-1.15.0,2,0,16.053,99.383,41.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec32768,smg-1.15.0,3,0,16.496,102.673,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec32768,smg-1.16.0,1,0,16.193,99.984,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec32768,smg-1.16.0,2,0,16.068,99.077,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec32768,smg-1.16.0,3,0,15.671,99.382,50.000,50.000,,,,,,,,smg hf:native [nativex1]
+qwen3.6-27b,dec32768,v1,1,0,16.815,98.704,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+qwen3.6-27b,dec32768,v1,2,0,16.343,98.926,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+qwen3.6-27b,dec32768,v1,3,0,16.475,98.394,41.000,50.000,,,,,,,,smg hf:v1 [v1x1]
+qwen3.6-27b,stream64,fastokens,1,0,,,,,240.000,531.000,501.000,451.000,,,,fastokens-stack fastokens
+qwen3.6-27b,stream64,fastokens,2,0,,,,,240.000,521.000,471.000,421.000,,,,fastokens-stack fastokens
+qwen3.6-27b,stream64,fastokens,3,0,,,,,240.000,511.000,481.000,431.000,,,,fastokens-stack fastokens
+qwen3.6-27b,stream64,smg-1.15.0,1,0,,,,,40.000,160.000,121.000,71.000,,,,smg hf:native [nativex1]
+qwen3.6-27b,stream64,smg-1.15.0,2,0,,,,,40.000,160.000,120.000,70.000,,,,smg hf:native [nativex1]
+qwen3.6-27b,stream64,smg-1.15.0,3,0,,,,,40.000,160.000,130.000,80.000,,,,smg hf:native [nativex1]
+qwen3.6-27b,stream64,smg-1.16.0,1,0,,,,,40.000,141.000,121.000,80.000,,,,smg hf:native [nativex1]
+qwen3.6-27b,stream64,smg-1.16.0,2,0,,,,,40.000,140.000,121.000,70.000,,,,smg hf:native [nativex1]
+qwen3.6-27b,stream64,smg-1.16.0,3,0,,,,,40.000,140.000,130.000,80.000,,,,smg hf:native [nativex1]
+qwen3.6-27b,stream64,v1,1,0,,,,,40.000,150.000,130.000,70.000,,,,smg hf:v1 [v1x1]
+qwen3.6-27b,stream64,v1,2,0,,,,,40.000,150.000,130.000,80.000,,,,smg hf:v1 [v1x1]
+qwen3.6-27b,stream64,v1,3,0,,,,,40.000,150.000,130.000,80.000,,,,smg hf:v1 [v1x1]
+t5-small,batch1000,fastokens,1,0,,,,,,,,,566974.000,647789.460,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,batch1000,fastokens,2,0,,,,,,,,,566974.000,648136.080,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,batch1000,fastokens,3,0,,,,,,,,,566974.000,665091.739,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,batch1000,smg-1.15.0,1,0,,,,,,,,,566974.000,735637.473,714353.046,smg hf:tokenizers [tokenizersx1]
+t5-small,batch1000,smg-1.15.0,2,0,,,,,,,,,566974.000,724121.389,728669.875,smg hf:tokenizers [tokenizersx1]
+t5-small,batch1000,smg-1.15.0,3,0,,,,,,,,,566974.000,757912.945,730457.848,smg hf:tokenizers [tokenizersx1]
+t5-small,batch1000,smg-1.16.0,1,0,,,,,,,,,566974.000,742371.235,743520.423,smg hf:tokenizers [tokenizersx1]
+t5-small,batch1000,smg-1.16.0,2,0,,,,,,,,,566974.000,748740.046,735449.874,smg hf:tokenizers [tokenizersx1]
+t5-small,batch1000,smg-1.16.0,3,0,,,,,,,,,566974.000,766114.079,735536.474,smg hf:tokenizers [tokenizersx1]
+t5-small,batch1000,v1,1,0,,,,,,,,,566974.000,786545.350,755948.209,smg hf:tokenizers [tokenizersx1]
+t5-small,batch1000,v1,2,0,,,,,,,,,566974.000,785981.968,754688.654,smg hf:tokenizers [tokenizersx1]
+t5-small,batch1000,v1,3,0,,,,,,,,,566974.000,787376.535,747311.401,smg hf:tokenizers [tokenizersx1]
+t5-small,dec2048,fastokens,1,0,125.754,481.266,421.000,401.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,dec2048,fastokens,2,0,123.436,471.504,410.000,361.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,dec2048,fastokens,3,0,122.654,471.308,410.000,361.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,dec2048,smg-1.15.0,1,0,105.827,435.522,361.000,381.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec2048,smg-1.15.0,2,0,104.081,434.955,361.000,391.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec2048,smg-1.15.0,3,0,100.960,442.274,370.000,391.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec2048,smg-1.16.0,1,0,6.274,107.963,50.000,211.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec2048,smg-1.16.0,2,0,6.655,107.979,50.000,210.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec2048,smg-1.16.0,3,0,6.651,107.597,50.000,201.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec2048,v1,1,0,6.597,107.915,50.000,200.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec2048,v1,2,0,6.777,107.518,50.000,210.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec2048,v1,3,0,6.651,107.269,50.000,210.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec32768,fastokens,1,0,201.630,479.326,401.000,551.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,dec32768,fastokens,2,0,180.046,490.668,411.000,571.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,dec32768,fastokens,3,0,160.761,485.002,410.000,561.000,,,,,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,dec32768,smg-1.15.0,1,0,159.822,467.468,371.000,832.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec32768,smg-1.15.0,2,0,182.853,468.219,380.000,841.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec32768,smg-1.15.0,3,0,145.948,462.974,371.000,801.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec32768,smg-1.16.0,1,0,12.463,124.341,60.000,270.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec32768,smg-1.16.0,2,0,12.449,124.632,60.000,270.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec32768,smg-1.16.0,3,0,12.297,123.936,60.000,270.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec32768,v1,1,0,12.396,123.458,60.000,261.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec32768,v1,2,0,12.409,123.669,60.000,261.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,dec32768,v1,3,0,12.537,123.152,60.000,271.000,,,,,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,stream64,fastokens,1,0,,,,,420.000,731.000,661.000,611.000,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,stream64,fastokens,2,0,,,,,420.000,821.000,612.000,561.000,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,stream64,fastokens,3,0,,,,,411.000,821.000,641.000,581.000,,,,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,stream64,smg-1.15.0,1,0,,,,,351.000,571.000,540.000,480.000,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,stream64,smg-1.15.0,2,0,,,,,371.000,861.000,541.000,491.000,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,stream64,smg-1.15.0,3,0,,,,,361.000,571.000,531.000,471.000,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,stream64,smg-1.16.0,1,0,,,,,60.000,231.000,381.000,320.000,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,stream64,smg-1.16.0,2,0,,,,,60.000,240.000,361.000,310.000,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,stream64,smg-1.16.0,3,0,,,,,60.000,231.000,361.000,301.000,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,stream64,v1,1,0,,,,,60.000,221.000,381.000,330.000,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,stream64,v1,2,0,,,,,60.000,220.000,361.000,300.000,,,,smg hf:tokenizers [tokenizersx1]
+t5-small,stream64,v1,3,0,,,,,60.000,221.000,360.000,310.000,,,,smg hf:tokenizers [tokenizersx1]

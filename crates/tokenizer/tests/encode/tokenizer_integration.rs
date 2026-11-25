@@ -360,6 +360,22 @@ fn test_special_tokens() {
     println!("Special tokens: {special_tokens:?}");
 }
 
+/// The file's BPE section says `byte_fallback`, so on the sentencepiece path
+/// the load builds no model and its listing answers in the model's place:
+/// `max_token_id` still counts the whole vocabulary (the three added tokens
+/// are below its last id), not just the empty model's added tokens.
+#[test]
+fn max_token_id_counts_the_vocabulary_of_an_unbuilt_model() {
+    use llm_tokenizer::traits::Tokenizer as TokenizerTrait;
+
+    let (_dir, tokenizer_path) = tokenizer_file();
+    let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
+        .expect("Failed to load tokenizer");
+    // `<unk>`, `<s>`, `</s>`, the 256 byte tokens, `▁`, 26 letters, 12 merges.
+    assert_eq!(TokenizerTrait::vocab_size(&tokenizer), 298);
+    assert_eq!(TokenizerTrait::max_token_id(&tokenizer), Some(297));
+}
+
 #[test]
 fn test_thread_safety() {
     use std::thread;
@@ -572,60 +588,6 @@ async fn test_qwen3_vl_json_template_priority() {
                 let _tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
                     .expect("Failed to load tokenizer");
                 println!("✓ Qwen3-VL: Loaded tokenizer with template priority handling");
-            }
-        }
-        Err(e) => {
-            println!("Download test skipped due to error: {e}");
-        }
-    }
-}
-
-#[tokio::test]
-#[expect(clippy::print_stdout, reason = "test diagnostic output")]
-async fn test_llava_separate_jinja_template() {
-    use llm_tokenizer::hub::download_tokenizer_from_hf;
-
-    // Test 5: llava has chat_template.jinja as a separate file, not in tokenizer_config.json
-    match download_tokenizer_from_hf("llava-hf/llava-1.5-7b-hf").await {
-        Ok(cache_dir) => {
-            // Check for .jinja file
-            let jinja_path = cache_dir.join("chat_template.jinja");
-            let has_jinja = jinja_path.exists()
-                || std::fs::read_dir(&cache_dir)
-                    .map(|entries| {
-                        entries.filter_map(|e| e.ok()).any(|e| {
-                            e.file_name()
-                                .to_str()
-                                .is_some_and(|name| name.ends_with(".jinja"))
-                        })
-                    })
-                    .unwrap_or(false);
-
-            if has_jinja {
-                println!("✓ llava: Found separate .jinja chat template file");
-            }
-
-            // Check tokenizer_config.json - should NOT have embedded template
-            let config_path = cache_dir.join("tokenizer_config.json");
-            if config_path.exists() {
-                let config_content =
-                    std::fs::read_to_string(&config_path).expect("Failed to read config");
-
-                // llava might not have chat_template in config
-                if !config_content.contains("\"chat_template\"") {
-                    println!("✓ llava: No embedded template in config (as expected)");
-                }
-            }
-
-            // Load tokenizer - should auto-discover the .jinja file
-            let tokenizer_path = cache_dir.join("tokenizer.json");
-            if tokenizer_path.exists() {
-                let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap());
-                if tokenizer.is_ok() {
-                    println!("✓ llava: Loaded tokenizer with auto-discovered .jinja template");
-                } else {
-                    println!("Note: llava tokenizer loading failed - might need specific handling");
-                }
             }
         }
         Err(e) => {

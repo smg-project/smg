@@ -1,0 +1,2124 @@
+//! Grand Central's two wire contracts, compiled and parsed at test
+//! time (`contracts/README.md`): the gRPC protocol in package `smg.policy.v1`
+//! and the WebAssembly world `smg:policy@1.2.0`. Nothing at run time reads
+//! the files; the world's `types` interface is rendered from the crate's
+//! types by the `wit` module and held to the committed file by `tests/wit.rs`.
+//! The tests here hold four things: the
+//! files compile; the view, decision and lifecycle messages and records
+//! mirror this crate's types field for field, in the crate's order; the
+//! versioned names a plugin author builds against (the package, the RPCs and
+//! their streaming shapes, the `oneof` cases, the worlds, the interfaces and
+//! their functions) cannot move without a change to the lists below; and the
+//! packed request block's padding keeps its u64 sections 8-byte aligned, as
+//! the world's comment states.
+//!
+//! The protocol compiles through `protoc` on the path (or named by `PROTOC`),
+//! the compiler the repository's generated gRPC clients already need.
+
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
+
+use prost_types::{
+    field_descriptor_proto::{Label, Type},
+    DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
+};
+use smg_grand_central::{
+    cases,
+    document::{PolicySpec, DENIED_HEADERS},
+    engine::{fingerprint, Identity, Phase, RequestFacts, Role, ShedReason},
+    mirrored,
+    tracking::Side,
+};
+use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
+
+const PLUGIN_PROTO: &str = "policy_plugin.proto";
+const CONTROLLER_PROTO: &str = "grand_central.proto";
+const WORLD_WIT: &str = "smg-policy.wit";
+const PACKAGE: &str = "smg.policy.v1";
+const WIT_NAMESPACE: &str = "smg";
+const WIT_PACKAGE: &str = "policy";
+const WIT_VERSION: &str = "1.2.0";
+
+/// The header deny-list of design section 4.6: the names no view may read
+/// and no routing-key override may key on, lowercase, in this order, each
+/// once. A name added or moved here is a contract change.
+const DENIED_HEADER_NAMES: [&str; 7] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
+
+#[test]
+fn the_header_deny_list_holds_its_seven_names() {
+    assert_eq!(DENIED_HEADERS, DENIED_HEADER_NAMES, "the deny-list moved");
+    for name in DENIED_HEADERS {
+        assert_eq!(name, name.to_ascii_lowercase(), "{name} is not lowercase");
+    }
+}
+
+// A record's field names and an enum's case names are listed by the
+// library's two proof macros (`record!`, `cases!`, its module `mirrored`):
+// a pattern that names every field without `..` and a match without a
+// wildcard arm, so a type cannot gain, lose or rename one without this file
+// failing to compile. No such pattern of a type marked non-exhaustive
+// builds outside the library: the lists of those types are stated there, by
+// the same macros, and read here (`mirrored::outcome` and its like).
+
+fn candidate_record() -> &'static [&'static str] {
+    mirrored::candidate()
+}
+
+/// A candidate's affinity facts: a column beside the rows in the crate, five
+/// fields of the candidate's own record on both wires, at the numbers they
+/// were given as fields of the row.
+fn affinity_record() -> &'static [&'static str] {
+    mirrored::affinity_facts()
+}
+
+fn request_record() -> &'static [&'static str] {
+    mirrored::request_facts()
+}
+
+fn load_row_record() -> &'static [&'static str] {
+    mirrored::load_row()
+}
+
+fn constraints_record() -> &'static [&'static str] {
+    mirrored::constraints()
+}
+
+fn pool_record() -> &'static [&'static str] {
+    mirrored::pool_facts()
+}
+
+fn zone_record() -> &'static [&'static str] {
+    mirrored::zone_capacity()
+}
+
+fn media_record() -> &'static [&'static str] {
+    mirrored::media_counts()
+}
+
+fn health_record() -> &'static [&'static str] {
+    mirrored::health()
+}
+
+fn target_record() -> &'static [&'static str] {
+    mirrored::target()
+}
+
+fn pair_record() -> &'static [&'static str] {
+    mirrored::pair()
+}
+
+fn shed_record() -> &'static [&'static str] {
+    mirrored::shed()
+}
+
+fn queue_record() -> &'static [&'static str] {
+    mirrored::queue()
+}
+
+fn trace_record() -> &'static [&'static str] {
+    mirrored::trace()
+}
+
+/// The lease's session crosses under the name both contracts still spell,
+/// `session_key`. A gateway's client reads it under that name. A change that
+/// renames the field renames it in both contracts and takes this pair out.
+fn lease_record() -> &'static [&'static str] {
+    mirrored::lease()
+}
+
+fn outcome_record() -> &'static [&'static str] {
+    mirrored::outcome()
+}
+
+/// The crate's enums the two contracts spell out, with the proto enum (a
+/// top-level name, or `Message.Nested`) and its value prefix, and the name
+/// of the WIT enum or variant.
+fn enum_mirrors() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+)> {
+    vec![
+        (
+            "Role",
+            "ROLE",
+            "role",
+            cases!(
+                Role,
+                Role {
+                    Single,
+                    Prefill,
+                    Decode,
+                    Encode
+                }
+            ),
+        ),
+        (
+            "Phase",
+            "PHASE",
+            "phase",
+            cases!(
+                Phase,
+                Phase {
+                    Single,
+                    Prefill,
+                    Decode,
+                    Encode
+                }
+            ),
+        ),
+        (
+            "Side",
+            "SIDE",
+            "side",
+            cases!(
+                Side,
+                Side {
+                    Single,
+                    Prefill,
+                    Decode,
+                    Encode
+                }
+            ),
+        ),
+        ("HashKind", "HASH_KIND", "hash-kind", mirrored::hash_kind()),
+        (
+            "SignalSource",
+            "SIGNAL_SOURCE",
+            "signal-source",
+            mirrored::signal_source(),
+        ),
+        (
+            "OverloadRegime",
+            "OVERLOAD_REGIME",
+            "overload-regime",
+            mirrored::overload_regime(),
+        ),
+        (
+            "LeaseKind",
+            "LEASE_KIND",
+            "lease-kind",
+            mirrored::lease_kind(),
+        ),
+        (
+            "Completed.Class",
+            "CLASS",
+            "transport-class",
+            mirrored::transport_class(),
+        ),
+        (
+            "Released.Reason",
+            "REASON",
+            "release-reason",
+            mirrored::release_reason(),
+        ),
+        (
+            "MembershipChange.Kind",
+            "KIND",
+            "membership",
+            mirrored::membership(),
+        ),
+    ]
+}
+
+/// The shed reasons have a proto enum and no WIT counterpart (a guest never
+/// sheds; the host does).
+fn shed_reasons() -> &'static [&'static str] {
+    cases!(
+        ShedReason,
+        ShedReason {
+            Saturated,
+            FlowLimit,
+            NoEndpoints,
+            PolicyDeclined,
+            Deadline
+        }
+    )
+}
+
+/// The signal kinds have a WIT variant; the proto spells them as a `oneof`
+/// whose third case names its unit.
+fn signal_cases() -> &'static [&'static str] {
+    mirrored::signal()
+}
+
+/// How a message of the protocol relates to the record it mirrors.
+struct ProtoMirror {
+    message: &'static str,
+    /// The record's fields, in the crate's order.
+    record: &'static [&'static str],
+    /// Record fields the wire does not carry: a host instant, a host-local
+    /// position, the in-process length of a fixed array, the trace the wire
+    /// hoists into `Decision`, whether a report counts resident tokens, a
+    /// fingerprint the host carries of a name the wire carries, the place
+    /// of a row's engine among the engines of its host's list.
+    host_only: &'static [&'static str],
+    /// Wire fields outside the record, in the wire's order: an event's key
+    /// before it, controller facts, a wire-only input, the observability
+    /// record's fields after it, and the fields of a record the crate keeps
+    /// beside this one (a candidate's affinity facts).
+    wire_only: &'static [&'static str],
+    /// Every wire field in number order with its scalar kind.
+    wire: &'static [(&'static str, Type)],
+    /// The `repeated` fields among them.
+    repeated: &'static [&'static str],
+    /// The proto3 `optional` fields among them: explicit presence, the
+    /// crate's `Option`.
+    optional: &'static [&'static str],
+}
+
+fn proto_mirrors() -> Vec<ProtoMirror> {
+    vec![
+        ProtoMirror {
+            message: "LoadRow",
+            record: load_row_record(),
+            host_only: &["resident_counted"],
+            wire_only: &[],
+            wire: &[
+                ("running", Type::Uint32),
+                ("queued", Type::Uint32),
+                ("waiting_uncached_tokens", Type::Uint32),
+                ("kv_usage_permille", Type::Uint32),
+                ("active_kv_permille", Type::Uint32),
+                ("live_rate", Type::Uint32),
+                ("resident_tokens", Type::Uint32),
+                ("report_age_ms", Type::Uint32),
+                ("source", Type::Enum),
+                ("max_running", Type::Uint32),
+            ],
+            repeated: &[],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "MediaCounts",
+            record: media_record(),
+            host_only: &[],
+            wire_only: &[],
+            wire: &[
+                ("images", Type::Uint32),
+                ("audio", Type::Uint32),
+                ("video", Type::Uint32),
+                ("bytes", Type::Uint32),
+            ],
+            repeated: &[],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "Candidate",
+            record: candidate_record(),
+            host_only: &["position", "load_sampled_at_micros", "engine"],
+            wire_only: affinity_record(),
+            wire: &[
+                ("id", Type::Fixed64),
+                ("role", Type::Enum),
+                ("dp_rank", Type::Uint32),
+                ("dp_size", Type::Uint32),
+                ("health", Type::Uint32),
+                ("wire_modes", Type::Uint32),
+                ("engine_kind", Type::Uint32),
+                ("connector", Type::Uint32),
+                ("in_flight", Type::Uint32),
+                ("load", Type::Message),
+                ("overlap_blocks", Type::Uint32),
+                ("predicted_blocks", Type::Uint32),
+                ("session_hit", Type::Bool),
+                ("session_in_flight", Type::Uint32),
+                ("pair_class", Type::Uint32),
+                ("has_capacity", Type::Bool),
+                ("has_room", Type::Bool),
+                ("admitted_age_ms", Type::Uint32),
+                ("indexed_growth", Type::Uint32),
+                ("zone", Type::Uint32),
+                ("labels", Type::Fixed64),
+                ("ec_compatible", Type::Bool),
+                ("vision", Type::Bool),
+                ("host_local", Type::Bool),
+                ("active_sessions", Type::Uint32),
+                ("key", Type::Uint32),
+                ("indexed_blocks", Type::Uint32),
+            ],
+            repeated: &[],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "RequestFacts",
+            record: request_record(),
+            // The affinity column rides the request in the crate; the wire
+            // carries each entry in its candidate.
+            host_only: &[
+                "prompt_chars",
+                "prompt_bytes",
+                "now_micros",
+                "session_counted",
+                "affinity",
+                "named",
+                "model_fingerprint",
+                "signal_cells",
+                "ring",
+                "ring_positions",
+                "decode_ring_positions",
+            ],
+            wire_only: &["prompt_text"],
+            wire: &[
+                ("model", Type::String),
+                ("namespace_seed", Type::Fixed64),
+                ("tenant", Type::Message),
+                ("priority", Type::Sint32),
+                ("streaming", Type::Bool),
+                ("max_output_tokens", Type::Uint32),
+                ("prompt_tokens", Type::Uint32),
+                ("block_hashes", Type::Fixed64),
+                ("hash_kind", Type::Enum),
+                ("session_key", Type::Message),
+                ("phase", Type::Enum),
+                ("attempt", Type::Uint32),
+                ("tried", Type::Fixed64),
+                ("budget_micros", Type::Uint32),
+                ("headers", Type::Message),
+                ("media", Type::Message),
+                ("seed", Type::Fixed64),
+                ("prompt_text", Type::Bytes),
+                ("block_size", Type::Uint32),
+                ("client_key", Type::Fixed64),
+                ("session_key_from_rid", Type::Bool),
+            ],
+            repeated: &["block_hashes", "tried", "headers"],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "Constraints",
+            record: constraints_record(),
+            host_only: &[
+                "decode_later",
+                "counted_on_decode",
+                "demands",
+                "stalled",
+                "held",
+                "places",
+                "target_worker",
+            ],
+            wire_only: &[],
+            wire: &[
+                ("excluded", Type::Fixed64),
+                ("wire_modes", Type::Uint32),
+                ("overload_lifted", Type::Bool),
+                ("subset_hint", Type::Uint32),
+            ],
+            repeated: &["excluded"],
+            optional: &["subset_hint"],
+        },
+        ProtoMirror {
+            message: "PoolFacts",
+            record: pool_record(),
+            host_only: &["reach", "reported", "engines", "word"],
+            wire_only: &[],
+            wire: &[
+                ("pool_size", Type::Uint32),
+                ("membership_epoch", Type::Uint64),
+                ("ring_epoch", Type::Uint64),
+                ("regime", Type::Enum),
+                ("generation", Type::Uint64),
+                ("zones", Type::Message),
+            ],
+            repeated: &["zones"],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "ZoneCapacity",
+            record: zone_record(),
+            host_only: &[],
+            wire_only: &[],
+            wire: &[
+                ("zone", Type::Uint32),
+                ("healthy", Type::Uint32),
+                ("total", Type::Uint32),
+            ],
+            repeated: &[],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "Target",
+            record: target_record(),
+            host_only: &["position"],
+            wire_only: &[],
+            wire: &[
+                ("id", Type::Fixed64),
+                ("dp_rank", Type::Uint32),
+                ("pair", Type::Message),
+            ],
+            repeated: &[],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "Pair",
+            record: pair_record(),
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
+            wire_only: &[],
+            wire: &[
+                ("decode_id", Type::Fixed64),
+                ("decode_dp_rank", Type::Uint32),
+            ],
+            repeated: &[],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "Shed",
+            record: shed_record(),
+            host_only: &["trace"],
+            wire_only: &[],
+            wire: &[
+                ("reason", Type::Enum),
+                ("emptied_by", Type::String),
+                ("retry_after_secs", Type::Uint32),
+                ("wait_allowed", Type::Bool),
+            ],
+            repeated: &[],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "Queue",
+            record: queue_record(),
+            host_only: &["trace"],
+            wire_only: &[],
+            wire: &[("ticket", Type::Fixed64), ("max_wait_micros", Type::Uint32)],
+            repeated: &[],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "Trace",
+            record: trace_record(),
+            host_only: &["top_len"],
+            wire_only: &[
+                "plan",
+                "drops",
+                "picker",
+                "shadow_pick",
+                "fallback",
+                "affinity_source",
+                // The record reads it from its count ([`Trace::drew_first`]).
+                "drew_first",
+                // The record marks this in `profile` ([`Trace::made_under`]).
+                "no_profile",
+            ],
+            wire: &[
+                ("profile", Type::Uint32),
+                ("survivors", Type::Uint32),
+                ("top", Type::Message),
+                ("seed", Type::Fixed64),
+                ("generation", Type::Uint64),
+                ("plan", Type::Uint32),
+                ("drops", Type::Message),
+                ("picker", Type::Uint32),
+                ("shadow_pick", Type::Fixed64),
+                ("fallback", Type::Bool),
+                ("affinity_source", Type::Enum),
+                ("drew_first", Type::Bool),
+                ("lifted", Type::Enum),
+                ("no_profile", Type::Bool),
+            ],
+            repeated: &["top", "drops"],
+            optional: &["survivors"],
+        },
+        ProtoMirror {
+            message: "Lease",
+            record: lease_record(),
+            host_only: &[
+                "booked",
+                "session_verdict",
+                "issued_micros",
+                "chars",
+                "bytes",
+            ],
+            wire_only: &["term", "dispatch_ttl_ms", "origin"],
+            wire: &[
+                ("id", Type::Fixed64),
+                ("kind", Type::Enum),
+                ("side", Type::Enum),
+                ("target_index", Type::Uint32),
+                ("generation", Type::Uint64),
+                ("session_key", Type::Fixed64),
+                ("tokens", Type::Uint32),
+                ("term", Type::Uint64),
+                ("dispatch_ttl_ms", Type::Uint32),
+                ("origin", Type::Enum),
+            ],
+            repeated: &[],
+            optional: &[],
+        },
+        ProtoMirror {
+            message: "Completed",
+            record: outcome_record(),
+            host_only: &[],
+            wire_only: &["lease_id"],
+            wire: &[
+                ("lease_id", Type::Fixed64),
+                ("side", Type::Enum),
+                ("served", Type::Fixed64),
+                ("status", Type::Uint32),
+                ("class", Type::Enum),
+                ("ttft_micros", Type::Uint32),
+                ("tokens_in", Type::Uint32),
+                ("tokens_out", Type::Uint32),
+                ("duration_micros", Type::Uint32),
+            ],
+            repeated: &[],
+            optional: &[],
+        },
+    ]
+}
+
+/// How a record of the world's `types` interface relates to the crate's.
+struct WitMirror {
+    record: &'static str,
+    crate_record: &'static [&'static str],
+    host_only: &'static [&'static str],
+    /// Fields the WIT record carries before the crate's (an event's lease).
+    before: &'static [&'static str],
+    /// The fields of a record the crate keeps beside this one and the WIT
+    /// record carries inside it, in that record's order (a candidate's
+    /// affinity facts).
+    beside: &'static [&'static str],
+}
+
+fn wit_mirrors() -> Vec<WitMirror> {
+    vec![
+        WitMirror {
+            record: "load",
+            crate_record: load_row_record(),
+            host_only: &["resident_counted"],
+            before: &[],
+            beside: &[],
+        },
+        WitMirror {
+            record: "candidate",
+            crate_record: candidate_record(),
+            host_only: &["position", "load_sampled_at_micros", "engine"],
+            before: &[],
+            beside: affinity_record(),
+        },
+        WitMirror {
+            record: "media",
+            crate_record: media_record(),
+            host_only: &[],
+            before: &[],
+            beside: &[],
+        },
+        WitMirror {
+            record: "request",
+            crate_record: request_record(),
+            host_only: &[
+                "prompt_chars",
+                "prompt_bytes",
+                "now_micros",
+                "session_counted",
+                "affinity",
+                "named",
+                "model_fingerprint",
+                "signal_cells",
+                "client_key",
+                "ring",
+                "ring_positions",
+                "decode_ring_positions",
+                "session_key_from_rid",
+            ],
+            before: &[],
+            beside: &[],
+        },
+        WitMirror {
+            record: "zone-capacity",
+            crate_record: zone_record(),
+            host_only: &[],
+            before: &[],
+            beside: &[],
+        },
+        WitMirror {
+            record: "pool",
+            crate_record: pool_record(),
+            host_only: &["reach", "reported", "engines", "word"],
+            before: &[],
+            beside: &[],
+        },
+        WitMirror {
+            record: "lease",
+            crate_record: lease_record(),
+            host_only: &[
+                "booked",
+                "session_verdict",
+                "issued_micros",
+                "chars",
+                "bytes",
+            ],
+            before: &[],
+            beside: &[],
+        },
+        WitMirror {
+            record: "pair",
+            crate_record: pair_record(),
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
+            before: &[],
+            beside: &[],
+        },
+        WitMirror {
+            record: "target",
+            crate_record: target_record(),
+            host_only: &["position"],
+            before: &[],
+            beside: &[],
+        },
+        WitMirror {
+            record: "completed",
+            crate_record: outcome_record(),
+            host_only: &[],
+            before: &["lease"],
+            beside: &[],
+        },
+    ]
+}
+
+/// The services, each RPC with its request, its answer and its streaming
+/// shape (client, server). A later version adds a row; it never changes or
+/// removes one.
+type Rpc = (&'static str, &'static str, &'static str, bool, bool);
+
+const PLUGIN_RPCS: &[Rpc] = &[
+    ("Decide", "PluginRequest", "PluginResponse", true, true),
+    ("Observe", "ObserveRequest", "Ack", true, false),
+];
+
+const CONTROLLER_RPCS: &[Rpc] = &[
+    ("Session", "GatewayFrame", "ControllerFrame", true, true),
+    ("Decide", "DecideRequest", "DecideAnswer", true, true),
+    (
+        "WatchWorkers",
+        "WatchWorkersRequest",
+        "WorkerEvent",
+        false,
+        true,
+    ),
+    (
+        "RegisterWorker",
+        "RegisterWorkerRequest",
+        "WorkerEvent",
+        false,
+        false,
+    ),
+    (
+        "PatchWorker",
+        "PatchWorkerRequest",
+        "WorkerEvent",
+        false,
+        false,
+    ),
+    (
+        "DeregisterWorker",
+        "DeregisterWorkerRequest",
+        "WorkerEvent",
+        false,
+        false,
+    ),
+    ("GetSnapshot", "SnapshotRequest", "Snapshot", false, false),
+    ("Explain", "ExplainRequest", "DecisionRecord", false, false),
+    (
+        "ApplyPolicySpec",
+        "ApplyRequest",
+        "ApplyResult",
+        false,
+        false,
+    ),
+    (
+        "GetPolicySpec",
+        "GetPolicySpecRequest",
+        "PolicySpecDocument",
+        false,
+        false,
+    ),
+    (
+        "RollbackPolicySpec",
+        "RollbackRequest",
+        "ApplyResult",
+        false,
+        false,
+    ),
+    ("Leader", "LeaderRequest", "LeaderInfo", false, false),
+    ("StepDown", "StepDownRequest", "Ack", false, false),
+    ("WatchRegime", "RegimeRequest", "Regime", false, true),
+    ("Replicate", "ReplicaFrame", "ReplicationBatch", true, true),
+];
+
+/// A `oneof` only grows: the cases of every frame and answer, in order.
+const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
+    (PLUGIN_PROTO, "Identity", "form", &["hash", "plain"]),
+    (
+        PLUGIN_PROTO,
+        "Decision",
+        "outcome",
+        &["pick", "shed", "queue"],
+    ),
+    (PLUGIN_PROTO, "Released", "what", &["lease_id", "ticket"]),
+    (
+        PLUGIN_PROTO,
+        "Signal",
+        "kind",
+        &["load", "health", "gateway_veto_micros"],
+    ),
+    (
+        PLUGIN_PROTO,
+        "LifecycleEvent",
+        "event",
+        &[
+            "issued",
+            "dispatched",
+            "completed",
+            "released",
+            "membership",
+            "signal",
+        ],
+    ),
+    (
+        PLUGIN_PROTO,
+        "PluginRequest",
+        "request",
+        &["hello", "decide"],
+    ),
+    (
+        PLUGIN_PROTO,
+        "ObserveRequest",
+        "request",
+        &["hello", "event"],
+    ),
+    (
+        PLUGIN_PROTO,
+        "PluginResponse",
+        "response",
+        &["hello", "decision"],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "GatewayFrame",
+        "frame",
+        &[
+            "hello",
+            "hello_page",
+            "dispatched",
+            "completed",
+            "released",
+            "veto",
+            "spec_ack",
+        ],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "ControllerFrame",
+        "frame",
+        &["welcome", "not_leader", "preempt", "spec"],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "DecideAnswer",
+        "answer",
+        &["decision", "busy", "credit"],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "WorkerEvent",
+        "event",
+        &[
+            "snapshot",
+            "registered",
+            "replaced",
+            "removed",
+            "status",
+            "relabelled",
+            "needs",
+            "snapshot_required",
+            "ranks",
+        ],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "RankRow",
+        "made",
+        &["registered", "replaced", "removed", "relabelled"],
+    ),
+    (CONTROLLER_PROTO, "ReplicaFrame", "frame", &["hello", "ack"]),
+    (
+        CONTROLLER_PROTO,
+        "ReplicationEvent",
+        "event",
+        &[
+            "membership",
+            "health",
+            "load",
+            "pin",
+            "reservation",
+            "generation",
+            "ids",
+            "lease_end",
+            "term_start",
+        ],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "ExplainRequest",
+        "key",
+        &["decision_id", "request_id"],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "Reachability",
+        "scope",
+        &["any", "gateway_id"],
+    ),
+];
+
+/// The worlds with their imports and exports, by interface name. Every
+/// import is an interface of this package: a module that needs anything else
+/// (a `wasi:` interface) is refused by the engine.
+const WORLDS: &[(&str, &[&str], &[&str])] = &[
+    ("policy", &["host", "types"], &["plugin"]),
+    ("policy-packed", &["host", "types"], &["plugin-packed"]),
+];
+const INTERFACES: &[&str] = &["types", "host", "plugin", "plugin-packed"];
+const HOST_FUNCTIONS: &[&str] = &["log", "now-micros", "counter", "random-u64"];
+const PLUGIN_FUNCTIONS: &[&str] = &[
+    "init",
+    "[constructor]decision",
+    "[method]decision.filter",
+    "[method]decision.score",
+    "[method]decision.pick",
+    "observe",
+];
+
+fn contracts_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts")
+}
+
+fn compile_protocol() -> io::Result<FileDescriptorSet> {
+    let dir = contracts_dir();
+    let mut config = prost_build::Config::new();
+    // proto3 `optional` needs the flag below protoc 3.15, the oldest the
+    // repository's build scripts run under.
+    config.protoc_arg("--experimental_allow_proto3_optional");
+    config.load_fds(
+        &[dir.join(PLUGIN_PROTO), dir.join(CONTROLLER_PROTO)],
+        &[dir],
+    )
+}
+
+fn file<'a>(set: &'a FileDescriptorSet, name: &str) -> Option<&'a FileDescriptorProto> {
+    set.file.iter().find(|file| file.name() == name)
+}
+
+fn message<'a>(file: &'a FileDescriptorProto, name: &str) -> Option<&'a DescriptorProto> {
+    file.message_type
+        .iter()
+        .find(|message| message.name() == name)
+}
+
+#[test]
+fn least_cost_term_names_match_the_plugin_contract_fields() {
+    let set = compile_protocol().expect("the protocol compiles");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin contract");
+    for (prefix, record, terms) in [
+        (
+            "load",
+            "LoadRow",
+            &[
+                "running",
+                "queued",
+                "waiting_uncached_tokens",
+                "kv_usage_permille",
+                "active_kv_permille",
+                "resident_tokens",
+            ][..],
+        ),
+        ("candidate", "Candidate", &["in_flight"][..]),
+    ] {
+        let record = message(plugin, record).expect("the term's record");
+        for field in terms {
+            assert!(
+                record.field.iter().any(|f| f.name() == *field),
+                "{prefix}.{field}"
+            );
+            let profile = serde_yaml::from_str(&format!(
+                "score: [{{least-cost: {{terms: {{{prefix}.{field}: 7}}, unreported: missing-as-zero}}}}]\npick: best"
+            )).expect("a profile with one term");
+            let spec = PolicySpec::new([("p".to_string(), profile)].into());
+            spec.validate()
+                .unwrap_or_else(|err| panic!("{prefix}.{field}: {err}"));
+        }
+    }
+}
+
+fn service<'a>(file: &'a FileDescriptorProto, name: &str) -> Option<&'a ServiceDescriptorProto> {
+    file.service.iter().find(|service| service.name() == name)
+}
+
+/// The fields of a message in number order: name, number, kind, repeated,
+/// proto3 optional.
+fn fields(message: &DescriptorProto) -> Vec<(String, i32, Type, bool, bool)> {
+    let mut fields: Vec<_> = message
+        .field
+        .iter()
+        .map(|field| {
+            (
+                field.name().to_owned(),
+                field.number(),
+                field.r#type(),
+                field.label() == Label::Repeated,
+                field.proto3_optional(),
+            )
+        })
+        .collect();
+    fields.sort_by_key(|(_, number, _, _, _)| *number);
+    fields
+}
+
+/// The cases of a named `oneof`, in declaration order.
+fn oneof_cases(message: &DescriptorProto, oneof: &str) -> Option<Vec<String>> {
+    let index = message
+        .oneof_decl
+        .iter()
+        .position(|decl| decl.name() == oneof)?;
+    let index = i32::try_from(index).ok()?;
+    Some(
+        message
+            .field
+            .iter()
+            .filter(|field| field.oneof_index == Some(index))
+            .map(|field| field.name().to_owned())
+            .collect(),
+    )
+}
+
+/// The values of a top-level enum (`Role`) or a nested one (`Completed.Class`).
+fn enum_values(file: &FileDescriptorProto, path: &str) -> Option<Vec<(String, i32)>> {
+    let found = match path.split_once('.') {
+        None => file.enum_type.iter().find(|e| e.name() == path)?,
+        Some((owner, nested)) => message(file, owner)?
+            .enum_type
+            .iter()
+            .find(|e| e.name() == nested)?,
+    };
+    Some(
+        found
+            .value
+            .iter()
+            .map(|v| (v.name().to_owned(), v.number()))
+            .collect(),
+    )
+}
+
+/// `BreakerOpen` to `breaker-open`.
+fn kebab_case(camel: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in camel.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('-');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `BreakerOpen` to `BREAKER_OPEN`.
+fn screaming_case(camel: &str) -> String {
+    kebab_case(camel).replace('-', "_").to_ascii_uppercase()
+}
+
+/// `wire_modes` to `wire-modes`.
+fn kebab_field(snake: &str) -> String {
+    snake.replace('_', "-")
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| (*item).to_owned()).collect()
+}
+
+/// The proto enum a crate enum mirrors: `PREFIX_UNSPECIFIED = 0`, then the
+/// crate's variants in order, numbered from 1.
+fn proto_enum(prefix: &str, cases: &[&str]) -> Vec<(String, i32)> {
+    let mut values = vec![(format!("{prefix}_UNSPECIFIED"), 0)];
+    for (i, case) in cases.iter().enumerate() {
+        let number = i32::try_from(i + 1).unwrap_or(i32::MAX);
+        values.push((format!("{prefix}_{}", screaming_case(case)), number));
+    }
+    values
+}
+
+struct World {
+    resolve: Resolve,
+    package: PackageId,
+}
+
+fn parse_world() -> Result<World, String> {
+    let mut resolve = Resolve::new();
+    let (package, _sources) = resolve
+        .push_path(contracts_dir().join(WORLD_WIT))
+        .map_err(|err| format!("{err:#}"))?;
+    Ok(World { resolve, package })
+}
+
+impl World {
+    fn interface(&self, name: &str) -> Option<InterfaceId> {
+        self.resolve.packages[self.package]
+            .interfaces
+            .get(name)
+            .copied()
+    }
+
+    fn world(&self, name: &str) -> Option<WorldId> {
+        self.resolve.packages[self.package]
+            .worlds
+            .get(name)
+            .copied()
+    }
+
+    /// The interface names behind a world's imports or exports: every item
+    /// is an interface of this package (a function or a type under the same
+    /// key is not), an interface key names the item it carries, and a named
+    /// item is the package's interface of that name.
+    fn interface_names<'a>(
+        &self,
+        items: impl Iterator<Item = (&'a WorldKey, &'a WorldItem)>,
+    ) -> Vec<String> {
+        let mut names = Vec::new();
+        for (key, item) in items {
+            assert!(
+                matches!(item, WorldItem::Interface { .. }),
+                "world item {key:?} is not an interface"
+            );
+            let WorldItem::Interface { id, .. } = item else {
+                continue;
+            };
+            let interface = &self.resolve.interfaces[*id];
+            assert_eq!(
+                interface.package,
+                Some(self.package),
+                "a world item outside the package"
+            );
+            let name = match key {
+                WorldKey::Interface(key_id) => {
+                    assert_eq!(key_id, id, "an interface key naming another item");
+                    interface.name.clone().unwrap_or_default()
+                }
+                WorldKey::Name(name) => {
+                    assert_eq!(
+                        self.interface(name),
+                        Some(*id),
+                        "a named world item is not the package's interface"
+                    );
+                    name.clone()
+                }
+            };
+            names.push(name);
+        }
+        names.sort();
+        names
+    }
+
+    fn type_kind(&self, name: &str) -> Option<&TypeDefKind> {
+        let id = self.interface("types")?;
+        let ty = *self.resolve.interfaces[id].types.get(name)?;
+        Some(&self.resolve.types[ty].kind)
+    }
+
+    fn record_fields(&self, name: &str) -> Option<Vec<String>> {
+        match self.type_kind(name)? {
+            TypeDefKind::Record(record) => Some(
+                record
+                    .fields
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The cases of an enum or a variant, or the flags of a flags type.
+    fn cases(&self, name: &str) -> Option<Vec<String>> {
+        match self.type_kind(name)? {
+            TypeDefKind::Enum(e) => Some(e.cases.iter().map(|case| case.name.clone()).collect()),
+            TypeDefKind::Variant(v) => Some(v.cases.iter().map(|case| case.name.clone()).collect()),
+            TypeDefKind::Flags(f) => Some(f.flags.iter().map(|flag| flag.name.clone()).collect()),
+            _ => None,
+        }
+    }
+
+    fn functions(&self, interface: &str) -> Option<Vec<String>> {
+        let id = self.interface(interface)?;
+        Some(
+            self.resolve.interfaces[id]
+                .functions
+                .keys()
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+#[test]
+fn the_protocol_compiles_and_mirrors_the_engine_record() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    assert_eq!(plugin.package(), PACKAGE);
+    assert_eq!(controller.package(), PACKAGE);
+    assert_eq!(
+        controller.dependency,
+        strings(&[PLUGIN_PROTO]),
+        "the controller protocol imports the plugin vocabulary alone"
+    );
+
+    for mirror in proto_mirrors() {
+        let message_name = mirror.message;
+        // The wire table is the crate's record, less the host's fields.
+        let table: Vec<&str> = mirror
+            .wire
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !mirror.wire_only.contains(name))
+            .collect();
+        let record: Vec<&str> = mirror
+            .record
+            .iter()
+            .copied()
+            .filter(|name| !mirror.host_only.contains(name))
+            .collect();
+        assert_eq!(
+            table, record,
+            "{message_name}: the wire table is not the crate's record"
+        );
+        // The wire's own fields are in the table, in the order listed: a
+        // record the wire carries inside this one keeps its field order.
+        let outside: Vec<&str> = mirror
+            .wire
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| mirror.wire_only.contains(name))
+            .collect();
+        assert_eq!(
+            outside, mirror.wire_only,
+            "{message_name}: the wire's own fields are not in the table in their order"
+        );
+        // The compiled message is the wire table, numbered 1..=n in order.
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let expected: Vec<(String, i32, Type, bool, bool)> = mirror
+            .wire
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                let number = i32::try_from(i + 1).expect("a field number fits");
+                (
+                    (*name).to_owned(),
+                    number,
+                    *ty,
+                    mirror.repeated.contains(name),
+                    mirror.optional.contains(name),
+                )
+            })
+            .collect();
+        assert_eq!(
+            fields(compiled),
+            expected,
+            "{message_name}: the fields differ from the record"
+        );
+    }
+
+    for (proto_name, prefix, _, cases) in enum_mirrors() {
+        let found = enum_values(plugin, proto_name)
+            .unwrap_or_else(|| panic!("enum {proto_name} is missing from {PLUGIN_PROTO}"));
+        assert_eq!(found, proto_enum(prefix, cases), "enum {proto_name}");
+    }
+    let found = enum_values(plugin, "ShedReason").expect("ShedReason is an enum");
+    assert_eq!(found, proto_enum("SHED_REASON", shed_reasons()));
+    // The lifted veto: the mark's variants in order, numbered from zero.
+    // Its zero is none, a case, on purpose: the enum's comment says why.
+    let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
+    let expected: Vec<(String, i32)> = mirrored::lifted_veto()
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let number = i32::try_from(i).unwrap_or(i32::MAX);
+            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+        })
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the lifted vetoes are the mark's, from none"
+    );
+    // The health bits: the record's flags in order, one bit each.
+    let found = enum_values(plugin, "HealthFlag").expect("HealthFlag is an enum");
+    let mut expected = vec![("HEALTH_FLAG_UNSPECIFIED".to_owned(), 0)];
+    for (i, flag) in health_record().iter().enumerate() {
+        expected.push((format!("HEALTH_FLAG_{}", screaming_case(flag)), 1 << i));
+    }
+    assert_eq!(
+        found, expected,
+        "the health flags are the record's, one bit each"
+    );
+    let found = enum_values(plugin, "WireMode").expect("WireMode is an enum");
+    assert_eq!(
+        found,
+        [
+            ("WIRE_MODE_UNSPECIFIED", 0),
+            ("WIRE_MODE_HTTP", 1),
+            ("WIRE_MODE_GRPC", 2),
+            ("WIRE_MODE_ZMQ", 4)
+        ]
+        .map(|(name, number)| (name.to_owned(), number))
+    );
+}
+
+#[test]
+fn the_wasm_world_resolves_and_mirrors_the_engine_record() {
+    let world = parse_world().expect("the world resolves");
+    let name = &world.resolve.packages[world.package].name;
+    assert_eq!(
+        name.to_string(),
+        format!("{WIT_NAMESPACE}:{WIT_PACKAGE}@{WIT_VERSION}")
+    );
+
+    for mirror in wit_mirrors() {
+        let record_name = mirror.record;
+        let expected: Vec<String> = mirror
+            .before
+            .iter()
+            .map(|name| (*name).to_owned())
+            .chain(
+                mirror
+                    .crate_record
+                    .iter()
+                    .filter(|name| !mirror.host_only.contains(name))
+                    .map(|name| kebab_field(name)),
+            )
+            .collect();
+        let found = world
+            .record_fields(record_name)
+            .unwrap_or_else(|| panic!("record {record_name} is missing from types"));
+        // The fields of a record the crate keeps beside this one are in the
+        // world's record in their own order; the rest is the crate's record.
+        let beside: Vec<String> = mirror.beside.iter().map(|name| kebab_field(name)).collect();
+        let (inside, found): (Vec<String>, Vec<String>) =
+            found.into_iter().partition(|name| beside.contains(name));
+        assert_eq!(found, expected, "record {record_name} is not the crate's");
+        assert_eq!(
+            inside, beside,
+            "record {record_name}: the record beside it is not in the world's in its order"
+        );
+    }
+    assert_eq!(
+        world
+            .record_fields("dispatched")
+            .expect("dispatched is a record"),
+        strings(&["lease", "target", "side", "since-decision-micros"]),
+        "the dispatch event carries the lifecycle hook's arguments"
+    );
+
+    for (_, _, wit_name, cases) in enum_mirrors() {
+        let expected: Vec<String> = cases.iter().map(|case| kebab_case(case)).collect();
+        let found = world
+            .cases(wit_name)
+            .unwrap_or_else(|| panic!("{wit_name} is missing from types"));
+        assert_eq!(found, expected, "{wit_name} is not the crate's enum");
+    }
+    let expected: Vec<String> = signal_cases().iter().map(|case| kebab_case(case)).collect();
+    assert_eq!(
+        world.cases("signal").expect("signal is a variant"),
+        expected
+    );
+    let expected: Vec<String> = health_record()
+        .iter()
+        .map(|flag| kebab_field(flag))
+        .collect();
+    assert_eq!(
+        world.cases("health").expect("health is a flags type"),
+        expected
+    );
+    assert_eq!(
+        world
+            .cases("wire-modes")
+            .expect("wire-modes is a flags type"),
+        strings(&["http", "grpc", "zmq"])
+    );
+    assert_eq!(
+        world.cases("identity").expect("identity is a variant"),
+        strings(&["none", "hash", "plain"])
+    );
+    assert_eq!(
+        world.cases("decline").expect("decline is a variant"),
+        strings(&["not-applicable", "budget", "internal"])
+    );
+    assert_eq!(
+        world
+            .cases("lifecycle-event")
+            .expect("lifecycle-event is a variant"),
+        strings(&[
+            "issued",
+            "dispatched",
+            "completed",
+            "released",
+            "membership",
+            "signal"
+        ])
+    );
+}
+
+#[test]
+fn the_versioned_names_a_plugin_author_builds_against_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (file, service_name, rpcs) in [
+        (plugin, "PolicyPlugin", PLUGIN_RPCS),
+        (controller, "GrandCentral", CONTROLLER_RPCS),
+    ] {
+        let found: Vec<(String, String, String, bool, bool)> = service(file, service_name)
+            .unwrap_or_else(|| panic!("service {service_name} is missing"))
+            .method
+            .iter()
+            .map(|method| {
+                (
+                    method.name().to_owned(),
+                    method.input_type().to_owned(),
+                    method.output_type().to_owned(),
+                    method.client_streaming(),
+                    method.server_streaming(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, String, String, bool, bool)> = rpcs
+            .iter()
+            .map(|(name, input, output, client, server)| {
+                (
+                    (*name).to_owned(),
+                    format!(".{PACKAGE}.{input}"),
+                    format!(".{PACKAGE}.{output}"),
+                    *client,
+                    *server,
+                )
+            })
+            .collect();
+        assert_eq!(
+            found, expected,
+            "service {service_name}: the RPC list moved"
+        );
+    }
+    for (file_name, message_name, oneof, cases) in ONEOFS {
+        let file = if *file_name == PLUGIN_PROTO {
+            plugin
+        } else {
+            controller
+        };
+        let compiled = message(file, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {file_name}"));
+        let found = oneof_cases(compiled, oneof)
+            .unwrap_or_else(|| panic!("{message_name} has no oneof {oneof}"));
+        assert_eq!(
+            found,
+            strings(cases),
+            "{message_name}.{oneof}: the cases moved"
+        );
+    }
+
+    let world = parse_world().expect("the world resolves");
+    let package = &world.resolve.packages[world.package];
+    assert_eq!(package.name.namespace, WIT_NAMESPACE);
+    assert_eq!(package.name.name, WIT_PACKAGE);
+    let version = package.name.version.as_ref().map(ToString::to_string);
+    assert_eq!(version.as_deref(), Some(WIT_VERSION));
+    let interfaces: Vec<String> = package.interfaces.keys().cloned().collect();
+    assert_eq!(interfaces, strings(INTERFACES));
+    let worlds: Vec<String> = package.worlds.keys().cloned().collect();
+    assert_eq!(
+        worlds,
+        WORLDS
+            .iter()
+            .map(|(name, _, _)| (*name).to_owned())
+            .collect::<Vec<_>>()
+    );
+    for (world_name, imports, exports) in WORLDS {
+        let id = world
+            .world(world_name)
+            .unwrap_or_else(|| panic!("world {world_name} is missing"));
+        let item = &world.resolve.worlds[id];
+        assert_eq!(
+            world.interface_names(item.imports.iter()),
+            strings(imports),
+            "world {world_name} imports"
+        );
+        assert_eq!(
+            world.interface_names(item.exports.iter()),
+            strings(exports),
+            "world {world_name} exports"
+        );
+    }
+    assert_eq!(
+        world.functions("host").expect("host is an interface"),
+        strings(HOST_FUNCTIONS)
+    );
+    assert_eq!(
+        world.functions("plugin").expect("plugin is an interface"),
+        strings(PLUGIN_FUNCTIONS)
+    );
+    assert_eq!(
+        world
+            .functions("plugin-packed")
+            .expect("plugin-packed is an interface"),
+        strings(PLUGIN_FUNCTIONS)
+    );
+}
+
+/// The resume fields a watcher hands back: `WorkerEvent.seq` is the
+/// replication log position and `term` the term it was written under,
+/// `WatchWorkersRequest` carries both back, and `SnapshotRequired` names the
+/// oldest position the log still holds.
+type ResumeField = (&'static str, i32, Type);
+
+const RESUME_FIELDS: &[(&str, &[ResumeField])] = &[
+    (
+        "WatchWorkersRequest",
+        &[
+            ("models", 1, Type::String),
+            ("resume_seq", 2, Type::Uint64),
+            ("with_needs", 3, Type::Bool),
+            ("resume_term", 4, Type::Uint64),
+        ],
+    ),
+    (
+        "WorkerEvent",
+        &[
+            ("seq", 1, Type::Uint64),
+            ("membership_epoch", 2, Type::Uint64),
+            ("term", 11, Type::Uint64),
+        ],
+    ),
+    ("SnapshotRequired", &[("oldest_seq", 1, Type::Uint64)]),
+];
+
+#[test]
+fn the_watch_workers_resume_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in RESUME_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a resume field moved");
+    }
+}
+
+/// What a gateway says to ask a pair's decode after its prefill, by name
+/// and number: the word on the pair's first request, and the lease whose
+/// decode side a later request asks.
+const DECODE_CALL_FIELDS: &[ResumeField] = &[
+    ("decode_later", 5, Type::Bool),
+    ("decode_of", 6, Type::Fixed64),
+];
+
+/// Why a decode call is refused, by name and number.
+const DECODE_CALL_REASONS: &[(&str, i32)] = &[
+    ("REASON_DECODE_NO_LEASE", 5),
+    ("REASON_DECODE_NOT_CHOSEN", 6),
+    ("REASON_DECODE_PREFILL_NOT_HELD", 7),
+    ("REASON_DECODE_STANDS", 8),
+];
+
+#[test]
+fn the_decode_call_fields_and_reasons_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let request = message(controller, "DecideRequest").expect("the request is a message");
+    let pinned = |name: &str| {
+        DECODE_CALL_FIELDS
+            .iter()
+            .any(|(field, _, _)| *field == name)
+    };
+    let found: Vec<(String, i32, Type, bool)> = fields(request)
+        .into_iter()
+        .filter(|(name, _, _, _, _)| pinned(name))
+        .map(|(name, number, kind, _, optional)| (name, number, kind, optional))
+        .collect();
+    // The lease's id is optional: its presence tells a call from a pair's
+    // first request.
+    let expected: Vec<(String, i32, Type, bool)> = DECODE_CALL_FIELDS
+        .iter()
+        .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind, *name == "decode_of"))
+        .collect();
+    assert_eq!(found, expected, "a decode call's field moved");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let reasons = enum_values(plugin, "Busy.Reason").expect("the reasons are an enum");
+    for (name, number) in DECODE_CALL_REASONS {
+        let reason = ((*name).to_owned(), *number);
+        assert!(reasons.contains(&reason), "{name} moved");
+    }
+}
+
+/// The number a request names its worker by, by name and number. The field
+/// is optional: its absence says the request names no worker, so the frame
+/// of a host older than the field is decided as it was.
+#[test]
+fn the_named_worker_field_is_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let request = message(controller, "DecideRequest").expect("the request is a message");
+    let found: Vec<(String, i32, Type, bool)> = fields(request)
+        .into_iter()
+        .filter(|(name, _, _, _, _)| name == "named_worker")
+        .map(|(name, number, kind, _, optional)| (name, number, kind, optional))
+        .collect();
+    let pinned = ("named_worker".to_owned(), 8, Type::Uint32, true);
+    assert_eq!(found, [pinned], "the named worker's field moved");
+}
+
+/// What a registration states and its answer tells, by name and number: the
+/// prober's settings (one message for the registration and the row), the
+/// row's rank and engine, and the two thresholds a row is judged by.
+const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
+    (
+        "HealthPolicy",
+        &[
+            ("failure_threshold", 1, Type::Uint32),
+            ("success_threshold", 2, Type::Uint32),
+            ("check_interval_ms", 3, Type::Uint32),
+            ("timeout_ms", 4, Type::Uint32),
+            ("disabled", 5, Type::Bool),
+        ],
+    ),
+    (
+        "OverloadThresholds",
+        &[
+            ("queue_limit", 1, Type::Uint32),
+            ("kv_usage_permille", 2, Type::Uint32),
+        ],
+    ),
+    (
+        "WorkerRow",
+        &[
+            ("dp_rank", 23, Type::Uint32),
+            ("engine", 24, Type::String),
+            ("health_policy", 25, Type::Message),
+            ("maker", 27, Type::Message),
+        ],
+    ),
+    (
+        "Maker",
+        &[("provider", 1, Type::String), ("key", 2, Type::String)],
+    ),
+    ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
+];
+
+/// A membership change on the plugin wire, by name and number: a plugin
+/// built against protocol 1 reads the first four fields and the kinds to
+/// `KIND_SNAPSHOT` as it did, and protocol 2 added the kind a worker left
+/// with its field `models`.
+#[test]
+fn the_plugin_wires_membership_change_is_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let compiled = message(plugin, "MembershipChange")
+        .unwrap_or_else(|| panic!("MembershipChange is missing from {PLUGIN_PROTO}"));
+    let found: Vec<(String, i32, Type, bool)> = fields(compiled)
+        .into_iter()
+        .map(|(name, number, kind, repeated, _)| (name, number, kind, repeated))
+        .collect();
+    let expected = [
+        ("kind", 1, Type::Enum, false),
+        ("worker_id", 2, Type::Fixed64, false),
+        ("old_worker_id", 3, Type::Fixed64, false),
+        ("ids", 4, Type::Fixed64, true),
+        ("models", 5, Type::String, true),
+    ]
+    .map(|(name, number, kind, repeated)| (name.to_owned(), number, kind, repeated));
+    assert_eq!(found, expected, "a field of the membership change moved");
+    let kinds = enum_values(plugin, "MembershipChange.Kind").expect("the kinds are an enum");
+    let pinned = [
+        "KIND_UNSPECIFIED",
+        "KIND_ADDED",
+        "KIND_REMOVED",
+        "KIND_REPLACED",
+        "KIND_RELABELLED",
+        "KIND_RESIZED",
+        "KIND_SNAPSHOT",
+        "KIND_LEFT",
+    ];
+    let pinned: Vec<(String, i32)> = (0..)
+        .zip(pinned)
+        .map(|(number, name)| (name.to_owned(), number))
+        .collect();
+    assert_eq!(kinds, pinned, "a kind of the membership change moved");
+}
+
+#[test]
+fn the_membership_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in MEMBERSHIP_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        // The two small messages are pinned whole, the two rows by the
+        // fields named here.
+        let whole = matches!(*message_name, "HealthPolicy" | "OverloadThresholds");
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                whole
+                    || expected
+                        .iter()
+                        .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a membership field moved");
+    }
+
+    // The two thresholds no judge read left the message: their numbers and
+    // names stay reserved, so a reader brings one back under a new number.
+    let overload = message(controller, "OverloadThresholds")
+        .expect("OverloadThresholds is in the controller file");
+    let reserved: Vec<i32> = overload
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..range.end())
+        .collect();
+    assert_eq!(reserved, [3, 4], "the reserved numbers");
+    assert_eq!(
+        overload.reserved_name,
+        strings(&["in_flight_limit", "waiting_tokens_limit"])
+    );
+
+    // A status keeps its number; the failed one is the last.
+    assert_eq!(
+        enum_values(controller, "WorkerStatus"),
+        Some(proto_enum(
+            "WORKER_STATUS",
+            &["Pending", "Ready", "NotReady", "Draining", "Failed"]
+        ))
+    );
+}
+
+/// The ingestion scope left the principal's scopes with its two relay calls:
+/// its number and its name stay reserved, so a later scope takes neither.
+#[test]
+fn the_principals_scopes_keep_the_ingestion_scopes_number_and_name_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    assert_eq!(
+        enum_values(controller, "Principal.Scope"),
+        Some(vec![
+            ("SCOPE_UNSPECIFIED".to_owned(), 0),
+            ("SCOPE_GATEWAY".to_owned(), 1),
+            ("SCOPE_CONTROL".to_owned(), 3),
+            ("SCOPE_REPLICATION".to_owned(), 4),
+        ])
+    );
+    let scopes = message(controller, "Principal")
+        .and_then(|principal| principal.enum_type.iter().find(|e| e.name() == "Scope"))
+        .expect("Principal.Scope is in the controller file");
+    let reserved: Vec<i32> = scopes
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..=range.end())
+        .collect();
+    assert_eq!(reserved, [2], "the reserved number");
+    assert_eq!(scopes.reserved_name, strings(&["SCOPE_INGESTION"]));
+}
+
+/// A pair's class left the pairing descriptor, and a snapshot's pair rows
+/// left with their message: no writer filled either. The two numbers and
+/// names stay reserved, so a later field takes neither, and no message
+/// takes the name of the one that left.
+#[test]
+fn the_pair_class_and_the_pair_rows_keep_their_numbers_and_names_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, number, name) in [
+        ("PairingDescriptor", 8, "pair_class"),
+        ("Snapshot", 9, "pairs"),
+    ] {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let reserved: Vec<i32> = compiled
+            .reserved_range
+            .iter()
+            .flat_map(|range| range.start()..range.end())
+            .collect();
+        assert_eq!(reserved, [number], "{message_name}: the reserved number");
+        assert_eq!(
+            compiled.reserved_name,
+            strings(&[name]),
+            "{message_name}: the reserved name"
+        );
+    }
+    assert!(
+        message(controller, "PairRow").is_none(),
+        "no message takes the name of the pair row that left"
+    );
+}
+
+/// The packed request block's layout as the world's comment states it: an
+/// 80-byte header, the model bytes, zero bytes to the next multiple of 8,
+/// then the u64 sections. The arithmetic is mirrored here so the alignment
+/// rule is pinned beside the sentence that states it.
+const PACKED_REQUEST_HEADER: usize = 80;
+
+fn packed_hashes_offset(model_len: usize) -> usize {
+    (PACKED_REQUEST_HEADER + model_len).div_ceil(8) * 8
+}
+
+#[test]
+fn the_packed_request_block_keeps_its_u64_sections_aligned() {
+    assert_eq!(packed_hashes_offset(12), 96, "a 12-byte model name");
+    for model_len in 0..=255usize {
+        let hashes = packed_hashes_offset(model_len);
+        assert_eq!(hashes % 8, 0, "block hashes at a {model_len}-byte name");
+        let tried = hashes + 8 * 16;
+        assert_eq!(
+            tried % 8,
+            0,
+            "tried after 16 hashes at a {model_len}-byte name"
+        );
+    }
+    let wit =
+        std::fs::read_to_string(contracts_dir().join(WORLD_WIT)).expect("the world file reads");
+    for sentence in [
+        "Request block: an 80-byte header",
+        "zero bytes to the next multiple of 8",
+        "puts the hashes at 96",
+        "returns 8-aligned memory for these lists",
+    ] {
+        assert!(
+            wit.contains(sentence),
+            "the world states the alignment rule: {sentence:?}"
+        );
+    }
+}
+
+/// The lease-id layout's bounds as `LeaseOrigin` states them: terms below
+/// 2^31 fit the 31 id bits, the per-term counter starts at 1 and never wraps
+/// into the term bits, so a controller-minted id is never 0 and never repeats
+/// across terms. The sentences are pinned beside the layout they bound.
+#[test]
+fn the_lease_id_layout_states_its_bounds() {
+    let proto = std::fs::read_to_string(contracts_dir().join(PLUGIN_PROTO))
+        .expect("the plugin protocol reads");
+    for sentence in [
+        "terms\n// stay below 2^31",
+        "the counter starts at 1",
+        "bumps its term before it mints again",
+        "never 0 and\n// never repeats across terms",
+    ] {
+        assert!(
+            proto.contains(sentence),
+            "LeaseOrigin states the id bounds: {sentence:?}"
+        );
+    }
+}
+
+/// The hello version fields: `PluginHello` offers a range on a Decide stream
+/// and one version (`protocol_min` = `protocol_max`) on an Observe stream;
+/// `PluginHelloAck.protocol` is the version a Decide stream settled, the one
+/// every Observe hello of that instance then names.
+type HelloField = (&'static str, i32, Type);
+
+const HELLO_FIELDS: &[(&str, &[HelloField])] = &[
+    (
+        "PluginHello",
+        &[
+            ("protocol_min", 1, Type::Uint32),
+            ("protocol_max", 2, Type::Uint32),
+        ],
+    ),
+    ("PluginHelloAck", &[("protocol", 1, Type::Uint32)]),
+];
+
+#[test]
+fn the_hello_version_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in HELLO_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "{message_name}: a hello version field moved"
+        );
+    }
+}
+
+/// The decline a plugin answers a stage with: `stage` is Stage bits, `reason`
+/// the enum, `detail` free text; a frame declining a stage and filling that
+/// stage's answer field is invalid.
+type DeclineField = (&'static str, i32, Type);
+
+const DECLINE_FIELDS: &[(&str, &[DeclineField])] = &[(
+    "Decline",
+    &[
+        ("stage", 1, Type::Uint32),
+        ("reason", 2, Type::Enum),
+        ("detail", 3, Type::String),
+    ],
+)];
+
+#[test]
+fn the_decline_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in DECLINE_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a decline field moved");
+    }
+}
+
+/// Every lease end names exactly one lifecycle event: a completion, or a
+/// release with its reason. An end with no event is the leak a stateful plugin
+/// cannot see, so a `LeaseEnd` cause without a row here fails the test.
+const LEASE_END_EVENTS: &[(&str, &str)] = &[
+    ("CAUSE_COMPLETED", "completed"),
+    ("CAUSE_RELEASED", "released(reason)"),
+    ("CAUSE_EXPIRED", "released(REASON_EXPIRED)"),
+    ("CAUSE_WORKER_REMOVED", "released(REASON_WORKER_REMOVED)"),
+];
+
+#[test]
+fn every_lease_end_cause_names_one_lifecycle_event() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let causes: Vec<String> = enum_values(controller, "LeaseEnd.Cause")
+        .expect("LeaseEnd.Cause is an enum")
+        .into_iter()
+        .filter(|(_, number)| *number != 0)
+        .map(|(name, _)| name)
+        .collect();
+    let mapped: Vec<String> = LEASE_END_EVENTS
+        .iter()
+        .map(|(cause, _)| (*cause).to_owned())
+        .collect();
+    assert_eq!(causes, mapped, "a LeaseEnd cause has no lifecycle event");
+    let reasons: Vec<String> = enum_values(plugin, "Released.Reason")
+        .expect("Released.Reason is an enum")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for (cause, event) in LEASE_END_EVENTS {
+        if let Some(reason) = event
+            .strip_prefix("released(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .filter(|reason| reason.starts_with("REASON_"))
+        {
+            assert!(
+                reasons.iter().any(|r| r == reason),
+                "{cause}: {reason} is not a Released.Reason"
+            );
+        }
+    }
+}
+
+/// The decide frame's budget beside the request's: `PluginDecide.budget_micros`
+/// is the plugin's own deadline, clamped to at most `request.budget_micros`.
+type DecideField = (&'static str, i32, Type);
+
+const DECIDE_FIELDS: &[(&str, &[DecideField])] = &[
+    (
+        "PluginDecide",
+        &[
+            ("stages", 5, Type::Uint32),
+            ("budget_micros", 7, Type::Uint32),
+        ],
+    ),
+    ("RequestFacts", &[("budget_micros", 14, Type::Uint32)]),
+];
+
+#[test]
+fn the_decide_budget_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in DECIDE_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a budget field moved");
+    }
+}
+
+/// The replication rejoin: `ReplicaHello` names its last applied position and
+/// the term it was written under, every batch names the write term of its
+/// events, a snapshot names the write term of the position it is consistent
+/// with. The pin holds names, numbers and types; the mismatch answer is the
+/// conformance suite's to check.
+type ReplicaField = (&'static str, i32, Type);
+
+const REPLICA_FIELDS: &[(&str, &[ReplicaField])] = &[
+    (
+        "ReplicaHello",
+        &[
+            ("replica_id", 1, Type::String),
+            ("last_applied_seq", 2, Type::Uint64),
+            ("term_seen", 3, Type::Uint64),
+            ("max_backlog", 4, Type::Uint32),
+            ("last_applied_term", 5, Type::Uint64),
+        ],
+    ),
+    (
+        "ReplicationBatch",
+        &[
+            ("first_seq", 1, Type::Uint64),
+            ("term", 2, Type::Uint64),
+            ("events", 3, Type::Message),
+            ("resync_required", 4, Type::Bool),
+        ],
+    ),
+    (
+        "Snapshot",
+        &[
+            ("term", 1, Type::Uint64),
+            ("replication_seq", 15, Type::Uint64),
+            ("replication_term", 18, Type::Uint64),
+        ],
+    ),
+];
+
+#[test]
+fn the_replica_rejoin_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in REPLICA_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a rejoin field moved");
+    }
+}
+
+/// The session's value is stated once, beside `Identity` in the plugin
+/// protocol, with a worked example: its numbers are what this crate makes,
+/// so the published formula and the one function cannot part unseen.
+#[test]
+fn the_published_session_example_is_what_the_crate_makes() {
+    let text = std::fs::read_to_string(contracts_dir().join(PLUGIN_PROTO))
+        .expect("the plugin protocol is readable");
+    let mut stated = vec![("the key's fingerprint", fingerprint(b"conversation-7"))];
+    for (name, phase) in [
+        ("single", Phase::Single),
+        ("prefill", Phase::Prefill),
+        ("decode", Phase::Decode),
+        ("encode", Phase::Encode),
+    ] {
+        let session = {
+            let mut facts = RequestFacts::default();
+            facts.model = "model-a";
+            facts.session_key = Identity::plain("conversation-7");
+            facts.phase = phase;
+            facts
+        }
+        .session();
+        stated.push((name, session.get()));
+    }
+    for (what, value) in stated {
+        let literal = format!("{value:#018x}");
+        assert!(
+            text.contains(&literal),
+            "{PLUGIN_PROTO} does not state {literal} ({what})"
+        );
+    }
+    // The formula's own constants and the example's inputs are in the text.
+    for part in [
+        "0x9e3779b97f4a7c15",
+        "0xbf58476d1ce4e5b9",
+        "0x94d049bb133111eb",
+        "\"conversation-7\"",
+        "\"model-a\"",
+    ] {
+        assert!(text.contains(part), "{PLUGIN_PROTO} does not state {part}");
+    }
+}

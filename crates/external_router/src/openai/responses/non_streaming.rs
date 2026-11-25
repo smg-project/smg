@@ -23,6 +23,9 @@ use crate::{
     openai_bridge,
     persistence_utils::{persist_conversation_items, PersistStep},
     tenant::storage_tenant,
+    upstream_body::{
+        read_response_body_limited, ReadBodyResult, ERROR_BODY_TOO_LARGE, MAX_ERROR_RESPONSE_SIZE,
+    },
     worker::redacted_url,
 };
 
@@ -159,9 +162,15 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         worker.record_outcome(status.as_u16());
 
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let body = error::sanitize_error_body(&body);
-            return (status, body).into_response();
+            return match read_response_body_limited(response, MAX_ERROR_RESPONSE_SIZE).await {
+                ReadBodyResult::Ok(body) => {
+                    (status, error::sanitize_error_body(&body)).into_response()
+                }
+                ReadBodyResult::TooLarge => {
+                    error::create_error(status, "upstream_error", ERROR_BODY_TOO_LARGE)
+                }
+                ReadBodyResult::Error(_) => (status, String::new()).into_response(),
+            };
         }
 
         response_json = match response.json::<Value>().await {

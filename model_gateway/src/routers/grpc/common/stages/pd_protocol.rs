@@ -9,7 +9,7 @@
 //! decision into a compile error instead of an audit of scattered
 //! `== RuntimeType::X` checks.
 
-use crate::worker::RuntimeType;
+use smg_worker::identity::basic::RuntimeType;
 
 /// Shape of the disaggregated dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

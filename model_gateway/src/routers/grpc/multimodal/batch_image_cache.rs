@@ -150,7 +150,16 @@ pub(super) async fn preprocess(
             }
             // An allocation that fills the budget leaves no room for entries.
             // Let the owned split copy those slices in parallel.
-            batch.encoder_input.share_wire(budget.saturating_sub(1));
+            let limit = budget.saturating_sub(1);
+            // A pooled buffer's class can be over the budget while its bytes
+            // fit: shrink it to its exact length, which the allocator does in
+            // place, so a replay reads the entries without a gather.
+            if let EncoderInput::Wire { bytes, .. } = &mut batch.encoder_input {
+                if bytes.capacity() > limit && bytes.len() <= limit {
+                    bytes.shrink_to_fit();
+                }
+            }
+            batch.encoder_input.share_wire(limit);
             let mut items = split_batch(&batch, &layouts, misses.len())?;
             // When pooled capacity leaves insufficient room for metadata,
             // compact the cache entries while retaining the request output.
@@ -202,11 +211,17 @@ pub(super) async fn preprocess(
                 PreprocessedEncoderInputs::concat_refs(&ordered, &layouts.model_specific)?;
             // Repoint the entries of a growing request to its assembled output
             // so its next replay can reuse it and old backing groups can leave.
-            if distinct
-                && has_misses
-                && admit_shared_batch(&mut output, &images, &layouts, &cache, fingerprint)?
-            {
-                return Ok(Some(output));
+            // A joined output is a pooled buffer: the cache keeps it at its
+            // exact length, which the allocator shrinks to in place.
+            if distinct && has_misses {
+                if let EncoderInput::Wire { bytes, .. } = &mut output.encoder_input {
+                    if bytes.len() <= cache.max_bytes() {
+                        bytes.shrink_to_fit();
+                    }
+                }
+                if admit_shared_batch(&mut output, &images, &layouts, &cache, fingerprint)? {
+                    return Ok(Some(output));
+                }
             }
             output
         };

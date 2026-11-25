@@ -14,6 +14,11 @@ use llm_tokenizer::factory;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::json;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
+use smg_worker::{
+    identity::basic::{BasicWorker, ConnectionMode, RuntimeType},
+    jobs::WorkerJobAsker,
+    workflow::WorkerKind,
+};
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
 use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
@@ -28,6 +33,7 @@ use crate::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
     },
     routers::grpc::{
+        backend_client::BasicWorkerBuilder,
         common::stages::RateLimitOutcome,
         test_engine::serve_on_loopback,
         testing::{
@@ -36,10 +42,9 @@ use crate::{
         },
     },
     tenant::TenantKey,
-    worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType},
     workflow::{
         create_worker_workflow_data, steps::local::SubmitTokenizerJobStep, JobQueue,
-        JobQueueConfig, TokenizerLoadFailure, WorkerKind, WorkerRegistrationMode, WorkerSpec,
+        JobQueueConfig, TokenizerLoadFailure, WorkerRegistrationMode, WorkerSpec,
         WorkerWorkflowData, WorkflowEngines,
     },
 };
@@ -232,17 +237,24 @@ async fn count_tokens_is_answered_from_the_tokenizer() {
 /// capability matrix is refused with the sentence `/v1/messages` gives,
 /// instead of counted, before any media is fetched; to an engine that
 /// takes images the count goes on into media resolution (here, to the
-/// config lookup the test's model directory cannot satisfy).
+/// config lookup the test's model directory cannot satisfy: the
+/// deployment's fault, answered in the server's class).
 #[tokio::test]
 async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
     let model_dir = unreadable_model_dir();
-    for (runtime, code, message) in [
+    for (runtime, status, code, message) in [
         (
             RuntimeType::Mlx,
+            StatusCode::BAD_REQUEST,
             "multimodal_not_supported",
             Some("backend mlx does not support image inputs"),
         ),
-        (RuntimeType::Sglang, "invalid_multimodal_request", None),
+        (
+            RuntimeType::Sglang,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "multimodal_processing_failed",
+            None,
+        ),
     ] {
         let (_ctx, router) = regular_router_over_m(Some(runtime), Some(model_dir.path())).await;
         let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
@@ -260,7 +272,7 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         let response = router
             .route_messages_count_tokens(None, &tenant_meta, request, "m")
             .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{runtime}");
+        assert_eq!(response.status(), status, "{runtime}");
         assert_eq!(
             error::extract_error_code_from_response(&response),
             code,
@@ -273,6 +285,87 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         assert_eq!(body["error"]["code"], code, "{runtime}: {body}");
         if let Some(message) = message {
             assert_eq!(body["error"]["message"], message, "{runtime}: {body}");
+        }
+    }
+}
+
+/// The rule that refuses images for a model without a vision encoder judges
+/// the workers the router's mode sends a request's pixels to, and the router
+/// tells it its mode. One fleet, a prefill and a decode worker of `m` that
+/// both run without the encoder, under two routers: the prefill/decode
+/// router refuses an image block, since its prefill side would take the
+/// pixels; the encode/prefill/decode router does not, since its encode
+/// workers would and none is registered, so the count goes on past the rule.
+#[tokio::test]
+async fn count_tokens_judges_the_workers_the_routers_mode_sends_the_pixels_to() {
+    let model_dir = unreadable_model_dir();
+    for (mode, refused) in [
+        (Mode::PrefillDecode, true),
+        (Mode::EncodePrefillDecode, false),
+    ] {
+        let ctx = grpc_ctx(routing_mode(mode)).await;
+        let source = model_dir.path().to_str().expect("utf-8 path");
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+        );
+        ctx.tokenizer_registry
+            .load("m", "m", source, || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        for (url, worker_type) in [
+            ("grpc://127.0.0.1:30001", WorkerType::Prefill),
+            ("grpc://127.0.0.1:30002", WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("m"))
+                .label(smg_worker::labels::SUPPORTS_VISION_LABEL, "false")
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            ctx.worker_registry
+                .register(Arc::new(worker))
+                .expect("register worker");
+        }
+        let router = GrpcRouter::new(&ctx, mode).expect("router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "What colour is this pixel?"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                }}
+            ]}]
+        }))
+        .expect("count request");
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, request, "m")
+            .await;
+        let status = response.status();
+        let code = error::extract_error_code_from_response(&response).to_string();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&bytes);
+        if refused {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{mode:?}: {body}");
+            assert_eq!(code, "multimodal_not_supported", "{mode:?}: {body}");
+            assert!(
+                body.contains("none of its prefill workers accept vision input"),
+                "{mode:?}: {body}"
+            );
+        } else {
+            assert_ne!(code, "multimodal_not_supported", "{mode:?}: {body}");
+            assert!(
+                !body.contains("accept vision input"),
+                "{mode:?}: the rule did not refuse: {body}"
+            );
         }
     }
 }
@@ -459,6 +552,7 @@ fn tokenizer_step_input(
         WorkerSpec::new("grpc://worker:30000"),
         WorkerRegistrationMode::Upsert,
         ctx.clone(),
+        WorkerJobAsker::Api,
     );
     data.worker_kind = Some(WorkerKind::Local);
     data.connection_mode = Some(ConnectionMode::Grpc);
@@ -845,6 +939,89 @@ async fn max_tokens_zero_is_answered_with_an_empty_message() {
         error::extract_error_code_from_response(&response),
         "context_length_exceeded"
     );
+}
+
+/// count_tokens answers a conversation that does not render as `/v1/messages`
+/// answers it, under the render failure's text. The 400
+/// `process_messages_failed`: where the model's template refuses the
+/// conversation through its own `raise_exception`, and where the render
+/// stops on a value (a second message the conversation does not have; a
+/// number the template iterates over on every conversation, its own bug of a
+/// kind the render cannot tell from a request's value; a macro the template
+/// declares only for a conversation that opens with `hello`). A 500
+/// `chat_template_render_failed`: where the failure is the template's own
+/// whatever the request holds (it asks for another template).
+#[tokio::test]
+async fn count_tokens_tells_a_templates_own_failure_from_a_render_a_value_stops() {
+    use llm_tokenizer::traits::Tokenizer as _;
+
+    for (template, status, code, cause) in [
+        (
+            "{{ raise_exception('the roles must alternate') }}",
+            StatusCode::BAD_REQUEST,
+            "process_messages_failed",
+            "the roles must alternate",
+        ),
+        (
+            "{{ messages[1]['content'] }}",
+            StatusCode::BAD_REQUEST,
+            "process_messages_failed",
+            "Failed to apply chat template: Failed to render template: undefined value",
+        ),
+        (
+            "{% for part in 42 %}{{ part }}{% endfor %}",
+            StatusCode::BAD_REQUEST,
+            "process_messages_failed",
+            "Failed to apply chat template: Failed to render template: invalid operation: ",
+        ),
+        (
+            "{% if messages[0].content == 'hello' %}{% macro greet() %}hi there{% endmacro %}\
+             {% endif %}{{ greet() }}",
+            StatusCode::BAD_REQUEST,
+            "process_messages_failed",
+            "Failed to apply chat template: Failed to render template: unknown function: ",
+        ),
+        (
+            "{% include 'tools.jinja' %}",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chat_template_render_failed",
+            "Failed to apply chat template: Failed to render template: template not found: ",
+        ),
+    ] {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .expect("tokenizer");
+        tokenizer
+            .set_chat_template(template.to_string())
+            .expect("template");
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(tokenizer);
+        ctx.tokenizer_registry
+            .load("m", "m", "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        ctx.worker_registry
+            .register(grpc_worker_for_m())
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+
+        assert_eq!(response.status(), status, "{template}");
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            code,
+            "{template}"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains(cause), "{template}: {body}");
+    }
 }
 
 /// count_tokens and `max_tokens: 0` render `output_config.effort` as
@@ -1662,13 +1839,12 @@ const V13_CHAT_TEMPLATE: &str =
     "{% for message in messages %}[INST]{{ message.content }}[/INST]{% endfor %}";
 
 /// One gateway serving two families under `--parser symphony
-/// --tool-call-parser mistral_v13`, in both modes: the model the registry
-/// knows, whose workers label no parser, is read by the registry's table
-/// (its own syntax read apart, not the fleet-wide name's), and the model
-/// the registry does not know is read by the fleet-wide name's table; both
-/// answers name Symphony.
+/// --tool-call-parser mistral_v13`, in both modes: the fleet-wide name's
+/// table reads the model the registry knows, whose workers label no parser,
+/// ahead of the registry's own table, as it reads the model the registry
+/// does not know; both answers name Symphony.
 #[tokio::test]
-async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_fleet_wide_names() {
+async fn the_fleet_wide_names_read_a_model_the_registry_knows_ahead_of_its_table() {
     assert_eq!(
         ::symphony::formats::table_for(KNOWN_MODEL).map(|table| table.name()),
         Some("qwen3")
@@ -1681,26 +1857,13 @@ async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_f
             Some("mistral_v13"),
         )
         .await;
-        register_tokenizer_for(
-            &ctx,
-            KNOWN_MODEL,
-            CHAT_TEMPLATE,
-            (TABLE_OUTPUT, TABLE_OUTPUT_ID),
-        )
-        .await;
-        register_tokenizer_for(
-            &ctx,
-            UNKNOWN_MODEL,
-            V13_CHAT_TEMPLATE,
-            (V13_OUTPUT, V13_OUTPUT_ID),
-        )
-        .await;
+        for model in [KNOWN_MODEL, UNKNOWN_MODEL] {
+            register_tokenizer_for(&ctx, model, V13_CHAT_TEMPLATE, (V13_OUTPUT, V13_OUTPUT_ID))
+                .await;
+        }
         for worker_type in roles(mode) {
-            for (model, output_id) in [
-                (KNOWN_MODEL, TABLE_OUTPUT_ID),
-                (UNKNOWN_MODEL, V13_OUTPUT_ID),
-            ] {
-                let port = spawn_engine(vec![output_id]).await;
+            for model in [KNOWN_MODEL, UNKNOWN_MODEL] {
+                let port = spawn_engine(vec![V13_OUTPUT_ID]).await;
                 register_worker(
                     &ctx,
                     &format!("grpc://127.0.0.1:{port}"),

@@ -17,14 +17,14 @@ use symphony::{
 use tracing::{debug, Span};
 
 use super::{
-    constraint::Asks,
+    constraint::{Asks, Forbids},
     names::Reading,
     telemetry::{self, Tally, Who},
     SymphonyError,
 };
 #[cfg(test)]
 use super::{names::reading, template::Templates};
-use crate::routers::grpc::utils::{isolation, CallIdFamily};
+use crate::routers::grpc::utils::{gives_way, isolation, CallIdFamily};
 #[cfg(test)]
 use crate::{config::ParserChoice, routers::grpc::utils::ModelNames};
 
@@ -35,10 +35,11 @@ pub(crate) struct Assignment {
     /// The table, shared with every reader of the response and every request it reads for.
     pub format: Arc<Format>,
     pub prompt: String,
-    /// The request forbade the calls the table reads (`tool_choice: none`,
-    /// [`Asks::forbids_calls_for`]): the reader drops every call, as the engine's own server reads
-    /// such a call and withholds it.
-    pub forbids_calls: bool,
+    /// The calls the request's `tool_choice` forbids among those the table reads
+    /// ([`Asks::forbids_for`]): every call under `none`, a call outside the callable tools under
+    /// a named function, an allowed list or `required`. The reader drops such a call, as the
+    /// engine's own server reads a call under `none` and withholds it.
+    pub forbids_calls: Forbids,
     /// The request asked for generation past the model's own end of output (`ignore_eos`,
     /// [`Asks::past_the_end`]): the output carries an unconstrained tail after the answer, which
     /// the reader reads and delivers like the rest, and a marker of the table kept as text in it
@@ -58,6 +59,8 @@ pub(crate) struct Assignment {
     /// gateway's JSON-schema constraint forces the call and the family numbers its ids by the
     /// conversation ([`CallIdFamily`]). The forced JSON has no header for the table to take an id
     /// from, so the reader gives each of its calls the family's id, as the older forced arm does.
+    /// So it does for every call of a table whose own name gives way ([`gives_way`]: today
+    /// `kimi`): it reads in the place of the legacy parsers, which numbered the family's calls.
     /// `None` for every other request: its ids are the table's.
     pub forced_ids: Option<(CallIdFamily, usize)>,
     /// The request holds the answer to JSON (a `json_object` or `json_schema` response format, a
@@ -89,7 +92,7 @@ pub(super) fn assignment(
     format: Arc<Format>,
     model: &str,
     prompt: &str,
-    forbids_calls: bool,
+    forbids_calls: Forbids,
     past_the_end: bool,
     forcing: Option<String>,
     forced_ids: Option<(CallIdFamily, usize)>,
@@ -271,8 +274,9 @@ pub(crate) fn assign(
 /// ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]). A call the conversation
 /// established without a tool inventory comes back as a call under either parser.
 ///
-/// `constraint` is the older registry's where the table built none (`WorkerConstraint::table`);
-/// the table's own is never passed, whatever kind its backend's spelling gave it.
+/// `constraint` is one no table built (`WorkerConstraint::table`): the older registry's where
+/// the table has no tag, or the forced call's JSON schema where the table's tag opens with free
+/// text; the table's own is never passed, whatever kind its backend's spelling gave it.
 ///
 /// Under a JSON-schema constraint (the forced call the older registry writes where the table has
 /// no tag for it) the output has none of the table's call markers: it is the model's thought,
@@ -343,9 +347,11 @@ pub(crate) fn assign_for(
             false,
         )
     };
-    // The forced JSON has no header to read an id from: a family that numbers its ids by the
-    // conversation numbers these too, as the older forced arm does.
-    let forced_ids = is_forced
+    // The forced JSON has no header to read an id from, and a table whose own name gives way
+    // (`GIVING_WAY`: today `kimi`) leaves its ids to the gateway: a family that numbers its ids
+    // by the conversation numbers these too, as the older parsers do. A table read through
+    // another such name (`command`, through `cohere_cmd`) mints its own.
+    let forced_ids = (is_forced || gives_way(format.name()))
         .then(|| CallIdFamily::of(asks.model()))
         .flatten()
         .map(|family| (family, asks.history_tool_calls_count()));
@@ -376,7 +382,7 @@ pub(crate) fn assign_for(
             format,
             asks.model(),
             prompt,
-            asks.forbids_calls_for(provider),
+            asks.forbids_for(provider),
             asks.past_the_end(),
             forcing,
             forced_ids,
@@ -555,10 +561,10 @@ pub(crate) struct Reader {
     ended: bool,
     /// Drop the events of every call after the first.
     first_call_only: bool,
-    /// Drop the events of every call: the request forbade them (`tool_choice: none`), the table
-    /// read them whole, and the engine's own server delivers nothing of such a call
-    /// ([`Assignment::forbids_calls`]).
-    forbids_calls: bool,
+    /// The calls the request's `tool_choice` forbids ([`Assignment::forbids_calls`]), dropped as
+    /// the output makes them: the table read them whole, and the engine's own server delivers
+    /// nothing of a call under `none`.
+    forbidden: ForbiddenCalls,
     /// Give every call the family's id by its place in the conversation
     /// ([`Assignment::forced_ids`]).
     forced_ids: Option<(CallIdFamily, usize)>,
@@ -617,6 +623,7 @@ impl Reader {
         tools: Arc<[Tool]>,
         out: &mut Events<'_>,
     ) -> Result<Self, SymphonyError> {
+        let forbids = assignment.forbids_calls.over(&tools);
         let declared = match &assignment.forcing {
             Some(name) => Declared::shared(tools).forcing(name.clone()),
             None => Declared::shared(tools),
@@ -634,7 +641,12 @@ impl Reader {
             read: 0,
             ended: false,
             first_call_only: false,
-            forbids_calls: assignment.forbids_calls,
+            forbidden: ForbiddenCalls {
+                any: forbids != Forbids::Nothing,
+                forbids,
+                dropping: None,
+                dropped: 0,
+            },
             forced_ids: assignment.forced_ids,
             shown: false,
             unshown: String::new(),
@@ -901,7 +913,9 @@ impl Reader {
     /// Feeds `input` to the engine, its events into `out` after the ones already there: the
     /// reader's one way in. A call the step started takes its family's id first, where the
     /// assignment gives one ([`Assignment::forced_ids`]). The events this step added are tallied,
-    /// and limited to the first call where the request asks. An output the engine refuses is
+    /// the calls the request's choice forbids are dropped ([`ForbiddenCalls`]), a call kept
+    /// after a dropped one takes its family's id by the place it is returned in, and the rest are
+    /// limited to the first call where the request asks. An output the engine refuses is
     /// recorded as failed for the table, which the error names.
     fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), SymphonyError> {
         let before = out.len();
@@ -928,12 +942,16 @@ impl Reader {
                 }
             }
         }
+        // A step that adds no event ends here: nothing below acts on it.
+        if fresh.is_empty() {
+            return Ok(());
+        }
         // Where the step's first event starts in the output: the held runs below are placed by it.
         let start = self.tally.at();
-        for event in fresh.iter() {
-            if self.forbids_calls {
-                self.tally.see_forbidden(event);
-            } else {
+        // Under a choice that forbids calls the step is tallied where they are dropped
+        // ([`ForbiddenCalls::drop_from`]).
+        if !self.forbidden.any {
+            for event in fresh.iter() {
                 self.tally.see(event, self.first_call_only);
             }
         }
@@ -1008,9 +1026,32 @@ impl Reader {
                 }
             }
         }
-        if self.forbids_calls {
-            symphony::event::forbidden_calls(fresh);
-        } else if self.first_call_only {
+        if self.forbidden.any {
+            let (tally, first_call_only) = (&mut self.tally, self.first_call_only);
+            self.forbidden.drop_from(fresh, |event, forbidden| {
+                if forbidden {
+                    tally.see_forbidden(event);
+                } else {
+                    tally.see(event, first_call_only);
+                }
+            });
+            // A call kept after a dropped one moved down: where the family numbers its ids by
+            // the conversation, its id is the one of the place it is returned in. Until a call
+            // is dropped every call keeps the id it took at the step's start.
+            if self.forbidden.dropped > 0 {
+                if let Some((family, history)) = self.forced_ids {
+                    for event in fresh.iter_mut() {
+                        if let Event::ToolCallStart {
+                            index, id, name, ..
+                        } = event
+                        {
+                            *id = family.id(name, *index as usize, history);
+                        }
+                    }
+                }
+            }
+        }
+        if self.first_call_only {
             symphony::event::first_call_only(fresh);
         }
         Ok(())
@@ -1072,6 +1113,103 @@ impl Reader {
     fn drop_held(&mut self) {
         self.refused.clear();
         self.clear_framing();
+    }
+}
+
+/// The calls of one output that the request's `tool_choice` forbids ([`Forbids`]), dropped as the
+/// reader meets them: every call under `none`; under a named function, an allowed list or
+/// `required`, each call to a function outside the tools the choice leaves callable; none under
+/// `auto`.
+struct ForbiddenCalls {
+    /// The choice forbids a call, some or every one: the one test a step pays under `auto`, which
+    /// forbids none and whose steps the reader tallies itself ([`Reader::feed`]).
+    any: bool,
+    forbids: Forbids,
+    /// The engine's index of the call being dropped, from its start to its end.
+    dropping: Option<u32>,
+    /// How many calls were dropped so far, by which a call kept after them moves down.
+    dropped: u32,
+}
+
+impl ForbiddenCalls {
+    /// For a step under a choice that forbids calls ([`Self::any`]; a step under `auto` the reader
+    /// tallies itself): tells `seen` of each of the step's `fresh` events, with whether the choice
+    /// forbids it, then rewrites a forbidden call's events as dropped text
+    /// (`event::forbidden_calls`): never a call or content. A call is asked once, at its start
+    /// ([`Forbids::call_to`]): by its function's name and by the engine's word on whether the
+    /// request declares it, the `Malformed { UnknownTool }` event of no bytes right before the
+    /// start, which goes with the call it announces. The call's later events follow that answer
+    /// by their index, so no name is compared on a delta, and text the table could not read
+    /// inside a dropped call (the bytes behind the arguments of an object the output never
+    /// closed) is dropped with it. A table reads one call at a time, so a call kept after a
+    /// dropped one moves down by the count dropped before it, and the calls delivered are
+    /// numbered from zero; the finish counts the calls kept, and with none kept it is forbidden
+    /// too: a `tool_calls` finish is the engine's `stop` again.
+    fn drop_from(&mut self, fresh: &mut [Event<'_>], mut seen: impl FnMut(&Event<'_>, bool)) {
+        match self.forbids {
+            Forbids::Nothing => {}
+            Forbids::Every | Forbids::Undeclared | Forbids::AllBut(_) => {
+                let mut undeclared = false;
+                for event in fresh {
+                    let announced = std::mem::take(&mut undeclared);
+                    let forbidden = match event {
+                        // The mark of a call to a function the request did not declare, which no
+                        // choice leaves callable.
+                        Event::Malformed {
+                            why: symphony::MalformedReason::UnknownTool,
+                            ..
+                        } => {
+                            undeclared = true;
+                            true
+                        }
+                        Event::ToolCallStart { index, name, .. } => {
+                            let forbidden = self.forbids.call_to(name, !announced);
+                            if forbidden {
+                                self.dropping = Some(*index);
+                                self.dropped += 1;
+                            } else {
+                                *index -= self.dropped;
+                            }
+                            forbidden
+                        }
+                        // Text the table could not read inside the call being dropped is that
+                        // call's: it goes with it, as dropped text.
+                        Event::Malformed { text, .. } if self.dropping.is_some() => {
+                            *event = Event::Dropped {
+                                text: std::mem::take(text),
+                                why: DropReason::ForbiddenCall,
+                            };
+                            false
+                        }
+                        Event::ToolCallArguments { index, .. } => {
+                            let forbidden = self.dropping == Some(*index);
+                            if !forbidden {
+                                *index -= self.dropped;
+                            }
+                            forbidden
+                        }
+                        Event::ToolCallEnd { index, .. } => {
+                            let forbidden = self.dropping == Some(*index);
+                            if forbidden {
+                                self.dropping = None;
+                            } else {
+                                *index -= self.dropped;
+                            }
+                            forbidden
+                        }
+                        Event::Finish { tool_calls, .. } => {
+                            *tool_calls -= self.dropped;
+                            self.dropped > 0 && *tool_calls == 0
+                        }
+                        _ => false,
+                    };
+                    seen(&*event, forbidden);
+                    if forbidden {
+                        symphony::event::forbidden_calls(std::slice::from_mut(event));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1198,7 +1336,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(format),
             prompt: prompt.to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -2166,7 +2304,7 @@ mod tests {
             table_of(&refused),
             "none keeps the calls the provider reads; the reader drops them"
         );
-        assert!(forbidden.forbids_calls);
+        assert_eq!(forbidden.forbids_calls, Forbids::Every);
         let declared_none = request(json!({"tools": []}));
         assert!(scans_for_tool_calls_for(
             &declared_none,
@@ -3277,6 +3415,133 @@ mod tests {
             .collect()
     }
 
+    /// Under a choice that forbids some calls a family that numbers its ids by the conversation
+    /// numbers the calls returned: a call kept after a dropped one takes the id of the place it
+    /// is returned in, so the first call of the next turn, counted on from the one call the
+    /// history then holds, takes a different id.
+    #[test]
+    fn a_call_kept_after_a_dropped_one_takes_the_familys_id_of_its_place() {
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        let list = r#"[{"name": "undeclared", "parameters": {"q": 1}}, {"name": "lookup", "parameters": {"q": 2}}]"#;
+        let first = json!([{"role": "user", "content": "hi"}]);
+        for (model, table, ids) in [
+            (
+                "moonshotai/Kimi-K2-Instruct",
+                Table::KimiK2,
+                ["functions.lookup:0", "functions.lookup:1"],
+            ),
+            (
+                "moonshotai/Kimi-K3",
+                Table::KimiK3,
+                ["lookup_0", "lookup_1"],
+            ),
+        ] {
+            // The second turn's history holds the one call the first turn returned.
+            let second = json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": ids[0], "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": ids[0], "content": "1"},
+            ]);
+            for (history, id) in [(first.clone(), ids[0]), (second, ids[1])] {
+                let forced = request(json!({
+                    "model": model, "messages": history,
+                    "tools": declared.clone(), "tool_choice": "required",
+                }));
+                let assignment = assign_for(
+                    Reading::Table(table.shared(), false),
+                    Asks::Chat(&forced),
+                    Some(&schema),
+                    "",
+                    ProviderProfile::for_model(&forced.model),
+                    || GrammarStart::Unknown,
+                )
+                .expect("the table reads the forced call");
+                let mut replayed = Events::new();
+                let mut reader =
+                    Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+                let events = read_tail(&mut reader, list);
+                assert_eq!(ids_of(&events), [id], "{model}: {events:?}");
+            }
+        }
+    }
+
+    /// Two calls kept after a dropped one take the ids of the first two places, where the family
+    /// numbers its ids by the conversation.
+    #[test]
+    fn two_calls_kept_after_a_dropped_one_take_the_familys_ids_of_their_places() {
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        let list = r#"[{"name": "undeclared", "parameters": {"q": 1}}, {"name": "lookup", "parameters": {"q": 2}}, {"name": "lookup", "parameters": {"q": 3}}]"#;
+        for (model, table, ids) in [
+            (
+                "moonshotai/Kimi-K2-Instruct",
+                Table::KimiK2,
+                ["functions.lookup:0", "functions.lookup:1"],
+            ),
+            (
+                "moonshotai/Kimi-K3",
+                Table::KimiK3,
+                ["lookup_0", "lookup_1"],
+            ),
+        ] {
+            let forced = request(json!({
+                "model": model, "messages": [{"role": "user", "content": "hi"}],
+                "tools": declared.clone(), "tool_choice": "required",
+            }));
+            let assignment = assign_for(
+                Reading::Table(table.shared(), false),
+                Asks::Chat(&forced),
+                Some(&schema),
+                "",
+                ProviderProfile::for_model(&forced.model),
+                || GrammarStart::Unknown,
+            )
+            .expect("the table reads the forced call");
+            let mut replayed = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+            let events = read_tail(&mut reader, list);
+            assert_eq!(ids_of(&events), ids, "{model}: {events:?}");
+        }
+    }
+
+    /// The `kimi` table reads in the place of the legacy parsers, which numbered a Kimi model's
+    /// calls by the conversation: each call takes the family's id, counted on from the call the
+    /// history holds, where the model wrote the first number again.
+    #[test]
+    fn the_calls_of_a_table_that_gives_way_take_the_familys_id() {
+        let asked = request(json!({
+            "model": "acme/kimi-tuned",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "a", "content": "1"},
+            ],
+            "tools": serde_json::to_value(tools()).expect("tools"),
+        }));
+        let assignment = assign_for(
+            Reading::Table(Table::Kimi.shared(), false),
+            Asks::Chat(&asked),
+            None,
+            "",
+            ProviderProfile::for_model(&asked.model),
+            || GrammarStart::Unknown,
+        )
+        .expect("the table reads the call");
+        let mut replayed = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+        let events = read_tail(
+            &mut reader,
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.lookup:0<|tool_call_argument_begin|>{\"q\": 1}<|tool_call_end|><|tool_calls_section_end|>",
+        );
+        assert_eq!(ids_of(&events), ["functions.lookup:1"], "{events:?}");
+    }
+
     /// A forced call's JSON has no header for the table to take an id from. On a family that
     /// numbers its ids by the conversation the reader gives the family's id, as the older forced
     /// arm does: the K2 line's `functions.{name}:{n}` and the K3 line's `{name}_{n}`, counted on
@@ -3458,7 +3723,7 @@ mod tests {
             let assignment = Assignment {
                 format: Arc::new(symphony::formats::inkling().without_calls()),
                 prompt: "<|message_model|>".to_string(),
-                forbids_calls: false,
+                forbids_calls: Forbids::Nothing,
                 past_the_end: false,
                 forcing: None,
                 opener: None,
@@ -3503,7 +3768,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(symphony::formats::inkling().without_calls()),
             prompt: "<|message_model|>".to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3581,7 +3846,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(glm4()),
             prompt: GLM4_PROMPT.to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3644,7 +3909,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3678,7 +3943,7 @@ mod tests {
                     Arc::new(qwen3(CallSyntax::Json)),
                     "Qwen/Qwen3-8B",
                     PROMPT,
-                    false,
+                    Forbids::Nothing,
                     false,
                     None,
                     None,
@@ -3731,7 +3996,7 @@ mod tests {
                     Arc::new(symphony::formats::qwen2_5()),
                     "Qwen/Qwen2.5-7B-Instruct",
                     "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
-                    false,
+                    Forbids::Nothing,
                     false,
                     None,
                     None,
@@ -3791,7 +4056,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3922,7 +4187,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3959,7 +4224,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -4013,7 +4278,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(symphony::formats::json().without_calls()),
             prompt: String::new(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -4053,7 +4318,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
-            forbids_calls: true,
+            forbids_calls: Forbids::Every,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -4109,7 +4374,7 @@ mod tests {
         assert!(forbidden.ends_with(" 1"), "{forbidden}");
         // The same output under `auto` is a call: the ask, not the table, decides.
         let allowed = Assignment {
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -4312,7 +4577,7 @@ mod tests {
             let assignment = Assignment {
                 format: Arc::new(format),
                 prompt: prompt.to_string(),
-                forbids_calls: false,
+                forbids_calls: Forbids::Nothing,
                 past_the_end: false,
                 forcing: None,
                 opener: None,

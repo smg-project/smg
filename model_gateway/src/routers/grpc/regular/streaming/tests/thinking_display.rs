@@ -14,7 +14,11 @@ use super::{
     eof::{chunk, complete, dispatch, response_processor, scripted_stream, CharacterTokenizer},
     symphony_chat::{message_blocks, message_events},
 };
-use crate::routers::grpc::{context, regular::symphony::Assignment, spec::MessagesResponseSpec};
+use crate::routers::grpc::{
+    context,
+    regular::symphony::{Assignment, Forbids},
+    spec::MessagesResponseSpec,
+};
 
 /// Every `display` a request can state, and none, with whether the thinking text is returned.
 const DISPLAYS: [(Option<&str>, bool); 4] = [
@@ -44,7 +48,7 @@ fn spec(display: Option<&str>, with_symphony: bool) -> MessagesResponseSpec {
         spec.symphony = Some(Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,

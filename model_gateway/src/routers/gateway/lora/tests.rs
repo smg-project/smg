@@ -10,11 +10,12 @@ use openai_protocol::{
     model_card::ModelCard,
 };
 use serde_json::{json, Value};
+use smg_worker::identity::basic::WorkerType;
 
 use super::*;
 use crate::{
     middleware::{RouteRequestMeta, TenantKey, TenantRequestMeta},
-    worker::{BasicWorkerBuilder, WorkerType},
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
 
 fn worker(

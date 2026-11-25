@@ -3,21 +3,21 @@
 //! Loads conversation history and/or previous response chains into the request
 //! input before forwarding to the upstream provider.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use openai_protocol::{
     event_types::ItemType,
     responses::{
-        from_turn_boundary, without_outputs_of_missing_calls, ResponseContentPart, ResponseInput,
-        ResponseInputOutputItem, ResponsesRequest,
+        from_turn_boundary, without_calls_answered_by, without_outputs_of_missing_calls,
+        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest,
     },
 };
 use serde::Deserialize;
 use serde_json::Value;
 use smg_data_connector::{
-    is_unstored, visible_chain, ConversationId, ConversationItem, ListParams, ResponseId,
-    ResponseStorageError, SortOrder, StoredResponse,
+    ConversationId, ConversationItem, ListParams, ResponseId, ResponseStorageError, SortOrder,
+    StorageFailure, StoredResponse,
 };
 use tracing::warn;
 
@@ -69,7 +69,7 @@ pub(crate) async fn load_input_history(
     if let Some(conv_id_str) = conversation {
         let conv_id = ConversationId::from(conv_id_str);
         check_conversation_visible(components, &conv_id, tenant, model).await?;
-        let mut items = conversation_window_items(components, &conv_id, model).await?;
+        let mut items = conversation_window_items(components, &conv_id, tenant, model).await?;
         let own_input =
             std::mem::replace(&mut request_body.input, ResponseInput::Items(Vec::new()));
         append_current_input(&mut items, own_input, conv_id_str);
@@ -94,6 +94,24 @@ pub(crate) async fn load_input_history(
     })
 }
 
+/// A storage failure while the history is loaded: logged in the context's
+/// words, recorded as an internal error on `model`, answered as a storage
+/// failure under `code`.
+fn storage_failed(
+    model: &str,
+    code: &str,
+    context: impl Display,
+    err: &(impl StorageFailure + Display),
+) -> Response {
+    warn!("{context}: {err}");
+    super::record_error(
+        model,
+        metrics_labels::ERROR_INTERNAL,
+        metrics_labels::REASON_INTERNAL,
+    );
+    error::storage_failure(code, context, err)
+}
+
 /// The previous-response chain as the caller may see it: the records up to the
 /// first of another tenant (the chain ends there, as it would at a missing
 /// one); a chain ending in a record its client asked not to store (a
@@ -109,18 +127,10 @@ async fn visible_previous_chain(
     let prev_id = ResponseId::from(prev_id_str);
     match components
         .response_storage
-        .get_response_chain(&prev_id, None)
+        .get_response_chain_for(&prev_id, tenant)
         .await
-        .map(|chain| visible_chain(chain.responses, tenant))
     {
-        Ok(responses)
-            if !responses.is_empty()
-                && !responses
-                    .last()
-                    .is_some_and(|response| is_unstored(response)) =>
-        {
-            Ok(responses)
-        }
+        Ok(chain) if !chain.responses.is_empty() => Ok(chain.responses),
         Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
             super::record_error(
                 model,
@@ -132,22 +142,12 @@ async fn visible_previous_chain(
                 format!("Previous response with id '{prev_id_str}' not found."),
             ))
         }
-        Err(e) => {
-            warn!(
-                "Failed to load previous response chain for {}: {}",
-                prev_id_str, e
-            );
-            super::record_error(
-                model,
-                metrics_labels::ERROR_INTERNAL,
-                metrics_labels::REASON_INTERNAL,
-            );
-            Err(error::storage_failure(
-                "load_previous_response_chain_failed",
-                format!("Failed to load previous response chain for {prev_id_str}"),
-                &e,
-            ))
-        }
+        Err(e) => Err(storage_failed(
+            model,
+            "load_previous_response_chain_failed",
+            format!("Failed to load previous response chain for {prev_id_str}"),
+            &e,
+        )),
     }
 }
 
@@ -192,19 +192,12 @@ async fn check_conversation_visible(
                 format!("No conversation found with id '{}'", conv_id.0),
             ))
         }
-        Err(e) => {
-            warn!("Failed to check conversation {}: {}", conv_id.0, e);
-            super::record_error(
-                model,
-                metrics_labels::ERROR_INTERNAL,
-                metrics_labels::REASON_INTERNAL,
-            );
-            Err(error::storage_failure(
-                "check_conversation_failed",
-                format!("Failed to check conversation {}", conv_id.0),
-                &e,
-            ))
-        }
+        Err(e) => Err(storage_failed(
+            model,
+            "check_conversation_failed",
+            format!("Failed to check conversation {}", conv_id.0),
+            &e,
+        )),
     }
 }
 
@@ -218,6 +211,7 @@ async fn check_conversation_visible(
 async fn conversation_window_items(
     components: &ResponsesComponents,
     conv_id: &ConversationId,
+    tenant: Option<&str>,
     model: &str,
 ) -> Result<Vec<ResponseInputOutputItem>, Response> {
     let params = ListParams {
@@ -232,13 +226,8 @@ async fn conversation_window_items(
     {
         Ok(stored_items) => stored_items,
         Err(e) => {
-            warn!("Failed to load conversation history: {}", e);
-            super::record_error(
+            return Err(storage_failed(
                 model,
-                metrics_labels::ERROR_INTERNAL,
-                metrics_labels::REASON_INTERNAL,
-            );
-            return Err(error::storage_failure(
                 "load_conversation_history_failed",
                 "Failed to load conversation history",
                 &e,
@@ -250,12 +239,29 @@ async fn conversation_window_items(
     if cut {
         stored_items.drain(..stored_items.len() - MAX_CONVERSATION_HISTORY_ITEMS);
     }
-    let mut items: Vec<ResponseInputOutputItem> = stored_items
+    let mut hidden = false;
+    // The rows the rule hid, converted: the call of an output among them is
+    // not replayed either.
+    let mut skipped = Vec::new();
+    let items: Vec<ResponseInputOutputItem> = stored_items
         .into_iter()
-        .filter_map(stored_item_as_input)
+        .filter_map(|row| {
+            let visible = row.is_visible_to(tenant);
+            hidden |= !visible;
+            let item = stored_item_as_input(row)?;
+            if !visible {
+                skipped.push(item);
+                return None;
+            }
+            Some(item)
+        })
         .collect();
+    let mut items = without_calls_answered_by(items, &skipped);
     if cut {
         items = without_outputs_of_missing_calls(from_turn_boundary(items));
+    } else if hidden {
+        // The output of a call the rule hid is no history, as after a cut.
+        items = without_outputs_of_missing_calls(items);
     }
     Ok(items)
 }
@@ -305,6 +311,16 @@ fn stored_item_as_input(item: ConversationItem) -> Option<ResponseInputOutputIte
                 }
                 Err(e) => {
                     tracing::error!("Failed to deserialize function_call_output: {}", e);
+                    None
+                }
+            }
+        }
+        "additional_tools" | "agent_message" | "tool_search_call" | "tool_search_output"
+        | "web_search_call" | "program" | "program_output" => {
+            match serde_json::from_value::<ResponseInputOutputItem>(item.content) {
+                Ok(replayed) => Some(replayed),
+                Err(e) => {
+                    tracing::error!("Failed to deserialize {}: {}", item.item_type, e);
                     None
                 }
             }
@@ -520,7 +536,7 @@ mod tests {
                     format!("function_call:{call_id}")
                 }
                 ResponseInputOutputItem::FunctionCallOutput { call_id, .. } => {
-                    format!("function_call_output:{call_id}")
+                    format!("function_call_output:{}", call_id.as_deref().unwrap_or(""))
                 }
                 other => format!("{other:?}"),
             })
@@ -544,6 +560,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn external_conversation_replays_codex_tool_declarations_and_agent_messages() {
+        let components = components().await;
+        let first_input = json!([
+            {"type":"additional_tools","id":"at_1","role":"developer","tools":[
+                {"type":"function","name":"exec_command","parameters":{"type":"object"}}
+            ]},
+            {"type":"agent_message","id":"amsg_1","author":"/root","recipient":"/root/worker",
+             "internal_chat_message_metadata_passthrough":{"turn_id":"turn_1","create_time":1795400000.5},
+             "content":[{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"},
+                        {"type":"encrypted_content","encrypted_content":"opaque-agent-message"}]}
+        ]);
+        let first = serde_json::from_value(json!({
+            "model":"m", "conversation":"conv_1", "input":first_input
+        }))
+        .expect("the first request parses");
+        crate::persistence_utils::persist_conversation_items(
+            components.conversation_storage.clone(),
+            components.conversation_item_storage.clone(),
+            components.response_storage.clone(),
+            &json!({"id":"resp_first","status":"completed","output":[]}),
+            &first,
+            None,
+            None,
+        )
+        .await
+        .expect("the first turn is stored");
+
+        let replayed = loaded_input(&components, "Report the results.").await;
+        let wire = serde_json::to_value(replayed).expect("the follow-up input serializes");
+        assert_eq!(wire[0], first_input[0]);
+        assert_eq!(wire[1], first_input[1]);
+        assert_eq!(wire[2]["content"][0]["text"], "Report the results.");
+    }
+
     /// A conversation of 120 items replays its newest 100, oldest first,
     /// then the request's input: the first 20 are not sent.
     #[tokio::test]
@@ -557,6 +608,46 @@ mod tests {
             .map(|n| format!("{}:item {n}", if n % 2 == 1 { "user" } else { "assistant" }))
             .collect();
         assert_eq!(shape(&items), expected);
+    }
+
+    /// A call and its output replay together or not at all: when the caller
+    /// may not see one of the two, the other goes with it. A second output
+    /// of the call takes nothing with it: the call keeps the output the
+    /// caller may see.
+    #[tokio::test]
+    async fn a_tool_row_the_caller_may_not_see_takes_its_pair_out_of_the_replay() {
+        for hide_call in [true, false] {
+            let components = components().await;
+            let (mut call, mut output) = (call_row("call_other"), output_row("call_other"));
+            let hidden = if hide_call { &mut call } else { &mut output };
+            hidden.tenant = Some("other".into());
+            link_rows(&components, vec![message_row(1), call, output]).await;
+            assert_eq!(
+                shape(&loaded_input(&components, "item 2").await),
+                ["user:item 1", "user:item 2"],
+                "hide_call {hide_call}"
+            );
+        }
+
+        let components = components().await;
+        let mut second = output_row("call_own");
+        second.tenant = Some("other".into());
+        let rows = vec![
+            message_row(1),
+            call_row("call_own"),
+            output_row("call_own"),
+            second,
+        ];
+        link_rows(&components, rows).await;
+        assert_eq!(
+            shape(&loaded_input(&components, "item 2").await),
+            [
+                "user:item 1",
+                "function_call:call_own",
+                "function_call_output:call_own",
+                "user:item 2"
+            ]
+        );
     }
 
     /// A conversation one item longer than the limit, whose first items are

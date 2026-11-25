@@ -6,6 +6,7 @@ without starting actual router instances.
 """
 
 import argparse
+import logging
 import re
 import sys
 from types import SimpleNamespace
@@ -71,7 +72,7 @@ class TestRouterArgs:
         # Test basic defaults
         assert args.host == "0.0.0.0"
         assert args.port == 30000
-        assert args.policy == "cache_aware"
+        assert args.policy is None
         assert args.worker_urls == []
         assert args.pd_disaggregation is False
         assert args.prefill_urls == []
@@ -1299,6 +1300,8 @@ class TestParseRouterArgs:
             "example.com/connector",
             "--kv-engine-id-annotation",
             "example.com/engine-id",
+            "--pairing-protocol-label",
+            "example.com/rollout",
         ]
         args_b = [
             "--service-discovery",
@@ -1313,6 +1316,8 @@ class TestParseRouterArgs:
             "example.com/connector",
             "--kv-engine-id-annotation",
             "example.com/engine-id",
+            "--pairing-protocol-label",
+            "example.com/rollout",
         ]
 
         for args in [args_a, args_b]:
@@ -1324,12 +1329,14 @@ class TestParseRouterArgs:
             assert router_args.service_discovery_namespace == "default"
             assert router_args.kv_connector_annotation == "example.com/connector"
             assert router_args.kv_engine_id_annotation == "example.com/engine-id"
+            assert router_args.pairing_protocol_label == "example.com/rollout"
 
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
         defaults = parser.parse_args([])
         assert defaults.kv_connector_annotation == RouterArgs.kv_connector_annotation
         assert defaults.kv_engine_id_annotation == RouterArgs.kv_engine_id_annotation
+        assert defaults.pairing_protocol_label == RouterArgs.pairing_protocol_label
 
     def test_repeated_list_flags_accumulate(self):
         """Repeated occurrences of list flags append, matching the Rust CLI."""
@@ -2733,6 +2740,82 @@ class TestPdPairingMode:
 
     def test_reaches_the_rust_router(self):
         assert _rust_router_kwargs(pd_pairing_mode="strict")["pd_pairing_mode"] == "strict"
+
+
+class TestGrandCentral:
+    def test_the_switch_and_document_have_defaults(self):
+        for args in (RouterArgs(), parse_router_args([])):
+            assert args.grand_central == "off"
+            assert args.policy_spec is None
+
+    @pytest.mark.parametrize("value", ["on", "off"])
+    def test_the_switch_parses_each_choice(self, value):
+        assert parse_router_args(["--grand-central", value]).grand_central == value
+        assert _prefixed(["--router-grand-central", value]).grand_central == value
+
+    def test_an_unknown_switch_value_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--grand-central", "other"])
+
+    def test_the_document_path_survives_parsing(self):
+        assert parse_router_args(["--policy-spec", "routing.yaml"]).policy_spec == "routing.yaml"
+        assert _prefixed(["--router-policy-spec", "routing.yaml"]).policy_spec == "routing.yaml"
+
+    def test_the_switch_and_document_reach_the_native_constructor(self):
+        keywords = _rust_router_kwargs(grand_central="on", policy_spec="routing.yaml")
+        assert keywords["grand_central"] == "on"
+        assert keywords["policy_spec"] == "routing.yaml"
+
+    def test_an_omitted_policy_stays_unset_through_parsing_and_keyword_conversion(self):
+        assert parse_router_args([]).policy is None
+        assert _prefixed([]).policy is None
+        assert _rust_router_kwargs()["policy"] is None
+        assert _prefixed(["--router-policy", "cache_aware"]).policy == "cache_aware"
+
+    @pytest.mark.parametrize(
+        ("policies", "message"),
+        [
+            (
+                {"prefill_policy": "random"},
+                "Using --prefill-policy 'random' for prefill nodes and --policy 'cache_aware' for decode nodes.",
+            ),
+            (
+                {"decode_policy": "random"},
+                "Using --policy 'cache_aware' for prefill nodes and --decode-policy 'random' for decode nodes.",
+            ),
+            (
+                {"prefill_policy": "random", "decode_policy": "random"},
+                "Both --prefill-policy and --decode-policy are specified. "
+                "The main --policy flag will be ignored for PD mode.",
+            ),
+        ],
+    )
+    def test_pd_policy_messages_use_the_default_without_a_document(self, caplog, policies, message):
+        args = RouterArgs(pd_disaggregation=True, **policies)
+        with caplog.at_level(logging.INFO):
+            args._validate_router_args()
+            assert caplog.messages == [message]
+            caplog.clear()
+            args.policy_spec = "routing.yaml"
+            args._validate_router_args()
+            assert caplog.messages == []
+
+    @pytest.mark.parametrize(
+        ("flags", "policy"),
+        [
+            ([], "passthrough"),
+            (["--router-grand-central", "on", "--router-policy-spec", "routing.yaml"], None),
+        ],
+    )
+    def test_single_worker_serve_preserves_the_policy_when_given_a_document(self, flags, policy):
+        from smg.serve import ServeOrchestrator
+
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = parser.parse_args(flags)
+        args.data_parallel_size = 1
+        with patch("smg.serve.BACKEND_LAUNCHERS", {"worker": object}):
+            assert ServeOrchestrator("worker", args, [])._build_router_args().policy == policy
 
 
 class TestPowerOfTwoLoadMetric:

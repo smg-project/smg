@@ -69,9 +69,16 @@ use axum::{
     Json, Router,
 };
 use llm_tokenizer::TokenizerRegistry;
-use openai_protocol::worker::{MmProcessingMode, WorkerStatus};
+use openai_protocol::{
+    worker::{MmProcessingMode, WorkerStatus},
+    UNKNOWN_MODEL_ID,
+};
 use serde::Serialize;
 use serde_json::json;
+use smg_worker::{
+    identity::basic::{Worker, WorkerType},
+    registry::event::WorkerEvent,
+};
 use tokio::{
     sync::broadcast::{
         error::{RecvError, TryRecvError},
@@ -85,8 +92,10 @@ use crate::{
     config::{bind_socket_addr, ReadinessRoleConfig, RouterConfig, RoutingMode},
     middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
-    routers::grpc::multimodal::{mm_settings, models_without_media_processing},
-    worker::{registry::event::WorkerEvent, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
+    routers::{
+        common::snapshot::{WorkerRegistry, WorkerRegistryExt},
+        grpc::multimodal::{mm_settings, models_without_media_processing},
+    },
 };
 
 /// How often the maintainer re-derives readiness from the registry even
@@ -732,15 +741,17 @@ pub fn start_probe_listener(
 mod tests {
     use std::sync::Arc;
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, WorkerStatus},
+    };
+    use smg_worker::identity::basic::{ConnectionMode, Worker};
     use tower::ServiceExt;
 
     use super::*;
     use crate::{
-        config::PdReadinessConfig,
-        middleware::test_support::json_of,
-        server::http_client,
-        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker},
+        config::PdReadinessConfig, middleware::test_support::json_of,
+        routers::grpc::backend_client::BasicWorkerBuilder, server::http_client,
     };
 
     fn worker(
@@ -1235,7 +1246,7 @@ mod tests {
     /// field.
     #[tokio::test]
     async fn worker_media_placement_names_models_without_media_processing_while_ready() {
-        use crate::{routers::grpc::multimodal::SUPPORTS_VISION_LABEL, worker::RuntimeType};
+        use smg_worker::{identity::basic::RuntimeType, labels::SUPPORTS_VISION_LABEL};
 
         fn vision_worker(url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
             let mut builder = BasicWorkerBuilder::new(url)

@@ -72,7 +72,7 @@ pub(super) async fn execute_mcp_tools(
     // the output-handling pass below — the previous code looked it up twice
     // per call (each lookup allocates two `Arc<str>`s for the qualified
     // name).
-    let prepared: Vec<(ToolExecutionInput, ResponseFormat)> = tool_calls
+    let (inputs, formats): (Vec<ToolExecutionInput>, Vec<ResponseFormat>) = tool_calls
         .iter()
         .map(|tc| {
             let args_str = tc.function.arguments.as_deref().unwrap_or("{}");
@@ -108,9 +108,7 @@ pub(super) async fn execute_mcp_tools(
             };
             (input, response_format)
         })
-        .collect();
-
-    let (inputs, formats): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
+        .unzip();
 
     debug!(
         tool_count = inputs.len(),

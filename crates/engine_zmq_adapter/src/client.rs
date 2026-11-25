@@ -3,7 +3,9 @@
 //! plus the connect entry points and metadata reads.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -30,7 +32,9 @@ use engine_zmq_client::{
 use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerType};
-use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
+use smg_grpc_client::{
+    constraint_refused_status, sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm,
+};
 use tokio::time::Instant;
 
 #[cfg(unix)]
@@ -42,27 +46,30 @@ use crate::{
     sglang::{
         aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
         encode_media_refs, fan_out_sglang_requests, translate_embed_request_sglang,
-        translate_request_sglang, RankPlacement, SglangGenerateStream, SglangProfileStart,
+        translate_request_sglang, RankPlacement, SglangConnection, SglangGenerateStream,
+        SglangProfileStart,
     },
     sglang_encode::{EncodeDispatchRequest, EncodeNotice, SglangEncodeDispatcher},
+    sglang_v41_items::PerImageItems,
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::{RequestDeadline, ZmqGenerateStream},
     structured_outputs::{
         refuse_unenforceable_constraint, StructuredOutputsBackendConfig, StructuredOutputsSupport,
     },
     tokenspeed::{
-        constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests,
+        constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests, loads_by_rank,
         translate_encode_request, translate_request_tokenspeed_for, EncodeRendezvous, GridTensors,
-        LogprobColumns, RankIndices, TokenSpeedGenerateStream,
+        TokenSpeedConnection, TokenSpeedGenerateStream, TokenSpeedHandshakes,
     },
     trtllm::{
         constraint_ref as trtllm_constraint_ref, fan_out_trtllm_requests, translate_request_trtllm,
         TrtllmGenerateStream,
     },
     vllm::{
-        fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
-        refuse_greedy_choices, translate_media, translate_request_with_media,
-        translated_from_processed, ProcessedMedia, TranslatedMedia, VllmGenerateStream,
+        constraint_ref as vllm_constraint_ref, fan_out_requests, has_media, kv_transfer_params,
+        now_secs, pulls_on_do_remote_prefill, ranked_candidate_count, refuse_greedy_choices,
+        translate_media, translate_request_with_media, translated_from_processed,
+        validate_token_ids, ProcessedMedia, TranslatedMedia, VllmGenerateStream, VocabBounds,
     },
 };
 
@@ -175,6 +182,17 @@ pub(crate) struct ZmqConnectionMeta {
     /// is the engine's `auto`, every kind taken
     /// ([`StructuredOutputsSupport::default`]).
     structured_outputs: OnceLock<StructuredOutputsSupport>,
+    /// The model's and the tokenizer's vocabulary bounds, set once by the
+    /// caller that knows them (the servicer); unset skips the out-of-vocab
+    /// token-id checks.
+    vocab_bounds: OnceLock<VocabBounds>,
+    /// Set once by the caller that knows it (the servicer that launched the
+    /// engine) when the engine's KV connector pulls a PD decode side's prompt
+    /// KV on `do_remote_prefill`: how many trailing prompt tokens the engine
+    /// still computes itself after the pull. Only then does a request's
+    /// handoff claim loosen its prompt bound, and only ahead of that tail
+    /// (see [`ZmqEngineClient::note_kv_transfer_config`]).
+    remote_kv_local_tail: OnceLock<NonZeroUsize>,
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
     supported_tasks: tokio::sync::OnceCell<Arc<[String]>>,
@@ -201,6 +219,17 @@ pub(crate) struct ZmqConnectionMeta {
     /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
     /// streams unbounded.
     request_timeout: OnceLock<Duration>,
+    /// What the ranks declared at their handshakes of a batch that goes on
+    /// as one item an image, read once here for every request of the
+    /// connection ([`PerImageItems::declared`]): on the SGLang wire, whose
+    /// translation alone asks it.
+    per_image: PerImageItems,
+    /// What the ranks declared at their handshakes of where a request is
+    /// placed, of the logprob columns and of an item's grid tensors, read
+    /// once here for every request of the connection
+    /// ([`TokenSpeedHandshakes::declared`]): on the TokenSpeed wire, whose
+    /// generate path and load report alone ask it.
+    tokenspeed: TokenSpeedHandshakes,
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
@@ -419,6 +448,18 @@ impl ZmqEngineClient {
             ZmqDialect::Sglang => check_engine_layouts::<SglangProtocol>(&transport)?,
             ZmqDialect::Trtllm => check_engine_layouts::<TrtllmProtocol>(&transport)?,
         }
+        let per_image = match dialect {
+            ZmqDialect::Sglang => PerImageItems::declared(&transport.engines),
+            ZmqDialect::Vllm | ZmqDialect::TokenSpeed | ZmqDialect::Trtllm => {
+                PerImageItems::default()
+            }
+        };
+        let tokenspeed = match dialect {
+            ZmqDialect::TokenSpeed => TokenSpeedHandshakes::declared(&transport.engines),
+            ZmqDialect::Vllm | ZmqDialect::Sglang | ZmqDialect::Trtllm => {
+                TokenSpeedHandshakes::declared(&[])
+            }
+        };
         let backend = match dialect {
             ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
             ZmqDialect::TokenSpeed => {
@@ -434,12 +475,16 @@ impl ZmqEngineClient {
                 eos,
                 tokenizer_eos: OnceLock::new(),
                 structured_outputs: OnceLock::new(),
+                vocab_bounds: OnceLock::new(),
+                remote_kv_local_tail: OnceLock::new(),
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
                 engine_ranks_are_replicas: OnceLock::new(),
                 pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
+                per_image,
+                tokenspeed,
             }),
         };
         // Every wire bounds a prompt by the window the engine reported
@@ -569,6 +614,49 @@ impl ZmqEngineClient {
             .request_timeout
             .get()
             .map(|timeout| RequestDeadline::after(*timeout))
+    }
+
+    /// Bound client-supplied token ids (prompt, `stop_token_ids`,
+    /// `logit_bias`) by the model's vocabulary, as vLLM's frontend does: an
+    /// out-of-range id reaching the engine faults the GPU. The tokenizer's
+    /// largest id (added tokens included) widens the bound where vLLM's does,
+    /// at the prompt positions whose embedding comes from elsewhere; unknown,
+    /// those positions get the model's. A zero `model_vocab_size` leaves the
+    /// checks off. The first call wins.
+    pub fn set_vocab_size(&self, model_vocab_size: u32, tokenizer_max_token_id: Option<u32>) {
+        if model_vocab_size > 0 {
+            let _ = self
+                .meta
+                .vocab_bounds
+                .set(VocabBounds::new(model_vocab_size, tokenizer_max_token_id));
+        }
+    }
+
+    /// The vocabulary bounds, once [`Self::set_vocab_size`] set them.
+    pub(crate) fn vocab_bounds(&self) -> Option<VocabBounds> {
+        self.meta.vocab_bounds.get().copied()
+    }
+
+    /// Note the engine's KV connector and role, as the servicer reports
+    /// them for PD (`kv_connector` projects a `MultiConnector` onto its one
+    /// P2P child), and `local_tail`: how many trailing prompt tokens a decode
+    /// side still computes itself after the pull (at least the last, which
+    /// is recomputed to sample the next; more where the connector pulls short
+    /// of a speculative drafter's prefill lookahead). When that connector
+    /// pulls a decode side's prompt KV on `do_remote_prefill: true` (NIXL,
+    /// Mooncake, MoRIIO, as a consumer), a request claiming that handoff has
+    /// its prompt ahead of the tail held to vLLM's own bound rather than the
+    /// model's (see `validate_token_ids`). Any other configuration leaves the
+    /// claim changing nothing: such an engine computes the prompt itself. So
+    /// does a zero `local_tail` (unknown): the tail is never assumed to be
+    /// one token. The first matching call wins.
+    pub fn note_kv_transfer_config(&self, kv_connector: &str, kv_role: &str, local_tail: u32) {
+        let Some(tail) = NonZeroUsize::new(local_tail as usize) else {
+            return;
+        };
+        if pulls_on_do_remote_prefill(kv_connector, kv_role) {
+            let _ = self.meta.remote_kv_local_tail.set(tail);
+        }
     }
 
     /// The tasks the engine's model runner serves (vLLM's
@@ -815,7 +903,7 @@ impl ZmqEngineClient {
         // and unlinked, a single time) and off the runtime: `/dev/shm` reads
         // and the dtype casts of multi-megabyte tensors would otherwise hold a
         // worker thread per request, starving token forwarding and health.
-        let media = if let Some(processed) = processed {
+        let mut media = if let Some(processed) = processed {
             if processed.is_batches() {
                 let (returned, media) = tokio::task::spawn_blocking(move || {
                     let media = translated_from_processed(&req, processed, model_dtype);
@@ -849,7 +937,32 @@ impl ZmqEngineClient {
         // On the request's own `n`: every sub below carries `n = 1`.
         if let Some(sp) = req.sampling_params.as_ref() {
             refuse_greedy_choices(sp).map_err(tonic::Status::invalid_argument)?;
+            // A constraint the engine's grammar backend cannot enforce is
+            // refused here, before anything reaches the engine, as on every
+            // wire.
+            refuse_unenforceable_constraint(vllm_constraint_ref(sp), support)
+                .map_err(constraint_refused_status)?;
         }
+        // After the media translation, not before: an SHM payload must be read
+        // (and so unlinked) even when the request is then refused, and the
+        // translation says which prompt positions the media fills. Taken out
+        // of the media: nothing past this check reads them, and the fan-out
+        // below copies the media per choice.
+        let embed_positions = std::mem::take(&mut media.embed_positions);
+        let bounds = self.vocab_bounds();
+        if let Some(bounds) = bounds {
+            let handoff_tail = self.meta.remote_kv_local_tail.get().copied();
+            validate_token_ids(&req, &embed_positions, bounds, handoff_tail)
+                .map_err(tonic::Status::invalid_argument)?;
+        }
+        drop(embed_positions);
+        // The EOS ids every sub carries, past-vocabulary ones dropped: they
+        // ride `_all_stop_token_ids` even under `ignore_eos`, where they would
+        // index the logits as surely as a caller's id the check refused.
+        let eos = match bounds {
+            Some(bounds) => self.effective_eos().within_vocab(bounds.model),
+            None => Cow::Borrowed(self.effective_eos()),
+        };
         let subs = fan_out_requests(req);
         let last = subs.len().saturating_sub(1);
         let mut media = Some(media);
@@ -865,14 +978,9 @@ impl ZmqEngineClient {
             // Worker-processed tensors ride as aux frames; each choice's
             // message carries them (shared bytes, not copies).
             let aux_frames = sub_media.aux_frames.clone();
-            let mut request = translate_request_with_media(
-                sub,
-                sub_media,
-                max_model_len,
-                self.effective_eos(),
-                support,
-            )
-            .map_err(tonic::Status::invalid_argument)?;
+            let mut request =
+                translate_request_with_media(sub, sub_media, max_model_len, &eos, support)
+                    .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             // The engine returns the sampled/prompt token's logprob
             // plus the requested ranked candidates per position; carry
@@ -990,10 +1098,7 @@ impl ZmqEngineClient {
         &self,
         req: tokenspeed_proto::GenerateRequest,
     ) -> Result<Vec<TokenSpeedGenerateStream>, tonic::Status> {
-        let grid_tensors = self
-            .ready_response()
-            .map_or(GridTensors::Positions, GridTensors::declared);
-        self.generate_tokenspeed_streams_for_model(req, grid_tensors)
+        self.generate_tokenspeed_streams_for_model(req, self.meta.tokenspeed.grid_tensors)
             .await
     }
 
@@ -1011,11 +1116,8 @@ impl ZmqEngineClient {
         };
         // A disaggregated encode worker lists `encode` alone: it runs no
         // language model, so the gRPC servicer's words for its Generate.
-        if !client
-            .engines()
-            .iter()
-            .any(|engine| engine.ready_response.takes_generate())
-        {
+        let declared = &self.meta.tokenspeed;
+        if !declared.takes_generate {
             return Err(tonic::Status::failed_precondition(
                 "Generate is unavailable on TokenSpeed encode workers",
             ));
@@ -1027,27 +1129,24 @@ impl ZmqEngineClient {
                 tokenspeed_constraint_ref(sp),
                 self.structured_outputs_support(),
             )
-            .map_err(tonic::Status::invalid_argument)?;
+            .map_err(constraint_refused_status)?;
         }
-        let max_model_len = self.prompt_bound()?;
-        // The ranks as the engine numbers them: a disaggregated request is
-        // placed on a prefill engine by its room's residue, a pinned one
-        // elsewhere by its pin.
-        let ranks = RankIndices::of(client.engines());
-        let logprobs = LogprobColumns::of(client.engines());
+        let connection = TokenSpeedConnection {
+            grid_tensors,
+            max_model_len: self.prompt_bound()?,
+            // The ranks as the engine numbers them: a disaggregated request is
+            // placed on a prefill engine by its room's residue, a pinned one
+            // elsewhere by its pin.
+            ranks: &declared.ranks,
+            logprobs: declared.logprobs,
+            yields: &self.meta.pin_yield,
+        };
         // Sub-streams submitted before a mid-loop failure are dropped with the
         // error, which auto-aborts their engine-side requests.
         let mut streams = Vec::new();
         for (index, sub) in fan_out_tokenspeed_requests(req).into_iter().enumerate() {
-            let request = translate_request_tokenspeed_for(
-                sub,
-                grid_tensors,
-                max_model_len,
-                &ranks,
-                logprobs,
-                &self.meta.pin_yield,
-            )
-            .map_err(tonic::Status::invalid_argument)?;
+            let request = translate_request_tokenspeed_for(sub, &connection)
+                .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
             streams.push(TokenSpeedGenerateStream::new(stream, index as u32));
         }
@@ -1198,14 +1297,13 @@ impl ZmqEngineClient {
                 sglang_constraint_ref(sp),
                 self.structured_outputs_support(),
             )
-            .map_err(tonic::Status::invalid_argument)?;
+            .map_err(constraint_refused_status)?;
         }
         let max_model_len = self.prompt_bound()?;
         // The connected scheduler ranks: a request is placed among them as
         // the engine's own dispatcher would place it, by its data-parallel
         // pin, or on a prefill side that follows the room by its room's
         // residue ([`Self::note_engine_places_by_rendezvous_room`]).
-        let ranks = client.engines().len();
         let placement = if self.meta.engine_places_by_rendezvous_room.get().is_none() {
             RankPlacement::Pin
         } else if self.meta.engine_ranks_are_replicas.get().is_some() {
@@ -1213,19 +1311,20 @@ impl ZmqEngineClient {
         } else {
             RankPlacement::RoomResidue
         };
+        let connection = SglangConnection {
+            max_model_len,
+            ranks: client.engines().len(),
+            placement,
+            yields: &self.meta.pin_yield,
+            per_image: self.meta.per_image,
+        };
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
         let mut shared_hashes = None;
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
             let media_refs = sub.mm_inputs.as_deref().and_then(encode_media_refs);
-            let mut request = translate_request_sglang(
-                sub,
-                max_model_len,
-                ranks,
-                placement,
-                &self.meta.pin_yield,
-            )
-            .map_err(tonic::Status::invalid_argument)?;
+            let mut request = translate_request_sglang(sub, &connection)
+                .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             if let (Some(hasher), Some(mm)) = (hasher, request.mm_inputs.as_mut()) {
                 hasher
@@ -1376,7 +1475,7 @@ impl ZmqEngineClient {
             trtllm_constraint_ref(&req),
             self.structured_outputs_support(),
         )
-        .map_err(tonic::Status::invalid_argument)?;
+        .map_err(constraint_refused_status)?;
         let max_model_len = self.prompt_bound()?;
         let mut streams = Vec::new();
         for (index, sub) in fan_out_trtllm_requests(req).into_iter().enumerate() {
@@ -1712,13 +1811,32 @@ impl ZmqEngineClient {
 
     /// Per-rank load from the piggybacked scheduler stats (SMG's DP routing
     /// signal), in the same shape as the gRPC `GetLoads` response. A rank that
-    /// has not reported yet has no entry.
+    /// has not reported yet has no entry. An entry is numbered by its
+    /// engine's index.
     pub fn get_loads(&self) -> WorkerLoadResponse {
         let loads: Vec<SchedulerLoadSnapshot> = self
             .engines()
             .iter()
             .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
             .collect();
+        WorkerLoadResponse {
+            timestamp: String::new(),
+            dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
+            loads,
+            ..Default::default()
+        }
+    }
+
+    /// [`get_loads`](Self::get_loads) with each entry numbered by the rank a
+    /// pin reaches, for a reader that scopes the answer to rank workers. A
+    /// TokenSpeed rank is its engine's index only when the ranks dialled in
+    /// at indices 0..n in rank order; the other dialects place a pin by
+    /// index.
+    pub fn get_loads_by_rank(&self) -> WorkerLoadResponse {
+        let ZmqBackend::TokenSpeed(_) = &self.backend else {
+            return self.get_loads();
+        };
+        let loads = loads_by_rank(&self.meta.tokenspeed.ranks, |index| self.rank_load(index));
         WorkerLoadResponse {
             timestamp: String::new(),
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
@@ -1915,19 +2033,53 @@ pub(crate) fn zmq_status(error: engine_zmq_client::Error) -> tonic::Status {
 /// failure of its engine out to every request in flight as the one error
 /// shared (`Error::Shared`), and a shared error answers as the bare one.
 fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
+    if let engine_zmq_client::Error::Shared(inner) = error {
+        return zmq_status_of(inner);
+    }
+    // Everything not better served elsewhere is INTERNAL, including the
+    // dispatcher's terminal `Shared(Decode)` after a run of undecodable
+    // output frames. A later submit on that same dead client reads as
+    // `ClientClosed` and so UNAVAILABLE; the asymmetry is intentional. The
+    // requests in flight when decoding failed saw the protocol mismatch
+    // itself, which replaying on another worker of the same build will not
+    // cure, while the later submit only finds a closed link.
+    if is_served_elsewhere(error) {
+        tonic::Status::unavailable(error.to_string())
+    } else {
+        tonic::Status::internal(error.to_string())
+    }
+}
+
+/// Whether `error` says the engine, or the link to it, is gone or not
+/// taking input, rather than anything about the request: such a request is
+/// better served elsewhere.
+///
+/// A failure of the engine link itself (its socket's I/O, the ZMQ
+/// transport, a client closed under the call) says the same as a dead
+/// engine: an engine killed under the servicer surfaces as `Broken pipe` on
+/// the next send. Reporting it as INTERNAL would tell the router the worker
+/// failed on this payload, a definitive answer it does not replay. In-flight
+/// requests see the dispatcher's terminal error wrapped in `Shared`, so the
+/// check looks through it.
+///
+/// A request stream closed without a terminal output is also not served
+/// here, though the engine behind it is healthy: the dispatcher always
+/// delivers a terminal error before it drops the senders on an engine
+/// death, so a bare close only arises when it retires a request vLLM listed
+/// as finished out of band, or when the client itself is dropped.
+fn is_served_elsewhere(error: &engine_zmq_client::Error) -> bool {
+    use engine_zmq_client::Error;
     match error {
-        engine_zmq_client::Error::Shared(inner) => zmq_status_of(inner),
-        // The engine is gone, is not taking input right now, or the
-        // connector to it is shutting down (its engine died, or the servicer
-        // drains): either way this request is better served elsewhere.
-        engine_zmq_client::Error::EngineCoreDead
-        | engine_zmq_client::Error::EngineInputBlocked { .. }
-        | engine_zmq_client::Error::EngineInputFull { .. }
-        | engine_zmq_client::Error::EngineInputBytesFull { .. }
-        | engine_zmq_client::Error::ClientClosed { .. } => {
-            tonic::Status::unavailable(error.to_string())
-        }
-        other => tonic::Status::internal(other.to_string()),
+        Error::EngineCoreDead
+        | Error::Io(_)
+        | Error::Transport(_)
+        | Error::ClientClosed { .. }
+        | Error::EngineInputBlocked { .. }
+        | Error::EngineInputFull { .. }
+        | Error::EngineInputBytesFull { .. }
+        | Error::RequestStreamClosed { .. } => true,
+        Error::Shared(inner) => is_served_elsewhere(inner),
+        _ => false,
     }
 }
 
@@ -2102,8 +2254,9 @@ mod tests {
             zmq_status(engine_zmq_client::Error::EngineCoreDead).code(),
             Code::Unavailable
         );
-        let engine_failure = zmq_status(engine_zmq_client::Error::RequestStreamClosed {
-            request_id: "req-1".to_string(),
+        let engine_failure = zmq_status(engine_zmq_client::Error::Decode {
+            target_type: "EngineCoreOutputs",
+            message: "bad frame".to_string(),
         });
         assert_eq!(engine_failure.code(), Code::Internal, "{engine_failure:?}");
     }
@@ -2144,13 +2297,52 @@ mod tests {
             "{ended:?}"
         );
         let nested = zmq_status(engine_zmq_client::Error::Shared(Arc::new(
-            engine_zmq_client::Error::Shared(Arc::new(
-                engine_zmq_client::Error::RequestStreamClosed {
-                    request_id: "req-2".to_string(),
-                },
-            )),
+            engine_zmq_client::Error::Shared(Arc::new(engine_zmq_client::Error::Decode {
+                target_type: "EngineCoreOutputs",
+                message: "bad frame".to_string(),
+            })),
         )));
         assert_eq!(nested.code(), Code::Internal, "{nested:?}");
+    }
+
+    /// A lost engine link is "not served now", as a dead engine is, never
+    /// the worker's own failure on the payload: the router does not replay
+    /// an INTERNAL on the worker, so a killed engine must not read as one.
+    /// In-flight requests receive the dispatcher's error wrapped in `Shared`.
+    #[test]
+    fn a_lost_engine_link_is_unavailable_not_internal() {
+        use engine_zmq_client::Error;
+
+        let broken_pipe = Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(zmq_status(broken_pipe).code(), Code::Unavailable);
+        let closed = || Error::ClientClosed {
+            message: "engine output reader exited".to_string(),
+        };
+        assert_eq!(zmq_status(closed()).code(), Code::Unavailable);
+        assert_eq!(zmq_status(Error::EngineCoreDead).code(), Code::Unavailable);
+        let transport = Error::Transport(zeromq::ZmqError::NoMessage);
+        assert_eq!(zmq_status(transport).code(), Code::Unavailable);
+        // A stream closed without a terminal output is not served here,
+        // but the engine behind it is healthy: see `is_served_elsewhere`.
+        let stream_closed = || Error::RequestStreamClosed {
+            request_id: "r".to_string(),
+        };
+        assert_eq!(zmq_status(stream_closed()).code(), Code::Unavailable);
+        let shared_dead = Error::Shared(Arc::new(Error::EngineCoreDead));
+        assert_eq!(zmq_status(shared_dead).code(), Code::Unavailable);
+        let shared_closed = Error::Shared(Arc::new(closed()));
+        assert_eq!(zmq_status(shared_closed).code(), Code::Unavailable);
+        let decode = || Error::Decode {
+            target_type: "EngineCoreOutputs",
+            message: "bad frame".to_string(),
+        };
+        assert_eq!(zmq_status(decode()).code(), Code::Internal);
+        // The dispatcher's terminal decode failure stays INTERNAL even though
+        // a later submit on the same dead client is UNAVAILABLE: the requests
+        // in flight saw a protocol mismatch, which a replay elsewhere will
+        // not cure (see `zmq_status`).
+        let shared_decode = Error::Shared(Arc::new(decode()));
+        assert_eq!(zmq_status(shared_decode).code(), Code::Internal);
     }
 
     /// A connected client over a throwaway ipc endpoint. The mock engine is
@@ -2749,6 +2941,15 @@ mod tests {
     /// `count` mock ranks behind one vLLM-dialect client, kept alive so they
     /// can answer utility calls.
     async fn connected_ranks(dir: &Path, count: usize) -> (ZmqEngineClient, Vec<MockEngine>) {
+        connected_ranks_with_eos(dir, count, EosTokenIds::default()).await
+    }
+
+    /// [`connected_ranks`] with a connect-time EOS set.
+    async fn connected_ranks_with_eos(
+        dir: &Path,
+        count: usize,
+        eos: EosTokenIds,
+    ) -> (ZmqEngineClient, Vec<MockEngine>) {
         let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
         let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
         let ranks = (0..count as u32).map(|rank| {
@@ -2768,7 +2969,7 @@ mod tests {
                 &output,
                 count,
                 "org/repo".to_string(),
-                EosTokenIds::default(),
+                eos,
                 RuntimeType::Vllm,
                 Duration::from_secs(10)
             ),
@@ -2978,6 +3179,48 @@ mod tests {
             .expect("an encode worker that lists the encode request and declares its address");
     }
 
+    /// What the ranks declared at their handshakes is read when the
+    /// connection is made and kept for its requests: a connection of an
+    /// encode worker alone refuses a generate request in the gRPC servicer's
+    /// words, and two ranks that dialled in against their own numbering are
+    /// reached by that numbering.
+    #[tokio::test]
+    async fn a_connection_keeps_what_its_ranks_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = tokenspeed_ranks(
+            &dir.path().join("e"),
+            vec![EngineCoreReadyResponse {
+                request_types: vec!["encode".into()],
+                ..default_ready_response()
+            }],
+        )
+        .await;
+        let Err(refused) = encoder
+            .generate_tokenspeed_streams(tokenspeed_proto::GenerateRequest::default())
+            .await
+        else {
+            panic!("an encode worker took a generate request");
+        };
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (
+                Code::FailedPrecondition,
+                "Generate is unavailable on TokenSpeed encode workers"
+            )
+        );
+
+        let numbered = |rank: u32| EngineCoreReadyResponse {
+            data_parallel_rank: rank,
+            ..default_ready_response()
+        };
+        let swapped = tokenspeed_ranks(&dir.path().join("s"), vec![numbered(1), numbered(0)]).await;
+        assert_eq!(
+            swapped.meta.tokenspeed.ranks,
+            crate::tokenspeed::RankIndices::new(vec![1, 0]),
+            "rank 0 is the engine that dialled in second"
+        );
+    }
+
     /// An RL operation rides the TokenSpeed control wire as a control call
     /// named after its route, with the route's JSON body as its one argument
     /// (a map, integers kept integers), answered on every rank under the call
@@ -3164,6 +3407,391 @@ mod tests {
             None,
             "a request without a grammar carries nothing"
         );
+    }
+
+    /// Once the vocabulary is known, an out-of-vocab id is refused as
+    /// INVALID_ARGUMENT before any frame reaches the engine (where it would
+    /// fault the GPU); unset, the request goes through as before.
+    #[tokio::test]
+    async fn out_of_vocab_ids_never_reach_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        let request = || vllm::GenerateRequest {
+            request_id: "oov".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2, 3],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                logit_bias: [(999_999_999, 5.0)].into_iter().collect(),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+
+        client.set_vocab_size(1000, None);
+        let Err(status) = client.generate_vllm_streams(request()).await else {
+            panic!("an out-of-vocab logit_bias key was accepted");
+        };
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("[999999999] in logit_bias"));
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a refused request reached the engine: {quiet:?}"
+        );
+
+        // The size is set once: a later zero (an unknown size) cannot clear it.
+        client.set_vocab_size(0, None);
+        assert!(client.generate_vllm_streams(request()).await.is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (unsized_client, mut engines) = connected_ranks(dir.path(), 1).await;
+        unsized_client.set_vocab_size(0, None);
+        let _streams = unsized_client
+            .generate_vllm_streams(request())
+            .await
+            .expect("an unknown vocabulary skips the check");
+        assert!(matches!(
+            engines[0].recv().await.expect("inbound"),
+            EngineInbound::Add(_)
+        ));
+    }
+
+    /// The vocabulary bound reads the positions the engine's features fill: a
+    /// placeholder id past the model's vocabulary but within the tokenizer's
+    /// reaches the engine where an image is attached, the same id at a text
+    /// position is refused before it does, and so is one under a tensor-less
+    /// identity batch, which attaches nothing. An image position still has a
+    /// bound, the tokenizer's, and `prompt_logprobs`, which scores every
+    /// prompt id against the model's logits, refuses the placeholder.
+    #[tokio::test]
+    async fn an_out_of_vocab_placeholder_id_passes_only_where_the_image_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        // The model's 1000 rows; the tokenizer's placeholder token is 1000.
+        client.set_vocab_size(1000, Some(1000));
+        // One image, its token 1000 at 1..3, its pixels inline.
+        let image = || vllm::MultimodalInputs {
+            pixel_values: Some(vllm::TensorData {
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+                payload: Some(vllm::tensor_data::Payload::Inline(
+                    [0.0f32, 1.0, 2.0, 3.0]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<u8>>()
+                        .into(),
+                )),
+            }),
+            im_token_id: Some(1000),
+            mm_placeholders: vec![vllm::PlaceholderRange {
+                offset: 1,
+                length: 2,
+            }],
+            mm_hashes: vec!["h0".to_string()],
+            batched_keys: vec!["pixel_values".to_string()],
+            ..Default::default()
+        };
+        let scored = |input_ids: Vec<u32>, mm: vllm::MultimodalInputs, prompt_logprobs| {
+            vllm::GenerateRequest {
+                request_id: "mm".to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids,
+                    },
+                )),
+                mm_inputs: Some(mm),
+                sampling_params: Some(vllm::SamplingParams {
+                    max_tokens: Some(4),
+                    prompt_logprobs,
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            }
+        };
+        let request = |input_ids, mm| scored(input_ids, mm, None);
+        let identity = vllm::MultimodalInputs {
+            pixel_values: None,
+            batched_keys: Vec::new(),
+            ..image()
+        };
+
+        let spoofed = vllm::MultimodalInputs {
+            im_token_id: Some(999_999_999),
+            ..image()
+        };
+        for (req, refusal) in [
+            (
+                request(vec![1000, 1000, 1000, 6], image()),
+                "Token id 1000 is out of vocabulary",
+            ),
+            (
+                request(vec![5, 1000, 1000, 6], identity),
+                "Token id 1000 is out of vocabulary",
+            ),
+            (
+                request(vec![5, 999_999_999, 999_999_999, 6], spoofed),
+                "Token id 999999999 is out of vocabulary",
+            ),
+            (
+                scored(vec![5, 1000, 1000, 6], image(), Some(0)),
+                "prompt_logprobs cannot score token id 1000",
+            ),
+        ] {
+            let Err(status) = client.generate_vllm_streams(req).await else {
+                panic!("an out-of-vocab id was accepted ({refusal})");
+            };
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert!(
+                status.message().starts_with(refusal),
+                "{}",
+                status.message()
+            );
+        }
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a refused request reached the engine: {quiet:?}"
+        );
+
+        let _streams = client
+            .generate_vllm_streams(request(vec![5, 1000, 1000, 6], image()))
+            .await
+            .expect("the image's positions are not bounded by the vocabulary");
+        let EngineInbound::Add(add) = engines[0].recv().await.expect("inbound") else {
+            panic!("expected the add");
+        };
+        assert_eq!(add.prompt_token_ids, Some(vec![5, 1000, 1000, 6]));
+        assert!(add.mm_features.is_some(), "the image rides along");
+    }
+
+    /// EOS ids past the vocabulary never reach the engine: not the primary
+    /// (`_eos_token_id`), not the extras folded into `stop_token_ids`, and not
+    /// `_all_stop_token_ids`, which carries them even under `ignore_eos` and
+    /// which the engine's `min_tokens` mask indexes the logits with. That
+    /// holds for a connect-time set and for one adopted from the tokenizer;
+    /// in-range ids keep their places.
+    #[tokio::test]
+    async fn eos_ids_past_the_vocabulary_never_reach_the_engine() {
+        // Each request its own id: a dropped stream's abort is asynchronous.
+        let request = |id: &str, ignore_eos: bool| vllm::GenerateRequest {
+            request_id: id.to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2, 3],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                min_tokens: 1,
+                stop_token_ids: vec![9],
+                ignore_eos,
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        async fn sent(
+            client: &ZmqEngineClient,
+            engine: &mut MockEngine,
+            req: vllm::GenerateRequest,
+        ) -> EngineCoreSamplingParams {
+            let _streams = client.generate_vllm_streams(req).await.expect("accepted");
+            // Skip the abort a previous request's dropped streams sent.
+            loop {
+                if let EngineInbound::Add(add) = engine.recv().await.expect("inbound") {
+                    return add.sampling_params.expect("sampling params");
+                }
+            }
+        }
+
+        // Connect-time set: primary 1500 and extra 1600 lie past the vocabulary.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) =
+            connected_ranks_with_eos(dir.path(), 1, EosTokenIds::new(Some(1500), vec![7, 1600]))
+                .await;
+        client.set_vocab_size(1000, None);
+        let sp = sent(&client, &mut engines[0], request("a", false)).await;
+        assert_eq!(sp.eos_token_id, None);
+        assert_eq!(sp.stop_token_ids, vec![9, 7]);
+        assert_eq!(sp.all_stop_token_ids, [7, 9].into_iter().collect());
+        let sp = sent(&client, &mut engines[0], request("b", true)).await;
+        assert_eq!(sp.eos_token_id, None);
+        assert_eq!(sp.stop_token_ids, vec![9]);
+        assert_eq!(sp.all_stop_token_ids, [7, 9].into_iter().collect());
+
+        // An in-range primary stays; only the out-of-range extra goes.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) =
+            connected_ranks_with_eos(dir.path(), 1, EosTokenIds::new(Some(2), vec![1500, 7])).await;
+        client.set_vocab_size(1000, None);
+        let sp = sent(&client, &mut engines[0], request("c", false)).await;
+        assert_eq!(sp.eos_token_id, Some(2));
+        assert_eq!(sp.stop_token_ids, vec![9, 7]);
+        assert_eq!(sp.all_stop_token_ids, [2, 7, 9].into_iter().collect());
+
+        // Adopted from the tokenizer: MockTokenizer's EOS is 999, past a
+        // vocabulary of 500.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        client.adopt_tokenizer_eos(Some(&tokenizer));
+        client.set_vocab_size(500, None);
+        for (id, ignore_eos) in [("d", false), ("e", true)] {
+            let sp = sent(&client, &mut engines[0], request(id, ignore_eos)).await;
+            assert_eq!(sp.eos_token_id, None);
+            assert_eq!(sp.stop_token_ids, vec![9]);
+            assert_eq!(sp.all_stop_token_ids, [9].into_iter().collect());
+        }
+
+        // An unknown vocabulary leaves the set as configured.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) =
+            connected_ranks_with_eos(dir.path(), 1, EosTokenIds::new(Some(1500), vec![1600])).await;
+        let sp = sent(&client, &mut engines[0], request("f", false)).await;
+        assert_eq!(sp.eos_token_id, Some(1500));
+        assert_eq!(sp.all_stop_token_ids, [9, 1500, 1600].into_iter().collect());
+    }
+
+    /// A request shaped like the gateway's language-model-only PD decode
+    /// leg (the prefill side's expanded prompt, image-token run past the
+    /// model's vocabulary included, the per-image hashes, `do_remote_prefill`)
+    /// reaches a NIXL consumer engine, held to the tokenizer's
+    /// bound; the same prompt without the handoff, with an id past the
+    /// tokenizer's too, ending in an id past the model's vocabulary (that
+    /// token is computed locally), with such an id in a longer local tail
+    /// (an MTP drafter's prefill lookahead), or with an out-of-vocab
+    /// `logit_bias` key, does not.
+    /// On an engine that would not pull on the claim (no connector, a
+    /// producer, an unprojected wrapper) or whose local tail is unknown the
+    /// claim changes nothing, nor does the legacy host/port pair on a
+    /// consumer: the engine would compute the prompt itself, so these are
+    /// refused.
+    #[tokio::test]
+    async fn a_pd_decode_leg_is_held_to_the_tokenizers_bound() {
+        let request = |input_ids: Vec<u32>,
+                       kv_transfer_params_json: Option<&str>,
+                       logit_bias: Option<i32>| vllm::GenerateRequest {
+            request_id: "decode".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids,
+                },
+            )),
+            mm_inputs: Some(vllm::MultimodalInputs {
+                mm_hashes: vec!["h0".to_string()],
+                ..Default::default()
+            }),
+            kv_transfer_params_json: kv_transfer_params_json.map(str::to_string),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                logit_bias: logit_bias.map(|id| (id, 1.0)).into_iter().collect(),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        const DECODE: Option<&str> = Some(r#"{"do_remote_prefill":true}"#);
+        let leg = || vec![5, 1000, 1000, 6];
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        client.set_vocab_size(1000, Some(1000));
+        client.note_kv_transfer_config("NixlConnector", "kv_both", 1);
+        for (req, refusal) in [
+            (
+                request(leg(), None, None),
+                "Token id 1000 is out of vocabulary",
+            ),
+            (
+                request(vec![5, 999_999_999, 6], DECODE, None),
+                "Token id 999999999 is out of vocabulary",
+            ),
+            (
+                request(leg(), DECODE, Some(999_999_999)),
+                "[999999999] in logit_bias",
+            ),
+            // The last prompt token is computed locally even on a full KV
+            // hit, so it keeps the model's bound.
+            (
+                request(vec![5, 1000, 1000], DECODE, None),
+                "Token id 1000 is out of vocabulary",
+            ),
+        ] {
+            let Err(status) = client.generate_vllm_streams(req).await else {
+                panic!("an out-of-vocab id was accepted ({refusal})");
+            };
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert!(status.message().contains(refusal), "{}", status.message());
+        }
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a refused request reached the engine: {quiet:?}"
+        );
+
+        let _streams = client
+            .generate_vllm_streams(request(leg(), DECODE, None))
+            .await
+            .expect("a decode side's placeholder is within the tokenizer's bound");
+        let EngineInbound::Add(add) = engines[0].recv().await.expect("inbound") else {
+            panic!("expected the add");
+        };
+        assert_eq!(add.prompt_token_ids, Some(vec![5, 1000, 1000, 6]));
+
+        // On the same consumer, the legacy host/port pair alone: the
+        // connector pulls only on `do_remote_prefill`, so the engine would
+        // compute this prompt itself.
+        let mut legacy = request(leg(), None, None);
+        legacy.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: "10.0.0.1".to_string(),
+            remote_port: 8998,
+        });
+        let Err(status) = client.generate_vllm_streams(legacy).await else {
+            panic!("a legacy host/port pair lifted the bound on a NIXL consumer");
+        };
+        assert_eq!(status.message(), "Token id 1000 is out of vocabulary");
+
+        // The forged claim on engines that would not pull on it (no KV
+        // connector, a producer, an unprojected wrapper) or whose local tail
+        // is unknown, and the real claim on a consumer that computes the
+        // last three prompt tokens itself (an MTP drafter's lookahead).
+        for config in [
+            None,
+            Some(("NixlConnector", "kv_producer", 1)),
+            Some(("MultiConnector", "kv_both", 1)),
+            Some(("NixlConnector", "kv_both", 0)),
+            Some(("NixlConnector", "kv_both", 3)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (other, mut engines) = connected_ranks(dir.path(), 1).await;
+            other.set_vocab_size(1000, Some(1000));
+            if let Some((connector, role, tail)) = config {
+                other.note_kv_transfer_config(connector, role, tail);
+            }
+            let Err(status) = other
+                .generate_vllm_streams(request(leg(), DECODE, None))
+                .await
+            else {
+                panic!("a forged handoff claim lifted the bound ({config:?})");
+            };
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert_eq!(status.message(), "Token id 1000 is out of vocabulary");
+            let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+            assert!(
+                quiet.is_err(),
+                "a refused request reached the engine: {quiet:?}"
+            );
+        }
     }
 
     /// Answer each rank's next utility call with its entry in `answers`,

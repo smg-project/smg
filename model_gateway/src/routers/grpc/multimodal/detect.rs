@@ -122,12 +122,15 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
 
         for block in blocks {
             match block {
-                InputContentBlock::Image(image_block) => parts.push(image_media_part(image_block)),
+                InputContentBlock::Image(image_block) => {
+                    parts.extend(image_media_part(image_block));
+                }
                 // Images inside a tool result enter the plan where the tool
                 // result stands, in block order: `convert_user_message` renders
                 // them into the user content at that same position.
                 InputContentBlock::ToolResult(tool_result) => {
-                    parts.extend(tool_result_image_blocks(tool_result).map(image_media_part));
+                    parts
+                        .extend(tool_result_image_blocks(tool_result).filter_map(image_media_part));
                 }
                 InputContentBlock::Text(_) => {}
                 _ => {}
@@ -147,9 +150,11 @@ fn media_type_is_plain(media_type: &str) -> bool {
 
 /// Convert a Messages API image block to a media part for the connector: a
 /// base64 source travels as its media type and its text, shared with the
-/// request; a URL is shared the same way.
-fn image_media_part(image_block: &ImageBlock) -> MediaContentPart {
-    match &image_block.source {
+/// request; a URL is shared the same way. A file source names a file of the
+/// public API's Files API, which this gateway cannot fetch, so it makes no
+/// part: the message conversion refuses the block by name.
+fn image_media_part(image_block: &ImageBlock) -> Option<MediaContentPart> {
+    Some(match &image_block.source {
         ImageSource::Base64 { media_type, data } if media_type_is_plain(media_type) => {
             MediaContentPart::ImageBase64 {
                 media_type: media_type.clone(),
@@ -171,7 +176,8 @@ fn image_media_part(image_block: &ImageBlock) -> MediaContentPart {
             uuid: None,
             max_long_side_pixel: None,
         },
-    }
+        ImageSource::File { .. } => return None,
+    })
 }
 
 /// Build the canonical ordered media plan for Messages API input.
@@ -471,6 +477,33 @@ mod tests {
         assert_eq!(parse_detail("LOW"), Some(ImageDetail::Low));
         assert_eq!(parse_detail("high"), Some(ImageDetail::High));
         assert_eq!(parse_detail("unknown"), None);
+    }
+
+    /// A file image makes no media part, as this gateway cannot fetch the
+    /// file: the plan holds the other images only, and the message
+    /// conversion refuses the file image by name.
+    #[test]
+    fn media_plan_messages_leaves_a_file_image_out() {
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![
+                InputContentBlock::Image(ImageBlock {
+                    source: ImageSource::File {
+                        file_id: "file_1".to_string(),
+                    },
+                    cache_control: None,
+                }),
+                InputContentBlock::Image(ImageBlock {
+                    source: ImageSource::Url {
+                        url: "https://example.com/chart.png".to_string().into(),
+                    },
+                    cache_control: None,
+                }),
+            ]),
+        }];
+
+        let plan = media_plan_messages(&messages);
+        assert_eq!(plan.count(Modality::Image), 1);
     }
 
     #[test]

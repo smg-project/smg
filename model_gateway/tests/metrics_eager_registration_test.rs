@@ -8,12 +8,14 @@
 //! so installing the global Prometheus recorder here does not collide with
 //! other suites.
 
+use std::sync::Arc;
+
 use smg::{
     observability::{
         metrics::{init_startup_series, start_prometheus, PrometheusConfig},
         metrics_server::start_metrics_server,
     },
-    worker::{CircuitBreaker, CircuitBreakerConfig},
+    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
 };
 use smg_test_harness::test_app::scrape;
 
@@ -38,7 +40,7 @@ async fn protection_retry_and_breaker_families_start_at_zero() {
         host: "127.0.0.1".to_string(),
         duration_buckets: None,
     });
-    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
     init_startup_series();
@@ -88,10 +90,12 @@ async fn protection_retry_and_breaker_families_start_at_zero() {
     }
 
     // A breaker trips long after start-up; its transition counters still
-    // exist from the moment its worker is built.
+    // exist from the moment its worker registers.
     let worker = "grpc://worker-a:50051";
-    let _breaker =
-        CircuitBreaker::with_config_and_label(CircuitBreakerConfig::default(), worker.to_string());
+    let registry = WorkerRegistry::new();
+    registry
+        .register(Arc::new(BasicWorkerBuilder::new(worker).build()))
+        .expect("a fresh URL registers");
     let body = scrape(addr).await;
     for (from, to) in [
         ("closed", "open"),

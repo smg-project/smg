@@ -19,18 +19,19 @@ use axum::{
     response::Response,
 };
 use openai_protocol::{
-    completion::CompletionRequest, rerank::RerankRequest, worker::HealthCheckConfig,
+    completion::CompletionRequest, model_card::ModelCard, rerank::RerankRequest,
+    worker::HealthCheckConfig,
 };
 use serde_json::{json, Value};
 use smg::{
     config::PolicyConfig,
-    routers::{http::pd_router::PDRouter, RouterTrait},
-    worker::{BasicWorkerBuilder, ModelCard, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, http::pd_router::PDRouter, RouterTrait},
 };
+use smg_worker::identity::basic::WorkerType;
 
 use super::tenant_rate_limiting_http_test::{
-    body_of, limited_context_with_policy, mock_worker, request, router, tenant, usage, Endpoint,
-    Limiter, MockWorker, RecordingBackend, ESTIMATED_INPUT_TOKENS, MODEL, PROMPT_TEXT,
+    body_of, limited_pair_context_with_policy, mock_worker, request, router, tenant, usage,
+    Endpoint, Limiter, MockWorker, RecordingBackend, ESTIMATED_INPUT_TOKENS, MODEL, PROMPT_TEXT,
 };
 
 /// The endpoints the disaggregated router serves and reserves on.
@@ -48,7 +49,7 @@ fn port_of(url: &str) -> u16 {
 }
 
 /// The disaggregated router over a prefill and a decode mock worker, routing
-/// at random (see [`limited_context_with_policy`]).
+/// at random (see [`limited_pair_context_with_policy`]).
 async fn pd_router(
     limiter: Limiter,
     prefill: &MockWorker,
@@ -66,7 +67,7 @@ async fn pd_router_with_policy(
     retries: bool,
     policy: PolicyConfig,
 ) -> (PDRouter, Option<tempfile::TempDir>) {
-    let (ctx, dir) = limited_context_with_policy(limiter, retries, policy).await;
+    let (ctx, dir) = limited_pair_context_with_policy(limiter, retries, policy).await;
     let health = HealthCheckConfig {
         disable_health_check: true,
         ..Default::default()

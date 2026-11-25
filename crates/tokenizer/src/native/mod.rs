@@ -62,11 +62,16 @@
 //! encoder.
 
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     cell::{RefCell, RefMut},
+    hash::Hash,
     ops::Range,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Instant,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex, OnceLock, PoisonError,
+    },
+    thread::ThreadId,
+    time::{Duration, Instant},
 };
 
 use aho_corasick::{
@@ -84,6 +89,7 @@ mod block;
 mod byte_split;
 mod cased;
 mod chain;
+mod learned_pieces;
 mod long_entries;
 mod merge;
 mod nfc;
@@ -94,12 +100,16 @@ mod short_pieces;
 mod unicode;
 mod wide_pieces;
 
+use learned_pieces::LearnedPieces;
 use long_entries::LongEntryFilter;
 use merge::{ByteTokens, MergeTable};
 use nfc::NfcQuick;
 use pattern::Pattern;
 use sentencepiece::{CharSymbols, Marker, WORD_MARKER};
-use short_pieces::{ShortPieceKey, ShortPieceTable, Vacancy, SHORT_PIECE_MAX_BYTES};
+use short_pieces::{
+    Entry, ShortPieceKey, ShortPieceTable, Vacancy, INLINE_IDS, MIN_SLOTS, SHORT_PIECE_MAX_BYTES,
+    THREAD_BACKING_SLOTS,
+};
 use wide_pieces::{WideKey, WidePieceTable};
 
 use crate::{
@@ -177,8 +187,16 @@ const LONG_PIECE_MAX_BYTES: usize = 16 << 10;
 const WORD_SCAN_MIN_BYTES: usize = PARALLEL_CHUNK_BYTES;
 /// Bytes at the head of a unit that `NativeEncoder::opens_as_ascii` reads.
 const ASCII_HEAD_BYTES: usize = 256;
-/// Entries a thread's piece cache holds for one encoder before it is cleared,
-/// at most; see `PIECE_CACHE_TOTAL_CAPACITY`. This is also the cliff of a
+/// A thread's share of one encoder's piece cache, at most; see
+/// `PIECE_CACHE_TOTAL_CAPACITY`. A share cut for more than sixteen threads,
+/// or to a part where the threads share what they merge,
+/// is a count of entries over the three tiers. At this full share the wide
+/// table and the map hold a share between them and the packed table is
+/// counted apart, by the fill bound of the slots the share takes (one and
+/// a half shares), because one count over the three cleared them all while
+/// those slots were at most half full: two passes over 33 documents of
+/// 500k tokens (277,000 distinct pieces, 154,000 of them packed) cleared a
+/// thread's tables twice. Either bound is the cliff of a
 /// repeated document: one with fewer distinct pieces is encoded again at the
 /// cost of its lookups, one with more at first-sight cost on every pass,
 /// since the clear takes the pieces that recur with the rest (the crate bench
@@ -194,8 +212,8 @@ const ASCII_HEAD_BYTES: usize = 256;
 /// little holds a few KB; at the full bound it has 524,288 slots of 33
 /// bytes, 16.5 MiB (the table keys pieces of up to `SHORT_PIECE_MAX_BYTES`
 /// bytes with up to fifteen ids each, four in the slot and the rest in a
-/// spill: 15 MiB more at most, emptied with the table, its capacity kept).
-/// The pieces of 16 to 64 bytes count against the same bound in a map
+/// spill: 22.5 MiB more at most, emptied with the table, its capacity kept).
+/// The pieces of 16 to 64 bytes count against the share in a map
 /// (`PieceCache::short`): its slot with the table's slack, the piece and
 /// the ids as two boxes, about 140 bytes for a typical entry (a 20-byte
 /// piece with four ids) and about 430 at most (a 64-byte piece whose ids
@@ -205,23 +223,40 @@ const ASCII_HEAD_BYTES: usize = 256;
 /// (`PieceCache::wide`: 65 bytes a slot, the table between three eighths
 /// and three quarters full past 4,096 slots, so 87 to 173 bytes an
 /// entry and 32.5 MiB at the full bound, inside the map's figures), and
-/// allocates nothing per entry. A clear at the bound keeps
+/// allocates nothing per entry. The packed table fills beside the other
+/// two, and a clear at a bound keeps
 /// the tiers' arrays (the packed table's slots and its spill's capacity,
 /// the wide table's slots and the map's buckets, unless the share fell
 /// below what they were grown
-/// for) and drops their entries, so a thread that filled its packed table
-/// on one kind of text and then meets such pieces holds both, about 51 MiB
-/// with typical map entries and 140 MiB at the worst case the count bound
-/// allows; a thread that filled its wide table between the two keeps those
-/// slots as well, 32.5 MiB more (about 84 MiB and 172 MiB).
+/// for) and drops their entries, so a thread can hold a full packed table
+/// and a full map, about 51 MiB
+/// with typical map entries and 147 MiB at the worst case the bounds
+/// allow; a thread that filled its wide table before the map keeps those
+/// slots as well, 32.5 MiB more (about 84 MiB and 180 MiB).
 /// Measured on one thread after a corpus of 7,015 prompts: the peak RSS
 /// grew by 8 MB on a 128k-token vocabulary and did not move on three
 /// larger ones, whose peak is the file load.
 const PIECE_CACHE_CAPACITY: usize = 262_144;
-/// Entries all threads together hold for one encoder: a thread's own cap is
+/// Packed entries a thread at the full share holds before its tiers are
+/// cleared: the fill bound of the slots that share takes.
+const FULL_SHARE_PACKED: usize = ShortPieceTable::slots_for(PIECE_CACHE_CAPACITY) / 4 * 3;
+/// Entries all threads together hold for one encoder once more than sixteen
+/// have encoded with it: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
-/// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table starts
-/// at 64 slots (2 KiB) and grows as the thread meets pieces (by four up to
+/// (and never more than `PIECE_CACHE_CAPACITY`). Up to sixteen threads that
+/// do not share what they merge are
+/// each at the full cap, where the packed table is counted apart and a
+/// thread holds up to two and a half caps of entries: their total is the
+/// bytes below, not this count. Where the threads share
+/// what they merge (once `LEARNED_FROM_THREADS` threads call an encoder
+/// whose misses wait), a thread keeps a quarter of that cap and the encoder keeps
+/// what the threads merge in one table for all of them, half of the entries
+/// (see `GROWN_SHARE_PART`): the figures below are then ceilings the threads
+/// stay under, three quarters of them in packed slots, the table's
+/// included, and a quarter in the maps and the wide tables. A thread's packed
+/// table starts
+/// at 64 slots (2 KiB) and grows as the thread meets pieces (to 1,024 slots
+/// in its first step, then by four up to
 /// 4,096 slots, by two above), up to the slots for its cap, and is cut back to
 /// the slots of a smaller cap when it is cleared (made anew only past its
 /// reservation), so a thread that encodes little holds little and the packed
@@ -237,17 +272,19 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// and a clear keeps the packed slots and the map's buckets (the map made anew,
 /// the packed table cut back, for a smaller share), so the count-bounded tiers
 /// of one tokenizer hold at most the sum of the two: about 820 MiB at sixteen
-/// threads with typical map entries (about 2.2 GiB, sixteen times the 140 MiB
+/// threads with typical map entries (about 2.3 GiB, sixteen times the 147 MiB
 /// of a thread, were every map entry the worst case), and the slots of wide
 /// tables that grew to the bound as well, kept through a clear like the packed
 /// slots (65 bytes a slot: 520 MiB more at sixteen threads, 693 MiB at the most
 /// however many threads share the total), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
-/// most (a thread's long tier keeps its map's slots through an eviction's
-/// clear when they fit four times its share and gives them back when they
-/// do not; a share that fell below a quarter of what the tier holds, entries
-/// and empty slots together, makes it anew at the thread's next call). A
+/// most once every thread has added one under its present share, and can
+/// add more until then, see that constant (a thread's long tier keeps its map's
+/// slots through an eviction's clear when they fit four times its share and
+/// gives them back when they do not; a share that fell below a quarter of
+/// what the tier holds, entries and empty slots together, makes it anew at
+/// the thread's next call). A
 /// thread reads its share at the start of every encode call and keeps
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
@@ -257,22 +294,133 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// `THREAD_BACKING_SLOTS` slots at most, 33 bytes each, about 528 KiB per
 /// thread: more than the share's slots only once those fall under the
 /// reservation, a share under 6,144 entries, some 680 threads on this total),
-/// and holds at most its earlier share until then, or until it exits if it
-/// never encodes again: right after a join the total is the earlier share times
+/// and holds at most its earlier share until then, or while the encoder
+/// lives if it never encodes again (its exit frees nothing, the encoder owns
+/// the caches): right after a join the total is the earlier share times
 /// the threads that had it plus the new share times the rest, and settles as
 /// they encode. Before this bound the same ceilings were a sixteenth of these.
 /// All of it is freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
+/// The part of its share a thread keeps where the threads share what they
+/// merge, which is once `LEARNED_FROM_THREADS` threads call an encoder
+/// whose misses wait (`NativeEncoder::misses_wait`: no other miss asks the
+/// learned table, so no other encoder's threads give up a part of their
+/// share for it): a quarter, from
+/// a thread's first call (a share cut only at a thread's first clear left
+/// the memory of sixteen threads where it was: measured). What such
+/// threads merge is kept for all of them in the encoder's learned table
+/// ([`LearnedPieces`]), which is made at the first ask for twice the
+/// entries the threads that have encoded by then keep themselves: half of
+/// what they held before the table (`PIECE_CACHE_TOTAL_CAPACITY` at the
+/// most, so 2,097,152 entries: its 64 parts of 65,536 slots are 132 MiB of
+/// packed slots, and the ids past four an entry in their spills). The
+/// quarter of every thread and that half are three quarters of the
+/// packed slots the threads held before the table, and three tenths of the
+/// entries a full share lets a thread hold with its packed table counted
+/// apart: a
+/// thread of eight to sixteen holds 131,072 packed slots, and the table
+/// 262,144 for each of them, where a thread held 524,288; the maps and the
+/// wide tables, bounded by the same share, hold a quarter. An encoder that
+/// fewer threads call, or whose `misses_wait` flag is off (the sentencepiece
+/// path waits by its own rule on a far seed, but its threads do not share;
+/// a byte-level table that does not merge every short piece does not wait),
+/// is as it was: the whole share, and no learned table.
+const GROWN_SHARE_PART: usize = 4;
+/// The threads that must call an encoder before its threads share what
+/// they merge: eight, and only on an encoder whose misses wait
+/// (`NativeEncoder::misses_wait`), since no other miss asks the learned
+/// table: the threads of any other encoder keep their whole share and
+/// share nothing, however many call. A thread is counted at its first
+/// encode with the encoder, where it takes its piece cache
+/// (`NativeEncoder::thread_piece_cache`), unless it is a thread of a pool
+/// then: the
+/// threads of a pool encode the cuts of a caller's long text, and a wide
+/// pool behind few callers is no reason to share (measured where the
+/// pool's threads counted: four callers whose long texts a pool encoded, a
+/// fifth of the text new, 3.8 % fewer tokens a second). So two kinds of
+/// thread encode and are not counted. A caller whose every text is long
+/// enough to be cut for the pool (`PARALLEL_MIN_BYTES`) takes no piece
+/// cache of its own: the pool's threads take theirs. And a thread of any
+/// pool is left out, so the workers of a batch encode, each of which
+/// encodes whole inputs, are not counted. An encoder that only such
+/// callers and threads use shares nothing and is as it was, every thread
+/// with its whole share; counting them is left for a change of its own
+/// (where the pool's threads counted, the cell above read slower). The
+/// count never falls: it is of the
+/// threads that have called, not of those that call at one time, so a
+/// process whose eight threads have each encoded once shares from then on,
+/// however little it encodes, until the encoder is dropped. Once eight
+/// threads are counted, a
+/// thread, a pool's too, keeps a part of its share (`GROWN_SHARE_PART`),
+/// and one that has cleared asks the learned table before it merges a piece
+/// and tells it after (`PieceCache::shares`). The learned table of fewer
+/// threads is small (131,072 entries a thread), and on a stream a fifth of
+/// whose text is new it answered under four misses in ten, which cost more
+/// than the merges it saved (measured at one, two and four threads); from
+/// eight threads on it answers enough.
+const LEARNED_FROM_THREADS: usize = 8;
+/// The asks of the learned table a thread judges together
+/// (`PieceCache::judge_asks`). An ask is of use only when the table
+/// answers it: a miss it does not answer has waited and asked for
+/// nothing, whether or not the table takes what the thread then merges
+/// and tells.
+const ASKS_JUDGED: u32 = 256;
+/// A thread rests when the table answers fewer than one in this many of
+/// the asks it judges, which is under one ask in two: it shares no more
+/// (`PieceCache::shares`), so its misses neither wait for the learned
+/// table nor ask it nor tell it, as before the thread shared. An ask the
+/// table does not answer pays the wait and the ask and saves no merge:
+/// sixteen callers of text that is all new encode faster where their
+/// threads rest so than where none rests (measured).
+const ASKS_OF_USE_PART: u32 = 2;
+/// The entries the count-bounded tiers of a resting thread take before
+/// the thread asks again and judges the next asks as it judged the last:
+/// of the misses the table never answers, one in seventeen still asks. A
+/// clear ends the rest, since the thread has lost its own words: the
+/// thread shares again from its next call, because sharing is turned on
+/// only at the start of a call (`PieceCache::shares`).
+const ASKS_RESTED: usize = 4_096;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
-/// `LONG_PIECE_BYTES_TOTAL`.
-const LONG_PIECE_BYTES_CAPACITY: usize = 2 << 20;
-/// Bytes of long pieces all threads together hold for one encoder, shared
-/// the way `PIECE_CACHE_TOTAL_CAPACITY` is. The long pieces of a prompt (its
-/// clauses, in a script without word spaces) are few in number and large,
-/// and each one that misses goes through the model's merges, so they are
-/// bounded by what they take rather than counted.
-const LONG_PIECE_BYTES_TOTAL: usize = 32 << 20;
+/// `LONG_PIECE_BYTES_TOTAL`. This is the cliff of a repeated document for
+/// its long pieces, as `PIECE_CACHE_CAPACITY` is for the others: a text
+/// whose long pieces fit is encoded again at the cost of their lookups, one
+/// with more merges them again on every pass, since the clear takes the
+/// pieces that recur with the rest. By this count the 33 documents of
+/// 128,000 tokens of the README's benchmark hold 2.8 to 3.0 MiB of long
+/// pieces in all and its 33 documents of 500,000 tokens 5.6 to 6.0 MiB
+/// (three byte-level vocabularies, some 14,000 and 29,000 entries of about
+/// 220 bytes), so the bound holds either set whole; at 2 MiB the tier was
+/// cleared once or twice in a pass over the first set and five or six
+/// times in a pass over the second, and a second pass merged most of the
+/// long pieces again (measured).
+/// Memory: a thread holds what the long pieces it met take, so one that
+/// meets few holds little; the count leaves out what the allocator rounds
+/// each box up by and the empty slots of the map.
+const LONG_PIECE_BYTES_CAPACITY: usize = 8 << 20;
+/// Bytes of long pieces the threads of one encoder share, the way they
+/// share `PIECE_CACHE_TOTAL_CAPACITY`: a thread's share is this total
+/// divided by the threads that have encoded with the encoder,
+/// `LONG_PIECE_BYTES_CAPACITY` at most, so sixteen threads have the full
+/// bound each and more threads a smaller share. A thread is held to its
+/// share in two places: where it adds a long piece, its long entries are
+/// cleared first when the piece would take them past the share read at
+/// that miss, and the start of a call makes anew a long tier that holds
+/// more than four times the share. Nothing reaches into another thread's
+/// cache, so the threads together are within this total only once each
+/// has added a long piece under the present share. A thread that filled a
+/// larger share and has added none since keeps what it holds, up to four
+/// times its share while it encodes and all of it while it does not, for
+/// as long as the encoder lives (a thread's exit frees nothing), and the
+/// threads together can stand above this total for that time: sixteen
+/// threads that filled 8 MiB each and a seventeenth that fills its share
+/// hold 135.5 MiB. At the worst, every thread filling its share as it
+/// joins and adding nothing after, the n-th keeps the total divided by n
+/// and the sum is 215 MiB at 32 threads, 302 MiB at 64. The long pieces
+/// of a prompt (its clauses, in a script without word spaces) are few in
+/// number and large, and each one that misses goes through the model's
+/// merges, so they are bounded by what they take rather than counted.
+const LONG_PIECE_BYTES_TOTAL: usize = 128 << 20;
 /// What an entry of the long tier takes beyond its piece and ids.
 const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
@@ -281,9 +429,55 @@ const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 /// when the pool has more than one thread (see `worth_the_pool`); shorter
 /// inputs would spend more on the hand-offs than they save.
 const PARALLEL_MIN_BYTES: usize = 64 << 10;
+/// A thread's first text at least this long has the merge table read before
+/// it (`NativeEncoder::piece_cache_for_text`): the read is half the time of
+/// a first 9 KiB text and a small part of a first 150 KiB one, which runs
+/// as before (measured). It is `PARALLEL_MIN_BYTES`: the pool takes only a
+/// text that long, so a thread of the pool reads before its first unit.
+const READ_AT_ONCE_BYTES: usize = PARALLEL_MIN_BYTES;
+/// How long the read of the merge table that ends a load stands in for the
+/// loading thread's own (`NativeEncoder::load_read_holds`): the span of a
+/// process that loads and encodes at once. A thread that did anything of
+/// weight in between, the load of another tokenizer for one, is past it
+/// and reads the table itself.
+const LOAD_READ_HOLDS: Duration = Duration::from_millis(10);
+/// A text at least this long may have the thread's packed table read back
+/// before it (`PieceCache::reads_back`).
+const READ_BACK_MIN_BYTES: usize = 4096;
+/// The time a long text is given to encode, this and `READ_BACK_PER_BYTE`
+/// for each of its bytes: a thread whose next long text starts later than
+/// that is taken to have lost its processor in between.
+const READ_BACK_BASE: Duration = Duration::from_micros(20);
+const READ_BACK_PER_BYTE: Duration = Duration::from_nanos(32);
+/// The longest gap the read answers: a wait for a processor lasts a few
+/// slices of the scheduler, a longer one is a thread at rest.
+const READ_BACK_WITHIN: Duration = Duration::from_millis(20);
+
+/// The processors this process may run on, or `usize::MAX` where the
+/// system does not say, so that no encoder has more threads inside a long
+/// text than that.
+fn processors() -> usize {
+    std::thread::available_parallelism().map_or(usize::MAX, usize::from)
+}
+
+/// A thread inside a long text (`NativeEncoder::inside`). The count gives
+/// it up on drop, so an encode that unwinds leaves the count right.
+struct Inside<'a>(&'a AtomicUsize);
+
+impl Drop for Inside<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
+/// The fewest bytes the units of a text may average for the pool's threads to
+/// take their own units of it. A text cut finer, as a chat transcript is by
+/// its added tokens, is read as the iterator splits it, a run of neighbours
+/// a thread: threads that each take every n-th of many small units write the
+/// same cache lines.
+const OWN_UNIT_MIN_BYTES: usize = 1 << 10;
 /// Threads of the pool the vocabulary seed is read on at load. The pool is
 /// built for that read and joined before the load returns: on rayon's
 /// global pool the first load would build that pool at the machine's
@@ -295,6 +489,11 @@ const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
 /// load that runs on a worker of a rayon pool already (the Python binding
 /// loads on its own, sized by its host) reads on that pool instead.
 const SEED_THREADS: usize = 4;
+/// Ids the vocabulary seed's pass reads at a time: one list of this many
+/// slots, three quarters of a megabyte, is all the pass holds of its reads
+/// beside the tables, the long spellings and the model's own answers of
+/// more than four ids, each in a block of its own (see `vocabulary_seed`).
+const SEED_WINDOW: usize = 1 << 14;
 /// Text on each side of a candidate cut that every stage's pattern is run
 /// over to confirm a piece starts there (widened to the spaces around it:
 /// the window starts where the text's match loop begins a piece and ends
@@ -348,25 +547,31 @@ type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
 /// thread that cuts (`NativeEncoder::cut_spans`).
 type CutSpans = [Vec<(usize, usize)>; 3];
 
-/// The ids of one vocabulary entry while the seed is built, in a fixed slot
-/// (a byte-level piece of `n` bytes has at most `n` ids), so the pass over
-/// the vocabulary allocates one list rather than one per entry.
-#[derive(Clone, Copy, Default)]
+/// The ids of one vocabulary entry as a seed thread hands them to the
+/// loading thread: their count and the first four, all the seed's table
+/// keeps in an entry, so a slot of the window is 48 bytes; the loading
+/// thread reads an entry of more ids again.
+#[derive(Clone, Copy)]
 struct SeededIds {
     count: u8,
-    ids: [u32; SHORT_PIECE_MAX_BYTES],
+    ids: [u32; INLINE_IDS],
 }
 
 impl SeededIds {
-    /// Takes one more id; `None` when the slot is full.
-    fn push(&mut self, id: u32) -> Option<()> {
-        *self.ids.get_mut(usize::from(self.count))? = id;
-        self.count += 1;
-        Some(())
+    fn of(ids: &[u32]) -> Self {
+        let mut first = [0; INLINE_IDS];
+        for (to, &id) in first.iter_mut().zip(ids) {
+            *to = id;
+        }
+        Self {
+            count: ids.len() as u8,
+            ids: first,
+        }
     }
 
-    fn as_slice(&self) -> &[u32] {
-        &self.ids[..usize::from(self.count)]
+    /// The ids, when the slot holds them all.
+    fn inline(&self) -> Option<&[u32]> {
+        self.ids.get(..usize::from(self.count))
     }
 }
 
@@ -385,7 +590,58 @@ struct SeedScratch {
 /// filter the whole-piece lookup consults (see `long_entries`).
 enum Seeded {
     Short(ShortPieceKey, SeededIds),
+    /// A short piece the model gave more ids than a slot holds, all of
+    /// them: the loading thread asks the model for no entry, since a call
+    /// leaves a record of the model in the calling thread's word cache.
+    Asked(ShortPieceKey, Box<[u32]>),
     Long(Box<[u8]>),
+}
+
+const _: () = assert!(size_of::<Option<Option<Seeded>>>() == 48);
+
+/// Most short pieces that wait for the seed's answer together (see
+/// `Native::waits`): the far lines of that many are read at once, and more
+/// buy nothing (measured on first sights of word lists: 4 buy a fifth of
+/// what 16 do, 64 what 32 do).
+const WAITING_PIECES: usize = 32;
+/// Ids between two misses of a thread's packed table up to which the second
+/// waits: misses that close together are text the thread has not met. A
+/// miss further behind the last one stands alone and is answered where it
+/// is met (measured: without the bound a thread that knows its text kept a
+/// few pieces waiting over hundreds of tokens, 3 to 7 % of the time of a
+/// text of 2k tokens).
+const WAITING_GAP: usize = 32;
+/// Slots of a seed up to which its lines are near a thread (4 MiB of
+/// entries and tags): a first sight of the sentencepiece path waits only on
+/// a larger seed (measured: with the wait, new text of 256 and of 2k tokens
+/// was 11 to 13 % slower on a vocabulary of 32k entries and 5 to 15 %
+/// faster by its median text on one of 262k).
+const NEAR_SEED_SLOTS: usize = 131_072;
+
+/// Pieces a unit cut by blocks holds and answers together
+/// (`Native::answer_asked`).
+const ASK_AHEAD: usize = 32;
+/// Slots of a thread's packed table past which a unit cut by blocks holds
+/// its pieces. A choice by workload: holding costs 25 to 30 instructions a
+/// token, and under a bound of 16,384 slots a text of 32 thousand tokens
+/// read 3 % slower, new and read again (measured).
+const ASK_AHEAD_SLOTS: usize = 8 * THREAD_BACKING_SLOTS;
+
+/// A piece held for `Native::answer_asked`.
+#[derive(Clone, Copy)]
+struct Asked {
+    start: usize,
+    end: usize,
+    key: Option<ShortPieceKey>,
+    hash: u64,
+}
+
+/// A short piece the thread's packed table missed, waiting for its answer
+/// (see `Native::waits`): where the probe ended, with the piece's key, and
+/// where its hole of one id stands in the output.
+struct Waiting {
+    vacancy: Vacancy,
+    at: usize,
 }
 
 /// One thread's cache of the pieces it met with one encoder, each with the
@@ -421,6 +677,50 @@ struct PieceCache {
     /// every encode call (`piece_cache_for_call`); the misses of the call
     /// read it here.
     share: usize,
+    /// The short pieces the packed table missed that wait for their answer
+    /// (see `Native::waits`), in the order of their holes; empty between
+    /// encode calls.
+    waiting: Vec<Waiting>,
+    /// The ids of the waiting pieces whose answer is not one id, from their
+    /// answer until one pass places them in the output: a scratch list of
+    /// the thread.
+    answer: Vec<u32>,
+    /// The length of the output at the packed table's last miss: a miss
+    /// close behind it waits.
+    last_miss: usize,
+    /// How often the count-bounded tiers were cleared (`Self::clear_short`):
+    /// a waiting piece's vacancy is of the table as it was before the next
+    /// clear.
+    clears: usize,
+    /// `clears` when the waiting pieces were last answered: after a clear
+    /// since then a waiting piece's vacancy may name no slot of the table
+    /// as it is, and every waiting piece asks the table again.
+    answered_clears: usize,
+    /// Whether the thread's misses ask the encoder's learned table before
+    /// they are merged and tell it after (`NativeEncoder::learned_pieces`):
+    /// the thread has cleared, and the encoder's threads share what they
+    /// merge (`NativeEncoder::enough_callers`), and the thread does not
+    /// rest (`Self::judge_asks`). Set at the start of a call, and cleared
+    /// where the thread starts to rest; the share does not hang on it.
+    shares: bool,
+    /// The calls up to the one that reads the merge table through
+    /// (`NativeEncoder::piece_cache_for_text`): two in a new cache, zero
+    /// once the table is read, or once the load's read stood in for it
+    /// (`NativeEncoder::load_read_holds`).
+    calls_to_read: u8,
+    /// The asks of the learned table since the thread last judged them
+    /// (`Self::judge_asks`), and those of them the table answered.
+    asked: u32,
+    of_use: u32,
+    /// The entries the count-bounded tiers must hold before a thread that
+    /// rests asks again; zero for a thread that does not rest.
+    asks_from: usize,
+    /// The vocabulary's form of a waiting piece being merged on the
+    /// sentencepiece path: a scratch string of the thread.
+    mapped: String,
+    /// When the thread's last long text started, and its bytes
+    /// (`Self::reads_back`); none when it ran with a processor to spare.
+    last_long: Option<(Instant, usize)>,
 }
 
 impl PieceCache {
@@ -437,7 +737,37 @@ impl PieceCache {
             symbols: Vec::new(),
             unit_ascii: false,
             share,
+            waiting: Vec::new(),
+            answer: Vec::new(),
+            last_miss: 0,
+            clears: 0,
+            answered_clears: 0,
+            shares: false,
+            calls_to_read: 2,
+            asked: 0,
+            of_use: 0,
+            asks_from: 0,
+            mapped: String::new(),
+            last_long: None,
         }
+    }
+
+    /// Whether a long text of `bytes` bytes that starts at `now` has the
+    /// packed table read back before it, and notes the text. It has when
+    /// the long text before it started longer ago than that one is given
+    /// to encode and within [`READ_BACK_WITHIN`]: the thread is taken to
+    /// have lost its processor to another caller, and the table's lines
+    /// to have left the near caches with it; read as a stream they cost
+    /// less than fetched one probe at a time. A thread that did other
+    /// work in between, a text the pool encoded for one, reads as well.
+    fn reads_back(&mut self, now: Instant, bytes: usize) -> bool {
+        let last = self.last_long.replace((now, bytes));
+        last.is_some_and(|(then, last_bytes)| {
+            let gap = now.saturating_duration_since(then);
+            let last_bytes = u32::try_from(last_bytes).unwrap_or(u32::MAX);
+            gap > READ_BACK_BASE + READ_BACK_PER_BYTE.saturating_mul(last_bytes)
+                && gap < READ_BACK_WITHIN
+        })
     }
 
     /// Bytes the long tier holds, used or not: its entries' pieces, ids and
@@ -475,6 +805,48 @@ impl PieceCache {
         self.packed.len() + self.wide.len() + self.short.len()
     }
 
+    /// The entries counted against `share`: all three tiers under a share
+    /// that was cut, the wide table and the map alone at the full share,
+    /// where the packed table is bounded by its slots.
+    fn counted_entries(&self, share: usize) -> usize {
+        if share < PIECE_CACHE_CAPACITY {
+            self.short_entries()
+        } else {
+            self.wide.len() + self.short.len()
+        }
+    }
+
+    /// Whether the tiers bounded by count are full under `share`. At the
+    /// full share the packed table is counted by its slots, apart from the
+    /// other two: one count over the three cleared them all while those
+    /// slots were at most half full. A share that was cut keeps the one
+    /// count, so those threads hold together what they held.
+    fn short_full(&self, share: usize) -> bool {
+        self.counted_entries(share) >= share
+            || (share >= PIECE_CACHE_CAPACITY && self.packed.len() >= FULL_SHARE_PACKED)
+    }
+
+    /// Counts `asked` asks of the learned table, `of_use` of them answered
+    /// by it, and judges every `ASKS_JUDGED` of them: where the table
+    /// answered fewer than one in `ASKS_OF_USE_PART`, under one ask in
+    /// two, the thread rests, which is to share no more until its
+    /// count-bounded tiers hold `ASKS_RESTED` entries more
+    /// (`NativeEncoder::piece_cache_for_call` reads it) or are cleared
+    /// (`Self::clear_short`). The counts are the thread's own, so a caller
+    /// and a thread of a pool are judged alike.
+    fn judge_asks(&mut self, asked: u32, of_use: u32) {
+        self.asked += asked;
+        self.of_use += of_use;
+        if self.asked >= ASKS_JUDGED {
+            if self.of_use < self.asked / ASKS_OF_USE_PART {
+                self.shares = false;
+                self.asks_from = self.short_entries() + ASKS_RESTED;
+            }
+            self.asked = 0;
+            self.of_use = 0;
+        }
+    }
+
     fn wide_slots(&self) -> usize {
         self.wide.slots()
     }
@@ -501,6 +873,14 @@ impl PieceCache {
     /// and a clear at the bound keeps the buckets); the wide table keeps its
     /// slots, or gives them back when it has more than the share takes.
     fn clear_short(&mut self, share: usize) {
+        self.clears += 1;
+        // The thread has lost its own words: a rest ends, and the asks it
+        // makes from here are judged by themselves. `shares` is turned on
+        // only at the start of a call, so a thread that rested shares
+        // again from its next call.
+        self.asked = 0;
+        self.of_use = 0;
+        self.asks_from = 0;
         self.packed.clear(share);
         self.wide.clear(share);
         if self.short.capacity() > 2 * share {
@@ -802,9 +1182,12 @@ type AddedTokenList = Vec<Added>;
 
 /// One set of added tokens, matched leftmost-longest as `AddedVocabulary`
 /// matches them. The automaton's own search scans a text for the tokens'
-/// first bytes when there are at most three of them, all ASCII; a set the
-/// scan cannot take (a token starting beyond ASCII, or more than three
-/// first bytes) it searches by the tokens' rarest bytes instead, which for a
+/// first bytes when there are at most three of them, all ASCII, each `<`,
+/// `[` or `]`; a set of two or three with another first byte takes a byte
+/// search of its own ([`Search::FirstBytes`]), unless a token of it holds
+/// more than one place of that search past its start. A set the scan cannot
+/// take (a token starting beyond ASCII, or more than three first bytes) the
+/// automaton searches by the tokens' rarest bytes instead, which for a
 /// vocabulary of a thousand `<` tokens and one fenced in fullwidth bars were
 /// the bars' continuation bytes, frequent in CJK text: that search was a
 /// third of a 2 KB encode (measured). Such a set takes its candidates from
@@ -835,9 +1218,11 @@ pub(crate) struct AddedTokens {
 /// [`Self::MAX_FIRST_BYTES`]: a hit then is a byte that starts some token,
 /// and the automaton anchored there decides, where the unanchored automaton
 /// walked every byte of the text (measured at about thirty instructions per
-/// byte on a 6,415-token set).
+/// byte on a 6,415-token set). A set of two or three first bytes, all ASCII,
+/// takes no prefixes: a byte search for them finds its places
+/// ([`Search::FirstBytes`]).
 struct Prefixes {
-    searcher: packed::Searcher,
+    searcher: Search,
 }
 
 impl Prefixes {
@@ -853,9 +1238,16 @@ impl Prefixes {
     /// shorter one would stop the pass at places no token stands.
     const NARROW_MIN_LEN: usize = 8;
     const MAX_FIRST_BYTES: usize = 16;
+    /// The most places of the byte search a token may hold past its own
+    /// start: one, the slash of `</think>` in a set with `/think`.
+    const MAX_INNER: usize = 1;
 
-    /// Whether the automaton's start-byte scan declines `tokens`: a first
-    /// byte beyond ASCII, or more than three distinct first bytes.
+    /// Whether a search of our own beats the automaton's on `tokens`: a first
+    /// byte beyond ASCII or more than three distinct ones, which its
+    /// first-byte scan declines; and two or three unless each is `<`, `[` or
+    /// `]`: beside a first byte more common in text (a slash) the automaton
+    /// scans for the tokens' rarest bytes instead, letters among them, and
+    /// text is full of those.
     fn wanted(tokens: &[Added]) -> bool {
         let mut firsts: Vec<u8> = tokens
             .iter()
@@ -863,7 +1255,9 @@ impl Prefixes {
             .collect();
         firsts.sort_unstable();
         firsts.dedup();
-        firsts.len() > 3 || firsts.iter().any(|first| !first.is_ascii())
+        firsts.len() > 3
+            || firsts.iter().any(|first| !first.is_ascii())
+            || (firsts.len() > 1 && firsts.iter().any(|first| !b"<[]".contains(first)))
     }
 
     /// The distinct prefixes of `tokens` of up to `len` bytes.
@@ -902,17 +1296,69 @@ impl Prefixes {
         (!cut_short || len >= Self::MIN_LEN).then_some(prefixes)
     }
 
-    /// The searcher over the prefixes of `tokens` ([`Self::chosen`]); none
-    /// when there are none to take or the library declines the set.
+    /// What searches for `tokens`: the byte search for two or three first
+    /// bytes, all ASCII; else the searcher over the prefixes
+    /// ([`Self::chosen`]), none when there are none to take or the library
+    /// declines the set, and none where the byte search would have a text
+    /// walked over and over.
     fn of(tokens: &[Added]) -> Option<Self> {
+        let firsts = Self::distinct(tokens, 1);
+        let bytes: Vec<u8> = firsts
+            .iter()
+            .filter_map(|first| first.first().copied())
+            .collect();
+        if let [a, .., c] = bytes[..] {
+            if bytes.len() <= 3 && bytes.iter().all(u8::is_ascii) {
+                let bytes = [a, bytes[1], c];
+                let mut seconds = [[false; 256]; 3];
+                for token in tokens {
+                    let content = token.content.as_bytes();
+                    let Some(which) = bytes.iter().position(|byte| content.first() == Some(byte))
+                    else {
+                        continue;
+                    };
+                    match content.get(1) {
+                        Some(&second) => seconds[which][usize::from(second)] = true,
+                        None => seconds[which] = [true; 256],
+                    }
+                }
+                // A token that holds places of this search past its own start
+                // has the anchored automaton walk them again from each. With
+                // at most `MAX_INNER` in a token, no byte of a text is walked
+                // more than that plus three times; a set beyond it (`aaaab`: a
+                // text of `a` walked from every byte) keeps the automaton's
+                // own search.
+                let inner = |token: &Added| {
+                    let content = token.content.as_bytes();
+                    let pairs = content.iter().zip(content.iter().skip(1));
+                    pairs
+                        .skip(1)
+                        .filter(|(first, second)| {
+                            bytes
+                                .iter()
+                                .position(|byte| byte == *first)
+                                .is_some_and(|which| seconds[which][usize::from(**second)])
+                        })
+                        .count()
+                };
+                if tokens.iter().any(|token| inner(token) > Self::MAX_INNER) {
+                    return None;
+                }
+                let pair = Pair::of(bytes, &seconds);
+                return Some(Self {
+                    searcher: Search::FirstBytes(bytes, Box::new(seconds), pair),
+                });
+            }
+        }
         let prefixes = Self::chosen(tokens)?;
         let searcher = Self::searcher(&prefixes).or_else(|| {
-            let firsts = Self::distinct(tokens, 1);
             (firsts.len() <= Self::MAX_FIRST_BYTES)
                 .then(|| Self::searcher(&firsts))
                 .flatten()
         })?;
-        Some(Self { searcher })
+        Some(Self {
+            searcher: Search::Packed(searcher),
+        })
     }
 
     /// The library's packed searcher over `patterns`, none when it declines
@@ -925,12 +1371,175 @@ impl Prefixes {
             .build()
     }
 
-    /// The first position at or after `from` where a prefix stands.
-    fn next(&self, text: &str, from: usize) -> Option<usize> {
-        self.searcher
-            .find_in(text, Span::from(from..text.len()))
-            .map(|found| found.start())
+    /// The first position at or after `from` where a token may start.
+    /// `sought` is this text's: through it the byte search counts the places
+    /// of a common first byte that start nothing and hands the text to the
+    /// split search ([`Pair`]).
+    fn next(&self, text: &str, from: usize, sought: &mut Sought) -> Option<usize> {
+        match &self.searcher {
+            Search::Packed(searcher) => searcher
+                .find_in(text, Span::from(from..text.len()))
+                .map(|found| found.start()),
+            Search::FirstBytes([a, b, c], seconds, pair) => {
+                let bytes = text.as_bytes();
+                let mut from = from;
+                loop {
+                    if let Some(pair) = pair {
+                        if sought.misses >= Pair::MISSES {
+                            return pair.next(bytes, from, [*a, *b, *c], seconds, sought);
+                        }
+                    }
+                    let mut at = from + memchr::memchr3(*a, *b, *c, bytes.get(from..)?)?;
+                    // A first byte right behind one that starts no token (a
+                    // doubled slash) is tested in place: a new search call
+                    // would only find it again.
+                    loop {
+                        let which = match bytes.get(at)? {
+                            byte if byte == a => 0,
+                            byte if byte == b => 1,
+                            _ => 2,
+                        };
+                        match bytes.get(at + 1) {
+                            Some(&second) if !seconds[which][usize::from(second)] => {
+                                if pair.as_ref().is_some_and(|pair| pair.common == which) {
+                                    sought.misses = sought.misses.saturating_add(1);
+                                    if sought.misses >= Pair::MISSES {
+                                        from = at + 1;
+                                        break;
+                                    }
+                                }
+                                if [*a, *b, *c].contains(&second) {
+                                    at += 1;
+                                } else {
+                                    from = at + 2;
+                                    break;
+                                }
+                            }
+                            _ => return Some(at),
+                        }
+                    }
+                }
+            }
+        }
     }
+}
+
+/// What finds the next place a token may start: the packed prefixes, or,
+/// for two or three ASCII first bytes, a byte search for them (the last
+/// stands twice for two) that passes a place only when the byte after it
+/// follows that first byte in some token, so that the automaton is not
+/// asked at every slash or bracket of a text. Where one of the first bytes
+/// is common in text, a text dense in it goes on by the split search
+/// ([`Pair`]).
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per tokenizer, never moved once built; a box adds a load to a search call"
+)]
+enum Search {
+    Packed(packed::Searcher),
+    FirstBytes([u8; 3], Box<[[bool; 256]; 3]>, Option<Pair>),
+}
+
+/// The split search of a set with one first byte common in text (a slash)
+/// that every token of it follows with the same second byte: that pair is
+/// searched as two bytes and the other first bytes by the byte search, so the
+/// common byte alone stops nothing. A text takes it after [`Self::MISSES`]
+/// places of the common byte that start no token; until then it pays what
+/// the search for all three bytes pays.
+struct Pair {
+    common: usize,
+    rare: [u8; 2],
+    finder: memchr::memmem::Finder<'static>,
+}
+
+impl Pair {
+    /// Two: a text with one such place keeps the one search, and the two
+    /// searches of the split start where the common byte has stopped it twice.
+    const MISSES: u8 = 2;
+
+    /// The split of `firsts` (sorted, the last standing twice for two), none
+    /// unless one of them alone is common and one byte follows it.
+    fn of(firsts: [u8; 3], seconds: &[[bool; 256]; 3]) -> Option<Self> {
+        let mut distinct = firsts.to_vec();
+        distinct.dedup();
+        let (rare, commons): (Vec<u8>, Vec<u8>) = distinct
+            .iter()
+            .copied()
+            .partition(|first| b"<[]".contains(first));
+        let [common] = commons[..] else {
+            return None;
+        };
+        let which = firsts.iter().position(|first| *first == common)?;
+        let mut follows = (0..=u8::MAX).filter(|second| seconds[which][usize::from(*second)]);
+        let (Some(second), None) = (follows.next(), follows.next()) else {
+            return None;
+        };
+        Some(Self {
+            common: which,
+            rare: [*rare.first()?, *rare.last()?],
+            finder: memchr::memmem::Finder::new(&[common, second]).into_owned(),
+        })
+    }
+
+    /// The first place at or after `from`: the earlier of the next rare first
+    /// byte a token can go on from and the next pair, each kept in `sought`
+    /// until the search has passed it. `from` is past the start of the text
+    /// here (a place was missed), so the zeros of a new `sought` are stale.
+    fn next(
+        &self,
+        bytes: &[u8],
+        from: usize,
+        firsts: [u8; 3],
+        seconds: &[[bool; 256]; 3],
+        sought: &mut Sought,
+    ) -> Option<usize> {
+        if sought.rare < from {
+            sought.rare = self.rare_from(bytes, from, firsts, seconds);
+        }
+        if sought.pair < from {
+            sought.pair = bytes
+                .get(from..)
+                .and_then(|rest| self.finder.find(rest))
+                .map_or(usize::MAX, |found| from + found);
+        }
+        let at = sought.rare.min(sought.pair);
+        (at != usize::MAX).then_some(at)
+    }
+
+    /// The first rare first byte at or after `from` that a token can go on
+    /// from, `usize::MAX` for none.
+    fn rare_from(
+        &self,
+        bytes: &[u8],
+        mut from: usize,
+        firsts: [u8; 3],
+        seconds: &[[bool; 256]; 3],
+    ) -> usize {
+        let [a, b] = self.rare;
+        while let Some(found) = bytes
+            .get(from..)
+            .and_then(|rest| memchr::memchr2(a, b, rest))
+        {
+            let at = from + found;
+            let which = firsts
+                .iter()
+                .position(|first| bytes.get(at) == Some(first))
+                .unwrap_or(0);
+            match bytes.get(at + 1) {
+                Some(&second) if !seconds[which][usize::from(second)] => from = at + 1,
+                _ => return at,
+            }
+        }
+        usize::MAX
+    }
+}
+
+/// What the search of one text remembers between its calls.
+#[derive(Default)]
+struct Sought {
+    misses: u8,
+    rare: usize,
+    pair: usize,
 }
 
 impl AddedTokens {
@@ -982,6 +1591,7 @@ impl AddedTokens {
     fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
         let mut at = 0;
         let mut taken = 0;
+        let mut sought = Sought::default();
         std::iter::from_fn(move || loop {
             let Some(prefixes) = &self.prefixes else {
                 let input = Input::new(text).range(at..);
@@ -995,7 +1605,7 @@ impl AddedTokens {
                 taken = range.end;
                 return Some((range, index));
             };
-            let start = prefixes.next(text, at)?;
+            let start = prefixes.next(text, at, &mut sought)?;
             let input = Input::new(text).range(start..).anchored(Anchored::Yes);
             if let Some(found) = self.automaton.find(input) {
                 at = found.end();
@@ -1050,6 +1660,16 @@ impl AddedTokens {
     /// The byte ranges of the added tokens in `text`, in order.
     pub(crate) fn ranges<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
         self.matches(text).map(|(range, _)| range)
+    }
+
+    /// The added tokens in `text`, in order, each as its byte range and its
+    /// id.
+    pub(crate) fn tokens<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = (Range<usize>, u32)> + 'a {
+        self.matches(text)
+            .map(|(range, index)| (range, self.ids[index]))
     }
 
     /// Calls `f` with each segment in order: an added token's id, or a text
@@ -1200,6 +1820,11 @@ pub(crate) struct NativeEncoder {
     /// has not met, before the piece is merged (see
     /// [`Self::seed_vocabulary`]).
     seed: ShortPieceTable,
+    /// What the threads have merged, kept for all of them: asked by a
+    /// thread that shares (`PieceCache::shares`), for a piece its own table
+    /// and the seed do not hold, before the merge
+    /// ([`Self::learned_pieces`]).
+    learned: OnceLock<LearnedPieces>,
     /// Whether the seed holds every vocabulary entry of up to
     /// `SHORT_PIECE_MAX_BYTES` raw bytes: the ids `0..vocab_size` were all
     /// entries when it was read. Then a short piece the seed misses is no
@@ -1207,6 +1832,16 @@ pub(crate) struct NativeEncoder {
     /// (see [`Self::tokenize_piece`]). A vocabulary with gaps in its ids has
     /// entries past that range the seed did not read, and keeps the lookup.
     seed_covers_short_entries: bool,
+    /// Whether a young thread's misses wait for their answers
+    /// ([`Self::waits`]). The waiting pieces are answered with no model at
+    /// hand, so they wait only where none is asked: on an encoder whose
+    /// table merges every short piece
+    /// ([`Self::merges_every_short_piece`]). Only a miss that waits asks
+    /// the learned table, so only such an encoder's threads share what
+    /// they merge ([`Self::enough_callers`]). The sentencepiece path, whose
+    /// character symbols merge every piece, waits by its own rule
+    /// ([`Self::seeded_raw`]) with this flag off: its threads do not share.
+    misses_wait: bool,
     /// The vocabulary's entries longer than the seed's keys as a filter,
     /// read with the seed when the pass read every entry (`None` on the
     /// paths without the pass, on the sentencepiece path, whose pass reads
@@ -1237,6 +1872,21 @@ pub(crate) struct NativeEncoder {
     cut_spans: ThreadLocal<RefCell<CutSpans>>,
     /// Threads that hold a piece cache of this encoder.
     threads: AtomicUsize,
+    /// Those of them that call: the threads that were no thread of a pool
+    /// at their first encode with this encoder ([`Self::thread_piece_cache`]
+    /// counts them, `LEARNED_FROM_THREADS` asks for them).
+    callers: AtomicUsize,
+    /// The thread that loaded this encoder, and when its rehearsal had read
+    /// the merge table through ([`Self::rehearse`]).
+    load_read: OnceLock<(ThreadId, Instant)>,
+    /// [`processors`] when the encoder was made: while more threads than
+    /// this are inside a long text, a thread reads its table back
+    /// (`PieceCache::reads_back`).
+    processors: usize,
+    /// The threads that encode the units of a long text of their own now
+    /// (`READ_BACK_MIN_BYTES` or more): no unit on the pool, and no thread
+    /// that still normalizes or cuts its text or waits for the pool.
+    inside: AtomicUsize,
 }
 
 impl std::fmt::Debug for NativeEncoder {
@@ -1301,7 +1951,7 @@ impl NativeEncoder {
         )?)?;
         let (raw, normalized) = Self::added_tokens_of(tokenizer, normalizer)?;
         let merges = match MergeTable::from_model(
-            tokenizer.get_model().wrapper(),
+            tokenizer.get_model(),
             ByteTokens::Alphabet,
             tokenizer.get_model().read(),
         ) {
@@ -1348,13 +1998,19 @@ impl NativeEncoder {
             frame,
             alphabet,
             seed: ShortPieceTable::for_entries(0),
+            learned: OnceLock::new(),
             seed_covers_short_entries: false,
+            misses_wait: false,
             long_entries: None,
             merges,
             chars: None,
             piece_cache: ThreadLocal::new(),
             cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
+            callers: AtomicUsize::new(0),
+            load_read: OnceLock::new(),
+            processors: processors(),
+            inside: AtomicUsize::new(0),
         })
     }
 
@@ -1403,11 +2059,8 @@ impl NativeEncoder {
                  beside it",
             ));
         }
-        let chars = CharSymbols::from_model(
-            tokenizer.get_model().wrapper(),
-            marker,
-            tokenizer.get_model().read(),
-        )?;
+        let chars =
+            CharSymbols::from_model(tokenizer.get_model(), marker, tokenizer.get_model().read())?;
         tracing::debug!(
             merges = chars.merges(),
             bytes = chars.bytes(),
@@ -1430,13 +2083,19 @@ impl NativeEncoder {
             frame,
             alphabet: bytes_char(),
             seed: ShortPieceTable::for_entries(0),
+            learned: OnceLock::new(),
             seed_covers_short_entries: false,
+            misses_wait: false,
             long_entries: None,
             merges: None,
             chars: Some(Box::new(chars)),
             piece_cache: ThreadLocal::new(),
             cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
+            callers: AtomicUsize::new(0),
+            load_read: OnceLock::new(),
+            processors: processors(),
+            inside: AtomicUsize::new(0),
         })
     }
 
@@ -1763,6 +2422,33 @@ impl NativeEncoder {
             self.merges.as_ref(),
             self.chars.as_deref(),
         );
+        self.misses_wait =
+            Self::merges_every_short_piece(self.merges.as_ref(), self.seed_covers_short_entries);
+    }
+
+    /// On the sentencepiece path, whose encode reads no model, the merges'
+    /// operands in rank order.
+    pub(crate) fn sentencepiece_pairs_by_rank(&self) -> Option<Vec<[u32; 2]>> {
+        self.chars.as_deref().map(CharSymbols::pairs_by_rank)
+    }
+
+    /// Whether this is the sentencepiece path.
+    pub(crate) fn is_sentencepiece(&self) -> bool {
+        self.chars.is_some()
+    }
+
+    /// Whether the merge table answers, with no model, every short piece
+    /// that neither a thread's table nor the seed holds: it has a token for
+    /// every byte, and the whole-piece lookup `ignore_merges` asks for is
+    /// spared for a short piece. The slow call asks the model in those two
+    /// cases alone (see [`Self::tokenize_piece_slow`]).
+    fn merges_every_short_piece(
+        merges: Option<&MergeTable>,
+        seed_covers_short_entries: bool,
+    ) -> bool {
+        merges.is_some_and(|table| {
+            table.missing_bytes() == 0 && (!table.ignore_merges || seed_covers_short_entries)
+        })
     }
 
     /// The table [`Self::seed_vocabulary`] reads, and whether every id of
@@ -1794,10 +2480,8 @@ impl NativeEncoder {
         // only where the path has no table: it allocates a word and a token
         // list per call.
         let ids_of = |id: u32, entry: &str, piece: &[u8], scratch: &mut SeedScratch| {
-            let mut ids = SeededIds::default();
             if bpe.ignore_merges {
-                ids.push(id)?;
-                return Some(ids);
+                return Some(SeededIds::of(&[id]));
             }
             scratch.ids.clear();
             match (chars, merges) {
@@ -1809,16 +2493,13 @@ impl NativeEncoder {
                     table.merge(piece, &mut scratch.ids);
                 }
                 (None, None) => {
-                    for token in &model.tokenize(entry).ok()? {
-                        ids.push(token.id)?;
-                    }
-                    return Some(ids);
+                    let tokens = model.tokenize(entry).ok()?;
+                    // One id past the limit tells that the entry is over it.
+                    let ids = tokens.iter().take(SHORT_PIECE_MAX_BYTES + 1);
+                    scratch.ids.extend(ids.map(|token| token.id));
                 }
             }
-            for &id in &scratch.ids {
-                ids.push(id)?;
-            }
-            Some(ids)
+            (scratch.ids.len() <= SHORT_PIECE_MAX_BYTES).then(|| SeededIds::of(&scratch.ids))
         };
         // One id's read: `None` for an id that is no entry, else the seeded
         // piece, the bytes of a long byte-level piece, or `None` inside for
@@ -1858,23 +2539,105 @@ impl NativeEncoder {
                     return Some(Seeded::Long(long.into_boxed_slice()));
                 }
                 let key = ShortPieceKey::of(&piece[..len])?;
-                Some(Seeded::Short(
-                    key,
-                    ids_of(id, entry, &piece[..len], scratch)?,
-                ))
+                let ids = ids_of(id, entry, &piece[..len], scratch)?;
+                Some(if merges.is_none() && ids.inline().is_none() {
+                    Seeded::Asked(key, scratch.ids.as_slice().into())
+                } else {
+                    Seeded::Short(key, ids)
+                })
             })();
             Some(seeded)
         };
-        let ids = 0..bpe.get_vocab_size() as u32;
-        // One slot per id, written in place (the read keeps its index, so the
-        // collect is one list and no concatenation); one scratch per rayon job
-        // (2048 entries or more).
-        let read_all = || {
-            ids.clone()
+        // A listing is the whole vocabulary, and a model that was not built
+        // has no size.
+        let vocab_size =
+            listing.map_or_else(|| bpe.get_vocab_size(), |listing| listing.len() as usize);
+        // The pass reads a window of ids at a time into one list of slots
+        // the calling thread owns and reuses, and the calling thread puts
+        // each window's short pieces straight into the table: no list of
+        // them as long as the vocabulary stands beside it (the long
+        // spellings wait for the filter). What the pass holds for
+        // a time stays behind after the load as free memory: the system
+        // allocator gives back no free top below the threshold that a freed
+        // block as large as the vocabulary file has raised. The table is
+        // made before the pass, so in the slots for a count the listing
+        // gives without a merge: a short piece has no more characters than
+        // its key has bytes.
+        let mut table = match listing {
+            Some(listing) => ShortPieceTable::for_entries(if chars.is_some() {
+                // A longer entry is short by its key's length: its bytes,
+                // each marker's three as one. One with a space has no key.
+                let extra = WORD_MARKER.len_utf8() - 1;
+                listing.count(SHORT_PIECE_MAX_BYTES, |entry| {
+                    !entry.contains(' ')
+                        && entry.len() - extra * entry.matches(WORD_MARKER).count()
+                            <= SHORT_PIECE_MAX_BYTES
+                })
+            } else {
+                listing.count(SHORT_PIECE_MAX_BYTES, |entry| {
+                    entry.chars().nth(SHORT_PIECE_MAX_BYTES).is_none()
+                })
+            }),
+            // No count before the pass: the table starts small and grows
+            // in place, in a reservation for the whole vocabulary, its only
+            // bound: 33 bytes a slot of address space, written only as far
+            // as pieces are stored. Below 4,096 slots a step of growth is
+            // more than a doubling (64 to 1,024 at the 49th piece), so
+            // `fitted` may make a smaller table of what this one holds.
+            None => ShortPieceTable::with_slots(MIN_SLOTS, ShortPieceTable::slots_for(vocab_size)),
+        };
+        let mut slots: Vec<Option<Option<Seeded>>> =
+            Vec::with_capacity(SEED_WINDOW.min(vocab_size));
+        let mut entries = 0usize;
+        let mut long_entries: Vec<Box<[u8]>> = Vec::new();
+        let mut again = SeedScratch::default();
+        // An id that was an entry has a slot that is `Some`; the seeded
+        // pieces are the inner `Some`s. A read leaves a short entry's ids
+        // in its scratch: one of more ids than a slot holds is read again
+        // (the model's come whole, see `Seeded::Asked`).
+        let mut keep = |first: u32, slots: &mut Vec<Option<Option<Seeded>>>| {
+            for (id, slot) in (first..).zip(slots.drain(..)) {
+                let Some(seeded) = slot else { continue };
+                entries += 1;
+                match seeded {
+                    Some(Seeded::Short(key, ids)) => {
+                        if let Some(ids) = ids.inline() {
+                            table.insert(key, ids, vocab_size);
+                        } else if let Some(Some(Seeded::Short(..))) = read(id, &mut again) {
+                            table.insert(key, &again.ids, vocab_size);
+                        }
+                    }
+                    Some(Seeded::Asked(key, ids)) => {
+                        table.insert(key, &ids, vocab_size);
+                    }
+                    Some(Seeded::Long(bytes)) => long_entries.push(bytes),
+                    None => {}
+                }
+            }
+        };
+        let windows = || {
+            (0..vocab_size)
+                .step_by(SEED_WINDOW)
+                .map(|start| start as u32..(start + SEED_WINDOW).min(vocab_size) as u32)
+        };
+        // One slot per id of the window, written in place (the read keeps
+        // its index, so the collect is one list and no concatenation); one
+        // scratch per rayon job. Rayon halves a window into jobs, none of
+        // fewer than `job` entries: the window's share of a thread of the
+        // pool the read runs on, held between 256 and 2048. On the seed's
+        // own pool a full window is eight jobs of 2048 for its four
+        // threads. On a caller's pool of eight threads or more it is as
+        // many jobs as the largest power of two that is not above the
+        // pool's threads, sixty-four at the most, and a thread reads a
+        // job: no more threads than there are jobs read a window, however
+        // wide the pool (its width is the `threads` of the debug line).
+        let read_window = |window: Range<u32>, slots: &mut Vec<Option<Option<Seeded>>>| {
+            let job = (SEED_WINDOW / rayon::current_num_threads().max(1)).clamp(256, 2048);
+            window
                 .into_par_iter()
-                .with_min_len(2048)
+                .with_min_len(job)
                 .map_init(SeedScratch::default, |scratch, id| read(id, scratch))
-                .collect::<Vec<Option<Option<Seeded>>>>()
+                .collect_into_vec(slots);
         };
         // A caller that is a worker of a rayon pool already (the Python
         // binding loads on its own, sized by its host) reads on that pool,
@@ -1883,44 +2646,50 @@ impl NativeEncoder {
         // entries are returned, so the load leaves no pool behind; a process
         // that cannot spawn them reads on the calling thread and says so.
         // (The name fits the fifteen bytes a thread's name keeps.)
-        let (entries, threads) = if rayon::current_thread_index().is_some() {
-            (read_all(), rayon::current_num_threads())
+        let threads = if rayon::current_thread_index().is_some() {
+            for window in windows() {
+                let first = window.start;
+                read_window(window, &mut slots);
+                keep(first, &mut slots);
+            }
+            rayon::current_num_threads()
         } else {
             let pooled = rayon::ThreadPoolBuilder::new()
                 .num_threads(SEED_THREADS)
                 .thread_name(|index| format!("vocab-seed-{index}"))
-                .build_scoped(|thread| thread.run(), |pool| pool.install(read_all));
+                .build_scoped(
+                    |thread| thread.run(),
+                    |pool| {
+                        for window in windows() {
+                            let first = window.start;
+                            pool.install(|| read_window(window, &mut slots));
+                            keep(first, &mut slots);
+                        }
+                    },
+                );
             match pooled {
-                Ok(entries) => (entries, SEED_THREADS),
+                Ok(()) => SEED_THREADS,
                 Err(error) => {
                     tracing::warn!(
                         %error,
                         "could not build the vocabulary seed's pool; reading on the calling thread"
                     );
                     let mut scratch = SeedScratch::default();
-                    (ids.map(|id| read(id, &mut scratch)).collect::<Vec<_>>(), 1)
+                    for window in windows() {
+                        let first = window.start;
+                        slots.extend(window.map(|id| read(id, &mut scratch)));
+                        keep(first, &mut slots);
+                    }
+                    1
                 }
             }
         };
-        // An id that was an entry has a slot that is `Some`; the seeded pieces
-        // are the inner `Some`s.
-        let covers = entries.iter().filter(|read| read.is_some()).count() == bpe.get_vocab_size();
-        let short = entries
-            .iter()
-            .flatten()
-            .flatten()
-            .filter(|seeded| matches!(seeded, Seeded::Short(..)))
-            .count();
-        let long = entries.iter().flatten().flatten().count() - short;
-        let mut table = ShortPieceTable::for_entries(short);
+        let covers = entries == vocab_size;
+        let long = long_entries.len();
+        let table = table.fitted();
         let mut filter = LongEntryFilter::for_entries(long);
-        for seeded in entries.iter().flatten().flatten() {
-            match seeded {
-                Seeded::Short(key, ids) => {
-                    table.insert(*key, ids.as_slice(), short);
-                }
-                Seeded::Long(bytes) => filter.insert(bytes),
-            }
+        for bytes in &long_entries {
+            filter.insert(bytes);
         }
         let filter = (covers && chars.is_none()).then_some(filter);
         tracing::debug!(
@@ -1946,8 +2715,8 @@ impl NativeEncoder {
     /// encodes each match: no normalizer, one stage whose matches alone are
     /// pieces, no frame. The seed is ready at once: every token of a
     /// complete table is its own id.
-    pub(crate) fn from_ranks(
-        ranks: &FxHashMap<Vec<u8>, u32>,
+    pub(crate) fn from_ranks<K: Borrow<[u8]> + Eq + Hash>(
+        ranks: &FxHashMap<K, u32>,
         pattern: &str,
         specials: &[(String, u32)],
     ) -> Result<Self, Declined> {
@@ -2053,22 +2822,28 @@ impl NativeEncoder {
             frame: Frame::default(),
             alphabet: bytes_char(),
             seed: Self::ranks_seed(ranks),
+            learned: OnceLock::new(),
             seed_covers_short_entries: false,
+            misses_wait: Self::merges_every_short_piece(Some(&merges), false),
             long_entries: None,
             merges: Some(merges),
             chars: None,
             piece_cache: ThreadLocal::new(),
             cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
+            callers: AtomicUsize::new(0),
+            load_read: OnceLock::new(),
+            processors: processors(),
+            inside: AtomicUsize::new(0),
         })
     }
 
     /// The seed of a tiktoken vocabulary: every token the key holds, with
     /// its own id (what a miss on it merges to, the table being complete).
-    fn ranks_seed(ranks: &FxHashMap<Vec<u8>, u32>) -> ShortPieceTable {
+    fn ranks_seed<K: Borrow<[u8]>>(ranks: &FxHashMap<K, u32>) -> ShortPieceTable {
         let mut table = ShortPieceTable::for_entries(ranks.len());
         for (token, &rank) in ranks {
-            if let Some(key) = ShortPieceKey::of(token) {
+            if let Some(key) = ShortPieceKey::of(token.borrow()) {
                 table.insert(key, &[rank], ranks.len());
             }
         }
@@ -2388,8 +3163,8 @@ impl NativeEncoder {
     }
 
     /// [`Self::encode`] with the thread pool used or not; the ids are the
-    /// same either way (the units are encoded by the same code in the same
-    /// order).
+    /// same either way (the units are encoded by the same code, and the
+    /// pool joins their ids in input order).
     pub(crate) fn encode_with(
         &self,
         model: Option<&ModelWrapper>,
@@ -2448,16 +3223,108 @@ impl NativeEncoder {
                 .iter()
                 .map(|unit| Vec::with_capacity(Self::ids_capacity(unit)))
                 .collect();
-            units
-                .par_iter()
-                .zip(parts.par_iter_mut())
-                .enumerate()
-                .try_for_each(|(index, (unit, ids))| {
+            if units.len() * OWN_UNIT_MIN_BYTES > text.len() {
+                units
+                    .par_iter()
+                    .zip(parts.par_iter_mut())
+                    .enumerate()
+                    .try_for_each(|(index, (unit, ids))| {
+                        let marker = self.marker_before(units, index, at_start);
+                        let mut mapped = String::new();
+                        let mut cache = self.piece_cache_for_text(text.len());
+                        // Filled through a Vec in this thread's frame: the
+                        // slots of `parts` share a cache line or two, and
+                        // every piece appended writes its Vec's length.
+                        let mut filled = std::mem::take(ids);
+                        self.encode_unit(
+                            model,
+                            unit,
+                            marker,
+                            words,
+                            &mut mapped,
+                            &mut filled,
+                            &mut cache,
+                        )?;
+                        self.answer_rest(&mut filled, &mut cache);
+                        *ids = filled;
+                        Ok(())
+                    })?;
+            } else {
+                // One callback a unit, as the iterator has, but the thread
+                // that runs a callback chooses its unit: unit k is the own
+                // unit of pool thread k (modulo the pool's size), and a
+                // thread takes its own units first, then any still free. A
+                // text read again so finds a unit's pieces in the cache of
+                // the thread that learned them, when that thread comes for
+                // it (none is sent for; a thread beyond the unit count owns
+                // none). The choice costs two allocations a call more than
+                // counted above (the units' claims and locks, the threads'
+                // counts). A unit costs one winning swap and one lock that
+                // no other thread asks for; every probe on the way to it
+                // costs a count, and a load where it names a unit already
+                // taken.
+                let slots: Vec<(AtomicBool, Mutex<&mut Vec<u32>>)> = parts
+                    .iter_mut()
+                    .map(|ids| (AtomicBool::new(false), Mutex::new(ids)))
+                    .collect();
+                let threads = rayon::current_num_threads();
+                // How many of its own units each thread has come for (a
+                // scan for the next one grows with the square of a thread's
+                // units).
+                let came: Vec<AtomicUsize> = (0..threads.min(units.len()))
+                    .map(|_| AtomicUsize::new(0))
+                    .collect();
+                // The units any thread may take are offered once each, in
+                // order.
+                let offered = AtomicUsize::new(0);
+                let take = || {
+                    let me = rayon::current_thread_index().unwrap_or(0);
+                    let own = std::iter::from_fn(|| {
+                        let index = me + came.get(me)?.fetch_add(1, Ordering::Relaxed) * threads;
+                        (index < units.len()).then_some(index)
+                    });
+                    let rest = std::iter::from_fn(|| {
+                        let index = offered.fetch_add(1, Ordering::Relaxed);
+                        (index < units.len()).then_some(index)
+                    });
+                    let claim = |index: usize| {
+                        let taken = &slots[index].0;
+                        !taken.load(Ordering::Relaxed) && !taken.swap(true, Ordering::Relaxed)
+                    };
+                    let Some(index) = own.chain(rest).find(|&index| claim(index)) else {
+                        // Every offer is out: a unit still free is held by
+                        // the callback that fetched its offer, and that one
+                        // takes it. No unit is left unread.
+                        return Ok(());
+                    };
+                    // Only the thread that took the unit asks for its lock.
+                    let (_, ids) = &slots[index];
+                    let mut ids = ids.lock().unwrap_or_else(PoisonError::into_inner);
                     let marker = self.marker_before(units, index, at_start);
                     let mut mapped = String::new();
-                    let mut cache = self.piece_cache_for_call();
-                    self.encode_unit(model, unit, marker, words, &mut mapped, ids, &mut cache)
-                })?;
+                    let mut cache = self.piece_cache_for_text(text.len());
+                    let mut filled = std::mem::take(&mut **ids);
+                    self.encode_unit(
+                        model,
+                        &units[index],
+                        marker,
+                        words,
+                        &mut mapped,
+                        &mut filled,
+                        &mut cache,
+                    )?;
+                    self.answer_rest(&mut filled, &mut cache);
+                    **ids = filled;
+                    Ok(())
+                };
+                // The range splits, and a decline stops it, as the iterator
+                // over the units did.
+                (0..units.len()).into_par_iter().try_for_each(|_| take())?;
+                debug_assert!(
+                    slots.iter().all(|(taken, _)| taken.load(Ordering::Relaxed)),
+                    "a unit of the text was left unread"
+                );
+            }
             let body: usize = parts.iter().map(Vec::len).sum();
             let mut ids = Vec::with_capacity(before.len() + body + after.len());
             ids.extend_from_slice(before);
@@ -2469,22 +3336,82 @@ impl NativeEncoder {
         }
         let mut ids = Vec::with_capacity(before.len() + text.len() / 3 + 8 + after.len());
         ids.extend_from_slice(before);
-        let mut mapped = String::new();
-        let mut cache = self.piece_cache_for_call();
-        for (index, unit) in units.iter().enumerate() {
-            let marker = self.marker_before(units, index, at_start);
-            self.encode_unit(
-                model,
-                unit,
-                marker,
-                words,
-                &mut mapped,
-                &mut ids,
-                &mut cache,
-            )?;
+        let mut cache = self.piece_cache_for_text(text.len());
+        // Only while more threads are inside a long text than the process
+        // has processors, and the clock is read only then. Not for a unit
+        // on the pool: it is no text of its thread.
+        let inside = (text.len() >= READ_BACK_MIN_BYTES).then(|| {
+            let others = self.inside.fetch_add(1, Ordering::Relaxed);
+            (Inside(&self.inside), others)
+        });
+        match &inside {
+            Some((_, others)) if *others >= self.processors => {
+                if cache.reads_back(Instant::now(), text.len()) {
+                    cache.packed.read_through();
+                }
+            }
+            // A long text run with a processor to spare: the next gap is
+            // not measured across it.
+            Some(_) => cache.last_long = None,
+            None => {}
         }
+        self.encode_serial(model, units, words, at_start, &mut ids, &mut cache)?;
         ids.extend_from_slice(after);
         Ok(ids)
+    }
+
+    /// The units of one call encoded in order onto `ids`, on `cache`: the
+    /// calling thread's for a request, one of its own for [`Self::rehearse`].
+    fn encode_serial(
+        &self,
+        model: Option<&ModelWrapper>,
+        units: &[Segment<'_>],
+        words: bool,
+        at_start: bool,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let mut mapped = String::new();
+        for (index, unit) in units.iter().enumerate() {
+            let marker = self.marker_before(units, index, at_start);
+            self.encode_unit(model, unit, marker, words, &mut mapped, ids, cache)?;
+        }
+        self.answer_rest(ids, cache);
+        Ok(())
+    }
+
+    /// The last step of a load: two short built-in texts encoded on a piece
+    /// cache of its own, which is dropped, then the merge table read through
+    /// once (`MergeTable::read_through`). The first request of a process
+    /// finds the encode path mapped and the table's lines in the caches. The
+    /// loading thread does not read the table again while this read is
+    /// fresh ([`Self::load_read_holds`]); every other thread's second call
+    /// still reads it itself ([`Self::piece_cache_for_text`]): a thread may
+    /// start long after the load. No thread's cache is made, so the loading
+    /// thread counts toward no share ([`Self::piece_cache_share`]).
+    pub(crate) fn rehearse(&self, model: Option<&ModelWrapper>) {
+        // Prose, digits, punctuation and JSON, then letters past ASCII.
+        const TEXTS: [&str; 2] = [
+            "The quick brown fox jumps over 12 lazy dogs. It's 3:45 pm, isn't it?\n\nHello, World! Please summarize the following text in one sentence: {\"key\": [1, 2.5, true]}",
+            "Caf\u{e9} na\u{ef}ve \u{4f60}\u{597d} \u{2014} the user's question: what is 2 + 2?\n",
+        ];
+        let mut cache = PieceCache::with_share(self.piece_cache_share());
+        for text in TEXTS {
+            let units = self.units(text, false, true);
+            let mut ids = Vec::with_capacity(text.len() / 3 + 8);
+            if self
+                .encode_serial(model, units.as_slice(), false, true, &mut ids, &mut cache)
+                .is_err()
+            {
+                break;
+            }
+        }
+        if let Some(merges) = &self.merges {
+            merges.read_through();
+        }
+        let _ = self
+            .load_read
+            .set((std::thread::current().id(), Instant::now()));
     }
 
     /// Room for the ids of one unit, from its bytes: about a token per three
@@ -2999,9 +3926,9 @@ impl NativeEncoder {
         cache.unit_ascii = text.is_ascii();
         // One walk per unit. A single-stage encoder hands the unit to
         // `encode_single_stage`, out of line, where the scanner's own loop
-        // probes each piece in place (no recursive walk); the chain hands
-        // its pieces, as offsets into the unit, to the same probe through
-        // its static callback; any other shape walks, a lone `Removed`
+        // probes each piece in place (no recursive walk); the chain's walk
+        // probes its own pieces, offsets into the unit, with the probe
+        // compiled into the walk; any other shape walks, a lone `Removed`
         // stage among them (its matches are no pieces: the scanner loop
         // stays the loop of a stage whose matches are).
         match (&self.chain, self.stages.as_slice(), self.mapped_from) {
@@ -3024,13 +3951,29 @@ impl NativeEncoder {
                 // the head is counted only for a unit with a byte beyond
                 // ASCII.
                 let words = words || cache.unit_ascii || Self::opens_as_ascii(text);
-                chain.pieces(text, words, &mut |start, end| {
-                    if let Err(declined) =
-                        self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
-                    {
-                        fallback = Some(declined);
-                    }
-                });
+                // The probe compiles into the walk where nearly every piece
+                // ends (the template's match, the block pass's cut): out of
+                // line it costs 16.5 to 18.2 of a token's 155 to 177
+                // instructions. Only its hit is compiled in; a miss is a call
+                // (`tokenize_piece_in_place`): with the whole probe there the
+                // walk kept less of its state in registers around a hit.
+                chain.pieces(
+                    text,
+                    words,
+                    #[inline(always)]
+                    |start, end| {
+                        if let Err(declined) = self.tokenize_piece_in_place(
+                            model,
+                            text,
+                            start..end,
+                            mapped,
+                            ids,
+                            cache,
+                        ) {
+                            fallback = Some(declined);
+                        }
+                    },
+                );
             }
             (None, [stage], None)
                 if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>
@@ -3038,15 +3981,19 @@ impl NativeEncoder {
                 // An all-ASCII unit has a copy of the stage's loop compiled
                 // for it (see `encode_single_stage`). Any other unit goes by
                 // blocks where its pattern gives that reader. The all-ASCII
-                // unit does not: its lean scan reads long words in fewer
-                // instructions than the block pass (measured: the pass costs
-                // a sixth more on a text of 18-byte words).
+                // unit begins on its lean scan, which reads long words in
+                // fewer instructions than the block pass (measured: the pass
+                // costs a sixth more on a text of 18-byte words), and the
+                // scan hands a unit that opens as short pieces to the block
+                // pass (`block::is_broken`). The cased-letter template has no
+                // lean scan: its unit goes by blocks either way, the
+                // all-ASCII one from `encode_single_stage`.
                 let encoded = if cache.unit_ascii {
                     self.encode_single_stage::<true>(model, stage, text, words, mapped, ids, cache)
                 } else if let Some(blocks) = stage.pattern.by_blocks(text) {
-                    self.encode_single_stage_by_blocks(
-                        model, blocks, text, words, mapped, ids, cache,
-                    )
+                    self.encode_unit_by_blocks(model, blocks, text, words, mapped, ids, cache)
+                } else if let Some(blocks) = stage.pattern.by_cased_blocks(text) {
+                    self.encode_unit_by_blocks(model, blocks, text, words, mapped, ids, cache)
                 } else {
                     self.encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache)
                 };
@@ -3399,14 +4346,19 @@ impl NativeEncoder {
     ///
     /// Compiled twice. `ASCII` is the copy an all-ASCII unit takes (the
     /// flag [`Self::encode_unit`] reads once per unit): in it the template
-    /// scanner ends every run by the lean scan (`Roles::run_end_ascii`),
+    /// scanner ends its runs by the lean scan (`Roles::run_end_ascii`),
     /// which has no character beyond ASCII to care for, whatever the
-    /// input's length. It is a copy and no third loop of the one function:
+    /// input's length, until that scan hands a unit that opens as short
+    /// pieces (`block::is_broken`) to
+    /// [`Self::encode_single_stage_by_blocks`], which reads the rest. It is
+    /// a copy and no third loop of the one function:
     /// compiled in here, the lean loop moved the code of the other loops,
     /// and the byte loops and the cased scanner cost 1 to 2 % more
     /// operations per token on text the lean scan never reads (counted). A
-    /// pattern with no lean scan goes on to the other copy, which is the
-    /// function as it was.
+    /// pattern with no lean scan leaves this copy at once: through
+    /// [`Self::encode_single_stage_by_blocks`] when it gives a reader of the
+    /// text by blocks (the cased-letter template, `Pattern::by_cased_blocks`),
+    /// else on to the other copy, which is the function as it was.
     #[inline(never)]
     #[expect(clippy::too_many_arguments)]
     fn encode_single_stage<const ASCII: bool>(
@@ -3420,6 +4372,11 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         if ASCII && !stage.pattern.has_lean_scan() {
+            // No lean scan: the block pass where the pattern gives that
+            // reader (the cased-letter template), else the walk as it was.
+            if let Some(blocks) = stage.pattern.by_cased_blocks(text) {
+                return self.encode_unit_by_blocks(model, blocks, text, words, mapped, ids, cache);
+            }
             return self
                 .encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache);
         }
@@ -3432,7 +4389,7 @@ impl NativeEncoder {
         // instructions for a hit of which the probe is about 50 (counted on
         // the long warm cells). The gap piece stays out of line: a scanner's
         // alternatives tile the text, so a gap is the rare case there.
-        stage.pattern.for_each_match::<ASCII, _>(
+        let stopped = stage.pattern.for_each_match::<ASCII, _>(
             text,
             words,
             #[inline(always)]
@@ -3452,6 +4409,23 @@ impl NativeEncoder {
                 cursor = end;
             },
         );
+        if stopped < text.len() {
+            // The lean scan left at a piece's end: the unit opens as short
+            // pieces of more than one kind, which the block pass reads in
+            // fewer missed branches (see `for_each_match_to_marks`).
+            if let Some(declined) = fallback {
+                return Err(declined);
+            }
+            let rest = &text[stopped..];
+            return match stage.pattern.by_blocks(rest) {
+                Some(blocks) => {
+                    self.encode_unit_by_blocks(model, blocks, rest, words, mapped, ids, cache)
+                }
+                None => {
+                    self.encode_single_stage::<false>(model, stage, rest, words, mapped, ids, cache)
+                }
+            };
+        }
         if gaps && cursor < text.len() {
             if let Err(declined) =
                 self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)
@@ -3468,13 +4442,15 @@ impl NativeEncoder {
     /// [`Self::encode_single_stage`] keeps its text and its loops as they
     /// are. A pattern that gives a reader by blocks leaves no gap in any
     /// text (`Pattern::by_blocks`), so there is none to tokenize here and
-    /// no cursor to keep.
+    /// no cursor to keep. Compiled once a template (`CASED`, the reader's
+    /// type): with the loops of both in one copy, the loop of the GPT-4
+    /// family's template cost one instruction a token more (counted).
     #[inline(never)]
     #[expect(clippy::too_many_arguments)]
-    fn encode_single_stage_by_blocks(
+    fn encode_single_stage_by_blocks<const CASED: bool>(
         &self,
         model: Option<&ModelWrapper>,
-        blocks: pattern::ByBlocks<'_>,
+        blocks: pattern::ByBlocks<'_, CASED>,
         text: &str,
         words: bool,
         mapped: &mut String,
@@ -3494,6 +4470,121 @@ impl NativeEncoder {
                 }
             },
         );
+        fallback.map_or(Ok(()), Err)
+    }
+
+    /// The table's size is asked here, at the call: asked inside the routine
+    /// by blocks, its loop ran one instruction a token more (counted).
+    #[inline(always)]
+    #[expect(clippy::too_many_arguments)]
+    fn encode_unit_by_blocks<const CASED: bool>(
+        &self,
+        model: Option<&ModelWrapper>,
+        blocks: pattern::ByBlocks<'_, CASED>,
+        text: &str,
+        words: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        if cache.packed.slots() > ASK_AHEAD_SLOTS {
+            self.encode_single_stage_asked_ahead(model, blocks, text, words, mapped, ids, cache)
+        } else {
+            self.encode_single_stage_by_blocks(model, blocks, text, words, mapped, ids, cache)
+        }
+    }
+
+    /// [`Self::encode_single_stage_by_blocks`] for a table past
+    /// [`ASK_AHEAD_SLOTS`].
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments)]
+    fn encode_single_stage_asked_ahead<const CASED: bool>(
+        &self,
+        model: Option<&ModelWrapper>,
+        blocks: pattern::ByBlocks<'_, CASED>,
+        text: &str,
+        words: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let mut fallback = None;
+        let bytes = text.as_bytes();
+        let mut held = [Asked {
+            start: 0,
+            end: 0,
+            key: None,
+            hash: 0,
+        }; ASK_AHEAD];
+        let mut count = 0usize;
+        blocks.for_each_match(
+            text,
+            words,
+            #[inline(always)]
+            |start, end| {
+                let key = ShortPieceKey::at(bytes, start, end);
+                // A piece without a key holds hash 0: its touch reads the
+                // table's first lines again, cheaper than a test a piece.
+                let hash = key.map_or(0, ShortPieceTable::hash_of);
+                held[count] = Asked {
+                    start,
+                    end,
+                    key,
+                    hash,
+                };
+                count += 1;
+                if count == ASK_AHEAD {
+                    count = 0;
+                    if let Err(declined) = self.answer_asked(model, text, &held, mapped, ids, cache)
+                    {
+                        fallback = Some(declined);
+                    }
+                }
+            },
+        );
+        if count != 0 {
+            let tail = self.answer_asked(model, text, &held[..count], mapped, ids, cache);
+            fallback = tail.err().or(fallback);
+        }
+        fallback.map_or(Ok(()), Err)
+    }
+
+    /// Answers `pieces` of `text`, in order. The touches go before the
+    /// probes, with nothing between them, so that the far lines of all the
+    /// pieces are in flight together.
+    #[inline(never)]
+    fn answer_asked(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        pieces: &[Asked],
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let bytes = text.as_bytes();
+        let mut touched = 0u8;
+        for piece in pieces {
+            touched ^= cache.packed.touch_hashed(piece.hash);
+        }
+        std::hint::black_box(touched);
+        let mut fallback = None;
+        for piece in pieces {
+            let vacancy = match piece.key {
+                Some(key) => match cache.packed.lookup_hashed(key, piece.hash, ids) {
+                    None => continue,
+                    Some(vacancy) if self.seeded(vacancy, ids, cache) => continue,
+                    vacancy => vacancy,
+                },
+                None => None,
+            };
+            let piece = &bytes[piece.start..piece.end];
+            if let Err(declined) =
+                self.tokenize_piece_slow(model, piece, vacancy, mapped, ids, cache)
+            {
+                fallback = Some(declined);
+            }
+        }
         fallback.map_or(Ok(()), Err)
     }
 
@@ -3521,6 +4612,71 @@ impl NativeEncoder {
         self.tokenize_piece_slow(model, &text.as_bytes()[piece], vacancy, mapped, ids, cache)
     }
 
+    /// [`Self::tokenize_piece_at`] for a walk that compiles the probe into
+    /// its loop, with only the packed table's answer compiled in there: the
+    /// key by its one read of the text, the probe, an entry's inline ids.
+    /// Every other piece leaves the loop by a call, so the walk keeps its
+    /// registers for the hit: a miss asks the seed, which holds nearly every
+    /// piece a new text misses; a piece longer than a key goes to the slow
+    /// path as it does from [`Self::tokenize_piece_at`] (the wide table or
+    /// the map answers it on a warm encode, so it is no rare piece); the
+    /// rest takes one cold call ([`Self::tokenize_missed_piece`]).
+    #[inline(always)]
+    fn tokenize_piece_in_place(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let bytes = text.as_bytes();
+        match ShortPieceKey::in_window(bytes, piece.start, piece.end) {
+            Some(key) => match cache.packed.lookup_inline(key, ids) {
+                Ok(()) => Ok(()),
+                Err(Some(vacancy)) if self.seeded(vacancy, ids, cache) => Ok(()),
+                Err(missed) => {
+                    let unseeded = missed.is_some();
+                    self.tokenize_missed_piece(model, text, piece, unseeded, mapped, ids, cache)
+                }
+            },
+            None if piece.len() > SHORT_PIECE_MAX_BYTES => {
+                self.tokenize_piece_slow(model, &bytes[piece], None, mapped, ids, cache)
+            }
+            None => self.tokenize_missed_piece(model, text, piece, false, mapped, ids, cache),
+        }
+    }
+
+    /// The rest of [`Self::tokenize_piece_in_place`], for a short piece its
+    /// loop did not answer. `unseeded` is a miss the seed's call did not
+    /// answer either: it goes to the slow path from its vacancy, found by a
+    /// second probe, since a loop that kept the vacancy across the seed's
+    /// call ran more instructions on a hit. A piece the loop did not probe
+    /// to the end (no key by the one read, near the end of the text, or ids
+    /// in the spill) takes [`Self::tokenize_piece_at`] whole.
+    #[cold]
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments)]
+    fn tokenize_missed_piece(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        unseeded: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        if !unseeded {
+            return self.tokenize_piece_at(model, text, piece, mapped, ids, cache);
+        }
+        let bytes = text.as_bytes();
+        let vacancy = ShortPieceKey::at(bytes, piece.start, piece.end)
+            .and_then(|key| cache.packed.probe(key).err());
+        self.tokenize_piece_slow(model, &bytes[piece], vacancy, mapped, ids, cache)
+    }
+
     /// [`Self::tokenize_piece_at`] for a gap between two matches of a
     /// single-stage encoder, out of line: the scanners' alternatives tile
     /// the text, so the gap is the rare piece and its code stays out of the
@@ -3539,6 +4695,283 @@ impl NativeEncoder {
         self.tokenize_piece_at(model, text, piece, mapped, ids, cache)
     }
 
+    /// The wait of a miss of a young thread or of one that shares
+    /// (`PieceCache::shares`; [`Self::seeded`] and [`Self::seeded_raw`] ask).
+    /// A first sight reads
+    /// lines of the seed that are far from the thread, as are the lines of
+    /// the learned table a thread that shares asks, and a piece answered
+    /// where it is met waits for its own lines alone. A miss within
+    /// [`WAITING_GAP`] ids of the last one, or any miss of a thread that
+    /// shares (each asks the learned table, however far apart they fall),
+    /// takes a hole of
+    /// one id in the output and waits, and up to [`WAITING_PIECES`] are
+    /// answered together ([`Self::answer_waiting`]), their lines read at once
+    /// (measured: a first sight of a word list 15 to 17 % faster, new text
+    /// of 16 tokens 5 to 10 %, of 256 tokens 8 to 12 %). [`Self::seeded`]
+    /// puts a miss close behind the last one (`near`) on the list itself
+    /// while both lists have room and no answer is due; this is the rest of
+    /// the wait. False for a miss that stands alone: the seed answers it
+    /// where it is met. True for a piece that waits; the waiting pieces are
+    /// answered here, this one the last of them, when they are as many as
+    /// are answered together or the miss is not close behind the last one.
+    #[cold]
+    #[inline(never)]
+    fn waits(
+        &self,
+        vacancy: Vacancy,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+        near: bool,
+    ) -> bool {
+        let close = near || cache.shares;
+        if !close && cache.waiting.is_empty() {
+            return false;
+        }
+        let at = ids.len();
+        cache.waiting.push(Waiting { vacancy, at });
+        ids.push(0);
+        if !close || cache.waiting.len() >= WAITING_PIECES {
+            self.answer_waiting(ids, cache);
+        }
+        true
+    }
+
+    /// Answers the waiting pieces ([`Self::waits`]). First one byte of the
+    /// tag and of the entry every piece's walk of the seed begins on is
+    /// read, one piece after the other with nothing between the reads, so
+    /// the far lines of all the pieces are in flight together. The bytes go
+    /// through `std::hint::black_box`, which keeps the loop: the hint is a
+    /// request, and where it were not honoured the pieces would be answered
+    /// one by one, with the same ids (measured: a first loop that does more
+    /// for a piece keeps less of the gain: one bit kept for the answer keeps
+    /// half to seven tenths of it on a first sight; a whole walk keeps seven
+    /// tenths to all of it there and half of it or less on new text of 16
+    /// tokens; no first loop keeps none). Then the pieces are answered, the
+    /// last hole first, and each is learned as [`Self::seeded`] and the slow
+    /// call learn it: at its vacancy, unless the cache was cleared since the
+    /// waiting pieces were last answered (`PieceCache::answered_clears`),
+    /// when the piece asks the table again. An answer of one id is
+    /// written into its hole. An answer that is not one id stays in the
+    /// thread's scratch list until the last piece is answered; one pass
+    /// from the last hole down then places them all: the output grows once,
+    /// the ids behind each hole move to their place once, and the holes
+    /// before it stay where they are. (Spliced in one at a time, each such
+    /// answer moved every id behind its hole: with new words in front of a
+    /// long text the thread knows, that text moved once for each word.) A
+    /// piece the seed does not hold asks the thread's table once more
+    /// before it is merged: one met twice while it waited is merged once.
+    /// A thread that shares (`PieceCache::shares`) then asks what the
+    /// threads have merged
+    /// ([`Self::learned_pieces`], its lines read early behind the seed's):
+    /// a piece it holds is kept the way a seeded piece is, and one it does
+    /// not hold is merged and told to it. The thread counts these asks and
+    /// those the table answers, and rests where it answers under one in
+    /// two (`PieceCache::judge_asks`).
+    /// The merge is the table's, or the character symbols' on the
+    /// sentencepiece path, and asks no model, so the answer comes wherever
+    /// it is due: a piece waits only where every short piece is merged so
+    /// ([`Self::seeded`], [`Self::seeded_raw`]).
+    #[cold]
+    #[inline(never)]
+    fn answer_waiting(&self, ids: &mut Vec<u32>, cache: &mut PieceCache) {
+        let waiting = std::mem::take(&mut cache.waiting);
+        let mut answer = std::mem::take(&mut cache.answer);
+        // A sentencepiece piece in the vocabulary's form, for its merge.
+        let mut mapped = std::mem::take(&mut cache.mapped);
+        let mut touched = 0u8;
+        for piece in &waiting {
+            touched ^= self.seed.touch(piece.vacancy.key());
+        }
+        let learned = cache.shares.then(|| self.learned_pieces());
+        if let Some(learned) = learned {
+            for piece in &waiting {
+                touched ^= learned.touch(piece.vacancy.key());
+            }
+        }
+        std::hint::black_box(touched);
+        // The answers that are not one id: the hole of each and where its ids
+        // begin in the scratch list, the last hole first.
+        let mut late = [(0usize, 0usize); WAITING_PIECES];
+        let mut late_len = 0;
+        // The asks of the learned table here, and those it answers.
+        let (mut asked, mut of_use) = (0u32, 0u32);
+        answer.clear();
+        for piece in waiting.iter().rev() {
+            let key = piece.vacancy.key();
+            // By reference: as a copy the vacancy was written to the stack
+            // for every piece, for the calls that few pieces make.
+            let anew;
+            let mut vacancy = Some(&piece.vacancy);
+            let mut one = None;
+            let from = answer.len();
+            if cache.answered_clears != cache.clears {
+                match cache.packed.probe(key) {
+                    Ok(entry) => {
+                        one = cache.packed.one_or_append(entry, &mut answer);
+                        vacancy = None;
+                    }
+                    Err(fresh) => {
+                        anew = fresh;
+                        vacancy = Some(&anew);
+                    }
+                }
+            }
+            if let Some(vacancy) = vacancy {
+                if let Ok(entry) = self.seed.probe(key) {
+                    one = self.keep_answer(&self.seed, entry, vacancy, from, &mut answer, cache);
+                } else {
+                    // The seed does not hold it: the thread's table (a
+                    // copy of a piece of this batch), the learned table
+                    // or a merge answers. The hint lays the loop out for
+                    // the pieces the seed answers; all three ride the
+                    // cold edge.
+                    std::hint::cold_path();
+                    match cache.packed.probe(key) {
+                        Ok(entry) => one = cache.packed.one_or_append(entry, &mut answer),
+                        Err(fresh) => {
+                            let part = learned.and_then(|learned| learned.read(key));
+                            let held = part
+                                .as_deref()
+                                .and_then(|table| Some((table, table.probe(key).ok()?)));
+                            asked += 1;
+                            if let Some((table, entry)) = held {
+                                // Another thread, or this one before a
+                                // clear, has merged it.
+                                one = self.keep_answer(
+                                    table,
+                                    entry,
+                                    &fresh,
+                                    from,
+                                    &mut answer,
+                                    cache,
+                                );
+                                of_use += 1;
+                            } else {
+                                // A writer needs the part to itself.
+                                drop(part);
+                                // Nobody holds it: it is merged as the slow
+                                // call of its path merges a piece (the table
+                                // from its pre-formed characters when it has
+                                // them, the sentencepiece path from the
+                                // character symbols of the raw piece the key
+                                // holds), and the thread remembers it.
+                                let (bytes, len) = key.bytes();
+                                let piece = &bytes[..len];
+                                debug_assert!(
+                                    self.misses_wait || self.chars.is_some(),
+                                    "every short piece is merged"
+                                );
+                                if let Some(chars) = &self.chars {
+                                    // A piece is cut between characters:
+                                    // nothing of it is replaced here.
+                                    let raw = String::from_utf8_lossy(piece);
+                                    chars.merge(
+                                        CharSymbols::normalized(&raw, &mut mapped),
+                                        &mut cache.symbols,
+                                        &mut answer,
+                                    );
+                                } else if let Some(table) = &self.merges {
+                                    if piece.is_ascii()
+                                        || !table.merge_preformed(piece, &mut answer)
+                                    {
+                                        table.merge(piece, &mut answer);
+                                    }
+                                }
+                                self.remember_piece(piece, Some(fresh), from, &answer, cache);
+                                if let Some(learned) = learned {
+                                    learned.learn(key, &answer[from..]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            match one {
+                Some(id) => ids[piece.at] = id,
+                None if answer.len() == from => {
+                    // No id (a table that merges every short piece gives no
+                    // such answer): the hole closes, and the holes behind it
+                    // move with the ids.
+                    ids.remove(piece.at);
+                    for (at, _) in &mut late[..late_len] {
+                        *at -= 1;
+                    }
+                }
+                None => {
+                    late[late_len] = (piece.at, from);
+                    late_len += 1;
+                }
+            }
+        }
+        // One pass from the last hole down: the output grows once by what
+        // the answers of several ids add, the ids behind each hole move to
+        // their place once, and the answer goes in front of them.
+        let mut rest = ids.len();
+        let mut to = rest + answer.len() - late_len;
+        ids.resize(to, 0);
+        for index in 0..late_len {
+            let (at, from) = late[index];
+            let end = if index + 1 < late_len {
+                late[index + 1].1
+            } else {
+                answer.len()
+            };
+            let behind = rest - at - 1;
+            if to != rest {
+                ids.copy_within(at + 1..rest, to - behind);
+            }
+            to -= behind + (end - from);
+            ids[to..to + end - from].copy_from_slice(&answer[from..end]);
+            rest = at;
+        }
+        cache.waiting = waiting;
+        cache.waiting.clear();
+        cache.answered_clears = cache.clears;
+        cache.answer = answer;
+        cache.mapped = mapped;
+        if learned.is_some() {
+            cache.judge_asks(asked, of_use);
+        }
+    }
+
+    /// The answer of a waiting piece that `table` holds as `entry` (the
+    /// seed, or a part of the learned table): its one id returned, or its
+    /// ids appended to `answer`, and the entry kept in the thread's table
+    /// at `vacancy` as a copy ([`ShortPieceTable::keep`]) or, where that
+    /// table takes no copy, remembered from its ids.
+    #[inline(always)]
+    fn keep_answer(
+        &self,
+        table: &ShortPieceTable,
+        entry: &Entry,
+        vacancy: &Vacancy,
+        from: usize,
+        answer: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Option<u32> {
+        let one = table.one_or_append(entry, answer);
+        if cache.short_full(cache.share) || !cache.packed.keep(*vacancy, entry) {
+            // Not kept as a copy: remembered from its ids.
+            answer.extend(one);
+            self.remember_seeded(*vacancy, from, answer, cache);
+            if one.is_some() {
+                answer.truncate(from);
+            }
+        }
+        one
+    }
+
+    /// The pieces that still wait when the units of an encode call are done
+    /// (one unit on the pool) take their ids ([`Self::answer_waiting`]).
+    /// Here and not at each unit's end: `encode_unit` holds the loops over
+    /// the pieces, and it keeps the text and the frame it had.
+    #[inline(always)]
+    fn answer_rest(&self, ids: &mut Vec<u32>, cache: &mut PieceCache) {
+        if !cache.waiting.is_empty() {
+            self.answer_waiting(ids, cache);
+        }
+    }
+
     /// A short piece the thread's table missed (`vacancy`), answered when
     /// the encoder's seed holds it, as it holds every short vocabulary word:
     /// the ids appended, and the seed's entry kept in the thread's table at
@@ -3553,10 +4986,71 @@ impl NativeEncoder {
     #[cold]
     #[inline(never)]
     fn seeded(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
+        // A young thread's miss close behind another waits (`Self::waits`);
+        // a thread whose table has outgrown its reservation knows the common
+        // words, most of what it misses is merged, and a merge gains nothing
+        // by waiting (counted: waiting cost new text of 32k tokens 15
+        // instructions a token and of 500k tokens 2 to 5), until the thread
+        // shares (`PieceCache::shares`): from then on a miss asks the
+        // learned table before its merge, whose lines are far, and waits
+        // for the others. Nor
+        // does a miss wait where a short piece may need the model
+        // (`Self::misses_wait`).
+        // The tests are three compares in front of the seed's read and not a
+        // call of their own: two first sights in a row read their far lines
+        // together only while both fit the processor's window, and a first
+        // sight with a few dozen instructions more in front of the read was
+        // 4 to 25 % slower (measured on first sights of word lists).
+        if (cache.packed.slots() <= THREAD_BACKING_SLOTS || cache.shares) && self.misses_wait {
+            let at = ids.len();
+            let near = at.wrapping_sub(cache.last_miss) <= WAITING_GAP;
+            cache.last_miss = at;
+            // A miss close behind the last one takes its place on the list
+            // here while both lists have room and no answer is due: one call
+            // a piece and not two (counted: 54 instructions a piece to its
+            // place on the list, 82 through `Self::waits`).
+            if near
+                && cache.waiting.len() < cache.waiting.capacity()
+                && cache.waiting.len() + 1 < WAITING_PIECES
+                && at < ids.capacity()
+            {
+                cache.waiting.push(Waiting { vacancy, at });
+                ids.push(0);
+                return true;
+            }
+            if self.waits(vacancy, ids, cache, near) {
+                return true;
+            }
+        }
+        self.seeded_alone(vacancy, ids, cache)
+    }
+
+    /// [`Self::seeded`] for a piece of the sentencepiece path, whose
+    /// character symbols merge every piece with no model: a young thread's
+    /// miss waits as well ([`Self::waits`]), where the seed is far
+    /// (`NEAR_SEED_SLOTS`); else the seed answers where the piece is met.
+    #[cold]
+    #[inline(never)]
+    fn seeded_raw(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
+        if cache.packed.slots() <= THREAD_BACKING_SLOTS && self.seed.slots() > NEAR_SEED_SLOTS {
+            let at = ids.len();
+            let near = at.wrapping_sub(cache.last_miss) <= WAITING_GAP;
+            cache.last_miss = at;
+            if self.waits(vacancy, ids, cache, near) {
+                return true;
+            }
+        }
+        self.seeded_alone(vacancy, ids, cache)
+    }
+
+    /// The seed's answer where the piece is met: the body of
+    /// [`Self::seeded`] and of [`Self::seeded_raw`], compiled into both.
+    #[inline(always)]
+    fn seeded_alone(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
         let Ok(entry) = self.seed.probe(vacancy.key()) else {
             return false;
         };
-        let kept = cache.short_entries() < cache.share && cache.packed.keep(vacancy, entry);
+        let kept = !cache.short_full(cache.share) && cache.packed.keep(vacancy, entry);
         let start = ids.len();
         self.seed.append(entry, ids);
         if !kept {
@@ -3673,7 +5167,7 @@ impl NativeEncoder {
     ) {
         if let Some(vacancy) = vacancy {
             let share = cache.share;
-            if cache.short_entries() >= share {
+            if cache.short_full(share) {
                 // The vacancy named a slot of the table as it was: the cleared
                 // table is probed again.
                 cache.clear_short(share);
@@ -3683,7 +5177,7 @@ impl NativeEncoder {
             }
         } else if piece.len() <= CACHED_PIECE_MAX_BYTES {
             let share = cache.share;
-            if cache.short_entries() >= share {
+            if cache.short_full(share) {
                 cache.clear_short(share);
             }
             let kept =
@@ -3722,6 +5216,17 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) {
+        // A unit under this length keeps the walk below, which asks each
+        // piece whether it is the first and reads a key near the end of the
+        // text inside the loop: the other walk's scan to the first cut and
+        // its call for each piece near the end cost a short unit more than
+        // its few pieces gain (counted on units between added tokens).
+        const LONG_UNIT_BYTES: usize = 256;
+        if text.len() >= LONG_UNIT_BYTES
+            && self.encode_long_sentencepiece_unit(chars, text, marker, mapped, ids, cache)
+        {
+            return;
+        }
         let bytes = text.as_bytes();
         // A text that starts with a space or a marker has its marker already,
         // unless the normalizer prepends one regardless.
@@ -3740,14 +5245,70 @@ impl NativeEncoder {
                     leading = false;
                     self.tokenize_leading_piece(chars, &text[start..end], mapped, ids, cache);
                 } else {
-                    self.tokenize_raw_piece(chars, text, start..end, mapped, ids, cache);
+                    let key = ShortPieceKey::at(bytes, start, end);
+                    self.tokenize_keyed_raw_piece(chars, key, text, start..end, mapped, ids, cache);
                 }
             },
         );
     }
 
-    /// The piece `text[piece]` of a sentencepiece unit: the key read from
-    /// the text around it and the packed table's probe; the rest out of line.
+    /// [`Self::encode_sentencepiece`] for a long unit: the marker's piece is
+    /// encoded before the walk, which then asks no piece whether it is the
+    /// first and reads a piece's key by one read of the text where sixteen
+    /// bytes stand from its start on. False, with nothing encoded, when a
+    /// prepended marker joins the text and no cut ends its piece near the
+    /// start: the caller's walk takes that unit. Out of line, so that each
+    /// walk keeps its own loop.
+    #[inline(never)]
+    fn encode_long_sentencepiece_unit(
+        &self,
+        chars: &CharSymbols,
+        text: &str,
+        marker: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> bool {
+        // The marker piece's end is searched a byte at a time, so only this
+        // near the start: the caller's walk finds a later one by the block.
+        const FIRST_CUT_BYTES: usize = 32;
+        let bytes = text.as_bytes();
+        let mut rest = text;
+        // A text that starts with a space or a marker has its marker already,
+        // unless the normalizer prepends one regardless.
+        if marker
+            && (chars.prepends_to_a_marked_text()
+                || !(text.starts_with(' ') || text.starts_with(WORD_MARKER)))
+        {
+            // The marker's piece goes before the walk, which then tests no
+            // piece for it: the marker alone when no token bridges it to the
+            // first byte, else the marker and the text up to its first cut.
+            let first = if chars.cuts_at(&[b' ', bytes[0]], 1) {
+                0
+            } else {
+                let near = FIRST_CUT_BYTES.min(bytes.len());
+                match (1..near).find(|&p| chars.cuts_at(bytes, p)) {
+                    Some(first) => first,
+                    None => return false,
+                }
+            };
+            self.tokenize_leading_piece(chars, &text[..first], mapped, ids, cache);
+            rest = &text[first..];
+        }
+        chars.pieces(
+            rest.as_bytes(),
+            #[inline(always)]
+            |start, end| self.tokenize_raw_piece(chars, rest, start..end, mapped, ids, cache),
+        );
+        true
+    }
+
+    /// The piece `text[piece]` of a long sentencepiece unit, compiled into
+    /// its walk's loop: the key by its one read of the text, as in
+    /// [`Self::tokenize_piece_in_place`], the packed table's probe and a
+    /// hit's ids, a spilled entry's too. A miss, a piece longer than a key
+    /// and a short piece the one read does not cover leave the loop by a
+    /// call.
     #[inline(always)]
     fn tokenize_raw_piece(
         &self,
@@ -3758,10 +5319,53 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) {
-        let vacancy = match ShortPieceKey::at(text.as_bytes(), piece.start, piece.end) {
+        let key = match ShortPieceKey::in_window(text.as_bytes(), piece.start, piece.end) {
+            None if piece.len() <= SHORT_PIECE_MAX_BYTES => {
+                return self.tokenize_raw_piece_off_loop(chars, text, piece, mapped, ids, cache)
+            }
+            key => key,
+        };
+        self.tokenize_keyed_raw_piece(chars, key, text, piece, mapped, ids, cache);
+    }
+
+    /// [`Self::tokenize_raw_piece`] for a short piece its loop's one read
+    /// does not cover: one with fewer than sixteen bytes of the text from its
+    /// start on, whose key is read on its own.
+    #[cold]
+    #[inline(never)]
+    fn tokenize_raw_piece_off_loop(
+        &self,
+        chars: &CharSymbols,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) {
+        let key = ShortPieceKey::of(&text.as_bytes()[piece.clone()]);
+        self.tokenize_keyed_raw_piece(chars, key, text, piece, mapped, ids, cache);
+    }
+
+    /// The piece `text[piece]` of a sentencepiece unit by its key, when it
+    /// is short enough to have one: the packed table's probe and the seed.
+    /// The rest goes out of line, and the piece is cut out of the text only
+    /// there: a hit of the packed table or of the seed never pays for it.
+    #[inline(always)]
+    #[expect(clippy::too_many_arguments)]
+    fn tokenize_keyed_raw_piece(
+        &self,
+        chars: &CharSymbols,
+        key: Option<ShortPieceKey>,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) {
+        let vacancy = match key {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return,
-                Some(vacancy) if self.seeded(vacancy, ids, cache) => return,
+                Some(vacancy) if self.seeded_raw(vacancy, ids, cache) => return,
                 vacancy => vacancy,
             },
             None => None,
@@ -3786,7 +5390,7 @@ impl NativeEncoder {
         let vacancy = match ShortPieceKey::of(spaced.as_bytes()) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return,
-                Some(vacancy) if self.seeded(vacancy, ids, cache) => return,
+                Some(vacancy) if self.seeded_raw(vacancy, ids, cache) => return,
                 vacancy => vacancy,
             },
             None => None,
@@ -3830,15 +5434,14 @@ impl NativeEncoder {
 
     /// The calling thread's piece cache for this encoder, made at the
     /// thread's first encode with it (from then on the thread counts toward
-    /// every thread's share, see [`Self::piece_cache_share`]); that first
-    /// encode also reads the merge table through once
-    /// (`MergeTable::read_through`), so the thread's first-sight pieces find
-    /// its lines in the caches.
+    /// every thread's share, see [`Self::piece_cache_share`], and, unless it
+    /// is a thread of a pool then, among the threads that call, see
+    /// `LEARNED_FROM_THREADS`).
     fn thread_piece_cache(&self) -> &RefCell<PieceCache> {
         self.piece_cache.get_or(|| {
             self.threads.fetch_add(1, Ordering::Relaxed);
-            if let Some(merges) = &self.merges {
-                merges.read_through();
+            if rayon::current_thread_index().is_none() {
+                self.callers.fetch_add(1, Ordering::Relaxed);
             }
             RefCell::new(PieceCache::with_share(self.piece_cache_share()))
         })
@@ -3855,17 +5458,34 @@ impl NativeEncoder {
     /// tier anew when it holds more than four times the long share, entries
     /// and empty slots together (see `PieceCache::remake_long`), so
     /// every thread that still encodes is within the share
-    /// from its next call on (the share is read here once and kept in the
+    /// from its next call on, its long tier within four times the long
+    /// share until it next adds a long piece (the share is read here once
+    /// and kept in the
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that
-    /// never encodes again holds what it had until it exits). Two relaxed
-    /// loads, one store and five compares per call.
+    /// never encodes again holds what it had while the encoder lives, see
+    /// `LONG_PIECE_BYTES_TOTAL`). Whether the
+    /// thread shares what it merges is set here as well
+    /// (`PieceCache::shares`): a thread that rests
+    /// (`PieceCache::judge_asks`) shares again once its tiers hold the
+    /// entries its rest lasts. It is set before the clear below and turned
+    /// on nowhere else, so it holds for the rest of the call unless the
+    /// thread starts to rest: a thread whose rest a clear ends, here or
+    /// where it remembers a piece, shares again from its next call.
+    /// Four relaxed loads, three stores and eleven
+    /// compares per call at the most. A call that ended on
+    /// a declined piece or unwound left its waiting pieces behind
+    /// (`Self::waits`): they are dropped here, their holes stood in ids
+    /// that are gone.
     fn piece_cache_for_call(&self) -> RefMut<'_, PieceCache> {
         let mut cache = self.thread_piece_cache().borrow_mut();
         let share = self.piece_cache_share();
+        cache.shares =
+            cache.clears > 0 && self.enough_callers() && cache.short_entries() >= cache.asks_from;
         cache.share = share;
+        cache.waiting.clear();
         let slots = ShortPieceTable::slots_for(share);
-        if cache.short_entries() > share
+        if cache.counted_entries(share) > share
             || cache.packed_slots() > slots
             || cache.wide_slots() > WidePieceTable::slots_for(share)
             || cache.map_capacity() > 2 * share
@@ -3877,6 +5497,43 @@ impl NativeEncoder {
             cache.remake_long();
         }
         cache
+    }
+
+    /// [`Self::piece_cache_for_call`] for a call that encodes a text of
+    /// `bytes` bytes, or a unit of one. The thread's second call reads the
+    /// merge table through once (`MergeTable::read_through`), so the
+    /// first-sight pieces of the calls after it find the table's lines in
+    /// the caches; its first call does not, the read is most of the time of
+    /// a short first encode and only the encodes after it pay it back. A
+    /// first text of [`READ_AT_ONCE_BYTES`] or more has the read before it.
+    /// A call is one call of the encoder, not one prompt: a prompt encoded
+    /// by segments is several, and has the read before its second. The
+    /// thread that loaded skips its read while the load's own is fresh
+    /// ([`Self::load_read_holds`]).
+    fn piece_cache_for_text(&self, bytes: usize) -> RefMut<'_, PieceCache> {
+        let mut cache = self.piece_cache_for_call();
+        if cache.calls_to_read > 0 {
+            cache.calls_to_read = if bytes >= READ_AT_ONCE_BYTES {
+                0
+            } else {
+                cache.calls_to_read - 1
+            };
+            if cache.calls_to_read == 0 && !self.load_read_holds(Instant::now()) {
+                if let Some(merges) = &self.merges {
+                    merges.read_through();
+                }
+            }
+        }
+        cache
+    }
+
+    /// Whether the read that ended the load ([`Self::rehearse`]) stands in
+    /// for the calling thread's own at `now`: the thread is the one that
+    /// loaded, and the read is less than [`LOAD_READ_HOLDS`] old.
+    fn load_read_holds(&self, now: Instant) -> bool {
+        self.load_read.get().is_some_and(|&(loader, read_at)| {
+            loader == std::thread::current().id() && now.duration_since(read_at) < LOAD_READ_HOLDS
+        })
     }
 
     /// Whether a piece the thread's cache and the seed missed can still be
@@ -3902,12 +5559,46 @@ impl NativeEncoder {
         mapped
     }
 
-    /// Entries one thread's piece cache may hold: the total shared among the
+    /// One thread's share of the piece cache (`PIECE_CACHE_CAPACITY` says
+    /// what a share bounds): the total shared among the
     /// threads that have encoded with this encoder, `PIECE_CACHE_CAPACITY` at
-    /// most.
+    /// most, and where the threads share what they merge
+    /// ([`Self::enough_callers`]) a part of that (`GROWN_SHARE_PART`),
+    /// beside the table that keeps it for all of them
+    /// ([`Self::learned_pieces`]).
     fn piece_cache_share(&self) -> usize {
-        (PIECE_CACHE_TOTAL_CAPACITY / self.threads.load(Ordering::Relaxed).max(1))
-            .clamp(1, PIECE_CACHE_CAPACITY)
+        let threads = self.threads.load(Ordering::Relaxed).max(1);
+        let share = (PIECE_CACHE_TOTAL_CAPACITY / threads).clamp(1, PIECE_CACHE_CAPACITY);
+        if self.enough_callers() {
+            // The threads share what they merge: each keeps a part.
+            (share / GROWN_SHARE_PART).max(1)
+        } else {
+            share
+        }
+    }
+
+    /// Whether the threads of this encoder share what they merge: a miss of
+    /// theirs can ask the learned table, which only a miss that waits does
+    /// (`Self::misses_wait`), and enough threads call
+    /// (`LEARNED_FROM_THREADS`). The cut of a thread's share
+    /// ([`Self::piece_cache_share`]) and `PieceCache::shares` both follow
+    /// it, so an encoder whose misses never reach the table keeps every
+    /// thread's whole share.
+    fn enough_callers(&self) -> bool {
+        self.misses_wait && self.callers.load(Ordering::Relaxed) >= LEARNED_FROM_THREADS
+    }
+
+    /// What the threads have merged ([`LearnedPieces`]), made at the first
+    /// ask, which is the first miss of a thread that shares
+    /// (`PieceCache::shares`): for twice the entries the threads that have
+    /// encoded with this encoder by then keep themselves, half of what they
+    /// held before the table (see `GROWN_SHARE_PART`). Threads that join
+    /// later share the table as it was made.
+    fn learned_pieces(&self) -> &LearnedPieces {
+        self.learned.get_or_init(|| {
+            let threads = self.threads.load(Ordering::Relaxed).max(1);
+            LearnedPieces::for_entries(2 * self.piece_cache_share() * threads)
+        })
     }
 
     /// Bytes of long pieces one thread may hold: the total shared among the

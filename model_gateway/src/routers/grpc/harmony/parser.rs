@@ -301,9 +301,6 @@ impl HarmonyParserAdapter {
 
         // Get current incomplete content
         let content = self.parser.current_content().ok()?;
-        if content.is_empty() {
-            return None;
-        }
 
         // Extract function name from recipient
         let Some(function_name) = recipient.strip_prefix("functions.") else {

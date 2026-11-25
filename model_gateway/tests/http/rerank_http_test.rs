@@ -14,10 +14,11 @@ use axum::{
     Json, Router,
 };
 use common::test_app::{create_test_app_context, create_test_app_with_context};
+use openai_protocol::model_card::ModelCard;
 use serde_json::{json, Value};
-use smg::{
-    routers::{factory::router_ids, gateway::Gateway, http::router::Router as HttpRouter},
-    worker::{BasicWorkerBuilder, ModelCard},
+use smg::routers::{
+    factory::router_ids, gateway::Gateway, grpc::backend_client::BasicWorkerBuilder,
+    http::router::Router as HttpRouter,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;

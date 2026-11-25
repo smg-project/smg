@@ -14,11 +14,11 @@ use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::RouterFactory,
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use smg_test_harness::scripted_tokenizer;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::{net::TcpListener, time::timeout};
 
 use crate::{common, scripted_worker};
@@ -400,6 +400,55 @@ async fn mcp_user_tool_limit_emits_completed_terminal_response() {
             "ignore calls exceeding the user cap"
         );
     }
+}
+
+/// A server tool call that fails, streamed through the gateway's own tool
+/// loop: the call closes under `response.mcp_call.failed` and then its
+/// `response.output_item.done` with a `failed` item, and no
+/// `response.mcp_call.completed` is sent. The HTTP router's loop closes a
+/// failed call under the same event
+/// (`a_streamed_mcp_call_that_failed_closes_under_the_failed_event` in the
+/// API tests); the two tests hold the two loops to it.
+#[tokio::test]
+async fn a_failed_mcp_call_closes_under_the_failed_event() {
+    let mut mcp = common::mock_mcp_server::MockFailingMCPServer::start("the tool is down")
+        .await
+        .unwrap();
+    let events = responses_events_with_output(
+        json!([{
+            "type": "mcp", "server_label": "test-tools", "server_url": mcp.url(),
+            "require_approval": "never",
+        }]),
+        Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>"),
+        Some(1),
+        "completed",
+    )
+    .await;
+    mcp.stop().await;
+    // The call's close: its sub-event, and the status of the item behind it.
+    let closes: Vec<(&str, &str)> = events
+        .windows(2)
+        .filter(|pair| {
+            pair[1]["type"] == "response.output_item.done" && pair[1]["item"]["type"] == "mcp_call"
+        })
+        .map(|pair| {
+            (
+                pair[0]["type"].as_str().unwrap_or_default(),
+                pair[1]["item"]["status"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        closes,
+        [("response.mcp_call.failed", "failed")],
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] != "response.mcp_call.completed"),
+        "{events:?}"
+    );
 }
 
 /// The request's cap reached: the loop runs the permitted call, then gives the

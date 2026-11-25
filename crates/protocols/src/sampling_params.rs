@@ -39,9 +39,9 @@ pub struct SamplingParams {
     pub min_new_tokens: Option<u32>,
     pub stop_token_ids: Option<Vec<u32>>,
     pub no_stop_trim: Option<bool>,
-    /// The number of choices to sample, one or more: the lower bound the chat
-    /// route puts on its `n`.
-    #[validate(range(min = 1))]
+    /// The number of choices to sample, 1 to 128: the bounds the chat route
+    /// puts on its `n`.
+    #[validate(range(min = 1, max = 128))]
     pub n: Option<u32>,
     pub sampling_seed: Option<u64>,
     /// Custom parameters for engine-specific sampling behavior.

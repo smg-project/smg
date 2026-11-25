@@ -1,8 +1,8 @@
 # WASM Guest Policy Example
 
 A routing policy written as a WebAssembly component: a filter, a scorer and a
-picker for the policy controller's plugin host
-(`crates/policy_controller/src/wasm`).
+picker for Grand Central's plugin host
+(`crates/grand_central/src/plugins/wasm`).
 
 The policy: among the healthy workers that have capacity, prefer the one with
 the fewest requests in flight, with a bonus for the worker that already holds
@@ -24,10 +24,13 @@ which a `wasm32-wasip2` build of the standard library carries.
 - `filter`: the surviving positions. With no usable worker the list is empty
   and the request is shed.
 - `score`: one score per candidate, scaled to stay within 0 to 1, where the
-  host clamps.
+  host clamps. The answer carries no tie band, so the host draws within its
+  default one.
 - `pick`: a position among the survivors.
 - `observe`: the lifecycle of issued decisions. It counts completed
-  dispatches in a counter the plugin's spec declares. The engine forwards the
+  dispatches in a counter the plugin's spec declares. The host calls it with
+  the kinds of event the spec lists in `observes`, none by default: this
+  plugin's spec lists `completed` and no other. The engine forwards the
   lifecycle to scorers and pickers: bound as a filter alone, a plugin
   observes nothing.
 - Two of the four host imports: `log` and `counter`.
@@ -43,7 +46,7 @@ learns from the lifecycle is a different example.
 ## The contract
 
 The plugin implements the `policy` world of
-[`smg-policy.wit`](../../../crates/policy_controller/contracts/smg-policy.wit),
+[`smg-policy.wit`](../../../crates/grand_central/contracts/smg-policy.wit),
 the record form: the view arrives as typed records. The same file defines a
 second world, `policy-packed`, where the view arrives as bytes the guest reads
 in place. It is the form for a hot path: on the host's bench a three-stage
@@ -57,6 +60,8 @@ What the host enforces:
   rebuilt.
 - `filter` returns positions that are unique and in range.
 - `score` returns one finite value per candidate. The host clamps it to 0..1.
+  A tie band beside the scores is optional: a finite value from 0 to 1, the
+  gap within which the best scores tie.
 - `pick` returns a position among the survivors: the host passes the scores
   back, and a score below zero marks a row a filter removed.
 - A stage that cannot judge a request declines (`Err(Decline::...)`). That is
@@ -110,9 +115,9 @@ stages of a profile:
 ```rust
 use std::sync::Arc;
 
-use smg_policy_controller::{
-    plugins::OpenDecisions,
-    wasm::{Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
+use smg_grand_central::{
+    plugins::shared::OpenDecisions,
+    plugins::wasm::{EventKind, EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
 };
 
 // One for the process: every plugin runtime is built over it, so a
@@ -123,6 +128,7 @@ let mut spec = PluginSpec::new("least-loaded", std::fs::read(component_path)?);
 spec.config = vec![20]; // the session bonus, in percent
 spec.budget_micros = 10_000; // per call
 spec.metrics = vec!["completed".to_string()]; // counter 0
+spec.observes = EventSet::of([EventKind::Completed]); // what `observe` hears
 let plugin = Plugin::load(&runtime, spec)?;
 
 let bound = plugin.bind();
@@ -131,7 +137,7 @@ let scorer = WasmScorer::new(Arc::clone(&bound), None);
 let picker = WasmPicker::new(bound, None);
 ```
 
-`crates/policy_controller/tests/wasm_example.rs` is the runnable form: it
+`crates/grand_central/tests/wasm_example.rs` is the runnable form: it
 loads this component into an engine and decides over a small pool. The policy
 document does not name a plugin yet, so a host builds the `PluginSpec` itself.
 
@@ -141,7 +147,7 @@ From the repository root (the example's directory is a workspace of its own):
 
 ```bash
 examples/wasm/wasm-guest-policy/build.sh
-cargo test -p smg-policy-controller --test wasm_example
+cargo test -p smg-grand-central --test wasm_example
 ```
 
 The tests skip, and say so, when the component is not built. With
@@ -155,6 +161,7 @@ Copy this directory, keep the `wit_bindgen::generate!` call pointing at
 it wants from a plugin, and a stage the policy does not implement can decline
 every call. A plugin gets the load rows, the hashes, the headers and the
 session counts only when its spec names them in `needs`: the host cannot read
-what a module wants off the module. Keep `panic = "abort"` in the release
+what a module wants off the module. It hears a lifecycle event only when its
+spec lists the kind in `observes`. Keep `panic = "abort"` in the release
 profile: a panic then ends the call as a trap the host handles, with no
 unwinding code in the module.

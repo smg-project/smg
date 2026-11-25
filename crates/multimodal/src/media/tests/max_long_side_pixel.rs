@@ -133,3 +133,40 @@ fn larger_caps_keep_more_pixels() {
     assert!(low.width() < mid.width());
     assert!(mid.width() < high.width());
 }
+
+/// A frame the cap resizes hands the frame a new image, so the decoder's
+/// buffer is back in the pool when the cap returns, for the RGB layout and
+/// for another; the pixels are the resize's. A frame inside the cap keeps
+/// its buffer.
+#[test]
+fn a_capped_frame_returns_the_decoders_buffer() {
+    static MINE: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+    buffer_pool::with_pool(&MINE, || {
+        let pooled = |pixels: &[u8]| {
+            let mut buffer = buffer_pool::take(pixels.len());
+            buffer.copy_from_slice(pixels);
+            buffer
+        };
+        let rgb = image::RgbImage::from_fn(320, 320, |x, y| {
+            image::Rgb([x as u8, y as u8, (x ^ y) as u8])
+        });
+        let frame = image::RgbImage::from_raw(320, 320, pooled(rgb.as_raw())).expect("sized");
+        let capped = apply_max_long_side_pixel(image::DynamicImage::ImageRgb8(frame), Some(160));
+        assert!(capped.as_bytes() == resize_catmull_rom_rgb(&rgb, 160, 160).as_raw().as_slice());
+        assert_eq!(MINE.held(), 512 << 10);
+
+        let rgba = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(320, 320, |x, y| {
+            image::Rgba([x as u8, y as u8, (x ^ y) as u8, (x + y) as u8])
+        }));
+        let expected = rgba.resize_exact(160, 160, image::imageops::FilterType::CatmullRom);
+        let frame = image::RgbaImage::from_raw(320, 320, pooled(rgba.as_bytes())).expect("sized");
+        let capped = apply_max_long_side_pixel(image::DynamicImage::ImageRgba8(frame), Some(160));
+        assert!(capped.as_bytes() == expected.as_bytes());
+        assert_eq!(MINE.held(), 512 << 10);
+
+        let frame = image::RgbImage::from_raw(320, 320, pooled(rgb.as_raw())).expect("sized");
+        let kept = apply_max_long_side_pixel(image::DynamicImage::ImageRgb8(frame), Some(320));
+        assert!(kept.as_bytes() == rgb.as_raw().as_slice());
+        assert_eq!(MINE.held(), 0);
+    });
+}

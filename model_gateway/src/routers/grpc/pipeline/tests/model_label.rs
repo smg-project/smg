@@ -2,12 +2,12 @@
 //! for a model no worker serves.
 
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 
 use super::*;
 use crate::{
-    config::types::PolicyConfig,
-    observability::metrics::test_support::render_with_recorder,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    config::types::PolicyConfig, observability::metrics::test_support::render_with_recorder,
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
 
 /// smg-lab #288: the pipeline's request and error records carry the

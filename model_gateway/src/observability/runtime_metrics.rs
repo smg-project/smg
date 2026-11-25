@@ -39,7 +39,7 @@
 //!   (`DYN_ENABLE_POLL_HISTOGRAM`). On tokio 1.52
 //!   `Builder::enable_metrics_poll_time_histogram()` is itself
 //!   `tokio_unstable`-only and would require changing the runtime builder in
-//!   `main.rs`. Revisit behind an `SMG_ENABLE_POLL_HISTOGRAM` env var once
+//!   `cli/mod.rs`. Revisit behind an `SMG_ENABLE_POLL_HISTOGRAM` env var once
 //!   tokio stabilizes the API (it costs ~2x `Instant::now()` per task poll,
 //!   so it must stay opt-in).
 //!
@@ -58,9 +58,8 @@ use std::{
 };
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+use smg_worker::metrics::writers::intern_string;
 use tokio::runtime::{Handle, RuntimeMetrics};
-
-use crate::worker::metrics::intern_string;
 
 /// Canary sleep interval. Wake drift is measured against this.
 const CANARY_INTERVAL: Duration = Duration::from_millis(10);

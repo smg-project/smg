@@ -5,11 +5,16 @@
 //! wait for all dependencies to complete successfully.
 
 use std::{
+    any::Any,
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    panic::{catch_unwind, AssertUnwindSafe},
+    pin::{pin, Pin},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    task::{self, Poll},
     time::Duration,
 };
 
@@ -30,11 +35,16 @@ use crate::{
 
 /// How often a step waiting out its backoff reads its workflow's cancellation.
 const CANCELLATION_READ_INTERVAL: Duration = Duration::from_millis(250);
+/// The error text of a step that failed without an error of its own: a plain
+/// `Failure` result, or a panic whose message goes to the log only.
+const PLAIN_FAILURE: &str = "Step failed";
 
 #[derive(Default)]
 struct StepTracker {
     completed: HashSet<StepId>,
     failed: HashSet<StepId>,
+    /// The first step to fail: the step a failed run is named by.
+    first_failed: Option<StepId>,
     skipped: HashSet<StepId>,
     running: HashSet<StepId>,
     /// Steps waiting for delay/scheduled_at: maps step INDEX to ready time
@@ -209,13 +219,16 @@ enum Gate {
     /// The context the condition reads could not be loaded; the step fails
     /// with this text rather than proceeding blindly.
     Fail(String),
+    /// The condition panicked, with the same fixed failure text used when a
+    /// step's `execute` panics. The step fails by its failure action.
+    Panic(String),
 }
 
 /// How a finished step reports itself: the signal its dependents get (which
-/// names the tracker set it lands in), and the step state to write after the
-/// tracker lock is released, on the paths that owe one: a step the gate
-/// skipped or failed before it ran, and a `ContinueNextStep` failure, whose
-/// `Failed` state is overwritten as `Skipped`.
+/// names the tracker set it lands in), and the step state to store before
+/// they are told, on the paths that owe one: a step the gate skipped or
+/// failed before it ran, and a `ContinueNextStep` failure, whose `Failed`
+/// state is overwritten as `Skipped`.
 struct Completion {
     signal: StepResult,
     state: Option<(StepStatus, Option<String>)>,
@@ -272,6 +285,19 @@ impl Completion {
             state: Some((StepStatus::Failed, Some(error))),
         }
     }
+
+    /// A step whose condition panicked, folded with its failure action: under
+    /// `ContinueNextStep` it signals as a skip and is recorded as skipped,
+    /// with the failure text kept.
+    fn panicked(error: String, on_failure: FailureAction) -> Self {
+        match on_failure {
+            FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => Self::failed(error),
+            FailureAction::ContinueNextStep => Self {
+                signal: StepResult::Skip,
+                state: Some((StepStatus::Skipped, Some(error))),
+            },
+        }
+    }
 }
 
 /// One run of a step's executor: what came of it, the context it ran on
@@ -288,11 +314,61 @@ enum Outcome {
     Skip,
     /// The error text for the step's state and events, and whether another
     /// attempt is allowed: the executor's word for its own errors, always
-    /// for a timeout, never for a plain `Failure` result.
+    /// for a timeout, never for a plain `Failure` result or a panic.
     Failed {
         error: String,
         retryable: bool,
     },
+}
+
+/// A future of a step author's code that ends with its panic, when it panics,
+/// where it would unwind its task. Its caller says what the panic means: a
+/// failed attempt for `execute`, a logged line for an end hook. Left to
+/// unwind, the step would read as running for ever and its run would never
+/// end, so every wait on that run would last its whole timeout.
+///
+/// The guarded future makes the author's call itself, so a method that
+/// panics before it returns its future is caught too.
+struct CatchPanic<F>(F);
+
+impl<F: Future + Unpin> Future for CatchPanic<F> {
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let inner = Pin::new(&mut self.0);
+        match catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(panic) => Poll::Ready(Err(panic)),
+        }
+    }
+}
+
+/// The words a panic carried, when it carried words.
+fn panic_words(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
+/// Logs how a step's hook ended when it failed or panicked. Neither changes
+/// what the step came to.
+fn log_hook_end<E: std::fmt::Debug>(
+    step_id: &StepId,
+    hook: &'static str,
+    end: Result<Result<(), E>, Box<dyn Any + Send>>,
+) {
+    match end {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(step_id = %step_id, error = ?error, "{hook} hook failed"),
+        Err(panic) => tracing::warn!(
+            step_id = %step_id,
+            panic = panic_words(panic.as_ref()),
+            "{hook} hook panicked"
+        ),
+    }
 }
 
 /// Fixed backoff that returns the same delay every time
@@ -796,13 +872,14 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// The blocked verdict: no step ready, none running or waiting, work left.
-    /// A failed step is the cause when there is one, a deadlock otherwise.
+    /// The first step to fail is the cause when there is one, a deadlock
+    /// otherwise.
     async fn fail_blocked(
         &self,
         instance_id: WorkflowInstanceId,
         tracker: &Arc<RwLock<StepTracker>>,
     ) -> WorkflowResult<()> {
-        let failed_step = tracker.read().failed.iter().next().cloned();
+        let failed_step = tracker.read().first_failed.clone();
         // Use &'static str to avoid allocation in common error paths
         let error_message: &'static str = if failed_step.is_some() {
             "Workflow failed due to step dependency failure"
@@ -810,11 +887,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             "Workflow deadlocked: no steps ready and none running"
         };
 
-        self.state_store
-            .update(instance_id, |s| {
-                s.status = WorkflowStatus::Failed;
-            })
-            .await?;
+        self.mark_failed(instance_id, failed_step.as_ref()).await?;
         self.event_bus
             .publish(WorkflowEvent::WorkflowFailed {
                 instance_id,
@@ -822,6 +895,26 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 error: error_message.to_string(),
             })
             .await;
+        Ok(())
+    }
+
+    /// Mark the run failed. Its current step becomes the first step that
+    /// failed, where one did: an attempt of another branch that began later
+    /// does not name the run's failure. A deadlock with no failed step keeps
+    /// the last step an attempt named.
+    async fn mark_failed(
+        &self,
+        instance_id: WorkflowInstanceId,
+        failed_step: Option<&StepId>,
+    ) -> WorkflowResult<()> {
+        self.state_store
+            .update(instance_id, |s| {
+                s.status = WorkflowStatus::Failed;
+                if let Some(step) = failed_step {
+                    s.current_step = Some(step.clone());
+                }
+            })
+            .await?;
         Ok(())
     }
 
@@ -848,34 +941,50 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             }
             Gate::Skip => Completion::skipped(),
             Gate::Fail(error) => Completion::failed(error),
+            Gate::Panic(error) => Completion::panicked(error, step.on_failure),
         };
 
-        Self::settle(&tracker, &tx, &step_id, completion.signal);
-
-        // The state store is written after the tracker lock is released.
+        // The step's end is stored before its dependents are told, so a
+        // reader of the ended run finds the step's status and its error.
         if let Some((status, last_error)) = completion.state {
             engine
                 .record_step_status(instance_id, &step_id, status, last_error)
                 .await;
         }
+
+        Self::settle(&tracker, &tx, &step_id, completion.signal);
     }
 
     /// The `run_if` verdict: a step without a condition runs; one whose
     /// condition does not hold is skipped; one whose context cannot be read
-    /// fails rather than proceeding blindly.
+    /// fails rather than proceeding blindly; one whose condition panics fails
+    /// by its failure action.
     async fn run_if_gate(&self, instance_id: WorkflowInstanceId, step: &StepDefinition<D>) -> Gate {
         let Some(condition) = step.run_if.as_ref() else {
             return Gate::Run;
         };
         match self.state_store.get_context(instance_id).await {
-            Ok(ctx) if condition(&ctx) => Gate::Run,
-            Ok(_) => {
-                tracing::debug!(
-                    step_id = %step.id,
-                    "Step skipped due to run_if condition"
-                );
-                Gate::Skip
-            }
+            // The condition is the step author's code: its panic fails the
+            // step as a panic in `execute` does.
+            Ok(ctx) => match catch_unwind(AssertUnwindSafe(|| condition(&ctx))) {
+                Ok(true) => Gate::Run,
+                Ok(false) => {
+                    tracing::debug!(
+                        step_id = %step.id,
+                        "Step skipped due to run_if condition"
+                    );
+                    Gate::Skip
+                }
+                Err(panic) => {
+                    tracing::error!(
+                        instance_id = %instance_id,
+                        step_id = %step.id,
+                        panic = panic_words(panic.as_ref()),
+                        "run_if panicked"
+                    );
+                    Gate::Panic(PLAIN_FAILURE.to_string())
+                }
+            },
             Err(e) => {
                 tracing::error!(
                     step_id = %step.id,
@@ -901,7 +1010,10 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         match signal {
             StepResult::Success => t.completed.insert(step_id.clone()),
             StepResult::Skip => t.skipped.insert(step_id.clone()),
-            StepResult::Failure => t.failed.insert(step_id.clone()),
+            StepResult::Failure => {
+                t.first_failed.get_or_insert_with(|| step_id.clone());
+                t.failed.insert(step_id.clone())
+            }
         };
 
         if let Err(e) = tx.try_send((step_id.clone(), signal)) {
@@ -923,8 +1035,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
     }
 
-    /// The step state a completion owes after the tracker lock: the status,
-    /// and the error text when the step failed before it ran.
+    /// The step state a completion owes: the status, and the error text when
+    /// the step failed before it ran. Such a step is the run's failing step.
     async fn record_step_status(
         &self,
         instance_id: WorkflowInstanceId,
@@ -935,6 +1047,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         if let Err(e) = self
             .state_store
             .update(instance_id, |s| {
+                // A step that failed before an attempt is the run's failing
+                // step: no attempt named it as the current one.
+                if status == StepStatus::Failed {
+                    s.current_step = Some(step_id.clone());
+                }
                 if let Some(step_state) = s.step_states.get_mut(step_id) {
                     step_state.status = status;
                     if last_error.is_some() {
@@ -1005,24 +1122,17 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// The end of the workflow: failed when a step failed, completed otherwise,
-    /// each with its event.
+    /// each with its event. A failed run is named by the first step to fail.
     async fn finish(
         &self,
         instance_id: WorkflowInstanceId,
         tracker: &Arc<RwLock<StepTracker>>,
         start_time: std::time::Instant,
     ) -> WorkflowResult<()> {
-        let failed_step = {
-            let t = tracker.read();
-            t.failed.iter().next().cloned()
-        };
+        let failed_step = tracker.read().first_failed.clone();
 
         if let Some(ref step) = failed_step {
-            self.state_store
-                .update(instance_id, |s| {
-                    s.status = WorkflowStatus::Failed;
-                })
-                .await?;
+            self.mark_failed(instance_id, Some(step)).await?;
             self.event_bus
                 .publish(WorkflowEvent::WorkflowFailed {
                     instance_id,
@@ -1168,20 +1278,45 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let mut context = self.state_store.get_context(instance_id).await?;
 
         let step_start = std::time::Instant::now();
-        let result = timeout(step_timeout, step.executor.execute(&mut context)).await;
+        let result = {
+            let attempt = pin!(async { step.executor.execute(&mut context).await });
+            timeout(step_timeout, CatchPanic(attempt)).await
+        };
         let duration = step_start.elapsed();
 
         let outcome = match result {
-            Ok(Ok(StepResult::Success)) => Outcome::Success,
-            Ok(Ok(StepResult::Skip)) => Outcome::Skip,
-            Ok(Ok(StepResult::Failure)) => Outcome::Failed {
-                error: "Step failed".to_string(),
+            Ok(Ok(Ok(StepResult::Success))) => Outcome::Success,
+            Ok(Ok(Ok(StepResult::Skip))) => Outcome::Skip,
+            Ok(Ok(Ok(StepResult::Failure))) => Outcome::Failed {
+                error: PLAIN_FAILURE.to_string(),
                 retryable: false,
             },
-            Ok(Err(e)) => Outcome::Failed {
+            Ok(Ok(Err(e))) => Outcome::Failed {
                 error: format!("{e}"),
-                retryable: step.executor.is_retryable(&e),
+                // The executor's word, and no further attempt when it panics.
+                retryable: catch_unwind(AssertUnwindSafe(|| step.executor.is_retryable(&e)))
+                    .unwrap_or_else(|panic| {
+                        tracing::warn!(
+                            step_id = %step.id,
+                            panic = panic_words(panic.as_ref()),
+                            "is_retryable panicked, no further attempt"
+                        );
+                        false
+                    }),
             },
+            // A panic fails the attempt, and no further attempt is made.
+            Ok(Err(panic)) => {
+                tracing::error!(
+                    instance_id = %instance_id,
+                    step_id = %step.id,
+                    panic = panic_words(panic.as_ref()),
+                    "Step panicked"
+                );
+                Outcome::Failed {
+                    error: PLAIN_FAILURE.to_string(),
+                    retryable: false,
+                }
+            }
             Err(_) => Outcome::Failed {
                 error: format!("Step timeout after {step_timeout:?}"),
                 // Timeouts are retryable
@@ -1230,9 +1365,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             })
             .await;
 
-        if let Err(e) = step.executor.on_success(context).await {
-            tracing::warn!(step_id = %step.id, error = ?e, "on_success hook failed");
-        }
+        let hook = pin!(async { step.executor.on_success(context).await });
+        log_hook_end(&step.id, "on_success", CatchPanic(hook).await);
         Ok(())
     }
 
@@ -1325,9 +1459,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             step_id: step.id.clone(),
             message: error,
         };
-        if let Err(hook_err) = step.executor.on_failure(context, &hook_error).await {
-            tracing::warn!(step_id = %step.id, error = ?hook_err, "on_failure hook failed");
-        }
+        let hook = pin!(async { step.executor.on_failure(context, &hook_error).await });
+        log_hook_end(&step.id, "on_failure", CatchPanic(hook).await);
     }
 
     fn create_backoff(strategy: &BackoffStrategy) -> BackoffImpl {
@@ -1400,7 +1533,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         label: &str,
         timeout_duration: Duration,
     ) -> Result<WorkflowState<D>, String> {
-        let start = std::time::Instant::now();
+        // The runtime's clock, which a step's own timeout reads too.
+        let start = tokio::time::Instant::now();
         let mut poll_interval = Duration::from_millis(100);
         let max_poll_interval = Duration::from_millis(2000);
         let poll_backoff = Duration::from_millis(200);
@@ -1710,5 +1844,31 @@ mod scheduler_tests {
         let mut tracker = StepTracker::default();
         tracker.set_waiting(1, now - Duration::from_secs(1));
         assert_eq!(time_to_next_wait(&tracker), Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn a_deadlock_with_no_failed_step_keeps_the_last_attempts_step() {
+        let engine: WorkflowEngine<Data> = WorkflowEngine::new();
+        let id = WorkflowInstanceId::new();
+        let last = StepId::new("last_attempt");
+        let mut state = WorkflowState::new(id, WorkflowId::new("deadlock"), Data);
+        state.status = WorkflowStatus::Running;
+        state.current_step = Some(last.clone());
+        engine
+            .state_store()
+            .save(state)
+            .await
+            .expect("the state is saved");
+
+        // No step failed, so the blocked verdict is a deadlock.
+        let tracker = Arc::new(RwLock::new(StepTracker::default()));
+        engine
+            .fail_blocked(id, &tracker)
+            .await
+            .expect("the verdict is written");
+
+        let state = engine.get_status(id).await.expect("the run's state");
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        assert_eq!(state.current_step, Some(last));
     }
 }

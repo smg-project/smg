@@ -132,9 +132,9 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   closes nothing. The structural tag is unchanged: the grammar takes the block from a row into the
   invoke from the wrapping state alone, so a forced call is still written as the block.
 - **An invoke's arguments may be one JSON object** in place of the parameter tags
-  (`Tags::DSML_V4.json_arguments`; `docs/assemblers.md`, the attributed assembler), as the serving
-  engines' own parser for the family reads it: SGLang's DSML detector takes the object as the
-  call's arguments, as written, and the structural tag it builds for a call writes the object
+  (`Tags::DSML_V4.json_arguments`; `docs/assemblers.md`, the attributed assembler), as one serving
+  engine's own parser for the family reads it: that parser takes the object as the call's
+  arguments, as written, and the structural tag the engine builds for a call writes the object
   between the invoke tag and its close, so an engine that constrains a call that way gets the
   shape back. The family's reference encoder writes parameter tags alone and its parser refuses
   the shape (`Tool name format error`), so it reads no call there. Before, the table read the call
@@ -357,6 +357,10 @@ writes the thought as `<think>\n`, the reasoning, `\n</think>\n\n`, then the con
 model's to write and reach the reasoning and content streams (bellwether #17's question, as for
 Qwen3), the ones inside the block are its wrapping.
 
+A deployment whose model the registry does not list names this table by its own name: the
+gateway reads the family's name, `minimax`, with the M3 table there. A model of this line the
+registry lists keeps this table behind the family's name alone.
+
 ## MiniMax M3 (`minimax_m3`)
 
 What this table says beyond the DSML one:
@@ -514,6 +518,11 @@ What the table says beyond the others:
   as under `auto`, and nothing of the call reaches the client as a call or as content, which is
   what the engine's own server delivers for it. A request with no tools anywhere still reads with
   the variant without calls, whatever its `tool_choice`.
+- **A choice that narrows the tools returns only the calls it leaves callable.** Under a named
+  function, an allowed list or `required`, the gateway's reader drops a call to any other
+  function the same way, one the request did not declare among them, and counts it in the same
+  counter; the calls beside it go out, numbered from zero, and with none left a `tool_calls`
+  finish is `stop` again. Under `auto` every call goes out as before.
 
 - **A JSON answer's quoted spellings are the answer's text under the engine's JSON-answer
   option.** A model held to a JSON answer may spell a marker in a key or a value, and the
@@ -563,9 +572,9 @@ What the table says beyond `inkling`, whose rows it shares:
   consumed them with the kind's marker. Without the lead the derivation, which starts from the
   turn's own state, wrote Inkling's tag: from the first token it owed the thought's or the
   answer's marker where the model writes `<|message_model|>`, a marker with no row out of the
-  state the turn starts in. The forced call's tag is Inkling's unchanged: the call marker
-  triggers it inside whatever message the model is writing, and the opener before it is free
-  text.
+  state the turn starts in. A forced call's tag takes the opener too: owed before the call's
+  marker where the engine starts at the first token, optional otherwise; a call the request does
+  not owe keeps Inkling's tag, the opener written in its free text.
 - **The opener said again inside a message is the opener.** A row on `<|message_model|>` from
   each body back into it, framing as a kind said again is, the kind marker after it the kind.
   The answer tag's optional way in admits the opener and the kind marker after an engine that
@@ -755,8 +764,10 @@ list and nothing after it; no thought. What the table says beyond the others:
   the recorded benchmark sets write it) closes at its quote, whole and at every cut. One
   reading is kept from the model's side: a `"` right after a backslash is the model's own
   escaped quote (`size="5\" screen"`, which the family's own readers decode) unless `,` or `)`
-  follows it, whitespace aside, so such a value reads whole with its backslash kept, and only a
-  quote the value's end follows closes it. A value the
+  follows it, whitespace aside, so such a value reads whole, the quote alone and its backslash
+  as the model's escape (`5" screen`; every other backslash stays as written; a value meant to
+  hold that backslash, the text `5\" screen` itself, cannot be told from the escape and loses
+  it), and only a quote the value's end follows closes it. A value the
   model writes bare (`days=3`, `detailed=False`, `city='Paris'`), the spelling its model card and
   the family's parsers take, reads as Python's, a single-quoted string with its escapes. The
   structural tags write Python's values, the spelling the model is told to write.
@@ -860,6 +871,92 @@ v1.1, whose template writes each call one `}` short (`{"name": …, "arguments":
 bellwether's reference heals and this table does not read; and the Ultra's CPT checkpoint
 (`Llama-3_1-Nemotron-Ultra-253B-CPT-v1`), whose bare `{"name": …, "parameters": …}` object is
 Llama 3.1's own syntax, which the `json` table reads.
+
+## Command (`command`)
+
+What the table says beyond the others:
+
+- **Every part has its own pair of markers, and the answer's move nothing.** The thought and the
+  list of calls are states their markers open and close, as Llama Nemotron's are. The answer is
+  the content state the turn starts in: `<|START_RESPONSE|>` and `<|END_RESPONSE|>` are dropped
+  where they stand, so an answer with no marker around it is content too, as Command R v01,
+  whose template has none of the markers, writes its own.
+- **A call is `tool_name` and `parameters`.** The outline reads those keys beside `name` and
+  `arguments`; the `tool_call_id` the template counts from zero is another member, and the
+  call's id is the engine's.
+- **Between the action markers, one object alone is one call.** The template renders a list,
+  one call a list of one; the gateway's older `cohere` parser also read a bare object there,
+  and the table does (`CallSyntax::JsonAlone` between markers: an object, several, or the
+  list), with text in place of the calls malformed as it is between Llama Nemotron's markers.
+  `<|START_TEXT|>` and `<|END_TEXT|>` are dropped from the answer, as the answer's markers are
+  and as that parser dropped them.
+
+Where the table reads otherwise than the older `cohere` parser read a response taken whole (its
+streaming reader is not compared). That parser looked for the action markers in all the text, a
+thought and a string of a JSON answer included; it parsed each block as one JSON value and
+dropped the block when the value did not parse; and it joined the text outside the blocks, then
+removed the answer's and the text markers from it, then trimmed its two ends. The table reads
+the output as it comes, a marker where its state has a row for it and a block object by object:
+
+- **A call's arguments are the model's bytes**, where that parser wrote them again without the
+  model's spacing. What a JSON parser refuses in them passes: a line feed or a tab written raw
+  inside a string comes out as its escape and a number beyond a float's range as written, where
+  that parser dropped the block.
+- **The first key written counts.** Of `name` and `tool_name` the first names the call, where
+  that parser took `tool_name`; of `arguments`, `parameters` and `args` the first holds the
+  arguments, where that parser took `parameters`, then `arguments`, and never `args`; a key
+  written twice counts the first time, where that parser took the last. A name that is no
+  string names no call in either.
+- **A call stands once its name and the start of its arguments have come, or its object has
+  closed.** A block the end cuts behind that point is the call with what arrived, and what the
+  cut leaves behind a closed arguments value is malformed text; an object that closed with no
+  `<|END_ACTION|>` behind it is the call. That parser read no call from either and showed the
+  block as content, its opener included. Cut before that point the block is no call, and what
+  arrived is malformed text.
+- **What stands behind a call does not take it back.** Two objects side by side, with
+  whitespace, a `;` or nothing between them, are two calls; a list or text behind an object is
+  malformed text behind the call; a comma before the object's close is passed over. That parser
+  read no call from any of these blocks and showed nothing.
+- **A block that holds no call is malformed text**, which a chat response shows as the model
+  wrote it, where that parser showed nothing; an empty list is nothing in both. A list whose
+  first value is no object is such a block whole, where that parser passed over the value and
+  read the calls behind it. Inside a list that opened with an object, an object with no name is
+  malformed text without the list's brackets, and the objects of a list inside the list are
+  calls, where that parser read the list's own objects alone.
+- **`<|END_ACTION|>` inside a string argument ends the block there**, where that parser read on
+  to the next one. A reader that follows the strings of the JSON keeps the marker as the
+  string's text, as that parser did: the forced variants, and the JSON-answer option
+  (`Engine::reads_json_answer`) inside a call.
+- **Whitespace.** Whitespace alone between one part's close and the next part's opener is the
+  template's wrapping and is dropped, where that parser kept it inside the text it joined.
+  Whitespace alone inside an action block is content, where that parser dropped the block. The
+  answer keeps the whitespace at its two ends, which that parser trimmed.
+- **A marker counts where its state has a row for it.** The text markers are dropped from the
+  answer alone, and an action block is read in the answer alone: inside a thought both are the
+  thought's text, also where the thought is shown as content (`Format::without_reasoning`), and
+  under the JSON-answer option both are text inside a string of the answer. That parser removed
+  the text markers from all the text it read, and read an action block wherever it stood.
+
+The older parsers' names answer to this table: `cohere` for the calls, with the differences
+above, and `cohere_cmd` for the thought. On that parser's own cases the thought reads the same;
+what stands behind it does not: the table drops the answer's markers and the whitespace alone
+before them, where the `cohere_cmd` parser left the text behind the thought as written
+(`\n<|START_RESPONSE|>The answer is 42.<|END_RESPONSE|>`, which is `The answer is 42.` here).
+Streamed, the `cohere` parser read a call from one object alone between the action markers and
+gave the list the template renders back as text; the table gives the list's calls. Either name
+selects the table for both channels, as every name a table answers to does: beside `cohere`
+another reasoning parser's name no longer reads the thought (with `qwen3`, a `<think>` block
+stays in the answer), and `cohere_cmd` alone, where no other name and no registry row selects a
+reader, reads the calls as well, so a call in another family's form stays text. Under
+`--parser legacy` each name reads with its own parser.
+
+What it leaves open: the structural tag derived from the table spells a call `name` and
+`arguments`, which the table reads and the template does not write. A checkpoint whose template
+writes the answer between `<|START_TEXT|>` and `<|END_TEXT|>` has no recorded output and no row
+here; the table drops the two markers from the answer. Command R v01's two recorded cases hold
+content alone: a call it writes in another spelling than the action markers (its `tool_use`
+template, which a request with tools selects, is not among the recorded sets) reads as content
+here, as it does with the legacy parser.
 
 ## MiniCPM5 (`minicpm5`)
 
@@ -1027,6 +1124,29 @@ whether the model ever writes a message to a recipient the table has no row for 
 framing today); and whether `commentary` should reach the client as content or as a channel of its
 own, which the API has no place for.
 
+## gpt-oss (`gpt_oss`)
+
+The Harmony format writes a turn as messages: a header closed by `<|message|>`, a body, and
+`<|end|>`, `<|call|>` or `<|return|>`. The header names a channel after `<|channel|>` and, for a
+call, the recipient `to=functions.NAME`, before the channel or after it, then an optional
+`<|constrain|>json`. What the table says:
+
+- **A recipient makes the call, not the channel.** `to=functions.` opens a call wherever the header
+  holds it, on the commentary channel or the analysis channel, and the name runs to the next space
+  or marker, so a name with a dash or a dot is read whole.
+- **Everything between two messages is framing.** The headers, `<|start|>assistant` and a channel
+  the table does not name are dropped; the body of an unnamed channel is content.
+- **A preamble and the model's own tools are the thought.** A commentary message with no recipient,
+  a message to `python`, `browser` or `container` on any channel, and an analysis or commentary
+  message to any other recipient that is no function read as reasoning, as the gateway's Harmony
+  pipeline reads them; every thought of a turn is kept, in order.
+- **The stop closes the last call.** `<|call|>` and `<|return|>` are stop tokens the stop decoder
+  hides; a `<|start|>` inside a call's body ends the call where it stands.
+
+What it leaves open: the registry does not list the table, since it has no layout yet and so
+writes no structural tag for a forced call or a JSON answer; the gateway's Harmony pipeline serves
+the family until both are there.
+
 ## Kimi K2 (`kimi_k2`)
 
 What this table says beyond the DeepSeek V3.1 one, whose rows it has (a thought, content, a
@@ -1101,3 +1221,25 @@ wrapper state for the block, an arguments state per call):
   and the older parsers read that back as raw text (the module tests pin how the table reads
   those bytes: a thought and JSON content, no call). What the table leaves open: the recorded
   sets, and the live reading against the engine's own server.
+- **`kimi` is this table with a second pair of markers for the thought.** `kimi()` builds the same
+  rows and adds `◁think▷` and `◁/think▷`, the pair of the gateway's older `kimi` reasoning parser,
+  which the older parsers paired with this line's calls. A thought `◁think▷` opens is a state of
+  its own, which `◁/think▷` alone leaves: all between the two is the thought, a `</think>` and the
+  markers of a call among it, as the older parser read it. A `◁think▷` the prompt writes opens no
+  thought: the table names two turn anchors where `kimi_k2` names a turn opener, the turn's opener
+  and `◁think▷` alone, so the output starts in the content behind the last anchor the prompt
+  holds, whatever stands before it, as the older parser, which read no prompt, had it.
+  No prompt leaves that state open, then, and the structural tags, which close a thought the
+  prompt left open with `</think>`, never meet it. Two limits come with the anchor: a thought
+  between `<think>` and `</think>` that the prompt left open and that quotes `◁think▷` is read
+  from the content, its `</think>` shown there; and a prompt without the line's opener is replayed
+  from behind its last `◁think▷`, and not at all where it holds none. A call's id is minted, not
+  the header's: the older parsers left the ids of this name to the gateway, which numbers them by
+  the conversation for a model it knows as Kimi by its name, and still does. No group of the
+  registry reads with it: an operator names it. Under the gateway the name read alone gives way:
+  the registry's table reads a model it knows, and a table another source's names select reads the
+  others, as before the table came; `kimi` reads where nothing else does. Two departures from the
+  older `kimi` parser: text before `◁think▷` is content when the output is read whole, as the
+  older parser's streamed reading had it (its whole reading put that text in the thought); and a
+  thought between `<think>` and `</think>` is read as a thought, where the older parser left it in
+  the content with its markers.

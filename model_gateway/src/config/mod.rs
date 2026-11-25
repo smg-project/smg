@@ -1,5 +1,6 @@
 pub(crate) mod bounds;
 pub mod builder;
+mod policy_document;
 pub(crate) mod redacted;
 pub mod secrets;
 #[cfg(test)]
@@ -9,10 +10,12 @@ pub(crate) mod validation;
 mod worker_settings;
 
 pub use builder::*;
+use smg_service_discovery::DiscoveryConfigError;
 pub use types::*;
 pub(crate) use validation::parse_listen_ip;
 pub use validation::{
-    available_cpus, bind_socket_addr, dp_minimum_tokens_scheduler_scope_warning, parse_bind_host,
+    available_cpus, bind_socket_addr, dp_aware_deprecation_warning,
+    dp_minimum_tokens_scheduler_scope_warning, parse_bind_host,
     runtime_worker_threads_oversubscription, unused_credentials_warning,
     unused_credentials_warnings, validate_encode_policy, validate_mesh_listener_port,
     validate_mesh_server_name, validate_worker_url, RUNTIME_WORKER_THREADS_CEILING,
@@ -53,6 +56,23 @@ impl ConfigError {
     }
 }
 
+impl From<DiscoveryConfigError> for ConfigError {
+    fn from(error: DiscoveryConfigError) -> Self {
+        match error {
+            DiscoveryConfigError::ValidationFailed { reason } => Self::ValidationFailed { reason },
+            DiscoveryConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            } => Self::InvalidValue {
+                field,
+                value,
+                reason,
+            },
+        }
+    }
+}
+
 pub type ConfigResult<T> = Result<T, ConfigError>;
 
 #[cfg(test)]
@@ -83,6 +103,41 @@ mod config_error_tests {
         assert_eq!(
             (field.as_str(), value.as_str(), reason.as_str()),
             ("port", "0", "Must be > 0")
+        );
+    }
+
+    /// A discovery provider's refusal reaches the caller as the config error
+    /// of the same kind, in the same words.
+    #[test]
+    fn a_discovery_refusal_keeps_its_kind_and_its_words() {
+        use smg_service_discovery::DiscoveryConfigError;
+
+        let refusal = DiscoveryConfigError::ValidationFailed {
+            reason: "no worker pools".to_string(),
+        };
+        let words = refusal.to_string();
+        let mapped = ConfigError::from(refusal);
+        assert!(
+            matches!(mapped, ConfigError::ValidationFailed { .. }),
+            "{mapped:?}"
+        );
+        assert_eq!(mapped.to_string(), words);
+
+        let refusal = DiscoveryConfigError::InvalidValue {
+            field: "discovery.port".to_string(),
+            value: "0".to_string(),
+            reason: "Must be > 0".to_string(),
+        };
+        let words = refusal.to_string();
+        let mapped = ConfigError::from(refusal);
+        assert!(
+            matches!(mapped, ConfigError::InvalidValue { .. }),
+            "{mapped:?}"
+        );
+        assert_eq!(mapped.to_string(), words);
+        assert_eq!(
+            words,
+            "Invalid value for field 'discovery.port': 0 - Must be > 0"
         );
     }
 }

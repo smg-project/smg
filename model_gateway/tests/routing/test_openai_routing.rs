@@ -28,13 +28,17 @@ use smg::{
     endpoints::models::list_models,
     routers::{
         external::{external_context, ExternalRouterAdapter},
+        grpc::backend_client::BasicWorkerBuilder,
         RouterFactory,
     },
     tenant::{RouteRequestMeta, TenantKey},
-    worker::{test_support::RefusedAddress, BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
 };
 use smg_data_connector::{ResponseId, StoredResponse};
 use smg_external_router::{openai::OpenAIRouter, ExternalRouter};
+use smg_worker::{
+    identity::basic::{RuntimeType, Worker, WorkerType},
+    test_support::RefusedAddress,
+};
 use tokio::{
     net::TcpListener,
     time::{sleep, Duration},

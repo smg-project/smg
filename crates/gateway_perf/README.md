@@ -53,6 +53,12 @@ invocation; each target writes under it, `<stamp>/perf-cpu`, `<stamp>/perf-alloc
 `bench_gate` TOML for the verdict column). `target/release/gateway-perf <mode> --help` lists
 the rest; the driver finds the bed script under `--repo` (the current directory by default).
 
+One binary under two settings: `--base-gw-args` gives the base side gateway flags of its
+own, and the head keeps `--gw-args`. With the same file as `--base` and `--head` the two
+sides differ by their flags alone: `gateway-perf alloc --base target/release/smg --head
+target/release/smg --base-gw-args '<flags>' --gw-args '<flags>'`. The setup column then
+names both lists, and every cell of `cells.json` carries the flags its gateway ran under.
+
 ## The paths
 
 Every cell drives one path: 64 distinct deterministic prompts of 64 words (a shared head

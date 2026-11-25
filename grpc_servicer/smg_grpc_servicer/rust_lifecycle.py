@@ -61,7 +61,26 @@ from smg_grpc_servicer.warmup import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DRAIN_SECS = 5.0
+# Upper bound on the drain at a shutdown signal: in-flight streams get this
+# long to finish with the engine still up. The drain ends as soon as none is
+# left, so an idle servicer stops at once; the bound only matters under load,
+# where it must cover the longest stream worth keeping. The pod's termination
+# grace must cover it plus SERVER_STOP_SECS, ENGINE_TERMINATE_SECS and, for
+# vLLM, the engine manager's own shutdown that runs before that wait (vLLM's
+# --shutdown-timeout N, 5 s when it is 0), with a margin: 30 + 5 + 5 + 30 =
+# 70 s by default against Kubernetes' default grace of 30 s (the smg chart's
+# workers[].terminationGracePeriodSeconds defaults to 90); a vLLM
+# --shutdown-timeout N puts N in place of the second 5.
+DEFAULT_DRAIN_SECS = 30.0
+# Once no stream is left, the engine stays up this much longer (within the
+# drain bound): a PD prefill worker's finished requests may still have their
+# KV read by the decode worker, which the servicer does not see. A launcher
+# raises its own default for an engine that produces KV (see
+# ``RustLauncher.default_drain_linger_secs``); its ``*_DRAIN_LINGER_SECS``
+# variable overrides either.
+DRAIN_LINGER_SECS = 1.0
+# How often a drain that waits reports what it waits on.
+_DRAIN_LOG_SECS = 5.0
 ENGINE_TERMINATE_SECS = 30.0
 # How long the Rust server gets to stop: at the end of the supervision loop,
 # and when the engine launch behind an already-bound server failed.
@@ -335,10 +354,21 @@ def check_metrics_port_needs_rust(
     )
 
 
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+FREE_PORT_ATTEMPTS = 64
+
+
+def free_port(exclude: Iterable[int | None] = ()) -> int:
+    """An unused loopback TCP port that is none of ``exclude`` (ports about to be bound)."""
+    excluded = {port for port in exclude if port}
+    for _ in range(FREE_PORT_ATTEMPTS):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        if port not in excluded:
+            return port
+    raise OSError(
+        f"no free loopback port outside {sorted(excluded)} after {FREE_PORT_ATTEMPTS} draws"
+    )
 
 
 def default_socket_dir(environ: Mapping[str, str] | None = None) -> str:
@@ -378,6 +408,7 @@ class LauncherKnobs:
     silence_timeout_secs: float
     prefill_tokens_per_sec: int
     socket_dir: str
+    drain_linger_secs: float = DRAIN_LINGER_SECS
 
 
 def read_launcher_knobs(
@@ -388,14 +419,18 @@ def read_launcher_knobs(
     startup_ceiling_secs_env: str,
     silence_timeout_secs_env: str,
     prefill_tokens_per_sec_env: str,
+    drain_linger_secs_env: str | None = None,
+    default_drain_linger_secs: float = DRAIN_LINGER_SECS,
     socket_dir: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> LauncherKnobs:
     """Every knob of a Rust-servicer launcher at once, each failure a
     :class:`ServicerConfigError` naming its variable: the handshake port (1 to
-    65535, or a free one), the drain on a signal (0 s or more), the startup
-    silence bound (above 0 s), the startup ceiling (0 lifts it), the connected
-    engine's silence bound (above 0 s) and the prefill rate it allows (0 or
+    65535, or a free one), the drain on a signal (0 s or more), the linger
+    after the last stream (0 s or more, ``default_drain_linger_secs`` when
+    unset; always within the drain bound), the startup silence bound (above
+    0 s), the startup ceiling (0 lifts it), the connected engine's silence
+    bound (above 0 s) and the prefill rate it allows (0 or
     more tokens per second; 0 allows nothing), the IPC socket directory
     (``socket_dir``, else ``$SMG_ZMQ_SOCKET_DIR``, else the default; created).
     Nothing is read later: a bad value is refused before the gRPC port is
@@ -420,6 +455,13 @@ def read_launcher_knobs(
         ),
         socket_dir=prepare_socket_dir(
             default_socket_dir(environ) if socket_dir is None else socket_dir
+        ),
+        drain_linger_secs=(
+            default_drain_linger_secs
+            if drain_linger_secs_env is None
+            else env_float(
+                drain_linger_secs_env, default_drain_linger_secs, environ=environ, minimum=0.0
+            )
         ),
     )
 
@@ -1247,36 +1289,154 @@ def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> Non
         )
 
 
-async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: float) -> bool:
+def _active_requests(server: Any) -> int | None:
+    """The server's in-flight request count, or ``None`` for a binding that
+    does not report one."""
+    try:
+        count = getattr(server, "active_requests", None)
+    except Exception:  # noqa: BLE001 -- a failing getter degrades to the timed drain
+        logger.exception("Reading the in-flight request count failed")
+        return None
+    return count if isinstance(count, int) else None
+
+
+async def _pause(seconds: float, cut: asyncio.Event | None) -> bool:
+    """Sleep ``seconds``, less when ``cut`` is set meanwhile; whether it was."""
+    if cut is None:
+        await asyncio.sleep(max(seconds, 0.0))
+        return False
+    if cut.is_set():
+        return True
+    try:
+        await asyncio.wait_for(cut.wait(), max(seconds, 0.0))
+    except asyncio.TimeoutError:  # noqa: UP041 -- distinct from the builtin before 3.11
+        return False
+    return True
+
+
+def _log_cut(count: int | None) -> None:
+    logger.warning(
+        "A second shutdown signal ended the drain; stopping now%s",
+        f" with {count} request(s) in flight" if count else "",
+    )
+
+
+def _drain_outcome(server: Any, engine: Any) -> bool | None:
+    """``None`` while the drain may go on; otherwise how it ends: ``False``
+    for a failed server or an engine that exited with an error, ``True`` for
+    an engine that exited cleanly."""
+    if server.last_error or not server.running:
+        logger.error("Rust servicer failed during drain")
+        return False
+    rc = engine.poll()
+    if rc is None:
+        return None
+    if rc == 0:
+        logger.info("Engine exited cleanly during drain")
+        return True
+    logger.error("Engine exited with code %s during drain", rc)
+    return False
+
+
+async def drain_server(
+    server: Any,
+    engine: Any,
+    timeout: float,
+    poll_secs: float,
+    *,
+    linger_secs: float = 0.0,
+    cut: asyncio.Event | None = None,
+) -> bool:
     """Wait at most ``timeout`` for admitted requests; false means a failure.
 
-    Older bindings without a count retain their bounded grace period.
     Health/admission must already have been closed by ``set_serving(False)``.
-    A zero timeout checks the final status without waiting for requests.
+    Ends as soon as the server reports no request in flight (after
+    ``linger_secs`` more, within the bound), when the engine exits or the
+    server fails, when ``cut`` is set (a second shutdown signal), or at the
+    bound, warning with the number of streams the stop will cut. A binding
+    without an in-flight count gets the whole ``timeout``, as before; a count
+    that turns unreadable during the drain (the getter fails or reports
+    nothing) is not taken for none left: the rest of the bound is waited out
+    instead. A zero timeout checks the final status without waiting for
+    requests.
     """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    logger.info("Draining for up to %.1fs before stopping", timeout)
-    while True:
-        if server.last_error or not server.running:
-            logger.error("Rust servicer failed during drain")
-            return False
-        rc = engine.poll()
-        if rc is not None:
-            if rc == 0:
-                logger.info("Engine exited cleanly during drain")
-                return True
-            logger.error("Engine exited with code %s during drain", rc)
-            return False
-        active = getattr(server, "active_requests", None)
-        if active == 0:
-            logger.info("Drain complete; no requests remain")
+    started = loop.time()
+    deadline = started + timeout
+    count = _active_requests(server)
+    unreadable = count is None
+    if unreadable:
+        logger.info("Draining for up to %.1fs before stopping", timeout)
+    elif count:
+        logger.info(
+            "Draining: %d request(s) in flight, waiting up to %.1fs for them", count, timeout
+        )
+    next_log = started + _DRAIN_LOG_SECS
+    while unreadable or count:
+        outcome = _drain_outcome(server, engine)
+        if outcome is not None:
+            return outcome
+        now = loop.time()
+        if now >= deadline:
+            if count:
+                logger.warning(
+                    "Drain bound of %.1fs passed with %d request(s) still in flight; "
+                    "stopping cuts their streams",
+                    timeout,
+                    count,
+                )
+            else:
+                logger.info("Drain bound of %.1fs passed; stopping", timeout)
             return True
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            logger.info("Drain deadline reached; active requests: %s", active)
+        if count and now >= next_log:
+            logger.info("Draining: %d request(s) in flight after %.0fs", count, now - started)
+            next_log = now + _DRAIN_LOG_SECS
+        if await _pause(min(poll_secs, deadline - now), cut):
+            _log_cut(count)
             return True
-        await asyncio.sleep(min(poll_secs, remaining))
+        if not unreadable:
+            last, count = count, _active_requests(server)
+            if count is None:
+                unreadable = True
+                logger.warning(
+                    "The in-flight request count became unreadable during the drain (%d "
+                    "request(s) in flight at the last read); waiting out the remaining %.1fs "
+                    "of the bound",
+                    last,
+                    max(deadline - loop.time(), 0.0),
+                )
+    outcome = _drain_outcome(server, engine)
+    if outcome is not None:
+        return outcome
+    linger_end = loop.time() + max(min(linger_secs, deadline - loop.time()), 0.0)
+    logger.info(
+        "Drained in %.1fs: no request in flight; stopping in %.1fs",
+        loop.time() - started,
+        linger_end - loop.time(),
+    )
+    while (now := loop.time()) < linger_end:
+        if await _pause(min(poll_secs, linger_end - now), cut):
+            _log_cut(None)
+            return True
+        outcome = _drain_outcome(server, engine)
+        if outcome is not None:
+            return outcome
+    return True
+
+
+def shutdown_signal_handler(stop_event: asyncio.Event, cut: asyncio.Event) -> Callable[[], None]:
+    """The handler :func:`supervise` installs for SIGTERM and SIGINT: the
+    first signal sets ``stop_event`` (the drain begins), a later one sets
+    ``cut`` (the drain ends at once and the stop proceeds; an operator's
+    second Ctrl-C, or a supervisor's second SIGTERM)."""
+
+    def on_signal() -> None:
+        if not stop_event.is_set():
+            stop_event.set()
+        else:  # the drain logs what the cut ends
+            cut.set()
+
+    return on_signal
 
 
 def hold_readiness(server: Any, ready: bool) -> None:
@@ -1357,6 +1517,8 @@ async def supervise(
     engine: Any,
     *,
     drain_secs: float = DEFAULT_DRAIN_SECS,
+    linger_secs: float = 0.0,
+    drain_cut: asyncio.Event | None = None,
     stop_timeout: float = SERVER_STOP_SECS,
     stop_event: asyncio.Event | None = None,
     poll_secs: float = _POLL_SECS,
@@ -1382,17 +1544,24 @@ async def supervise(
     when it returned, whatever it returned.
 
     Signals drain: health flips to NOT_SERVING at once (the Router stops
-    routing here), in-flight streams get up to ``drain_secs`` to finish with the
-    engine still up, then the server stops and the engine is terminated.
-    Returns the process exit code.
+    routing here), in-flight streams get up to ``drain_secs`` to finish with
+    the engine still up (:func:`drain_server`, lingering ``linger_secs`` after
+    the last one; the launcher passes its ``*_DRAIN_LINGER_SECS`` knob), then
+    the server stops and the engine is terminated. A second signal during the
+    drain (``drain_cut``, set by the installed handler, see
+    :func:`shutdown_signal_handler`) ends it at once. Returns the process exit
+    code.
     """
     loop = asyncio.get_running_loop()
     note_engine_alive = getattr(server, "note_engine_alive", None)
     track = getattr(engine, "track", None)
+    if drain_cut is None:
+        drain_cut = asyncio.Event()
     if stop_event is None:
         stop_event = asyncio.Event()
+        on_signal = shutdown_signal_handler(stop_event, drain_cut)
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, stop_event.set)
+            loop.add_signal_handler(sig, on_signal)
     exit_code = 0
     announced_ready = False
     held: _WarmupHold | None = None
@@ -1443,7 +1612,14 @@ async def supervise(
             warming.cancel()
         try:
             if stop_event.is_set():
-                if not await drain_server(server, engine, drain_secs, poll_secs):
+                if not await drain_server(
+                    server,
+                    engine,
+                    drain_secs,
+                    poll_secs,
+                    linger_secs=linger_secs,
+                    cut=drain_cut,
+                ):
                     exit_code = 1
         finally:
             try:
@@ -1487,6 +1663,9 @@ class RustLauncher:
     # This launcher's own environment variables (:func:`read_launcher_knobs`).
     handshake_port_env: str
     drain_secs_env: str
+    # How long the engine stays up after the drain's last stream; a launcher
+    # without one keeps :data:`DRAIN_LINGER_SECS`.
+    drain_linger_secs_env: str | None = None
     startup_timeout_secs_env: str
     startup_ceiling_secs_env: str
     silence_timeout_secs_env: str
@@ -1505,6 +1684,14 @@ class RustLauncher:
     # The pass's default budget in seconds when the knob names none: the
     # shared default, or an engine module's own for a longer plan.
     warmup_default_budget_secs: float = DEFAULT_BUDGET_SECS
+
+    def default_drain_linger_secs(self, args: Any) -> float:
+        """How long the engine stays up after the drain's last stream when
+        ``drain_linger_secs_env`` is unset (:data:`DRAIN_LINGER_SECS` by
+        default; an engine that hands KV to a peer after its stream ends
+        keeps it up longer). Read from the launcher's arguments alone,
+        before any engine work."""
+        return DRAIN_LINGER_SECS
 
     def prepare(self, args: Any) -> None:
         """Engine-specific set-up after the knobs are read and the binding is
@@ -1656,6 +1843,8 @@ class RustLauncher:
             startup_ceiling_secs_env=self.startup_ceiling_secs_env,
             silence_timeout_secs_env=self.silence_timeout_secs_env,
             prefill_tokens_per_sec_env=self.prefill_tokens_per_sec_env,
+            drain_linger_secs_env=self.drain_linger_secs_env,
+            default_drain_linger_secs=self.default_drain_linger_secs(args),
             socket_dir=default_socket_dir(),
         )
         warmup_setting = read_warmup_setting(
@@ -1685,11 +1874,20 @@ class RustLauncher:
                 knob=self.warmup_env,
                 nonce=warmup_nonce,
             )
-        handshake_port = knobs.handshake_port or free_port()
         # The metrics endpoint, resolved and checked before the port is
         # bound and the engine starts (a clash with the gRPC port is refused
         # here, not by a bind after the engine loaded).
         metrics_bind_address = self.metrics_bind_address(args)
+        # The gRPC and metrics ports are not bound yet, so the kernel may hand them out.
+        # The metrics port is read off the resolved address, not the flag: a
+        # launcher may resolve its own (TokenSpeed's `--metrics-port` is the
+        # engine's, and its servicer's comes from the variable).
+        handshake_port = knobs.handshake_port or free_port(
+            exclude=(
+                int(getattr(args, "port", 0) or 0),
+                int(metrics_bind_address.rpartition(":")[2]) if metrics_bind_address else None,
+            )
+        )
         server = getattr(servicer, self.server_class)(
             bind_address=self.bind_address(args),
             # Per process, not per requested port: `--port 0` launchers would
@@ -1718,4 +1916,10 @@ class RustLauncher:
         self.announce(server, knobs, handshake_port, engine_count)
         engine = await launch_or_stop(server, lambda: self.launch(args, handshake_port, facts))
         self.launched(engine)
-        return await supervise(server, engine, drain_secs=knobs.drain_secs, **supervision)
+        return await supervise(
+            server,
+            engine,
+            drain_secs=knobs.drain_secs,
+            linger_secs=knobs.drain_linger_secs,
+            **supervision,
+        )

@@ -79,6 +79,62 @@ pub(super) struct Preformed {
     some: [u64; 16],
 }
 
+/// A vocabulary's tokens as the raw bytes they stand for, with their ids:
+/// one buffer for all of them, where a block per token was a few hundred
+/// thousand blocks alive at the peak of a load.
+pub(super) struct Raws {
+    bytes: Vec<u8>,
+    /// Per token: its id, where its bytes start and how many they are.
+    spans: Vec<(u32, u32, u32)>,
+    /// False once a token's place did not fit the spans' 32 bits.
+    whole: bool,
+}
+
+impl Raws {
+    /// For about `tokens` tokens of at most `bytes` bytes together: their
+    /// spans in one allocation, their bytes in one where `bytes` is known.
+    pub(super) fn for_tokens(tokens: usize, bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(bytes),
+            spans: Vec::with_capacity(tokens),
+            whole: true,
+        }
+    }
+
+    /// Adds the token `id` with the bytes `raw` yields: nothing for a token
+    /// without bytes, with a byte missing, or whose bytes `keep` refuses.
+    pub(super) fn push(
+        &mut self,
+        id: u32,
+        raw: impl IntoIterator<Item = Option<u8>>,
+        keep: impl FnOnce(&[u8]) -> bool,
+    ) {
+        let start = self.bytes.len();
+        for byte in raw {
+            let Some(byte) = byte else {
+                self.bytes.truncate(start);
+                return;
+            };
+            self.bytes.push(byte);
+        }
+        let len = self.bytes.len() - start;
+        if len > 0 && keep(&self.bytes[start..]) {
+            match (u32::try_from(start), u32::try_from(len)) {
+                (Ok(start), Ok(len)) => self.spans.push((id, start, len)),
+                _ => self.whole = false,
+            }
+        } else {
+            self.bytes.truncate(start);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&u32, &[u8])> {
+        self.spans
+            .iter()
+            .map(|(id, start, len)| (id, &self.bytes[*start as usize..][..*len as usize]))
+    }
+}
+
 impl Preformed {
     /// No pre-formable character.
     pub(super) fn empty() -> Self {
@@ -125,18 +181,18 @@ impl Preformed {
     /// model's alphabet spellings mapped back, a rank file's bytes as they
     /// are); `min_operand` holds, per id, the least rank of a merge that
     /// takes the id as an operand (`u32::MAX` for none).
-    pub(super) fn analyse(
-        table: &MergeTable,
-        mut raws: Vec<(u32, Vec<u8>)>,
-        min_operand: &[u32],
-    ) -> Self {
-        raws.retain(|(_, raw)| !raw.is_empty());
-        raws.sort_unstable_by_key(|(id, _)| *id);
+    pub(super) fn analyse(table: &MergeTable, mut raws: Raws, min_operand: &[u32]) -> Self {
+        // A token the spans could not place is a fragment the analysis would
+        // miss, and a character could pre-form where it must not: none does.
+        if !raws.whole {
+            return Self::empty();
+        }
+        raws.spans.sort_unstable_by_key(|&(id, ..)| id);
         // The fragment tokens: leading continuation bytes -> the rest;
         // a trailing incomplete character -> the bytes before it.
         let mut heads: FxHashMap<&[u8], Vec<Box<[u8]>>> = FxHashMap::default();
         let mut tails: FxHashMap<&[u8], Vec<Box<[u8]>>> = FxHashMap::default();
-        for (_, raw) in &raws {
+        for (_, raw) in raws.iter() {
             let lead = raw
                 .iter()
                 .take_while(|&&b| is_continuation(b))
@@ -158,7 +214,7 @@ impl Preformed {
         let mut rules = vec![Rule::default()];
         let mut rule_index: FxHashMap<Rule, u32> = FxHashMap::default();
         let mut any = false;
-        for (id, raw) in &raws {
+        for (id, raw) in raws.iter() {
             if !(2..=4).contains(&raw.len()) || *id > ID_MASK {
                 continue;
             }
@@ -263,7 +319,7 @@ impl Preformed {
         // Adjacent whole characters inside any token (a fragment token's
         // whole characters count too).
         let mut pairs: Vec<u64> = Vec::new();
-        for (_, raw) in &raws {
+        for (_, raw) in raws.iter() {
             let mut prev: Option<(u32, usize)> = None;
             let mut i = 0;
             while i < raw.len() {
@@ -284,6 +340,13 @@ impl Preformed {
                 }
             }
         }
+        // A pair stands in many tokens: one found again in the slot its
+        // last occurrence went through leaves before the sort.
+        let mut last = [u64::MAX; 1 << 12];
+        pairs.retain(|&pair| {
+            let slot = &mut last[bigram_bit(pair, last.len())];
+            std::mem::replace(slot, pair) != pair
+        });
         pairs.sort_unstable();
         pairs.dedup();
         let bits = (pairs.len() * BIGRAM_BITS_PER_PAIR)
@@ -416,8 +479,11 @@ fn one_char(bytes: &[u8]) -> Option<char> {
 /// The whole character at the start of `bytes` and its length, if one is
 /// there.
 fn whole_char(bytes: &[u8]) -> Option<(u32, usize)> {
+    if bytes[0] < 0x80 {
+        return Some((u32::from(bytes[0]), 1));
+    }
     let len = char_len(bytes[0]);
-    if bytes[0] >= 0x80 && len == 1 || len > bytes.len() {
+    if len == 1 || len > bytes.len() {
         return None;
     }
     let c = one_char(&bytes[..len])?;

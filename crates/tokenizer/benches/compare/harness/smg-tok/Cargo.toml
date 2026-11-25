@@ -1,0 +1,32 @@
+[package]
+name = "smg-tok"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A workspace of its own: every adapter builds one implementation with that implementation's own
+# dependency graph and profile, which the repository's workspace does not carry.
+[workspace]
+
+# This crate, from the checkout the harness lives in. `run.py prepare` builds a copy of this package
+# against another checkout for the column of an earlier release.
+[dependencies]
+llm-tokenizer = { path = "../../../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# The `v1` column: the same adapter over the crate's opt-in tokenizers v1 encoder.
+[features]
+tokenizers-v1 = ["llm-tokenizer/tokenizers-v1"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+# The repository's release profile: opt-level 3, fat LTO, one codegen unit.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = false
+debug = 0

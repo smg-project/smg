@@ -5,12 +5,12 @@ use openai_protocol::{
     generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
 use serde_json::json;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 
 use super::*;
 use crate::{
     config::types::PolicyConfig,
-    routers::grpc::regular::symphony::template::Templates,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    routers::grpc::{backend_client::BasicWorkerBuilder, regular::symphony::template::Templates},
 };
 
 const CANONICAL_MODEL: &str = "canonical-model";

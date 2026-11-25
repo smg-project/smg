@@ -17,6 +17,7 @@ pub mod event_types;
 pub mod ext;
 pub mod generate;
 pub mod interactions;
+mod kind_read;
 pub mod messages;
 mod messages_validation;
 pub mod models;

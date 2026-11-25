@@ -27,12 +27,27 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `ChatCompletionRequest.return_prompt_text` (a boolean, `false` unless sent, serialized only
+  when `true`), `ChatCompletionResponse.prompt_text` and
+  `ChatCompletionStreamResponse.prompt_text` (an optional string each, absent unless set): a chat
+  request asks for the prompt as rendered for the model, and the answer carries it. The gateway's
+  gRPC path fills it for a request that sends the worker no media (not where media travels with
+  the prompt, and not for a model served through the Harmony pipeline), at the top level of a
+  collected answer and on the first opening chunk of a stream.
+  Breaking for a caller that writes one of the three types as a whole literal: the literal names
+  the new field (a request literal that ends in `..Default::default()` does not).
 - `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
   map of its pairs), `responses::validate_metadata_pair_count` (its 16-pair bound alone, for a
   count read on its own), `responses::validate_input_message_role` (an input message's role in
   the public set) and `common::json_type_name` are public: a route that reads a metadata object or
   stores message items of its own (the gateway's Conversations routes) validates them with the
   rules the Responses request already validates with, in the same words and under the same codes.
+- `GenerationRequest::routing_text`, a provided method: the text the routing policies key on, by
+  default the text of `extract_text_for_routing`, so an implementer that states none is keyed as
+  before. `ChatCompletionRequest` states its own: the same text with a marker of 256 characters at
+  the place of each part that is no text (an image, an audio or a video clip, a part of an unknown
+  kind), 32 markers a request at most, each made from a digest of the part's reference that reads
+  1,024 bytes at most. The gateway's HTTP routes key a chat request on it.
 - `into_chat_tools` and the by-value `From<CustomTool> for Tool` and `From<InputSchema> for Value`:
   a caller that owns a Messages request's tools converts them into chat tools without copying the
   schemas (the properties and the additional fields move in); the by-reference forms stay for a
@@ -305,6 +320,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
   its `top_n` keeps reading `0` as all documents. `TokenizeRequest` and `DetokenizeRequest`
   declare no rule; the rules `EmbeddingRequest` and `ClassifyRequest` declare follow.
+- The `/v1/audio/transcriptions` relay forwards the form's text fields the gateway's types do not
+  model: the public API's `include[]`, `chunking_strategy` (and the SDK's bracketed
+  `chunking_strategy[...]` keys), `known_speaker_names[]`, `known_speaker_references[]` and the
+  next field the API adds. The extractor drained them and the HTTP router rebuilt the worker's
+  form from the typed fields alone, so a transcription answered without the logprobs, speaker
+  names or chunking the client asked for. `TranscriptionRequest.other` keeps them in order under
+  the names they came with, and the router appends them to the worker's form; a file part under
+  another name is still drained. The gRPC pipeline builds its request from the typed fields and
+  does not read them. Breaking: `TranscriptionRequest` gains `other`.
 - The preview web search tool takes the public API's dated type, `web_search_preview_2025_03_11`,
   written back under the canonical `web_search_preview`, and its `search_content_types`. The crate
   refused a request declaring either, as an unknown tool type or field. Breaking:
@@ -316,6 +340,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `InteractionsTool` gains `ComputerUse`, `GoogleMaps` and `Retrieval`, `GoogleSearch` gains
   `search_types`, `McpServer.allowed_tools` is a `Vec<AllowedTools>`, and `ToolChoiceType`, which
   the SDK keeps open as it does the tools' other sets, gains `Other` and is `#[non_exhaustive]`.
+- Interactions content keeps the fields the public API added: an audio part's `channels` and
+  `sample_rate` (and an audio delta's), a video part's `processing` and `name`, and a text
+  annotation's `type` and that kind's fields (a URL citation's `url` and `title`, a file
+  citation's `file_name` and `page_number`, ...). Each was dropped on the way to the upstream.
+  Breaking: `Content::Audio`, `Delta::Audio` and `Content::Video` gain the fields, and
+  `Annotation` gains `other`.
 - `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
   an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
   member of another kind than the first is refused by its index), and `EmbeddingRequest` the
@@ -375,6 +405,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   So does a key of the generation and agent configs (`maxOutputTokens`, `stopSequences`,
   `thinkingSummaries`, ...), which goes upstream in snake_case with its value.
   Breaking: `InteractionsRequest` gains `other: Map<String, Value>`.
+- A Messages image or document whose source is a file uploaded through the Files API
+  (`{"type": "file", "file_id": ...}`) is accepted and forwarded as written, as the public API
+  takes it. The source was an unknown variant, which refused the whole request. The gRPC router,
+  which has no Files API to read the file from, refuses such an image naming the block wherever it
+  appears, and such a document at a message's top level; a document inside a tool result is left
+  out of its prompt, as every document there is today. Breaking: `ImageSource` and
+  `DocumentSource` gain `File`.
 - `GenerateRequest` runs the rules of its `sampling_params`, with the chat route's lower bound on
   `n`, and refuses an empty `input_ids` as the chat route refuses an empty `messages`, so the
   gateway's `/generate` reads its body through the validated extractor and answers a negative
@@ -384,6 +421,8 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `input_ids`, `input_embeds`), as `missing_required_parameter`; a body with both `text` and
   `input_ids` and an `input_embeds`-only body stay with the routers as today. The cross-field sampling rules (`min_new_tokens` above
   `max_new_tokens`, more than one structured-output constraint) name their field in `error.param`.
+- `SamplingParams::n` ends at 128, the upper bound `ChatCompletionRequest` and `CompletionRequest`
+  put on their `n`: a `/generate` body that asks more choices is refused as an `n` of zero is.
 - An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
   the request is written back for an upstream, as the HTTP router and the provider routers write
   it. The crate dropped all three while reading the message, so a replayed refused turn reached a

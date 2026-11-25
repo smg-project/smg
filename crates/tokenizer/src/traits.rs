@@ -156,11 +156,9 @@ pub trait Encoder: Send + Sync {
 /// Per-stream state that turns generated token ids into text one at a time.
 ///
 /// Implementations own whatever they need (pending bytes, a decode window)
-/// and must produce, over a whole stream, steps and finish together, the
-/// text [`Decoder::decode`] gives for all of its ids, a character the
-/// stream's end cut short included, as the replacement character (the one
-/// exception, a ByteFallback vocabulary's window, is named at
-/// [`finish_into`](Self::finish_into)).
+/// and must produce the text that became complete during the stream. A
+/// character for which the stream ends before all of its bytes arrive is not
+/// emitted.
 pub trait IncrementalDecoder: Send + Sync {
     /// Feed one token; returns the text that became final with it (empty when
     /// the token only extends a multi-byte character or is skipped).
@@ -177,16 +175,11 @@ pub trait IncrementalDecoder: Send + Sync {
         Ok(!text.is_empty())
     }
 
-    /// The stream's end: appends the text the decoder still holds, rendered
-    /// as [`Decoder::decode`] renders the end of the same ids: a complete
-    /// character as it is, a stray invalid byte and an incomplete trailing
-    /// sequence (the start of a character the model never finished) as the
-    /// replacement character. The one exception is a ByteFallback
-    /// vocabulary's window, which keeps a cut character's byte tokens off
-    /// its end: its decoder renders the whole byte run around them as
-    /// replacement characters, rewriting text already sent. Says whether
-    /// anything was appended. The default is for a decoder that holds
-    /// nothing back between steps.
+    /// The stream's end: appends complete text the decoder still holds and
+    /// drops an incomplete trailing character. Invalid bytes that are not a
+    /// character prefix still render as replacement characters. Says whether
+    /// anything was appended. The default is for a decoder that holds nothing
+    /// back between steps.
     fn finish_into(&mut self, out: &mut String) -> Result<bool> {
         let _ = out;
         Ok(false)
@@ -278,13 +271,10 @@ pub trait Decoder: Send + Sync {
     /// decoder whose final text no longer starts with what it emitted reports
     /// `prefix_mismatch` and returns the remainder instead of failing. The
     /// default releases what [`decode_step`](Self::decode_step) holds: the
-    /// window's decode past the emitted prefix, and leaves the window empty;
-    /// a window that holds the bytes of a character the end cut short (a
-    /// tiktoken vocabulary without its per-id table) releases them as
-    /// `decode` renders them, the replacement character. A Hugging Face
-    /// vocabulary with byte fallback overrides this: its window keeps a cut
-    /// character's byte tokens off its end (see
-    /// [`IncrementalDecoder::finish_into`]).
+    /// window's decode past the emitted prefix, and leaves the window empty.
+    /// A decoder backed by raw bytes overrides this so it can distinguish an
+    /// incomplete suffix from invalid bytes or a literal replacement
+    /// character (see [`IncrementalDecoder::finish_into`]).
     fn finish_decode(
         &self,
         ids: &mut Vec<TokenIdType>,
@@ -605,6 +595,19 @@ pub trait Tokenizer: Encoder + Decoder {
         Err(anyhow::anyhow!(
             "set_chat_template is not supported by this tokenizer"
         ))
+    }
+
+    /// The largest id the tokenizer knows, added tokens included, as vLLM's
+    /// `tokenizer.max_token_id` reads it: a multimodal placeholder token can
+    /// lie past the model's vocabulary, so the ids an engine's frontend admits
+    /// are bounded by the larger of the two. The default reads it off
+    /// [`Self::vocab_size`], which suits a vocabulary that counts every id;
+    /// one whose size leaves its added tokens out overrides it. `None` for an
+    /// empty vocabulary.
+    fn max_token_id(&self) -> Option<TokenIdType> {
+        self.vocab_size()
+            .checked_sub(1)
+            .map(|id| TokenIdType::try_from(id).unwrap_or(TokenIdType::MAX))
     }
 
     /// EOS token IDs for stop detection.

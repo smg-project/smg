@@ -47,6 +47,7 @@
 //! tests hold the scan against.
 
 use super::{
+    block,
     pattern::{concat, plain_class, previous_boundary, repeat, Class, Node},
     scan::{Bits, Roles, WordScan},
     Pieces, Stage,
@@ -221,6 +222,10 @@ pub(super) struct Scanner {
     /// (`Roles::run_end_as_in`): no stop class holds an ASCII character of
     /// the scanned sets, so a word of members never hides a stop.
     word_scans: bool,
+    /// Whether the encoder may read a text by blocks: [`block`]'s pass cuts
+    /// plain ASCII text as this scanner does
+    /// ([`Self::reads_ascii_as_blocks`]).
+    blocks: bool,
 }
 
 impl Scanner {
@@ -265,12 +270,60 @@ impl Scanner {
         }
         let roles = Roles::build(&classes);
         let word_scans = roles.ascii_members(STAGE_STOP) & WordScan::MEMBERS == 0;
-        tracing::debug!(word_scans, "the native encode path takes the chain scanner");
+        let blocks = Self::reads_ascii_as_blocks(&roles, *digits);
+        tracing::debug!(
+            word_scans,
+            blocks,
+            "the native encode path takes the chain scanner"
+        );
         Some(Self {
             roles,
             digits: *digits,
             word_scans,
+            blocks,
         })
+    }
+
+    /// Whether [`block`]'s pass cuts plain ASCII text as this scanner does.
+    /// The pass computes the starts from the plain ASCII sets, so every
+    /// role must hold, of ASCII, exactly its set of them: the ten digits in
+    /// the first stage's class and nothing in the second's, the letters,
+    /// the punctuation marks and the whitespace in the template's places,
+    /// and every other character as a lead-in alone (a control character:
+    /// the pass leaves a block that holds one to the scanner). The digit
+    /// bound must fit a block's shifts. A chain with another class in any
+    /// place is matched by the scanner alone.
+    fn reads_ascii_as_blocks(roles: &Roles, digits: u32) -> bool {
+        let ascii = |test: &dyn Fn(u8) -> bool| {
+            (0..128u8)
+                .filter(|&code| test(code))
+                .fold(0u128, |set, code| set | (1 << code))
+        };
+        let letters = ascii(&block::is_letter);
+        let digit_set = ascii(&block::is_digit);
+        let spaces = ascii(&block::is_space);
+        let breaks = ascii(&block::is_break);
+        let controls = ascii(&|code| code.is_ascii_control()) & !spaces;
+        let punct = !(letters | digit_set | spaces | controls);
+        [
+            (Role::Digit, digit_set),
+            (Role::Run, 0),
+            (Role::PunctLead, punct),
+            (Role::PunctLetter, letters),
+            (Role::Lead, !(letters | punct | breaks)),
+            (Role::Word, letters),
+            (Role::PunctSpace, 1 << b' '),
+            (Role::Punct, punct),
+            (Role::PunctBreak, breaks),
+            (Role::BreakSpace, spaces),
+            (Role::Break, breaks),
+            (Role::TrailSpace, spaces),
+            (Role::NotTrail, !spaces),
+            (Role::Space, spaces),
+        ]
+        .into_iter()
+        .all(|(role, set)| roles.ascii_members(role.bit()) == set)
+            && (digits < u64::BITS || digits == u32::MAX)
     }
 
     /// Calls `f` with each piece of `text` as its byte range, in order; the
@@ -278,19 +331,108 @@ impl Scanner {
     /// leave no character out. `words` says the run loops take their word
     /// scans (a long input, or a unit that opens as ASCII text; see the
     /// encoder's `WORD_SCAN_MIN_BYTES`): the walk is compiled both ways and
-    /// the choice is made once per unit.
-    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, words: bool, f: &mut F) {
-        if words {
-            self.pieces_as::<true, F>(text, f);
+    /// the choice is made once per unit. A unit [`block`]'s pass serves
+    /// ([`Self::by_blocks`]) is read by blocks, any other by the scanner's
+    /// own loop. `f` is taken by value, so that a caller's closure can ask
+    /// to be compiled into the walk (`#[inline(always)]` on the closure, as
+    /// the encoder's probe does).
+    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, words: bool, mut f: F) {
+        if self.by_blocks(text, words) {
+            if words {
+                self.pieces_by_blocks::<true, F>(text, &mut f);
+            } else {
+                self.pieces_by_blocks::<false, F>(text, &mut f);
+            }
+        } else if words {
+            self.pieces_as::<true, F>(text, &mut f);
         } else {
-            self.pieces_as::<false, F>(text, f);
+            self.pieces_as::<false, F>(text, &mut f);
         }
     }
 
-    /// [`Self::pieces`] with the word scans on or off.
-    fn pieces_as<const WORDS: bool, F: FnMut(usize, usize)>(&self, text: &str, f: &mut F) {
+    /// Whether `text` is read by blocks, decided as the pass's other caller
+    /// decides it (`Pattern::by_blocks`): [`block`]'s pass cuts as this
+    /// scanner does, the text is no shorter than the pass's bound, and one
+    /// of the places it is asked at begins an ASCII stretch
+    /// ([`block::has_stretch`]). A text of under one step between two such
+    /// places is asked at its opening alone, and one that takes no word
+    /// scans (`words`) has answered that, it does not open as ASCII text:
+    /// it is not asked, and runs the code it ran before the pass. A longer
+    /// text in another script pays the test and keeps the scanner's own
+    /// loop.
+    #[inline]
+    fn by_blocks(&self, text: &str, words: bool) -> bool {
+        self.blocks
+            && text.len() >= block::MIN_BYTES
+            && (words || text.len() >= block::SAMPLE)
+            && block::has_stretch(text.as_bytes())
+    }
+
+    /// [`Self::pieces`] through [`block`]'s pass, word scans on or off. The
+    /// pass cuts each stretch of plain ASCII. What lies between two
+    /// stretches and behind the last one is cut here by the scanner's loop
+    /// with a bound, from the piece the pass left open up to the first
+    /// piece start a walk further on:
+    /// text beyond ASCII, a block with a control character, a blank run the
+    /// pass declines, the text's last block. Behind a stretch of four
+    /// blocks or more the pass is tried again two blocks on; where it cut
+    /// less the walk goes twice as far as the one before, up to
+    /// [`block::MAX_WALK`]. The pass begins at any piece start and the
+    /// scanner at any other: no rule of the template reads the text before
+    /// a piece's start, and a group of the first stage begins at each of
+    /// its cuts. Out of line: compiled into [`Self::pieces`], it made the
+    /// scanner's own loop there dearer (counted on a memorized text of
+    /// 1.5 KB in another script: about a hundred instructions a text).
+    #[inline(never)]
+    fn pieces_by_blocks<const WORDS: bool, F: FnMut(usize, usize)>(&self, text: &str, f: &mut F) {
         let mut pos = 0;
+        let mut walk = 2 * block::BLOCK;
+        while pos < text.len() {
+            let open = block::chain_pieces(text.as_bytes(), pos, self.digits, f);
+            // The pass reads two blocks before it cuts one, so a short
+            // stretch pays for more blocks than it cuts: only a stretch of
+            // four blocks says the text reads by blocks here.
+            walk = if open - pos >= 4 * block::BLOCK {
+                2 * block::BLOCK
+            } else {
+                (2 * walk).min(block::MAX_WALK)
+            };
+            pos = self.pieces_from::<WORDS, true, F>(text, open, open + walk, f);
+        }
+    }
+
+    /// A piece end off the walk's main path (a digit group or a run taken
+    /// whole, the text before a match or after the last one): the callback
+    /// out of line, so that a callback compiled into the walk stands at the
+    /// template's match alone.
+    #[inline(never)]
+    fn aside<F: FnMut(usize, usize)>(f: &mut F, start: usize, end: usize) {
+        f(start, end);
+    }
+
+    /// [`Self::pieces`] by the scanner's own loop, with the word scans on or
+    /// off.
+    fn pieces_as<const WORDS: bool, F: FnMut(usize, usize)>(&self, text: &str, f: &mut F) {
+        self.pieces_from::<WORDS, false, F>(text, 0, usize::MAX, f);
+    }
+
+    /// The pieces of `text` from `from`, a piece's start, to its end; with
+    /// `BOUNDED`, to the first piece start at or behind `until`, which is
+    /// answered (the text's length when there is none): the walk by blocks
+    /// reads the text between two stretches of the pass this way.
+    #[inline(always)]
+    fn pieces_from<const WORDS: bool, const BOUNDED: bool, F: FnMut(usize, usize)>(
+        &self,
+        text: &str,
+        from: usize,
+        until: usize,
+        f: &mut F,
+    ) -> usize {
+        let mut pos = from;
         while let Some((c, len)) = self.roles.at(text, pos) {
+            if BOUNDED && pos >= until {
+                break;
+            }
             let after = pos + len;
             pos = if c & Role::Digit.bit() != 0 {
                 // The first stage: a group of up to the bound; the stages
@@ -314,7 +456,7 @@ impl Scanner {
                     // class or opens a match of the template: the group is
                     // one piece, and the two stages' reads of it are left
                     // out.
-                    f(pos, end);
+                    Self::aside(f, pos, end);
                 } else {
                     self.group_pieces::<WORDS, F>(text, pos, end, f);
                 }
@@ -337,17 +479,25 @@ impl Scanner {
                     // first opens no punctuation match: the template's
                     // letter run takes the run whole, so the run is one
                     // piece and the template's read of it is left out.
-                    f(pos, end);
+                    Self::aside(f, pos, end);
                     end
                 } else {
-                    self.template_pieces::<WORDS, F>(text, pos, end, 0, f)
+                    self.template_pieces::<WORDS, false, F>(text, pos, end, 0, usize::MAX, f)
                 }
             } else {
                 // A gap of both: the stretch to the next digit or run
                 // character, which the template cuts as it reads it.
-                self.template_pieces::<WORDS, F>(text, pos, text.len(), STAGE_STOP, f)
+                self.template_pieces::<WORDS, BOUNDED, F>(
+                    text,
+                    pos,
+                    text.len(),
+                    STAGE_STOP,
+                    until,
+                    f,
+                )
             };
         }
+        pos
     }
 
     /// The second and third stages over one group of the first,
@@ -377,7 +527,7 @@ impl Scanner {
                     _ => break,
                 }
             }
-            self.template_pieces::<WORDS, F>(text, pos, piece_end, 0, f);
+            self.template_pieces::<WORDS, false, F>(text, pos, piece_end, 0, usize::MAX, f);
             pos = piece_end;
         }
     }
@@ -388,12 +538,13 @@ impl Scanner {
     /// stages' pieces, which the template cuts with that character as the
     /// end of the text): its matches, and the text between them as pieces
     /// of their own. Answers where the piece ended.
-    fn template_pieces<const WORDS: bool, F: FnMut(usize, usize)>(
+    fn template_pieces<const WORDS: bool, const BOUNDED: bool, F: FnMut(usize, usize)>(
         &self,
         text: &str,
         start: usize,
         end: usize,
         stop: Bits,
+        until: usize,
         f: &mut F,
     ) -> usize {
         let piece = &text[start..end];
@@ -403,17 +554,22 @@ impl Scanner {
             match self.template_match::<WORDS>(piece, pos, c, len, stop) {
                 Some(matched) => {
                     if gap < pos {
-                        f(start + gap, start + pos);
+                        Self::aside(f, start + gap, start + pos);
                     }
                     f(start + pos, start + matched);
                     pos = matched;
                     gap = matched;
+                    // The walk by blocks stops at the first piece start at
+                    // or behind its bound (`BOUNDED`).
+                    if BOUNDED && start + matched >= until {
+                        break;
+                    }
                 }
                 None => pos += len,
             }
         }
         if gap < pos {
-            f(start + gap, start + pos);
+            Self::aside(f, start + gap, start + pos);
         }
         start + pos
     }
@@ -458,6 +614,11 @@ impl Scanner {
     /// character with the role bits `c` of `len` bytes stands, if one does:
     /// the first of the six alternatives that matches there, as the engine
     /// picks it; a character holding one of `stop` is the end of the text.
+    /// Compiled into each copy of the template's loop: the loop has a
+    /// bounded copy for the walk by blocks, and as a routine with two
+    /// callers this was a call a piece (counted: about twenty instructions
+    /// a piece on the walk, two on a short text).
+    #[inline(always)]
     fn template_match<const WORDS: bool>(
         &self,
         text: &str,
@@ -580,7 +741,11 @@ mod tests {
     };
 
     use super::{
-        super::{pattern::Pattern, Pieces, Stage, Walk},
+        super::{
+            pattern::Pattern,
+            tests::{pseudo_random, staged},
+            Pieces, Stage,
+        },
         *,
     };
 
@@ -621,53 +786,6 @@ mod tests {
             "the word scans and the byte loop cut {text:?} alike"
         );
         pieces
-    }
-
-    /// The pieces of the stage patterns run in turn, each over the pieces
-    /// of the one before (the recursion of `NativeEncoder::pieces`).
-    fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
-        fn walk(stages: &[Stage], text: &str, offset: usize, out: &mut Vec<(usize, usize)>) {
-            if text.is_empty() {
-                return;
-            }
-            let Some((stage, rest)) = stages.split_first() else {
-                out.push((offset, offset + text.len()));
-                return;
-            };
-            let (gaps, matches) = match stage.pieces.walk() {
-                Walk::Merged => {
-                    let mut merged = None;
-                    for (start, _) in stage.pattern.find_iter(text) {
-                        match merged {
-                            Some(from) => walk(rest, &text[from..start], offset + from, out),
-                            None if start > 0 => walk(rest, &text[..start], offset, out),
-                            None => {}
-                        }
-                        merged = Some(start);
-                    }
-                    let from = merged.unwrap_or(0);
-                    walk(rest, &text[from..], offset + from, out);
-                    return;
-                }
-                Walk::Apart { gaps, matches } => (gaps, matches),
-            };
-            let mut cursor = 0;
-            for (start, end) in stage.pattern.find_iter(text) {
-                if gaps && cursor < start {
-                    walk(rest, &text[cursor..start], offset + cursor, out);
-                }
-                if matches {
-                    walk(rest, &text[start..end], offset + start, out);
-                }
-                cursor = end;
-            }
-            if gaps && cursor < text.len() {
-                walk(rest, &text[cursor..], offset + cursor, out);
-            }
-        }
-        let mut out = Vec::new();
-        walk(stages, text, 0, &mut out);
-        out
     }
 
     /// The pieces of the engine: a `Sequence` of `Split`s over the text.
@@ -739,13 +857,6 @@ mod tests {
                 "the stage alone; text {text:?}"
             );
         }
-    }
-
-    fn pseudo_random(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
     }
 
     /// Text shaped for the chain's stages: digit runs of every length up to
@@ -840,6 +951,238 @@ mod tests {
         (0..parts)
             .map(|_| PARTS[(pseudo_random(state) % PARTS.len() as u64) as usize])
             .collect()
+    }
+
+    /// The walk by blocks cuts as the scanner alone does. The text is
+    /// plain ASCII in stretches, shaped around the three rules in which
+    /// the chain's template and the GPT-4 family's differ there (no
+    /// clitic, a run of blanks before a digit stays whole, a control
+    /// character is no punctuation), with a part beyond the pass's classes
+    /// thrown in never, rarely or often, so the pass begins and hands back
+    /// at every kind of piece start and at every block edge.
+    #[test]
+    fn the_walk_by_blocks_cuts_as_the_scanner_alone() {
+        const PLAIN: &[&str] = &[
+            "a",
+            "b",
+            "word",
+            "Word",
+            "x",
+            "I",
+            " ",
+            " ",
+            " ",
+            "  ",
+            "   ",
+            "\t",
+            "\t\t",
+            "\n",
+            "\n",
+            "\r\n",
+            "\n\n",
+            " \n",
+            "\n ",
+            "\n  ",
+            "\n\t",
+            "1",
+            "22",
+            "333",
+            "4444",
+            "55555",
+            "7777777",
+            " 1",
+            "  1",
+            "   22",
+            "\t1",
+            "\n 1",
+            "\n  1",
+            ".",
+            ",",
+            "!",
+            "?",
+            "'",
+            "'s",
+            "'re",
+            "'ll",
+            "(",
+            ")",
+            "((",
+            " (",
+            " .",
+            "._",
+            "-",
+            "--",
+            "\"",
+            ".\n",
+            "!\r\n\r\n",
+            "don't",
+            "x.y",
+            "_",
+            "$",
+            "+",
+            "=",
+            "\u{b}",
+            "\u{c}",
+        ];
+        const ODD: &[&str] = &[
+            "\u{1}",
+            "\u{7f}",
+            "\u{1}a",
+            "\u{0}",
+            "\u{e9}",
+            "\u{65e5}\u{672c}",
+            "\u{30ab}\u{30fb}",
+            "\u{44f}",
+            "\u{2014}",
+            "\u{a0}",
+            "\u{663}",
+            "\u{3000}",
+            "\u{1f600}",
+        ];
+        let shipped = Scanner::recognize(&chain(&[DIGITS, RUNS, TEMPLATE])).expect("the scanner");
+        assert!(
+            shipped.blocks,
+            "the shipped chain reads plain ASCII by blocks"
+        );
+        let one = Scanner::recognize(&chain(&[ONE_DIGIT, RUNS, TEMPLATE])).expect("the scanner");
+        assert!(one.blocks, "a one-digit first stage reads by blocks too");
+        let overlapping =
+            Scanner::recognize(&chain(&[HEX, LETTERS, TEMPLATE])).expect("the scanner");
+        assert!(
+            !overlapping.blocks,
+            "a digit class holding a-f keeps the scanner"
+        );
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for scanner in [&shipped, &one] {
+            for round in 0..3000usize {
+                let odd_every = [0u64, 64, 8][round % 3];
+                let mut text = String::new();
+                // One round in eight is long, so that its walks double
+                // further.
+                let parts = (150 + round % 250) * if round % 8 == 7 { 8 } else { 1 };
+                for _ in 0..parts {
+                    let pick = pseudo_random(&mut state);
+                    let pool = if odd_every != 0 && (pick >> 32).is_multiple_of(odd_every) {
+                        ODD
+                    } else {
+                        PLAIN
+                    };
+                    text.push_str(pool[(pick % pool.len() as u64) as usize]);
+                }
+                let mut alone = Vec::new();
+                scanner.pieces_as::<false, _>(&text, &mut |start, end| alone.push((start, end)));
+                let mut by_blocks = Vec::new();
+                scanner.pieces_by_blocks::<false, _>(&text, &mut |start, end| {
+                    by_blocks.push((start, end));
+                });
+                assert_eq!(by_blocks, alone, "text {text:?}");
+                by_blocks.clear();
+                scanner.pieces_by_blocks::<true, _>(&text, &mut |start, end| {
+                    by_blocks.push((start, end));
+                });
+                assert_eq!(by_blocks, alone, "with the word scans; text {text:?}");
+            }
+        }
+        // The pass itself cuts plain text up to its last blocks.
+        let plain = "word, 12  345 (x) don't\n  go ".repeat(40);
+        let mut cut = 0;
+        let open = block::chain_pieces(plain.as_bytes(), 0, 3, &mut |_, _| cut += 1);
+        assert!(
+            cut > 100 && open + 3 * block::BLOCK >= plain.len(),
+            "{cut} pieces, open at {open} of {}",
+            plain.len()
+        );
+    }
+
+    /// A run of blanks behind a line break that fills the whole block behind
+    /// its first blank: whether that blank starts a piece hangs on the byte
+    /// that ends the run, and the pass then reads it past the next block
+    /// (`Edge::starts` of `block`). The generated texts above hold no run
+    /// that long. Here the break stands at every offset of a block, the run
+    /// is from just under one block to three blocks long, and it ends in
+    /// each kind of byte the pass can meet there: the text's end; a letter;
+    /// a digit, which the chain's template never sees, alone and before a
+    /// line break (the run ends at the digit all the same); a control
+    /// character, whose block is the scanner's; a line break of either
+    /// kind, with which the run is one piece from its first break on; and
+    /// beyond ASCII, where the pass declines, a letter, a digit, and
+    /// whitespace before a line break (the run goes on through it). The
+    /// scanner alone and the walk by blocks cut each text as the engine
+    /// does.
+    #[test]
+    fn a_block_of_blanks_behind_a_line_break_is_cut_as_the_engine_cuts_it() {
+        const ENDS: &[&str] = &[
+            "", "x", "1", "1\n", "\u{1}", "\n", "\r", "\u{e9}", "\u{663}", "\u{a0}\n",
+        ];
+        const BLANKS: [usize; 5] = [
+            block::BLOCK - 1,
+            block::BLOCK,
+            block::BLOCK + 1,
+            2 * block::BLOCK,
+            3 * block::BLOCK,
+        ];
+        let words = "word ".repeat(40);
+        for patterns in [[DIGITS, RUNS, TEMPLATE], [ONE_DIGIT, RUNS, TEMPLATE]] {
+            let scanner = Scanner::recognize(&chain(&patterns)).expect("the scanner");
+            assert!(scanner.blocks, "the chain reads plain ASCII by blocks");
+            for shift in 0..block::BLOCK {
+                let lead = &words[..2 * block::BLOCK + shift];
+                for blanks in BLANKS {
+                    let run = " ".repeat(blanks);
+                    for ends_in in ENDS {
+                        for tail in ["", words.as_str()] {
+                            let text = format!("{lead}\n{run}{ends_in}{tail}");
+                            let cut = engine(&patterns, &text);
+                            let mut alone = Vec::new();
+                            scanner.pieces_as::<false, _>(&text, &mut |start, end| {
+                                alone.push((start, end));
+                            });
+                            assert_eq!(alone, cut, "the scanner alone; text {text:?}");
+                            let mut by_blocks = Vec::new();
+                            scanner.pieces_by_blocks::<false, _>(&text, &mut |start, end| {
+                                by_blocks.push((start, end));
+                            });
+                            assert_eq!(by_blocks, cut, "by blocks; text {text:?}");
+                            by_blocks.clear();
+                            scanner.pieces_by_blocks::<true, _>(&text, &mut |start, end| {
+                                by_blocks.push((start, end));
+                            });
+                            assert_eq!(by_blocks, cut, "with the word scans; text {text:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A text is read by blocks only where the pass serves it: from the
+    /// pass's bound on, with an ASCII stretch at one of the places the text
+    /// is asked at. A text in another script keeps the scanner's own loop,
+    /// and a short one that takes no word scans is not asked at all.
+    #[test]
+    fn a_text_is_read_by_blocks_only_with_an_ascii_stretch() {
+        let scanner = Scanner::recognize(&chain(&[DIGITS, RUNS, TEMPLATE])).expect("the scanner");
+        let ascii = "word ".repeat(block::MIN_BYTES);
+        assert!(scanner.by_blocks(&ascii, true));
+        assert!(!scanner.by_blocks(&ascii[..block::MIN_BYTES - 1], true));
+        // A text under one step between two places is asked at its opening
+        // alone: one that takes no word scans has answered, and is not
+        // asked.
+        assert!(ascii.len() < block::SAMPLE);
+        assert!(!scanner.by_blocks(&ascii, false));
+        let cyrillic = "слово ".repeat(block::MIN_BYTES);
+        assert!(cyrillic.len() >= block::SAMPLE);
+        assert!(!scanner.by_blocks(&cyrillic, true));
+        assert!(!scanner.by_blocks(&cyrillic, false));
+        // The stretch may stand at any place a longer text is asked at,
+        // whether the text takes the word scans or not.
+        let late = format!("{}{ascii}", "я".repeat(block::SAMPLE / 2));
+        assert!(scanner.by_blocks(&late, true));
+        assert!(scanner.by_blocks(&late, false));
+        // A chain the pass does not cut as keeps the scanner on any text.
+        let overlapping =
+            Scanner::recognize(&chain(&[HEX, LETTERS, TEMPLATE])).expect("the scanner");
+        assert!(!overlapping.by_blocks(&ascii, true));
     }
 
     #[test]

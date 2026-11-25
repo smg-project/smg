@@ -16,6 +16,7 @@ use std::{
 
 use parking_lot::RwLock;
 use smg_auth::RequestId;
+use smg_worker::load::capacity::WorkerCapacity;
 use thiserror::Error;
 use tokio::sync::{oneshot, watch, Notify};
 use tokio_util::sync::CancellationToken;
@@ -27,7 +28,7 @@ use super::{
     slots::SlotPool,
     Class, ClassRuntimeConfig, SchedulerSettings,
 };
-use crate::{middleware::edge_body::Permit, worker::WorkerCapacity};
+use crate::middleware::edge_body::Permit;
 
 /// Max time to wait, after firing a preemption cancel, for the victim's slot
 /// to free before falling back to enqueue.

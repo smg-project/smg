@@ -25,25 +25,29 @@
 //! window closes on that worker only, its partner stays selectable, and
 //! when no other worker of the side's kind is available the answer stands.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{http::StatusCode, response::Response};
 use parking_lot::Mutex;
+use smg_worker::identity::basic::{Worker, WorkerType};
 
-use crate::{
-    routers::common::{placement::CandidateFilter, retry::mark_non_retryable},
-    worker::{Worker, WorkerType},
-};
+use crate::routers::common::{placement::CandidateFilter, retry::mark_non_retryable};
 
-/// Response extension: the worker answered the request itself, so the status
-/// is the worker's verdict on this payload rather than a transport failure or
-/// a status the router synthesized.
+/// Response extension: the worker answered the request itself. The status is
+/// the worker's own, or the router's judgement of an answer the worker gave
+/// (the Decisions adapter's 502 for an answer it cannot map). A transport
+/// failure carries no mark.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamAnswer;
 
 /// Mark `response` as answered by the worker (see [`UpstreamAnswer`]).
 pub(crate) fn mark_upstream_answer(response: &mut Response) {
     response.extensions_mut().insert(UpstreamAnswer);
+}
+
+/// Whether the worker itself answered `response` (see [`UpstreamAnswer`]).
+pub(crate) fn is_upstream_answer(response: &Response) -> bool {
+    response.extensions().get::<UpstreamAnswer>().is_some()
 }
 
 /// Response extension: the attempt failed on one side of a disaggregated pair,
@@ -63,25 +67,81 @@ pub(crate) fn mark_failed_side(response: &mut Response, worker: &dyn Worker) {
     });
 }
 
+/// Response extension: the worker's stream failed after the worker took the
+/// call, and its breaker is not charged yet. The stream's reader has no
+/// ledger: the dispatch loop charges it ([`AttemptLedger::charge_pending`]).
+#[derive(Clone)]
+pub(crate) struct PendingCharge {
+    worker: Arc<dyn Worker>,
+    status_code: u16,
+}
+
+/// Mark `response` as the failure of `worker`'s stream, which its breaker
+/// samples as `status_code` (see [`PendingCharge`]).
+pub(crate) fn mark_pending_charge(
+    response: &mut Response,
+    worker: &Arc<dyn Worker>,
+    status_code: u16,
+) {
+    response.extensions_mut().insert(PendingCharge {
+        worker: Arc::clone(worker),
+        status_code,
+    });
+}
+
+/// The kind of the worker whose side alone failed, where `response` names
+/// one ([`FailedSide`]).
+pub(crate) fn failed_side_type(response: &Response) -> Option<WorkerType> {
+    let side = response.extensions().get::<FailedSide>();
+    side.map(|side| side.worker_type)
+}
+
 /// Whether `response` is a failure the answering worker must not see again
 /// for this request: the worker's own 500, the one retryable status a worker
 /// gives a request it processed and failed on. Its "not served now" statuses
 /// (502, 503, 504) stay replayable.
 pub(crate) fn is_definitive_failure(response: &Response) -> bool {
-    response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        && response.extensions().get::<UpstreamAnswer>().is_some()
+    response.status() == StatusCode::INTERNAL_SERVER_ERROR && is_upstream_answer(response)
+}
+
+/// Whether `response` closes the retry window: it names a failed side
+/// ([`FailedSide`]) or is a definitive failure. [`AttemptLedger::settle`]
+/// passes any other response untouched, so a caller that asks this first
+/// takes its pool only for a response `settle` reads it for.
+pub(crate) fn closes_retry_window(response: &Response) -> bool {
+    failed_side_type(response).is_some() || is_definitive_failure(response)
 }
 
 /// What one request's attempts have told the worker pool so far.
 #[derive(Debug, Default)]
 pub(crate) struct AttemptLedger {
     inner: Mutex<Ledger>,
+    /// Made at the request's first failure, or for its first holder.
+    charges: OnceLock<Charges>,
+}
+
+/// The workers (by URL) one request already charged a circuit-breaker
+/// failure. A task that outlives its attempt holds a clone, so the outcome it
+/// meets late is counted by the request's rule.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Charges(Arc<Mutex<Vec<String>>>);
+
+impl Charges {
+    /// [`AttemptLedger::record_outcome`], through the request's charges.
+    pub(crate) fn record_outcome(&self, worker: &dyn Worker, status_code: u16) {
+        if worker.is_breaker_failure(status_code) {
+            let mut charged = self.0.lock();
+            if charged.iter().any(|url| url == worker.url()) {
+                return;
+            }
+            charged.push(worker.url().to_string());
+        }
+        worker.record_outcome(status_code);
+    }
 }
 
 #[derive(Debug, Default)]
 struct Ledger {
-    /// Workers (by URL) already charged a circuit-breaker failure.
-    charged: Vec<String>,
     /// Engines (by base URL, so one DP rank's answer stands for its
     /// siblings) that answered the request definitively.
     answered: Vec<String>,
@@ -93,13 +153,24 @@ impl AttemptLedger {
     /// request fails on the worker.
     pub(crate) fn record_outcome(&self, worker: &dyn Worker, status_code: u16) {
         if worker.is_breaker_failure(status_code) {
-            let mut ledger = self.inner.lock();
-            if ledger.charged.iter().any(|url| url == worker.url()) {
-                return;
-            }
-            ledger.charged.push(worker.url().to_string());
+            self.charges().record_outcome(worker, status_code);
+        } else {
+            worker.record_outcome(status_code);
         }
-        worker.record_outcome(status_code);
+    }
+
+    /// The request's charges, for a task that outlives the attempt it
+    /// reports on.
+    pub(crate) fn charges(&self) -> &Charges {
+        self.charges.get_or_init(Charges::default)
+    }
+
+    /// Charge the worker whose stream failed under the attempt
+    /// ([`PendingCharge`]), by the rule of [`Self::record_outcome`].
+    pub(crate) fn charge_pending(&self, response: &Response) {
+        if let Some(charge) = response.extensions().get::<PendingCharge>() {
+            self.record_outcome(charge.worker.as_ref(), charge.status_code);
+        }
     }
 
     /// Whether a retry attempt may select `worker`: not after it answered the
@@ -149,10 +220,10 @@ impl AttemptLedger {
         answered_by: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
         pool: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
     ) {
-        let side = response.extensions().get::<FailedSide>().cloned();
-        if side.is_none() && !is_definitive_failure(response) {
+        if !closes_retry_window(response) {
             return;
         }
+        let side = response.extensions().get::<FailedSide>().cloned();
         {
             let mut ledger = self.inner.lock();
             for worker in answered_by {
@@ -182,15 +253,15 @@ mod tests {
     use std::time::Duration;
 
     use axum::response::IntoResponse;
+    use smg_worker::{
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::{
-        routers::common::retry::is_retryable_response,
-        worker::{
-            health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::{no_health_check, worker_of},
-            BasicWorkerBuilder,
-        },
+    use crate::routers::{
+        common::{retry::is_retryable_response, snapshot::test_support::worker_of},
+        grpc::backend_client::BasicWorkerBuilder,
     };
 
     fn worker(url: &str, failure_threshold: u32) -> Arc<dyn Worker> {

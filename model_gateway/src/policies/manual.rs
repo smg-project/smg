@@ -26,6 +26,7 @@ use std::{
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::RngExt;
+use smg_worker::identity::basic::Worker;
 use tracing::info;
 
 use super::{
@@ -34,7 +35,7 @@ use super::{
 };
 use crate::{
     config::ManualAssignmentMode, observability::metrics::Metrics,
-    routers::common::header_utils::extract_routing_key_hint, worker::Worker,
+    routers::common::header_utils::extract_routing_key_hint,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +91,12 @@ impl Borrow<str> for RoutingId {
 }
 
 const MAX_CANDIDATE_WORKERS: usize = 2;
+
+/// The most keys a routing map holds. A key new to a full map is not
+/// recorded: its request is placed by the assignment with no pin, until the
+/// idle eviction takes entries out. A map can stand past it by a key a
+/// shard ([`ManualPolicy::admits_new_entry`]).
+const MAX_ROUTING_KEYS: usize = 4_194_304;
 
 #[derive(Debug, Clone)]
 pub struct ManualConfig {
@@ -188,14 +195,28 @@ impl ManualPolicy {
         }
     }
 
-    /// A key the map did not hold was inserted: the count and the size gauge
-    /// move here, not on the selection path. The gauge moves by one rather
-    /// than to the count read back: two inserts racing would publish their
-    /// counts in either order, and nothing rewrites the gauge until the next
-    /// change.
-    fn note_new_entry(&self) {
+    /// Whether the map holds [`MAX_ROUTING_KEYS`]: a read of the kept count.
+    fn is_full(&self) -> bool {
+        self.entries.load(Ordering::Relaxed) >= MAX_ROUTING_KEYS
+    }
+
+    /// Whether a key the map does not hold is recorded: none is while the map
+    /// holds [`MAX_ROUTING_KEYS`]. The count and the size gauge move here,
+    /// ahead of the insert and not on the selection path. The gauge moves by
+    /// one rather than to the count read back: two inserts racing would
+    /// publish their counts in either order, and nothing rewrites the gauge
+    /// until the next change. Inserts of different shards that race for the
+    /// last room each take it: the map can stand past the most by a key a
+    /// shard.
+    fn admits_new_entry(&self) -> bool {
+        // A full map refuses by a read alone, and a key that enters writes
+        // the count once: no writer tries twice.
+        if self.is_full() {
+            return false;
+        }
         self.entries.fetch_add(1, Ordering::Relaxed);
         Metrics::manual_policy_cache_entry_added();
+        true
     }
 
     /// The entry count as kept: what the size gauge shows.
@@ -256,14 +277,24 @@ impl ManualPolicy {
             front(&mut entry);
             return;
         }
+        // A full map records nothing: the key is not copied. It is looked
+        // up once more first: an entry made since the miss above takes the
+        // pin.
+        if self.is_full() {
+            if let Some(mut entry) = self.routing_map.get_mut(key) {
+                front(&mut entry);
+            }
+            return;
+        }
         match self.routing_map.entry(RoutingId::new(key)) {
             Entry::Occupied(mut entry) => front(entry.get_mut()),
             Entry::Vacant(entry) => {
-                entry.insert(Node {
-                    candi_worker_urls: vec![url.to_string()],
-                    last_access: Instant::now(),
-                });
-                self.note_new_entry();
+                if self.admits_new_entry() {
+                    entry.insert(Node {
+                        candi_worker_urls: vec![url.to_string()],
+                        last_access: Instant::now(),
+                    });
+                }
             }
         }
     }
@@ -310,15 +341,27 @@ impl ManualPolicy {
         if let Some(mut entry) = self.routing_map.get_mut(routing_id) {
             return occupied(&mut entry);
         }
+        // A full map records nothing: the key is placed with no copy of it.
+        // It is looked up once more first: a pin written since the miss
+        // above is followed. The test under the entry's lock, below, holds
+        // for a writer that found room here and none there.
+        if self.is_full() {
+            if let Some(mut entry) = self.routing_map.get_mut(routing_id) {
+                return occupied(&mut entry);
+            }
+            let selected_idx = self.select_new_worker(workers, healthy_indices);
+            return (selected_idx, ExecutionBranch::Vacant);
+        }
         match self.routing_map.entry(RoutingId::new(routing_id)) {
             Entry::Occupied(mut entry) => occupied(entry.get_mut()),
             Entry::Vacant(entry) => {
                 let selected_idx = self.select_new_worker(workers, healthy_indices);
-                entry.insert(Node {
-                    candi_worker_urls: vec![workers[selected_idx].url().to_string()],
-                    last_access: Instant::now(),
-                });
-                self.note_new_entry();
+                if self.admits_new_entry() {
+                    entry.insert(Node {
+                        candi_worker_urls: vec![workers[selected_idx].url().to_string()],
+                        last_access: Instant::now(),
+                    });
+                }
                 (selected_idx, ExecutionBranch::Vacant)
             }
         }
@@ -369,6 +412,10 @@ impl LoadBalancingPolicy for ManualPolicy {
 
     fn name(&self) -> &'static str {
         "manual"
+    }
+
+    fn honors_routing_key(&self) -> bool {
+        true
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -937,6 +984,40 @@ mod tests {
                 .contains("smg_manual_policy_cache_entries"),
             "a hit publishes nothing about the map's size"
         );
+    }
+
+    #[test]
+    fn a_full_map_records_no_new_key_and_answers_the_keys_it_holds() {
+        let policy = ManualPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let held = headers_with_routing_key("held");
+        let pinned = policy.select_worker(&workers, &with_headers(&held));
+        // One key under the 4,194,304 a map holds: the kept count stands for
+        // the keys no test inserts, and the next key takes the last room.
+        policy.entries.store(4_194_303, Ordering::Relaxed);
+        policy.pin_front("last", "http://w1:8000");
+        // The test under an entry's lock refuses at the most, and a refusal
+        // writes no count.
+        assert!(!policy.admits_new_entry());
+        assert_eq!(policy.entry_count(), MAX_ROUTING_KEYS);
+        let fresh = headers_with_routing_key("fresh");
+        assert!(policy
+            .select_worker(&workers, &with_headers(&fresh))
+            .is_some());
+        policy.pin_front("fresh", "http://w2:8000");
+        assert_eq!(policy.routing_map.len(), 2, "a new key is not recorded");
+        assert_eq!(policy.select_worker(&workers, &with_headers(&held)), pinned);
+        // The idle eviction gives the room back: the key is recorded.
+        evict_idle(
+            &policy.routing_map,
+            &policy.entries,
+            Duration::ZERO,
+            Instant::now(),
+        );
+        policy.select_worker(&workers, &with_headers(&fresh));
+        assert_eq!(policy.routing_map.len(), 1);
+        // The count as the map stands: the drop takes it off the gauge.
+        policy.entries.store(1, Ordering::Relaxed);
     }
 
     #[test]
