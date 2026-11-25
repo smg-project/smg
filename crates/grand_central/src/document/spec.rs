@@ -9329,17 +9329,21 @@ mod tests {
         assert!(AppliedSpec::unbound()
             .key_sources_for("chat/a", Phase::Single)
             .is_none());
-        // One binding of the three keys by the request's own id, so the
-        // document does. The same document without that source does not,
-        // and neither does one that binds nothing.
+        // The first binding of the three keys by the request's own id, so
+        // the document does. So does one where the second binding does,
+        // behind a sessions rule's. That document less its one source does
+        // not, and neither does one that binds nothing.
         assert!(applied.reads_request_id());
-        let headers_alone = AppliedSpec::validate(&doc(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}},"bindings":[
-                {"match":{"model":"chat/*"},"profile":"p","routing_key":{"sources":[{"header":"x-smg-routing-key"},{"header":"cookie"}]}},
-                {"profile":"p"}]}"#,
-        ))
-        .expect("the document validates");
-        assert!(!headers_alone.reads_request_id());
+        let second = r#"{"apiVersion":"smg.policy/v1","view":{"headers":["x-session-id","x-tenant-session"]},"profiles":{"p":{"pick":"best"}},"bindings":[
+            {"match":{"model":"code/*"},"profile":"p","sessions":{"sticky_header":"x-session-id","headers":["x-tenant-session","x-session-id"]}},
+            {"match":{"model":"chat/*"},"profile":"p","routing_key":{"sources":[{"header":"x-smg-routing-key"},{"rid":true}]}},
+            {"profile":"p"}]}"#;
+        let reads = |text: &str| {
+            let applied = AppliedSpec::validate(&doc(text));
+            applied.expect("the document validates").reads_request_id()
+        };
+        assert!(reads(second));
+        assert!(!reads(&second.replace(r#",{"rid":true}"#, "")));
         assert!(!AppliedSpec::unbound().reads_request_id());
     }
 
