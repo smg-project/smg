@@ -456,6 +456,10 @@ fn a_gap_no_retry_closes_is_named_by_membership() {
     let mut bed = Bed::new();
     bed.prefill_classes = vec![0];
     assert_eq!(bed.stage(), "ec-compatible");
+    // Neither states an end. No end is no class: the encoder hands to no
+    // prefill, and the prefill no encoder hands to takes none.
+    bed.facts = vec![pushing(0)];
+    assert_eq!(bed.stage(), "ec-compatible");
 
     // References, and no encoder that processes them.
     let mut bed = Bed::new();
@@ -1895,8 +1899,13 @@ fn decided_widths(bed: &Bed, table: PairTable<'_>) -> (Decision, [usize; 4]) {
         .encode
         .as_deref()
         .expect("the entry leaves its side in the scratch");
-    let held = &side.decode_classes;
-    let sets = [&side.open, &side.member, &held.registered, &held.vision];
+    let (encoders, decodes) = (&side.encoders, &side.decode_classes);
+    let sets = [
+        &encoders.open,
+        &encoders.member,
+        &decodes.registered,
+        &decodes.vision,
+    ];
     (decision, sets.map(|set| set.words.len()))
 }
 
@@ -2791,21 +2800,25 @@ fn an_item_is_placed_on_an_encoder_at_one_of_its_requests_places() {
     assert_eq!(encoder(&masked), Some(1));
 
     // The idle prefill's one encoder stands outside the places: the pair is
-    // the busy prefill, and its encoder takes the item.
-    let mut classes = Bed::new();
-    classes.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 5)];
-    classes.prefill_classes = vec![1, 2];
-    classes.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
-    classes.facts = vec![pushing(1), pushing(2)];
-    let placed = |held: &Constraints<'_>| {
-        let sides = [&open, &open, held];
-        let (decision, placed) = decide_under(&classes, &engine, &facts, classes.pools(), sides);
-        let encoders: Vec<u32> = placed.encoders().iter().map(|t| t.position).collect();
-        (pair_of(&decision), encoders)
-    };
-    assert_eq!(placed(&open), ((0, 0), vec![0]));
-    assert_eq!(placed(&holding(&[1])), ((1, 0), vec![1]));
-    assert_eq!(placed(&holding(&[0, 1])), ((0, 0), vec![0]));
+    // the busy prefill, and its encoder takes the item. So it is for two
+    // classes the sets' bits hold, and for two far above the rows handed.
+    for [idle, busy] in [[1, 2], [u32::MAX - 1, u32::MAX]] {
+        let mut classes = Bed::new();
+        classes.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 5)];
+        classes.prefill_classes = vec![idle, busy];
+        classes.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+        classes.facts = vec![pushing(idle), pushing(busy)];
+        let placed = |held: &Constraints<'_>| {
+            let sides = [&open, &open, held];
+            let (decision, placed) =
+                decide_under(&classes, &engine, &facts, classes.pools(), sides);
+            let encoders: Vec<u32> = placed.encoders().iter().map(|t| t.position).collect();
+            (pair_of(&decision), encoders)
+        };
+        assert_eq!(placed(&open), ((0, 0), vec![0]));
+        assert_eq!(placed(&holding(&[1])), ((1, 0), vec![1]));
+        assert_eq!(placed(&holding(&[0, 1])), ((0, 0), vec![0]));
+    }
 }
 
 /// A request whose places on a list name workers and none that takes it,
