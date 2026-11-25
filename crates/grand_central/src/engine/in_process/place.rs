@@ -1395,7 +1395,9 @@ pub enum Unplaced {
         /// route's rule that takes no worker of the list (`admits`), a
         /// budget the call's earlier decisions used up (`budget`), a
         /// worker the request names that cannot take it
-        /// (`target-worker`). A caller's refusal line names it.
+        /// (`target-worker`), a document that binds the request's model
+        /// no plan for a request of its kind (`binding`). A caller's
+        /// refusal line names it.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room: a caller's
         /// retry hint.

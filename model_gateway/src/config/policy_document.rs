@@ -45,10 +45,10 @@ impl RouterConfig {
     /// The policy document this configuration says, or the first of its
     /// settings that no document says.
     ///
-    /// A pure function of the configuration. The document is not validated
-    /// here, the encode mode of many routers apart: the controller
-    /// validates a document where it is applied, and names there a stage
-    /// its build does not run yet.
+    /// A pure function of the configuration. The controller validates a
+    /// document where it is applied, and names there a stage its build
+    /// does not run yet. What the settings check ahead of that is said at
+    /// [`RoutingSettings::policy_document`].
     pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         self.routing_settings().policy_document()
     }

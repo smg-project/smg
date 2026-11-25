@@ -516,10 +516,11 @@ mod tests {
         );
     }
 
-    /// The two pools are lent with what the gateway states of each worker:
-    /// the number of its runtime and transport and nothing else, in each
-    /// pool's order. The facts, the cells and the pair classes are the
-    /// index's own: a second lending hands the same ones.
+    /// The two pools are lent with what the gateway states of each worker,
+    /// by its one function ([`stated_facts`]): the number of its runtime
+    /// and transport among it, in each pool's order. The facts, the cells
+    /// and the pair classes are the index's own: a second lending hands the
+    /// same ones.
     #[test]
     fn the_pools_are_lent_with_the_wire_each_worker_is_on() {
         let (prefill, decode) = three_runtimes();
@@ -533,14 +534,9 @@ mod tests {
         assert!(Arc::ptr_eq(prefills.workers, &prefill));
         assert!(Arc::ptr_eq(decodes.workers, &decode));
         let numbers = |list: LentList<'_>| -> Vec<u32> {
-            let stated = |facts: &FixedFacts| {
-                let mut wire_alone = FixedFacts::default();
-                wire_alone.demands.runtime = facts.demands.runtime;
-                assert_eq!(*facts, wire_alone, "the wire and nothing else");
-                facts.demands.runtime
-            };
             let facts = list.facts.expect("one fact a worker");
-            facts.iter().map(stated).collect()
+            assert_eq!(facts, &*stated_facts(list.workers), "the one function's");
+            facts.iter().map(|facts| facts.demands.runtime).collect()
         };
         let on = |runtime| wire_number(runtime, ConnectionMode::Grpc);
         assert_eq!(

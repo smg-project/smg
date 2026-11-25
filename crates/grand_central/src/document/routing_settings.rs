@@ -312,7 +312,12 @@ pub enum ModeSettings {
     },
     /// An encode worker ahead of a pair.
     EncodePrefillDecode {
-        /// The encode side's own policy.
+        /// The encode side's own policy. A gateway's configuration takes
+        /// three policies on this side: consistent hashing, round robin and
+        /// random. The profile written for each of those three is held to
+        /// what the gateway's own policy of that name answers. Any other
+        /// policy lands on its preset as it does on every side, and no
+        /// answer of a gateway holds that profile.
         encode_policy: Option<PolicySettings>,
         /// The prefill side's own policy.
         prefill_policy: Option<PolicySettings>,

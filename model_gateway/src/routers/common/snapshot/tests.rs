@@ -17,7 +17,8 @@ use smg_worker::{
 
 use super::*;
 use crate::routers::{
-    common::place_request::wire_number, grpc::backend_client::BasicWorkerBuilder,
+    common::place_request::{stated_facts, wire_number},
+    grpc::backend_client::BasicWorkerBuilder,
 };
 
 /// A gRPC worker of `model` whose card names `window` as its context
@@ -349,10 +350,10 @@ fn a_refresh_keeps_the_list_its_order_and_its_handles() {
 }
 
 /// A pool's list is lent to Grand Central with what the gateway states
-/// of each worker: the number of its runtime and transport and nothing
-/// else, in the list's order. The list, its cell and its facts are made at
-/// the pool's first lending and handed again at every later one, and each
-/// pool has its own.
+/// of each worker, in the list's order ([`stated_facts`]): the number of
+/// its runtime and transport among it. The list, its cell and its facts
+/// are made at the pool's first lending and handed again at every later
+/// one, and each pool has its own.
 #[test]
 fn a_pool_is_lent_with_the_wire_each_of_its_workers_is_on() {
     let registry = WorkerRegistry::new();
@@ -380,10 +381,12 @@ fn a_pool_is_lent_with_the_wire_each_of_its_workers_is_on() {
         assert!(Arc::ptr_eq(lent.workers, snapshot.pool(pool)));
         let facts = lent.facts.expect("one fact a worker");
         assert_eq!(facts.len(), lent.workers.len());
+        assert_eq!(
+            facts,
+            &*stated_facts(lent.workers),
+            "what the gateway states"
+        );
         let wire_of = |(worker, facts): (&Arc<dyn Worker>, &FixedFacts)| {
-            let mut wire_alone = FixedFacts::default();
-            wire_alone.demands.runtime = facts.demands.runtime;
-            assert_eq!(*facts, wire_alone, "the wire and nothing else");
             (worker.url().to_owned(), facts.demands.runtime)
         };
         let mut stated: Vec<_> = lent.workers.iter().zip(facts).map(wire_of).collect();

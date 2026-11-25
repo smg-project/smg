@@ -13,6 +13,10 @@
 //! ([`wire_number`]). The gateway states that number of every worker of a
 //! list it lends ([`stated_facts`]) and as the demand of a pinned request
 //! ([`place_request`]), and the engine compares the two.
+//!
+//! Beside its wire a worker is stated what an encode request's decision
+//! reads of it: whether it takes images, and whether it processes media by
+//! reference and by whose pipeline ([`stated_facts`]).
 
 use std::sync::Arc;
 
@@ -20,10 +24,10 @@ use smg_grand_central::engine::{
     worker_id, Demands, FixedFacts, HashSeeds, HeaderRead, PlaceRequest, Prompt, PromptEntry,
     TextKey, TokenKey, WorkerId, WorkerLists, WorkerRule,
 };
-use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker};
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 
 use super::placement::{was_tried, PlacementInputs, Stated, WireConstraint};
-use crate::policies::CacheNamespace;
+use crate::{policies::CacheNamespace, routers::grpc::multimodal};
 
 /// The workers at the engines a request's failed attempts were sent to,
 /// each by the id the engine knows it by ([`tried_ids`]): every rank of a
@@ -105,18 +109,37 @@ pub(crate) const fn wire_number(runtime: RuntimeType, connection: ConnectionMode
 }
 
 /// What this gateway states of each worker of `workers` beside its object,
-/// one a worker in the list's order: the number of the runtime and
-/// transport it is dialed on ([`wire_number`]), and nothing else. A list is
-/// lent with them, made once a list at its first lending: the engine reads
-/// them where it makes its value of the list, under each document.
+/// one a worker in the list's order. A list is lent with them, made once a
+/// list at its first lending: the engine reads them where it makes its
+/// value of the list, under each document.
+///
+/// - The number of the runtime and transport the worker is dialed on
+///   ([`wire_number`]).
+/// - Whether it takes images: yes, unless its registration says that it
+///   runs with no vision encoder
+///   ([`multimodal::worker_language_model_only`]). A decode is held to that
+///   word on the one runtime whose decode the classic encode stage holds to
+///   it, and takes images on every other: the engine applies no rule of a
+///   runtime's own.
+/// - Whether it processes media by reference, and by this gateway's own
+///   pipeline ([`multimodal::worker_accepts_media_refs`],
+///   [`multimodal::worker_runs_gateway_pipeline`]).
+///
+/// The last three are read by an encode request's decision alone: a single
+/// request and a pair state no media and no demand for it
+/// ([`place_request`]).
 #[must_use]
 pub(crate) fn stated_facts(workers: &[Arc<dyn Worker>]) -> Box<[FixedFacts]> {
     let stated = |worker: &Arc<dyn Worker>| {
+        let worker = worker.as_ref();
+        let runtime = worker.metadata().spec.runtime_type;
         let mut facts = FixedFacts::default();
-        facts.demands.runtime = wire_number(
-            worker.metadata().spec.runtime_type,
-            *worker.connection_mode(),
-        );
+        facts.demands.runtime = wire_number(runtime, *worker.connection_mode());
+        let held_to_no_word =
+            *worker.worker_type() == WorkerType::Decode && runtime != RuntimeType::Vllm;
+        facts.vision = held_to_no_word || !multimodal::worker_language_model_only(worker);
+        facts.demands.references = multimodal::worker_accepts_media_refs(worker);
+        facts.demands.host_pipeline = multimodal::worker_runs_gateway_pipeline(worker);
         facts
     };
     workers.iter().map(stated).collect()
@@ -355,7 +378,8 @@ mod tests {
     /// a pinned wire holds them alike ([`WireConstraint::admits`]), over
     /// every runtime and transport, and no number is zero, which states
     /// none. The gateway states that number of each worker of a list, in
-    /// the list's order, and nothing else.
+    /// the list's order. A worker whose registration says nothing else is
+    /// stated to take images and to process no media by reference.
     #[test]
     fn one_number_names_one_wire() {
         const RUNTIMES: [RuntimeType; 8] = [
@@ -411,6 +435,7 @@ mod tests {
             assert_ne!(number, 0, "{runtime:?} over {connection:?}");
             let mut stated = FixedFacts::default();
             stated.demands.runtime = number;
+            stated.vision = true;
             assert_eq!(facts[at], stated, "{runtime:?} over {connection:?}");
             let pinned = Some(WireConstraint {
                 runtime,
@@ -427,6 +452,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Beside its wire a worker is stated what an encode request's decision
+    /// reads of it, each as the classic encode stage reads it of the
+    /// worker's registration. It takes images unless its registration says
+    /// that it runs with no vision encoder, and a decode is held to that
+    /// word on one runtime alone. It processes media by reference where its
+    /// registration names a processor, and by the gateway's own pipeline
+    /// where it names that one.
+    #[test]
+    fn a_worker_is_stated_its_vision_and_its_references() {
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::grpc::multimodal::{GATEWAY_PIPELINE_PROCESSOR, MM_PROCESSOR_LABEL};
+
+        let built = |role: WorkerType, runtime: RuntimeType, labels: &[(&str, &str)]| {
+            let mut builder = BasicWorkerBuilder::new(format!("grpc://w:{}", labels.len()))
+                .worker_type(role)
+                .runtime_type(runtime)
+                .connection_mode(ConnectionMode::Grpc);
+            for (label, value) in labels {
+                builder = builder.label(*label, *value);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            let facts = stated_facts(&[worker])[0];
+            (
+                facts.vision,
+                facts.demands.references,
+                facts.demands.host_pipeline,
+            )
+        };
+        let (vllm, other) = (RuntimeType::Vllm, RuntimeType::TokenSpeed);
+        let blind = [("supports_vision", "false")];
+        for role in [WorkerType::Regular, WorkerType::Encode, WorkerType::Prefill] {
+            for runtime in [vllm, other] {
+                assert_eq!(built(role, runtime, &[]), (true, false, false));
+                assert_eq!(built(role, runtime, &blind), (false, false, false));
+            }
+        }
+        // A decode is held to the word on the one runtime.
+        assert_eq!(
+            built(WorkerType::Decode, vllm, &blind),
+            (false, false, false)
+        );
+        assert_eq!(
+            built(WorkerType::Decode, other, &blind),
+            (true, false, false)
+        );
+        assert_eq!(built(WorkerType::Decode, vllm, &[]), (true, false, false));
+
+        let own = [(MM_PROCESSOR_LABEL, "inprocess")];
+        let hosted = [(MM_PROCESSOR_LABEL, GATEWAY_PIPELINE_PROCESSOR)];
+        assert_eq!(built(WorkerType::Encode, vllm, &own), (true, true, false));
+        assert_eq!(built(WorkerType::Encode, vllm, &hosted), (true, true, true));
+        // The other runtime processes no reference by a processor of its
+        // own.
+        assert_eq!(built(WorkerType::Encode, other, &own), (true, false, false));
     }
 
     /// A request's entry in a lent token tree is the key the classic policy
