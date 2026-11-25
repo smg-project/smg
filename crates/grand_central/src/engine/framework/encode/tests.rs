@@ -876,6 +876,60 @@ fn a_column_of_another_length_and_a_binding_of_another_plan_decline() {
     );
 }
 
+/// An encode request names no worker: a decision that states a number on
+/// its decode side ([`Constraints::target_worker`]) is declined under
+/// `target-worker`, beside places of that side and beside none, with an
+/// item and with none. The pair entry counts such a number.
+#[test]
+fn a_number_on_the_decode_side_declines_an_encode_request() {
+    let (bed, engine) = (Bed::new(), engine());
+    let (facts, pool) = bed.asked();
+    let shed = |keys: &[Identity<'static>], decode_cx: &Constraints<'_>| {
+        let encode = EncodePool {
+            encoders: &bed.encoders,
+            facts: &bed.facts,
+            prefill_classes: &bed.prefill_classes,
+            affinity: &bed.encode_affinity,
+            ..EncodePool::default()
+        };
+        let items = EncodeItems {
+            keys,
+            one: None,
+            references: false,
+            decode_images: false,
+            ring: None,
+        };
+        let cx = Constraints::default();
+        let decision = engine.decide_encode_pair(
+            &facts,
+            &pool,
+            bed.pools(),
+            encode,
+            items,
+            &cx,
+            decode_cx,
+            &cx,
+            &mut Scratch::new(),
+            &mut EncodePlaced::new(),
+        );
+        match decision {
+            Decision::Shed(shed) => Some((shed.reason, shed.emptied_by)),
+            Decision::Pick(_) | Decision::Queue(_) => None,
+        }
+    };
+    let numbered = |places| Constraints {
+        places,
+        target_worker: Some(0),
+        ..Constraints::default()
+    };
+    let declined = Some((ShedReason::PolicyDeclined, "target-worker"));
+    for keys in [&bed.keys[..], &[]] {
+        assert_eq!(shed(keys, &numbered(Some(&[0]))), declined);
+        assert_eq!(shed(keys, &numbered(None)), declined);
+        assert_eq!(shed(keys, &Constraints::default()), None, "a pick");
+    }
+}
+
 /// What the pair entry answers, this entry answers the same when it admits
 /// every row: a pick with its alternates, a shed, and the overload veto,
 /// with an item and without. No built-in stage issues a queue ticket yet,

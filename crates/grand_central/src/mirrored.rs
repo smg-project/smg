@@ -263,7 +263,8 @@ pub fn constraints() -> &'static [&'static str] {
             demands,
             stalled,
             held,
-            places
+            places,
+            target_worker
         }
     )
 }

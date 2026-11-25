@@ -826,6 +826,14 @@ pub(crate) const SUBSET_HINT: &str = "subset-hint";
 /// `decode-vision`) is answered ahead of every list's places.
 pub(crate) const PLACES: &str = "places";
 
+/// The stage a request that names its worker is shed under where that
+/// worker cannot take it: by the one call in a host's own process, and by
+/// a controller's served decision. A pair's decision is shed under it
+/// where the number its decode side states reaches no row
+/// ([`Constraints::target_worker`](crate::engine::view::Constraints::target_worker)),
+/// and declined under it where the number stands beside no places.
+pub(crate) const TARGET_WORKER: &str = "target-worker";
+
 /// A shed the deciders say in the engine's place, in the shape of the
 /// engine's own.
 #[cfg_attr(

@@ -24,6 +24,8 @@ use crate::{
     tracking::lease::{Lease, Side},
 };
 
+mod named_decode;
+
 /// A ready row at `position`, under an id and a stable key of its own.
 fn ready(position: u32) -> Candidate {
     Candidate {

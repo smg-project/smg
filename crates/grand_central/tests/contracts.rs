@@ -474,6 +474,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "stalled",
                 "held",
                 "places",
+                "target_worker",
             ],
             wire_only: &[],
             wire: &[
