@@ -595,7 +595,8 @@ fn a_chosen_decodes_dispatch_is_its_issue_under_the_pick_on_file() {
 /// What a pair's lease lends with a word, part by part, as it stood before
 /// the word: the prefill side's lease, the index and the target the word
 /// is about in a pair's form, the decode side as the file keeps it, and a
-/// pick. A word of the prefill side is lent a pick of no target, and a word
+/// pick. A word of the prefill side is lent a pick of no target where no
+/// decode stands chosen, as none does here, and a word
 /// of the decode side the pick's first target alone: the decode the side's
 /// lease books, with the side's verdict. A single's lease lends nothing
 /// here.
