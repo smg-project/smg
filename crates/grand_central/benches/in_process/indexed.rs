@@ -1,12 +1,12 @@
 //! Two cells whose host keeps an index of cache events.
 //!
 //! The index of the cell named `indexed` holds one block, for the list's
-//! first worker and of no prompt,
-//! and the host lends no tree. A turn hands token ids, so the index names it
-//! alone: the engine's record of sent prefixes is neither read nor written,
-//! and a worker the index holds nothing for is named nothing. No worker's
-//! stream feeds the index here. So no turn finds its conversation in it, and
-//! a turn goes back to its worker by the profile's other stages alone.
+//! first worker and of no prompt, and the host lends no tree. A turn hands
+//! token ids, so the index names it alone: the engine's record of sent
+//! prefixes is neither read nor written, and a worker the index holds
+//! nothing for is named nothing. No worker's stream feeds the index here.
+//! So no turn finds its conversation in it, and a turn goes back to its
+//! worker by the profile's other stages alone.
 //!
 //! The bench publishes its load reports once, unless `--publish-ms` says
 //! how often. Where nothing names a turn's worker, the load stages then
