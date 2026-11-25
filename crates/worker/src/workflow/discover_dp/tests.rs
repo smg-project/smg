@@ -472,7 +472,7 @@ fn the_plain_worker_warning_names_the_engine_the_route_and_what_was_read() {
         ),
         (
             NativeLoads::Inconclusive(FetchFailure::Answer),
-            "answered with an error status",
+            "answered with an error status or a body too large to read",
         ),
     ] {
         assert_eq!(missing_rank_loads(&loads, 2), Some(read));

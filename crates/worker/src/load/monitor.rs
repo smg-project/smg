@@ -3319,10 +3319,7 @@ mod native_loads_tests {
     #[path = "tests/poll_counts.rs"]
     mod poll_counts;
     use crate::{
-        connection::{
-            client_factory::http_client,
-            engine::{EngineConnection, EngineConnector, ZmqLink},
-        },
+        connection::engine::{EngineConnection, EngineConnector, ZmqLink},
         identity::basic::{ConnectionMode, WorkerLoadGuard, WorkerType},
         model_card::ModelCard,
         runtime::StallReason,
@@ -4980,8 +4977,13 @@ mod native_loads_tests {
     /// connector that has not said at the poll's deadline keeps no source
     /// for this read: the engine's route is asked once, its answer by rank
     /// is the read's, and the source is never called.
+    ///
+    /// The read builds under its step's feature, and so does this case.
+    #[cfg(feature = "workflow")]
     #[tokio::test]
     async fn a_registrations_read_asks_the_engine_once_its_connector_is_late_to_say() {
+        use crate::connection::client_factory::http_client;
+
         let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
         let late = SourceConnector::keeping(Some(host_answer(2)));
         late.silent_asks.store(1, Ordering::Relaxed);
