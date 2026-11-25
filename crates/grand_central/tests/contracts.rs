@@ -1764,6 +1764,39 @@ fn the_principals_scopes_keep_the_ingestion_scopes_number_and_name_reserved() {
     assert_eq!(scopes.reserved_name, strings(&["SCOPE_INGESTION"]));
 }
 
+/// A pair's class left the pairing descriptor, and a snapshot's pair rows
+/// left with their message: no writer filled either. The two numbers and
+/// names stay reserved, so a later field takes neither, and no message
+/// takes the name of the one that left.
+#[test]
+fn the_pair_class_and_the_pair_rows_keep_their_numbers_and_names_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, number, name) in [
+        ("PairingDescriptor", 8, "pair_class"),
+        ("Snapshot", 9, "pairs"),
+    ] {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let reserved: Vec<i32> = compiled
+            .reserved_range
+            .iter()
+            .flat_map(|range| range.start()..range.end())
+            .collect();
+        assert_eq!(reserved, [number], "{message_name}: the reserved number");
+        assert_eq!(
+            compiled.reserved_name,
+            strings(&[name]),
+            "{message_name}: the reserved name"
+        );
+    }
+    assert!(
+        message(controller, "PairRow").is_none(),
+        "no message takes the name of the pair row that left"
+    );
+}
+
 /// The packed request block's layout as the world's comment states it: an
 /// 80-byte header, the model bytes, zero bytes to the next multiple of 8,
 /// then the u64 sections. The arithmetic is mirrored here so the alignment
