@@ -60,7 +60,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use tokio::task::JoinError;
 use tracing::{debug, warn};
 
@@ -78,7 +78,7 @@ use crate::{
     document::{
         operator::{
             above, over_bound, Checked, DocumentManager, DryRun, EnforceOutcome, EnforceRefused,
-            Entered, Held, Line,
+            Entered, FollowerTurn, Held, Line,
         },
         spec::{AppliedSpec, Digest, OverloadSwitch, PolicySpec, SpecError},
     },
@@ -539,7 +539,7 @@ impl Generations {
     /// store is bound. The spec calls are served and the spec's series
     /// rendered from then on.
     pub(crate) fn bound(&self) -> bool {
-        self.writable() || self.file_sourced.load(Ordering::Relaxed) || self.held.lock().is_some()
+        self.writable() || self.file_sourced.load(Ordering::Relaxed) || self.holds()
     }
 
     /// `GetPolicySpec`: the standing generation's document from memory
@@ -589,9 +589,8 @@ impl Generations {
     /// store's entry: an entry of the log is never read here ahead of its
     /// document.
     pub(crate) fn sent(&self, generation: u64) -> proto::GenerationEvent {
-        let held = self.held.lock();
-        match held.as_ref().filter(|held| held.generation == generation) {
-            Some(held) => wire::generation_event(held.document()),
+        match self.held_under(generation) {
+            Some(document) => wire::generation_event(document),
             None => worker_wire::generation_told(generation),
         }
     }
@@ -599,11 +598,7 @@ impl Generations {
     /// The standing generation's event, for the snapshot a standby is
     /// restored from; none where no document is held for it.
     pub(crate) fn standing_sent(&self) -> Option<proto::GenerationEvent> {
-        let held = self.held.lock();
-        let standing = self.generation();
-        held.as_ref()
-            .filter(|held| held.generation == standing)
-            .map(|held| wire::generation_event(held.document()))
+        self.document(0).ok().map(wire::generation_event)
     }
 
     /// The start's document of the door's file, as its source wrote it in
@@ -637,26 +632,17 @@ impl Generations {
     /// kept for the replica's first lead ([`Generations::deferred_now`]),
     /// and the door has its source from here on ([`Generations::bound`]).
     fn defer(&self, document: Vec<u8>, format: Format) -> Result<(), SpecRejected> {
-        let applying = self.applying.lock();
-        if applying.is_some() {
-            return Err(SpecRejected::SecondSource);
-        }
-        let standing = self.standing();
-        let Checked { digest, line, next } = self.pass(standing, &document, format, Line::Claim)?;
-        if let Some(next) = next {
-            above(standing.0, next.generation())?;
-        }
-        self.sourced(digest, line);
-        *self.deferred.lock() = Some((document, format));
-        self.file_sourced.store(true, Ordering::Relaxed);
-        // Until the document lands a request is no decision: the unbound
-        // start says so, where the start of a store with no source sheds
-        // by the binding.
-        if standing.0 == 0 {
-            self.store.snapshot().spec().mark_document_awaited();
-        }
-        drop(applying);
-        Ok(())
+        self.admit_deferred(|standing| {
+            let Checked { digest, line, next } =
+                self.pass(standing, &document, format, Line::Claim)?;
+            if let Some(next) = next {
+                above(standing.0, next.generation())?;
+            }
+            self.sourced(digest, line);
+            *self.deferred.lock() = Some((document, format));
+            self.file_sourced.store(true, Ordering::Relaxed);
+            Ok(())
+        })
     }
 
     /// Whether the source writes now: always for a replica alone over its
@@ -806,18 +792,18 @@ impl Generations {
                 })
                 .ok()
         });
-        let _entry = self.held.lock();
-        let (number, standing) = self.standing();
-        *self.handed.lock() = match passed {
-            Some(Checked { next: None, .. }) => Handed::Stood,
-            Some(Checked { digest, line, .. })
-                if standing == Some(digest) && (line == 0 || line == number) =>
-            {
-                Handed::Stood
-            }
-            Some(Checked { digest, line, .. }) => Handed::Unstood { digest, line },
-            None => Handed::Undigested,
-        };
+        self.observing(|number, standing| {
+            *self.handed.lock() = match passed {
+                Some(Checked { next: None, .. }) => Handed::Stood,
+                Some(Checked { digest, line, .. })
+                    if standing == Some(digest) && (line == 0 || line == number) =>
+                {
+                    Handed::Stood
+                }
+                Some(Checked { digest, line, .. }) => Handed::Unstood { digest, line },
+                None => Handed::Undigested,
+            };
+        });
     }
 
     /// The source handed a document that passed, by its digest and its
@@ -874,15 +860,15 @@ impl Generations {
                 why: "a generation's event names its number",
             });
         }
-        let applying = self.applying.lock();
-        let following = |applying, change| Following {
+        let turn = self.follower_turn();
+        let following = |turn, change| Following {
             door: self,
-            _applying: applying,
+            turn,
             number,
             change,
         };
         let Some(push) = &told.document else {
-            return Ok(following(applying, None));
+            return Ok(following(turn, None));
         };
         let Some(format) = Format::named(&push.format) else {
             return Err(Unfollowed {
@@ -890,7 +876,7 @@ impl Generations {
                 why: "a form this build does not know",
             });
         };
-        if applying.is_some() {
+        if turn.beside_spec_store() {
             return Err(Unfollowed {
                 path: "generation.document",
                 why: "a spec store is bound here, and no standby follows beside one",
@@ -922,14 +908,9 @@ impl Generations {
         };
         if number <= standing {
             // The held bytes of the standing generation, compared as bytes.
-            let same = number == standing
-                && self.held.lock().as_ref().is_some_and(|held| {
-                    held.generation == standing
-                        && held.format == format
-                        && held.document == push.document
-                });
+            let same = number == standing && self.holds_bytes(standing, format, &push.document);
             if same {
-                return Ok(following(applying, None));
+                return Ok(following(turn, None));
             }
             warn!(
                 generation = number,
@@ -952,7 +933,7 @@ impl Generations {
                 next: Some(next),
                 ..
             }) => (digest, next),
-            Ok(Checked { next: None, .. }) => return Ok(following(applying, None)),
+            Ok(Checked { next: None, .. }) => return Ok(following(turn, None)),
             Err(rejected) => {
                 warn!(
                     generation = number,
@@ -982,7 +963,7 @@ impl Generations {
             format,
             applied,
         };
-        Ok(following(applying, Some((next, kept))))
+        Ok(following(turn, Some((next, kept))))
     }
 }
 
@@ -1003,7 +984,7 @@ struct Unfollowable {
 /// between its pass and its entry.
 pub(crate) struct Following<'a> {
     door: &'a Generations,
-    _applying: MutexGuard<'a, Option<SpecStore>>,
+    turn: FollowerTurn<'a>,
     number: u64,
     /// The generation to enter, with the bytes it runs from; none where the
     /// event changes nothing here.
@@ -1018,25 +999,13 @@ impl Following<'_> {
     pub(crate) fn land(self, at: Option<Position>) -> Result<(), Unfollowed> {
         let Self {
             door,
-            _applying,
+            turn,
             number,
             change,
         } = self;
         match (change, at) {
-            (Some((next, kept)), at) => door
-                .enter(
-                    next,
-                    kept,
-                    |store, spec| {
-                        match at {
-                            Some(at) => store.follow_generation(at, spec),
-                            None => store.apply(spec),
-                        }
-                        .map(|()| true)
-                    },
-                    |generation, digest| door.stands(generation, digest),
-                )
-                .map(drop)
+            (Some((next, kept)), at) => turn
+                .enter(at, next, kept, |generation, digest| door.stands(generation, digest))
                 .map_err(|stale| {
                     warn!(
                         generation = number,
@@ -1049,7 +1018,7 @@ impl Following<'_> {
                     }
                 }),
             (None, Some(at)) => {
-                door.store.follow_generation_place(at, number);
+                turn.place(at, number);
                 Ok(())
             }
             (None, None) => Ok(()),
@@ -1105,8 +1074,8 @@ pub(crate) mod tests {
             let Some(count) = notices.get() else {
                 return;
             };
-            assert!(door.applying.try_lock().is_none());
-            assert_eq!(door.held.try_lock().is_none(), holds_document);
+            assert!(door.applying_lock().try_lock().is_none());
+            assert_eq!(door.held_lock().try_lock().is_none(), holds_document);
             assert_eq!(door.generation(), u64::from(holds_document));
             notices.set(Some(count + 1));
         });
@@ -1752,6 +1721,12 @@ pub(crate) mod tests {
             Err(SpecRejected::SecondSource)
         );
         assert_eq!(generations.apply_counts(), applied(0, 0));
+        // Nor is one passed there for a later take.
+        assert_eq!(
+            generations.defer(LEAST_LOAD.into(), Format::Yaml),
+            Err(SpecRejected::SecondSource)
+        );
+        assert!(generations.deferred.lock().is_none(), "nothing is kept");
     }
 
     /// The bound of what waits: no more write calls are let in than the
@@ -1978,7 +1953,7 @@ pub(crate) mod tests {
             door.enforce_in_turn(String::new(), document, Format::Yaml)
                 .await
         };
-        let applying = generations.applying.lock();
+        let applying = generations.applying_lock().lock();
         let mut calls = JoinSet::new();
         for n in 0..=WRITES_WAITING {
             calls.spawn(enforce(Arc::clone(&generations), n));
@@ -2125,7 +2100,7 @@ pub(crate) mod tests {
         let (_, first) = enforce(&generations, LEAST_LOAD).expect("it runs");
         let (_, second) = enforce(&generations, RANDOM).expect("it runs");
 
-        let applying = generations.applying.lock();
+        let applying = generations.applying_lock().lock();
         let old = generations.read(1).await.expect("on file");
         drop(applying);
         assert_eq!(
@@ -2293,6 +2268,12 @@ pub(crate) mod tests {
         assert_eq!((refused.path, refused.why), (NUMBER, NOT_ABOVE));
         assert_eq!(standing(&store), own);
         assert_eq!(standby.document(0).expect("held").generation, 2);
+        // Its own number over its own bytes, in another form.
+        let mut told = sent(&standby);
+        told.document.as_mut().expect("a document").format = "json".to_owned();
+        let refused = followed(&standby, &told).expect_err("another form");
+        assert_eq!((refused.path, refused.why), (NUMBER, NOT_ABOVE));
+        assert_eq!(standing(&store), own);
     }
 
     #[test]
@@ -2605,13 +2586,79 @@ pub(crate) mod tests {
         );
     }
 
+    /// A start that defers its document passes it under the door's lock,
+    /// as an apply does. It lets the lock go behind the start. So no second
+    /// source comes between its pass and its mark.
+    #[test]
+    fn a_deferred_start_passes_its_document_under_the_doors_lock() {
+        thread_local! {
+            static DOOR: RefCell<Option<Arc<Generations>>> = const { RefCell::new(None) };
+            static LOCKED: Cell<Option<bool>> = const { Cell::new(None) };
+        }
+        fn looking(
+            document: &PolicySpec,
+            digest: Digest,
+            catalog: &StageRegistry,
+            denied_headers: &[&str],
+        ) -> Result<AppliedSpec, SpecError> {
+            let locked = DOOR.with_borrow(|door| {
+                let door = door.as_ref().expect("the case's door");
+                door.applying_lock().try_lock().is_none()
+            });
+            LOCKED.set(Some(locked));
+            AppliedSpec::validate_digested(document, digest, catalog, denied_headers)
+        }
+        let store = Arc::new(MemoryStore::new());
+        let door = Arc::new(Generations::validating(store, stock(), looking, None));
+        DOOR.set(Some(Arc::clone(&door)));
+        let deferred = door.defer(RANDOM.into(), Format::Yaml);
+        DOOR.set(None);
+        deferred.expect("a valid document");
+        assert_eq!(LOCKED.get(), Some(true), "the pass ran under the lock");
+        assert!(
+            door.applying_lock().try_lock().is_some(),
+            "let go behind the start"
+        );
+    }
+
+    /// A leader's generation holds the door's lock from its pass until it
+    /// lands, its entry included. No apply comes between the two. An event
+    /// that changes nothing holds it the same way.
+    #[test]
+    fn a_followed_generation_holds_the_doors_lock_from_its_pass_until_it_lands() {
+        let (_, leader) = generations();
+        yaml(&leader, RANDOM).expect("a valid document");
+        let told = sent(&leader);
+        let (store, standby) = generations();
+        let locked = || standby.applying_lock().try_lock().is_none();
+
+        let following = standby.following(&told).expect("above no generation");
+        assert!(locked(), "held behind the pass");
+        // The entry's notice looks at the lock where it runs.
+        REPLICA_NOTICES.with(|notices| notices.set(Some(0)));
+        let landed = following.land(None);
+        assert_eq!(REPLICA_NOTICES.with(Cell::take), Some(1));
+        landed.expect("it lands");
+        assert!(!locked(), "let go behind the entry");
+        assert_eq!(standing(&store).0, 1);
+
+        let again = standby.following(&told).expect("the standing one again");
+        assert!(locked(), "held by an event that changes nothing");
+        again.land(None).expect("nothing to land");
+        assert!(!locked());
+        // An event the door refuses holds nothing behind its refusal.
+        yaml(&standby, LEAST_LOAD).expect("its own second generation");
+        assert!(standby.following(&told).is_err(), "under its own");
+        assert!(!locked());
+    }
+
     /// The hand of a replica that follows waits for the lock a generation
     /// enters under, the one of the bytes held: a hand and an entry stand
     /// in one order, whichever thread runs first.
     #[test]
     fn a_hand_waits_for_the_lock_a_generation_enters_under() {
         let (_, door) = generations();
-        let entry = door.held.lock();
+        let entry = door.held_lock().lock();
         thread::scope(|scope| {
             let (done, lands) = mpsc::channel();
             let door = &door;
@@ -2778,6 +2825,13 @@ pub(crate) mod tests {
         assert!(awaits(&store));
         followed(&standby, &sent(&leader)).expect("above no generation");
         assert!(!awaits(&store), "a followed generation stands");
+        // A start that passes its document behind a generation it followed
+        // marks nothing: a generation stands.
+        let (store, late) = generations();
+        followed(&late, &sent(&leader)).expect("above no generation");
+        late.defer(RANDOM.into(), Format::Yaml)
+            .expect("a valid document");
+        assert!(!awaits(&store), "no mark on a generation that stands");
     }
 
     /// The watch's sleep where the start's document waits: no longer than
@@ -2871,7 +2925,7 @@ pub(crate) mod tests {
         elector.tick(Instant::now()).expect("a take");
         assert!(door.source_writes());
         let (held, loads) = match locked {
-            Locked::Held => (Some(door.held.lock()), None),
+            Locked::Held => (Some(door.held_lock().lock()), None),
             Locked::Loads => (None, Some(store.holding_loads())),
         };
         let outcome = thread::scope(|scope| {
@@ -2884,7 +2938,7 @@ pub(crate) mod tests {
         assert_eq!(outcome, Ok(ApplyOutcome::Waits(0)));
         assert_eq!(standing(&store), (0, None));
         assert_eq!(door.apply_counts(), applied(0, 0));
-        assert!(door.held.lock().is_none(), "no bytes are kept");
+        assert!(!door.holds(), "no bytes are kept");
     }
 
     /// A fence that closes while the entry waits for the door's lock of
