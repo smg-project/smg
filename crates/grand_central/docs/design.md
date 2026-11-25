@@ -2359,8 +2359,22 @@ request ──> route (HTTP or gRPC, any family)
   client's own body fault on the pass-through. These routes state no time to first token and no
   tokens.
 
+  A single request on the gRPC wire tells its end through its stream, an answer read whole too:
+  every answer of that wire is read through one stream. The execution stage asks the attempt's
+  selection for the handle once the dispatch has returned, and hands it to the stream its call
+  opened. The stream tells a clean end as the worker's 200, and a failed one by the status the
+  circuit breaker samples for it. A reader whose own stop ends the generation tells that good end
+  where it lets the engine go. The stage tells an attempt that opened no stream: a call that
+  failed, a deadline that passed before the call answered, an embedding's one sample. Where an
+  embedding's inputs fail in different ways, its status is that sample and its class the first
+  failure's. A batch of prompts is one placement, told as one status: the first failure one of its
+  streams meets, or the worker's 200 once every stream ended well. Nobody tells a client that
+  left, a reading the gateway gave up, or a failure the breaker takes no sample of: the request's
+  media, a constraint the engine could not continue under, a constraint the worker refused. This
+  wire states no time to first token and no tokens yet.
+
   A route tells every answer of its workers or none. The other routes tell no outcome yet
-  **[planned]**: the transcription route, the gRPC stages, the pair routes. There, and for an end
+  **[planned]**: the transcription route, the pair routes. There, and for an end
   nobody reported, a stage hears the end of a request that was sent as a cancelled completion,
   with the time since its dispatch and no other measure. So a plugin stage that learns from
   outcomes reads those requests as cancelled.
@@ -2387,13 +2401,14 @@ The bar for that change:
    pair routes between a prefill's answer and its decode's dispatch, where the document asks the
    decode again. A route that tells an outcome makes one more call where it records the status
    on the worker: on the answer it keeps, or on a handle it asked of the guard for its stream's
-   reader. A classic request makes the same call.
+   reader. On the gRPC wire the stream is that reader, and the execution stage hands it the
+   handle. A classic request makes the same call.
 3. With the engine off, a classic decision pays what rule 5 names and no more, counted in the
    gateway's decision bench.
 
    With the engine off, neither pair route makes the one call of the second point. Each route asks the pair's first answer once, where it decides how the pair is sent, and builds no ask for a decode the classic policies picked. A classic pair sent prefill first still pays that test, the holder of its decode ahead of the send, and on the HTTP route the cell a moved decode is written to. The decision bench runs no route's attempt, so it does not count that cost. It was counted once by a program built for the count, under Callgrind, on the lines the second point added.
 
-   With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A pair route's relay is handed an empty handle and pays its test. The decision bench's `--end` flag counts each against a cell that reports nothing.
+   With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A pair route's relay is handed an empty handle and pays its test. On the gRPC wire the stage's ask returns at the answer's first test, and the request's stream is left as it is. The decision bench's `--end` flag counts each against a cell that reports nothing.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
 
 ### 9.3 The options
@@ -2903,8 +2918,8 @@ gateway                                           controller (leader)
   the gateway placed by itself holds no lease on file, so it enters no count of requests in
   flight: its dispatch names no worker (decision 6). Its completion names the worker that served
   it. Nothing counts it toward that worker's health yet **[planned]**. In process the regular HTTP
-  router's typed and pass-through routes tell the gateway's own engine the outcome, and its other
-  routes do not yet (section 9.2).
+  router's typed and pass-through routes and a single request on the gRPC wire tell the gateway's
+  own engine the outcome, and the other routes do not yet (section 9.2).
 - When no answer comes in time (no credit on the stream, a change of leader, the controller
   gone), the gateway decides by itself with the same engine, under the document the controller
   pushed, over the worker list it follows (decision 6). That list stops changing while the

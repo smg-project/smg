@@ -4455,7 +4455,7 @@ impl<'a> ChatStream<'a> {
             endpoint,
             tail_tokens: self.tail_tokens,
         });
-        drop(grpc_stream);
+        grpc_stream.abort_past_stop();
     }
 
     /// The engine's end, one pass per call: first the choices Symphony reads
@@ -5609,7 +5609,7 @@ impl<'a> MessagesStream<'a> {
             endpoint: metrics_labels::ENDPOINT_MESSAGES,
             tail_tokens: self.tail_tokens,
         });
-        drop(grpc_stream);
+        grpc_stream.abort_past_stop();
     }
 
     /// Phase 1: the `message_start` with the skeleton message.

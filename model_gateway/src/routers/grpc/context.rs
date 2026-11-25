@@ -63,7 +63,7 @@ use crate::{
         common::{
             attempt_ledger::AttemptLedger,
             pd_admission::PdAdmissionGuard,
-            placement::Placed,
+            placement::{Placed, RequestEnd, SharedEnd},
             prefill_admission::{PrefillAhead, PrefillLoadGuard},
             snapshot::WorkerRegistry,
             sse::SseSender,
@@ -1217,6 +1217,20 @@ impl LoadGuards {
             }
         }
     }
+
+    /// The handle on the end of the single request these guards count
+    /// ([`RequestEnd::of`]), asked of its guard under whatever rides with
+    /// it. A batch's sub-requests are one placement: the first guard made
+    /// from its answer keeps Grand Central's side of it, and that guard
+    /// is asked. A pair's guards hand the empty handle.
+    pub(crate) fn end(&self) -> RequestEnd {
+        match self {
+            Self::Single { _guard } => RequestEnd::of(_guard),
+            Self::Batch { _guards } => _guards.first().map_or_else(RequestEnd::default, Self::end),
+            Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => _guards.end(),
+            Self::Disaggregated { .. } => RequestEnd::default(),
+        }
+    }
 }
 
 /// Response processing state (Step 6)
@@ -1670,6 +1684,36 @@ impl WorkerSelection {
         std::iter::once(first).chain(second)
     }
 
+    /// The handle a single request tells Grand Central its end through
+    /// ([`RequestEnd`]), asked of `guards`, the attempt's
+    /// ([`LoadGuards::end`]). The answer's one word is tested first
+    /// ([`Placed::end_of`]): a request the classic policies placed walks no
+    /// guards and takes the empty handle. Every sub-request of a batch
+    /// takes the handle of the batch's one placement. A pair takes the
+    /// empty handle: nobody tells the engine a pair's end yet.
+    #[inline]
+    pub(crate) fn end(&self, guards: Option<&LoadGuards>) -> RequestEnd {
+        match self {
+            Self::Single { worker } => {
+                worker.end_of(|| guards.map_or_else(RequestEnd::default, LoadGuards::end))
+            }
+            Self::Disaggregated { .. } => RequestEnd::default(),
+        }
+    }
+
+    /// Whether this selection's request tells Grand Central its end:
+    /// the test [`Self::end`] makes ahead of its guards, for a place that
+    /// holds no guards or would make something for the report alone. True
+    /// for a single request whose answer says so ([`Placed::tells_end`]). A
+    /// request the classic policies placed and a pair tell none.
+    #[inline]
+    pub(crate) fn tells_end(&self) -> bool {
+        match self {
+            Self::Single { worker } => worker.tells_end(),
+            Self::Disaggregated { .. } => false,
+        }
+    }
+
     /// The engines (base URLs) this selection dispatches to: the one worker,
     /// or the prefill and decode sides.
     pub fn engines(&self) -> impl Iterator<Item = &str> {
@@ -1970,6 +2014,47 @@ impl ExecutionResult {
                     result.apply_deadline(deadline);
                 }
             }
+        }
+    }
+
+    /// From here on the result tells Grand Central its request's end
+    /// through `end`, the handle the execution plan asked of the attempt's
+    /// guards ([`WorkerSelection::end`]). The one worker's stream tells its
+    /// own end ([`ProtoStream::report_through`]). The streams of a batch
+    /// share its one placement's end ([`SharedEnd`]): the first failure one
+    /// of them meets stands, and the worker's 200 is told once every stream
+    /// ended well. An embedding is its answers, in hand
+    /// and all good: the worker's 200 is told here, the status the circuit
+    /// breaker sampled for them, and nothing for an embedding of no answer,
+    /// which the breaker took no sample of.
+    pub(crate) fn report_through(&mut self, end: RequestEnd) {
+        match self {
+            Self::Single { stream, .. } => stream.report_through(end),
+            // Nobody tells the engine a pair's end yet. The change that
+            // makes a pair's two sides tell theirs turns this arm on.
+            Self::PrefillDecode { .. } => {}
+            Self::Embedding { responses } => {
+                if !responses.is_empty() {
+                    end.report(200, || true);
+                }
+            }
+            Self::Batch { results } if !end.is_empty() => {
+                let shared = SharedEnd::among(end);
+                for result in results {
+                    match result {
+                        Self::Single { stream, .. } => {
+                            stream.put_report_layer(RequestEnd::default(), Some(shared.reader()));
+                        }
+                        // A single request's batch holds its streams alone.
+                        // A result of another kind takes no share of the
+                        // end: the batch's good end does not wait on it.
+                        Self::PrefillDecode { .. }
+                        | Self::Embedding { .. }
+                        | Self::Batch { .. } => {}
+                    }
+                }
+            }
+            Self::Batch { .. } => {}
         }
     }
 }
@@ -2698,6 +2783,65 @@ mod tests {
             3,
         ));
         assert_eq!(spy.0.lock().unwrap().len(), before + 3);
+    }
+
+    /// The handle on a request's end is asked of its guard under whatever
+    /// rides with the guards: the dispatch's upstream span, an admission
+    /// claim. A request told through that handle hears its outcome.
+    #[test]
+    fn the_guards_hand_a_requests_end_under_what_rides_with_them() {
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::{
+            common::{
+                pd_admission::{try_admit_decode, Tried},
+                placement::tests::heard_request,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
+        };
+
+        // A ride takes the guards and hands them back under itself.
+        type Ride = Box<dyn FnOnce(LoadGuards) -> LoadGuards>;
+
+        let window = [("max_running_requests".to_string(), "1".to_string())];
+        let windowed: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://windowed")
+                .worker_type(WorkerType::Decode)
+                .labels(window.into_iter().collect())
+                .build(),
+        );
+        let Tried::Claimed(claim) = try_admit_decode(&windowed, 1) else {
+            panic!("a free room is claimed");
+        };
+        let rides: [(&str, Ride); 2] = [
+            (
+                "the upstream span",
+                Box::new(|guards| LoadGuards::traced(tracing::Span::none(), guards)),
+            ),
+            (
+                "an admission claim",
+                Box::new(move |guards| LoadGuards::admitted(Some(claim), guards)),
+            ),
+        ];
+        for (ride, under) in rides {
+            let (heard, guard, end) = heard_request();
+            drop(end);
+            let guards = under(LoadGuards::Single { _guard: guard });
+            assert!(
+                matches!(
+                    guards,
+                    LoadGuards::Traced { .. } | LoadGuards::Admitted { .. }
+                ),
+                "{ride}"
+            );
+            guards.end().report(200, || true);
+            drop(guards);
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                ["issued", "dispatched Single", "completed Ok 200"],
+                "{ride}"
+            );
+        }
     }
 
     /// The client-shape mismatch answers an executor takes from the
