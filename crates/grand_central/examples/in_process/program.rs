@@ -44,9 +44,16 @@
 //! both are a route's own, behind the engine's answer. It keeps no limit of
 //! its own on a pair's workers either ([`NoLimit`]).
 //!
-//! An encode request here carries items and no more: the program states no
-//! fact of a worker, so it serves no image, no demand and no item handed as
-//! a reference.
+//! A retry stays on the wire of its first attempt's worker. The request a
+//! route keeps for a retry was built for one runtime and transport, so the
+//! program states the wire of each worker a retry can go to beside its
+//! list ([`wire`]), and a retry demands the one its first worker is on
+//! ([`Demands::runtime`]). A host whose retries are bound to no wire states
+//! no demand.
+//!
+//! An encode request here carries items and no more. Beyond its wire the
+//! program states no fact of a worker, so it serves no image, no other
+//! demand and no item handed as a reference.
 
 use std::{
     future::Future,
@@ -57,9 +64,9 @@ use http::HeaderMap;
 use smg_grand_central::{
     document::{AppliedSpec, ModeSettings, PolicySettings, RoutingSettings},
     engine::{
-        EncodeClasses, EncodeItems, EncodeLists, EncodeMember, EncoderFacts, HeaderRead, Identity,
-        InProcess, LentList, ModelLists, PairAdmission, PairLists, PartnerClasses, PlaceRequest,
-        PublishedList, Unplaced, WorkerData, WorkerId, WorkerLists,
+        Demands, EncodeClasses, EncodeItems, EncodeLists, EncodeMember, EncoderFacts, FixedFacts,
+        HeaderRead, Identity, InProcess, LentList, ModelLists, PairAdmission, PairLists,
+        PartnerClasses, PlaceRequest, PublishedList, Unplaced, WorkerData, WorkerId, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     store::{EncodeHandoff, EncodeOffer},
@@ -89,6 +96,28 @@ pub const ASKED_AGAIN: [u16; 6] = [408, 429, 500, 502, 503, 504];
 /// handoff ([`Lists::cut`]). It is opaque text: the rule compares it and
 /// reads nothing in it.
 const RUNTIME: &str = "example";
+
+/// The number the program knows a worker's wire by: the runtime it runs and
+/// the transport it is dialed over, each by its place in the worker crate's
+/// own list. It is never zero, which states no wire. The numbering is the
+/// program's own: the engine compares two numbers and reads nothing else of
+/// one ([`DemandFacts::runtime`]), so each host numbers its wires as it
+/// likes.
+///
+/// [`DemandFacts::runtime`]: smg_grand_central::engine::DemandFacts::runtime
+fn wire(worker: &dyn Worker) -> u32 {
+    let runtime = worker.metadata().spec.runtime_type as u32;
+    let transport = *worker.connection_mode() as u32;
+    ((runtime + 1) << 8) | (transport + 1)
+}
+
+/// What the program states of `worker` beside its object: its wire, and
+/// nothing else.
+fn facts_of(worker: &Arc<dyn Worker>) -> FixedFacts {
+    let mut facts = FixedFacts::default();
+    facts.demands.runtime = wire(worker.as_ref());
+    facts
+}
 
 /// The routing settings of a gateway that sets `policy` and nothing else:
 /// each other setting at the value a configuration that leaves it out gets
@@ -159,8 +188,8 @@ impl Plan {
 /// The program's value of one membership generation of a model: the
 /// members the registry published and, cut from them at the value's first
 /// lending, the list of each kind of worker with the cell the program keeps
-/// beside it ([`Cut`]). The program knows nothing of a worker beside its
-/// object, so it states no fact of one.
+/// beside it ([`Cut`]). Of a worker the program states its wire beside its
+/// object ([`wire`]), and no other fact: of an encoder it states none.
 #[derive(Debug)]
 pub struct Lists {
     members: Arc<[Arc<dyn Worker>]>,
@@ -168,14 +197,15 @@ pub struct Lists {
 }
 
 /// A generation's members by the kind of worker each is: each kind's list
-/// in the registry's order with an empty cell beside it, the pair classes
-/// of the prefills and the decodes, and what the encode side reads of the
-/// encoders and of the prefills. Which workers pair is the program's own
-/// word: here every prefill pairs with every decode. Which encoder hands an
-/// item to which prefill is derived by the crate's one rule
-/// ([`EncodeClasses::derive`]) from what the program says each worker
-/// states: here a rendezvous under one runtime, so every encoder hands to
-/// every prefill.
+/// in the registry's order with an empty cell beside it, the wire of each
+/// worker a retry can go to ([`facts_of`]), the pair classes of the
+/// prefills and the decodes, what the encode side reads of the encoders and
+/// of the prefills, and the generation's ring, made of every member's
+/// address. Which workers pair is the program's own word: here every
+/// prefill pairs with every decode. Which encoder hands an item to which
+/// prefill is derived by the crate's one rule ([`EncodeClasses::derive`])
+/// from what the program says each worker states: here a rendezvous under
+/// one runtime, so every encoder hands to every prefill.
 #[derive(Debug)]
 struct Cut {
     single: PublishedList,
@@ -211,9 +241,10 @@ impl Generation for Lists {
 
 impl Lists {
     /// The lists, cut at the first ask: each member is read once, for the
-    /// kind of worker it is. Asks that meet there wait for the one that
-    /// cuts. The engine's task asks behind each membership change, so a
-    /// request cuts only where it comes ahead of the task.
+    /// kind of worker it is, for the wire it is on and for the address the
+    /// ring holds it by. Asks that meet there wait for the one that cuts.
+    /// The engine's task asks behind each membership change, so a request
+    /// cuts only where it comes ahead of the task.
     fn cut(&self) -> &Cut {
         self.cut.get_or_init(|| {
             let of = |kind: WorkerType| -> Arc<[Arc<dyn Worker>]> {
@@ -246,9 +277,10 @@ impl Lists {
                 encoder_facts: ends.encoder_facts(encoders.iter().map(|_| &offer)),
                 prefill_classes: classed.collect(),
                 ring: Ring::of(self.members.iter().map(|worker| worker.url())),
-                single: PublishedList::new(of(WorkerType::Regular)),
-                prefill: PublishedList::new(prefills),
-                decode: PublishedList::new(decodes),
+                single: PublishedList::with_facts(of(WorkerType::Regular), facts_of),
+                prefill: PublishedList::with_facts(prefills, facts_of),
+                decode: PublishedList::with_facts(decodes, facts_of),
+                // A retry states no item, so no demand meets an encoder.
                 encode: PublishedList::new(encoders),
             }
         })
@@ -260,7 +292,7 @@ impl Lists {
         &self.cut().ring
     }
 
-    /// The single workers' list lent with its cell, and with no fact.
+    /// The single workers' list lent with its cell and its workers' wires.
     fn lent(&self) -> LentList<'_> {
         self.cut().single.lent()
     }
@@ -361,6 +393,17 @@ impl Engine {
     fn place<'a>(&self, request: &PlaceRequest<'a>) -> Result<Placement<'a>, Unplaced> {
         self.0.place(request)
     }
+}
+
+/// What one attempt of a request states beyond what its client asked: its
+/// number, the workers the request's failed attempts were sent to, and the
+/// wire the request stays on ([`wire`]). A first attempt states the
+/// default: the number `0`, no worker tried, and `0` for no wire.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stated<'a> {
+    number: u8,
+    tried: &'a [WorkerId],
+    wire: u32,
 }
 
 /// What a client's request states.
@@ -576,10 +619,12 @@ impl Program {
     }
 
     /// The request of one attempt, as each call for that attempt states it:
-    /// the attempt of number `attempt`, `0` the first, of a request that
-    /// already tried `tried`, over `lists`, the model's generation as its
-    /// caller holds it at that call. The number is stated and not counted
-    /// off `tried`: a failed attempt of a pair names two workers. The
+    /// what the attempt states ([`Stated`]) of the request its client
+    /// asked, over `lists`, the model's generation as its caller holds it
+    /// at that call. The attempt's number is stated and not counted off the
+    /// tried workers: a failed attempt of a pair names two workers. A retry
+    /// states the wire it stays on as its demand ([`Demands::runtime`]),
+    /// and a first attempt demands nothing. The
     /// request lends what the program's plan says: the single workers'
     /// list, a pair's two, or an encode request's three. The items a
     /// request carries are stated with those three lists, at its first
@@ -592,8 +637,7 @@ impl Program {
         &self,
         asked: &Asked<'a>,
         lists: Option<&'a Lists>,
-        attempt: u8,
-        tried: &'a [WorkerId],
+        stated: Stated<'a>,
     ) -> PlaceRequest<'a> {
         let lent = match (lists, self.plan) {
             (None, _) => WorkerLists::None,
@@ -613,16 +657,23 @@ impl Program {
         let mut items = EncodeItems::default();
         items.keys = asked.items;
         let lends = matches!(lent, WorkerLists::Encode(_));
-        let carries = attempt == 0 && lends && !asked.items.is_empty();
+        let carries = stated.number == 0 && lends && !asked.items.is_empty();
         // The generation's ring goes with every request. The engine asks it
         // where the document's ring stage places by a routing value's text,
         // and for an encode request's items.
         let ring = lists.map(|lists| lists.ring() as &dyn LentRing);
+        // A retry stays on its first worker's wire: the engine holds it to
+        // the workers that state the same number, ahead of every stage.
+        let demands = Demands {
+            runtime: stated.wire,
+            ..Demands::default()
+        };
         PlaceRequest {
             headers,
+            demands,
             encode: carries.then_some(items),
-            attempt,
-            tried,
+            attempt: stated.number,
+            tried: stated.tried,
             decode_again: self.in_turn,
             ring,
             ..PlaceRequest::of(asked.model, lent)
@@ -630,24 +681,20 @@ impl Program {
     }
 
     /// One attempt placed: the engine asked once over the generation that
-    /// stands, for the request of that attempt ([`Self::request`]). The
-    /// answer is the placement kept with the load guard of each worker the
-    /// request goes to, under the routing key the placement names: a
-    /// pair's decode is counted from here, sent at once or later. An item's
-    /// encoder takes its guard at the item's send, and no sooner
-    /// ([`Self::serve`]).
+    /// stands, for the request of that attempt ([`Self::request`]), which
+    /// states `stated`. A caller that keeps its own attempt states a first
+    /// attempt's ([`Stated::default`]). The answer is the placement kept
+    /// with the load guard of each worker the request goes to, under the
+    /// routing key the placement names: a pair's decode is counted from
+    /// here, sent at once or later. An item's encoder takes its guard at
+    /// the item's send, and no sooner ([`Self::serve`]).
     ///
     /// # Errors
     ///
     /// Why the engine named no worker.
-    pub fn place(
-        &self,
-        asked: &Asked<'_>,
-        attempt: u8,
-        tried: &[WorkerId],
-    ) -> Result<InFlight, Unplaced> {
+    pub fn place(&self, asked: &Asked<'_>, stated: Stated<'_>) -> Result<InFlight, Unplaced> {
         let lists = self.published(asked.model);
-        let request = self.request(asked, lists.as_deref(), attempt, tried);
+        let request = self.request(asked, lists.as_deref(), stated);
         let placement = self.engine.place(&request)?;
         let key = placement.routing_key;
         let guard = WorkerLoadGuard::with_key(Arc::clone(&placement.worker), key);
@@ -667,6 +714,11 @@ impl Program {
     /// attempts. Both sides of a pair sent at once go out, whatever the
     /// first answered: the attempt's status is its prefill's where that one
     /// failed, and its decode's otherwise.
+    ///
+    /// A retry stays on the wire of the worker the first attempt went to
+    /// ([`wire`]): each later attempt states that number as its demand. A
+    /// wire that holds one worker keeps it for the retry, and a wire that
+    /// holds none any more leaves the retry no endpoint.
     ///
     /// An encode request's items go out once a request, with its first
     /// attempt: each to the encoder the placement names for it, ahead of
@@ -691,8 +743,15 @@ impl Program {
     /// response can say that it is not to be asked again.
     pub fn serve(&self, asked: &Asked<'_>) -> Answer {
         let (mut tried, mut sent, mut attempts) = (Vec::new(), Vec::new(), 0u8);
+        // The wire the request stays on, from its first attempt's worker.
+        let mut pinned = 0;
         loop {
-            let placed = self.place(asked, attempts, &tried);
+            let stated = Stated {
+                number: attempts,
+                tried: &tried,
+                wire: pinned,
+            };
+            let placed = self.place(asked, stated);
             attempts += 1;
             let mut attempt = match placed {
                 Ok(attempt) => attempt,
@@ -728,7 +787,7 @@ impl Program {
                 };
             }
             if self.in_turn && attempt.placement.decode.is_some() {
-                status = self.sent_in_turn(asked, &mut attempt, attempts - 1, &tried, &mut sent);
+                status = self.sent_in_turn(asked, &mut attempt, stated, &mut sent);
             } else {
                 attempt.sent();
                 for &side in attempt.sides() {
@@ -748,12 +807,17 @@ impl Program {
                     unplaced: None,
                 };
             }
+            // The request kept for a retry was built for the wire of the
+            // worker it went to first: a pair's is its prefill's.
+            if pinned == 0 {
+                pinned = wire(attempt.placement.worker.as_ref());
+            }
             tried.push(attempt.placement.id());
             tried.extend(attempt.placement.decode_id());
         }
     }
 
-    /// A pair's attempt sent in turn, for the attempt of number `number`:
+    /// A pair's attempt sent in turn, for the attempt that states `stated`:
     /// the prefill first, and behind its good answer the decode, which the
     /// engine is asked for again. The answer is the attempt's status: the
     /// prefill's where it failed, else the decode's.
@@ -790,8 +854,7 @@ impl Program {
         &self,
         asked: &Asked<'_>,
         attempt: &mut InFlight,
-        number: u8,
-        tried: &[WorkerId],
+        stated: Stated<'_>,
         sent: &mut Vec<String>,
     ) -> u16 {
         attempt.placement.sent(Side::Prefill);
@@ -808,7 +871,7 @@ impl Program {
             let lists = self.published(asked.model);
             let request = PlaceRequest {
                 counted_on_decode: true,
-                ..self.request(asked, lists.as_deref(), number, tried)
+                ..self.request(asked, lists.as_deref(), stated)
             };
             attempt.placement.decode_again(&request).is_ok()
         };

@@ -3,8 +3,9 @@
 //! The program keeps a hash ring of a model's workers for each generation
 //! ([`Ring`]) and lends it with every request. Under `consistent_hashing` a
 //! request's routing key then goes to the worker that ring's walk reaches
-//! from where the key stands. Each case reads the ring the program holds
-//! and expects the sends its walk says.
+//! from where the key stands. Each case reads the ring the program holds.
+//! All but one expect the sends its walk says, and that one holds the
+//! ring's two walks to one order.
 //!
 //! [`Ring`]: crate::ring::Ring
 
@@ -15,7 +16,7 @@ use std::{
 
 use http::{HeaderMap, HeaderValue};
 use smg_grand_central::{
-    document::PolicySettings,
+    document::{DecodePick, PolicySettings},
     engine::{Identity, WorkerId},
     policies::consistent_hashing::LentRing,
 };
@@ -57,7 +58,8 @@ fn served_under(program: &Program, key: &str) -> Answer {
 /// Under `consistent_hashing` a routing key goes to the worker the program's
 /// ring puts it on: the first worker of the ring's walk from where the key
 /// stands. Sixteen keys over four workers each go there, every time, and
-/// they spread over the workers.
+/// they reach every worker: keys that differ in their last letters alone
+/// stand far apart on this ring.
 ///
 /// The gateway lends the ring its own ring policy walks
 /// (`impl LentRing for HashRing`,
@@ -79,7 +81,31 @@ fn a_routing_key_goes_to_the_worker_the_programs_ring_puts_it_on() {
         }
         owners.insert(owner);
     }
-    assert!(owners.len() > 1, "sixteen keys on one worker");
+    assert_eq!(owners.len(), fleet.len(), "the keys reach every worker");
+}
+
+/// The ring is in the order of its workers' places, whatever order the
+/// registry holds them in. The walk from where a worker's own address
+/// stands starts at that worker, for each of four workers, and two programs
+/// whose workers joined in opposite orders walk every key alike.
+///
+/// The gateway's ring is ordered by its entries' places and walked from
+/// the first entry at a position or past it
+/// (`model_gateway/src/policies/hash_ring.rs:134`, `:297`).
+#[test]
+fn a_ring_is_in_the_order_of_its_workers_places() {
+    let fleet = workers(4);
+    let (program, _loads, _task) = under(PolicySettings::ConsistentHashing, &fleet, served);
+    for worker in &fleet {
+        let walk = walked(&program, worker.url());
+        assert_eq!(walk[0], worker.url(), "the walk from its own address");
+    }
+    let mut backwards = workers(4);
+    backwards.reverse();
+    let (other, _loads, _task) = under(PolicySettings::ConsistentHashing, &backwards, served);
+    for key in keys() {
+        assert_eq!(walked(&program, &key), walked(&other, &key), "{key}");
+    }
 }
 
 /// A worker that leaves hands its keys to the next worker of the ring, and
@@ -203,6 +229,35 @@ fn a_pairs_two_sides_are_walked_on_the_one_ring() {
         let answer = served_under(&program, &key);
         assert_eq!((answer.status, &answer.sent), (200, &expected), "{key}");
     }
+}
+
+/// A pair sent in turn lends the ring at its second ask too. One prefill
+/// and three decodes under `consistent_hashing`, in a document that picks
+/// the decode behind the prefill: the decode a key's request is sent to is
+/// the first decode of the key's walk, which the second ask takes, and the
+/// sixteen keys spread over the decodes.
+///
+/// The gateway states a pair's second ask by the request maker of its
+/// first, which lends the model's ring (`with_pair_request`,
+/// `model_gateway/src/routers/common/placement.rs:2507-2560`, the ring at
+/// `:2556`, the second ask at `:1011-1027`).
+#[test]
+fn a_decode_asked_again_is_walked_on_the_ring_its_second_ask_lends() {
+    let fleet = pair::fleet(1, 3);
+    let ring = PolicySettings::ConsistentHashing;
+    let document = pair::picked(DecodePick::AfterPrefill, ring.clone(), ring);
+    let (program, _loads, _task) = pair::in_turn(&document, &fleet, served);
+    let mut decodes = BTreeSet::new();
+    for key in keys() {
+        let walk = walked(&program, &key);
+        let first = walk.iter().find(|address| address.contains("decode"));
+        let first = first.expect("a decode").clone();
+        let expected = vec![pair::prefill(0), first.clone()];
+        let answer = served_under(&program, &key);
+        assert_eq!((answer.status, &answer.sent), (200, &expected), "{key}");
+        decodes.insert(first);
+    }
+    assert!(decodes.len() > 1, "the keys spread over the decodes");
 }
 
 /// An encode request's item goes to the encoder the ring reaches from where
