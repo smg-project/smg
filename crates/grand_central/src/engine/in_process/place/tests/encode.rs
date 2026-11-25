@@ -1,5 +1,7 @@
 //! The cases of a request with an encode request's three lists.
 
+mod ruled;
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use super::{
@@ -552,6 +554,7 @@ fn an_item_whose_encoder_cannot_be_sent_to_is_placed_by_the_calls_next_decision(
         &asking(lists, both),
         &lists,
         both,
+        &WorkerLists::Encode(lists),
         &mut call,
     );
     assert!(matches!(asked, Ok(None)), "no placement");
@@ -566,6 +569,7 @@ fn an_item_whose_encoder_cannot_be_sent_to_is_placed_by_the_calls_next_decision(
         &asking(lists, both),
         &lists,
         both,
+        &WorkerLists::Encode(lists),
         &mut call,
     );
     assert!(matches!(asked, Ok(None)), "no placement");
@@ -710,6 +714,7 @@ fn a_prompt_behind_an_encoder_that_cannot_be_sent_to_is_written_for_no_pair() {
             &request,
             &lists,
             items,
+            &request.lists,
             &mut Call::default(),
         );
         assert!(matches!(asked, Ok(None)), "no placement");
@@ -770,7 +775,8 @@ fn a_call_takes_its_decisions_answer_on_each_of_five_encoders() {
         ..asking(lists, items)
     };
     let mut call = Call::default();
-    let asked = ask(engine.loaded(), &request, &lists, items, &mut call);
+    let lent = &request.lists;
+    let asked = ask(engine.loaded(), &request, &lists, items, lent, &mut call);
     let placement = asked.expect("a decision").expect("a placement");
     assert_eq!(three.places(&placement).2, vec![0, 1, 2, 3, 4]);
     assert!(call.missed.is_empty(), "{:?}", call.missed);

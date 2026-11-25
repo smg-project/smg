@@ -15,7 +15,12 @@
 //! is answered. The result line's `entry=decide_at` names the engine's
 //! entry as the switch does: for these cells that is the entry for an
 //! encode request. The line also says a request's items and the list's
-//! encoders (`items=`, `encoders=`).
+//! encoders (`items=`, `encoders=`). `--entry place_ruled` and `--entry
+//! place_held` state a route's rule with the one call (the bench's `ruled`
+//! file). Under `place_ruled` the rule takes every worker: the first
+//! decision places, and the rule is asked of its picks alone. Under
+//! `place_held` it is asked of the pair's two lists as well. It is asked
+//! of no encoder under either.
 //!
 //! A cell named `encode_held_...` holds its request to places of each of
 //! the three lists: every worker of the list, as a gateway states the
@@ -65,7 +70,7 @@ use tokio::runtime::Builder;
 use super::{
     measure, mix,
     pair::{self, typed, Open},
-    place, published, reports, signals, Cell, Host, ListOrder, Run, Shadowed, Stated, MODEL,
+    place, published, reports, ruled, signals, Cell, Host, ListOrder, Run, Shadowed, Stated, MODEL,
 };
 
 /// The images one request carries, each an item of its own.
@@ -229,8 +234,9 @@ impl Sides {
 
     /// One request of an `encode_ring...` cell, by the engine's entry or by
     /// the one call: its items' keys in the clear, each with the text the
-    /// turn's seed names, and the cell's ring lent for them.
-    fn keyed(&self, host: &Host, seed: u64, one_call: bool) -> Option<u32> {
+    /// turn's seed names, and the cell's ring lent for them. With `rule`
+    /// the one call's request states the run's rule of its route.
+    fn keyed(&self, host: &Host, seed: u64, one_call: bool, rule: bool) -> Option<u32> {
         let texts = self.texts.as_deref()?;
         let keys: [Identity<'_>; ITEMS] = array::from_fn(|item| {
             let turn = (seed as usize).wrapping_mul(ITEMS).wrapping_add(item);
@@ -248,7 +254,7 @@ impl Sides {
             ..EncodeItems::default()
         };
         if one_call {
-            self.place_items(host, items, ring)
+            self.place_items(host, items, ring, rule)
         } else {
             self.decide_items::<true>(host, seed, items)
         }
@@ -313,20 +319,22 @@ impl Sides {
     /// One encode request of `host` by the one call: the model, the three
     /// lists, the items and a prompt of the plain request's size, with no
     /// entry in a token tree, and both sides' dispatch and end said of the
-    /// placement. The call answers workers and no place of a list, so the
-    /// place this says is the first. A turn that leaves an item with no
-    /// encoder places nothing.
-    fn place(&self, host: &Host, seed: u64) -> Option<u32> {
+    /// placement. With `rule` the request states the run's rule of its
+    /// route ([`ruled::admits`]). The call answers workers and no place of
+    /// a list, so the place this says is the first. A turn that leaves an
+    /// item with no encoder places nothing.
+    fn place(&self, host: &Host, seed: u64, rule: bool) -> Option<u32> {
         let keys = keys(seed);
         let items = EncodeItems {
             keys: &keys,
             ..EncodeItems::default()
         };
-        self.place_items(host, items, None)
+        self.place_items(host, items, None, rule)
     }
 
     /// [`Self::place`] for `items`, with the `ring` the host states on the
-    /// request: the call lends it to the items. Built into each of its two
+    /// request: the call lends it to the items. With `rule` the request
+    /// states the run's rule of its route. Built into each of its two
     /// callers, as [`Self::decide_items`] is.
     #[inline(always)]
     fn place_items(
@@ -334,6 +342,7 @@ impl Sides {
         host: &Host,
         items: EncodeItems<'_>,
         ring: Option<&dyn LentRing>,
+        rule: bool,
     ) -> Option<u32> {
         let request = PlaceRequest {
             prompt: Prompt {
@@ -343,6 +352,7 @@ impl Sides {
             media: images(),
             encode: Some(items),
             ring,
+            admits: ruled::admits(rule),
             ..PlaceRequest::of(MODEL, WorkerLists::Encode(self.lists(host)))
         };
         let mut answer = host.engine.place(&request);
@@ -390,6 +400,8 @@ pub(super) fn runs(run: &Run) -> bool {
     assert!(run.shadow == Shadowed::No, "an encode cell runs no shadow");
     assert!(!run.overloaded, "an encode cell's lists are open");
     let one_call = place::asked_with_lists(run, false);
+    // The run's rule of its route, where its entry states one.
+    let rule = one_call && ruled::stated(run);
     let side = |side: &str, count: usize, worker_type| -> Arc<[Arc<dyn Worker>]> {
         let url = |at: usize| format!("http://{side}-{at:04}:8000");
         (0..count).map(|at| typed(url(at), worker_type)).collect()
@@ -463,7 +475,7 @@ pub(super) fn runs(run: &Run) -> bool {
     // A cell whose items carry their text makes its own turn, so every
     // other cell's turn is the body it was.
     if sides.texts.is_some() {
-        let turn = |seed| sides.keyed(&host, seed, one_call);
+        let turn = |seed| sides.keyed(&host, seed, one_call, rule);
         measure(run, &host, upkeep, || feed.publish(&loads), converted, turn);
         return true;
     }
@@ -475,7 +487,7 @@ pub(super) fn runs(run: &Run) -> bool {
         converted,
         |seed| {
             if one_call {
-                sides.place(&host, seed)
+                sides.place(&host, seed, rule)
             } else {
                 sides.decide(&host, seed)
             }

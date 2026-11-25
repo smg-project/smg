@@ -13,10 +13,14 @@
 //!
 //! Where no target of a call's first decision holds, or that decision
 //! sheds the request as saturated, and the request states a rule, the
-//! rule is asked of both lists once, and the call's later decisions are
-//! held to the workers it takes on each ([`again`]): they are lent the
-//! same two lists with each side's places beside it
-//! ([`PairLists::prefill_places`], [`PairLists::decode_places`]).
+//! rule is asked of the two lists once, the prefills' first, and the
+//! call's later decisions are held to the workers it takes on each
+//! ([`again`]): they are lent the same two lists with each side's places
+//! beside it ([`PairLists::prefill_places`],
+//! [`PairLists::decode_places`]). A list the rule takes no worker of ends
+//! the call there: behind such prefills the decodes are not asked. An
+//! encode request that carries items is held the same way, by the same
+//! routine, over the pair's two of its three lists ([`super::encode`]).
 //!
 //! Which workers pair is the caller's word: the classes its lists carry
 //! ([`PartnerClasses`](crate::engine::PartnerClasses)). A decision names no
@@ -182,21 +186,23 @@ pub(super) fn asks<'a>(
     lent: &WorkerLists<'_>,
     call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
-    match ask(engine, request, lists, lent, call) {
-        Ok(Some(placement)) => Ok(placement),
-        Ok(None) => again(engine, request, lists, lent, call, None),
+    let shed = match ask(engine, request, lists, lent, call) {
+        Ok(Some(placement)) => return Ok(placement),
+        Ok(None) => None,
         Err(
             shed @ Unplaced::Shed {
                 reason: ShedReason::Saturated,
                 ..
             },
-        ) => again(engine, request, lists, lent, call, Some(shed)),
-        Err(unplaced) => Err(unplaced),
-    }
+        ) => Some(shed),
+        Err(unplaced) => return Err(unplaced),
+    };
+    let next = |lent: &WorkerLists<'_>, call: &mut Call| asks(engine, request, lists, lent, call);
+    again(request, lists, lent, call, shed, &next)
 }
 
-/// The call's next ask behind one none of whose targets held, or that
-/// shed the request as saturated (`shed`), which was lent `lent`
+/// The call's next ask (`next`) behind one none of whose targets held, or
+/// that shed the request as saturated (`shed`), which was lent `lent`
 /// ([`asks`]). Behind the call's first ask, a rule the request
 /// states is asked of the two lists first, while the call holds no
 /// decision ([`hold_to_rule`]): of the prefills, then of the decodes,
@@ -214,6 +220,16 @@ pub(super) fn asks<'a>(
 /// lent its lists as they stand. Out of line: a pair whose first ask
 /// takes a target runs none of it.
 ///
+/// One routine for a pair and for an encode request that carries items
+/// ([`super::encode`]): `lists` are the pair's two, of a pair's lists or
+/// of an encode request's three, and `next` is the caller's own ask, which
+/// this routine is handed and does not name. The rule is asked of the
+/// pair's two lists and of no encoder, and the encoders' list is lent as
+/// it stands. An encode request comes here too where an encoder could not
+/// be sent to: its pair is then decided among the rule's workers as well.
+/// A shed made over its encoders does not come here: it stands with the
+/// ask that made it.
+///
 /// A decision judges the overload over the lists it is lent: a worker
 /// under its thresholds that the rule refuses, and that no decision
 /// names, keeps a list from being wholly over them, and the decision
@@ -228,13 +244,13 @@ pub(super) fn asks<'a>(
 /// a worker it cannot send to it has no worker, and its shed stands.
 #[cold]
 #[inline(never)]
-fn again<'a>(
-    engine: Loaded<'static, '_>,
+pub(super) fn again<'a>(
     request: &PlaceRequest<'a>,
     lists: &PairLists<'_>,
     lent: &WorkerLists<'_>,
     call: &mut Call,
     shed: Option<Unplaced>,
+    next: &dyn Fn(&WorkerLists<'_>, &mut Call) -> Result<Placement<'a>, Unplaced>,
 ) -> Result<Placement<'a>, Unplaced> {
     /// `pair` with each side's places beside its list.
     fn held<'w>(pair: PairLists<'w>, prefills: &'w [u32], decodes: &'w [u32]) -> PairLists<'w> {
@@ -272,7 +288,9 @@ fn again<'a>(
         (WorkerLists::Pair(pair), Some(prefills), Some(decodes)) => {
             WorkerLists::Pair(held(pair, prefills, decodes))
         }
-        // Three lists with no item are decided as their pair.
+        // An encode request's three lists: the pair's two with their
+        // places, the encoders' as it stands. With no item they are
+        // decided as their pair, and with items by the request's own ask.
         (WorkerLists::Encode(three), Some(prefills), Some(decodes)) => {
             WorkerLists::Encode(EncodeLists {
                 pair: held(three.pair, prefills, decodes),
@@ -282,5 +300,5 @@ fn again<'a>(
         // No places were found here: the next ask is lent what this one was.
         _ => *lent,
     };
-    call.again(|call| asks(engine, request, lists, &lent, call))
+    call.again(|call| next(&lent, call))
 }

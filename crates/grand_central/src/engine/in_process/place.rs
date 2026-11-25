@@ -51,8 +51,9 @@
 //! A request with an encode request's three lists is placed the same way:
 //! a decision names its pair and each item's encoder, and the request is
 //! placed where its pair's two workers and every encoder can be sent to
-//! ([`encode`]), three decisions a call at most. Where it carries items,
-//! its later decisions are not held to the workers the rule takes.
+//! ([`encode`]), three decisions a call at most. Its later decisions are
+//! held to the workers the rule takes on each of its pair's two lists, as
+//! a pair's are, with the items it carries or with none.
 //!
 //! A pair's decode decided again behind its prefill is placed by the same
 //! read of a worker, over the decodes that decision names
@@ -404,8 +405,7 @@ pub struct PlaceRequest<'a> {
     /// under the same lock, and each is held to the same.
     ///
     /// For an encode request the rule is its pair's: it is asked of the
-    /// pair's two workers and of no encoder, and of no list where the
-    /// request carries items.
+    /// pair's two workers and of the pair's two lists, and of no encoder.
     pub admits: Option<WorkerRule<'a>>,
 }
 
@@ -471,9 +471,10 @@ pub(super) struct Made<'r, 'a> {
     /// sent to.
     missed: &'r [WorkerId],
     /// The lists the decision is lent ([`RequestMaker::workers`]): the
-    /// request's own. A pair's ask behind the decision that had the rule
-    /// asked of its two lists is lent the same lists with each side's
-    /// places beside it ([`pair`]).
+    /// request's own. A pair's ask, or one of an encode request that
+    /// carries items, behind the decision that had the rule asked of the
+    /// pair's two lists is lent the same lists with each side's places
+    /// beside it ([`pair`]).
     lists: &'r WorkerLists<'r>,
     /// The places of a single request's list the decision is held to: the
     /// workers the route's rule takes, for an ask behind the decision that
@@ -971,8 +972,9 @@ impl RequestMaker for Made<'_, '_> {
         prompt_bytes_of(prompt.tokens, prompt.text)
     }
 
-    // The lists the ask is lent: the request's own, but for a pair's ask
-    // that is held to its route's rule ([`pair`]).
+    // The lists the ask is lent: the request's own, but for an ask of a
+    // pair or of an encode request that is held to its route's rule
+    // ([`pair`]).
     fn workers(&self) -> WorkerLists<'_> {
         *self.lists
     }
@@ -1116,19 +1118,16 @@ pub enum Unplaced {
     /// circuit breaker and admitted by its route's rule. A caller answers
     /// that it has no worker for the request.
     ///
-    /// For a single request and for a pair, a rule that answers each
-    /// worker one way within a call is not the cause: a request whose rule
-    /// takes no worker of a list is shed under the rule's name (`admits`),
-    /// and one whose rule takes some is decided among them. Under a
-    /// profile that filters by health a list with no ready worker is shed
-    /// by that filter. So this answer is left for a worker that stopped
-    /// being ready between a decision's read of it and the send, for a
-    /// profile that lists no such filter, and for a rule that refused as a
-    /// pick a worker it took when it was asked of the list.
-    ///
-    /// For an encode request that carries items, the answer does not say
-    /// whether the rule refused the picks or they were not ready: a caller
-    /// that answers the two apart reads its lists itself.
+    /// For a single request, for a pair and for an encode request's pair,
+    /// a rule that answers each worker one way within a call is not the
+    /// cause: a request whose rule takes no worker of a list is shed under
+    /// the rule's name (`admits`), and one whose rule takes some is
+    /// decided among them. Under a profile that filters by health a list
+    /// with no ready worker is shed by that filter. So this answer is left
+    /// for a worker that stopped being ready between a decision's read of
+    /// it and the send, for a profile that lists no such filter, and for a
+    /// rule that refused as a pick a worker it took when it was asked of
+    /// the list.
     ///
     /// An encode request has no worker also where each decision of its
     /// call named an encoder that could not be sent to.
@@ -1309,21 +1308,21 @@ pub(super) fn give_up(
 
 /// Holds the later asks of a call to the workers of `list` its route's
 /// rule takes: a single request's one list, or one of a pair's two, a
-/// list at a time. The rule is asked of every worker of `list`, ready or
-/// not, in the list's order, among the places its caller states for the
-/// list (`stated`, and every place for `None`). The places it takes are
-/// kept in `held`, ascending, each once: a single request's in its call
-/// ([`Call::admitted`]), and each of a pair's two beside the asks that
-/// are lent them ([`pair`]). It is asked of a list once a call, while the
-/// call holds no decision: behind the call's first decision none of whose
-/// targets can be sent to, whether it refused them or they were not
-/// ready, and behind a pair's first decision that sheds the request as
-/// saturated. A request that states no rule keeps no places: its later
-/// asks are made over its lists whole. A rule that panics here leaves no
-/// lease behind. Out of line: a request whose first decision takes a
-/// target runs none of it. An encode request that carries items comes
-/// here for no list: this call hands its decision no places of the
-/// rule's.
+/// list at a time. An encode request's pair is a pair here, with the items
+/// the request carries or with none, and its encoders' list never comes
+/// here. The rule is asked of every worker of `list`, ready or not, in the
+/// list's order, among the places its caller states for the list
+/// (`stated`, and every place for `None`). The places it takes are kept in
+/// `held`, ascending, each once: a single request's in its call
+/// ([`Call::admitted`]), and each of a pair's two beside the asks that are
+/// lent them ([`pair`]). It is asked of a list once a call, while the call
+/// holds no decision: behind the call's first decision none of whose
+/// targets can be sent to, whether it refused them or they were not ready,
+/// and behind a pair's or an encode request's first decision that sheds
+/// the request as saturated. A request that states no rule keeps no
+/// places: its later asks are made over its lists whole. A rule that
+/// panics here leaves no lease behind. Out of line: a request whose first
+/// decision takes a target runs none of it.
 ///
 /// A worker that is not ready is asked too. A rule that takes no worker
 /// is so told from a rule whose workers are not ready: the first is the
@@ -1420,6 +1419,14 @@ pub(super) struct Call {
     /// follows it ([`pair`]). The worker a request names is that
     /// decision's, so no later one moves it.
     named_pair: bool,
+    /// Whether the call's last decision shed an encode request as
+    /// saturated over its encoders, by that decision's own word
+    /// ([`EncodePlaced::shed_over_encoders`]). The route's rule is asked
+    /// of no encoder, so such a shed stands and no rule is asked behind
+    /// it ([`encode`]).
+    ///
+    /// [`EncodePlaced::shed_over_encoders`]: crate::engine::framework::EncodePlaced::shed_over_encoders
+    over_encoders: bool,
     /// The instant of the call's first ask, for a request that states a
     /// budget: the budget is counted from it ([`Call::left`]). `None` for
     /// a request that states no budget: no clock is read for its budget.
@@ -1652,8 +1659,10 @@ impl InProcess {
     /// with no endpoint, under `admits`. One whose rule takes workers none
     /// of which is ready, or workers of a pair's two lists no two of which
     /// pair, is answered by the decision held to them, which names what
-    /// left nobody. An encode request that carries items is held to no
-    /// such places: its decisions are made over its three lists whole.
+    /// left nobody. An encode request is held so over its pair's two
+    /// lists, with the items it carries or with none: the rule is asked of
+    /// no encoder, and the encoders' list is decided as its caller lent
+    /// it.
     ///
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
@@ -1699,14 +1708,14 @@ impl InProcess {
     /// with that encoder excluded, and with each side of the pair that
     /// could not be sent to either. Behind a decision given up its call
     /// makes three decisions at most, each given the request's whole
-    /// budget, and the rule is asked of no list. So such a request can be
-    /// answered no worker while its pair's lists hold workers the rule
-    /// takes: where three decisions' picks are all refused, where such a
-    /// worker is overloaded and a worker the rule refuses is not, and
-    /// where an earlier attempt of the request tried it. An encoder is
-    /// read by its state alone: the route's rule is asked of the pair's
-    /// two workers. With no item the three lists are placed as their
-    /// pair, and held to the rule's workers as a pair is.
+    /// budget. Behind the first of them, and behind a first decision that
+    /// sheds the request as saturated over a list of its pair, the rule
+    /// is asked of the pair's two lists, and the later decisions are made
+    /// among the workers it takes on each, as a pair's are. A shed made
+    /// over the encoders stands, and no rule is asked behind it: the rule
+    /// narrows nothing of them. An encoder is read by its state alone:
+    /// the route's rule is asked of the pair's two workers and of its two
+    /// lists. With no item the three lists are placed as their pair.
     ///
     /// A single request may name its worker. Under a document whose
     /// binding names a target source

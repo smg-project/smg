@@ -171,18 +171,15 @@ pub(super) fn word() -> &'static str {
 }
 
 /// Whether `run` asks the one call of a cell that hands lists of its own,
-/// which its own file runs: a pair's, or an encode request's. A pair's
-/// cell takes a route's rule (`takes_rule`), which its file then states
-/// ([`ruled::stated`]). An encode request's takes none, and the run stops
-/// on one. The result line's word says the entry asked.
-pub(super) fn asked_with_lists(run: &Run, takes_rule: bool) -> bool {
-    let rule = ruled::names(&run.entry);
+/// which its own file runs: a pair's, or an encode request's. Either takes
+/// a route's rule, which its file then states ([`ruled::stated`]). A pair's
+/// cell names a worker too (`names`): an encode request's names none, and
+/// the run stops on that entry. The result line's word says the entry
+/// asked.
+pub(super) fn asked_with_lists(run: &Run, names: bool) -> bool {
     let named = run.entry == pair::NAMED;
-    assert!(
-        takes_rule || !(rule || named),
-        "such a cell states no rule and names no worker"
-    );
-    let asked = rule || named || run.entry == "place";
+    assert!(names || !named, "such a cell names no worker");
+    let asked = ruled::names(&run.entry) || named || run.entry == "place";
     ASKED.store(asked, Ordering::Relaxed);
     asked
 }
