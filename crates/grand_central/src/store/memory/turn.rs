@@ -1161,7 +1161,21 @@ impl MemoryStore {
     /// is of the sides the record held as the frame found it. A dispatch
     /// at an index a chosen side's pick holds no target at moves nothing
     /// and is handed on all the same.
+    ///
+    /// A side a decode call issued stands in the place of the chosen side
+    /// the pair's first decision filed. A release that ends the issued
+    /// side ends that chosen side too, and the engine hears it as the
+    /// release of a decode still chosen that is named alone: the session
+    /// table does, under the verdict the first decision stated, and no
+    /// stage.
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
+        // Read ahead of the door's change, for a release that can end the
+        // decode: one that names it, or no side.
+        #[cfg(feature = "controller")]
+        let first = match said {
+            Said::Released(None | Some(lease::Side::Decode), _) => leases.replaced_decode(&key),
+            _ => None,
+        };
         let found = match said {
             Said::Dispatched(dispatch, when) => leases
                 .dispatched(self.slots(), &key, dispatch, when)
@@ -1171,6 +1185,15 @@ impl MemoryStore {
         };
         if let Some(found) = found {
             self.tell(at, one.world(self), &found, said);
+            #[cfg(feature = "controller")]
+            if let (Some(first), Said::Released(_, reason)) = (first, said) {
+                let chosen = Sides {
+                    decode: Some(first),
+                    ..found
+                };
+                let alone = Said::Released(Some(lease::Side::Decode), reason);
+                self.tell(at, one.world(self), &chosen, alone);
+            }
         }
     }
 }
