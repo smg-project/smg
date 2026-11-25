@@ -38,10 +38,13 @@
       }
     },
     "profiles": {
-      "description": "The profiles by name.",
+      "description": "The profiles by name, each of at least one character.",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/ProfileSpec"
+      },
+      "propertyNames": {
+        "minLength": 1
       }
     },
     "plans": {
