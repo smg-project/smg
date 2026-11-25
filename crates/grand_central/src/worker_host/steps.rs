@@ -85,8 +85,9 @@ struct Keeping {
     /// that holder where the line is built ([`Objects::credentials`]). So
     /// the write and the build read one keeper.
     credentials: Arc<Credentials>,
-    /// The store that holder follows. Where the keeper's answer says so,
-    /// the write has the holder lay the address's objects again from it.
+    /// The store the write's door writes. Where the keeper's answer says
+    /// so, the write has the holder lay the address's objects again, and
+    /// a lay hands each row's count to this store. No row is read from it.
     store: Arc<dyn WorkersStore>,
 }
 
@@ -149,9 +150,15 @@ pub fn registration_into_store<H: WorkflowHost>(
 /// ([`Objects::with_credentials`]), and the holder builds the row's object
 /// with it.
 ///
-/// `store` is the store the holder follows: where the keeper's answer says
-/// so, the write has the holder lay the address's objects again from it. A
-/// holder is built with no store, since each of its reads is handed one.
+/// `door` writes through the holder's write calls ([`Objects::upsert`],
+/// [`Objects::patch`], [`Objects::remove`]), so a row's object stands when
+/// the door answers: the line follows no store. A row written around the
+/// holder has no object when its registration is answered, and the keeper
+/// forgets it there.
+///
+/// `store` is the store that door writes: where the keeper's answer says
+/// so, the write has the holder lay the address's objects again, and a lay
+/// hands each row's count to it. No row is read from it.
 ///
 /// The write runs in the holder's turn, from its keep to that lay-again. A
 /// registration that states another credential alone moves no row, and the
@@ -780,9 +787,10 @@ mod tests {
             WorkersStore,
         },
         worker_host::{
-            facts, membership_writer::tests::StoreDoor, Members, MembershipWriteOutcome,
-            MembershipWriteRefused, MembershipWriter, Objects, Over, Precondition, Remover,
-            RowRevision,
+            facts,
+            membership_writer::tests::{HolderDoor, StoreDoor},
+            Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects,
+            Over, Precondition, Remover, RowRevision,
         },
     };
 
@@ -950,13 +958,17 @@ mod tests {
             }
         }
 
-        /// The fixture with a keeper that its holder reads.
+        /// The fixture with a keeper that its holder reads, and a door that
+        /// writes through that holder: the line that keeps follows no
+        /// store, so a row's object stands when its door answers.
         fn keeping() -> (Self, Arc<Credentials>) {
             let mut fixture = Self::new();
             let credentials = Arc::new(Credentials::new());
             let registry = Arc::clone(&fixture.host.registry);
             fixture.objects =
                 Arc::new(Objects::new(registry).with_credentials(Arc::clone(&credentials)));
+            let (store, objects) = (Arc::clone(&fixture.store), Arc::clone(&fixture.objects));
+            fixture.door = Arc::new(HolderDoor::new(store, objects));
             (fixture, credentials)
         }
 
