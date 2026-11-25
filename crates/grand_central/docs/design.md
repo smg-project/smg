@@ -531,7 +531,9 @@ as its first partners. So a controller makes a pair on one known runtime ahead o
 such a worker, as a gateway does on that wire (section 9.2). The classes hold a model's workers
 of both wires in one table, so a pair of the HTTP wire is a first pair too: no order stands
 between the wires, and a frame decided over both has no twin in a gateway's own placement,
-which places each request on one wire. A row whose facts change gets a new worker object, so
+which places each request on one wire.
+
+A row whose facts change gets a new worker object, so
 the registry builds a new list and a new `G` for each model the worker serves, and for each model
 it leaves. The classes are
 derived once for a `G` and a pairing mode, at the first ask, and stand with it.
@@ -1062,9 +1064,11 @@ states protocols where a worker of its list, or of either list of a pair, is dia
 does not state. The refusal names the input. A controller's request states no protocols and no hint
 above zero: a frame's wires are stated as places of the list (section 10.2), and such a hint is
 dropped.
+
 A pair's demand is kept a side at a time: each side of its two lists is held to the
 workers that meet it as that side's role is held to it, and a side it leaves nobody sheds the pair
 under that demand's stage, the prefills' first.
+
 An encode request's demand is kept the same way for its pair, a side at a time
 (`EncodeLists::decide`), and by the encode pass for its encoders. An
 encoder takes the media of a request that carries items. So the encoders are held to the runtime,
@@ -1074,7 +1078,9 @@ no way of deciding a constraint (`Demands::beside_pair`): it runs neither the pr
 completion. An encode request that stands alone has no pair beside it, and its one list is held to
 the whole demand. A request with no item takes no encoder,
 and its pair's two lists are held as a pair's own. A side the demand leaves nobody sheds the
-request under that demand's stage, the prefills' first. No encoder is cut ahead of the encode
+request under that demand's stage, the prefills' first.
+
+No encoder is cut ahead of the encode
 pass. The pass keeps the encoders' part of the demand in its one test of an encoder, a part at a
 time, against what each encoder states beside its record (`EncodePool::demands`): the runtime is
 the rest of the request's wire, the references and their pipeline stand with the items'
@@ -1083,25 +1089,31 @@ its class. So what the encoders lack is named in the pass's own order, as classi
 whether a request states a fact as a demand or as its own: an encoder that would take the
 request but for its images (`encode-vision`), a pushing encoder that takes the media
 (`ec-compatible`), the media (`encode-media`), the encoders (`encoders`). No encoder is shed
-under a demand's own stage. Three answers for the encoders stand ahead of a side's stage: a gap
+under a demand's own stage.
+
+Three answers for the encoders stand ahead of a side's stage: a gap
 of their membership, encoders none of which is open, and a saturated fleet. A
 host's places for the encoders stand beside a demand as beside none: the pass reads every
 encoder for what the model takes, and the places for what the request may reach. The
 encoders' `places` answer waits behind a side's stage, as it waits behind a gap of the pair's
 membership.
+
 A request with items that demands vision or a way of processing its
 references leaves that part of the demand to its encoders. A decode asked again takes no items
 and would hold the decode to the whole demand, so the decode of such a request is not asked
 again: the entry declines one that states the later decode under `decode-later`, and a placement
 books its decode with its prefill.
+
 A pair's encode items are decided over a host's three lists, with the pair's lease issued
 (`InProcess::decide_encode_at`). The trait has no method for them: the one it had took no
 lists and could only refuse, and it was removed.
+
 The encoders are the one list the engine narrows by protocol itself. An encoder is named by its
 place in its list, and what its host says of it and of each prefill is laid by that place, so the
 host has no narrowed list to hand. The decision leaves out each encoder that serves no protocol
 the request states, and a request with items is refused under `wires` where the list holds
 encoders and none serves one. The pair's two lists are refused as a pair's are.
+
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
 names `places`, where the request is a pair or an encode request: one list of places cannot hold
 a pair's two lists, or an encode request's three. A single request that states places is decided
@@ -1491,9 +1503,13 @@ every count of sends takes it, and its prompt is recorded as behind any pick. Un
 `untold` it is kept from the profile: no stage hears its issue or its dispatch, no count of sends
 takes it, and neither the engine's record of sent prefixes nor a lent tree takes its prompt.
 The session's pin still follows its dispatch, and its completion and its release are told as any
-request's, so a stage matches an end by the lease's id. The routing settings write `untold` for
+request's, so a stage matches an end by the lease's id.
+
+The routing settings write `untold` for
 the sticky override's rule alone: a gateway's sticky map keeps a request it places from the
-gateway's policy. The engine keeps the word on the pick, and one function reads it
+gateway's policy.
+
+The engine keeps the word on the pick, and one function reads it
 (`lease_events::stages_hear`) wherever it is asked, among them a single's lease words, the record's
 two writes, a pair's two writes behind its pick, the tree's store, and the hand-over of a pin
 followed by its own row. Such a pin that is the profile's own
@@ -2495,10 +2511,14 @@ A `Decide` request of the single phase is decided on one of a fixed set of threa
 picks the thread) by `InProcess::decide_without_lease`, over the list of the model's workers
 that the worker objects' registry publishes. A pair's request at its prefill is decided there
 too, over the registry's two lists of its model. Its answer carries a lease a side, or the
-prefill side's alone where its frame stated the later decode. A decode call that names a lease
+prefill side's alone where its frame stated the later decode.
+
+A decode call that names a lease
 goes to the thread that keeps that lease's file. One that names the
 pair's lease is decided behind the prefill that lease holds, by
-`InProcess::decide_decode_without_lease`, and its pick is issued under that lease. A prefill
+`InProcess::decide_decode_without_lease`, and its pick is issued under that lease.
+
+A prefill
 request, or a decode request that names no lease, stands alone where its plan pairs no side of
 its phase: it is decided as a single request is, over the registry's list of its own phase's
 workers, and its lease is a single's. The token count of a prefill-decode mode (section 3.3) is
@@ -2513,7 +2533,9 @@ and for each item's encoder, by `InProcess::decide_encode_without_lease` over th
 three lists of its model, with the holder's pair classes and its encode columns. Its pick is
 issued as a pair's is, with no lease for an encoder, and its answer names each item's encoder
 beside the decision (`DecideAnswer.encode`). The answers come in a pair's order, and a request
-with a key takes its encoders' list as a third list in it. A decode asked again names its lease
+with a key takes its encoders' list as a third list in it.
+
+A decode asked again names its lease
 and states no items. A frame of the encode phase that does not state `DecideRequest.encode`, and a
 decode request that names no lease under a pair plan, are answered `Busy`. By the contract the
 gateway decides such a request locally
@@ -2563,7 +2585,9 @@ worker object's own test. The frame's one decision is held to the places the cou
 prefill's and the decode's where both sides' profiles are the plain hash ring, and the prefill's
 alone where the decode's is not. Where the decode's side alone is the ring's, the decision is
 lent the decodes the gateway can be sent to and counts the number itself, behind the prefill it
-picks (`Constraints::target_worker`). A number that reaches no worker on a side sheds the pair
+picks (`Constraints::target_worker`).
+
+A number that reaches no worker on a side sheds the pair
 with no endpoint, under `target-worker`, and so does a named worker that cannot take the request
 after all. Where no prefill is counted, or none opens the pair, the frame is decided as one that
 names none, and keeps its keys. Where every decode is over its thresholds and the binding steers
@@ -3027,7 +3051,9 @@ Five things follow, and they are the first work of section 16.
    registered, never one of the ranks behind a worker that stands for all of them. In a host's
    own process those answers are classic's own code, which stays, so the 74 lines hold there
    with no replay. For the two rank sheets that rests on a rule of the gateway's change
-   (section 9.2). On main `pair_index` replays through the pairing rule a controller derives its pair classes by (`PairClasses::derive`), `sticky_rank` replays over rank objects through `InProcess`, and `overload` (25 lines) replays as recorded through the worker crate's load monitor, built as a host builds it, where the worker is one object for all its ranks. Eleven of its lines answer differently where each rank is a worker object, by the one rule stage 4's line names (section 16). `minimum_tokens` (18 lines) replays as recorded through the rank cache of that load monitor, where the worker is one object for all its ranks or the object of its one rank. No test replays it through the engine's pick among rank objects, which stage 4's line counts (section 16).
+   (section 9.2).
+
+   On main `pair_index` replays through the pairing rule a controller derives its pair classes by (`PairClasses::derive`), `sticky_rank` replays over rank objects through `InProcess`, and `overload` (25 lines) replays as recorded through the worker crate's load monitor, built as a host builds it, where the worker is one object for all its ranks. Eleven of its lines answer differently where each rank is a worker object, by the one rule stage 4's line names (section 16). `minimum_tokens` (18 lines) replays as recorded through the rank cache of that load monitor, where the worker is one object for all its ranks or the object of its one rank. No test replays it through the engine's pick among rank objects, which stage 4's line counts (section 16).
 2. **23 lines were held to the crate's own answer** (`minimum_tokens` 10, `overload` 6,
    `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The 16 of `minimum_tokens` and `overload` were held by the old engine's store. The 6 of `overload` replay as classic recorded now, through the host's load monitor (point 1). The 10 of `minimum_tokens` replay as classic recorded now too, through that monitor's rank cache (point 1); three of them are rules of the scorer and the picker, which the engine shares where it picks among rank objects. The 4 of `sticky_rank` are held the same through `InProcess`, by the ring and the picker. The
    other three were the engine's. The 2 of `prefix_hash` differ from classic there too (a
@@ -3037,8 +3063,9 @@ Five things follow, and they are the first work of section 16.
    1 of `manual` replays as classic recorded now: a sessions rule runs on the two sides of a
    pair, each side by its own session and under its own cap.
    One answer under a cap differs from classic's, by decision 13 (section 15): the engine moves a
-   prefill side's pin where the pair forms, and classic where it selects the prefill. Each
-   of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
+   prefill side's pin where the pair forms, and classic where it selects the prefill.
+
+   Each of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
    at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,
    `least_load` and `consistent_hashing`. Their only recorded lines are over pools in trouble.
@@ -3061,13 +3088,16 @@ Five things follow, and they are the first work of section 16.
    (`the_classic_prefix_hash_rows_replay_through_the_one_call_with_no_place_stated`). The other
    16 measure which tokens are in a prompt's key (15 lines) or how
    2,000 prompts spread over eight workers (1 line); the second held line is one of the 15.
+
    With a lent ring a request's place is the host's to state, so these 16 test the host's
    recipe. In the crate they stay on the crate's own ring with its own hashes, which a caller
    that lends no ring still runs: 15 hold classic's shares, as on main, and one is held apart.
+
    A gateway runs that ring for some requests, among them a shadow profile whose live profile
    reads the ring too, by another word: such a shadow is lent no ring (`Engine::unlent`). A
    single binding's shadow beside a live profile that reads no ring is lent it, and stated its
    own place.
+
    Classic's key recipe and its ring lookup are functions that classic and the lender both call
    (`PrefixHashPolicy::ring_key` and `HashRing::walk_from` in `model_gateway/src/policies/`), and
    gateway tests place the policy's own requests through classic and through the engine, worker
