@@ -858,8 +858,9 @@ differs in any other field builds every profile anew.
 The exception is safe because no stage is built from the header list. A validation's own stages
 read four values of the view: the block size, the boundaries, the bound of block hashes and the age
 limit of load reports (`check_profile`, `document/spec.rs`). A stage of the host's own is built by a
-factory that is handed no view (`StageBuild`, `stages/registry.rs`). The keep's own premise holds
-here too: a factory builds from what it is handed.
+factory that is handed no header list. Of the view it is handed the age limit of load reports alone
+(`StageBuild::load_report_reader`, `stages/registry.rs`). The keep's own premise holds here too: a
+factory builds from what it is handed.
 
 A stage that reads a request's header reads it by its place in the list of the document its
 decision runs under. A plugin's stage reads the places its host's exposure names, and a stage of
