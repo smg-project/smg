@@ -5723,12 +5723,6 @@ pub struct ViewListPositions {
     pub zone: u16,
     /// One bit for each label selector the worker meets.
     pub labels: u64,
-    /// The worker names an engine family, and the list holds entries and
-    /// not that one.
-    pub engine_outside: bool,
-    /// The worker names a zone, and the list holds entries and not that
-    /// one.
-    pub zone_outside: bool,
 }
 
 impl ViewLists {
@@ -5771,20 +5765,16 @@ impl ViewLists {
         zone: Option<&str>,
         labels: &BTreeMap<String, String>,
     ) -> ViewListPositions {
-        let (engine_at, engine_outside) = self.engine(engine);
-        let (zone_at, zone_outside) = self.zone(zone);
         ViewListPositions {
-            engine_kind: engine_at.unwrap_or(0),
-            zone: zone_at.unwrap_or(0),
+            engine_kind: self.engine(engine).0.unwrap_or(0),
+            zone: self.zone(zone).0.unwrap_or(0),
             labels: self.met(labels),
-            engine_outside,
-            zone_outside,
         }
     }
 
     /// Whether a worker's engine family and its zone stand outside these
-    /// lists, the family first: the two bits [`Self::positions`] answers,
-    /// for a reader that keeps nothing else of that read. No label is read.
+    /// lists, the family first: the worker names one, and its list holds
+    /// entries and not that one. No label is read.
     #[must_use]
     pub(crate) fn outside(&self, engine: &str, zone: Option<&str>) -> (bool, bool) {
         (self.engine(engine).1, self.zone(zone).1)
@@ -7609,36 +7599,39 @@ mod tests {
         let held = labels(&[("tier", "gold"), ("note", "a=b")]);
         let gold = lists.positions("beta", Some("west"), &held);
         assert_eq!((gold.engine_kind, gold.zone, gold.labels), (2, 2, 0b111));
-        assert!(!gold.engine_outside && !gold.zone_outside);
+        assert_eq!(lists.outside("beta", Some("west")), (false, false));
         let held = labels(&[("tier", "silver"), ("note", "a")]);
         let silver = lists.positions("alpha", Some("east"), &held);
         assert_eq!(
             (silver.engine_kind, silver.zone, silver.labels),
             (1, 1, 0b001)
         );
+        // Each position is read from its own list: this worker's family
+        // stands second among the families, and its zone first among the
+        // zones.
+        let apart = lists.positions("beta", Some("east"), &labels(&[]));
+        assert_eq!((apart.engine_kind, apart.zone), (2, 1));
         // A bit is the selector's place in the list, whatever the keys'
         // order: two selectors of one key stand apart here.
         let mixed = spec_with_view(r#"{"labels":["z","b=1","m","b","a=2","q=x"]}"#);
         let mixed = AppliedSpec::validate(&mixed).expect("the document validates");
         let held = labels(&[("a", "2"), ("b", "1"), ("c", "9"), ("m", ""), ("q", "y")]);
         assert_eq!(mixed.lists().positions("", None, &held).labels, 0b01_1110);
-        // A name the list does not hold reads 0 and says so. No name reads
-        // 0 and is not outside.
+        // A name the list does not hold reads 0, and the narrow reader says
+        // it stands outside. No name reads 0 and is not outside.
         let stray = lists.positions("gamma", Some("north"), &labels(&[]));
         assert_eq!((stray.engine_kind, stray.zone, stray.labels), (0, 0, 0));
-        assert!(stray.engine_outside && stray.zone_outside);
+        assert_eq!(lists.outside("gamma", Some("north")), (true, true));
         for zone in [None, Some("")] {
             assert_eq!(
                 lists.positions("", zone, &labels(&[])),
                 ViewListPositions::default()
             );
+            assert_eq!(lists.outside("", zone), (false, false));
         }
-        // The narrow reader answers those two bits alone, the family's
-        // first.
-        assert_eq!(lists.outside("beta", Some("west")), (false, false));
+        // The narrow reader answers its two bits apart, the family's first.
         assert_eq!(lists.outside("gamma", Some("west")), (true, false));
         assert_eq!(lists.outside("beta", Some("north")), (false, true));
-        assert_eq!(lists.outside("", Some("")), (false, false));
         // No list: every worker reads 0 and none is outside.
         let none = AppliedSpec::validate(&spec_with_view("{}")).expect("the document validates");
         assert!(none.lists().is_empty() && AppliedSpec::unbound().lists().is_empty());
