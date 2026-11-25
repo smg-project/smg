@@ -180,12 +180,10 @@ fn pair_table(c: &mut Criterion) {
             decode.health.healthy = true;
         }
         for (state, decodes) in [("open", &open), ("last", &last), ("closed", &closed)] {
-            let pools = PairPools {
-                prefills: &prefills,
-                decodes,
-                table: PairTable::new(&ends, &classes),
-                ..PairPools::default()
-            };
+            let mut pools = PairPools::default();
+            pools.prefills = &prefills;
+            pools.decodes = decodes;
+            pools.table = PairTable::new(&ends, &classes);
             let mut scratch = Scratch::new();
             let probe = engine.decide_pair(&facts(0), &pool, pools, &cx, &cx, &mut scratch);
             assert_eq!(

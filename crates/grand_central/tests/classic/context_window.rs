@@ -108,10 +108,11 @@ impl Replayed for Row {
                 wire_modes: wire_of(&worker.transport)?,
                 state: worker.state,
                 vision: false,
-                facts: DemandFacts {
-                    runtime: runtimes.number(&worker.runtime),
-                    window: worker.window(),
-                    ..DemandFacts::default()
+                facts: {
+                    let mut demand_facts = DemandFacts::default();
+                    demand_facts.runtime = runtimes.number(&worker.runtime);
+                    demand_facts.window = worker.window();
+                    demand_facts
                 },
             });
         }

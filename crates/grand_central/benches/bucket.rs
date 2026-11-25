@@ -85,11 +85,9 @@ fn bucket_prefill(group: &mut BenchmarkGroup<'_, WallTime>) {
                 facts.seed = seed;
                 facts.now_micros = now_micros;
                 let decision = engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch);
-                let lease = Lease {
-                    tokens,
-                    issued_micros: now_micros,
-                    ..Lease::default()
-                };
+                let mut lease = Lease::default();
+                lease.tokens = tokens;
+                lease.issued_micros = now_micros;
                 engine.on_decision_issued(&lease, &decision);
                 decision
             });
@@ -145,11 +143,9 @@ fn bucket_prefill_stale(group: &mut BenchmarkGroup<'_, WallTime>) {
                 facts.seed = seed;
                 facts.now_micros = now_micros;
                 let decision = engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch);
-                let lease = Lease {
-                    tokens,
-                    issued_micros: now_micros,
-                    ..Lease::default()
-                };
+                let mut lease = Lease::default();
+                lease.tokens = tokens;
+                lease.issued_micros = now_micros;
                 engine.on_decision_issued(&lease, &decision);
                 decision
             });
@@ -211,11 +207,9 @@ fn bucket_prefill_models(group: &mut BenchmarkGroup<'_, WallTime>) {
                 facts.seed = seed;
                 facts.now_micros = now_micros;
                 let decision = engine.decide(&facts, &pool, black_box(view), &cx, &mut scratch);
-                let lease = Lease {
-                    tokens,
-                    issued_micros: now_micros,
-                    ..Lease::default()
-                };
+                let mut lease = Lease::default();
+                lease.tokens = tokens;
+                lease.issued_micros = now_micros;
                 engine.on_decision_issued(&lease, &decision);
                 decision
             });
@@ -288,11 +282,9 @@ fn bucket_prefill_parted(group: &mut BenchmarkGroup<'_, WallTime>) {
                 let tokens = (seed.wrapping_mul(2_654_435_761) % 4_096) as u32;
                 let facts = facts_of(tokens, seed, now_micros);
                 let decision = engine.decide(&facts, &pool, black_box(view), &cx, &mut scratch);
-                let lease = Lease {
-                    tokens,
-                    issued_micros: now_micros,
-                    ..Lease::default()
-                };
+                let mut lease = Lease::default();
+                lease.tokens = tokens;
+                lease.issued_micros = now_micros;
                 engine.on_decision_issued(&lease, &decision);
                 decision
             });

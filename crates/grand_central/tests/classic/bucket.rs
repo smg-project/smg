@@ -239,11 +239,9 @@ impl Bed {
             &Constraints::default(),
             &mut self.scratch,
         );
-        let lease = Lease {
-            tokens: request.size(),
-            issued_micros: now_micros,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.tokens = request.size();
+        lease.issued_micros = now_micros;
         self.engine.on_decision_issued(&lease, &decision);
         let target = *decision
             .pick()

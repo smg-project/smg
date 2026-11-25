@@ -44,11 +44,6 @@
 //! member all the same. A gap is named by what the model takes, and a
 //! place says what this request may reach.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
     run_profile, shed, Buffers, ClassBits, Engine, PairPools, Plan, Profile, Scratch, Set,
@@ -100,6 +95,7 @@ const ENCODE_SCOPE: &str = "encode-scope";
 /// What the encode side reads of one encoder beside its candidate row, as
 /// its host states it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncoderFacts {
     /// The encoder's encode class; `0` when it states no end. Its host
     /// numbers the classes from 1 over the encoders it lends, as their
@@ -115,6 +111,7 @@ pub struct EncoderFacts {
 /// and the columns the encode side reads, each by a row's index in its
 /// pool.
 #[derive(Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct EncodePool<'a> {
     pub encoders: &'a [Candidate],
     /// One entry an encoder.
@@ -142,6 +139,7 @@ pub struct EncodePool<'a> {
 
 /// The encode items of a request and what it asks for them.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct EncodeItems<'a> {
     /// Each item's key, the caller's content hash. Empty for a request
     /// without items. A key that carries its text ([`Identity::plain`]) is

@@ -876,12 +876,21 @@ pub trait DecisionScope: Send + Sync + Debug {
 
 /// A scorer with its weight in the profile's combination.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct WeightedScorer {
     pub scorer: Box<dyn Scorer>,
     pub weight: f32,
 }
 
 impl WeightedScorer {
+    /// A scorer with its weight: the record's two fields, so nothing is left
+    /// for a caller to assign today. Code outside this crate starts here:
+    /// the record gains fields, so no literal of it builds there.
+    #[must_use]
+    pub fn of(scorer: Box<dyn Scorer>, weight: f32) -> Self {
+        Self { scorer, weight }
+    }
+
     /// The stage's share of the weights of a profile whose one scorer it
     /// is, as the whole pass folds it into a score ([`combine`]): the
     /// weight times its own inverse. A weight's share of itself need not
@@ -896,6 +905,7 @@ impl WeightedScorer {
 
 /// One profile: an ordered set of filters, scorers and exactly one picker.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Profile {
     pub name: String,
     pub filters: Vec<Box<dyn Filter>>,
@@ -904,6 +914,19 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// A profile of one picker, with no filter and no scorer: a caller
+    /// assigns the two lists over it. Code outside this crate starts here:
+    /// the record gains fields, so no literal of it builds there.
+    #[must_use]
+    pub fn of(name: String, picker: Box<dyn Picker>) -> Self {
+        Self {
+            name,
+            filters: Vec::new(),
+            scorers: Vec::new(),
+            picker,
+        }
+    }
+
     /// What this profile's stages read from the host beyond the facts every
     /// view carries: every stage of every kind, so a stage that reads the
     /// affinity column as a filter or as the picker counts as one that
@@ -3149,6 +3172,7 @@ fn shadow_index(binding: &Binding, phase: Phase) -> Option<u16> {
 
 /// A binding: which profile (or plan of profiles) a request resolves to.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Binding {
     /// A model glob: `*`, `prefix*`, `*suffix` or an exact id.
     pub model: String,
@@ -3170,6 +3194,25 @@ pub struct Binding {
 }
 
 impl Binding {
+    /// The binding of the models `model` names to the profile at `profile`,
+    /// as a document's binding that states those two and nothing else:
+    /// every phase, the `single` plan, no shadow and no session rule. A
+    /// caller assigns the rest over it. Code outside this crate starts
+    /// here: the record gains fields, so no literal of it builds there.
+    #[must_use]
+    pub fn of(model: String, profile: u16) -> Self {
+        Self {
+            model,
+            phases: Vec::new(),
+            plan: Plan::Single,
+            profile,
+            decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
+            sessions: None,
+        }
+    }
+
     fn single_shadow(&self) -> Option<u16> {
         (self.plan == Plan::Single).then_some(self.shadow).flatten()
     }
@@ -4327,6 +4370,7 @@ struct AssignmentStages {
 /// empty for a side nothing reads it on, and its signal cells, none for a
 /// side whose stages read no signal.
 #[derive(Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct PairPools<'a> {
     pub prefills: &'a [Candidate],
     pub decodes: &'a [Candidate],
@@ -4750,8 +4794,8 @@ impl PairSide {
 impl<'a> PairPools<'a> {
     /// The two pools with nothing beside them: no affinity column, no
     /// signal cells and no pair table, so classes pair by their number.
-    /// A caller writes what it holds beside its pools over it:
-    /// `PairPools { table, ..PairPools::of(prefills, decodes) }`.
+    /// A caller assigns what it holds beside its pools over it:
+    /// `let mut pools = PairPools::of(prefills, decodes); pools.table = table;`.
     #[must_use]
     pub fn of(prefills: &'a [Candidate], decodes: &'a [Candidate]) -> Self {
         Self {

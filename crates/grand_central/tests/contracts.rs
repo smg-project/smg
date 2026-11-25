@@ -27,12 +27,9 @@ use prost_types::{
 use smg_grand_central::{
     cases,
     document::{PolicySpec, DENIED_HEADERS},
-    engine::{
-        fingerprint, Identity, LiftedVeto, Pair, Phase, Queue, RequestFacts, Role, Shed,
-        ShedReason, Target, Trace,
-    },
-    mirrored, record,
-    tracking::{Lease, LeaseKind, Side},
+    engine::{fingerprint, Identity, Phase, RequestFacts, Role, ShedReason},
+    mirrored,
+    tracking::Side,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -113,89 +110,30 @@ fn health_record() -> &'static [&'static str] {
 }
 
 fn target_record() -> &'static [&'static str] {
-    record!(
-        Target,
-        Target {
-            position,
-            id,
-            dp_rank,
-            pair
-        }
-    )
+    mirrored::target()
 }
 
 fn pair_record() -> &'static [&'static str] {
-    record!(
-        Pair,
-        Pair {
-            decode_position,
-            decode_id,
-            decode_dp_rank,
-            decode_verdict
-        }
-    )
+    mirrored::pair()
 }
 
 fn shed_record() -> &'static [&'static str] {
-    record!(
-        Shed,
-        Shed {
-            reason,
-            emptied_by,
-            retry_after_secs,
-            wait_allowed,
-            trace
-        }
-    )
+    mirrored::shed()
 }
 
 fn queue_record() -> &'static [&'static str] {
-    record!(
-        Queue,
-        Queue {
-            ticket,
-            max_wait_micros,
-            trace
-        }
-    )
+    mirrored::queue()
 }
 
 fn trace_record() -> &'static [&'static str] {
-    record!(
-        Trace,
-        Trace {
-            profile,
-            survivors,
-            top,
-            top_len,
-            seed,
-            generation,
-            lifted
-        }
-    )
+    mirrored::trace()
 }
 
 /// The lease's session crosses under the name both contracts still spell,
 /// `session_key`. A gateway's client reads it under that name. A change that
 /// renames the field renames it in both contracts and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
-    record!(
-        Lease,
-        Lease {
-            id,
-            kind,
-            side,
-            target_index,
-            booked,
-            generation,
-            session as "session_key",
-            session_verdict,
-            issued_micros,
-            tokens,
-            chars,
-            bytes,
-        }
-    )
+    mirrored::lease()
 }
 
 fn outcome_record() -> &'static [&'static str] {
@@ -271,13 +209,7 @@ fn enum_mirrors() -> Vec<(
             "LeaseKind",
             "LEASE_KIND",
             "lease-kind",
-            cases!(
-                LeaseKind,
-                LeaseKind {
-                    Credit,
-                    Reservation
-                }
-            ),
+            mirrored::lease_kind(),
         ),
         (
             "Completed.Class",
@@ -1319,21 +1251,14 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     // The lifted veto: the mark's variants in order, numbered from zero.
     // Its zero is none, a case, on purpose: the enum's comment says why.
     let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
-    let expected: Vec<(String, i32)> = cases!(
-        LiftedVeto,
-        LiftedVeto {
-            None,
-            Overload,
-            Liveness
-        }
-    )
-    .iter()
-    .enumerate()
-    .map(|(i, case)| {
-        let number = i32::try_from(i).unwrap_or(i32::MAX);
-        (format!("LIFTED_VETO_{}", screaming_case(case)), number)
-    })
-    .collect();
+    let expected: Vec<(String, i32)> = mirrored::lifted_veto()
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let number = i32::try_from(i).unwrap_or(i32::MAX);
+            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+        })
+        .collect();
     assert_eq!(
         found, expected,
         "the lifted vetoes are the mark's, from none"

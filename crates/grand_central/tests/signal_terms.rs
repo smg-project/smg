@@ -186,19 +186,12 @@ fn a_signal_term_closes_the_sum_behind_the_sends() {
         "terms: {{sent.requests: 1000, signal.{PENDING}: 1}}, unreported: missing-as-zero"
     ));
     let rows = [row(0, 0), row(1, 0), row(2, 0)];
-    engine.on_dispatched(
-        &Lease {
-            issued_micros: NOW - 7,
-            tokens: 317,
-            ..Lease::default()
-        },
-        &Target {
-            id: rows[1].id,
-            ..Target::default()
-        },
-        Side::Single,
-        0,
-    );
+    let mut lease = Lease::default();
+    lease.issued_micros = NOW - 7;
+    lease.tokens = 317;
+    let mut target = Target::default();
+    target.id = rows[1].id;
+    engine.on_dispatched(&lease, &target, Side::Single, 0);
     // The costs are 500, 1000 and 1500: the second row holds one send.
     let cells = pending(&[fresh(500.0), fresh(0.0), fresh(1_500.0)]);
     assert_eq!(scores(&engine, &cells, &rows), FIRST_SECOND_THIRD);
@@ -361,19 +354,12 @@ fn a_rule_that_names_a_signal_counts_the_profiles_sends() {
     let cells = pending(&[fresh(700.0), fresh(700.0)]);
     // No send is on file: each row holds its 700 pending tokens.
     assert_eq!(kept(&engine, &facts(Some(&cells), 0), &rows), [0, 1]);
-    engine.on_dispatched(
-        &Lease {
-            issued_micros: NOW - 7,
-            tokens: 301,
-            ..Lease::default()
-        },
-        &Target {
-            id: rows[0].id,
-            ..Target::default()
-        },
-        Side::Single,
-        0,
-    );
+    let mut lease = Lease::default();
+    lease.issued_micros = NOW - 7;
+    lease.tokens = 301;
+    let mut target = Target::default();
+    target.id = rows[0].id;
+    engine.on_dispatched(&lease, &target, Side::Single, 0);
     // A send of 301 tokens puts the first row a token over the bound.
     assert_eq!(kept(&engine, &facts(Some(&cells), 0), &rows), [1]);
 }
@@ -611,16 +597,15 @@ bindings:
     facts.now_micros = NOW;
     facts.signal_cells = Some(&request);
     let cx = Constraints::default();
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
+    pools.prefill_signal_cells = Some(&prefill);
+    pools.decode_signal_cells = Some(&decode);
     let decision = engine.decide_pair(
         &facts,
         &PoolFacts::default(),
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            prefill_signal_cells: Some(&prefill),
-            decode_signal_cells: Some(&decode),
-            ..PairPools::default()
-        },
+        pools,
         &cx,
         &cx,
         &mut Scratch::new(),

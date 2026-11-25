@@ -83,18 +83,15 @@ fn decide(c: &mut Criterion) {
         let fleet = fleet(n);
         let mut view = Vec::with_capacity(n);
         build_view(&fleet, &mut view);
-        let lease = Lease {
-            issued_micros: 1_000_000,
-            tokens: 512,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = 1_000_000;
+        lease.tokens = 512;
         for c in &view {
-            let target = Target {
-                position: c.position,
-                id: c.id,
-                dp_rank: c.dp_rank,
-                pair: None,
-            };
+            let mut target = Target::default();
+            target.position = c.position;
+            target.id = c.id;
+            target.dp_rank = c.dp_rank;
+            target.pair = None;
             engine.on_dispatched(&lease, &target, Side::Single, 0);
         }
         let mut scratch = Scratch::new();
@@ -197,13 +194,11 @@ fn keyed(group: &mut BenchmarkGroup<'_, WallTime>) {
     let decision = engine.decide(&hit, &pool, &view, &cx, &mut scratch);
     let pick = decision.pick().expect("a keyed pick");
     let target = *pick.targets.first().expect("a target");
-    let lease = Lease {
-        session: hit.session(),
-        session_verdict: pick.session_verdict,
-        issued_micros: hit.now_micros,
-        tokens: hit.prompt_tokens,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.session = hit.session();
+    lease.session_verdict = pick.session_verdict;
+    lease.issued_micros = hit.now_micros;
+    lease.tokens = hit.prompt_tokens;
     engine.on_dispatched(&lease, &target, Side::Single, 0);
     group.bench_with_input(BenchmarkId::new("manual_keyed_hit", n), &n, |b, _| {
         let mut seed = 0u64;

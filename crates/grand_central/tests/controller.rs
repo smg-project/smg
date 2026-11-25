@@ -379,9 +379,10 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
         let now = Instant::now();
         store
             .issue(LeaseRecord {
-                lease: Lease {
-                    id: LeaseId(1),
-                    ..Lease::default()
+                lease: {
+                    let mut lease = Lease::default();
+                    lease.id = LeaseId(1);
+                    lease
                 },
                 gateway,
                 request: 1,
