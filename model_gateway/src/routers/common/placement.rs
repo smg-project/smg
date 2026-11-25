@@ -526,7 +526,8 @@ impl RequestEnd {
     /// The request ended with `status`, as the reader of its answer took
     /// it. `answered` says whether the worker itself answered the request:
     /// at a route's account, whether the answer carries the worker's mark
-    /// ([`super::attempt_ledger::UpstreamAnswer`]).
+    /// ([`super::attempt_ledger::UpstreamAnswer`]) or is the route's
+    /// refusal of a body the worker gave over the limit.
     ///
     /// The outcome is made behind the handle's test: an empty handle pays
     /// that test, and nothing is asked or classed for it.
@@ -556,10 +557,10 @@ fn reported(end: &SideEnd, status: u16, answered: bool) {
 /// status under 400 is a success, 408 and 504 a timeout, any other 4xx the
 /// client's error. A 5xx follows whether the worker answered the request.
 /// Where it did, the 5xx is the server's error, whoever wrote the status:
-/// the worker's own, or the 502 the Decisions adapter makes of an answer
-/// it cannot map. Where no answer of the worker stands, the 5xx is a
-/// failed connection. One refusal differs: the router's refusal of a
-/// worker's body over its limit carries no mark, on the Decisions route
+/// the worker's own, the 502 the Decisions adapter makes of an answer it
+/// cannot map, or the 502 a route makes of a worker's body over its limit,
+/// which carries no mark and is known by its code. Where no answer of the
+/// worker stands, the 5xx is the router's own, on the Decisions route
 /// too, so it reads as a failed connection.
 fn transport_class(status: u16, answered: bool) -> TransportClass {
     match status {
@@ -830,10 +831,9 @@ impl Placed {
 
     /// The request this answer placed ended with `status`, as the route
     /// that keeps the answer takes it at its attempt's account. `answered`
-    /// says whether the answer carries the worker's mark
-    /// ([`super::attempt_ledger::UpstreamAnswer`]): it is asked only where
-    /// Grand Central hears the outcome. A classic answer pays the test
-    /// of its one empty word.
+    /// says whether the worker itself answered ([`RequestEnd::report`]):
+    /// it is asked only where Grand Central hears the outcome. A
+    /// classic answer pays the test of its one empty word.
     ///
     /// It needs the guard made by [`Self::guard_keeping_end`]: behind any
     /// other guard the answer keeps no handle, and this says nothing.
