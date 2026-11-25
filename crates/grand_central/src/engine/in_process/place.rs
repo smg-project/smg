@@ -1871,8 +1871,10 @@ fn single<'a>(
     // is written without the room of one.
     match alone {
         // The engine picked the place on the read of the worker that
-        // found it eligible: the worker is read no second time, and its
-        // route's rule is asked of it.
+        // found it eligible, and under a document whose session table
+        // alone takes a word on a lease read it ready a second time: the
+        // worker is not read again here, and its route's rule is asked of
+        // it.
         Some(pick) => {
             let worker = at(pick.place).ok_or(Unplaced::NoWorkers)?;
             // A caller of this call states no worker id of its own: where
@@ -1944,10 +1946,11 @@ impl InProcess {
     /// ready, let through by its circuit breaker, and admitted by its
     /// route's own rule ([`PlaceRequest::admits`]). A request a place
     /// answers is placed on the worker at that place, which the pick itself
-    /// read: the rule alone is asked of it. The placement names the
-    /// request's routing value where the document derived one that leaves
-    /// in the clear, and none for a request a place answers: no fact of
-    /// such a request is made.
+    /// read, and under a document whose session table alone takes a word
+    /// on a lease read ready a second time: the rule alone is asked of it.
+    /// The placement names the request's routing value where the document
+    /// derived one that leaves in the clear, and none for a request a place
+    /// answers: no fact of such a request is made.
     ///
     /// Where no target of a decision can be sent to, the engine decides
     /// again with their workers excluded ([`Constraints::excluded`], which

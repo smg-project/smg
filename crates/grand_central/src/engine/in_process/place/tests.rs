@@ -35,6 +35,7 @@ use crate::{
         decision::{Queue, Shed, Target, Targets, Trace},
         decision_engine::{Decided, DecisionEngine},
         framework::{Filter, Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
+        in_process::single::tests::ruled_ahead,
         list_cell::PublishedList,
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
@@ -1044,6 +1045,81 @@ fn a_plain_request_is_placed_on_the_worker_at_its_place() {
         let placement = engine.place(&request).expect("a placement");
         assert!(!Arc::ptr_eq(&placement.worker, &list[1]), "turn {turn}");
     }
+}
+
+/// A picker that places the worker at place 0 of its list by itself, takes
+/// no word of a lease, and marks that worker not ready behind the read that
+/// found it eligible.
+#[derive(Debug)]
+struct Turns(Arc<dyn Worker>);
+
+impl Lifecycle for Turns {}
+
+impl Picker for Turns {
+    fn name(&self) -> &'static str {
+        "turns"
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
+    fn picks_alone(&self) -> bool {
+        true
+    }
+
+    fn pick_alone(&self, _: &PoolWord<'_>, keep: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
+        let kept = keep(0);
+        if kept {
+            self.0.set_status(WorkerStatus::NotReady);
+        }
+        kept.then_some(0)
+    }
+
+    fn pick(
+        &self,
+        _: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut Targets,
+    ) {
+        push_drawn(candidates, kept, out);
+    }
+}
+
+/// Under a document whose session table alone takes a word on a lease, the
+/// worker at a plain request's place is read a second time, as a noted
+/// pick's target is at its walk: where its picker turned it, the pick is
+/// noted, and the call's next decision places the request on a worker that
+/// is ready.
+#[test]
+fn a_place_under_a_table_that_alone_takes_a_word_is_read_ready_a_second_time() {
+    let list = pool(2);
+    let first = Arc::clone(&list[0]);
+    let mut stages = StageRegistry::builtin();
+    let added = stages.picker("turns", move || Box::new(Turns(Arc::clone(&first))));
+    added.expect("a free name");
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    let profile = document.profiles.get_mut("random");
+    profile.expect("the preset's profile").pick = "turns".into();
+    let spec = AppliedSpec::validate_in(&ruled_ahead(document), &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the picker")));
+    let hears = engine.in_force().hears.intersects(EventSet::LEASE);
+    let beside = engine.in_force().hears_beside_table;
+    assert!(
+        hears && !beside.intersects(EventSet::LEASE),
+        "the session table alone takes a word"
+    );
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
+    let placement = engine.place(&request).expect("a placement");
+    assert!(!ready(list[0].as_ref()), "the pick turned its worker");
+    assert!(
+        Arc::ptr_eq(&placement.worker, &list[1]),
+        "the worker that is ready"
+    );
 }
 
 /// A room rule that names the request's output limit reserves room for the

@@ -15,7 +15,7 @@ use smg_worker::{
 use super::{
     super::{
         place::{PlaceRequest, Prompt},
-        single::tests::{pool, request, Asks, MODEL},
+        single::tests::{pool, request, ruled_ahead, Asks, MODEL},
     },
     *,
 };
@@ -229,8 +229,8 @@ fn a_request_with_no_id_is_found_by_the_id_its_host_states() {
 /// A place one pick decides, a noted place and a whole decision alike keep
 /// a request that states no id under its host's. The record names the
 /// worker the request was placed on. Each document is held to its road:
-/// whether one pick decides the place, and whether the document takes a
-/// word on a lease.
+/// whether one pick decides the place, and whether a stage or a count of
+/// sends of the document takes a word on a lease.
 #[test]
 fn a_place_a_noted_place_and_a_whole_decision_are_kept_under_a_hosts_id() {
     let roads = [
@@ -242,7 +242,8 @@ fn a_place_a_noted_place_and_a_whole_decision_are_kept_under_a_hosts_id() {
         let engine = hosted(&document);
         let handle = engine.spec();
         let one_pick = matches!(handle.place_for(MODEL, Phase::Single), Place::Alone(_));
-        let hears = engine.in_force().hears.intersects(EventSet::LEASE);
+        let beside = engine.in_force().hears_beside_table;
+        let hears = beside.intersects(EventSet::LEASE);
         assert_eq!((one_pick, hears), (alone, noted), "{road}");
         let list = pool(4);
         let members = PublishedList::new(Arc::clone(&list));
@@ -354,14 +355,15 @@ fn a_singles_record_holds_what_its_shadow_said() {
     assert_eq!(counted, 1, "the word the engine counted");
 }
 
-/// Under a document that takes a word on a lease and keeps a sample, a
-/// place one pick decides is noted, and kept as it was noted: the record
-/// is the decision its lease was issued for, dated as the lease is. Each
-/// request takes one id and one turn of its pool.
+/// Under a document a count of sends of which takes a word on a lease and
+/// that keeps a sample, a place one pick decides is noted, and kept as it
+/// was noted: the record is the decision its lease was issued for, dated as
+/// the lease is. Each request takes one id and one turn of its pool.
 #[test]
 fn a_noted_place_is_kept_as_it_was_noted() {
     let engine = hosted(&noting(1));
-    assert!(engine.in_force().hears.intersects(EventSet::LEASE));
+    let beside = engine.in_force().hears_beside_table;
+    assert!(beside.intersects(EventSet::LEASE), "a count takes a word");
     let handle = engine.spec();
     let alone = matches!(handle.place_for(MODEL, Phase::Single), Place::Alone(_));
     assert!(alone, "one pick decides the place");
@@ -386,6 +388,28 @@ fn a_noted_place_is_kept_as_it_was_noted() {
     for turn in turns.windows(2) {
         assert_eq!(turn[1], (turn[0] + 1) % 4, "one turn a request");
     }
+}
+
+/// Under a document that keeps a sample and whose session table alone takes
+/// a word on a lease, a plain request of a place one pick decides is
+/// answered the place and counted toward the sample, as under a document
+/// that takes no word: its binding states no rule, so the table has no
+/// word for its pick. The pick is kept, and no lease takes an id.
+#[test]
+fn a_place_is_kept_under_a_table_that_alone_takes_a_word() {
+    let engine = hosted(&ruled_ahead(sampling("round_robin", 2)));
+    assert!(engine.in_force().hears.intersects(EventSet::LEASE));
+    let beside = engine.in_force().hears_beside_table;
+    assert!(!beside.intersects(EventSet::LEASE), "the table alone");
+    let list = pool(4);
+    let members = PublishedList::new(Arc::clone(&list));
+    let asks = Asks::of(request(), Some(&members));
+    for _ in 0..4 {
+        let answered = engine.decide_under(GatewayId::LOCAL, &asks, Instant::now());
+        assert!(matches!(answered, Ok(Decided::Alone(_))), "{answered:?}");
+    }
+    assert!(engine.explained(b"request").is_some(), "the pick is kept");
+    assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
 }
 
 /// A plain request that is never made is asked its id through its maker,

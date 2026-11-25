@@ -1211,7 +1211,9 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 
    Where no worker of the list is eligible, the request takes the full path.
 2. If no stage of the document needs lease events, that is all. No request is built, no clock is
-   read, no lease exists, and the host owes the engine nothing more.
+   read, no lease exists, and the host owes the engine nothing more. Where the session table alone
+   takes them, that is all too once the worker picked reads ready a second time: the binding of
+   such a pick states no sessions rule, so the table is told nothing of it.
 
 **The full path**, in logical order (the code interleaves some steps to save work):
 
@@ -1397,8 +1399,9 @@ encode phase first, and the engine's answer for an encode decision carries that 
 A lease is the engine's note that a decision's request is on its way. For a single request it
 exists only where the document takes a lease event. Where a stage or a count of sends takes one,
 every pick has a lease. Where the session table alone takes one, a pick the table is told nothing
-of has none, a request with no session key among them. The short path is the exception: its pick
-has a lease wherever the document takes a lease event (section 5.6). A pair's pick always has one.
+of has none, a request with no session key among them. The short path's pick is one of them where
+its worker reads ready a second time, and has a lease where it does not (section 5.6). A pair's
+pick always has one.
 On a controller every pick it answers has one on file: the leases on file are its count of
 requests in flight (section 4.2).
 
