@@ -7,8 +7,6 @@
 
 #[cfg(test)]
 use std::sync::mpsc::{self, Receiver, SyncSender};
-#[cfg(feature = "controller")]
-use std::sync::OnceLock;
 use std::{
     collections::{HashMap, VecDeque},
     mem,
@@ -132,13 +130,6 @@ pub struct MemoryStore {
     /// the one instant the host's loop cannot have read. A lock of its own,
     /// the last taken and held for the call alone.
     wake: Mutex<Option<Wake>>,
-    /// The indexes of cache events the store's host lent its engine
-    /// ([`MemoryStore::lend_cache_indexes`]): handed once. The store's one
-    /// engine keeps them under every policy spec, so an apply hands nothing
-    /// on, and this hold answers a second lending alone. The store holds
-    /// the engine's own trait object and names no index.
-    #[cfg(feature = "controller")]
-    indexes: OnceLock<Arc<dyn CacheIndexes>>,
 }
 
 /// The replicated rows at one place of the log's history. A controller's is
@@ -226,8 +217,6 @@ impl MemoryStore {
             origin,
             journal: None,
             wake: Mutex::new(None),
-            #[cfg(feature = "controller")]
-            indexes: OnceLock::new(),
         }
     }
 
@@ -796,17 +785,15 @@ impl MemoryStore {
     }
 
     /// Lend this store's engine the indexes of cache events its host
-    /// keeps, once: a later call is ignored. The store's one engine is
-    /// handed them here and keeps them under every policy spec applied
-    /// from now on: an apply builds no engine and hands nothing on. The
-    /// call takes the membership lock, so no apply runs beside it. The
-    /// store calls nothing of what it is handed.
+    /// keeps, once: a later call is ignored, by the engine's own rule
+    /// ([`Affinity::set_indexes`](crate::engine::Affinity::set_indexes)).
+    /// The store's one engine is handed them here and keeps them under
+    /// every policy spec applied from now on: an apply builds no engine
+    /// and hands nothing on. The store keeps none of what it is handed and
+    /// calls nothing of it. The call takes no lock: every world of the
+    /// store holds the one engine, so an apply beside it loses nothing.
     #[cfg(feature = "controller")]
     pub(crate) fn lend_cache_indexes(&self, indexes: Arc<dyn CacheIndexes>) {
-        let _workers = self.workers.lock();
-        if self.indexes.set(Arc::clone(&indexes)).is_err() {
-            return;
-        }
         self.world.load().front().affinity().set_indexes(indexes);
     }
 

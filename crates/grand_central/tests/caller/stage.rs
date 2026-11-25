@@ -166,6 +166,7 @@ fn the_programs_scorer_places_a_request_past_the_workers_under_way() {
         model: MODEL,
         headers: None,
         items: &[],
+        tokens: None,
     };
     let document = settings(PolicySettings::RoundRobin).policy_document();
     let mut document = document.expect("the settings have a document");

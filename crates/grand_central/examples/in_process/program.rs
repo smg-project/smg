@@ -58,23 +58,39 @@
 //! where the engine says that the rule left the request no worker, the
 //! worker's answer is the client's ([`Program::serve`]).
 //!
+//! A request states its prompt where the program tokenized it: the token
+//! ids, and the prompt's entry in the program's token tree
+//! ([`Asked::tokens`]). The program keeps such a tree of the prompts it
+//! sent, one a model, and lends it to the engine at its start
+//! ([`Trees`]). Under a document that reads the prefixes sent to each
+//! worker, a single request is then decided inside the tree's match, and
+//! the same descent writes the request for the worker it goes to. Under
+//! any other document the engine asks for no tree, and none is made. A host
+//! that has such a tree lends that one, and makes none for the engine
+//! alone. This program has no other use of one: it keeps its own, in the
+//! index crate's store, to show what a lent tree asks of its host. A
+//! worker that leaves is taken out of it ([`Program::leave`]), and a pass
+//! of the host's holds it to a size ([`Program::trim`]).
+//!
 //! An encode request here carries items and no more. Beyond its wire the
 //! program states no fact of a worker, so it serves no image, no other
 //! demand and no item handed as a reference.
 
 use std::{
+    borrow::Cow,
     future::Future,
     sync::{Arc, OnceLock},
 };
 
 use http::HeaderMap;
+use kv_index::{ModelTrees, TenantId, TokenTree};
 use smg_grand_central::{
     document::{AppliedSpec, ModeSettings, PolicySettings, RoutingSettings},
     engine::{
-        Demands, EncodeClasses, EncodeItems, EncodeLists, EncodeMember, EncoderFacts, FixedFacts,
-        HeaderRead, Identity, InProcess, LentList, ModelLists, PairAdmission, PairLists,
-        PartnerClasses, PlaceRequest, PublishedList, Unplaced, WorkerData, WorkerId, WorkerLists,
-        WorkerRule,
+        CacheIndex, CacheIndexes, Demands, EncodeClasses, EncodeItems, EncodeLists, EncodeMember,
+        EncoderFacts, FixedFacts, HeaderRead, Identity, InProcess, LentList, ModelLists,
+        PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Prompt, PromptEntry,
+        PublishedList, TokenKey, Unplaced, WorkerData, WorkerId, WorkerLists, WorkerRule,
     },
     policies::consistent_hashing::LentRing,
     store::{EncodeHandoff, EncodeOffer},
@@ -468,6 +484,39 @@ impl ModelLists for PublishedLists {
     }
 }
 
+/// The program's token trees of the prompts it sent, one a model: what it
+/// lends the engine at its start ([`WorkerData::cache_indexes`]). A model's
+/// tree is made where the engine first asks for it, a page the document's
+/// block, and the engine asks under a document that reads the prefixes sent
+/// to each worker and under no other. The engine calls the tree's match
+/// and nothing else: the bound and the workers that leave are the
+/// program's ([`Program::trim`], [`Program::leave`]).
+///
+/// The store is empty until that ask, so the program makes it always. A
+/// host whose trees cost it a task of its own makes them where its document
+/// reads them: the document's needs say so (`Needs::sent_prefixes`), and a
+/// gateway asks them before it makes its trees.
+///
+/// The engine decides a single request inside a lent tree and no other, so
+/// the program lends its tree at no other phase. It keeps no index of its
+/// workers' cache events and no tree of prompts held as text: its workers
+/// read as publishing no events, and it holds every prompt as token ids.
+struct Trees(Arc<ModelTrees>);
+
+impl CacheIndexes for Trees {
+    fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+        None
+    }
+
+    fn block_size(&self, _: &str) -> Option<u32> {
+        None
+    }
+
+    fn token_tree(&self, model: &str, phase: Phase) -> Option<Arc<TokenTree>> {
+        matches!(phase, Phase::Single).then(|| self.0.token_tree_or_new(model))
+    }
+}
+
 /// Every call the program makes of the engine once it is started: one.
 ///
 /// [`Engine::place`] is the host contract's one call for a request: a
@@ -502,8 +551,9 @@ pub struct Stated<'a> {
     admits: Option<WorkerRule<'a>>,
 }
 
-/// What a client's request states.
-#[derive(Clone, Copy, Debug)]
+/// What a client's request states. It prints nothing of itself: a client's
+/// tokens reach no log line.
+#[derive(Clone, Copy)]
 pub struct Asked<'a> {
     /// The model the request is for.
     pub model: &'a str,
@@ -513,6 +563,22 @@ pub struct Asked<'a> {
     /// each. Empty for a request with none. A program that routes to no
     /// encoder reads none.
     pub items: &'a [Identity<'a>],
+    /// The prompt's token ids, where the program tokenized it. `None` for a
+    /// request it read no prompt of: such a request states no prompt and
+    /// names no entry in the program's tree.
+    pub tokens: Option<&'a [u32]>,
+}
+
+/// A request's entry in the program's token tree ([`Trees`]): its prompt's
+/// token ids as they are. The program's workers share one cache partition,
+/// so the entry holds no marker and the prompt is hashed under the plain
+/// seeds. A host that parts its workers' caches hands the ids behind the
+/// partition's marker, in whole pages, and states the partition's seeds
+/// with the prompt.
+impl PromptEntry for Asked<'_> {
+    fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
+        Some(TokenKey::of(Cow::Borrowed(self.tokens?), 0))
+    }
 }
 
 /// One attempt of a request on its way: the placement, and the load guard
@@ -635,6 +701,9 @@ pub struct Program {
     /// Whether the program's route sends a pair's decode behind its
     /// prefill's answer ([`Self::in_turn`]).
     in_turn: bool,
+    /// The program's token trees ([`Trees`]). The engine holds them too,
+    /// since its start.
+    trees: Arc<ModelTrees>,
 }
 
 impl Program {
@@ -642,7 +711,9 @@ impl Program {
     /// ([`InProcess::start`]), made over the program's own data. The
     /// engine is built from `spec` for the life of the process and takes
     /// the program's registry, and its load monitor's channel where the
-    /// program has a monitor. This program keeps no index of cache events.
+    /// program has a monitor. It lends its token trees with them
+    /// ([`Trees`]), a page of a tree the block of `spec`, and keeps no
+    /// index of cache events.
     /// Beside the start it hands the engine its lists by model
     /// ([`PublishedLists`]). `plan` is the kinds of worker the settings
     /// behind `spec` route to ([`Plan::of`]).
@@ -661,10 +732,12 @@ impl Program {
     ) -> (Self, impl Future<Output = ()> + Send + 'static) {
         let registry = Arc::new(WorkerRegistry::new());
         let handed: Arc<WorkerRegistry<Lists>> = Arc::clone(&registry);
+        let trees = Arc::new(ModelTrees::new(spec.block_size() as usize));
+        let lent: Arc<dyn CacheIndexes> = Arc::new(Trees(Arc::clone(&trees)));
         let data = WorkerData {
             registry: handed,
             loads,
-            cache_indexes: None,
+            cache_indexes: Some(lent),
         };
         let (engine, task) = InProcess::start(spec, data);
         engine.set_lists(Arc::new(PublishedLists(Arc::clone(&registry))));
@@ -674,6 +747,7 @@ impl Program {
             plan,
             sends: Box::new(sends),
             in_turn: false,
+            trees,
         };
         (program, task)
     }
@@ -704,8 +778,34 @@ impl Program {
     /// without its scheme too. The engine's task hears the removal with
     /// the worker's own object, so the stages are told the worker under
     /// the address it states.
+    ///
+    /// The worker is taken out of the program's trees too, under that
+    /// address: the engine writes a prompt for a worker by it. A tree keeps
+    /// what it holds for a worker that is gone until its host takes it
+    /// out, and the size pass alone would keep it for good. A worker that
+    /// joins at the address again starts with no prompt.
     pub fn leave(&self, address: &str) -> bool {
-        self.registry.remove_by_url(address).is_some()
+        let Some(left) = self.registry.remove_by_url(address) else {
+            return false;
+        };
+        self.trees.remove_tenant(&TenantId::from(left.url()));
+        true
+    }
+
+    /// The program's size pass: each model's tree is held to `tokens`
+    /// tokens ([`ModelTrees::evict_token_trees`]). The bound is the host's,
+    /// as the purge of a worker that left is: the engine calls a tree's
+    /// match and nothing else. A program runs the pass on a timer of its
+    /// own, with its settings' number. This one spawns nothing, and its
+    /// builder calls the pass.
+    pub fn trim(&self, tokens: usize) {
+        self.trees.evict_token_trees(tokens, |_, _| {});
+    }
+
+    /// The program's token tree of `model`: `None` until the engine asked
+    /// for it, and so under a document that reads no sent prefix.
+    pub fn tree(&self, model: &str) -> Option<Arc<TokenTree>> {
+        self.trees.token_tree(model)
     }
 
     /// The model's generation as the registry holds it now.
@@ -728,10 +828,12 @@ impl Program {
     /// model that has no generation lends no list and states no item. The
     /// generation's ring is lent with its lists ([`Lists::ring`]). A
     /// program whose route sends a pair's decode behind its prefill's
-    /// answer says so here.
+    /// answer says so here. A request that holds its prompt's token ids
+    /// states them and its entry in the program's tree, at each attempt
+    /// alike ([`Asked::tokens`]).
     fn request<'a>(
         &self,
-        asked: &Asked<'a>,
+        asked: &'a Asked<'a>,
         lists: Option<&'a Lists>,
         stated: Stated<'a>,
     ) -> PlaceRequest<'a> {
@@ -764,7 +866,17 @@ impl Program {
             runtime: stated.wire,
             ..Demands::default()
         };
+        // The prompt as the program holds it: its token ids, and the
+        // request itself as its entry in the program's tree. The engine
+        // asks the entry where a decision reads that tree, and of no other
+        // request.
+        let mut prompt = Prompt::NONE;
+        if asked.tokens.is_some() {
+            prompt.tokens = asked.tokens;
+            prompt.entry = Some(asked);
+        }
         PlaceRequest {
+            prompt,
             headers,
             demands,
             encode: carries.then_some(items),

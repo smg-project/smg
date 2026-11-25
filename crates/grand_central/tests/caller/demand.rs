@@ -94,7 +94,7 @@ fn failing_at(failing: String) -> impl Fn(&dyn Worker) -> u16 + Send + Sync + 's
 /// to its plan's wire (`stated_facts` and the request's demand,
 /// `model_gateway/src/routers/common/place_request.rs:113-123`, `:192-195`):
 /// its case `the_engine_keeps_a_pinned_retry_on_its_runtime_and_transport`
-/// (`model_gateway/src/routers/common/placement.rs:7809-7851`).
+/// (`model_gateway/src/routers/common/placement.rs:7930-7972`).
 #[test]
 fn a_retry_stays_on_the_wire_of_its_first_worker() {
     for (wire, another) in [
@@ -133,8 +133,8 @@ fn a_retry_stays_on_the_wire_of_its_first_worker() {
 /// The gateway narrows a pinned request's pool to its wire, and lets the
 /// workers it tried step aside while another is left: its case
 /// `a_pinned_wire_narrows_to_its_runtime_and_transport`
-/// (`model_gateway/src/routers/common/placement.rs:4665-4687`, and
-/// `:1620-1640`).
+/// (`model_gateway/src/routers/common/placement.rs:4774-4796`, and
+/// `:1728-1748`).
 #[test]
 fn a_wire_with_one_worker_keeps_it_for_the_retry() {
     let fleet = singles(&[GRPC, HTTP, OTHER]);
@@ -160,7 +160,7 @@ fn a_wire_with_one_worker_keeps_it_for_the_retry() {
 /// The gateway's pinned request has no answer where no worker of its pool
 /// is on the wire: its case
 /// `the_engine_keeps_a_pinned_retry_on_its_runtime_and_transport`
-/// (`model_gateway/src/routers/common/placement.rs:7809-7851`).
+/// (`model_gateway/src/routers/common/placement.rs:7930-7972`).
 #[test]
 fn a_wire_with_no_worker_left_leaves_the_retry_no_endpoint() {
     let fleet = singles(&[GRPC, HTTP, OTHER]);
@@ -197,7 +197,7 @@ fn a_wire_with_no_worker_left_leaves_the_retry_no_endpoint() {
 ///
 /// The gateway holds a pinned pair's two sides to the retained wire: its
 /// case `a_pinned_pair_keeps_the_retained_runtime_and_transport`
-/// (`model_gateway/src/routers/common/placement.rs:4738-4803`).
+/// (`model_gateway/src/routers/common/placement.rs:4847-4912`).
 #[test]
 fn a_pairs_retry_holds_both_sides_to_its_wire() {
     let fleet = [

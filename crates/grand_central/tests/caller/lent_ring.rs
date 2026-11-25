@@ -65,10 +65,11 @@ fn served_under(program: &Program, key: &str) -> Answer {
 /// The gateway lends the ring its own ring policy walks
 /// (`impl LentRing for HashRing`,
 /// `model_gateway/src/policies/hash_ring.rs:343-359`), read for each request
-/// (`ModelRing`, `model_gateway/src/routers/common/placement.rs:1057-1133`),
-/// so a key keeps the worker that policy sends it to: its case
+/// whose phases the document places by a ring (`ModelRing`,
+/// `model_gateway/src/routers/common/placement.rs:1143-1241`), so a key
+/// keeps the worker that policy sends it to: its case
 /// `the_engine_places_a_keyed_request_where_the_classic_ring_does`
-/// (`:8138-8167`).
+/// (`:8259-8288`).
 #[test]
 fn a_routing_key_goes_to_the_worker_the_programs_ring_puts_it_on() {
     let fleet = workers(4);
@@ -115,7 +116,7 @@ fn a_ring_is_in_the_order_of_its_workers_places() {
 ///
 /// The gateway's ring is one of a generation too: a request is lent the ring
 /// of the generation its list is read from (`ModelRing::of`,
-/// `model_gateway/src/routers/common/placement.rs:1087-1101`).
+/// `model_gateway/src/routers/common/placement.rs:1194-1208`).
 #[test]
 fn a_worker_that_leaves_hands_its_keys_to_the_next_on_the_ring() {
     let fleet = workers(4);
@@ -148,7 +149,7 @@ fn a_worker_that_leaves_hands_its_keys_to_the_next_on_the_ring() {
 /// lent ring with it: its cases
 /// `a_retry_under_consistent_hashing_falls_through_to_the_next_ring_node`
 /// and `the_engine_places_a_keyed_request_where_the_classic_ring_does`
-/// (`model_gateway/src/routers/common/placement.rs:5394-5456`, `:8138-8167`).
+/// (`model_gateway/src/routers/common/placement.rs:5503-5565`, `:8259-8288`).
 #[test]
 fn a_retry_walks_on_from_the_worker_it_tried() {
     let fleet = workers(4);
@@ -212,10 +213,10 @@ fn the_rings_two_walks_name_the_same_workers() {
 ///
 /// The gateway reads the model's one ring once for a pair and hands it to
 /// both sides' policies
-/// (`model_gateway/src/routers/common/placement.rs:3000-3014`), and lends the
+/// (`model_gateway/src/routers/common/placement.rs:3109-3123`), and lends the
 /// engine that ring: its case
 /// `the_engine_places_a_pair_of_two_ring_words_where_its_classic_policies_do`
-/// (`:8660-8771`).
+/// (`:8781-8892`).
 #[test]
 fn a_pairs_two_sides_are_walked_on_the_one_ring() {
     let fleet = pair::fleet(3, 3);
@@ -240,8 +241,8 @@ fn a_pairs_two_sides_are_walked_on_the_one_ring() {
 ///
 /// The gateway states a pair's second ask by the request maker of its
 /// first, which lends the model's ring (`with_pair_request`,
-/// `model_gateway/src/routers/common/placement.rs:2507-2560`, the ring at
-/// `:2556`, the second ask at `:1012-1028`).
+/// `model_gateway/src/routers/common/placement.rs:2615-2669`, the ring at
+/// `:2665`, the second ask at `:1098-1114`).
 #[test]
 fn a_decode_asked_again_is_walked_on_the_ring_its_second_ask_lends() {
     let fleet = pair::fleet(1, 3);

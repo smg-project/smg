@@ -189,30 +189,56 @@ pub(crate) async fn elector(
         }
         #[cfg(feature = "kubernetes")]
         LeasePlace::Kubernetes { namespace, name } => {
-            let mut config = kube::Config::infer()
+            let inferred = kube::Config::infer()
                 .await
                 .map_err(|error| LeaseError::Client(error.to_string()))?;
-            // A stalled round trip returns before the fence it could have
-            // renewed closes, so the thread's next step is never behind a
-            // call that outlives the lease.
-            let deadline = election.settings.renew_deadline;
-            config.connect_timeout = Some(deadline);
-            config.read_timeout = Some(deadline);
-            config.write_timeout = Some(deadline);
-            let namespace = namespace
-                .clone()
-                .unwrap_or_else(|| config.default_namespace.clone());
-            let client = kube::Client::try_from(config)
-                .map_err(|error| LeaseError::Client(error.to_string()))?;
-            Box::new(KubernetesLease::new(
-                client,
-                &namespace,
+            Box::new(kubernetes_lease(
+                inferred,
+                namespace.as_deref(),
                 name,
-                tokio::runtime::Handle::current(),
-            ))
+                election.settings.renew_deadline,
+            )?)
         }
     };
     Ok(Elector::new(backend, identity, election.settings)?)
+}
+
+/// The `Lease` object `name` as a lease's backend, on the client
+/// configuration `inferred` for this process; with no `namespace`, in the
+/// configuration's own. Its calls block on the runtime this runs on.
+#[cfg(feature = "kubernetes")]
+fn kubernetes_lease(
+    inferred: kube::Config,
+    namespace: Option<&str>,
+    name: &str,
+    deadline: std::time::Duration,
+) -> Result<KubernetesLease, LeaseError> {
+    let namespace = namespace.map_or_else(|| inferred.default_namespace.clone(), str::to_owned);
+    let client = kube::Client::try_from(lease_config(inferred, deadline))
+        .map_err(|error| LeaseError::Client(error.to_string()))?;
+    Ok(KubernetesLease::new(
+        client,
+        &namespace,
+        name,
+        tokio::runtime::Handle::current(),
+    ))
+}
+
+/// `inferred` as a lease's client takes it: every round trip is bounded by
+/// the renew `deadline` and made once.
+///
+/// A stalled round trip returns before the fence it could have renewed
+/// closes, so the thread's next step is never behind a call that outlives
+/// the lease. The client library's own retry of an answer that says try
+/// later (429, 503, 504) would hold one call past that bound, so it is off:
+/// the thread's next step is the retry.
+#[cfg(feature = "kubernetes")]
+fn lease_config(mut inferred: kube::Config, deadline: std::time::Duration) -> kube::Config {
+    inferred.connect_timeout = Some(deadline);
+    inferred.read_timeout = Some(deadline);
+    inferred.write_timeout = Some(deadline);
+    inferred.default_retry = false;
+    inferred
 }
 
 /// What the election's last step saw of the lease.
@@ -928,6 +954,73 @@ mod tests {
         let now = Instant::now();
         alone.tick(now).expect("the take");
         assert_eq!(alone.fence().leader_term(now), Some(1));
+    }
+
+    /// What the client library gives a client by itself is read first, so a
+    /// release that moves its retry's default again fails here.
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn a_lease_clients_round_trip_is_bounded_by_the_renew_deadline_and_made_once() {
+        let inferred = kube::Config::new("https://api.invalid".parse().expect("a url"));
+        assert!(inferred.default_retry, "the library's own default");
+        let deadline = Duration::from_millis(1_500);
+
+        let lease = super::lease_config(inferred, deadline);
+
+        assert_eq!(lease.connect_timeout, Some(deadline));
+        assert_eq!(lease.read_timeout, Some(deadline));
+        assert_eq!(lease.write_timeout, Some(deadline));
+        assert!(!lease.default_retry);
+    }
+
+    /// The API server here refuses every call with 503 and names an hour to
+    /// wait. The refusal comes back inside the renew deadline, after one
+    /// call: the client library's own retry would hold the election thread
+    /// behind that call for the hour.
+    #[cfg(feature = "kubernetes")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_call_the_api_server_refuses_comes_back_inside_the_renew_deadline() {
+        use axum::http::{header, StatusCode};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port of this host");
+        let address = listener.local_addr().expect("the listener's address");
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&calls);
+        let refuses = axum::Router::new().fallback(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::future::ready((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "3600")],
+                "the server is currently unable to handle the request",
+            ))
+        });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the case holds the task's handle and ends the task"
+        )]
+        let server = tokio::spawn(async move { axum::serve(listener, refuses).await });
+
+        let deadline = Duration::from_secs(5);
+        let inferred = kube::Config::new(
+            format!("http://{address}")
+                .parse()
+                .expect("the server's url"),
+        );
+        let mut lease = super::kubernetes_lease(inferred, Some("policy"), "smg-policy", deadline)
+            .expect("a client of the server");
+        // The election's thread is no runtime worker: a call blocks its
+        // thread on the runtime.
+        let read = tokio::task::spawn_blocking(move || lease.read());
+        let refused = tokio::time::timeout(deadline, read)
+            .await
+            .expect("the refusal comes back inside the renew deadline")
+            .expect("the read ran");
+
+        assert!(refused.is_err(), "a refused read is an error: {refused:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the call was made once");
+        server.abort();
     }
 
     #[tokio::test]

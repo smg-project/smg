@@ -45,6 +45,7 @@ const PLAIN: Asked<'static> = Asked {
     model: MODEL,
     headers: None,
     items: &[],
+    tokens: None,
 };
 
 /// A first attempt of [`PLAIN`], placed for a case that keeps the attempt
@@ -68,7 +69,7 @@ fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeMap<&'a str,
 ///
 /// The classic router rotates the list it is given the same way: its case
 /// `a_pinned_wire_under_round_robin_rotates_the_workers_on_it`
-/// (`model_gateway/src/routers/common/placement.rs:5604-5632`).
+/// (`model_gateway/src/routers/common/placement.rs:5713-5741`).
 #[test]
 fn plain_requests_take_each_worker_in_turn() {
     let fleet = workers(3);
@@ -107,7 +108,7 @@ fn a_single_request_of_a_program_in_turn_is_sent_once() {
 ///
 /// The classic router answers so: its case
 /// `callers_that_pick_at_once_take_each_idle_worker_once`
-/// (`model_gateway/src/routers/common/placement.rs:5857-5894`).
+/// (`model_gateway/src/routers/common/placement.rs:5966-6003`).
 #[test]
 fn callers_that_ask_at_once_take_each_idle_worker_once() {
     const CALLERS: usize = 4;
@@ -147,8 +148,8 @@ fn callers_that_ask_at_once_take_each_idle_worker_once() {
 ///
 /// The classic router lets the workers a request tried step aside while
 /// another is left, and uses the list whole otherwise
-/// (`model_gateway/src/routers/common/placement.rs:1620-1640`, its case
-/// `:5781-5815`).
+/// (`model_gateway/src/routers/common/placement.rs:1728-1748`, its case
+/// `:5890-5924`).
 #[test]
 fn a_retry_names_the_worker_it_tried_and_goes_to_another() {
     let fleet = workers(2);
@@ -214,8 +215,8 @@ fn a_send_is_asked_again_for_the_statuses_a_gateway_asks_again_for() {
 /// 503.
 ///
 /// The classic router keeps a worker that is available
-/// (`model_gateway/src/routers/common/placement.rs:1600-1603`), and answers a
-/// list with none a 503 with the same hint (`:1641-1644`, `:1746`, `:1767`).
+/// (`model_gateway/src/routers/common/placement.rs:1708-1711`), and answers a
+/// list with none a 503 with the same hint (`:1749-1752`, `:1854`, `:1875`).
 #[test]
 fn a_worker_that_cannot_be_sent_to_takes_no_request() {
     let fleet = workers(4);
@@ -522,7 +523,7 @@ async fn the_engine_hears_each_requests_end() {
 /// address that object states. A leave that finds no worker tells nothing.
 ///
 /// The classic router's registry resolves such an address the same way
-/// (`resolve_url_to_id`, `crates/worker/src/registry.rs:534-560`).
+/// (`resolve_url_to_id`, `crates/worker/src/registry.rs:543-569`).
 #[tokio::test(start_paused = true)]
 async fn a_worker_that_leaves_is_forgotten_under_the_address_it_states() {
     let (program, heard, _fails, task) = hearing().await;

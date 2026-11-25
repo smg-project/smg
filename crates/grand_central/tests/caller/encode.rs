@@ -118,7 +118,7 @@ fn an_item_goes_to_its_encoder_ahead_of_its_pair() {
 /// gateway asks the engine, a request with no item is placed on the engine's
 /// pair and on no encoder: its case
 /// `the_engine_places_an_encode_requests_pair_and_refuses_an_item_by_name`
-/// (`worker_selection.rs:5313-5442`).
+/// (`worker_selection.rs:5410-5539`).
 #[test]
 fn a_request_with_no_item_is_placed_as_its_pair() {
     for encoders in [2, 0] {
@@ -191,11 +191,11 @@ fn an_encoder_that_cannot_be_sent_to_takes_no_item() {
 /// The classic router sends an item once a request: the first dispatch
 /// takes its encode outputs, and a replay gets none
 /// (`model_gateway/src/routers/grpc/common/stages/request_execution.rs:295-299`).
-/// Where its encoder answers ahead of the pair (`:882-883`), a dispatch
+/// Where its encoder answers ahead of the pair (`:966-967`), a dispatch
 /// that failed is marked as one that is not asked again (`:461-466`).
 /// Where its items launch beside the pair, a failed encode dispatch is
 /// answered a 502 that is final for the retry layer
-/// (`encode_dispatch_failure_response`, `:2593-2608`).
+/// (`encode_dispatch_failure_response`, `:2705-2720`).
 #[test]
 fn an_encoder_that_fails_is_the_requests_answer_and_no_side_is_sent() {
     let fleet = fleet(2, 2, 3);
@@ -265,9 +265,9 @@ fn an_encoder_that_fails_is_the_requests_answer_and_no_side_is_sent() {
 /// The classic router's retry selects the pair alone again, since the first
 /// dispatch launched the encode jobs (the doc of its re-selection,
 /// `worker_selection.rs:781-783`): a replay launches none
-/// (`model_gateway/src/routers/grpc/common/stages/request_execution.rs:929-932`).
+/// (`model_gateway/src/routers/grpc/common/stages/request_execution.rs:1013-1016`).
 /// It names the addresses of the prefill and of the decode as tried, and no
-/// encoder's (`model_gateway/src/routers/grpc/context.rs:1665-1669`, read at
+/// encoder's (`model_gateway/src/routers/grpc/context.rs:1717-1721`, read at
 /// `model_gateway/src/routers/grpc/pipeline.rs:849-861`).
 #[test]
 fn a_retry_behind_a_failed_side_states_no_item_and_sends_none() {

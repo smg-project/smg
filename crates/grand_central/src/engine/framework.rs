@@ -1006,9 +1006,11 @@ impl Profile {
     ///
     /// The cache events meant are a request's holders, which a scorer
     /// reads from the index where it declares token hashes beside the
-    /// events. One scorer that reads them there keeps the index's holders
-    /// first, whatever another reads. A scorer that reads the events for a
-    /// row's warm-up reads no holder and turns nothing here.
+    /// events. One scorer that reads them there has the index name a
+    /// single request of token ids alone where the model's index holds a
+    /// block, and keeps the index's holders first for every other
+    /// request, whatever another reads. A scorer that reads the events for
+    /// a row's warm-up reads no holder and turns nothing here.
     fn reads_sent_alone(&self) -> bool {
         let needs = || self.scorers.iter().map(|stage| stage.scorer.needs());
         needs().any(|needs| needs.sent_prefixes)
@@ -6334,8 +6336,10 @@ impl Engine {
     /// whatever the index holds for the worker. One prefix stage that
     /// reads cache events
     /// keeps the index's holders first, whatever another reads: under a
-    /// cap it would lose them. A stage that reads cache events for a row's
-    /// warm-up reads no holder and turns nothing here.
+    /// cap it would lose them. For a single request of token ids under a
+    /// model whose index holds a block they are the only holders named. A
+    /// stage that reads cache events for a row's warm-up reads no holder
+    /// and turns nothing here.
     /// Kept at the build, as [`Self::reads_sent_for`] is.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {

@@ -14,9 +14,10 @@
 //! lane's making: a row that asks for cache events has its number ahead of
 //! its stream, as a gateway's index numbers a worker where its stream's
 //! task opens its place. The index holds no block of such a row until its
-//! stream writes, and the engine reads a worker with no block as one the
-//! record of sent prefixes speaks for. An index that holds no block is none
-//! to the engine.
+//! stream writes. On a pair's side the engine reads a worker with no block
+//! as one the record of sent prefixes speaks for. A single request of token
+//! ids is decided by the index alone, and names such a worker by nothing.
+//! An index that holds no block is none to the engine.
 //!
 //! # Locks
 //!
@@ -346,9 +347,11 @@ mod tests {
     /// as a gateway's index numbers a worker where its stream's task opens
     /// its place
     /// (`model_gateway/src/policies/kv_index/event_monitor/index_sink.rs:186-196`).
-    /// The engine reads a numbered worker with no block as the record's of
-    /// sent prefixes: its own cases hold that
-    /// (`the_index_speaks_for_its_workers_and_the_record_for_the_others`).
+    /// On a pair's side the engine reads a numbered worker with no block
+    /// as the record's of sent prefixes, and a single request of token ids
+    /// names it by nothing: its own cases hold both
+    /// (`a_sides_column_holds_a_text_sent_to_a_worker_the_index_holds_blocks_for`,
+    /// `the_index_decides_a_single_request_of_token_ids_alone`).
     #[test]
     fn a_row_with_a_place_and_no_batch_has_its_number_and_no_block() {
         let bed = Bed::new();

@@ -71,7 +71,9 @@ pub struct EngineCoreReadyResponse {
     /// Kept separate from model dtype so silence retains the legacy media wire.
     #[serde(default)]
     pub multimodal_encoder_dtype: Option<String>,
-    /// Python vLLM version reported by the engine process (compatibility gate).
+    /// Python vLLM version reported by the engine process. The vLLM protocol
+    /// picks its add-request layout by it
+    /// ([`VllmLayout`](crate::protocol::vllm::VllmLayout)).
     pub vllm_version: String,
     /// World size (TP * PP) from the parallel config.
     pub world_size: u64,

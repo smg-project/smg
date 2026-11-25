@@ -1246,3 +1246,18 @@ fn test_build_watcher_config_logs_selector_at_info_level() {
     assert!(logs_contain("Starting K8s worker watcher"));
     assert!(logs_contain("app=sglang"));
 }
+
+/// What the client library gives a client by itself is read first, so a
+/// release that moves either default again fails here: no bound on a read,
+/// and its own retry of an answer that says try later.
+#[test]
+fn a_watchs_client_bounds_a_silent_read_and_sends_a_call_once() {
+    let inferred = kube::Config::new("https://api.invalid".parse().unwrap());
+    assert_eq!(inferred.read_timeout, None, "the library's own default");
+    assert!(inferred.default_retry, "the library's own default");
+
+    let watch = watch_config(inferred);
+
+    assert_eq!(watch.read_timeout, Some(Duration::from_secs(295)));
+    assert!(!watch.default_retry);
+}

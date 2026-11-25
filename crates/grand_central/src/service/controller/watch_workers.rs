@@ -194,6 +194,21 @@ impl Feed {
         }
     }
 
+    /// Lets the kept cut go whatever its place: no reader is left to share
+    /// it. The feed's readers call it, at the last seat given back and at
+    /// the last snapshot call out with no watch open ([`Readers`]). It
+    /// waits for the lock, where [`Feed::let_go`] tries it and lets go a
+    /// cut the log has passed and no other.
+    fn keep_none(&self) {
+        *self.rows.lock() = None;
+    }
+
+    /// Whether `other` is this feed: a clone of a feed shares its kept cut,
+    /// and a feed made apart keeps one of its own.
+    fn shares_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.rows, &other.rows)
+    }
+
     /// The rows at the log's last watched write. A cut is a write's, not a
     /// reader's: the first read that starts at a place cuts it from
     /// `objects`, in their holder's turn for the copy
@@ -561,7 +576,7 @@ impl Readers {
     /// its own at worst.
     fn unshared(&self) {
         if !self.open() {
-            *self.feed.rows.lock() = None;
+            self.feed.keep_none();
         }
     }
 
@@ -573,7 +588,7 @@ impl Readers {
     /// Whether these are the readers of `feed`: a clone of a feed shares its
     /// kept cut, so a clone of the feed they were built over is theirs too.
     fn are_of(&self, feed: &Feed) -> bool {
-        Arc::ptr_eq(&self.feed.rows, &feed.rows)
+        self.feed.shares_with(feed)
     }
 
     /// The snapshots' turn, for a case that fills it or holds it.
@@ -604,7 +619,7 @@ impl Drop for WatchPlace {
         // The table's lock is given back first: a watch that opens now
         // takes a cut of its own at worst.
         if last {
-            *self.readers.feed.rows.lock() = None;
+            self.readers.feed.keep_none();
         }
     }
 }
