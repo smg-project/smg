@@ -73,7 +73,9 @@ mod lent_ring;
 
 #[cfg(test)]
 pub(crate) use lent_ring::InOrder;
-pub use lent_ring::{Head, LentRing};
+pub use lent_ring::LentRing;
+
+pub use crate::policies::prefix_hash::Head;
 
 /// How the `consistent_hashing` policy is composed: its filters, its scorers
 /// and its picker.
