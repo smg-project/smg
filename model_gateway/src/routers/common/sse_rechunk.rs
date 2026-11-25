@@ -1745,6 +1745,10 @@ mod tests {
         );
         assert_eq!(evs[2]["prompt_text"], Value::from("user: hi"));
         assert_eq!(evs[2]["choices"][0]["finish_reason"], Value::from("stop"));
+        assert!(
+            evs[2]["choices"][0]["delta"]["content"].is_null(),
+            "{evs:?}"
+        );
     }
 
     #[test]
