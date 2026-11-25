@@ -1472,7 +1472,7 @@ pub(super) fn issued(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeSet, sync::Arc, time::Duration};
+    use std::{cell::RefCell, collections::BTreeSet, sync::Arc, thread, time::Duration};
 
     use parking_lot::Mutex;
     use smg_worker::{
@@ -5813,5 +5813,50 @@ mod tests {
         assert_eq!(asked(&capped_host(1, 1)), 1, "a capped rule");
         assert_eq!(asked(&ruled_host(u16::MAX, 1, 1)), 0, "a rule with no cap");
         assert_eq!(asked(&Host::of(1, 1)), 0, "no rule");
+    }
+
+    /// A pick of a decode that holds the whole prompt past the eight rows a
+    /// read keeps moves no count of writes left out through the pair's own
+    /// decision too: the decode side's write is handed the decode side's
+    /// column. Ten decodes are each sent the prompt once. Then, while a
+    /// reader holds the record, a thread of its own picks the ninth and the
+    /// tenth and ends: a write it had kept would be left out there, as the
+    /// write of a prompt no decode was sent is.
+    #[test]
+    fn a_pick_of_a_ninth_decode_holder_leaves_nothing_out() {
+        let pair = PolicySpec::pair_presets("round_robin", "cache_aware");
+        let host = host_of(pair.expect("the pair presets"), 2, 10);
+        // One instant for every decision: the list's table is read once.
+        let now = Instant::now();
+        let decide_among = |sent: &PromptHashes, decode: u32| {
+            let (prefills, class) = (host.prefills.len(), [decode]);
+            let classes =
+                PartnerClasses::number(host.decodes.len(), (0..prefills).map(|_| &class[..]));
+            let Asks(mut request, lists, _) = host.asks(&classes, false);
+            request.facts = facts();
+            sent.write_to(&mut request.facts);
+            let decision = lists.decide(&host.engine, None, now, &mut request, None);
+            assert_eq!(host.picked(&decision).1, decode as usize);
+        };
+        let sent = prompt(&host, 1_000);
+        (0..10).for_each(|decode| decide_among(&sent, decode));
+        let affinity = host.engine.affinity();
+        let left_out_behind = |sent: &PromptHashes, decodes: &[u32]| {
+            affinity.while_held(|| {
+                thread::scope(|scope| {
+                    let picks = scope.spawn(|| {
+                        for &decode in decodes {
+                            decide_among(sent, decode);
+                        }
+                    });
+                    picks.join().expect("the picks");
+                });
+            });
+            affinity.left_out()
+        };
+        assert_eq!(left_out_behind(&sent, &[8, 9]), 0);
+        // The count is live in this setup: every block of a prompt no
+        // decode was sent is still to add, and its write meets the reader.
+        assert_eq!(left_out_behind(&prompt(&host, 2_000), &[9]), 1);
     }
 }

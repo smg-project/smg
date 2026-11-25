@@ -33,6 +33,14 @@ impl Affinity {
         let bound = record.predictor.read().bound();
         Some(bound)
     }
+
+    /// Runs `run` while a reader holds every record of sent prefixes, as a
+    /// decision's naming on another thread does.
+    pub(in crate::engine::in_process) fn while_held<R>(&self, run: impl FnOnce() -> R) -> R {
+        let held: Vec<Arc<PrefixRecord>> = self.records.lock().values().cloned().collect();
+        let _readers: Vec<_> = held.iter().map(|record| record.predictor.read()).collect();
+        run()
+    }
 }
 
 const MODEL: &str = "model-a";
