@@ -1570,6 +1570,86 @@ jobs:
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
+  e2e-1gpu-completions-vllm-amd:
+    name: e2e-1gpu-completions-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_COMPLETIONS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/completions
+      min_selected: 15
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  e2e-1gpu-embeddings-vllm-amd:
+    name: e2e-1gpu-embeddings-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_EMBEDDINGS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-embeddings != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/embeddings
+      min_selected: 20
+      extra_deps: sentence-transformers
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  e2e-1gpu-gateway-vllm-amd:
+    name: e2e-1gpu-gateway-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_GATEWAY == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/router
+      min_selected: 3
+      enabled: ${{ needs.detect-changes.outputs.skip-chat-completions != 'true' }}
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   # The chat cases against the deprecated Python gRPC servicer
   # (SMG_SGLANG_SERVICER_IMPL=python, SMG_VLLM_SERVICER_IMPL=python), named
   # explicitly: the same workers and chat suite as the engine's e2e-1gpu-chat
@@ -2579,7 +2659,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-completions-vllm-amd, e2e-1gpu-embeddings-vllm-amd, e2e-1gpu-gateway-vllm-amd]
     if: always()
     # A hosted runner, never a self-hosted pool: this job runs on a cancelled
     # run too, and a cancelled run is complete only once it has run. Until
@@ -2658,6 +2738,9 @@ jobs:
                 "${{ needs.rust-aarch64.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-completions-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-embeddings-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-gateway-vllm-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-python-servicer.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \
