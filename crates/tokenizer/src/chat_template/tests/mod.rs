@@ -66,6 +66,45 @@ fn a_replacement_template_refreshes_the_tool_call_arguments_answer() {
     assert!(!state.raw_tool_call_arguments());
 }
 
+/// A system message's image reaches the prompt through a parts template
+/// that writes for it what it writes for a user message's, and through a
+/// template of one string per message, which is handed the anchor in the
+/// system text. A template that writes text parts alone, one that writes
+/// the image for a user message alone and one that fails on a system
+/// message keep the refusal, and so does a state whose `tool_use` template
+/// keeps it.
+#[test]
+fn a_template_answers_whether_it_writes_a_system_image() {
+    let every_role = "{% for m in messages %}<{{ m.role }}>{% for p in m.content %}\
+                      {% if p.type == 'image' %}<image>{% else %}{{ p.text }}{% endif %}\
+                      {% endfor %}{% endfor %}";
+    let text_alone = "{% for m in messages %}<{{ m.role }}>{% for p in m.content %}\
+                      {% if p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endfor %}";
+    let user_alone = "{% for m in messages %}<{{ m.role }}>{% for p in m.content %}\
+                      {% if p.type == 'text' %}{{ p.text }}{% elif m.role == 'user' %}<image>\
+                      {% endif %}{% endfor %}{% endfor %}";
+    let one_string = "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}";
+    let no_system = "{% for m in messages %}{% if m.role == 'system' %}\
+                     {{ raise_exception('no system message') }}{% endif %}{{ m.content }}\
+                     {% endfor %}";
+    for (template, writes) in [
+        (every_role, true),
+        (text_alone, false),
+        (user_alone, false),
+        (one_string, true),
+        (no_system, false),
+    ] {
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.system_images(), writes, "{template}");
+    }
+    let state = ChatTemplateState::from_config(ConfigChatTemplates {
+        default: Some(every_role.to_string()),
+        tool_use: Some(text_alone.to_string()),
+    })
+    .unwrap();
+    assert!(!state.system_images());
+}
+
 /// A state reads the names its templates read: a bare name anywhere in an
 /// expression of the default template, or of an alternate a request may
 /// render through. The gateway hands a request control to the template

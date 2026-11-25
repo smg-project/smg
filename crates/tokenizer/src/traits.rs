@@ -130,7 +130,8 @@ pub struct RendererCapabilities {
     /// system turn anywhere.
     pub leading_system_only: bool,
     /// The media parts that reach the rendered prompt from a message of a
-    /// [`TextRole`]. The gateway takes such a part for this renderer and
+    /// [`TextRole`] the renderer is handed as the request wrote it. The
+    /// gateway takes such a part of such a message for this renderer and
     /// refuses any other, whose prompt would carry no anchor for it.
     pub text_role_media: TextRoleMedia,
     /// JSON constraints require reasoning outside the response body.

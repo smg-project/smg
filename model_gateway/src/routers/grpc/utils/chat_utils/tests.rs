@@ -148,47 +148,76 @@ fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
 
 /// A system message's image is taken where the model's template writes it,
 /// its anchor in the rendered system turn, and refused at the door where it
-/// does not. The rows are two templates of one maker: the content macro of
-/// the first writes an image part in every role, that of the second writes a
-/// message's text parts alone.
+/// does not, or where the template may not be handed that message as the
+/// request wrote it. The templates are two of one maker: the content macro
+/// of the first writes an image part in every role, that of the second
+/// writes a message's text parts alone.
 #[test]
 fn a_system_image_is_taken_where_the_template_writes_it() {
-    let request: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": "m",
-        "messages": [
-            {"role": "system", "content": [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}},
-                {"type": "text", "text": "You are an image analyst."}
-            ]},
-            {"role": "user", "content": "What did you see in the system image?"}
-        ]
-    }))
-    .unwrap();
-    let render = |template: &str| {
+    let system = json!({"role": "system", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}},
+        {"type": "text", "text": "You are an image analyst."}
+    ]});
+    let user = json!({"role": "user", "content": "What did you see in the system image?"});
+    let writes = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/tokenizer/tests/fixtures/minimax_m3/chat_template.jinja"
+    ));
+    let text_alone = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/tokenizer/tests/fixtures/minimax_m2/chat_template.jinja"
+    ));
+    for (template, messages, taken) in [
+        (writes, json!([system, user]), true),
+        (text_alone, json!([system, user]), false),
+        (writes, json!([user, system]), false),
+        (
+            writes,
+            json!([system, {"role": "developer", "content": "Be brief."}, user]),
+            false,
+        ),
+        (
+            writes,
+            json!([system, {"role": "root", "content": "Be brief."}, user]),
+            false,
+        ),
+    ] {
+        let request: ChatCompletionRequest =
+            serde_json::from_value(json!({"model": "m", "messages": messages})).unwrap();
         let mut tokenizer =
             llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
                 .unwrap();
         tokenizer.set_chat_template(template.to_string()).unwrap();
-        process_chat_messages(&request, &tokenizer, None).map(|processed| processed.text)
-    };
-    let taken = render(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../crates/tokenizer/tests/fixtures/minimax_m3/chat_template.jinja"
-    )))
-    .unwrap();
-    assert!(
-        taken.contains("]<]image[>[You are an image analyst."),
-        "{taken}"
-    );
-    assert_eq!(
-        render(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../crates/tokenizer/tests/fixtures/minimax_m2/chat_template.jinja"
-        )))
-        .unwrap_err(),
-        "Unsupported chat content part type \"image_url\" in a system message for gRPC \
-         backends: media parts are taken in user and tool messages"
-    );
+        let door = validate_chat_template_content_parts(
+            &request,
+            tokenizer.renderer_capabilities().text_role_media,
+        );
+        if taken {
+            door.unwrap();
+            let (processed, _) = process_chat_messages_with_placeholders(
+                &request,
+                &tokenizer,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap();
+            assert!(
+                processed
+                    .text
+                    .contains("]<]image[>[You are an image analyst."),
+                "{}",
+                processed.text
+            );
+        } else {
+            assert_eq!(
+                door.unwrap_err(),
+                "Unsupported chat content part type \"image_url\" in a system message for gRPC \
+                 backends: media parts are taken in user and tool messages",
+                "{messages}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -813,7 +813,21 @@ fn validate_chat_parts(
     template_request: Option<&ChatCompletionRequest>,
     text_role_media: TextRoleMedia,
 ) -> Result<(), String> {
-    for message in messages {
+    // The renderer answers for a system message its template is handed as
+    // the request wrote it: the first message, with no developer and no root
+    // message in the request. A template may read the leading system message
+    // alone, and the renderer merges the system messages as text behind a
+    // developer or root message whose role the template does not name.
+    let system_as_written = |index: usize| {
+        index == 0
+            && !messages.iter().any(|message| {
+                matches!(
+                    message,
+                    ChatMessage::Developer { .. } | ChatMessage::Root { .. }
+                )
+            })
+    };
+    for (index, message) in messages.iter().enumerate() {
         let content = match message {
             ChatMessage::System { content, .. }
             | ChatMessage::Root { content, .. }
@@ -830,7 +844,8 @@ fn validate_chat_parts(
         // prompt's anchors did not match it (none for a system, developer or
         // root part the template does not write; one too many for an
         // assistant part on a template that renders assistant media). A
-        // part taken there is one the renderer writes (`text_role_media`).
+        // part taken there is one the renderer writes (`text_role_media`)
+        // from a message it is handed as written (`system_as_written`).
         // The binding carries the role's article for the sentence.
         let text_only_role = match message {
             ChatMessage::System { .. } => Some(("a system", TextRole::System)),
@@ -876,7 +891,9 @@ fn validate_chat_parts(
                         if let (Some((type_name, kind)), Some((role_name, role))) =
                             (media_part_type(part), text_only_role)
                         {
-                            if !text_role_media.writes(role, kind) {
+                            let taken = text_role_media.writes(role, kind)
+                                && (role != TextRole::System || system_as_written(index));
+                            if !taken {
                                 return Err(format!(
                                     "Unsupported chat content part type {type_name:?} in \
                                      {role_name} message for gRPC backends: media parts are \
@@ -1403,11 +1420,7 @@ pub fn process_chat_messages_with_encoding(
     image_placeholder: Option<&str>,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     // Bindings call this entry point without the gRPC preparation stage.
-    validate_chat_parts(
-        &request.messages,
-        None,
-        tokenizer.renderer_capabilities().text_role_media,
-    )?;
+    validate_chat_content_parts(&request.messages)?;
     let placeholder_tokens = image_placeholder.map(|token| {
         let mut placeholders = PlaceholderTokens::default();
         placeholders.insert(Modality::Image, token.to_string());
