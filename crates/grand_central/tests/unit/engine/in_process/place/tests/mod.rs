@@ -2833,13 +2833,14 @@ fn a_sides_shadow_alone_walks_the_lent_ring() {
         (2, [agreed, another, [0; 4]], 0),
         "the prefill's prefix form"
     );
-    // Beside a pair made past a veto that left the prefills nobody, a
-    // side's shadow is said as skipped and is stated no place: the lender
-    // is not asked, so a ring that panics where it is asked counts no
-    // fault.
+    // Beside a pair made past a veto that left the prefills nobody, each
+    // side's shadow follows the pair's default and agrees. Neither is
+    // stated a place: the filters empty the prefill shadow's own set, and
+    // the default asks for none. So the lender is not asked, and a ring
+    // that panics where it is asked counts no fault.
     assert_eq!(
         walks(plain, plain, true),
-        (0, [[0, 0, 0, 1], [0, 0, 0, 1], [0; 4]], 0),
+        (0, [agreed, agreed, [0; 4]], 0),
         "the veto's mark"
     );
 }

@@ -1323,10 +1323,10 @@ struct Buffers {
     /// tier on both sides' buffers ([`vetoed::paired`]). No other pass
     /// clears it, so a decision that reads it clears it first: a keyed
     /// request's ([`Engine::keep`]), and a pair's for the prefill's buffer
-    /// ([`Engine::decide_pair`]). There the pair's default writes it again,
-    /// and so does a pick the weighing lift alone made possible. Each
-    /// side's shadow reads it there, and none is made beside such a pair
-    /// ([`Engine::shadow_side`]).
+    /// ([`Engine::decide_pair`]). There the pair's default alone writes it
+    /// again. Each side's shadow reads on the prefill's buffer whether the
+    /// default made the pair, and in which tier. The prefill's shadow
+    /// leaves that mark as it found it ([`Engine::shadow_side`]).
     lifted: LiftedVeto,
     /// The pool size every buffer holds room for ([`Buffers::reserve`]).
     room: usize,
@@ -8408,10 +8408,9 @@ impl Engine {
             }
         }
         // The prefill buffer's mark of a lifted veto is cleared for this
-        // decision. The pair's default writes it again
-        // ([`vetoed::paired`]), and so does a pick the weighing lift alone
-        // made possible, below: each side's shadow reads it
-        // ([`Self::shadow_side`]).
+        // decision. The pair's default alone writes it again, by the tier
+        // it paired in ([`vetoed::paired`]): each side's shadow reads there
+        // whether the default made the pair ([`Self::shadow_side`]).
         scratch.single.lifted = LiftedVeto::None;
         // A prefill profile that weighs load against affinity runs with the
         // overload veto lifted ([`Self::weighing_lift`]): its run, the
@@ -8482,9 +8481,7 @@ impl Engine {
                         prefills,
                         run_cx,
                     );
-                    let listed = |c: &&Candidate| classed(&scratch.firsts, c.pair_class);
-                    let mut among = takes.places().filter(listed);
-                    if among.any(|c| takes.but_for_the_limit(c)) {
+                    if takes.waits_among(&scratch.firsts) {
                         let limit = HasCapacity.name();
                         return shed(reason_of(limit), limit, refused.trace)
                             .of_side(PairSide::Prefill);
@@ -8567,9 +8564,7 @@ impl Engine {
                     // of a side that reads the constraints the run itself
                     // read: the default above read the stated ones.
                     let takes = Half::new(prefill_profile, first, &prefill_facts, prefills, run_cx);
-                    let open = |c: &&Candidate| classed(&scratch.classes, c.pair_class);
-                    let mut partnered = takes.places().filter(open);
-                    if partnered.any(|c| takes.but_for_the_limit(c)) {
+                    if takes.waits_among(&scratch.classes) {
                         let limit = HasCapacity.name();
                         return shed(reason_of(limit), limit, prefill_shed.trace)
                             .of_side(PairSide::Prefill);
@@ -8676,8 +8671,8 @@ impl Engine {
         // A pick the weighing lift alone made possible says so, as a kept
         // key's pick does ([`Self::keep`]): where the veto as it stands
         // leaves the prefills nobody, the pair's trace names the lifted
-        // overload veto. The prefill buffer takes the mark too, so neither
-        // side's shadow is said beside such a pair
+        // overload veto. The prefill buffer takes no mark: the pair is the
+        // profile's, and each side's shadow runs beside it
         // ([`Self::shadow_side`]). A pick beside a prefill under its
         // thresholds carries no mark.
         let lift_placed = lifted_run.is_some() && {
@@ -8685,9 +8680,6 @@ impl Engine {
             let buf = &mut scratch.single;
             vetoed::all_vetoed(prefill_profile, &prefill_facts, shown, cx, buf)
         };
-        if lift_placed {
-            scratch.single.lifted = LiftedVeto::Overload;
-        }
         let mut last_shed: Option<Shed> = None;
         for prefill_target in prefill_pick.targets.iter() {
             // A target's position is the host's; a row outside the slice
@@ -8965,19 +8957,42 @@ impl Engine {
     /// binding's word, as its live side is ([`Set::ruled`]): where a veto
     /// leaves the live prefill's partners nobody, the rule steers the
     /// shadow or sheds it as it does that side. The prefill's shadow is
-    /// put to no rule, as its live side is put to none.
+    /// put to no all-vetoed rule, as its live side is put to none.
+    ///
+    /// A side's shadow follows the pair's default as its live side does
+    /// ([`vetoed::paired`]). It is the pair's decision with that side's
+    /// profile replaced, under every rule of the engine as it stands.
+    ///
+    /// A prefill's shadow that sheds goes the live decision's way
+    /// ([`Self::decide_pair`]), in this order:
+    ///
+    /// - Among first partners, the admission limit's test of the prefills
+    ///   shown. Where one of them waits on its limit, the shed is the
+    ///   limit's.
+    /// - Among first partners, its run over every open class.
+    /// - The default's first step, which answers its prefill
+    ///   ([`vetoed::paired_prefill`]). The live decode profile stands on
+    ///   the other side.
+    ///
+    /// Where the default answers nothing, the run's own refusal stands: a
+    /// shadow is compared by its outcome.
+    ///
+    /// The mark on the prefill's buffer says a pair the default made.
+    /// Beside such a pair the decode's shadow is the default's second step
+    /// for the live pair's prefill ([`vetoed::paired_decode`]). It reads
+    /// the decodes its own profile's hard filters keep in the pass that
+    /// paired. The prefill's shadow leaves the mark as it found it: the
+    /// decode's shadow runs behind it on one scratch.
+    ///
+    /// A pair that a weighing prefill profile's lifted run placed
+    /// ([`Self::weighing_lift`]) is a pair of the profiles. Each shadow
+    /// runs beside it as beside any other. A prefill's shadow that does
+    /// not weigh takes the default's prefill there.
     ///
     /// `None` where the binding names no shadow for the side, where the
     /// build did not find that profile free to run beside the live one
     /// ([`side_shadows`]), and where it would be handed another column
-    /// than the live side's pool carries ([`Self::side_apart`]). `None`
-    /// too, for either side, beside a pair the pair's default made
-    /// ([`vetoed::paired`]): the default takes each side by load, where a
-    /// shadow's run decides by its profile, and a prefill's shadow sheds
-    /// a pool the vetoes refuse. The mark on the prefill's buffer says
-    /// that pair. It says a pair a weighing prefill profile's lifted run
-    /// alone placed as well ([`Self::weighing_lift`]), and not which of
-    /// the two: no shadow is said beside that pair either.
+    /// than the live side's pool carries ([`Self::side_apart`]).
     ///
     /// `None` as well beside a side its binding's sessions rule or its
     /// picker's assignment placed ([`Self::places_side`]): a shadow's run
@@ -9009,12 +9024,7 @@ impl Engine {
         lends: &dyn Fn(u16) -> Option<(&'l dyn LentRing, &'l [u64])>,
     ) -> Option<Decision> {
         let index = self.shadow_sides.get(at as usize)?[side.index()]?;
-        // A pair the default made, or one the weighing lift alone placed:
-        // the mark the pair's decision left on the prefill's buffer
-        // ([`Self::decide_pair`]). The prefill's shadow runs over that
-        // buffer ahead of the decode's and leaves the mark as it stands:
-        // its set is put to no rule, so none of its passes writes it.
-        if self.side_apart(at, side) || scratch.single.lifted != LiftedVeto::None {
+        if self.side_apart(at, side) {
             return None;
         }
         let profile = self.profiles.get(usize::from(index))?;
@@ -9034,6 +9044,11 @@ impl Engine {
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
         // The shadow's own place, asked behind the filter half alone.
         let lent = || self.side_ring_profile(at, side).and_then(lends);
+        // The mark the pair's decision left on the prefill's buffer: the
+        // tier the pair's default paired in, and none beside a pair the
+        // profiles made ([`Self::decide_pair`]).
+        let defaulted = scratch.single.lifted;
+        let steers = entry.vetoed == AllVetoed::Steer;
         Some(match side {
             PairSide::Prefill => {
                 // The prefills the live prefill profile was shown: the
@@ -9045,38 +9060,110 @@ impl Engine {
                 // its own profile's word, as the live run is by the live
                 // profile's ([`Self::weighing_lift`]).
                 let lifted_run = self.weighing_lift(index, entry.vetoed, cx);
-                run_side_lent(
-                    profile,
-                    index,
-                    &prefill_facts,
-                    pool,
-                    Set::side(prefills, None, Some(&scratch.classes)),
-                    lifted_run.as_ref().unwrap_or(cx),
-                    &mut scratch.single,
-                    None,
-                    &lent,
-                )
+                let run_cx = lifted_run.as_ref().unwrap_or(cx);
+                // A refusal the pair's decision goes on from: a shed that is
+                // no picker's decline.
+                let refused = |run: &Decision| match run {
+                    Decision::Shed(shed) => shed.reason != ShedReason::PolicyDeclined,
+                    Decision::Pick(_) | Decision::Queue(_) => false,
+                };
+                // The shadow's own run over the prefills of `classes`. It asks
+                // for its place behind its filter half ([`run_side_lent`]).
+                let own = |classes: &[u32], buf: &mut Buffers| {
+                    let set = Set::side(prefills, None, Some(classes));
+                    run_side_lent(profile, index, &prefill_facts, pool, set, run_cx, buf, None, &lent)
+                };
+                let mut run = own(&scratch.classes, &mut scratch.single);
+                // A run that sheds goes the live decision's way. Among
+                // first partners, one of the prefills shown that stands
+                // but for its admission limit keeps the request under the
+                // limit's stage. Else the side runs again over every open
+                // class, which stand in `firsts` behind that decision's
+                // swap.
+                let takes = Half::new(profile, index, &prefill_facts, prefills, run_cx);
+                let firsts_shed = scratch.among_first && refused(&run);
+                let waits = firsts_shed && takes.waits_among(&scratch.classes);
+                if waits {
+                    let limit = HasCapacity.name();
+                    run = shed(reason_of(limit), limit, *run.trace());
+                } else if firsts_shed {
+                    run = own(&scratch.firsts, &mut scratch.single);
+                }
+                // A run that still sheds goes to the pair's default for
+                // its prefill, the live decode profile on the other side.
+                // The default reads every open class and the constraints
+                // as they are stated, and writes both buffers' marks. The
+                // decode side's facts are this run's, with no ring where
+                // the shadow is lent none: that step asks the decode
+                // profile's hard filters alone, and none reads a ring.
+                if !waits && refused(&run) {
+                    let live_decode = lives[PairSide::Decode.index()];
+                    let live_decode_profile = self.profiles.get(usize::from(live_decode))?;
+                    let sides = [
+                        Half::new(profile, index, &prefill_facts, prefills, cx),
+                        Half::new(
+                            live_decode_profile,
+                            live_decode,
+                            &decode_facts,
+                            decodes,
+                            decode_cx,
+                        ),
+                    ];
+                    let words = (steers, self.weighs(index));
+                    if scratch.among_first {
+                        std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
+                    }
+                    let taken =
+                        vetoed::paired_prefill::<true>(sides, &pools.table, words, pool, scratch);
+                    if scratch.among_first {
+                        std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
+                    }
+                    run = taken.unwrap_or(run);
+                }
+                // The decode's shadow runs behind this one on the same
+                // scratch and reads the live pair's mark there.
+                scratch.single.lifted = defaulted;
+                run
             }
             PairSide::Decode => {
-                // The partners of the live pair's prefill, put to the
-                // binding's all-vetoed rule as the live decode side's are:
-                // its first partners where the pair's decision read those,
-                // by the word it left ([`Scratch::among_first`]).
                 let prefill = live.targets.first()?;
                 let class = prefills.get(prefill.position as usize)?.pair_class;
-                let firsts = scratch.among_first;
-                let partners = Set::side(decodes, Some(pools.partners(&class, firsts)), None);
-                run_side_lent(
-                    profile,
-                    index,
-                    &decode_facts,
-                    pool,
-                    partners.ruled(entry.vetoed),
-                    decode_cx,
-                    &mut scratch.decode,
-                    None,
-                    &lent,
-                )
+                if defaulted == LiftedVeto::None {
+                    // The partners of the live pair's prefill, put to the
+                    // binding's all-vetoed rule as the live decode side's
+                    // are: its first partners where the pair's decision
+                    // read those, by the word it left
+                    // ([`Scratch::among_first`]).
+                    let firsts = scratch.among_first;
+                    let partners = Set::side(decodes, Some(pools.partners(&class, firsts)), None);
+                    run_side_lent(
+                        profile,
+                        index,
+                        &decode_facts,
+                        pool,
+                        partners.ruled(entry.vetoed),
+                        decode_cx,
+                        &mut scratch.decode,
+                        None,
+                        &lent,
+                    )
+                } else {
+                    // The pair's default made the live pair: its decode is
+                    // the live prefill's usable partner of the fewest
+                    // requests, in the pass of the tier the mark names.
+                    // The shadow's is that step's answer over the decodes
+                    // its own profile's hard filters keep in that pass,
+                    // every partner alike.
+                    let half = Half::new(profile, index, &decode_facts, decodes, decode_cx);
+                    half.usable(defaulted, steers, &mut scratch.decode);
+                    vetoed::paired_decode::<true>(
+                        &half,
+                        &pools.table,
+                        class,
+                        pool,
+                        &mut scratch.decode,
+                    )
+                }
             }
         })
     }
