@@ -43,7 +43,9 @@ use super::{
 use crate::routers::common::snapshot::WorkerRegistry;
 
 /// The settle window of a worker whose own window is zero: how long behind
-/// its removal its address is owed a purge.
+/// its removal its address is owed a purge. The look behind events that
+/// went unheard is owed as long behind them: the window of a worker whose
+/// removal was among them is not known.
 const SETTLE_WHERE_NONE_IS_STATED: Duration = Duration::from_secs(5);
 
 /// The owner of the token trees Grand Central is lent, one a model.
@@ -232,9 +234,14 @@ impl LentTrees {
 /// worker's address is owed a purge one settle window behind its removal,
 /// the worker's own window or five seconds where that is zero, at an event
 /// or with none. An address a worker was registered under meanwhile is
-/// owed none: what stands under it is that worker's own. Behind events
-/// that went unheard no address is owed one, as a registration may be
-/// among them.
+/// owed none: what stands under it is that worker's own.
+///
+/// A purge that is owed stays owed across events that went unheard. A
+/// registration under its address may be among them, so a store that can
+/// ask the registry does, when the purge is due. A removal may be among
+/// them too, and no event that was heard names its address: `forget` is
+/// asked once more, five seconds behind them ([`Left::looks_again`]), for
+/// what a decision under way wrote behind the purge of that wake.
 ///
 /// The task holds `stores` weakly, and of the registry its events alone. It
 /// ends with the registry, at the first wake after `stores` are gone, or
@@ -253,9 +260,11 @@ pub(super) fn follow_removals<S: Send + Sync + 'static>(
         // The addresses owed a purge behind a settle window, each with the
         // instant it is due.
         let mut owed: Vec<(Instant, String)> = Vec::new();
+        // The instant the look behind events that went unheard is due.
+        let mut look: Option<Instant> = None;
         loop {
             let mut left = Left::default();
-            let heard = match owed.iter().map(|(due, _)| *due).min() {
+            let heard = match owed.iter().map(|(due, _)| *due).chain(look).min() {
                 Some(due) => timeout_at(due, events.recv()).await.ok(),
                 None => Some(events.recv().await),
             };
@@ -263,7 +272,8 @@ pub(super) fn follow_removals<S: Send + Sync + 'static>(
                 Some(Ok(event)) => left.note(&event),
                 Some(Err(RecvError::Lagged(lost))) => left.unheard += lost,
                 Some(Err(RecvError::Closed)) => return,
-                // A purge behind a settle window is due.
+                // A purge behind a settle window is due, or the look
+                // behind unheard events.
                 None => {}
             }
             loop {
@@ -275,10 +285,13 @@ pub(super) fn follow_removals<S: Send + Sync + 'static>(
             }
             let now = Instant::now();
             if left.unheard > 0 {
-                // A registration may be among the unheard: no address is
-                // known to stand empty a window from now.
-                owed.clear();
-                left.settles.clear();
+                // This wake's purge answers the unheard events, and what is
+                // written behind it is looked for a window from now. A
+                // look that was owed already is answered by it too.
+                look = now.checked_add(SETTLE_WHERE_NONE_IS_STATED);
+            } else if look.is_some_and(|due| due <= now) {
+                left.looks_again = true;
+                look = None;
             }
             owed.retain(|(due, address)| {
                 if left.listed.contains(address) {
@@ -333,6 +346,8 @@ pub(super) struct Left {
     again: Vec<String>,
     /// How many events went unheard: a removal may be among them.
     unheard: u64,
+    /// Whether the look behind events that went unheard is due.
+    looks_again: bool,
 }
 
 impl Left {
@@ -371,7 +386,10 @@ impl Left {
 
     /// The addresses to purge at this wake in a store where a worker that
     /// rejoins under its address starts with no prompt: those a removal
-    /// named, then those whose purge behind a settle window is due.
+    /// named, then those whose purge behind a settle window is due. The
+    /// second stay owed across events that went unheard: a worker
+    /// registered under one by an event of those starts with no prompt
+    /// once more.
     pub(super) fn purged(&self) -> impl Iterator<Item = &str> {
         self.addresses.iter().chain(&self.again).map(String::as_str)
     }
@@ -380,7 +398,9 @@ impl Left {
     /// worker is registered under again keeps its prompts: those whose
     /// worker was being drained when it left and that no worker was
     /// registered under behind the removal, then those whose purge behind
-    /// a settle window is due.
+    /// a settle window is due. A registration that went unheard is not
+    /// told by either: such a store asks the registry for the addresses it
+    /// lists.
     pub(super) fn settled(&self) -> impl Iterator<Item = &str> {
         self.drained.iter().chain(&self.again).map(String::as_str)
     }
@@ -390,10 +410,19 @@ impl Left {
         self.unheard
     }
 
+    /// Whether this wake is the look behind events that went unheard, five
+    /// seconds behind them: a decision that read a worker whose removal
+    /// was among them may have written under its address behind the purge
+    /// of their wake, and no event that was heard names that address.
+    pub(super) fn looks_again(&self) -> bool {
+        self.looks_again
+    }
+
     /// Whether the events ask for a purge: a removal was heard, a purge
-    /// behind a settle window is due, or events went unheard.
+    /// behind a settle window is due, events went unheard, or the look
+    /// behind them is due.
     fn asks_for_a_purge(&self) -> bool {
-        self.unheard > 0 || !self.addresses.is_empty() || !self.again.is_empty()
+        self.unheard > 0 || self.looks_again || !self.addresses.is_empty() || !self.again.is_empty()
     }
 }
 
@@ -624,6 +653,11 @@ mod tests {
             ..Left::default()
         };
         assert!(unheard.asks_for_a_purge(), "events that went unheard");
+        let look = Left {
+            looks_again: true,
+            ..Left::default()
+        };
+        assert!(look.asks_for_a_purge(), "the look behind them");
         assert!(!Left::default().asks_for_a_purge());
     }
 

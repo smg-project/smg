@@ -764,11 +764,13 @@ impl CacheAwarePolicy {
     }
 
     /// Keeps the workers `listed` names and removes every other one, from
-    /// every model. A tenant of a string or token tree that `listed` does
-    /// not name leaves the load scorer and the trees by a walk of its own.
-    /// A model's hash placements are scanned once for the holders `listed`
-    /// does not name.
+    /// every model. The load scorer drops every entry `listed` does not
+    /// name, whether or not a tree holds its worker: hash mode keeps no
+    /// tree. A tenant of a string or token tree that `listed` does not name
+    /// leaves the trees by a walk of its own. A model's hash placements are
+    /// scanned once for the holders `listed` does not name.
     pub(crate) fn keep_workers_by_url(&self, listed: &HashSet<String>) {
+        self.load_scorer.keep_workers(listed);
         let mut gone: HashSet<String> = HashSet::new();
         // The size pass's own call at a size no tree is over: it visits
         // each string tree and evicts nothing.
@@ -780,7 +782,6 @@ impl CacheAwarePolicy {
         }
         gone.retain(|tenant| !listed.contains(tenant));
         for url in &gone {
-            self.load_scorer.remove_worker(url);
             self.trees.remove_tenant(&TenantId::from(url.as_str()));
         }
         let placement_maps: Vec<Arc<PlacementMap>> = self

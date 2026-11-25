@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
@@ -819,6 +819,16 @@ impl LeastLoadPolicy {
     /// reported running request, is priced at.
     pub(super) fn mean_prefill_tokens(&self) -> u32 {
         self.mean_prefill_tokens
+    }
+
+    /// Drops the dispatch tally of every worker `listed` does not name,
+    /// where no event names the workers that left: the cache-aware policy's
+    /// purge behind registry events it did not hear.
+    pub(super) fn keep_workers(&self, listed: &HashSet<String>) {
+        self.tally
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|url, _| listed.contains(url));
     }
 
     /// Argmin of the expected-wait score over `candidates` (indices into

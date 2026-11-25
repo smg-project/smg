@@ -1935,6 +1935,52 @@ fn workers_removed_by_url_as_a_batch_leave_every_model() {
     }
 }
 
+/// Workers kept by URL in hash mode, which keeps no tree: a worker the list
+/// does not name leaves the load scorer and the hash placements all the
+/// same, and a listed worker keeps both.
+#[test]
+fn workers_kept_by_url_in_hash_mode_leave_the_load_scorer() {
+    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let model = normalize_model_key(workers[0].model_id());
+    // One request sent to each worker: a dispatch the scorer notes and a
+    // placement.
+    for (at, worker) in workers.iter().enumerate() {
+        let tokens: Vec<u32> = (0..16).map(|token| token + 100 * at as u32).collect();
+        assert_eq!(
+            route_tokens(&policy, std::slice::from_ref(worker), &tokens),
+            0
+        );
+    }
+    // The requests the scorer counts for `url`, and whether a placement
+    // names it.
+    let remembered = |url: &str| {
+        let placed = policy
+            .placement_index
+            .get(model)
+            .unwrap()
+            .iter()
+            .any(|placement| placement.value().iter().any(|h| h.worker_url == url));
+        (policy.load_scorer.load_state_for_test(url).2, placed)
+    };
+    for worker in &workers {
+        assert_eq!(remembered(worker.url()), (1, true), "{}", worker.url());
+    }
+    assert_eq!(
+        policy.trees.string_tree_count(),
+        0,
+        "hash mode keeps no tree"
+    );
+
+    policy.keep_workers_by_url(&HashSet::from([workers[1].url().to_owned()]));
+    assert_eq!(
+        remembered(workers[0].url()),
+        (0, false),
+        "the one not listed"
+    );
+    assert_eq!(remembered(workers[1].url()), (1, true), "the one listed");
+}
+
 #[test]
 fn test_apply_known_remote_insert_round_trip() {
     // Seed both kinds via `apply_repair_page` (the cold-start path,
