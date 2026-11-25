@@ -2310,6 +2310,67 @@ mod tests {
         }
     }
 
+    /// The overload switch holds the holder's turn over its lays, so every
+    /// build reads one word. Its caller's word of the lead is asked behind
+    /// a lay, and finds the turn held. Behind the call the turn is free.
+    #[test]
+    fn the_overload_switch_holds_the_holders_turn_over_its_lays() {
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: None,
+        };
+        let mut replica = Replica::new();
+        let registry = Arc::clone(replica.objects.registry());
+        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        let (objects, store) = (&replica.objects, replica.store.as_ref());
+        let turns = RefCell::new(Vec::new());
+        let leads = || {
+            turns.borrow_mut().push(objects.read_to.is_locked());
+            true
+        };
+        assert_eq!(objects.state_overload_switch(store, false, &leads), 1);
+        let turns = turns.into_inner();
+        assert!(!turns.is_empty(), "the lay asks for the lead");
+        assert!(turns.iter().all(|&held| held), "inside the turn");
+        assert!(!objects.read_to.is_locked(), "the turn is let go");
+    }
+
+    /// The overload switch takes the holder's turn ahead of its word. While
+    /// another holds the turn the call waits there and the word stands, as
+    /// a read under that turn builds every object by one word.
+    #[test]
+    fn the_overload_switch_takes_the_holders_turn_ahead_of_its_word() {
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: None,
+        };
+        let mut replica = Replica::new();
+        let registry = Arc::clone(replica.objects.registry());
+        replica.objects = Objects::new(registry).with_overload_thresholds(defaults);
+        replica.store.upsert(facts(A, 1));
+        replica.follow();
+        let (objects, store) = (&replica.objects, replica.store.as_ref());
+        let (stated, state) = mpsc::channel();
+        let turn = objects.read_to.lock();
+        thread::scope(|scope| {
+            let call = scope.spawn(move || {
+                let laid = objects.state_overload_switch(store, false, &|| true);
+                let _ = stated.send(());
+                laid
+            });
+            assert_eq!(
+                state.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            assert!(objects.defaults_on.load(Relaxed), "the word waits");
+            drop(turn);
+            assert_eq!(call.join().expect("the call ends"), 1);
+        });
+        assert!(!objects.defaults_on.load(Relaxed), "the word moved");
+    }
+
     /// A default that states one signal alone changes the rows that take
     /// that signal, and no other: a row that names it keeps its object
     /// under either word, whatever it leaves out of the other signal.

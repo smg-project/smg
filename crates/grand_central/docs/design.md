@@ -3248,8 +3248,10 @@ registers it with no threshold at all. What that leaves of a binding's block:
   that takes force: its document door states the word on the holder of its worker objects
   behind each generation's entry, under the door's lock, and the objects the word changes are
   built again before the entry returns. Its default is off where every binding switches it
-  off. Bindings that disagree keep it on, and a controller refuses no document for them. At a
-  standby's restore the snapshot's rows are built ahead of its generation: where that
+  off. A controller refuses a document whose bindings disagree on it, by the path of the first
+  binding that differs from the first, at every pass of its document door: a start, an apply,
+  a dry run, a rollback, a spec store's bind and a leader's generation that a standby follows.
+  At a standby's restore the snapshot's rows are built ahead of its generation: where that
   generation moves the word, a row it changes is built twice. A worker's own thresholds veto
   either way.
 

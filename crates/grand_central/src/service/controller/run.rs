@@ -1794,6 +1794,55 @@ mod tests {
         }
     }
 
+    /// A start ends on the refusal's words where its document's bindings
+    /// differ on the overload switch: a spec store whose newest generation
+    /// on file is such a document does not bind, and a spec file that holds
+    /// one does not start. Nothing serves until the document is edited.
+    #[tokio::test]
+    async fn a_document_whose_bindings_differ_on_the_overload_switch_ends_the_start() {
+        const WORDS: &str = "bindings[1].overload.enabled = true is not the false bindings[0] says, by its block or the block's default: a controller builds its workers with one default set of overload thresholds, so the bindings of its document say one word";
+        let dir = tempfile::tempdir().expect("a directory");
+        let head = "apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\nbindings:\n";
+        let first = "  - match:\n      model: chat/*\n    profile: p\n    overload:\n      enabled: false\n";
+        let differs = format!("{head}{first}  - profile: p\n");
+        let store = dir.path().join("store");
+        std::fs::create_dir(&store).expect("the directory");
+        std::fs::write(store.join("00000000000000000004.yaml"), &differs).expect("the file");
+        let file = dir.path().join("spec.yaml");
+        std::fs::write(&file, &differs).expect("the file");
+        let start = |source: SpecSource| {
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            bind(config, StageRegistry::builtin(), &[], source)
+        };
+
+        match start(SpecSource::Store(store.clone())).await {
+            Err(
+                refused @ Error::SpecStore {
+                    source: StoreRefused::Rejected { generation: 4, .. },
+                    ..
+                },
+            ) => assert_eq!(
+                refused.to_string(),
+                format!("the spec store {}: generation 4: {WORDS}", store.display())
+            ),
+            Err(other) => panic!("the store was refused as {other}"),
+            Ok(_) => panic!("the store's newest generation does not run"),
+        }
+        match start(SpecSource::File(file.clone())).await {
+            Err(
+                refused @ Error::SpecFile {
+                    source: SpecRejected::Invalid(_),
+                    ..
+                },
+            ) => assert_eq!(
+                refused.to_string(),
+                format!("the spec file {}: {WORDS}", file.display())
+            ),
+            Err(other) => panic!("the file was refused as {other}"),
+            Ok(_) => panic!("the file's document does not run"),
+        }
+    }
+
     /// Beside a lease another replica can take, a spec store refuses the
     /// start by name: a standby follows a file's generations alone.
     #[tokio::test]

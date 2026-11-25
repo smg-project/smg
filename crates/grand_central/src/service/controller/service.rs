@@ -3109,6 +3109,41 @@ mod tests {
         assert_eq!(control.shared.generations.standing(), standing);
     }
 
+    /// The write call refuses a document whose bindings differ on the
+    /// overload switch, at a dry run and at an enforce alike: one issue by
+    /// the field of the first binding that differs, in the refusal's words,
+    /// and the standing generation stays. Bindings that agree are taken.
+    #[tokio::test]
+    async fn the_write_call_names_the_binding_that_differs_on_the_overload_switch() {
+        const FIELD: &str = "bindings[1].overload.enabled";
+        const OFF: &str = "    overload:\n      enabled: false\n";
+        let (_dir, _elector, _standing, control) = stored(true);
+        let write = |mode: proto::ApplyMode, second: &str| {
+            let head = "apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\nbindings:\n";
+            let first = format!("  - match:\n      model: chat/*\n    profile: p\n{OFF}");
+            let document = format!("{head}{first}  - profile: p\n{second}");
+            control.apply_policy_spec(apply(mode, document, "yaml", ""))
+        };
+        let agreed = write(proto::ApplyMode::Enforce, OFF).await;
+        let agreed = agreed.expect("an answer").into_inner();
+        assert!(agreed.accepted, "{agreed:?}");
+        assert_eq!(agreed.generation, 1);
+        for mode in [proto::ApplyMode::DryRun, proto::ApplyMode::Enforce] {
+            let refused = write(mode, "").await.expect("an answer").into_inner();
+            assert!(!refused.accepted && !refused.read_only, "{refused:?}");
+            assert_eq!(refused.generation, 1, "the standing generation stays");
+            let [issue] = refused.issues.as_slice() else {
+                panic!("one issue: {refused:?}")
+            };
+            assert_eq!(issue.field_path, FIELD);
+            assert_eq!(
+                issue.message,
+                format!("{FIELD} = true is not the false bindings[0] says, by its block or the block's default: a controller builds its workers with one default set of overload thresholds, so the bindings of its document say one word")
+            );
+        }
+        assert_eq!(control.shared.generations.generation(), 1);
+    }
+
     /// The spec's source is a file, which no call writes: an enforce and a
     /// rollback answer `read_only` with the standing number and digest,
     /// whatever the document, and validate nothing.
