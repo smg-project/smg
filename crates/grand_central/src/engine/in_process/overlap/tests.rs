@@ -1819,6 +1819,128 @@ fn a_pick_that_meets_a_held_record_keeps_its_prefix_for_its_thread() {
     assert_eq!(bed.affinity.left_out(), 0);
 }
 
+/// A thread keeps the newest eight writes. A longer prompt sent to the
+/// worker a kept write of its leading part waits for takes that write's
+/// place as the newest of them: the two turns are one write. A ninth write
+/// pushes the oldest out, which is counted, and the thread names its worker
+/// no more.
+#[test]
+fn a_thread_keeps_eight_writes_and_a_conversations_turns_are_one() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let first = prompt(1_000, 4);
+    let second = prompt(1_000, 6);
+    let other = prompt(2_000, 4);
+    let ninth = prompt(9_000, 4);
+    // The first read makes the model's record.
+    assert!(bed.holders(&first, NOW).is_empty());
+    thread::scope(|scope| {
+        let keeper = scope.spawn(|| {
+            let eight = bed.affinity.while_held(|| {
+                // Another prompt's write is kept between the two turns.
+                bed.decide(&request(&first, 7, NOW), Some(2));
+                bed.decide(&request(&other, 7, NOW), Some(2));
+                bed.decide(&request(&second, 7, NOW), Some(2));
+                for more in 3..9 {
+                    let asked = prompt(1_000 * more, 4);
+                    bed.decide(&request(&asked, 7, NOW), Some(2));
+                }
+                let eight = (
+                    bed.affinity.left_out(),
+                    bed.holders(&other, NOW),
+                    bed.holders(&second, NOW),
+                );
+                bed.decide(&request(&ninth, 7, NOW), Some(2));
+                eight
+            });
+            let nine = (
+                bed.affinity.left_out(),
+                bed.holders(&other, NOW),
+                bed.holders(&second, NOW),
+                bed.holders(&ninth, NOW),
+            );
+            (eight, nine)
+        });
+        let (eight, nine) = keeper.join().expect("a keeper");
+        assert_eq!(eight, (0, vec![(2, 0, 4)], vec![(2, 0, 6)]));
+        // The oldest is the other prompt's: the second turn's is newer.
+        assert_eq!(nine, (1, vec![], vec![(2, 0, 6)], vec![(2, 0, 4)]));
+    });
+    // The eight end unwritten with their thread's buffers, each counted.
+    assert_eq!(bed.affinity.left_out(), 9);
+}
+
+/// A write behind a column that meets a held record is kept as one behind
+/// a pick is: the thread's next column reads it beside what the record
+/// holds, another thread's column reads the record alone, and the next
+/// turn's write is kept in its turn. Once the record is free, the write
+/// behind the thread's next column stands, the kept write is written on
+/// behind it, and nothing waits.
+#[test]
+fn a_column_reads_the_write_its_thread_keeps_and_the_next_turn_is_kept() {
+    let (affinity, _, _) = hosted(false);
+    let prefills = Bed::new(affinity, paired(), 4);
+    let asked = prompt(1_000, 4);
+    let longer = prompt(1_000, 6);
+    let stood = prompt(2_000, 4);
+    // A column of the prompt and the write behind it for the worker `to`.
+    let sent = |prompt: &PromptHashes, to: usize| {
+        let facts = request(prompt, 7, NOW);
+        let (column, read) = prefills.column(&facts, Phase::Prefill);
+        let read = read.expect("the record speaks for the prefills");
+        record_prefix(
+            &prefills.pool,
+            Phase::Prefill,
+            &facts,
+            read,
+            prefills.ids[to],
+        );
+        held(&column)
+    };
+    let read =
+        |prompt: &PromptHashes| held(&prefills.column(&request(prompt, 7, NOW), Phase::Prefill).0);
+    // What a thread that keeps no write reads.
+    let elsewhere = |prompt: &PromptHashes| {
+        thread::scope(|scope| {
+            let reader = scope.spawn(|| read(prompt));
+            reader.join().expect("a reader")
+        })
+    };
+    // The blocks a column reads for one worker of the four.
+    let at = |worker: usize, blocks: u32| {
+        let mut column = [(0, 0); 4];
+        column[worker] = (0, blocks);
+        column
+    };
+    // The record holds another prompt for the fourth worker.
+    assert_eq!(sent(&stood, 3), [(0, 0); 4]);
+    thread::scope(|scope| {
+        let keeper = scope.spawn(|| {
+            assert_eq!(
+                prefills.affinity.while_held(|| sent(&asked, 1)),
+                [(0, 0); 4]
+            );
+            assert_eq!(prefills.affinity.left_out(), 0);
+            assert_eq!(read(&asked), at(1, 4));
+            // A thread that keeps a write reads the record as before.
+            assert_eq!(read(&stood), at(3, 4));
+            assert_eq!(elsewhere(&asked), [(0, 0); 4]);
+            // The next turn, the record held again: its column reads the
+            // turn before, and its write is kept in its turn.
+            assert_eq!(prefills.affinity.while_held(|| sent(&longer, 1)), at(1, 4));
+            assert_eq!(read(&longer), at(1, 6));
+            assert_eq!(elsewhere(&longer), [(0, 0); 4]);
+            // The record free, the turn sent to the third worker: its write
+            // stands and the kept write is written on behind it.
+            assert_eq!(sent(&longer, 2), at(1, 6));
+            assert_eq!(elsewhere(&longer), [(0, 0), (0, 6), (0, 6), (0, 0)]);
+        });
+        keeper.join().expect("a keeper");
+    });
+    // Nothing waited as the thread's buffers went.
+    assert_eq!(prefills.affinity.left_out(), 0);
+}
+
 /// A pick of a worker the record holds the whole request for leaves nothing
 /// out, however many workers hold it: a read keeps eight of them, and the
 /// pick's own entry of the column says it of the others. At the tick of the
