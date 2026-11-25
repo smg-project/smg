@@ -176,7 +176,9 @@ fn addresses_overlap(first: SocketAddr, second: SocketAddr) -> bool {
         || (a.is_ipv4() && b.is_ipv4() && (a == b || a.is_unspecified() || b.is_unspecified()))
 }
 
-/// The number of [`Config::MAX_DECIDE_SHARDS`], named by the refusal too.
+/// The number of [`Config::MAX_DECIDE_SHARDS`], named by the refusal too:
+/// the refusal reads it here, not through `Config`, so `ConfigError` does
+/// not know the record whose check returns it.
 const DECIDE_SHARDS_CEILING: usize = 256;
 
 impl Config {
