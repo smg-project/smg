@@ -73,7 +73,7 @@ A profile can keep a *tally of sends*: what the host sent each worker since that
 A send leaves the tally at the first of these events:
 
 - A load report of the worker, sampled at or after the send. Where the profile sets `sent_report_delay_ms`, the sample must come at least that long after the send.
-- The worker leaves, joins again, is replaced or changes its number of ranks.
+- The worker is removed, joins again, is replaced or changes its number of ranks.
 - The end of `sent_ttl_ms`, where the profile sets it.
 
 The tally keeps 8,192 sends for a worker, and for each rank of a data-parallel worker, whether or not the profile sets `sent_ttl_ms`. One more send lets the oldest of them go.
@@ -314,7 +314,7 @@ The entry and its refusal names stand in [`encode.rs`](../src/engine/framework/e
 
 These parts of a binding are still in the reference:
 
-- [Overload, shadows and reserved fields](../REFERENCE.md#bindings-and-plans), with `sessions` and `routing_key`
+- [Overload, shadows and reserved fields](../REFERENCE.md#overload-shadows-and-reserved-fields), with `sessions` and `routing_key`
 - [Session keys](../REFERENCE.md#session-keys)
 
 A spec's life is there too:
