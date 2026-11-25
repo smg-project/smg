@@ -705,7 +705,9 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// it from here. A dispatch said after that deadline already ended
     /// the lease meets no lease: the request runs unbooked, and its host
     /// is told nothing. Said once: a second call says nothing.
-    /// For a pair this says the prefill's dispatch.
+    /// For a pair this says the prefill's dispatch. A decode side issued
+    /// with that prefill stands on a controller's file from here while the
+    /// prefill runs, and has the deadline's span from the prefill's end.
     pub fn dispatched(&mut self, now: Instant) {
         self.owed = self.dispatch(self.owed, self.target.id, now);
     }

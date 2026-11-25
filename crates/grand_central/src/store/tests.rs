@@ -1803,9 +1803,10 @@ fn a_release_ends_the_side_it_names_and_with_no_side_every_side() {
 }
 
 /// A pair filed with its prefill part dispatched and its decode side
-/// waiting is due at its deadline all the same: the side that waits ends.
+/// waiting is asked at its deadline all the same: the side stands behind
+/// its prefill, and the lease's deadline is written one span on.
 #[test]
-fn a_pair_filed_with_its_decode_side_alone_waiting_is_due_at_its_deadline() {
+fn a_pair_filed_with_its_decode_side_alone_waiting_is_asked_at_its_deadline() {
     let store = MemoryStore::new();
     let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
     let leases: &dyn LeasesStore = &store;
@@ -1816,15 +1817,16 @@ fn a_pair_filed_with_its_decode_side_alone_waiting_is_due_at_its_deadline() {
     record.state = dispatched;
     issue_pair(leases, (record, decode)).expect("the key is free");
     assert_eq!(booked(&store, &[p, d]), [1, 1]);
-    // An issue past the deadline ends the side that waits.
+    // An issue past the deadline asks the lease and ends nothing of it.
     let later = now + Duration::from_secs(2);
     let world = store.snapshot();
     store
         .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
         .expect("minted under the store's term");
-    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
-    assert_eq!(sides(&store, 1), Some((dispatched, abandoned)));
-    assert_eq!(booked(&store, &[p, d]), [2, 0]);
+    assert_eq!(sides(&store, 1), Some((dispatched, LeaseState::ISSUED)));
+    assert_eq!(booked(&store, &[p, d]), [2, 1]);
+    let filed = leases.get(gateway, LeaseId(1)).expect("the lease stands");
+    assert_eq!(filed.dispatch_deadline, later + DISPATCH_TTL);
 }
 
 /// A place let go is the next one laid: a file's list of places is as
@@ -1855,11 +1857,11 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     let leases: &dyn LeasesStore = &store;
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
-    // Two pairs: the first's prefill is dispatched, the second waits whole.
+    // Two pairs: the first's decode is dispatched, the second waits whole.
     for id in [1, 2] {
         issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
     }
-    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 0), now));
     assert_eq!(booked(&store, &[p, d]), [2, 2]);
     // An issue past the deadline ends what waits and tells of each side
     // it ended, the prefill's first.
@@ -1884,7 +1886,7 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     assert_eq!(
         ended.collect::<Vec<_>>(),
         [
-            (1, Some(Side::Decode)),
+            (1, Some(Side::Prefill)),
             (2, Some(Side::Prefill)),
             (2, Some(Side::Decode)),
         ]
@@ -1893,11 +1895,11 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     let dispatched = LeaseState::Dispatched { at: now };
     // The dispatched side stands with its count; the pair that waited
     // whole left the file.
-    assert_eq!(sides(&store, 1), Some((dispatched, abandoned)));
+    assert_eq!(sides(&store, 1), Some((abandoned, dispatched)));
     assert_eq!(leases.get(gateway, LeaseId(2)), None);
-    assert_eq!(booked(&store, &[p, d]), [2, 0]);
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
     // The side that stands ends by its own frame.
-    assert!(leases.completed(gateway, LeaseId(1), &done(Side::Prefill)));
+    assert!(leases.completed(gateway, LeaseId(1), &done(Side::Decode)));
     assert_eq!(leases.get(gateway, LeaseId(1)), None);
     assert_eq!(booked(&store, &[p, d]), [1, 0]);
     // The store's own sweep returns both sides as it left them.
@@ -1911,11 +1913,13 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     assert_eq!(sides(&store, 3), Some((abandoned, at)));
 }
 
-/// A pair's sides are dispatched one by one. A decode side that waits
-/// behind its dispatched prefill ends at the dispatch deadline, at a later
-/// issue and at the store's own sweep, and the dispatched prefill stands.
+/// A pair's sides are dispatched one by one. A decode side that was issued
+/// with its prefill stands at the dispatch deadline while that prefill is
+/// dispatched, at a later issue and at the store's own sweep: no end is
+/// told of it, it keeps its count, and its own dispatch finds it booked
+/// however long the prefill ran.
 #[test]
-fn the_dispatch_deadline_ends_a_decode_side_that_waits_behind_its_dispatched_prefill() {
+fn the_dispatch_deadline_ends_no_decode_side_that_waits_behind_its_dispatched_prefill() {
     let store = MemoryStore::new();
     let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
     let leases: &dyn LeasesStore = &store;
@@ -1932,28 +1936,111 @@ fn the_dispatch_deadline_ends_a_decode_side_that_waits_behind_its_dispatched_pre
     assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 0), now));
     assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
     assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Prefill, 0), now));
-    // An issue past the deadline ends the decode side that waits, and
-    // the dispatched sides stand.
+    // An issue past the deadline ends nothing and tells nothing: the
+    // decode side that waits stands behind its prefill, with its count.
     let later = now + Duration::from_secs(2);
     let world = store.snapshot();
+    store.tell_through(heard);
+    drop(told_sides());
     store
         .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
         .expect("minted under the store's term");
-    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    assert!(told_sides().is_empty(), "no end is told");
     assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
-    assert_eq!(sides(&store, 2), Some((dispatched, abandoned)));
-    // The store's own sweep returns the prefill as it stood and the
-    // decode side as the sweep left it.
-    issue_pair(leases, pair(3, p, &[d], later)).expect("the key is free");
-    assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Prefill, 0), later));
-    let swept = leases.expire(later + Duration::from_secs(9));
-    let at = LeaseState::Dispatched { at: later };
-    let third = |found: &Sides| {
-        (found.record.lease.id, found.record.state) == (LeaseId(3), at)
+    assert_eq!(sides(&store, 2), Some((dispatched, LeaseState::ISSUED)));
+    assert_eq!(booked(&store, &[p, d]), [3, 2]);
+    // The lease keeps one place of the queue, a span behind that pass.
+    let deadline = |id| {
+        leases
+            .get(gateway, LeaseId(id))
+            .map(|filed| filed.dispatch_deadline)
+    };
+    assert_eq!(deadline(2), Some(later + DISPATCH_TTL));
+    // The store's own sweep asks it at that deadline and holds it too:
+    // of the three leases that wait, it ends the single's alone.
+    let swept = leases.expire(later + DISPATCH_TTL);
+    let ended: Vec<_> = swept.iter().map(|found| found.record.target).collect();
+    assert_eq!(ended, [p], "the single's lease, issued at the first pass");
+    assert_eq!(sides(&store, 2), Some((dispatched, LeaseState::ISSUED)));
+    assert_eq!(deadline(2), Some(later + DISPATCH_TTL * 2));
+    assert_eq!(booked(&store, &[p, d]), [2, 2]);
+    // The decode is named a minute behind the pair's issue: it is booked.
+    let sent = now + Duration::from_secs(60);
+    assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Decode, 0), sent));
+    let decode_sent = LeaseState::Dispatched { at: sent };
+    assert_eq!(sides(&store, 2), Some((dispatched, decode_sent)));
+    assert_eq!(booked(&store, &[p, d]), [2, 2]);
+    assert!(leases.expire(sent + DISPATCH_TTL).is_empty());
+}
+
+/// A decode side that was issued with its prefill has a whole deadline
+/// behind that prefill's end. A deadline that falls due between the
+/// prefill's end and the decode's dispatch a moment later ends nothing:
+/// that pass starts the side's own deadline, and the dispatch finds the
+/// side booked. A side that still waits at the end of its own deadline is
+/// released as abandoned.
+#[test]
+fn a_decode_side_has_a_whole_deadline_behind_its_prefills_end() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    // Two pairs sent prefill first: each prefill is dispatched and has
+    // answered inside the lease's first deadline, a second from the issue.
+    for id in [1, 2] {
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
+        assert!(leases.dispatched(gateway, LeaseId(id), on(Side::Prefill, 0), now));
+        assert!(leases.completed(gateway, LeaseId(id), &done(Side::Prefill)));
+    }
+    let waiting = Some((LeaseState::Completed, LeaseState::ISSUED));
+    assert_eq!((sides(&store, 1), sides(&store, 2)), (waiting, waiting));
+    assert_eq!(booked(&store, &[p, d]), [0, 2]);
+    // The first deadline falls due behind the prefills' ends: the pass
+    // ends nothing, tells nothing and starts each side a whole deadline.
+    let first = now + Duration::from_secs(1);
+    store.tell_through(heard);
+    drop(told_sides());
+    assert!(leases.expire(first).is_empty());
+    assert!(told_sides().is_empty(), "no end is told");
+    assert_eq!((sides(&store, 1), sides(&store, 2)), (waiting, waiting));
+    let deadline = |id| {
+        leases
+            .get(gateway, LeaseId(id))
+            .map(|filed| filed.dispatch_deadline)
+    };
+    assert_eq!(deadline(1), Some(first + DISPATCH_TTL));
+    assert_eq!(deadline(2), Some(first + DISPATCH_TTL));
+    // The first pair's decode is named a moment behind that pass: the
+    // side is booked on its worker, and no later deadline ends it.
+    let sent = first + Duration::from_millis(1);
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 0), sent));
+    let decode_sent = LeaseState::Dispatched { at: sent };
+    assert_eq!(sides(&store, 1), Some((LeaseState::Completed, decode_sent)));
+    assert_eq!(booked(&store, &[p, d]), [0, 2]);
+    drop(told_sides());
+    // The second pair's decode has that one deadline and no second: a
+    // moment inside it the side waits, and at its end the side is
+    // released as abandoned and told so, and its lease leaves the file.
+    let own = first + DISPATCH_TTL;
+    assert!(leases.expire(own - Duration::from_millis(1)).is_empty());
+    assert_eq!(sides(&store, 2), waiting);
+    let swept = leases.expire(own);
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    let second = |found: &Sides| {
+        (found.record.lease.id, found.record.state) == (LeaseId(2), LeaseState::Completed)
             && found.decode.is_some_and(|decode| decode.state == abandoned)
     };
-    assert!(swept.iter().any(third));
-    assert_eq!(sides(&store, 3), Some((at, abandoned)));
+    assert_eq!(swept.len(), 1);
+    assert!(swept.iter().all(second));
+    let told: Vec<_> = told_sides().into_iter().map(|(_, said)| said).collect();
+    assert_eq!(
+        told,
+        [Said::Released(Some(Side::Decode), ReleaseReason::Abandoned)]
+    );
+    assert_eq!(leases.get(gateway, LeaseId(2)), None);
+    assert_eq!(sides(&store, 1), Some((LeaseState::Completed, decode_sent)));
+    assert_eq!(booked(&store, &[p, d]), [0, 1]);
 }
 
 #[test]
@@ -3460,10 +3547,10 @@ fn a_decode_side_is_on_file_for_each_record_that_carries_the_mark_and_for_no_oth
     filed.remove(&10);
     read("a pair's release whole", &filed);
     // The dispatch deadline: a pair that waits whole leaves, and one with
-    // a dispatched side stands with its decode side ended.
+    // a dispatched decode stands with its prefill side ended.
     issue_pair(leases, pair(5, p, &[d0], now)).expect("free");
     issue_pair(leases, pair(6, p, &[d0], now)).expect("free");
-    assert!(leases.dispatched(gateway, LeaseId(6), on(Side::Prefill, 0), now));
+    assert!(leases.dispatched(gateway, LeaseId(6), on(Side::Decode, 0), now));
     filed.extend([(5, true), (6, true)]);
     read("two pairs more", &filed);
     leases.expire(now + Duration::from_secs(2));
@@ -3471,7 +3558,7 @@ fn a_decode_side_is_on_file_for_each_record_that_carries_the_mark_and_for_no_oth
     read("the dispatch deadline", &filed);
     // A frame applied through a hand, by whoever holds the turn next.
     let hand = Hand::new(gateway);
-    store.hand(&hand, LeaseId(6), Said::Completed(done(Side::Prefill)));
+    store.hand(&hand, LeaseId(6), Said::Completed(done(Side::Decode)));
     store.hand_back(hand);
     filed.remove(&6);
     read("a handed frame", &filed);

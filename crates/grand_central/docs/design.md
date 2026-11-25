@@ -1363,8 +1363,16 @@ pub enum Said {
 decide ──> lease issued ──> Dispatched ──> Completed
                 │                └───────> Released (client gone, send failed, worker removed)
                 └── never dispatched ──> Released when the host drops its guard
-                                         (a controller releases one on its file 5 s after issue)
+                                         (a controller releases one on its file 5 s after issue;
+                                          a pair's decode side behind its prefill, 5 s after
+                                          that prefill's end)
 ```
+
+A controller's deadline is the time to name a lease's first dispatch. A pair's decode side that
+was issued with its prefill is sent when that prefill has answered. So the file holds it while
+the prefill is dispatched, as its booking stands in a gateway's own process, and it has a whole
+deadline from the file's first pass behind the prefill's end. A side a decode call issued keeps
+the call's own deadline.
 
 The kept engine stores nothing about a lease. The host keeps what it was handed and hands it back
 with each event (`DecisionEngine::say`). The crate has a guard for that, `DecisionGuard`

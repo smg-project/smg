@@ -444,7 +444,9 @@ message Lease {
   uint64 term = 8;
   // Bounds decision to Dispatched; then Completed or the stream rule ends it.
   // A controller's lease tells what is left of the span as its answer is
-  // sent; the span counts from the request's take.
+  // sent; the span counts from the request's take. A pair's decode side
+  // issued with its prefill is bound from that prefill's end: a controller
+  // holds it while the prefill is dispatched.
   uint32 dispatch_ttl_ms = 9;
   LeaseOrigin origin = 10;
 }
