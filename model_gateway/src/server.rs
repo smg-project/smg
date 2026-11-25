@@ -56,6 +56,7 @@ use wfaas::LoggingSubscriber;
 pub mod connection_limit;
 pub mod connection_timeouts;
 pub mod health;
+mod policy_explain;
 pub mod posture;
 mod rate_limit_document;
 pub(crate) mod tls;
@@ -1554,6 +1555,7 @@ pub fn build_apps(
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
+        .route("/policy/explain/{request_id}", get(policy_explain::get))
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))

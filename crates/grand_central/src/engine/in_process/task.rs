@@ -234,7 +234,7 @@ impl InProcess {
     /// leaves the lists it had not handed to theirs.
     #[must_use]
     pub fn upkeep_faults(&self) -> u64 {
-        self.upkeep_faults.load(Ordering::Relaxed)
+        self.held.upkeep.load(Ordering::Relaxed)
     }
 
     /// One step of the engine's task under the task's catch: `None` where
@@ -245,7 +245,7 @@ impl InProcess {
             Ok(done) => Some(done),
             Err(payload) => {
                 release(payload);
-                self.upkeep_faults.fetch_add(1, Ordering::Relaxed);
+                self.held.upkeep.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
@@ -256,7 +256,12 @@ impl InProcess {
     /// runs the upkeep at a tick of its own. A panic in it is held and
     /// counted ([`Self::upkeep_faults`]): the host's tick goes on.
     pub(crate) fn upkeep(&self, now: Instant) {
-        let _swept = self.held(|| self.sweep(now));
+        let _swept = self.held(|| {
+            // A case's fault: the upkeep panics here as its sweep would.
+            #[cfg(test)]
+            tests::raise_the_armed_fault();
+            self.sweep(now);
+        });
     }
 
     /// The task's loop. `upkeep` is the step it runs once a second under

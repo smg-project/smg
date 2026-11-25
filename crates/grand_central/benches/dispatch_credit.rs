@@ -132,17 +132,13 @@ fn least_cost() -> Engine {
 }
 
 fn fill(engine: &Engine, rows: &[Candidate]) {
-    let lease = Lease {
-        issued_micros: SENT_AT,
-        tokens: 379,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = SENT_AT;
+    lease.tokens = 379;
     for row in rows {
-        let target = Target {
-            id: row.id,
-            dp_rank: row.dp_rank,
-            ..Target::default()
-        };
+        let mut target = Target::default();
+        target.id = row.id;
+        target.dp_rank = row.dp_rank;
         engine.on_dispatched(&lease, &target, Side::Single, 0);
     }
 }
@@ -153,21 +149,18 @@ fn cells(c: &mut Criterion, group: &str, engine: fn() -> Engine, in_flight_cycle
     let mut group = c.benchmark_group(group);
     for n in [8, 64, 512] {
         let rows: Vec<_> = (0..n)
-            .map(|position| Candidate {
-                position,
-                id: WorkerId(1003 + u64::from(position)),
-                in_flight: position % in_flight_cycle,
-                ..Candidate::default()
+            .map(|position| {
+                let mut row = Candidate::default();
+                row.position = position;
+                row.id = WorkerId(1003 + u64::from(position));
+                row.in_flight = position % in_flight_cycle;
+                row
             })
             .collect();
-        let pool = PoolFacts {
-            pool_size: n,
-            ..PoolFacts::default()
-        };
-        let facts = RequestFacts {
-            now_micros: SENT_AT + 911,
-            ..RequestFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n;
+        let mut facts = RequestFacts::default();
+        facts.now_micros = SENT_AT + 911;
         let constraints = Constraints::default();
         let engine = engine();
         let mut scratch = Scratch::new();
@@ -179,10 +172,7 @@ fn cells(c: &mut Criterion, group: &str, engine: fn() -> Engine, in_flight_cycle
             b.iter(|| engine.decide(&facts, &pool, black_box(&rows), &constraints, &mut scratch));
         });
 
-        let facts = RequestFacts {
-            now_micros: SENT_AT + u64::from(TTL_MS) * 1000,
-            ..facts
-        };
+        facts.now_micros = SENT_AT + u64::from(TTL_MS) * 1000;
         // The cutoff empties each row, so put the send back before timing
         // the next decision.
         let _ = engine.decide(&facts, &pool, &rows, &constraints, &mut scratch);
@@ -233,15 +223,14 @@ fn tell_each(engine: &Engine, lease: &Lease, targets: &[Target]) {
 /// enters a rank and each rank holds two sends at the pass's end.
 fn dispatch(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_sent/dispatch");
-    let lease = Lease {
-        issued_micros: SENT_AT,
-        tokens: 379,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = SENT_AT;
+    lease.tokens = 379;
     let targets: Vec<_> = (0..64)
-        .map(|position| Target {
-            id: WorkerId(1003 + position),
-            ..Target::default()
+        .map(|position| {
+            let mut placed = Target::default();
+            placed.id = WorkerId(1003 + position);
+            placed
         })
         .collect();
     for (name, reader) in [("least_load", false), ("least_load_and_reader", true)] {

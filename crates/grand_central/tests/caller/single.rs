@@ -34,7 +34,7 @@ use smg_worker::{
 use tokio::{task::JoinHandle, time::sleep};
 
 use crate::{
-    program::{settings, Answer, Asked, Program, ATTEMPTS},
+    program::{settings, Answer, Asked, InFlight, Program, Stated, ATTEMPTS},
     served, started, under, url, worker, workers, MODEL,
 };
 
@@ -42,7 +42,15 @@ use crate::{
 const PLAIN: Asked<'static> = Asked {
     model: MODEL,
     headers: None,
+    items: &[],
 };
+
+/// A first attempt of [`PLAIN`], placed for a case that keeps the attempt
+/// itself.
+fn placed(program: &Program) -> InFlight {
+    let placed = program.place(&PLAIN, Stated::default());
+    placed.expect("a placement")
+}
 
 /// How often each worker was sent to over `answers`, by its address.
 fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeMap<&'a str, u32> {
@@ -56,8 +64,9 @@ fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeMap<&'a str,
 /// Plain requests under `round_robin` take the workers of their list in
 /// turn: nine requests over three workers, three each, one send a request.
 ///
-/// The classic router rotates the list it is given the same way
-/// (`model_gateway/src/routers/common/placement.rs:4044-4071`).
+/// The classic router rotates the list it is given the same way: its case
+/// `a_pinned_wire_under_round_robin_rotates_the_workers_on_it`
+/// (`model_gateway/src/routers/common/placement.rs:5604-5632`).
 #[test]
 fn plain_requests_take_each_worker_in_turn() {
     let fleet = workers(3);
@@ -74,8 +83,9 @@ fn plain_requests_take_each_worker_in_turn() {
 /// callers ask together, a barrier a round, over 256 idle workers, 64
 /// rounds, and every worker takes exactly one request.
 ///
-/// The classic router answers so
-/// (`model_gateway/src/routers/common/placement.rs:4284-4321`).
+/// The classic router answers so: its case
+/// `callers_that_pick_at_once_take_each_idle_worker_once`
+/// (`model_gateway/src/routers/common/placement.rs:5857-5894`).
 #[test]
 fn callers_that_ask_at_once_take_each_idle_worker_once() {
     const CALLERS: usize = 4;
@@ -115,8 +125,8 @@ fn callers_that_ask_at_once_take_each_idle_worker_once() {
 ///
 /// The classic router lets the workers a request tried step aside while
 /// another is left, and uses the list whole otherwise
-/// (`model_gateway/src/routers/common/placement.rs:556-576`, its case
-/// `:4218-4252`).
+/// (`model_gateway/src/routers/common/placement.rs:1620-1640`, its case
+/// `:5781-5815`).
 #[test]
 fn a_retry_names_the_worker_it_tried_and_goes_to_another() {
     let fleet = workers(2);
@@ -178,8 +188,8 @@ fn a_send_is_asked_again_for_the_statuses_a_gateway_asks_again_for() {
 /// 503.
 ///
 /// The classic router keeps a worker that is available
-/// (`model_gateway/src/routers/common/placement.rs:536-539`), and answers a
-/// list with none a 503 with the same hint (`:577-580`, `:682`, `:703`).
+/// (`model_gateway/src/routers/common/placement.rs:1600-1603`), and answers a
+/// list with none a 503 with the same hint (`:1641-1644`, `:1746`, `:1767`).
 #[test]
 fn a_worker_that_cannot_be_sent_to_takes_no_request() {
     let fleet = workers(4);
@@ -226,7 +236,7 @@ fn a_worker_that_cannot_be_sent_to_takes_no_request() {
 ///
 /// The classic router's `manual` policy pins a key to the worker its first
 /// request took, and places a key it has not seen by the configured
-/// assignment (`model_gateway/src/policies/manual.rs:292-326`, `:208-216`).
+/// assignment (`model_gateway/src/policies/manual.rs:322-368`, `:228-236`).
 #[test]
 fn the_requests_of_one_key_stay_on_its_worker() {
     const KEY: &str = "session-7";
@@ -282,16 +292,25 @@ fn the_requests_of_one_key_stay_on_its_worker() {
 }
 
 /// What a stage heard of the leases of its requests, in order.
-type Heard = Arc<Mutex<Vec<String>>>;
+pub(crate) type Heard = Arc<Mutex<Vec<String>>>;
 
 /// A scorer added in code that scores every worker alike and takes every
 /// word of a lease.
 #[derive(Debug)]
-struct Hears(Heard);
+pub(crate) struct Hears(pub(crate) Heard);
 
 impl Hears {
     fn heard(&self, word: String) {
         self.0.lock().expect("no case panicked").push(word);
+    }
+
+    /// `word` as it is kept of `side`: bare for a single request's one
+    /// side, and with the side's name behind it for a side of a pair.
+    fn of(word: &str, side: Side) -> String {
+        match side {
+            Side::Single => word.to_owned(),
+            side => format!("{word} {side:?}"),
+        }
     }
 }
 
@@ -300,20 +319,25 @@ impl Lifecycle for Hears {
         EventSet::LEASE
     }
 
-    fn on_decision_issued(&self, _: &Lease, _: &Decision) {
-        self.heard("issued".to_owned());
+    fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+        self.heard(Self::of("issued", lease.side));
     }
 
-    fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
-        self.heard("dispatched".to_owned());
+    fn on_dispatched(&self, _: &Lease, _: &Target, side: Side, _: u32) {
+        self.heard(Self::of("dispatched", side));
     }
 
-    fn on_completed(&self, _: &Lease, outcome: &Outcome) {
-        self.heard(format!("completed {} {:?}", outcome.status, outcome.class));
+    fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+        let completed = Self::of("completed", lease.side);
+        self.heard(format!(
+            "{completed} {} {:?}",
+            outcome.status, outcome.class
+        ));
     }
 
-    fn on_released(&self, _: &Lease, reason: ReleaseReason) {
-        self.heard(format!("released {reason:?}"));
+    fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+        let released = Self::of("released", lease.side);
+        self.heard(format!("{released} {reason:?}"));
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
@@ -397,7 +421,7 @@ async fn hearing() -> (Program, Heard, Arc<AtomicBool>, JoinHandle<()>) {
 }
 
 /// The words `heard` holds, taken out of it.
-fn taken(heard: &Heard) -> Vec<String> {
+pub(crate) fn taken(heard: &Heard) -> Vec<String> {
     std::mem::take(&mut *heard.lock().expect("no case panicked"))
 }
 
@@ -429,11 +453,11 @@ async fn the_engine_hears_each_requests_end() {
     ];
     assert_eq!(taken(&heard), [failed, served].concat());
 
-    let unsent = program.place(&PLAIN, &[]).expect("a placement");
+    let unsent = placed(&program);
     drop(unsent);
     assert_eq!(taken(&heard), ["issued", "released Abandoned"]);
 
-    let mut cut = program.place(&PLAIN, &[]).expect("a placement");
+    let mut cut = placed(&program);
     cut.sent();
     drop(cut);
     let cancelled = taken(&heard);
@@ -441,16 +465,16 @@ async fn the_engine_hears_each_requests_end() {
     assert!(cancelled[2].ends_with("Cancelled"), "{cancelled:?}");
     assert_eq!(cancelled.len(), 3);
 
-    let mut streamed = program.place(&PLAIN, &[]).expect("a placement");
+    let mut streamed = placed(&program);
     streamed.sent();
-    let ended = thread::spawn(move || streamed.ended(200));
+    let ended = thread::spawn(move || streamed.ended(Side::Single, 200));
     ended.join().expect("the stream's thread ends");
     assert_eq!(taken(&heard), ["issued", "dispatched", "completed 200 Ok"]);
 
     for (status, class) in [(404, "ClientError"), (408, "Timeout"), (504, "Timeout")] {
-        let mut ended = program.place(&PLAIN, &[]).expect("a placement");
+        let mut ended = placed(&program);
         ended.sent();
-        ended.ended(status);
+        ended.ended(Side::Single, status);
         let completed = format!("completed {status} {class}");
         assert_eq!(taken(&heard), ["issued", "dispatched", completed.as_str()]);
     }
@@ -465,7 +489,7 @@ async fn the_engine_hears_each_requests_end() {
 /// address that object states. A leave that finds no worker tells nothing.
 ///
 /// The classic router's registry resolves such an address the same way
-/// (`crates/worker/src/registry.rs:2032-2035`).
+/// (`resolve_url_to_id`, `crates/worker/src/registry.rs:534-560`).
 #[tokio::test(start_paused = true)]
 async fn a_worker_that_leaves_is_forgotten_under_the_address_it_states() {
     let (program, heard, _fails, task) = hearing().await;
@@ -562,7 +586,7 @@ fn a_request_is_placed_over_the_generation_that_stands() {
     // A request is under way on the worker that leaves.
     let leaving = url(1);
     let mut under_way = loop {
-        let attempt = program.place(&PLAIN, &[]).expect("a placement");
+        let attempt = placed(&program);
         if attempt.placement.worker.url() == leaving {
             break attempt;
         }
@@ -575,7 +599,7 @@ fn a_request_is_placed_over_the_generation_that_stands() {
     let (first, last) = (url(0), url(2));
     let expected = BTreeMap::from([(first.as_str(), 3), (last.as_str(), 3)]);
     assert_eq!(sends(&answers), expected, "the worker that left takes none");
-    under_way.ended(200);
+    under_way.ended(Side::Single, 200);
     drop(under_way);
     assert_eq!(fleet[1].load(), 0, "its request ended");
 

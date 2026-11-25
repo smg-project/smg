@@ -622,7 +622,9 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
         .as_ref()
         .ok_or_else(|| unknown("row.health_policy"))?;
     // Of a descriptor the leader tells the bootstrap port alone ([`row`]):
-    // one that tells more is of a build this one does not follow.
+    // one that tells more is of a build this one does not follow. A number
+    // the contract reserves is no field: the generated reader passes over
+    // it, so a row that states one reads as the row of its port alone.
     let port = told
         .pairing
         .as_ref()
@@ -1050,7 +1052,9 @@ fn over(
 
 /// The bootstrap port a registration's pairing descriptor states; `None`
 /// where it states none. The store holds no other field of a descriptor
-/// yet: one a caller states is refused by its path, never dropped.
+/// yet: one a caller states is refused by its path, never dropped. A number
+/// the contract reserves is no field: the generated reader passes over it,
+/// so a peer that states one is read as one that states none.
 fn bootstrap_port(pairing: &proto::PairingDescriptor) -> Result<Option<u16>, Refused> {
     const NOT_HELD: &str = "the store holds a descriptor's bootstrap port alone in this build";
     // Every field by its name: one the contract gains stops the build
@@ -1063,7 +1067,6 @@ fn bootstrap_port(pairing: &proto::PairingDescriptor) -> Result<Option<u16>, Ref
         bootstrap_port,
         bootstrap_host,
         kv_layout,
-        pair_class,
         ec_producer,
         ec_consumer,
         vision,
@@ -1091,12 +1094,6 @@ fn bootstrap_port(pairing: &proto::PairingDescriptor) -> Result<Option<u16>, Ref
         return Err(refused(
             "spec.pairing.bootstrap_host",
             "the bootstrap host is the URL's: its reader derives it",
-        ));
-    }
-    if *pair_class != 0 {
-        return Err(refused(
-            "spec.pairing.pair_class",
-            "the store derives a pairing class: a registration states none",
         ));
     }
     match u16::try_from(*bootstrap_port) {
@@ -1725,6 +1722,31 @@ mod tests {
         assert_eq!(port(&spec(), Some(&standing)), Some(8_998));
     }
 
+    /// Number 8 of a descriptor was its pair class, and the contract
+    /// reserves it. A peer built before that can still state it: the
+    /// generated reader passes over the number, so the descriptor reads as
+    /// one that states none and its registration is taken.
+    #[test]
+    fn a_descriptor_that_states_the_reserved_number_reads_as_one_that_states_none() {
+        let stated = proto::PairingDescriptor {
+            bootstrap_port: 8_998,
+            ..Default::default()
+        };
+        // The descriptor's own bytes, then number 8 as a varint of 7: a
+        // field's key is its number over three bits of wire type, and a
+        // varint's type is 0.
+        let mut sent = stated.encode_to_vec();
+        sent.extend([8 << 3, 7]);
+        let read = proto::PairingDescriptor::decode(sent.as_slice()).expect("a descriptor");
+        assert_eq!(read, stated);
+        let registered = proto::WorkerSpec {
+            pairing: Some(read),
+            ..spec()
+        };
+        let made = facts(&registered, None).expect("a registration");
+        assert_eq!(made.bootstrap_port, Some(8_998));
+    }
+
     #[test]
     fn a_threshold_the_block_leaves_unset_takes_the_stores_default() {
         // Each line reads the store's default field, set or not: the case
@@ -1934,7 +1956,7 @@ mod tests {
         // Of a pairing descriptor the store holds the bootstrap port alone:
         // every other field a caller states is refused by its own path.
         let named = |name: &str| name.to_owned();
-        let descriptors: [(proto::PairingDescriptor, &str); 14] = [
+        let descriptors: [(proto::PairingDescriptor, &str); 13] = [
             (
                 proto::PairingDescriptor {
                     protocol: named("protocol-a"),
@@ -2018,13 +2040,6 @@ mod tests {
                     ..Default::default()
                 },
                 "spec.pairing.bootstrap_host",
-            ),
-            (
-                proto::PairingDescriptor {
-                    pair_class: 7,
-                    ..Default::default()
-                },
-                "spec.pairing.pair_class",
             ),
             (
                 proto::PairingDescriptor {
@@ -2866,6 +2881,31 @@ mod tests {
         });
         let refused = told_row(&wide, now).expect_err("a permille past the width");
         assert_eq!(refused.path, "row.overload.kv_usage_permille");
+    }
+
+    /// Number 8 of a descriptor was its pair class, and the contract
+    /// reserves it. A leader built before that can still state it in a row
+    /// it tells: the generated reader passes over the number, so the row
+    /// reads as the row of its port alone, and a standby or a watcher takes
+    /// it.
+    #[test]
+    fn a_told_row_that_states_the_reserved_number_reads_as_the_row_of_its_port_alone() {
+        let stored = full();
+        let now = stored.admitted_at + Duration::from_millis(1_500);
+        let mut sent = proto::WorkerRow {
+            admitted_age_ms: 1_500,
+            ..row(&stored)
+        };
+        // The told descriptor's own bytes, then number 8 as a varint of 7.
+        let mut stated = sent
+            .pairing
+            .take()
+            .expect("a row with a port tells a descriptor")
+            .encode_to_vec();
+        stated.extend([8 << 3, 7]);
+        let read = proto::PairingDescriptor::decode(stated.as_slice()).expect("a descriptor");
+        sent.pairing = Some(read);
+        assert_eq!(told_row(&sent, now), Ok(stored));
     }
 
     #[test]

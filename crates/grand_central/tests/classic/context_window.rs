@@ -108,10 +108,11 @@ impl Replayed for Row {
                 wire_modes: wire_of(&worker.transport)?,
                 state: worker.state,
                 vision: false,
-                facts: DemandFacts {
-                    runtime: runtimes.number(&worker.runtime),
-                    window: worker.window(),
-                    ..DemandFacts::default()
+                facts: {
+                    let mut demand_facts = DemandFacts::default();
+                    demand_facts.runtime = runtimes.number(&worker.runtime);
+                    demand_facts.window = worker.window();
+                    demand_facts
                 },
             });
         }
@@ -119,15 +120,13 @@ impl Replayed for Row {
         let mut answers = Vec::with_capacity(self.requests.len());
         for asked in &self.requests {
             let (wire_modes, runtime) = runtimes.stays_on(asked.wire.as_ref())?;
-            let constraints = Constraints {
-                wire_modes,
-                demands: Demands {
-                    runtime,
-                    input_window: asked.input_window(),
-                    output_window: asked.output_tokens.unwrap_or(0),
-                    ..Demands::default()
-                },
-                ..Constraints::default()
+            let mut constraints = Constraints::default();
+            constraints.wire_modes = wire_modes;
+            constraints.demands = Demands {
+                runtime,
+                input_window: asked.input_window(),
+                output_window: asked.output_tokens.unwrap_or(0),
+                ..Demands::default()
             };
             answers.push(bed.answer(constraints, refusal)?);
         }

@@ -359,7 +359,7 @@ trait PdRoute: GenerationRequest {
 
     /// The (text, tokens) the policies route on, read only when one asks.
     fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
-        (Some(self.extract_text_for_routing()), None)
+        (Some(self.routing_text()), None)
     }
 }
 
@@ -2633,7 +2633,7 @@ impl PDRouter {
         body: CountMessageTokensRequest,
         policies_need_text: bool,
     ) -> (Option<String>, CountMessageTokensRequest) {
-        let text = policies_need_text.then(|| body.extract_text_for_routing());
+        let text = policies_need_text.then(|| body.routing_text());
         (text, body)
     }
 
@@ -3818,6 +3818,48 @@ mod tests {
         );
         assert!(!message.contains(&addr.to_string()), "{message}");
         assert!(!message.contains("for url"), "{message}");
+    }
+
+    /// A route keys a chat request on its routing text: two requests of one
+    /// text and two images part at the image's place, as they do in a
+    /// backend's prefix cache; one image keeps one key, a request of text
+    /// alone reads the text of before, and the tenant's charge counts the
+    /// words of the prompt alone. The marker and its digest have their own
+    /// cases in the protocol crate.
+    #[test]
+    fn a_chat_request_routes_on_a_marker_at_the_place_of_each_part_that_is_no_text() {
+        let chat = |parts: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "m", "messages": [{"role": "user", "content": parts}]
+            }))
+            .unwrap()
+        };
+        let routed = |parts: Value| chat(parts).routing_inputs().0.unwrap();
+        let text = json!({"type": "text", "text": "what does it show"});
+        let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+        let around = |part: Value| json!([text, part, text]);
+
+        assert_eq!(
+            routed(json!([text, text])),
+            "what does it show what does it show"
+        );
+        let first = routed(around(image("https://example.com/a.png")));
+        let other = routed(around(image("https://example.com/b.png")));
+        assert_eq!(first, routed(around(image("https://example.com/a.png"))));
+        // The text in front is shared, the digests part the keys at the
+        // image's place and the text behind follows the marker.
+        assert_eq!(first[..18], other[..18]);
+        assert_ne!(first[18..34], other[18..34]);
+        assert!(first.starts_with("what does it show ") && first.ends_with(" what does it show"));
+        // The route hands the marker on whole: the digest's 16 digits
+        // sixteen times, 256 characters.
+        assert_eq!(first.len(), 18 + 256 + 18);
+        assert_eq!(first[18..274], first[18..34].repeat(16));
+
+        let with_image = chat(around(image("https://example.com/a.png")));
+        let words = chat(json!([text, text])).estimated_input_tokens(None);
+        assert_eq!(with_image.estimated_input_tokens(Some(&first)), words);
+        assert_eq!(with_image.estimated_input_tokens(None), words);
     }
 
     #[test]

@@ -152,23 +152,19 @@ fn decide_beside(c: &mut Criterion) {
             let mut view = Vec::with_capacity(n);
             build_view(&fleet, &mut view);
             let mut scratch = Scratch::new();
-            let pool = PoolFacts {
-                pool_size: n as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool = PoolFacts::default();
+            pool.pool_size = n as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             group.bench_with_input(BenchmarkId::new(arm, n), &n, |b, _| {
                 let mut seed = 0u64;
                 b.iter(|| {
                     seed += 1;
-                    let facts = RequestFacts {
-                        model: "m",
-                        prompt_tokens: 512,
-                        seed,
-                        now_micros: 1_000_000,
-                        ..RequestFacts::default()
-                    };
+                    let mut facts = RequestFacts::default();
+                    facts.model = "m";
+                    facts.prompt_tokens = 512;
+                    facts.seed = seed;
+                    facts.now_micros = 1_000_000;
                     engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
                 });
             });

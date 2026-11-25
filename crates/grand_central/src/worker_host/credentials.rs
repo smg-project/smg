@@ -53,12 +53,15 @@ use crate::{engine::view::WorkerId, store::WorkerFacts};
 /// what stood, and each returns `true` where an object may hold a
 /// credential that is not its row's any more.
 ///
-/// The holder forgets by itself. Each of its reads drops the rows that
-/// left from the keeper, and an entry goes with its last row. The holder
-/// reads the keeper's clock ahead of the store: a row bound behind that
-/// read may have been written behind it, and stays. Once the clock is
-/// past the last forgetting, the next read forgets again whatever it
-/// finds: an answer may bind a row that left before it. A forgetting
+/// The holder forgets by itself. Each of its reads of the store drops the
+/// rows it finds gone from the keeper, and an entry goes with its last row.
+/// A write of the holder's own that takes a row out drops that row, and
+/// the lay-again an answer asks for drops each bound row that holds no
+/// object. Neither reads the store.
+/// The holder reads the keeper's clock ahead of the store: a row bound
+/// behind that read may have been written behind it, and stays. Once the
+/// clock is past the last forgetting, the next read forgets again whatever
+/// it finds: an answer may bind a row that left before it. A forgetting
 /// that misses a row leaves a binding no later worker matches.
 ///
 /// The address is the one the row's object dials. The keeper works it out
@@ -361,7 +364,9 @@ impl Credentials {
     /// that stand in it. A bound row that does not stand and was bound no
     /// later than `read` is dropped: it left the store the holder read.
     /// One bound later stays: its row may have been written behind that
-    /// read. An entry with no row and no registration in flight goes.
+    /// read. A read of one record asks about that record's row alone, and
+    /// says of every other row that it stands.
+    /// An entry with no row and no registration in flight goes.
     /// The holder calls again behind its next read once the clock is past
     /// `read`: a registration answered since bound a row this call did
     /// not ask about.

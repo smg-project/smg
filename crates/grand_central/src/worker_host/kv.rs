@@ -2612,6 +2612,107 @@ mod tests {
                 assert_eq!(stores, Some(1.0));
                 let blocks = series.read("smg_kv_event_parentless_blocks_total", &[]);
                 assert_eq!(blocks, Some(1.0));
+                assert_eq!(first_block_holders(&f, 1), [(f.row, 1)]);
+            });
+        }
+
+        /// The rows that hold the block `hash` as the first block of a
+        /// request, each with its count of the request's leading blocks.
+        fn first_block_holders(f: &Fixture, hash: i64) -> Vec<(WorkerId, u32)> {
+            let request = [kv_index::compute_content_hash(&tokens_of(hash)).0];
+            f.tables.overlaps(MODEL, &request)
+        }
+
+        /// A worker that holds blocks stores under a parent it does not
+        /// hold: the store is counted for the worker and starts a chain of
+        /// its own, which a request reads from its first block.
+        #[test]
+        fn a_parentless_store_behind_held_blocks_is_counted_and_starts_a_chain() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let count = |name: &str| series.read(name, &[]);
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &wide(1, 32)),
+                    BatchOutcome::Applied
+                );
+                assert_eq!(count("smg_kv_event_parentless_stores_total"), None);
+                let orphan = KvBlocksStored {
+                    parent_block_hash: Some(99),
+                    ..wide_store(2, 32)
+                };
+                let orphan = batch([Data::Stored(orphan)]);
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(2), &orphan),
+                    BatchOutcome::Applied
+                );
+                assert_eq!(count("smg_kv_event_parentless_stores_total"), Some(1.0));
+                assert_eq!(count("smg_kv_event_parentless_blocks_total"), Some(1.0));
+                assert_eq!(f.tables.indexed_blocks(f.row, 0), 2);
+                for hash in [1, 2] {
+                    assert_eq!(first_block_holders(&f, hash), [(f.row, 1)], "block {hash}");
+                }
+            });
+        }
+
+        /// One store from `parent` of the block 1 and the block `hash`
+        /// behind it, each as wide as the block of record.
+        fn forked(hash: i64, parent: Option<i64>) -> KvBlocksStored {
+            let wide = |hash: i64| KvBlock {
+                block_size: 32,
+                ..block(hash, &tokens_of(hash))
+            };
+            KvBlocksStored {
+                blocks: vec![wide(1), wide(hash)],
+                parent_block_hash: parent,
+                ..KvBlocksStored::default()
+            }
+        }
+
+        /// Blocks the index declines at a size cap are counted for the
+        /// worker: on a store from the root, and on the retry from the root
+        /// of a store whose parent the worker does not hold.
+        #[test]
+        fn blocks_declined_at_a_size_cap_are_counted_for_the_worker() {
+            // The first chain's second block lengthens the first block's
+            // own run. Each later chain's second block is one more entry of
+            // the table behind that run, which holds 196,608 at the most.
+            const CHAINS: i64 = 196_609;
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let count = |name: &str| series.read(name, &[]);
+                let stores = "smg_kv_event_cap_refused_stores_total";
+                let blocks = "smg_kv_event_cap_refused_blocks_total";
+                let fill = (0..CHAINS).map(|chain| Data::Stored(forked(1_000 + chain, None)));
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &batch(fill)),
+                    BatchOutcome::Applied
+                );
+                assert_eq!(
+                    count(stores),
+                    None,
+                    "the table takes its entries up to the cap"
+                );
+                let held = usize::try_from(CHAINS).expect("a count of chains") + 1;
+                assert_eq!(f.tables.indexed_blocks(f.row, 0), held);
+                // The first block is held, and the second is declined.
+                let over = batch([Data::Stored(forked(2_000_000, None))]);
+                assert_eq!(sink.admit(f.row, 0, facts(2), &over), BatchOutcome::Applied);
+                assert_eq!((count(stores), count(blocks)), (Some(1.0), Some(1.0)));
+                // Under a parent the worker does not hold, the retry from
+                // the root is declined the same way.
+                let orphan = batch([Data::Stored(forked(2_000_001, Some(99)))]);
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(3), &orphan),
+                    BatchOutcome::Applied
+                );
+                assert_eq!((count(stores), count(blocks)), (Some(2.0), Some(2.0)));
+                let parentless = count("smg_kv_event_parentless_stores_total");
+                assert_eq!(parentless, Some(1.0));
+                assert_eq!(f.tables.indexed_blocks(f.row, 0), held);
             });
         }
 
@@ -3123,18 +3224,29 @@ mod tests {
         for id in [row, other] {
             tables.member(&store.get(id).expect("the row"));
         }
-        // The adapter's list of rows is held: read while the step waits at
-        // its clear, and for as long as the case looks.
-        let rows_held = || {
-            let held = sink.rows.try_lock().is_none();
-            held.then(|| (0..64).all(|_| sink.rows.try_lock().is_none()))
+        // One look at the adapter's list while the step cannot get past its
+        // clear. Held: the step holds it, at its clear or still ahead of
+        // it, so the case looks again behind a wait that is long against a
+        // claim's own hold. A clear inside the hold still holds the list
+        // then. Free, with the row's entry naming `stream`: the step wrote
+        // its entry and let the list go ahead of its clear.
+        let held_at_its_clear = |stream: WorkerId| {
+            let Some(rows) = sink.rows.try_lock() else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                return Some(sink.rows.try_lock().is_none());
+            };
+            let written = rows.written.get(&row);
+            let wrote = written.is_some_and(|written| written.stream == stream);
+            wrote.then_some(false)
         };
 
         // Another stream's take of the row, then the open of its own feed.
         let take = || assert!(sink.take(other, row).is_some());
-        assert!(at_its_clear(&tables, row, 1, take, rows_held));
+        let held = at_its_clear(&tables, row, 1, take, || held_at_its_clear(other));
+        assert!(held, "a take's clear runs in the hold of its claim");
         let begin = || assert_eq!(sink.begin(row, || true), Ok(()));
-        assert!(at_its_clear(&tables, row, 1, begin, rows_held));
+        let held = at_its_clear(&tables, row, 1, begin, || held_at_its_clear(row));
+        assert!(held, "a begin's clear runs in the hold of its claim");
 
         // The feed's removal: its mark stands in the list, which is free,
         // while its clear still waits for the lane.

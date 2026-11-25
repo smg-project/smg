@@ -300,7 +300,7 @@ pub struct PolicyRegistry {
     engine: Arc<OnceLock<&'static InProcess>>,
 
     /// The token trees Grand Central is lent, where its start asked
-    /// for them ([`Self::lend_token_trees`]). A worker the registry lost is
+    /// for them ([`Self::lend_trees`]). A worker the registry lost is
     /// taken out of them by their own task
     /// ([`LentTrees::follow_removals`]).
     lent_trees: Arc<OnceLock<Arc<LentTrees>>>,
@@ -966,7 +966,7 @@ impl PolicyRegistry {
         self.supplied_document
     }
 
-    /// The token trees Grand Central is lent, made at the first call
+    /// The trees Grand Central is lent, made at the first call
     /// under the numbers of `document`, the document the engine runs, whose
     /// block size is `page` tokens ([`LentTrees::of_document`]), and kept
     /// here. The engine's start calls it, and only where its document reads
@@ -978,7 +978,7 @@ impl PolicyRegistry {
     /// call is made on. The start runs on one, the engine's own task needs
     /// it. Where none is entered no task is started, nothing takes a worker
     /// out of the trees, and a debug line says so.
-    pub(crate) fn lend_token_trees(
+    pub(crate) fn lend_trees(
         &self,
         document: &PolicySpec,
         page: u32,
@@ -988,7 +988,7 @@ impl PolicyRegistry {
             let trees = Arc::new(LentTrees::of_document(document.clone(), page));
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => trees.follow_removals(workers, &runtime),
-                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent token trees"),
+                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent trees"),
             }
             trees
         };
@@ -1749,6 +1749,24 @@ impl PolicyRegistry {
     /// on worker removal alongside the cache-aware cleanup above.
     pub fn remove_worker_from_policies(&self, worker_url: &str) {
         self.each_policy(|policy| policy.remove_worker(worker_url));
+    }
+
+    /// Whether the prefill and the decode side's policy read their side's
+    /// workers at [`Self::init_pd_cache_aware_policies`] and
+    /// [`Self::init_pd_bucket_policies`]. A side's policy is set once, so
+    /// the answer of two set sides stands. While a side has none, both
+    /// read as `true`: one can still be set, and those calls test it
+    /// after their caller has listed the workers.
+    pub(crate) fn pd_lists_read(&self) -> (bool, bool) {
+        let (Some(prefill), Some(decode)) = (self.prefill_policy.get(), self.decode_policy.get())
+        else {
+            return (true, true);
+        };
+        let prefill = prefill.as_ref();
+        (
+            as_cache_aware(prefill).is_some() || as_bucket(prefill).is_some(),
+            as_cache_aware(decode.as_ref()).is_some(),
+        )
     }
 
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
@@ -3807,10 +3825,10 @@ mod tests {
             workers.register(ready_worker(url, "llama-3"));
         }
         assert!(registry.lent_trees().is_none());
-        let trees = registry.lend_token_trees(&document, 8, &workers);
+        let trees = registry.lend_trees(&document, 8, &workers);
         assert!(Arc::ptr_eq(
             &trees,
-            &registry.lend_token_trees(&document, 8, &workers)
+            &registry.lend_trees(&document, 8, &workers)
         ));
         let tokens: Vec<u32> = (0..64).collect();
         let tree = trees.token_tree("llama-3");
@@ -4069,6 +4087,71 @@ mod tests {
             "the largest size falls in the last range of the even split"
         );
         assert!(!logs_contain("No bucket found for model"));
+    }
+
+    /// Every kind the factory builds by name, set on both sides of a pair:
+    /// the sides [`PolicyRegistry::pd_lists_read`] names are the sides the
+    /// two init calls hand their workers, so a registration lists a side's
+    /// workers for every kind that reads them. A kind the factory learns is
+    /// added to the list here.
+    #[traced_test]
+    #[test]
+    fn pd_lists_read_names_the_sides_the_init_calls_hand_their_workers() {
+        const KINDS: [&str; 10] = [
+            "random",
+            "round_robin",
+            "passthrough",
+            "power_of_two",
+            "least_load",
+            "cache_aware",
+            "bucket",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash",
+        ];
+        for (at, kind) in KINDS.into_iter().enumerate() {
+            let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            for set in [
+                PolicyRegistry::set_prefill_policy,
+                PolicyRegistry::set_decode_policy,
+            ] {
+                let policy = PolicyFactory::create_by_name(kind)
+                    .unwrap_or_else(|| panic!("the factory builds no {kind} policy"));
+                set(&registry, policy);
+            }
+            // A list length of the kind's own tells its debug lines from the
+            // lines of the kinds before it.
+            let count = at + 2;
+            let side = |role: &str, worker_type: WorkerType| -> Vec<Arc<dyn Worker>> {
+                (0..count)
+                    .map(|i| worker_of(&format!("http://{role}-{i}:8000"), worker_type))
+                    .collect()
+            };
+            let prefill = side("prefill", WorkerType::Prefill);
+            let decode = side("decode", WorkerType::Decode);
+
+            registry.init_pd_cache_aware_policies(&prefill, &decode);
+            registry.init_pd_bucket_policies(&prefill);
+
+            let read = registry.pd_lists_read();
+            logs_assert(|lines: &[&str]| {
+                let handed = |role: &str| {
+                    let start = format!("Initializing {role} ");
+                    let end = format!("policy with {count} workers");
+                    lines
+                        .iter()
+                        .any(|line| line.contains(&start) && line.contains(&end))
+                };
+                let handed = (handed("prefill"), handed("decode"));
+                if handed == read {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{kind}: the init calls hand the sides {handed:?} and pd_lists_read says {read:?}"
+                    ))
+                }
+            });
+        }
     }
 
     /// A prefill worker's removal reaches the bucket policy, which keeps the

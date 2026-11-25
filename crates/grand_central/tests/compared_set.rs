@@ -39,9 +39,7 @@
 
 use smg_grand_central::{
     document::PolicySpec,
-    engine::{
-        Candidate, Constraints, Engine, Health, LoadRow, PoolFacts, RequestFacts, Scratch, WorkerId,
-    },
+    engine::{Candidate, Constraints, Engine, LoadRow, PoolFacts, RequestFacts, Scratch, WorkerId},
     policies::power_of_two::PowerOfTwoMetric::{self, ExpectedWait, LeastRequests, Requests},
 };
 
@@ -90,39 +88,34 @@ fn counts(metric: PowerOfTwoMetric, workers: &[Worker], prompt_tokens: u32) -> V
     let pool: Vec<Candidate> = workers
         .iter()
         .enumerate()
-        .map(|(i, worker)| Candidate {
-            position: i as u32,
-            id: WorkerId(1_000 + i as u64),
-            key: 1_000 + i as u32,
-            health: Health {
-                healthy: true,
-                ..Health::default()
-            },
-            in_flight: worker.in_flight,
-            load: worker.report.map(|report| LoadRow {
-                running: report.running,
-                live_rate: report.throughput,
-                ..LoadRow::default()
-            }),
-            load_sampled_at_micros: clock,
-            ..Candidate::default()
+        .map(|(i, worker)| {
+            let mut row = Candidate::default();
+            row.position = i as u32;
+            row.id = WorkerId(1_000 + i as u64);
+            row.key = 1_000 + i as u32;
+            row.health.healthy = true;
+            row.in_flight = worker.in_flight;
+            row.load = worker.report.map(|report| {
+                let mut load = LoadRow::default();
+                load.running = report.running;
+                load.live_rate = report.throughput;
+                load
+            });
+            row.load_sampled_at_micros = clock;
+            row
         })
         .collect();
-    let pool_facts = PoolFacts {
-        pool_size: pool.len() as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = pool.len() as u32;
+    pool_facts.generation = 1;
     let mut scratch = Scratch::new();
     let mut counts = vec![0u32; pool.len()];
     for seed in 1..=u64::from(DRAWS) {
-        let facts = RequestFacts {
-            model: "m",
-            prompt_tokens,
-            seed,
-            now_micros: clock + seed * 1_000,
-            ..RequestFacts::default()
-        };
+        let mut facts = RequestFacts::default();
+        facts.model = "m";
+        facts.prompt_tokens = prompt_tokens;
+        facts.seed = seed;
+        facts.now_micros = clock + seed * 1_000;
         let decision = engine.decide(
             &facts,
             &pool_facts,

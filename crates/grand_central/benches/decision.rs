@@ -83,38 +83,31 @@ fn decide(c: &mut Criterion) {
         let fleet = fleet(n);
         let mut view = Vec::with_capacity(n);
         build_view(&fleet, &mut view);
-        let lease = Lease {
-            issued_micros: 1_000_000,
-            tokens: 512,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = 1_000_000;
+        lease.tokens = 512;
         for c in &view {
-            let target = Target {
-                position: c.position,
-                id: c.id,
-                dp_rank: c.dp_rank,
-                pair: None,
-            };
+            let mut target = Target::default();
+            target.position = c.position;
+            target.id = c.id;
+            target.dp_rank = c.dp_rank;
+            target.pair = None;
             engine.on_dispatched(&lease, &target, Side::Single, 0);
         }
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
         group.bench_with_input(BenchmarkId::new("least_load_credited", n), &n, |b, _| {
             let mut seed = 0u64;
             b.iter(|| {
                 seed += 1;
-                let facts = RequestFacts {
-                    model: "m",
-                    prompt_tokens: 512,
-                    seed,
-                    now_micros: 1_000_000,
-                    ..RequestFacts::default()
-                };
+                let mut facts = RequestFacts::default();
+                facts.model = "m";
+                facts.prompt_tokens = 512;
+                facts.seed = seed;
+                facts.now_micros = 1_000_000;
                 engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
             });
         });
@@ -137,18 +130,14 @@ fn decide(c: &mut Criterion) {
             row.health.overloaded = true;
         }
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
-        let asked = RequestFacts {
-            model: "m",
-            prompt_tokens: 512,
-            now_micros: 1_000_000,
-            ..RequestFacts::default()
-        };
+        let mut asked = RequestFacts::default();
+        asked.model = "m";
+        asked.prompt_tokens = 512;
+        asked.now_micros = 1_000_000;
         let steers = matches!(
             engine.decide(&asked, &pool, &view, &cx, &mut scratch),
             Decision::Pick(pick) if pick.trace.lifted == LiftedVeto::Overload
@@ -160,7 +149,8 @@ fn decide(c: &mut Criterion) {
             let mut seed = 0u64;
             b.iter(|| {
                 seed += 1;
-                let facts = RequestFacts { seed, ..asked };
+                let mut facts = asked;
+                facts.seed = seed;
                 engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
             });
         });
@@ -188,39 +178,34 @@ fn keyed(group: &mut BenchmarkGroup<'_, WallTime>) {
     let mut view = Vec::with_capacity(n);
     build_view(&fleet, &mut view);
     let mut scratch = Scratch::new();
-    let pool = PoolFacts {
-        pool_size: n as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = n as u32;
+    pool.generation = 1;
     let cx = Constraints::default();
 
     let model_fingerprint = ModelFingerprint::of(KEYED_MODEL);
     let engine = engine_of("manual");
-    let hit = RequestFacts {
-        model: KEYED_MODEL,
-        model_fingerprint,
-        prompt_tokens: 512,
-        session_key: Identity::hashed(0x5e55_10f1),
-        now_micros: 1_000_000,
-        ..RequestFacts::default()
-    };
+    let mut hit = RequestFacts::default();
+    hit.model = KEYED_MODEL;
+    hit.model_fingerprint = model_fingerprint;
+    hit.prompt_tokens = 512;
+    hit.session_key = Identity::hashed(0x5e55_10f1);
+    hit.now_micros = 1_000_000;
     let decision = engine.decide(&hit, &pool, &view, &cx, &mut scratch);
     let pick = decision.pick().expect("a keyed pick");
     let target = *pick.targets.first().expect("a target");
-    let lease = Lease {
-        session: hit.session(),
-        session_verdict: pick.session_verdict,
-        issued_micros: hit.now_micros,
-        tokens: hit.prompt_tokens,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.session = hit.session();
+    lease.session_verdict = pick.session_verdict;
+    lease.issued_micros = hit.now_micros;
+    lease.tokens = hit.prompt_tokens;
     engine.on_dispatched(&lease, &target, Side::Single, 0);
     group.bench_with_input(BenchmarkId::new("manual_keyed_hit", n), &n, |b, _| {
         let mut seed = 0u64;
         b.iter(|| {
             seed += 1;
-            let facts = RequestFacts { seed, ..hit };
+            let mut facts = hit;
+            facts.seed = seed;
             engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
         });
     });
@@ -242,15 +227,13 @@ fn keyed(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.bench_with_input(BenchmarkId::new("manual_keyed_miss", n), &n, |b, _| {
         b.iter(|| {
             turn += 1;
-            let facts = RequestFacts {
-                model: KEYED_MODEL,
-                model_fingerprint,
-                prompt_tokens: 512,
-                session_key: Identity::hashed(1 + (turn & 63)),
-                seed: turn,
-                now_micros: 1_000_000 + turn * 40_000,
-                ..RequestFacts::default()
-            };
+            let mut facts = RequestFacts::default();
+            facts.model = KEYED_MODEL;
+            facts.model_fingerprint = model_fingerprint;
+            facts.prompt_tokens = 512;
+            facts.session_key = Identity::hashed(1 + (turn & 63));
+            facts.seed = turn;
+            facts.now_micros = 1_000_000 + turn * 40_000;
             engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
         });
     });

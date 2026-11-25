@@ -150,6 +150,35 @@ impl PromptHashes {
         })
     }
 
+    /// What [`Self::under_document`] states of a prompt's token ids beside
+    /// its list, with no block hashed: for a request whose list is hashed
+    /// where it is read ([`Self::whole`]).
+    #[cfg(feature = "in-process")]
+    pub(crate) fn unhashed(
+        spec: &AppliedSpec,
+        block_size_of_record: Option<u32>,
+        tokens: &[u32],
+        seeds: HashSeeds,
+    ) -> Self {
+        let (block_size, _, _) = block_size_and_depth(spec, block_size_of_record, HashKind::Token);
+        Self::of_tokens(tokens, block_size, 0, seeds)
+    }
+
+    /// The hashes [`Self::under_document`] makes of `tokens`, the prompt
+    /// this value was made of with no block hashed ([`Self::unhashed`]): by
+    /// the block size it was made with, as deep as `spec` reads. `None`
+    /// where `spec` reads no block: this value holds all a decision reads.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn whole(
+        &self,
+        spec: &AppliedSpec,
+        tokens: &[u32],
+        seeds: HashSeeds,
+    ) -> Option<Self> {
+        let depth = spec.block_hashes_read(HashKind::Token, self.block_size);
+        (depth > 0).then(|| Self::of_tokens(tokens, self.block_size, depth, seeds))
+    }
+
     /// The hashes of a prompt by what its caller holds of it: its token ids
     /// win, else its text is hashed, else it has none. `read` is asked once,
     /// for the kind that is hashed: the size of one block of that kind and
@@ -199,6 +228,17 @@ impl PromptHashes {
         if facts.prompt_bytes == 0 {
             facts.prompt_bytes = self.prompt_bytes;
         }
+    }
+
+    /// A copy of `facts` with these hashes written over it
+    /// ([`Self::write_to`]): what a decision reads of a request whose
+    /// making left its list out ([`Self::unhashed`]), where it reads the
+    /// list.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn over<'a>(&'a self, facts: &RequestFacts<'a>) -> RequestFacts<'a> {
+        let mut whole = RequestFacts { ..*facts };
+        self.write_to(&mut whole);
+        whole
     }
 
     /// The size in tokens of a prompt whose request states `stated`: the

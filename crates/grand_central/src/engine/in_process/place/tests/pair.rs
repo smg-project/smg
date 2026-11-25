@@ -2,6 +2,8 @@
 
 mod decode_again;
 mod named;
+mod ring_words;
+pub(super) mod rows;
 mod ruled;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -1066,4 +1068,101 @@ fn a_prompt_sent_past_a_refused_decode_goes_to_its_pair_again() {
         drop(again);
     }
     assert_eq!(went, [to; 16], "the pair the prompt was sent to");
+}
+
+/// A pair's placement states what its prefill holds of the request
+/// ([`Placement::overlap`]): a pair's first target names its prefill, and
+/// its pick states that worker's entry of the prefills' column. A prompt's
+/// first pair reads a miss of its blocks, and its next pair, which goes
+/// back to that prefill, reads every block, by the record of sent prefixes.
+/// Every target of a pair names the one prefill: a pair whose first decode
+/// the route's rule refuses goes to the target behind and is stated the
+/// same, since it goes to the worker the statement is of. Nothing is stated
+/// of the decode: a pair whose decode side alone reads who holds the prompt
+/// states nothing.
+///
+/// The classic router's pair observes each cache-aware side by that side's
+/// own policy (`model_gateway/src/policies/cache_aware.rs`,
+/// `record_cache_aware_match_ratio`): twice where both sides run one.
+#[test]
+fn a_pairs_placement_states_what_its_prefill_holds() {
+    use crate::engine::decision::{Overlap, OverlapSource};
+
+    // The prefill side reads who holds the prompt, and the decode side
+    // names its decodes in the list's order: a pick's later targets are the
+    // decodes behind the first, under the one prefill.
+    let mut stages = StageRegistry::builtin();
+    let added = stages.picker("in-order", || {
+        Box::new(InOrder {
+            heard: Heard::default(),
+            budgets: Budgets::default(),
+            panics: false,
+        })
+    });
+    added.expect("a free name");
+    let mut document = PolicySpec::pair_presets("cache_aware", "round_robin").expect("presets");
+    document.generation = 1;
+    let decode = document.profiles.get_mut("decode");
+    decode.expect("the decode side's profile").pick = "in-order".into();
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the picker")));
+    let lists = Lists::of(2, 3);
+    let classes = lists.every();
+    let pair = lists.under(&classes, &Open);
+    let tokens: Vec<u32> = (0..256).collect();
+    let prompt = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::NONE
+    };
+    let request = PlaceRequest {
+        prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let first = engine.place(&request).expect("a pair");
+    let of = first.overlap.of;
+    assert_ne!(of, 0, "a miss is stated of the request's blocks");
+    let miss = Overlap {
+        of,
+        ..Overlap::NONE
+    };
+    assert_eq!(first.overlap, miss);
+    let (prefill, decode) = lists.places(&first);
+    assert_eq!(decode, 0, "the decodes in the list's order");
+    drop(first);
+
+    let again = engine.place(&request).expect("a pair");
+    let held = Overlap {
+        blocks: of,
+        source: OverlapSource::Predictor,
+        ..miss
+    };
+    assert_eq!((lists.places(&again), again.overlap), ((prefill, 0), held));
+    assert_eq!(again.kept().overlap, held, "a kept placement states it too");
+
+    // The rule refuses the first decode: the pair goes to the target
+    // behind, which names the same prefill, and is stated what it holds.
+    let first_decode = lists.decode_id(0);
+    let admits = |worker: &dyn Worker| worker_id(worker) != first_decode;
+    let refusing = PlaceRequest {
+        admits: Some(&admits),
+        ..request
+    };
+    let moved = engine.place(&refusing).expect("a pair");
+    assert_eq!((lists.places(&moved), moved.overlap), ((prefill, 1), held));
+
+    // A decode side that reads who holds the prompt states nothing of
+    // itself, and a prefill side that reads none states nothing.
+    let sides = PolicySpec::pair_presets("round_robin", "cache_aware");
+    let decode_alone = hosted(engine_of(&sides.expect("the pair presets")));
+    let lists = Lists::of(2, 3);
+    let classes = lists.every();
+    let request = PlaceRequest {
+        prompt,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+    };
+    for _ in 0..2 {
+        let placement = decode_alone.place(&request).expect("a pair");
+        assert!(placement.decode.is_some());
+        assert_eq!(placement.overlap, Overlap::NONE);
+    }
 }

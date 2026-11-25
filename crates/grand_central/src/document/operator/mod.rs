@@ -32,7 +32,7 @@ pub(crate) use document_manager::needs_rows;
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use document_manager::Validate;
 #[cfg(feature = "controller")]
-pub(crate) use document_manager::{above, Checked, Held, Line};
+pub(crate) use document_manager::{above, Checked, Entered, Held, Line};
 pub use document_manager::{dry_run_against, DocumentManager};
 #[cfg(feature = "controller")]
 pub(crate) use document_manager::{DRY_RUNS_WAITING, WRITES_WAITING};

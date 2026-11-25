@@ -45,12 +45,9 @@ use crate::engine::sticky_sessions::SessionTable;
 use crate::{
     document::routing_key::KeySources,
     engine::{
-        framework::{
-            Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer,
-            WeightedScorer,
-        },
+        framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, WeightedScorer},
         sticky_sessions::SessionRule,
-        view::{blocks_within, threshold_permille, HashKind, Phase, MAX_LOAD_REPORT_AGE_MS},
+        view::{blocks_within, HashKind, Phase, MAX_LOAD_REPORT_AGE_MS},
     },
     load::{
         load_report_reader::LoadReportReader,
@@ -699,7 +696,9 @@ pub enum AffinitySource {
     /// The record of the prefixes sent alone.
     Predictor,
     /// Each worker by what it has: its cache events where it publishes
-    /// them, and the prefixes sent to it where it does not.
+    /// them, and the prefixes sent to it where it does not. A request
+    /// hashed by its text reads the prefixes sent to every worker: cache
+    /// events are token blocks.
     #[default]
     Merged,
 }
@@ -2202,7 +2201,10 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// thresholds, and its routes read one shed word, both from that document:
 /// it refuses one whose bindings differ on either word. With no document
 /// supplied it reads its own two settings. A controller that judges on its
-/// worker objects does not read the switch yet.
+/// worker objects reads the switch there too, at each document that takes
+/// force: its default is off where every binding switches it off. It
+/// refuses a document whose bindings differ on the switch, as a gateway
+/// does.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct OverloadSpec {
@@ -2256,6 +2258,51 @@ impl Default for OverloadSpec {
     }
 }
 
+/// What a document's bindings say of the overload switch, taken together
+/// ([`OverloadSpec::enabled`]). A host builds its workers with one default
+/// set of thresholds, so it reads the bindings' words as one
+/// ([`AppliedSpec::overload_switch`]). A binding with no block says the
+/// block's default, which is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OverloadSwitch {
+    /// Every binding says on, or the document has no binding.
+    #[default]
+    On,
+    /// Every binding says off.
+    Off,
+    /// The bindings differ. What becomes of the default then is the rule
+    /// of the host that reads the word: a controller refuses the document
+    /// where it is handed one, by the first binding that differs.
+    Differ,
+}
+
+impl OverloadSwitch {
+    /// The word `bindings` say, taken together.
+    fn of(bindings: &[BindingSpec]) -> Self {
+        match (Self::differs(bindings), bindings.first().map(Self::says)) {
+            (Some(_), _) => Self::Differ,
+            (None, Some(false)) => Self::Off,
+            (None, _) => Self::On,
+        }
+    }
+
+    /// Whether `binding` says on, by its block or by the block's default.
+    fn says(binding: &BindingSpec) -> bool {
+        binding.overload.as_ref().is_none_or(|block| block.enabled)
+    }
+
+    /// The first of `bindings` that says another word than the first one
+    /// does: its place and its word. None where they say one word. The
+    /// one reading of the bindings' words: [`OverloadSwitch::Differ`] is
+    /// the word of the bindings this names a place in.
+    pub(crate) fn differs(bindings: &[BindingSpec]) -> Option<(usize, bool)> {
+        let first = Self::says(bindings.first()?);
+        let mut words = bindings.iter().map(Self::says).enumerate();
+        words.find(|&(_, says)| says != first)
+    }
+}
+
 /// How a session key seen for the first time picks its worker. Under the
 /// `manual` picker the same assignment places a request with no key, which
 /// is not pinned, and a `manual` profile bound with no sessions rule places
@@ -2288,9 +2335,10 @@ pub enum Recovery {
     Latest,
 }
 
-/// Whether a single request a sessions rule placed alone is the profile's
-/// own: a pin of the request's key followed, or the rule's own assignment.
-/// No stage of the profile placed such a request.
+/// Whether a request a sessions rule placed alone is the profile's own: a
+/// pin of the request's key followed, or the rule's own assignment. No
+/// stage of the profile placed such a request. A single request is such a
+/// request, and so is a side of a pair, each side by its own decision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -2352,14 +2400,18 @@ pub struct SessionsSpec {
     /// `original`).
     #[serde(default)]
     pub recovery: Recovery,
-    /// Whether a single request this rule placed alone is the profile's
-    /// own (default `told`). Under `untold` no stage hears that request's
+    /// Whether a request this rule placed alone is the profile's own
+    /// (default `told`). Under `untold` no stage hears that request's
     /// issue or its dispatch, it is none of the profile's sends, and
-    /// neither the engine's record of sent prefixes nor a lent token tree
+    /// neither the engine's record of sent prefixes nor a lent tree
     /// takes its prompt. The session table still hears its dispatch,
-    /// and the stages its completion and its release. A pair's sides are
-    /// told under either word. A controller keeps the word on the lease it
-    /// files, and tells such a request off its file by it all the same.
+    /// and the stages its completion and its release. Under the `pd-pair`
+    /// plan each side of a pair follows the word on its own: a side the
+    /// rule placed alone is kept from that side's profile, beside a side
+    /// the stages placed, which is told. A controller keeps the word on
+    /// the lease it files for a single request, and tells such a request
+    /// off its file by it all the same. Its file keeps no word of a pair's
+    /// side: a controller takes `told` alone under the `pd-pair` plan.
     #[serde(default, skip_serializing_if = "is_default")]
     pub rule_placed: RulePlaced,
 }
@@ -2444,12 +2496,11 @@ pub struct KeySourceSpec {
     /// so `rid`, `max_bytes` and `client` are refused beside it. It is
     /// read for a request a program places in process: a single request,
     /// and a pair under the `pd-pair` plan, on each side whose profile
-    /// scores by `consistent-hash` with no `prefix_tokens`, where its
-    /// prefill side is one. A pair's prefill is counted among the prefills
-    /// that have a decode to pair with, and its decode among that
-    /// prefill's partners. A pair whose prefill side is no such profile
-    /// and a request under the `epd` plan are not read for it. Default
-    /// false.
+    /// scores by `consistent-hash` with no `prefix_tokens`. A pair's
+    /// prefill is counted among the prefills that have a decode to pair
+    /// with. Its decode is counted among the partners of its prefill: the
+    /// one the request names, or the one the prefill's own profile picks.
+    /// A request under the `epd` plan is not read for it. Default false.
     #[serde(skip_serializing_if = "is_default")]
     pub target: bool,
 }
@@ -2754,8 +2805,9 @@ pub struct PolicySpec {
         "propertyNames" = { "pattern": SIGNAL_NAME_PATTERN }
     ))]
     pub signals: BTreeMap<String, SignalSpec>,
-    /// The profiles by name.
+    /// The profiles by name, each of at least one character.
     #[serde(deserialize_with = "keyed_once")]
+    #[schemars(extend("propertyNames" = { "minLength": 1 }))]
     pub profiles: BTreeMap<String, ProfileSpec>,
     /// The plans' rules.
     #[serde(default, skip_serializing_if = "is_default")]
@@ -3581,8 +3633,11 @@ fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
 
 /// The gates a profile's affinity stages share: the spill gate of its
 /// `prefix-affinity` entry, the fleet gate of its `kv-pressure` entry and
-/// the view's block size. Of two entries of a kind the last one's stands
-/// here; a `prefix-affinity` scorer spills by its own entry's gate.
+/// the view's block size. Of two entries of a kind that write parameters
+/// the last one's stand here, and the defaults where none does; a
+/// `prefix-affinity` scorer spills by its own entry's gate. A
+/// `warmup-slice` follows this spill gate by its `rel` and `abs`, so beside
+/// one `check_profile` refuses `prefix-affinity` entries that write two.
 fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
     let mut affinity = None;
     let mut kv = None;
@@ -4225,6 +4280,38 @@ impl HashDepth {
 /// one its stages read.
 type BuiltProfile = (Profile, bool, Option<usize>);
 
+/// The two depths of one generation: how deep its stages read a request's
+/// block hashes, and how deep a stage reads them itself. The
+/// prefix-affinity stage declares the hashes and reads none of them: the
+/// lookup that names a request's holders reads them for it. Of the list
+/// the stage reads the length alone, where it sizes the request
+/// (`Gates::whole`, `RequestFacts::blocks`), and only under a `max` with
+/// the count the prompt's size gives. The list the engine's own call makes
+/// of a prompt's token ids is never longer than that count: one hash for
+/// each whole block, as deep as the document reads at most, one for a
+/// shorter prompt, none for an empty one. So the engine sizes such a
+/// request the same with its list and with none. Facts a host states
+/// itself can hold more hashes than their size gives: those are sized by
+/// the list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HashDepths {
+    /// The deepest read under the generation.
+    read: HashDepth,
+    /// The deepest read a stage makes itself.
+    by_stage: HashDepth,
+}
+
+impl HashDepths {
+    /// Deepens the generation's read to `other`, and its stages' own where
+    /// the stage reads the hashes `itself`.
+    fn deepen(&mut self, other: HashDepth, itself: bool) {
+        self.read.deepen(other);
+        if itself {
+            self.by_stage.deepen(other);
+        }
+    }
+}
+
 /// One profile's stages, built when this build carries every one of them,
 /// and whether the profile keeps a session key on its worker over the
 /// overload veto: the plain ring alone decides its pick. `depth` is
@@ -4235,9 +4322,17 @@ fn check_profile(
     view: &ViewSpec,
     from: StageInputs<'_>,
     deferred: &mut Deferred,
-    depth: &mut HashDepth,
+    depth: &mut HashDepths,
     sent_credits: &mut Vec<Arc<DispatchCredit>>,
 ) -> Result<Option<BuiltProfile>, SpecError> {
+    // The empty label is the engine's word for no profile.
+    if name.is_empty() {
+        return Err(SpecError::BadField {
+            path: "profiles".to_owned(),
+            value: format!("{name:?}"),
+            reason: "a profile name of at least one character",
+        });
+    }
     let catalog = from.catalog;
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
@@ -4273,12 +4368,15 @@ fn check_profile(
     let mut complete = true;
     let mut plain_ring = false;
     let mut kv_gate = None;
+    let mut spill_gate = None;
+    let mut other_spill = None;
+    let mut sliced = false;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
         let stage = match scored(entry, name, &entry_at, from, settings, &mut sent)? {
             Scored::Typed(stage) => stage,
             Scored::Built(weighted) => {
-                depth.deepen(HashDepth::of(weighted.scorer.needs()));
+                depth.deepen(HashDepth::of(weighted.scorer.needs()), true);
                 scorers.push(weighted);
                 continue;
             }
@@ -4304,12 +4402,34 @@ fn check_profile(
                 }
             }
         }
+        // A `prefix-affinity` scorer spills by its own gate; a warm-up slice
+        // asks the shared one with no held tokens: its `rel` and `abs` alone.
+        match &stage {
+            ScoreStage::PrefixAffinity(params) if other_spill.is_none() => {
+                let own = Gates::of(Some(params), None, None);
+                let first = *spill_gate.get_or_insert(own);
+                if own.rel != first.rel || own.abs != first.abs {
+                    other_spill = Some((i, own, first));
+                }
+            }
+            ScoreStage::WarmupSlice(_) => sliced = true,
+            _ => {}
+        }
+        if let Some((entry, own, first)) = other_spill.take_if(|_| sliced) {
+            let spill_at = At::new(format!("{}.score[{entry}].prefix-affinity.spill", at.0));
+            let reason = "the limit the profile's first prefix-affinity entry writes: a warmup-slice follows one spill gate, so beside one the entries write the same rel and abs";
+            return Err(if own.rel == first.rel {
+                spill_at.bad("abs", own.abs, reason)
+            } else {
+                spill_at.bad("rel", own.rel, reason)
+            });
+        }
         check_prefix_depth(&stage, gates, view, &stage_at)?;
         let count = || profile_sent(&mut sent, name, settings);
         match scorer_of(&stage, gates, view, from.signals, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
-                depth.deepen(read);
+                depth.deepen(read, !matches!(stage, ScoreStage::PrefixAffinity(_)));
                 plain_ring |= matches!(
                     &stage,
                     ScoreStage::ConsistentHash(ring)
@@ -4417,7 +4537,7 @@ fn check_profile(
             }
             // A filter and a picker name no depth of their own.
             let unkeyed = filters.iter().map(|filter| filter.needs());
-            depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)));
+            depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)), true);
             Some((
                 Profile {
                     name: name.to_string(),
@@ -4455,6 +4575,10 @@ struct BindingContext<'a> {
     /// The profiles whose built picker leaves the placement to a sessions
     /// rule ([`Picker::by_assignment`]), by name.
     by_assignment: &'a [&'a str],
+    /// Whether the host makes the lifecycle's calls
+    /// ([`StageRegistry::makes_lifecycle_calls`]). One that makes some
+    /// only tells a lease's words off a file of leases.
+    lifecycle: bool,
 }
 
 fn check_bounds<T>(bounds: &Bounds<T>, at: &At) -> Result<(), SpecError>
@@ -4524,21 +4648,6 @@ fn check_matcher(
         deferred.note(at.field("labels"), "the label matcher");
     }
     Ok(())
-}
-
-/// The thresholds a binding hands its pools: the crate's two defaults, and
-/// none when the block is switched off. A binding with no block has the
-/// default block. A block names no number of its own ([`check_overload`]):
-/// a worker's registration states its two over these. The usage goes to
-/// permille by the one conversion of a threshold ([`threshold_permille`]):
-/// the rounding a report's usage takes, so one rank's usage at or above the
-/// threshold as a ratio is never read as under it.
-fn overload_thresholds(block: Option<&OverloadSpec>) -> Option<OverloadThresholds> {
-    let enabled = block.is_none_or(|block| block.enabled);
-    enabled.then(|| OverloadThresholds {
-        waiting_requests: OVERLOAD_WAITING_REQUESTS,
-        kv_usage_permille: threshold_permille(f64::from(OVERLOAD_TOKEN_USAGE)),
-    })
 }
 
 /// A binding's overload block names no number, with its switch on or off:
@@ -4928,7 +5037,6 @@ fn resolve_plan(
         shadow,
         decode_shadow,
         sessions: None,
-        overload: overload_thresholds(b.overload.as_ref()),
     };
     if plan == PlanName::Single {
         if b.profile.is_some() && !b.profiles.is_empty() {
@@ -5005,7 +5113,7 @@ fn check_binding(
         }
     }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
-        let rule = session_rule(sessions, cx.index, binding.plan)?;
+        let rule = session_rule(sessions, cx.index, binding.plan, cx.lifecycle)?;
         needs.active_sessions |= rule.assignment == Assignment::MinGroup;
         needs.session_in_flight |= rule.inflight_cap > 0;
         binding.sessions = Some(rule);
@@ -5013,23 +5121,36 @@ fn check_binding(
     Ok(built)
 }
 
+/// Why a sessions rule that keeps what it places from the profile is refused
+/// under the `pd-pair` plan in the build of a host that makes some of the
+/// lifecycle's calls only ([`session_rule`]), as the refusal prints it
+/// behind "is not".
+const UNTOLD_ON_FILE: &str =
+    "`told` under the pd-pair plan in this build: a file of leases keeps no side's word";
+
 /// The sessions rule as the engine runs it: the schema's largest cap is no
 /// cap, its largest idle time or sweep is for ever (a sweep for ever under a
 /// finite idle time is refused, as nothing would forget the keys; an idle
 /// time for ever sweeps nothing). The rule runs under the `single` plan, and
-/// on the two sides of a `pd-pair` plan where it tells its stages: a pair's
-/// pick has one word for whether its stages hear of it, not one a side.
+/// on the two sides of a `pd-pair` plan: each side of a pair's pick states
+/// its own word for whether its stages hear of it. A rule that keeps what
+/// it places from the profile is in the build of a host that makes the
+/// lifecycle's calls (`lifecycle`), which tells each side by the pick in
+/// its hand. It is refused by the field's name in the build of a host that
+/// makes some only: that host tells a lease's words off a file, and its
+/// file keeps no word of a pair's side.
 /// Under a cap each side's records carry the count of its key's requests
 /// in flight, as a single's do.
 fn session_rule(
     sessions: &SessionsSpec,
     index: usize,
     plan: Plan,
+    lifecycle: bool,
 ) -> Result<SessionRule, SpecError> {
     let refused = match plan {
         Plan::Single => None,
-        Plan::PdPair if sessions.rule_placed != RulePlaced::Told => {
-            Some(("rule_placed", "`told` under the pd-pair plan"))
+        Plan::PdPair if sessions.rule_placed != RulePlaced::Told && !lifecycle => {
+            Some(("rule_placed", UNTOLD_ON_FILE))
         }
         Plan::PdPair => None,
         Plan::Epd { .. } => Some(("plan", "`single` or `pd-pair`")),
@@ -5246,7 +5367,7 @@ impl PolicySpec {
         &self,
         catalog: &StageRegistry,
         denied_headers: &[&str],
-    ) -> Result<(Engine, HashDepth, Arc<[SignalColumn]>), SpecError> {
+    ) -> Result<(Engine, HashDepths, Arc<[SignalColumn]>), SpecError> {
         if let Some(kind) = &self.kind {
             return Err(SpecError::Kind(kind.clone()));
         }
@@ -5272,7 +5393,7 @@ impl PolicySpec {
         check_signals(&self.signals)?;
         let signal_columns = resolve_signals(&self.signals);
         let mut deferred = Deferred::default();
-        let mut depth = HashDepth::default();
+        let mut depth = HashDepths::default();
         // What no stage declares: the sessions rules' counts and the view's
         // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
@@ -5356,6 +5477,7 @@ impl PolicySpec {
                 live_profiles: &live_profiles,
                 scoped_stages: &scoped_stages,
                 by_assignment: &by_assignment,
+                lifecycle: catalog.makes_lifecycle_calls(),
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
                 if binding
@@ -5395,7 +5517,6 @@ impl PolicySpec {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: overload_thresholds(None),
             });
         }
         needs.headers |= !self.view.headers.is_empty();
@@ -5594,7 +5715,7 @@ fn index_matching<'a>(
 /// number says which generation a replica runs, the digest which document,
 /// and one load reads the pair.
 ///
-/// It also holds what a store derives under, beside the engine: the
+/// It also holds what pair classes are derived under, beside the engine: the
 /// document's pairing mode ([`AppliedSpec::pairing`]). It says when a host
 /// asks a pair's decode ([`AppliedSpec::decode_pick`]). And it says how deep
 /// a host hashes a request for it ([`AppliedSpec::block_hashes_read`]).
@@ -5610,6 +5731,9 @@ pub struct AppliedSpec {
     digest: Option<Digest>,
     /// How deep the engine's stages read a request's block hashes.
     depth: HashDepth,
+    /// Whether no stage of the engine reads those hashes itself
+    /// ([`Self::hashes_named_alone`]).
+    named_alone: bool,
     /// The document's `view.max_block_hashes`: no read is past it.
     max_block_hashes: u32,
     /// The view's block size: a request that names none is counted by it.
@@ -5632,6 +5756,9 @@ pub struct AppliedSpec {
     /// Whether a binding names a target source
     /// ([`AppliedSpec::names_target`]).
     names_target: bool,
+    /// What the bindings say of the overload switch, taken together
+    /// ([`AppliedSpec::overload_switch`]).
+    overload_switch: OverloadSwitch,
     /// The document's signals, resolved, in column order
     /// ([`AppliedSpec::signal_columns`]).
     signal_columns: Arc<[SignalColumn]>,
@@ -5692,7 +5819,7 @@ impl AppliedSpec {
     fn of(
         document: &PolicySpec,
         digest: Digest,
-        (engine, depth, signal_columns): (Engine, HashDepth, Arc<[SignalColumn]>),
+        (engine, depth, signal_columns): (Engine, HashDepths, Arc<[SignalColumn]>),
     ) -> Self {
         let sources = |binding| KeySources::of_binding(binding, &document.view);
         let key_sources: Box<[_]> = document.bindings.iter().map(sources).collect();
@@ -5705,7 +5832,8 @@ impl AppliedSpec {
                 signals: document.signals.clone(),
             },
             digest: Some(digest),
-            depth,
+            depth: depth.read,
+            named_alone: depth.by_stage == HashDepth::Unread,
             signal_columns,
             max_block_hashes: document.view.max_block_hashes,
             block_size: Gates::of(None, None, document.view.block_size).block_size,
@@ -5721,6 +5849,7 @@ impl AppliedSpec {
                 .map(|name| name.as_str().into())
                 .collect(),
             names_target: key_sources.iter().flatten().any(KeySources::names_target),
+            overload_switch: OverloadSwitch::of(&document.bindings),
             key_sources,
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
@@ -5739,6 +5868,7 @@ impl AppliedSpec {
             built_from: BuiltFrom::default(),
             digest: None,
             depth: HashDepth::Unread,
+            named_alone: true,
             signal_columns: Arc::default(),
             max_block_hashes: ViewSpec::default().max_block_hashes,
             block_size: Gates::default().block_size,
@@ -5750,6 +5880,7 @@ impl AppliedSpec {
             view_headers: Box::default(),
             key_sources: Box::default(),
             names_target: false,
+            overload_switch: OverloadSwitch::On,
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
@@ -5900,6 +6031,22 @@ impl AppliedSpec {
         usize::try_from(blocks).unwrap_or(usize::MAX)
     }
 
+    /// Whether no stage reads a request's block hashes itself under this
+    /// generation: the lookup that names the request's holders reads them
+    /// where the prefix-affinity stage declares them, and nothing does
+    /// where no stage declares any.
+    /// The engine's own call then hashes a prompt where that lookup reads
+    /// the list, and not for a request it decides inside a lent token tree.
+    /// A request that call makes of a prompt's token ids with no block
+    /// hashed is sized as the one it makes with its list (`HashDepths`).
+    #[cfg_attr(
+        not(feature = "in-process"),
+        expect(dead_code, reason = "the engine's own placing call reads it")
+    )]
+    pub(crate) const fn hashes_named_alone(&self) -> bool {
+        self.named_alone
+    }
+
     /// What the host must feed under this generation
     /// ([`Engine::needs`]).
     #[must_use]
@@ -5940,7 +6087,17 @@ impl AppliedSpec {
         self.names_target
     }
 
-    /// The mode a store derives its pair classes under while this
+    /// What the bindings of this generation say of the overload switch,
+    /// taken together ([`OverloadSwitch`]), decided when the document was
+    /// applied. A host that builds its workers with a default set of
+    /// thresholds reads it where it builds that default. The unbound start
+    /// says on, as a document with no binding does.
+    #[must_use]
+    pub fn overload_switch(&self) -> OverloadSwitch {
+        self.overload_switch
+    }
+
+    /// The mode a model's pair classes are derived under while this
     /// generation stands: the document's `plans.pd-pair.pairing`.
     #[must_use]
     pub fn pairing(&self) -> Pairing {
@@ -5958,8 +6115,8 @@ impl AppliedSpec {
         self.decode_pick
     }
 
-    /// The lists this generation declares, as a store reads them when it
-    /// writes a worker's row.
+    /// The lists this generation declares: a worker's candidate row is
+    /// written under them, and a store counts the members outside them.
     #[must_use]
     pub fn lists(&self) -> &ViewLists {
         &self.lists
@@ -5974,8 +6131,8 @@ impl AppliedSpec {
     }
 }
 
-/// The lists a generation declares, as a store reads them when it writes a
-/// worker's row ([`Candidate`](crate::engine::view::Candidate)): the row names its
+/// The lists a generation declares, as the writer of a worker's candidate
+/// row ([`Candidate`](crate::engine::view::Candidate)) reads them: the row names its
 /// engine family and its zone by a position from 1, and holds one bit for
 /// each label selector the worker meets. Built once, at validation.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -6057,16 +6214,41 @@ impl ViewLists {
         zone: Option<&str>,
         labels: &BTreeMap<String, String>,
     ) -> ViewListPositions {
-        let engine_at = self.engines.get(engine).copied();
-        let zone = zone.filter(|zone| !zone.is_empty());
-        let zone_at = zone.and_then(|zone| self.zones.get(zone).copied());
+        let (engine_at, engine_outside) = self.engine(engine);
+        let (zone_at, zone_outside) = self.zone(zone);
         ViewListPositions {
             engine_kind: engine_at.unwrap_or(0),
             zone: zone_at.unwrap_or(0),
             labels: self.met(labels),
-            engine_outside: engine_at.is_none() && !engine.is_empty() && !self.engines.is_empty(),
-            zone_outside: zone_at.is_none() && zone.is_some() && !self.zones.is_empty(),
+            engine_outside,
+            zone_outside,
         }
+    }
+
+    /// Whether a worker's engine family and its zone stand outside these
+    /// lists, the family first: the two bits [`Self::positions`] answers,
+    /// for a reader that keeps nothing else of that read. No label is read.
+    #[must_use]
+    pub(crate) fn outside(&self, engine: &str, zone: Option<&str>) -> (bool, bool) {
+        (self.engine(engine).1, self.zone(zone).1)
+    }
+
+    /// The position of an engine family, and whether it stands outside the
+    /// list: the worker names one, and the list holds entries and not that
+    /// one.
+    fn engine(&self, engine: &str) -> (Option<u16>, bool) {
+        let at = self.engines.get(engine).copied();
+        let outside = at.is_none() && !engine.is_empty() && !self.engines.is_empty();
+        (at, outside)
+    }
+
+    /// The position of a zone and whether it stands outside the list, as
+    /// [`Self::engine`] reads a family. An empty zone is no zone.
+    fn zone(&self, zone: Option<&str>) -> (Option<u16>, bool) {
+        let zone = zone.filter(|zone| !zone.is_empty());
+        let at = zone.and_then(|zone| self.zones.get(zone).copied());
+        let outside = at.is_none() && zone.is_some() && !self.zones.is_empty();
+        (at, outside)
     }
 
     /// The bits of the selectors a worker's labels meet, in one pass over
@@ -6354,7 +6536,7 @@ mod tests {
             let (_, depth, _) = document
                 .built(&catalog, &[])
                 .expect("the document validates");
-            depth
+            depth.read
         };
         assert_eq!(depth(r#"{"pick":"random"}"#), HashDepth::Unread);
         // A guest of each kind declares the hashes and names no depth.
@@ -7894,11 +8076,18 @@ mod tests {
                 ViewListPositions::default()
             );
         }
+        // The narrow reader answers those two bits alone, the family's
+        // first.
+        assert_eq!(lists.outside("beta", Some("west")), (false, false));
+        assert_eq!(lists.outside("gamma", Some("west")), (true, false));
+        assert_eq!(lists.outside("beta", Some("north")), (false, true));
+        assert_eq!(lists.outside("", Some("")), (false, false));
         // No list: every worker reads 0 and none is outside.
         let none = AppliedSpec::validate(&spec_with_view("{}")).expect("the document validates");
         assert!(none.lists().is_empty() && AppliedSpec::unbound().lists().is_empty());
         let read = none.lists().positions("beta", Some("west"), &held);
         assert_eq!(read, ViewListPositions::default());
+        assert_eq!(none.lists().outside("beta", Some("west")), (false, false));
     }
 
     #[test]
@@ -9010,13 +9199,21 @@ mod tests {
     }
 
     /// A sessions rule runs under the single plan, and on the two sides of
-    /// a pair where it tells its stages, under a cap or under none. A cap
-    /// under the pair makes the document's engine read a worker's count of
-    /// a key's requests, the schema's default cap as one that is written.
-    /// A rule that keeps what it places from the profile is refused by
-    /// that field's name, and a rule under `epd` by the plan's.
+    /// a pair, under a cap or under none. A cap under the pair makes the
+    /// document's engine read a worker's count of a key's requests, the
+    /// schema's default cap as one that is written. A rule that keeps what
+    /// it places from the profile runs under a pair in the build of a host
+    /// that makes the lifecycle's calls, where each side of a pick states
+    /// its own word. In the build of a host that makes some only it is
+    /// refused by that field's name, and the refusal says why: that host
+    /// tells a lease's words off a file, which keeps no word of a pair's
+    /// side. A rule under `epd` is refused by the plan's name.
+    ///
+    /// A gateway's sticky map places each role of a pair under that role's
+    /// own key, and hands its policy no request it placed
+    /// (`model_gateway/src/policies/registry.rs:762-769`, `:794-797`).
     #[test]
-    fn a_sessions_rule_runs_under_a_pair_that_tells_its_stages_and_not_under_epd() {
+    fn a_sessions_rule_runs_under_a_pair_by_its_hosts_calls_and_not_under_epd() {
         let built = |plan: &str, profiles: &str, sessions: &str| {
             spec_with_binding(&format!(
                 r#"{{"plan":"{plan}","profiles":{profiles},"sessions":{sessions}}}"#
@@ -9040,18 +9237,37 @@ mod tests {
         }
         let untold =
             r#"{"sticky_header":"x-session-id","inflight_cap":65535,"rule_placed":"untold"}"#;
+        assert_eq!(under("pd-pair", pair, untold), None);
+        let some = StageRegistry::builtin().without_lifecycle();
+        let on_file = |sessions: &str| {
+            spec_with_binding(&format!(
+                r#"{{"plan":"pd-pair","profiles":{pair},"sessions":{sessions}}}"#
+            ))
+            .validate_in(&some, &[])
+            .err()
+        };
+        assert_eq!(on_file(uncapped), None, "a rule that tells its stages");
+        let refused = on_file(untold);
         assert_eq!(
-            under("pd-pair", pair, untold),
+            refused,
             Some(SpecError::BadSessions {
                 index: 0,
                 name: "rule_placed",
-                reason: "`told` under the pd-pair plan",
+                reason: UNTOLD_ON_FILE,
             })
         );
-        // The single plan takes each of the three.
+        assert_eq!(
+            refused.map(|err| err.to_string()),
+            Some(format!(
+                "binding 0: sessions rule_placed is not {UNTOLD_ON_FILE}"
+            ))
+        );
+        assert!(UNTOLD_ON_FILE.ends_with("a file of leases keeps no side's word"));
+        // The single plan takes each of the three, under either host.
         for rule in [uncapped, untold, r#"{"sticky_header":"x-session-id"}"#] {
             let single = spec_with_binding(&format!(r#"{{"profile":"q","sessions":{rule}}}"#));
             assert_eq!(single.validate().err(), None, "{rule}");
+            assert_eq!(single.validate_in(&some, &[]).err(), None, "{rule}");
         }
         let epd = r#"{"encode":"q","prefill":"q","decode":"q"}"#;
         let refused = under("epd", epd, uncapped);
@@ -9120,39 +9336,35 @@ mod tests {
         assert!(alone.validate().is_ok());
     }
 
+    /// The start a binding is built from by hand ([`Binding::of`]) is the
+    /// binding a document gets that states its model and its profile and
+    /// nothing else: the two are held equal here.
+    #[test]
+    fn a_binding_of_a_model_and_a_profile_alone_is_the_start_built_by_hand() {
+        let built = spec_with_binding(r#"{"match":{"model":"m"},"profile":"p"}"#)
+            .validate()
+            .expect("the binding validates");
+        let binding = built.binding("m", Phase::Single).expect("the binding");
+        assert_eq!(
+            format!("{binding:?}"),
+            format!("{:?}", Binding::of("m".into(), 0))
+        );
+    }
+
     #[test]
     fn the_binding_rules_are_checked_in_shape_then_by_the_build() {
-        let thresholds = |spec: &PolicySpec| {
-            spec.validate()
-                .expect("the binding validates")
-                .binding("m", Phase::Single)
-                .and_then(|binding| binding.overload)
-        };
-        // A block names no number. Switched on, a binding hands its pools
-        // the crate's two, the usage in permille, whatever its shed word
-        // says. So does a binding with no block, and the binding of a
-        // document that writes none.
-        let defaults = OverloadThresholds {
-            waiting_requests: OVERLOAD_WAITING_REQUESTS,
-            kv_usage_permille: 800,
-        };
-        for on in [
+        // A block names no number, and a null is no number. Switched on or
+        // off, with a shed word or none, the binding validates, and so
+        // does a binding with no block.
+        for block in [
             r#"{"profile":"p"}"#,
             r#"{"profile":"p","overload":{}}"#,
             r#"{"profile":"p","overload":{"enabled":true,"shed_when_all_vetoed":true}}"#,
             r#"{"profile":"p","overload":{"waiting_requests":null,"token_usage":null}}"#,
+            r#"{"profile":"p","overload":{"enabled":false,"shed_when_all_vetoed":true}}"#,
         ] {
-            assert_eq!(thresholds(&spec_with_binding(on)), Some(defaults), "{on}");
+            assert!(spec_with_binding(block).validate().is_ok(), "{block}");
         }
-        assert_eq!(
-            thresholds(&doc(
-                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["kv-pressure"],"pick":"best"}}}"#
-            )),
-            Some(defaults)
-        );
-        // Off is the block's switch alone: the binding hands no threshold.
-        let off = r#"{"profile":"p","overload":{"enabled":false,"shed_when_all_vetoed":true}}"#;
-        assert_eq!(thresholds(&spec_with_binding(off)), None);
 
         let sessions = spec_with_binding(
             r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","ttl_s":600,"assignment":"min_load"}}"#,
@@ -9610,6 +9822,91 @@ mod tests {
             "no key's source"
         );
         assert!(!AppliedSpec::unbound().names_target());
+    }
+
+    /// What the bindings say of the overload switch, taken together, is
+    /// decided when the document is applied. A binding with no block, or a
+    /// block that names no switch, says on. Every binding off says off, and
+    /// one word against another says that they differ, whichever comes
+    /// first. A document with no binding says on, as the generation no
+    /// document was applied to does. The shed word is not the switch.
+    #[test]
+    fn the_applied_document_says_its_bindings_overload_switch_as_one_word() {
+        let said = |first: &str, second: &str| {
+            AppliedSpec::validate(&doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"pick":"best"}}}},"bindings":[
+                {{"match":{{"model":"chat/*"}},"profile":"p"{first}}},
+                {{"profile":"p"{second}}}]}}"#
+            )))
+            .expect("the document validates")
+            .overload_switch()
+        };
+        let off = r#","overload":{"enabled":false}"#;
+        let on = r#","overload":{"enabled":true}"#;
+        let sheds = r#","overload":{"shed_when_all_vetoed":true}"#;
+        let empty = r#","overload":{}"#;
+        for (first, second) in [("", ""), (on, ""), ("", empty), (sheds, on)] {
+            assert_eq!(said(first, second), OverloadSwitch::On, "{first} {second}");
+        }
+        assert_eq!(said(off, off), OverloadSwitch::Off);
+        let off_and_sheds = r#","overload":{"enabled":false,"shed_when_all_vetoed":true}"#;
+        assert_eq!(said(off, off_and_sheds), OverloadSwitch::Off);
+        for (first, second) in [(off, ""), ("", off), (off, on), (sheds, off)] {
+            assert_eq!(
+                said(first, second),
+                OverloadSwitch::Differ,
+                "{first} {second}"
+            );
+        }
+        let unbound = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}}}"#);
+        let no_binding = AppliedSpec::validate(&unbound).expect("the document validates");
+        assert_eq!(no_binding.overload_switch(), OverloadSwitch::On);
+        assert_eq!(AppliedSpec::unbound().overload_switch(), OverloadSwitch::On);
+    }
+
+    /// The first binding that says another word than the first one does is
+    /// handed by its place and its word, and none where the bindings say
+    /// one word. It is the one reading of the bindings' words: a document
+    /// has a place to name exactly where its word is that they differ.
+    #[test]
+    fn the_first_binding_that_differs_on_the_overload_switch_is_handed_by_its_place() {
+        let heads = [
+            r#"{"match":{"model":"chat/*"},"profile":"p""#,
+            r#"{"match":{"model":"code/*"},"profile":"p""#,
+            r#"{"profile":"p""#,
+        ];
+        let document = |words: [Option<bool>; 3]| {
+            let bindings = heads.iter().zip(words).map(|(head, word)| {
+                let block = word.map_or_else(String::new, |enabled| {
+                    format!(r#","overload":{{"enabled":{enabled}}}"#)
+                });
+                format!("{head}{block}}}")
+            });
+            let bindings: Vec<_> = bindings.collect();
+            doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"pick":"best"}}}},"bindings":[{}]}}"#,
+                bindings.join(",")
+            ))
+        };
+        let (on, off) = (Some(true), Some(false));
+        let cases = [
+            ([None, None, None], None),
+            ([off, off, off], None),
+            ([on, None, on], None),
+            ([None, off, off], Some((1, false))),
+            ([off, off, None], Some((2, true))),
+            ([off, on, None], Some((1, true))),
+            ([on, None, off], Some((2, false))),
+        ];
+        for (words, place) in cases {
+            let document = document(words);
+            let differs = OverloadSwitch::differs(&document.bindings);
+            assert_eq!(differs, place, "{words:?}");
+            let applied = AppliedSpec::validate(&document).expect("the document validates");
+            let differ = applied.overload_switch() == OverloadSwitch::Differ;
+            assert_eq!(differ, place.is_some(), "{words:?}");
+        }
+        assert_eq!(OverloadSwitch::differs(&[]), None, "no binding");
     }
 
     #[test]
@@ -10381,6 +10678,14 @@ mod tests {
             refused("apiVersion: smg.policy/v9\nprofiles:\n  default:\n    pick: random\n"),
             "apiVersion"
         );
+        let unnamed: PolicySpec = serde_yaml::from_str(
+            "apiVersion: smg.policy/v1\nprofiles:\n  \"\":\n    pick: random\n",
+        )
+        .expect("a document");
+        assert!(matches!(
+            unnamed.validate(),
+            Err(SpecError::BadField { path, .. }) if path == "profiles"
+        ));
     }
 
     #[test]
@@ -10392,6 +10697,55 @@ mod tests {
         spec.validate().expect("one profile binds to everything");
         let text = serde_json::to_string(&spec).expect("serializes");
         assert!(!text.contains("kind"), "{text}");
+    }
+
+    /// A warm-up slice follows the profile's one spill gate. Beside a slice
+    /// a `prefix-affinity` entry that writes another `rel` or `abs` than the
+    /// profile's first is refused by that limit, wherever the slice stands,
+    /// and a bare name writes the defaults. Entries of one gate load, and
+    /// so do two gates with no slice: each scorer spills by its own.
+    #[test]
+    fn a_warmup_slice_beside_two_spill_gates_is_refused() {
+        let refused = |score: &str| match spec_with_score(score).validate() {
+            Err(SpecError::BadField { path, .. }) => path,
+            Err(other) => panic!("{score}: {other:?}"),
+            Ok(_) => panic!("{score}: the document loads"),
+        };
+        let (wide, tight) = (
+            r#"{"prefix-affinity":{"spill":{"rel":4.0}}}"#,
+            r#"{"prefix-affinity":{"spill":{"rel":1.0}}}"#,
+        );
+        for (score, path) in [
+            (
+                format!(r#"{wide},{tight},"warmup-slice""#),
+                "profiles.p.score[1].prefix-affinity.spill.rel",
+            ),
+            (
+                format!(r#"{tight},"warmup-slice",{wide}"#),
+                "profiles.p.score[2].prefix-affinity.spill.rel",
+            ),
+            (
+                format!(r#""warmup-slice",{wide},"prefix-affinity""#),
+                "profiles.p.score[2].prefix-affinity.spill.rel",
+            ),
+            (
+                r#"{"prefix-affinity":{"spill":{"abs":8}}},"prefix-affinity","warmup-slice""#
+                    .to_owned(),
+                "profiles.p.score[1].prefix-affinity.spill.abs",
+            ),
+        ] {
+            assert_eq!(refused(&score), path, "{score}");
+        }
+        for loads in [
+            format!("{wide},{tight}"),
+            format!(r#"{wide},{wide},"warmup-slice""#),
+            r#"{"prefix-affinity":{"spill":{"rel":1.5,"abs":64}}},"prefix-affinity","warmup-slice""#
+                .to_owned(),
+            r#"{"prefix-affinity":{"spill":{"prefix_margin_tokens":512}}},"prefix-affinity","warmup-slice""#
+                .to_owned(),
+        ] {
+            assert!(spec_with_score(&loads).validate().is_ok(), "{loads}");
+        }
     }
 
     /// The spill parameters of a prefix-affinity entry reach the gates the

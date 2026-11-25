@@ -48,6 +48,7 @@ use std::{
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 
 use super::{
+    place::Made,
     single::{self, WholeDecision},
     InProcess, Loaded, PoolMembers,
 };
@@ -65,9 +66,10 @@ use crate::engine::{
 /// shadow's outcome is written into `outcome`, for the caller that counts
 /// it.
 struct WithShadow<'a> {
-    /// The binding's position, and how its shadow profile reads the
-    /// affinity rows of the live decision ([`Engine::shadow_for`]).
-    binding: (u32, ShadowRows),
+    /// The binding's position, how its shadow profile reads the affinity
+    /// rows of the live decision ([`Engine::shadow_for`]), and what the
+    /// request lends that profile alone ([`RequestMaker::shadow_ring`]).
+    binding: (u32, ShadowRows, records::with_shadow::Lends<'a>),
     outcome: &'a mut Shadow,
 }
 
@@ -138,9 +140,8 @@ impl InProcess {
     /// plan asks one ([`ShadowSide`]) and by each kind, a count of zero
     /// too. A binding of one profile counts beside its single requests. A
     /// pair's binding counts beside each side that names a shadow, and
-    /// its decode side beside a decode decided again as well. No decision
-    /// counts beside a decode decided again yet: a host is told zeros
-    /// under that side. A row is told once, in the order of the rows: the
+    /// its decode side beside a decode decided again as well, in a count
+    /// of its own. A row is told once, in the order of the rows: the
     /// bindings from the last row on share it ([`SHADOW_ROWS`]). A shadow
     /// that panicked is in no count here: it is one of the engine's faults
     /// ([`DecisionEngine::faults`](crate::engine::DecisionEngine::faults)).
@@ -201,26 +202,33 @@ impl InProcess {
 ///
 /// Out of line, as [`issued`] is.
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what the whole decision takes, and the binding's shadow"
+)]
 pub(super) fn decide(
     own: Loaded<'_, '_>,
     request: &mut Request<'_>,
     members: &PoolMembers,
     maker: &(impl RequestMaker + ?Sized),
+    late: Option<&Made<'_, '_>>,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     binding: (u32, ShadowRows),
 ) -> (Decision, Option<Shadowed>) {
     let mut outcome = Shadow::NotDue;
+    let spec = &own.document.spec;
+    let lends = |shadow| maker.shadow_ring(spec, shadow);
     let whole = WithShadow {
-        binding,
+        binding: (binding.0, binding.1, &lends),
         outcome: &mut outcome,
     };
-    let decision = single::decide(own, request, members, maker, loads, now, whole);
+    let decision = single::decide(own, request, members, maker, late, loads, now, whole);
     let said = match outcome {
         Shadow::Said(said) => Some(said),
         Shadow::NotDue => None,
         Shadow::Faulted => {
-            own.faults.fetch_add(1, Ordering::Relaxed);
+            own.held.decisions.fetch_add(1, Ordering::Relaxed);
             None
         }
     };

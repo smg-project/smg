@@ -791,9 +791,9 @@ pub(crate) fn refresh(
 ///
 /// Labels are no part of a row's offer, and a patch writes them under the
 /// row's guard. A descriptor is part of it. Where it moved, the row takes
-/// the write a registration takes in place, and the store derives the
-/// row's pair classes again there. That write has no guard of its own: the
-/// door's turn holds the row as the guard read it.
+/// the write a registration takes in place, and the pair classes are
+/// derived again from the membership that write leaves. That write has no
+/// guard of its own: the door's turn holds the row as the guard read it.
 fn refresh_stated(
     turn: &impl Turn,
     seen: RowRevision,
@@ -887,7 +887,7 @@ pub(super) mod tests {
             MembershipChange, MembershipTail, MemoryStore, Registrant, Signals, WorkerFacts,
             WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
-        worker_host::kv_tables::indexed_under,
+        worker_host::{kv_tables::indexed_under, Members, Objects},
     };
 
     const URL: &str = "http://worker:8000";
@@ -979,6 +979,129 @@ pub(super) mod tests {
     }
 
     impl MembershipWriter for StoreDoor {
+        fn found(
+            &self,
+            maker: &Registrant,
+            expect: Precondition,
+            url: &str,
+            state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            lay_one(self, maker, expect, url, state)
+        }
+
+        fn found_rows(
+            &self,
+            maker: &Registrant,
+            expect: Precondition,
+            built: &[Arc<dyn Worker>],
+            over: Option<Over<'_>>,
+        ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
+            stating(built, over, found::stated, |rows| {
+                lay(self, maker, expect, rows)
+            })
+        }
+
+        fn drained(
+            &self,
+            by: Remover<'_>,
+            url: &str,
+            seen: RowRevision,
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            drain(self, by, url, seen)
+        }
+
+        fn gone(
+            &self,
+            by: Remover<'_>,
+            url: &str,
+            seen: RowRevision,
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            take(self, by, url, seen)
+        }
+
+        fn refreshed(
+            &self,
+            seen: RowRevision,
+            built: &Arc<dyn Worker>,
+            _: &Arc<dyn Worker>,
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            refresh(self, seen, built.as_ref(), found::stated)
+        }
+    }
+
+    /// A door over a store and the holder of its worker objects, with no
+    /// election and no log: each call runs the door's rules, reads a row
+    /// off the worker objects and writes through the holder, as a
+    /// controller's door does. So the object of a row it wrote stands when
+    /// it answers, with no follow.
+    pub(crate) struct HolderDoor {
+        store: Arc<MemoryStore>,
+        objects: Arc<Objects<Members>>,
+        base: u64,
+    }
+
+    impl HolderDoor {
+        pub(crate) fn new(store: Arc<MemoryStore>, objects: Arc<Objects<Members>>) -> Self {
+            Self {
+                store,
+                objects,
+                base: membership::base(),
+            }
+        }
+    }
+
+    impl Turn for HolderDoor {
+        fn store(&self) -> &MemoryStore {
+            &self.store
+        }
+
+        fn row(&self, id: WorkerId) -> Option<WorkerRow> {
+            self.objects.record(id)
+        }
+
+        fn row_under(&self, url: &str) -> Option<WorkerRow> {
+            self.objects.record_under(url)
+        }
+
+        fn rows_of(&self, engine: &str) -> Vec<WorkerRow> {
+            self.objects.records_of(engine)
+        }
+
+        fn upsert(&self, facts: WorkerFacts, maker: Registrant) -> Option<MembershipChange> {
+            self.objects.upsert(&self.store, facts, maker)
+        }
+
+        fn patch(
+            &self,
+            id: WorkerId,
+            patch: WorkerPatch,
+            revision: u64,
+        ) -> Option<MembershipChange> {
+            self.objects.patch(&self.store, id, patch, revision)
+        }
+
+        fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+            self.objects.remove(&self.store, id, revision)
+        }
+
+        fn connect(&self, id: WorkerId, revision: u64) {
+            self.objects.connect_row(&self.store, id, revision);
+        }
+
+        fn drain(&self, id: WorkerId, revision: u64) -> bool {
+            self.objects.drain_row(&self.store, id, revision)
+        }
+
+        fn life(&self) -> Result<u64, MembershipWriteRefused> {
+            Ok(membership::life(0, self.base, self.store.epoch()))
+        }
+
+        fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), MembershipWriteRefused> {
+            Ok(())
+        }
+    }
+
+    impl MembershipWriter for HolderDoor {
         fn found(
             &self,
             maker: &Registrant,
@@ -1232,7 +1355,10 @@ pub(super) mod tests {
             engine: format!("{URL}@03"),
             ..stated()
         };
-        store.upsert(alias.clone());
+        door.found_one(&maker, &alias.key, &|_| alias.clone())
+            .map_err(|_| "the alias registered")?;
+        // The door numbers the alias's life: what it wrote must stand.
+        let alias = store.by_key(&alias.key).ok_or("the alias row")?.facts;
         let epoch = store.epoch();
         let two = ranked(2);
         assert_eq!(
@@ -1871,13 +1997,18 @@ pub(super) mod tests {
         assert_eq!(store.by_key(URL), None);
 
         // The second of two ranks stands with another label: the add
-        // writes neither.
+        // writes neither. Both ranks are registered at the door and the
+        // first is removed there, so the second stands alone.
         let (store, door) = open();
         let two = ranked(2);
-        store.upsert(WorkerFacts {
+        let gold = WorkerFacts {
             labels: [("tier".to_owned(), "gold".to_owned())].into(),
             ..two[1].clone()
-        });
+        };
+        find_rows(&*door, &control, &[two[0].clone(), gold]).expect("two ranks");
+        let first = store.by_key(&two[0].key).expect("rank zero");
+        door.gone(Remover::Registrant(&control), &two[0].key, standing(&first))
+            .expect("rank zero removed");
         let epoch = store.epoch();
         assert_eq!(
             find_rows_over(&*door, &control, Precondition::Absent, &two),
@@ -2917,10 +3048,10 @@ pub(super) mod tests {
             }
         }
 
-        /// A holder with a registry of its own, whose objects take their
-        /// rows' status. It reads `store` where a case has it follow.
+        /// A holder with a registry of its own. It reads `store` where a
+        /// case has it follow, and builds each object in its row's status.
         fn holder() -> Objects<Members> {
-            Objects::new(Arc::new(WorkerRegistry::new())).with_status_followed()
+            Objects::new(Arc::new(WorkerRegistry::new()))
         }
 
         /// What `engine` decides for `asked` over `lists`: a whole decision.

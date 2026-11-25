@@ -1,5 +1,8 @@
 //! The cases of a request with an encode request's three lists.
 
+mod rows;
+mod ruled;
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use super::{
@@ -283,6 +286,7 @@ fn references_beside_an_image_keep_one_decision_on_a_decode_that_takes_images() 
     let (prefill, takes_images) = (three.id(0, 0), three.id(1, 1));
     assert_eq!(*heard.lock(), [issued(prefill), issued(takes_images)]);
     placement.sent(Side::Prefill);
+    assert!(!placement.decode_chosen(), "a decode held to images");
     let never_chosen = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
     assert_eq!(placement.decode_again(&with_an_image), Err(never_chosen));
     drop(placement);
@@ -296,6 +300,7 @@ fn references_beside_an_image_keep_one_decision_on_a_decode_that_takes_images() 
     assert_eq!(three.places(&placement), (0, 0, vec![0]));
     assert_eq!(*heard.lock(), [issued(prefill)]);
     placement.sent(Side::Prefill);
+    assert!(placement.decode_chosen(), "no image holds the decode");
     assert_eq!(placement.decode_again(&with_none), Ok(()));
     assert_eq!(three.places(&placement), (0, 0, vec![0]));
     drop(placement);
@@ -373,6 +378,7 @@ fn a_request_whose_media_is_its_encoders_to_meet_keeps_one_decision() {
     let (prefill, decode) = (three.id(0, 0), three.id(1, 0));
     assert_eq!(*heard.lock(), [issued(prefill), issued(decode)]);
     placement.sent(Side::Prefill);
+    assert!(!placement.decode_chosen(), "a demand left to its encoders");
     let never_chosen = Unplaced::Refused(DecisionRefused::Decode(DecodeRefused::NotChosen));
     assert_eq!(placement.decode_again(&demanding), Err(never_chosen));
     drop(placement);
@@ -386,6 +392,7 @@ fn a_request_whose_media_is_its_encoders_to_meet_keeps_one_decision() {
     assert_eq!(three.places(&placement), (0, 0, vec![0]));
     assert_eq!(*heard.lock(), [issued(prefill)]);
     placement.sent(Side::Prefill);
+    assert!(placement.decode_chosen(), "no demand is split");
     assert_eq!(placement.decode_again(&undemanding), Ok(()));
 }
 
@@ -552,6 +559,7 @@ fn an_item_whose_encoder_cannot_be_sent_to_is_placed_by_the_calls_next_decision(
         &asking(lists, both),
         &lists,
         both,
+        &WorkerLists::Encode(lists),
         &mut call,
     );
     assert!(matches!(asked, Ok(None)), "no placement");
@@ -566,6 +574,7 @@ fn an_item_whose_encoder_cannot_be_sent_to_is_placed_by_the_calls_next_decision(
         &asking(lists, both),
         &lists,
         both,
+        &WorkerLists::Encode(lists),
         &mut call,
     );
     assert!(matches!(asked, Ok(None)), "no placement");
@@ -710,6 +719,7 @@ fn a_prompt_behind_an_encoder_that_cannot_be_sent_to_is_written_for_no_pair() {
             &request,
             &lists,
             items,
+            &request.lists,
             &mut Call::default(),
         );
         assert!(matches!(asked, Ok(None)), "no placement");
@@ -770,7 +780,8 @@ fn a_call_takes_its_decisions_answer_on_each_of_five_encoders() {
         ..asking(lists, items)
     };
     let mut call = Call::default();
-    let asked = ask(engine.loaded(), &request, &lists, items, &mut call);
+    let lent = &request.lists;
+    let asked = ask(engine.loaded(), &request, &lists, items, lent, &mut call);
     let placement = asked.expect("a decision").expect("a placement");
     assert_eq!(three.places(&placement).2, vec![0, 1, 2, 3, 4]);
     assert!(call.missed.is_empty(), "{:?}", call.missed);

@@ -127,13 +127,12 @@ fn rows(n: u32, class: fn(u32) -> u32) -> Vec<Candidate> {
 }
 
 fn facts(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 512,
-        seed,
-        now_micros: 1_000_000,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.prompt_tokens = 512;
+    facts.seed = seed;
+    facts.now_micros = 1_000_000;
+    facts
 }
 
 #[expect(clippy::print_stdout, reason = "the sizes are the bench's report")]
@@ -142,11 +141,9 @@ fn pair_table(c: &mut Criterion) {
         .expect("the pair spec")
         .validate()
         .expect("the engine");
-    let pool = PoolFacts {
-        pool_size: PREFILLS + DECODES,
-        generation: 1,
-        ..PoolFacts::default()
-    };
+    let mut pool = PoolFacts::default();
+    pool.pool_size = PREFILLS + DECODES;
+    pool.generation = 1;
     let cx = Constraints::default();
     let mut group = c.benchmark_group("engine/pair_table");
     for fleet in fleets() {
@@ -183,12 +180,10 @@ fn pair_table(c: &mut Criterion) {
             decode.health.healthy = true;
         }
         for (state, decodes) in [("open", &open), ("last", &last), ("closed", &closed)] {
-            let pools = PairPools {
-                prefills: &prefills,
-                decodes,
-                table: PairTable::new(&ends, &classes),
-                ..PairPools::default()
-            };
+            let mut pools = PairPools::default();
+            pools.prefills = &prefills;
+            pools.decodes = decodes;
+            pools.table = PairTable::new(&ends, &classes);
             let mut scratch = Scratch::new();
             let probe = engine.decide_pair(&facts(0), &pool, pools, &cx, &cx, &mut scratch);
             assert_eq!(

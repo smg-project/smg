@@ -63,17 +63,13 @@ fn decode_later(c: &mut Criterion) {
     for &n in &SIZES {
         let prefills = side_view(n / 4, Role::Prefill, 10_000);
         let decodes = side_view(n - n / 4, Role::Decode, 20_000);
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = &decodes;
         // The facts of the decode pool: the entry's profile places there.
-        let pool = PoolFacts {
-            pool_size: decodes.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = decodes.len() as u32;
+        pool.generation = 1;
         let cx = Constraints::default();
         let mut scratch = Scratch::new();
         let held = prefills[prefills.len() / 2].id;
@@ -81,13 +77,12 @@ fn decode_later(c: &mut Criterion) {
             let mut seed = 0u64;
             b.iter(|| {
                 seed += 1;
+                let mut facts = RequestFacts::default();
+                facts.model = "m";
+                facts.seed = seed;
+                facts.now_micros = 1_000_000;
                 engine.decide_decode(
-                    &RequestFacts {
-                        model: "m",
-                        seed,
-                        now_micros: 1_000_000,
-                        ..RequestFacts::default()
-                    },
+                    &facts,
                     &pool,
                     black_box(pools),
                     held,
@@ -127,26 +122,20 @@ fn decode_later_handed(c: &mut Criterion, decode: &str, handed: &str) {
     for &n in &SIZES {
         let prefills = side_view(n / 4, Role::Prefill, 10_000);
         let decodes = side_view(n - n / 4, Role::Decode, 20_000);
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        };
-        let pool = PoolFacts {
-            pool_size: decodes.len() as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = &decodes;
+        let mut pool = PoolFacts::default();
+        pool.pool_size = decodes.len() as u32;
+        pool.generation = 1;
         let (cx, mut scratch) = (Constraints::default(), Scratch::new());
         let held = prefills[prefills.len() / 2].id;
         let first = &decodes[decodes.len() / 2];
         let first = Some((first.id, first.dp_rank));
         for (name, first) in [(handed, first), ("picked", None)] {
-            let facts = RequestFacts {
-                model: "m",
-                now_micros: 1_000_000,
-                ..RequestFacts::default()
-            };
+            let mut facts = RequestFacts::default();
+            facts.model = "m";
+            facts.now_micros = 1_000_000;
             group.bench_with_input(BenchmarkId::new(name, n), &n, |b, _| {
                 b.iter(|| {
                     engine.decide_decode(

@@ -205,10 +205,11 @@ impl RouterConfig {
     /// hands in, which holds the stages that build added. A document that
     /// names a stage the table does not hold is refused by the stage's name.
     ///
-    /// A binding's shadows by side are refused as not in this build: this
-    /// gateway takes a shadow of a single request's binding alone. The
-    /// shadow of a binding whose phase list is not empty and leaves out
-    /// `single` would load and never run, and it is refused too.
+    /// A pair binding's shadows by side load: the engine asks them beside
+    /// the pair's first decision and beside its decode decided again. The
+    /// shadow of a single request's binding whose phase list is not empty
+    /// and leaves out `single` would load and never run, and it is refused
+    /// as not in this build.
     pub fn hosted_policy(
         &self,
         document: &PolicySpec,
@@ -218,8 +219,12 @@ impl RouterConfig {
         for (index, binding) in document.bindings.iter().enumerate() {
             let phases = &binding.matcher.phase;
             let what = match binding.shadow {
-                Some(ShadowSpec::Sides(_)) => "a pair's shadow",
-                Some(_) if !phases.is_empty() && !phases.contains(&Phase::Single) => {
+                // A shadow named by one profile is a single request's. A
+                // pair's binding names every phase of its plan or none, so
+                // its shadows by side are reached where its pair is decided.
+                Some(ShadowSpec::Profile(_))
+                    if !phases.is_empty() && !phases.contains(&Phase::Single) =>
+                {
                     "a shadow outside the single phase"
                 }
                 _ => continue,
@@ -1573,11 +1578,15 @@ mod tests {
     }
 
     /// One model's single binding with a shadow stands ahead of a pair's
-    /// binding. The single binding's shadow loads, and a shadow by side on
-    /// the pair's binding is refused by that binding's path. Scoped to the
-    /// decode phase, the single binding's shadow is refused too.
+    /// binding. The single binding's shadow loads, and so do the shadows
+    /// by side of the pair's binding, with that binding's phase list empty
+    /// or naming its two phases. Scoped to the decode phase, the single
+    /// binding's shadow is refused, beside the pair's shadows and alone.
+    ///
+    /// The classic router reads no policy document and runs no second
+    /// policy beside a request: the load is the engine's own.
     #[test]
-    fn a_pair_bindings_shadow_is_refused_as_not_in_this_build() {
+    fn a_pair_bindings_shadows_load_beside_a_single_bindings() {
         let pairs = PolicySpec::pair_presets("round_robin", "round_robin");
         let mut document = pairs.expect("the presets of a pair");
         document.profiles.extend(preset("random").profiles);
@@ -1596,19 +1605,16 @@ mod tests {
         };
         assert_eq!(refused(&document), None);
 
-        let pair = document.bindings.last_mut().expect("the pair's binding");
-        let by_side = [("prefill".to_owned(), "random".to_owned())];
-        pair.shadow = Some(ShadowSpec::Sides(by_side.into()));
-        assert_eq!(
-            refused(&document),
-            Some(SpecError::NotInBuild {
-                path: "bindings[1].shadow".to_owned(),
-                what: "a pair's shadow",
-            })
-        );
+        let by_side = ["prefill", "decode"].map(|side| (side.to_owned(), "random".to_owned()));
+        for phases in [vec![], vec![Phase::Prefill, Phase::Decode]] {
+            let pair = document.bindings.last_mut().expect("the pair's binding");
+            pair.shadow = Some(ShadowSpec::Sides(by_side.clone().into()));
+            pair.matcher.phase = phases;
+            assert_eq!(refused(&document), None);
+        }
 
         // No single request reaches a binding scoped to the decode phase:
-        // its shadow is named ahead of the pair's, and alone too.
+        // its shadow is refused beside the pair's shadows, and alone too.
         let outside = Some(SpecError::NotInBuild {
             path: "bindings[0].shadow".to_owned(),
             what: "a shadow outside the single phase",

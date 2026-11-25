@@ -53,10 +53,11 @@ fn signals(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine/signals");
     for n in [8u32, 64, 512] {
         let rows: Vec<_> = (0..n)
-            .map(|position| Candidate {
-                position,
-                id: WorkerId(1003 + u64::from(position)),
-                ..Candidate::default()
+            .map(|position| {
+                let mut candidate = Candidate::default();
+                candidate.position = position;
+                candidate.id = WorkerId(1003 + u64::from(position));
+                candidate
             })
             .collect();
         // Two cells a row, in the names' order: `pending`, then `used`.
@@ -68,10 +69,8 @@ fn signals(c: &mut Criterion) {
             .flat_map(|row| [cell(row % 7), cell(row % 11)])
             .collect();
         let cells = SignalCells::new(cells, 2);
-        let pool = PoolFacts {
-            pool_size: n,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n;
         let constraints = Constraints::default();
         let engine = engine();
         let mut scratch = Scratch::new();
@@ -79,12 +78,10 @@ fn signals(c: &mut Criterion) {
             let mut seed = 0u64;
             b.iter(|| {
                 seed += 1;
-                let facts = RequestFacts {
-                    seed,
-                    now_micros: NOW,
-                    signal_cells: Some(&cells),
-                    ..RequestFacts::default()
-                };
+                let mut facts = RequestFacts::default();
+                facts.seed = seed;
+                facts.now_micros = NOW;
+                facts.signal_cells = Some(&cells);
                 engine.decide(&facts, &pool, black_box(&rows), &constraints, &mut scratch)
             });
         });

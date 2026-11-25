@@ -50,8 +50,8 @@ use smg_grand_central::{
     engine::{
         fingerprint, Constraints, Decision, EncodeClasses, EncodeItems, EncodeLists, EncodeMember,
         EncodePlaced, EncoderFacts, FixedFacts, Identity, InProcess, LentList, ListCell,
-        MediaCounts, PairAdmission, PairLists, PartnerClasses, Phase, Request as HostRequest,
-        RequestFacts, RequestMaker, WorkerLists,
+        PairAdmission, PairLists, PartnerClasses, Phase, Request as HostRequest, RequestFacts,
+        RequestMaker, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     store::{EncodeHandoff, EncodeOffer},
@@ -244,17 +244,11 @@ fn replay(row: &Row) -> Vec<String> {
         row.encoders
             .iter()
             .zip(&of_encoders)
-            .map(|(worker, offer)| EncodeMember {
-                runtime: &worker.runtime,
-                offer,
-            }),
+            .map(|(worker, offer)| EncodeMember::of(&worker.runtime, offer)),
         row.prefills
             .iter()
             .zip(&of_prefills)
-            .map(|(worker, offer)| EncodeMember {
-                runtime: &worker.runtime,
-                offer,
-            }),
+            .map(|(worker, offer)| EncodeMember::of(&worker.runtime, offer)),
     );
     let mut found = Vec::new();
     if row.requests.len() != row.outcome.sequence.len() {
@@ -606,13 +600,12 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer], lent: boo
             Some(text) => Some(Identity::plain(text)),
             None => (!request.fanout && !keys.is_empty()).then_some(digest),
         };
-        let items = EncodeItems {
-            keys: &keys,
-            one,
-            references: request.references,
-            decode_images: request.decode_images,
-            ring: of_answer.as_ref().map(|ring| ring as &dyn LentRing),
-        };
+        let mut items = EncodeItems::default();
+        items.keys = &keys;
+        items.one = one;
+        items.references = request.references;
+        items.decode_images = request.decode_images;
+        items.ring = of_answer.as_ref().map(|ring| ring as &dyn LentRing);
         let seed = at as u64 + 1;
         let id = seed.to_le_bytes();
         // The request as its host makes it for the prefill phase: held to
@@ -620,15 +613,13 @@ fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer], lent: boo
         let asked = Asked {
             request: HostRequest {
                 id: &id,
-                facts: RequestFacts {
-                    model: MODEL,
-                    phase: Phase::Prefill,
-                    media: MediaCounts {
-                        images: u16::from(request.images),
-                        ..MediaCounts::default()
-                    },
-                    seed,
-                    ..RequestFacts::default()
+                facts: {
+                    let mut facts = RequestFacts::default();
+                    facts.model = MODEL;
+                    facts.phase = Phase::Prefill;
+                    facts.media.images = u16::from(request.images);
+                    facts.seed = seed;
+                    facts
                 },
                 constraints: Constraints::default(),
             },

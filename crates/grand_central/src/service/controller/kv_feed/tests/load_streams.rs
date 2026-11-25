@@ -59,16 +59,18 @@ struct Replica {
 }
 
 impl Replica {
-    /// Writes the worker's record as `Ready` through the store's own
-    /// entries and has the holder follow it, as a host that writes its
-    /// store does: no task of the serve lays the record's object.
+    /// Writes the worker's record through the holder and readies its
+    /// object by the connect signal, as a registration call does.
     fn lay(&self) {
-        let id = self.store.upsert(self.record.clone()).id();
+        let record = self.record.clone();
+        let written = self
+            .objects
+            .upsert(&self.store, record, Registrant::Control);
+        let id = written.expect("the store takes the record").id();
         let revision = self.store.get(id).expect("the record").revision;
-        self.store
-            .set_status(id, WorkerStatus::Ready, revision)
-            .expect("the worker is ready");
-        self.objects.follow(&*self.store);
+        self.objects.connect_row(&self.store, id, revision);
+        let status = self.store.get(id).map(|record| record.status);
+        assert_eq!(status, Some(WorkerStatus::Ready), "the worker is ready");
         self.store.publish_now();
     }
 

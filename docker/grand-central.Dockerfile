@@ -133,7 +133,7 @@ RUN if [ "${TARGETARCH}" = "arm64" ]; then \
         fi; \
     fi
 
-# The listeners' default ports: the gateways and the relays (30100), the
+# The listeners' default ports: the gateways (30100), the
 # operators (30101), the standbys (30102) and the HTTP admin listener with
 # the probes and the metrics (30103).
 EXPOSE 30100 30101 30102 30103

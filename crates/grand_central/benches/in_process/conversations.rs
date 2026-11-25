@@ -39,8 +39,8 @@ use std::{
 
 use kv_index::TokenTree;
 use smg_grand_central::engine::{
-    CacheIndex, CacheIndexes, DecisionEngine, HashSeeds, InProcess, Phase, PromptHashes,
-    TokenEntry, TokenKey,
+    CacheIndex, CacheIndexes, DecisionEngine, HashSeeds, InProcess, Phase, PromptEntry,
+    PromptHashes, TokenKey,
 };
 
 use super::{mix, place, ruled, stretch, Host, Run, CALLER_WARM, MODEL};
@@ -70,12 +70,9 @@ pub(super) struct Turn<'a> {
 
 /// A turn's entry in its host's token tree: its token ids, under no cache
 /// partition. The runner's maker and the one call's request state the same.
-impl TokenEntry for Turn<'_> {
+impl PromptEntry for Turn<'_> {
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
-        Some(TokenKey {
-            tokens: Cow::Borrowed(self.tokens),
-            marker: 0,
-        })
+        Some(TokenKey::of(Cow::Borrowed(self.tokens), 0))
     }
 }
 

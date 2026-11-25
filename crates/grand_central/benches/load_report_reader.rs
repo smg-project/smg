@@ -112,25 +112,23 @@ fn reports(c: &mut Criterion) {
     ];
     for n in [8, 64, 512] {
         let rows: Vec<_> = (0..n)
-            .map(|position| Candidate {
-                position,
-                id: WorkerId(2003 + u64::from(position)),
-                load: Some(LoadRow {
-                    running: position % 7,
-                    ..LoadRow::default()
-                }),
-                load_sampled_at_micros: SAMPLED_AT,
-                ..Candidate::default()
+            .map(|position| {
+                let mut row = Candidate::default();
+                row.position = position;
+                row.id = WorkerId(2003 + u64::from(position));
+                row.load = Some({
+                    let mut load = LoadRow::default();
+                    load.running = position % 7;
+                    load
+                });
+                row.load_sampled_at_micros = SAMPLED_AT;
+                row
             })
             .collect();
-        let pool = PoolFacts {
-            pool_size: n,
-            ..PoolFacts::default()
-        };
-        let facts = RequestFacts {
-            now_micros: NOW,
-            ..RequestFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n;
+        let mut facts = RequestFacts::default();
+        facts.now_micros = NOW;
         let constraints = Constraints::default();
         for (cell, name, max_age_ms) in cells {
             let engine = engine(name, max_age_ms);

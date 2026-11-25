@@ -68,46 +68,46 @@ mod tests {
     use super::*;
     use crate::{
         service::controller::worker_objects::WorkerObjects,
-        store::{MemoryStore, WorkerFacts, WorkersStore},
+        store::{MemoryStore, Registrant, WorkerFacts},
     };
 
     const URL: &str = "http://worker:8000";
 
-    fn follow_a_row() -> (WorkerObjects, Option<WorkerId>) {
+    /// The holder of a store's worker objects with one row written through
+    /// it, and the row's object.
+    fn a_laid_row() -> (WorkerObjects, Option<WorkerId>) {
         let store = Arc::new(MemoryStore::new());
         let workers = WorkerObjects::new(Arc::clone(&store));
-        store.upsert(WorkerFacts {
+        let facts = WorkerFacts {
             key: URL.to_owned(),
             engine: URL.to_owned(),
             models: vec!["m".to_owned()],
             dp_size: 1,
             ..WorkerFacts::default()
-        });
-        workers.objects().follow(&*store);
-        let object = store
-            .by_key(URL)
-            .and_then(|row| workers.objects().object(row.id));
+        };
+        let written = workers.objects().upsert(&store, facts, Registrant::Control);
+        let object = written.and_then(|written| workers.objects().object(written.id()));
         (workers, object)
     }
 
     #[test]
     fn the_host_lists_the_objects_of_the_rows_that_stand() {
-        let (workers, id) = follow_a_row();
+        let (workers, id) = a_laid_row();
         let host = Host::new(Arc::clone(workers.objects().registry()), None);
         let actual: Vec<_> = host
             .workers()
             .into_iter()
             .map(|(id, worker)| (id, worker.url().to_owned()))
             .collect();
-        assert_eq!(actual, [(id.expect("followed row"), URL.to_owned())]);
+        assert_eq!(actual, [(id.expect("the laid row"), URL.to_owned())]);
     }
 
     #[test]
     fn a_laid_object_has_its_origin_and_an_unknown_id_has_none() {
-        let (workers, id) = follow_a_row();
+        let (workers, id) = a_laid_row();
         let host = Host::new(Arc::clone(workers.objects().registry()), None);
         assert_eq!(
-            host.origin_of(&id.expect("followed row")),
+            host.origin_of(&id.expect("the laid row")),
             Some(WorkerOrigin::Local)
         );
         assert_eq!(host.origin_of(&WorkerId::new()), None);

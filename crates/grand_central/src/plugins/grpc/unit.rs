@@ -18,7 +18,7 @@ use thread_local::ThreadLocal;
 
 use super::runtime::RECONNECT_PAUSE;
 use crate::plugins::shared::{
-    breaker::{Breaker, Latency},
+    breaker::{Breaker, Latency, Recorded},
     config::BreakerSpec,
     Part,
 };
@@ -155,12 +155,12 @@ impl Unit {
         }
         let sample = u32::try_from(charged).unwrap_or(u32::MAX);
         let frame = Latency::frame(seed_micros, frames);
-        let slow = self
+        let recorded = self
             .latency
             .get_or(|| RefCell::new(Latency::new()))
             .borrow_mut()
             .record(sample, frame);
-        if slow && self.breaker.slow(now()) {
+        if recorded == Recorded::SlowWindow && self.breaker.slow(now()) {
             self.opened("latency");
         }
     }

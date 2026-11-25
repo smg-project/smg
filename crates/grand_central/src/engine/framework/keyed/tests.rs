@@ -176,7 +176,6 @@ fn single(sessions: Option<SessionRule>) -> Binding {
         shadow: None,
         decode_shadow: None,
         sessions,
-        overload: None,
     }
 }
 

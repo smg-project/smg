@@ -52,7 +52,7 @@ use super::{
     config::Scope,
     decide::{self, Streams},
     decision_slots::{self, DecisionSlots, Reads},
-    election::{self, split_identity, ElectionObservation, Running},
+    election::{self, split_identity, ElectionObservation, LeasePlace, Running},
     floor::Floors,
     gateways::Gateways,
     generations::{
@@ -63,7 +63,7 @@ use super::{
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
     session, snapshot,
-    standby::{self, Lag},
+    standby::Lag,
     watch_workers::{self, Feed, Source, Watchers, Watching},
     wire, PROTOCOL_VERSION,
 };
@@ -184,14 +184,18 @@ pub(crate) struct Shared {
     pub(crate) streams: Arc<Streams>,
     /// The run loop's word that the listeners close: `true` from the end
     /// of the drain's settle window on. An open decide stream ends at it.
-    pub(crate) stop: watch::Sender<bool>,
+    /// The drain alone says it: a listener holds this receiver.
+    pub(crate) stop: watch::Receiver<bool>,
     /// The log that store journals to and the wake of its watched writes:
     /// what a watch of the rows reads.
     pub(crate) feed: Feed,
     /// The term this replica leads, if it leads one, told at a change alone
     /// by the run loop's one task: how an idle watch learns its replica
     /// stopped leading, and a task of the lead that another term began.
-    pub(crate) role: watch::Sender<Option<u64>>,
+    /// That task alone tells it: a listener holds this receiver, whose
+    /// clone has seen no word, and marks its own seen where it hears from
+    /// its start on.
+    pub(crate) role: watch::Receiver<Option<u64>>,
     /// Who watches this replica: the bounds of a watch's open.
     pub(crate) watchers: Arc<Watchers>,
     /// A gateway's term floor above this replica's term, on its way to the
@@ -199,8 +203,8 @@ pub(crate) struct Shared {
     pub(crate) floors: Floors,
     /// How far behind its leader this replica is while it follows one: the
     /// standby loop writes it. It holds the bound a standby reads synced
-    /// under, the first of the three counts of design 5.4: made again
-    /// where the configuration is known.
+    /// under, the first of the three counts of design 5.4: the bind makes
+    /// it once, where the configuration is known.
     pub(crate) lag: Arc<Lag>,
     /// The turn of the operators' snapshots: one is taken at a time, off
     /// the runtime's workers.
@@ -225,11 +229,18 @@ impl Shared {
     /// it can, so the other builders do not change. The identity and the
     /// fence are `elector`'s, so no instance answers under an identity
     /// another fence guards. A spec document names the stages `catalog`
-    /// holds. `deciders` is how many threads decide. The store comes with
+    /// holds, and its door is built under that fence where `place`, the
+    /// lease's, is one another replica can take
+    /// ([`Generations::stating`]): no later step puts it there.
+    /// `deciders` is how many threads decide. The store comes with
     /// the feed of the log it journals to, the one value one place builds
     /// ([`journaled`](super::replication::journaled)), and with the holder
     /// of the replica's worker objects, whose rows stand in that store: the
-    /// deciders decide over their lists.
+    /// deciders decide over their lists. The run loop's side comes as a
+    /// listener holds it: the receivers of the election's sight of the
+    /// lease, of the listeners' close and of the role's word, each word's
+    /// sender with its one writer, and the standby's lag, made once from
+    /// the configured interval.
     ///
     /// # Errors
     ///
@@ -238,14 +249,19 @@ impl Shared {
         controller_id: String,
         address: String,
         elector: &Elector,
-        standing: watch::Receiver<ElectionObservation>,
+        (standing, stop, role, lag): (
+            watch::Receiver<ElectionObservation>,
+            watch::Receiver<bool>,
+            watch::Receiver<Option<u64>>,
+            Arc<Lag>,
+        ),
         (store, feed, objects, loads): (
             Arc<MemoryStore>,
             Feed,
             Arc<Objects<Members>>,
             LoadReceiver,
         ),
-        catalog: Arc<StageRegistry>,
+        (catalog, place): (Arc<StageRegistry>, &LeasePlace),
         deciders: usize,
     ) -> io::Result<Self> {
         let gateways = Arc::new(Gateways::new(
@@ -275,7 +291,16 @@ impl Shared {
                 counts: Arc::default(),
             },
         )?;
-        let generations = Arc::new(Generations::new(Arc::clone(&store), catalog));
+        // The door states each generation's overload switch on the worker
+        // objects the deciding threads read. Under a lease another replica
+        // can take it stands under this replica's fence from its first
+        // instant.
+        let generations = Arc::new(Generations::stating(
+            Arc::clone(&store),
+            catalog,
+            Arc::clone(&objects),
+            place.is_shared().then(|| elector.fence()),
+        ));
         Ok(Self {
             controller_id,
             address,
@@ -299,15 +324,15 @@ impl Shared {
                 objects,
             )
             .telling(Arc::clone(&generations)),
-            lag: Arc::new(Lag::new(standby::synced_within(Duration::ZERO))),
+            lag,
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
             deciders,
             streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
-            stop: watch::Sender::new(false),
+            stop,
             feed,
-            role: watch::channel(None).0,
+            role,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
             snapshots: SerialTurn::new(snapshot::SNAPSHOTS_WAITING),
@@ -386,8 +411,6 @@ pub(crate) enum Call {
     Session,
     Decide,
     WatchWorkers,
-    PushLoad,
-    PushKvEvents,
     RegisterWorker,
     PatchWorker,
     DeregisterWorker,
@@ -404,12 +427,10 @@ pub(crate) enum Call {
 impl Call {
     /// Every call, in the contract's order.
     #[cfg(test)]
-    pub(crate) const ALL: [Call; 16] = [
+    pub(crate) const ALL: [Call; 14] = [
         Call::Session,
         Call::Decide,
         Call::WatchWorkers,
-        Call::PushLoad,
-        Call::PushKvEvents,
         Call::RegisterWorker,
         Call::PatchWorker,
         Call::DeregisterWorker,
@@ -429,8 +450,6 @@ impl Call {
             Call::Session => "Session",
             Call::Decide => "Decide",
             Call::WatchWorkers => "WatchWorkers",
-            Call::PushLoad => "PushLoad",
-            Call::PushKvEvents => "PushKvEvents",
             Call::RegisterWorker => "RegisterWorker",
             Call::PatchWorker => "PatchWorker",
             Call::DeregisterWorker => "DeregisterWorker",
@@ -449,7 +468,6 @@ impl Call {
     pub(crate) const fn scopes(self) -> &'static [Scope] {
         match self {
             Call::Session | Call::Decide | Call::WatchWorkers => &[Scope::Gateway],
-            Call::PushLoad | Call::PushKvEvents => &[Scope::Ingestion],
             Call::GetSnapshot
             | Call::RegisterWorker
             | Call::PatchWorker
@@ -821,31 +839,21 @@ impl GrandCentral for Service {
         let term = self.watched(Instant::now())?;
         let asked = request.get_ref();
         let start = watch_workers::start(asked)?;
+        // The role's word as it stands at the open is seen: the watch
+        // ends at a word told from here on, whatever the word before it.
+        let mut role = self.shared.role.clone();
+        role.mark_unchanged();
         let source = Source {
             store: Arc::clone(&self.shared.store),
             objects: Arc::clone(&self.shared.objects),
             feed: self.shared.feed.clone(),
             fence: Arc::clone(&self.shared.fence),
-            role: self.shared.role.subscribe(),
+            role,
             term,
         };
         let watchers = &self.shared.watchers;
         let watching = watch_workers::open(source, watchers, by, start, asked.models.clone())?;
         Ok(Response::new(watching))
-    }
-
-    async fn push_load(
-        &self,
-        request: Request<Streaming<proto::LoadReport>>,
-    ) -> Result<Response<proto::Ack>, Status> {
-        self.unserved(Call::PushLoad, &request)
-    }
-
-    async fn push_kv_events(
-        &self,
-        request: Request<Streaming<proto::RelayKvFrame>>,
-    ) -> Result<Response<proto::Ack>, Status> {
-        self.unserved(Call::PushKvEvents, &request)
     }
 
     async fn register_worker(
@@ -1248,9 +1256,9 @@ mod tests {
                 ID.to_owned(),
                 ADDRESS.to_owned(),
                 &elector,
-                stood,
+                bed::unserved(stood),
                 bed::followed(journaled_at(&LeasePlace::Process, 0, 2)),
-                Arc::new(catalog),
+                (Arc::new(catalog), &LeasePlace::Process),
                 2,
             )
             .expect("the deciders start"),
@@ -1305,9 +1313,9 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             state,
-            catalog,
+            (catalog, &LeasePlace::Process),
             1,
         );
     }
@@ -1337,9 +1345,9 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             (Arc::clone(&store), feed, Arc::clone(&objects), loads),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1413,9 +1421,9 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             bed::followed((Arc::clone(&store), feed)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1500,9 +1508,9 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             bed::followed((store, feed)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1542,16 +1550,20 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             bed::followed((store, feed)),
-            Arc::new(StageRegistry::builtin()),
+            // The door stands under the fence, as under a lease another
+            // replica can take: its start passes the document.
+            (
+                Arc::new(StageRegistry::builtin()),
+                &LeasePlace::File("shared".into()),
+            ),
             1,
         )
         .expect("the decider starts");
-        shared.generations.under(Arc::clone(&shared.fence));
         shared
             .generations
-            .defer(LEAST_LOAD.into(), Format::Yaml)
+            .start_with(LEAST_LOAD.into(), Format::Yaml)
             .expect("a valid document");
         assert_eq!(shared.store.snapshot().spec().generation(), 0);
 
@@ -1608,9 +1620,9 @@ mod tests {
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
-            stood,
+            bed::unserved(stood),
             bed::followed((Arc::clone(&store), feed)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1736,9 +1748,9 @@ mod tests {
                 ID.to_owned(),
                 ADDRESS.to_owned(),
                 &elector,
-                stood,
+                bed::unserved(stood),
                 bed::followed((Arc::clone(&store), feed)),
-                Arc::new(StageRegistry::builtin()),
+                (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
                 2,
             )
             .expect("the deciders start"),
@@ -1829,12 +1841,10 @@ mod tests {
     /// a change of a call's scopes is made in both.
     #[test]
     fn every_call_keeps_the_scopes_copied_here_from_the_contracts_header() {
-        let expected: [(&str, &[Scope]); 16] = [
+        let expected: [(&str, &[Scope]); 14] = [
             ("Session", &[Scope::Gateway]),
             ("Decide", &[Scope::Gateway]),
             ("WatchWorkers", &[Scope::Gateway]),
-            ("PushLoad", &[Scope::Ingestion]),
-            ("PushKvEvents", &[Scope::Ingestion]),
             ("RegisterWorker", &[Scope::Control]),
             ("PatchWorker", &[Scope::Control]),
             ("DeregisterWorker", &[Scope::Control]),
@@ -1863,7 +1873,7 @@ mod tests {
     #[test]
     fn a_listener_admits_the_calls_of_its_scopes_from_a_caller_with_a_principal() {
         let listeners: [&[Scope]; 4] = [
-            &[Scope::Gateway, Scope::Ingestion],
+            &[Scope::Gateway],
             &[Scope::Control],
             &[Scope::Replication],
             &Scope::ALL,
@@ -1905,7 +1915,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unserved_call_is_denied_off_its_scope_and_unimplemented_to_a_principal_on_it() {
-        let (_elector, _standing, gateway) = service(&[Scope::Gateway, Scope::Ingestion]);
+        let (_elector, _standing, gateway) = service(&[Scope::Gateway]);
         let (_elector, _standing, control) = service(&[Scope::Control]);
         let (_elector, _standing, replication) = service(&[Scope::Replication]);
 
@@ -2084,6 +2094,54 @@ mod tests {
         );
     }
 
+    /// A watch hears the role's word from its open on. The word that
+    /// nobody leads here, told before a take, stands until the take is
+    /// told: the fence admits a watch under it, and it ends no such watch.
+    /// Told again, it ends the watch whatever the fence reads.
+    #[tokio::test]
+    async fn a_watch_ends_at_a_role_told_after_its_open_and_at_none_before() {
+        let mut elector = Elector::alone(IDENTITY, PATIENT).expect("the settings are in order");
+        let (_standing, stood) = watch::channel(ElectionObservation::default());
+        // The role's word is the case's to tell, as the serve's one task
+        // tells it.
+        let (told, role) = watch::channel(None);
+        let (stood, stop, _untold, lag) = bed::unserved(stood);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            (stood, stop, role, lag),
+            bed::followed(journaled_from(&LeasePlace::Process, 0)),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
+            1,
+        )
+        .expect("the decider starts");
+        let service = Service::new(vec![Scope::Gateway], Arc::new(shared));
+        told.send_replace(None);
+        elector.lead_at(Instant::now());
+        service.shared.store.set_term(1);
+        let mut stream = service
+            .watch_workers(from("gateway-a", proto::WatchWorkersRequest::default()))
+            .await
+            .expect("opened")
+            .into_inner();
+        let mut next = async || {
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("a word within five seconds")
+                .expect("the stream is open")
+        };
+        let page = next()
+            .await
+            .expect("a page: the word before the open ends nothing");
+        assert_eq!((page.seq, page.term, page.membership_epoch), (1, 1, 0));
+        // The same word again, while the fence reads this replica's lead.
+        told.send_replace(None);
+        let ended = next().await.expect_err("the word told after the open");
+        assert_eq!(ended.code(), Code::Aborted);
+        assert_eq!(service.shared.fence.leader_term(Instant::now()), Some(1));
+    }
+
     /// The path the transport routes `Decide` by is the contract's: its
     /// service's name, then its method's.
     #[test]
@@ -2137,9 +2195,13 @@ mod tests {
     /// unimplemented, `Session` is reached (the empty message is no
     /// `Hello`), and registration, watching rows, snapshots and Explain
     /// are refused by a replica that does not lead. The names are read
-    /// from the contract, so a method added there joins the case.
+    /// from the contract, so a method added there joins the case. A name
+    /// the contract dropped is no method: whoever calls it, the transport
+    /// answers unimplemented and no body admits the call first.
     #[tokio::test]
     async fn every_method_of_the_contract_answers_by_its_calls_scopes_and_its_callers_principal() {
+        /// The relays' two calls, which left the contract.
+        const DROPPED: [&str; 2] = ["PushLoad", "PushKvEvents"];
         let methods = methods();
         assert_eq!(
             methods.len(),
@@ -2147,7 +2209,7 @@ mod tests {
             "one call a method, and Leader: {methods:?}"
         );
         let listeners = [
-            &[Scope::Gateway, Scope::Ingestion][..],
+            &[Scope::Gateway][..],
             &[Scope::Control],
             &[Scope::Replication],
         ];
@@ -2178,7 +2240,7 @@ mod tests {
                 .await
                 .expect("the listener accepts");
             let mut client = Grpc::new(channel);
-            for method in &methods {
+            for method in methods.iter().chain(&DROPPED) {
                 let path = PathAndQuery::try_from(format!("/smg.policy.v1.GrandCentral/{method}"))
                     .expect("a path");
                 client.ready().await.expect("the channel is ready");
@@ -2192,6 +2254,15 @@ mod tests {
                     .unary(request, path, ProstCodec::<(), ()>::default())
                     .await;
                 let round = format!("{method} on {scopes:?}, {layer:?}, a name stated: {stated}");
+                if DROPPED.contains(method) {
+                    let status = answered.expect_err("the contract holds no such method");
+                    assert_eq!(
+                        (status.code(), status.message()),
+                        (Code::Unimplemented, ""),
+                        "{round}"
+                    );
+                    continue;
+                }
                 if *method == "Leader" {
                     assert!(answered.is_ok(), "{round}: {answered:?}");
                     continue;
@@ -2311,9 +2382,9 @@ mod tests {
                     ID.to_owned(),
                     ADDRESS.to_owned(),
                     &elector,
-                    stood,
+                    bed::unserved(stood),
                     bed::followed((store, feed)),
-                    Arc::new(StageRegistry::builtin()),
+                    (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
                     2,
                 )
                 .expect("the deciders start"),
@@ -2508,7 +2579,7 @@ mod tests {
     #[tokio::test]
     async fn leader_answers_on_every_listener_and_for_every_model() {
         for scopes in [
-            &[Scope::Gateway, Scope::Ingestion][..],
+            &[Scope::Gateway][..],
             &[Scope::Control],
             &[Scope::Replication],
         ] {
@@ -2535,7 +2606,7 @@ mod tests {
     #[tokio::test]
     async fn the_read_call_answers_the_standing_document_once_a_source_applied_one() {
         let (_elector, _standing, control) = service(&[Scope::Control]);
-        let (_elector, _standing, gateway) = service(&[Scope::Gateway, Scope::Ingestion]);
+        let (_elector, _standing, gateway) = service(&[Scope::Gateway]);
         for service in [&control, &gateway] {
             service
                 .shared
@@ -3046,6 +3117,41 @@ mod tests {
         assert_eq!(issue.field_path, FIELD);
         assert_eq!(issue.message, format!("{FIELD} = 0 is not above zero"));
         assert_eq!(control.shared.generations.standing(), standing);
+    }
+
+    /// The write call refuses a document whose bindings differ on the
+    /// overload switch, at a dry run and at an enforce alike: one issue by
+    /// the field of the first binding that differs, in the refusal's words,
+    /// and the standing generation stays. Bindings that agree are taken.
+    #[tokio::test]
+    async fn the_write_call_names_the_binding_that_differs_on_the_overload_switch() {
+        const FIELD: &str = "bindings[1].overload.enabled";
+        const OFF: &str = "    overload:\n      enabled: false\n";
+        let (_dir, _elector, _standing, control) = stored(true);
+        let write = |mode: proto::ApplyMode, second: &str| {
+            let head = "apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\nbindings:\n";
+            let first = format!("  - match:\n      model: chat/*\n    profile: p\n{OFF}");
+            let document = format!("{head}{first}  - profile: p\n{second}");
+            control.apply_policy_spec(apply(mode, document, "yaml", ""))
+        };
+        let agreed = write(proto::ApplyMode::Enforce, OFF).await;
+        let agreed = agreed.expect("an answer").into_inner();
+        assert!(agreed.accepted, "{agreed:?}");
+        assert_eq!(agreed.generation, 1);
+        for mode in [proto::ApplyMode::DryRun, proto::ApplyMode::Enforce] {
+            let refused = write(mode, "").await.expect("an answer").into_inner();
+            assert!(!refused.accepted && !refused.read_only, "{refused:?}");
+            assert_eq!(refused.generation, 1, "the standing generation stays");
+            let [issue] = refused.issues.as_slice() else {
+                panic!("one issue: {refused:?}")
+            };
+            assert_eq!(issue.field_path, FIELD);
+            assert_eq!(
+                issue.message,
+                format!("{FIELD} = true is not the false bindings[0] says, by its block or the block's default: a controller builds its workers with one default set of overload thresholds, so the bindings of its document say one word")
+            );
+        }
+        assert_eq!(control.shared.generations.generation(), 1);
     }
 
     /// The spec's source is a file, which no call writes: an enforce and a

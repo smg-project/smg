@@ -316,7 +316,7 @@ mod tests {
             proto::{self, snapshot_request::Slice},
         },
         stages::registry::StageRegistry,
-        store::{MemoryStore, StoreCheckpoint, WorkerFacts, WorkerRow, WorkersStore},
+        store::{MemoryStore, Registrant, StoreCheckpoint, WorkerFacts, WorkerRow, WorkersStore},
         worker_host::{Members, Objects},
     };
 
@@ -351,26 +351,34 @@ mod tests {
         }
     }
 
-    /// A row under `key` that serves `model`: its id.
-    fn register(store: &MemoryStore, key: &str, model: &str) -> u64 {
-        store
-            .upsert(WorkerFacts {
-                key: key.to_owned(),
-                engine: key.to_owned(),
-                incarnation: 1,
-                models: vec![model.to_owned()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            })
-            .id()
-            .0
+    /// What a row under `key` that serves `model` states.
+    fn stated(key: &str, model: &str) -> WorkerFacts {
+        WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            models: vec![model.to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        }
     }
 
-    /// The rows a lone call reads of `store`, as the service reads them:
-    /// off the worker objects, whose holder follows the store first.
-    fn lone(store: &MemoryStore, models: &[String], limit: usize) -> (Vec<WorkerRow>, usize) {
-        let objects: Objects<Members> = Objects::new(Arc::default());
-        objects.rows_serving(store, models, limit)
+    /// A row under `key` that serves `model`, in a store no holder of
+    /// worker objects stands over: its id.
+    fn register(store: &MemoryStore, key: &str, model: &str) -> u64 {
+        store.upsert(stated(key, model)).id().0
+    }
+
+    /// A holder of worker objects with none yet, as a lone call reads its
+    /// rows off one.
+    fn holder() -> Objects<Members> {
+        Objects::new(Arc::default())
+    }
+
+    /// A row under `key` that serves `model`, written through `objects`.
+    fn laid(objects: &Objects<Members>, store: &MemoryStore, key: &str, model: &str) {
+        let written = objects.upsert(store, stated(key, model), Registrant::Control);
+        written.expect("the store takes the write");
     }
 
     /// The address of row `n`.
@@ -680,12 +688,12 @@ mod tests {
     /// mark says so. The first row is told whatever it weighs.
     #[test]
     fn rows_past_a_pages_bytes_are_left_out_and_said() {
-        let store = MemoryStore::new();
+        let (store, objects) = (MemoryStore::new(), holder());
         // A row tells its address three times: each of these passes a
         // page's bytes alone.
         for n in 0..3 {
             let wide = format!("grpc://{n}.{}:8000", "u".repeat(PAGE_BYTES / 2));
-            register(&store, &wide, "model-a");
+            laid(&objects, &store, &wide, "model-a");
         }
         let cut = store.checkpoint();
         let (page, truncated) = rows(&cut.rows, &ROWS, Instant::now());
@@ -696,7 +704,7 @@ mod tests {
             models: Vec::new(),
             limit: 3,
         };
-        let (read, serving) = lone(&store, &asked.models, asked.limit);
+        let (read, serving) = objects.rows_serving(&store, &asked.models, asked.limit);
         let (page, truncated) = super::rows(&asked, Rows::Told(read, serving), Instant::now());
         assert_eq!((page.len(), truncated), (1, true));
         assert!(page[0].url.starts_with("grpc://0."));
@@ -751,10 +759,10 @@ mod tests {
     /// the limit tells.
     #[test]
     fn the_rows_read_for_one_call_are_the_cuts_rows() {
-        let store = MemoryStore::new();
+        let (store, objects) = (MemoryStore::new(), holder());
         let models = ["model-a", "model-b", "model-a", "model-b", "model-a"];
         for (n, model) in models.into_iter().enumerate() {
-            register(&store, &url(n), model);
+            laid(&objects, &store, &url(n), model);
         }
         let cut = store.checkpoint();
         let filters = [
@@ -777,7 +785,8 @@ mod tests {
                     ..ROWS
                 };
                 let now = Instant::now();
-                let (read, serving) = lone(&store, &asked.rows.models, asked.rows.limit);
+                let (read, serving) =
+                    objects.rows_serving(&store, &asked.rows.models, asked.rows.limit);
                 assert!(read.len() <= limit, "models {models:?}, limit {limit}");
                 assert_eq!(
                     super::rows(&asked.rows, Rows::Told(read, serving), now),
@@ -1100,14 +1109,14 @@ mod tests {
             worker_rows_page, Rows as ReadRows, WorkerRowsQuery,
         };
 
-        let store = MemoryStore::new();
+        let (store, objects) = (MemoryStore::new(), holder());
         for (key, model) in [
             ("grpc://user:secret@host-a:8000", "a"),
             ("grpc://host-b:8000", "b"),
             ("grpc://user:se/cret@host-c:8000", "a"),
             ("grpc://host-d:8000", "b"),
         ] {
-            register(&store, key, model);
+            laid(&objects, &store, key, model);
         }
         let cut = Arc::new(store.checkpoint());
         let now = Instant::now() + Duration::from_secs(1);
@@ -1117,7 +1126,7 @@ mod tests {
                     models: models.clone(),
                     limit,
                 };
-                let (rows, serving) = lone(&store, &models, limit);
+                let (rows, serving) = objects.rows_serving(&store, &models, limit);
                 let expected = legacy_rows(&cut.rows, &models, limit, now);
                 for read in [
                     ReadRows::Shared(Arc::clone(&cut)),

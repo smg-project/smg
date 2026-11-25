@@ -1,8 +1,9 @@
 //! What is said of a lease on file, told to the engine that issued it.
 //!
-//! A dispatch, a completion or a release reaches the stages of the
-//! generation the lease was issued under, on the lease's record as the
-//! store found it. Whoever applies the report calls [`told`]: a decider, a
+//! A dispatch, a completion or a release reaches the stages that stood
+//! when the lease was issued, on the lease's record as the store found it:
+//! the generation's own, or the ones a later generation kept of them
+//! ([`issuing`]). Whoever applies the report calls [`told`]: a decider, a
 //! session, the gateways' sweep.
 
 use std::{
@@ -11,11 +12,11 @@ use std::{
 };
 
 use crate::{
-    document::spec::AppliedSpec,
     engine::{
         decision::Decision,
         decision_slot::DecisionSlot,
         framework::{release, Engine},
+        in_process::StoodAt,
         lease_events::{self, Hearers},
         view::WorkerId,
     },
@@ -30,11 +31,13 @@ use crate::{
 /// write a line for that one.
 ///
 /// The engine told is the one of the lease's own generation, where
-/// `world` holds that generation: a later generation's stages never saw
-/// the issue and hear nothing of it. The caller loads `world` for this
-/// word, or once for the words it tells in a row: behind a later
-/// generation's start, a word told under such a load still reaches the
-/// lease's own engine. A dispatch also feeds the counts of sends of the
+/// `world` holds that generation. Under a later generation it is what that
+/// generation kept of the stages that stood at the issue ([`issuing`]): a
+/// stage built since never saw the issue and hears nothing of it. The
+/// caller loads `world` for this word, or once for the words it tells in
+/// a row: behind a later generation's start, a word told under such a
+/// load still reaches the lease's own engine. A dispatch also feeds the
+/// counts of sends of the
 /// generation `world` holds, whichever generation issued the lease: a
 /// send is the host's, whatever document decided it
 /// ([`Engine::dispatched_sent`]). A count that does not know the rank
@@ -102,14 +105,54 @@ pub(crate) fn told(
     store.call_faulted()
 }
 
-/// The engine that hears a lease's words under `spec`: the one of the
-/// generation the lease was issued under, where that generation still
-/// stands. A later generation's engine heard no issue of the lease and
-/// hears nothing of it: no dispatch, no end, and no issue of a side a call
-/// decides later.
+/// The engine that hears a lease's words under a world ([`issuing`]), held
+/// for the telling.
+pub(crate) enum Issuing<'a> {
+    /// The engine of the lease's own generation, which the world holds.
+    Own(&'a Engine),
+    /// What the world's generation kept of the stages that stood when the
+    /// lease was issued ([`InProcess::stood_at`]). Its session table was
+    /// made with that generation and hears nothing of the lease
+    /// ([`Engine::table_from`]). It holds the front's document while the
+    /// word is told.
+    ///
+    /// [`InProcess::stood_at`]: crate::engine::in_process::InProcess::stood_at
+    Kept(StoodAt),
+    /// No engine: the world is older than the lease.
+    Nobody,
+}
+
+impl Issuing<'_> {
+    /// The engine told, where one hears.
+    #[inline]
+    pub(crate) fn engine(&self) -> Option<&Engine> {
+        match self {
+            Self::Own(engine) => Some(engine),
+            Self::Kept(kept) => Some(kept.engine()),
+            Self::Nobody => None,
+        }
+    }
+}
+
+/// The engine that hears a lease's words under `world`. For a lease of the
+/// world's own generation it is that generation's engine. For a lease of an
+/// earlier one it is what the world's generation kept of the stages that
+/// stood when the lease was issued: a stage it built new heard no issue of
+/// the lease and hears nothing of it, no dispatch, no end, and no issue of
+/// a side a call decides later. Neither does the generation's session
+/// table, which is new with it. Nobody hears under a world older than the
+/// lease.
 #[inline]
-pub(crate) fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a Engine> {
-    (spec.generation() == lease.generation).then(|| spec.engine())
+pub(crate) fn issuing<'a>(world: &'a StoreSnapshot, lease: &Lease) -> Issuing<'a> {
+    let spec = world.spec();
+    if lease.generation < spec.generation() {
+        return Issuing::Kept(world.front().stood_at(lease.generation));
+    }
+    if lease.generation == spec.generation() {
+        Issuing::Own(spec.engine())
+    } else {
+        Issuing::Nobody
+    }
 }
 
 /// What [`told`] tells, under its catch. A lease's words go by the
@@ -121,8 +164,10 @@ pub(crate) fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a En
 /// the read of the dispatch's frame. It says nothing more.
 fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(WorkerId, u16) -> bool) {
     let spec = world.spec();
+    // The issuing engine is said by a value, which the hearers borrow.
+    let issuing = issuing(world, &found.record.lease);
     let hearers = Hearers {
-        issuing: issuing(spec, &found.record.lease),
+        issuing: issuing.engine(),
         sends: spec.engine(),
         listed,
     };

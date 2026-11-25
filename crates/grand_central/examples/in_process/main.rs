@@ -8,10 +8,21 @@
 //! ([`InProcess::place`]): it keeps the placement to the request's end
 //! and says when the request went out and how it ended.
 //!
-//! `program.rs` is the program. This file runs it over three workers that
-//! serve nothing: a send is a line on the output, and one worker answers
-//! every send with a server error, so a request that meets it is asked
-//! again past it.
+//! `program.rs` is the program. This file runs it six times, over workers
+//! that serve nothing: a send is a line on the output. The first run is over
+//! three single workers, one of which answers every send with a server
+//! error, so a request that meets it is asked again past it. The second is
+//! over pairs of a prefill worker and a decode worker: the settings' mode
+//! says so, a request lends the two lists, and the same one call names both
+//! of its workers. The third is over such a pair behind two encoders: a
+//! request lends the three lists, one that carries an item states it, and
+//! the call names the item's encoder too. The fourth is over a pair whose
+//! decode goes out behind its prefill's answer: the program asks the engine
+//! for the decode again, behind that answer. The fifth is under a policy
+//! that places a routing key by a ring: the program lends its own
+//! (`ring.rs`), and a key goes to the worker that ring puts it on. The
+//! sixth is over workers on two wires: a retry stays on the wire of the
+//! worker its request went to first.
 //!
 //! `engine_load.rs` is a stage of the program's own, a scorer added in
 //! code. This file shows it once over records made by hand, as a program
@@ -31,19 +42,23 @@
 use std::{error::Error, sync::Arc};
 
 use engine_load::{decided_by_engine_load, stages};
-use program::{settings, Asked, Program};
+use http::{HeaderMap, HeaderValue};
+use program::{encode_settings, pair_settings, settings, Asked, Plan, Program};
 use smg_grand_central::{
-    document::{AppliedSpec, PolicySettings, PolicySpec},
-    engine::{Candidate, Constraints, PoolFacts, RequestFacts, Role, Scratch, Target, WorkerId},
+    document::{AppliedSpec, DecodePick, PolicySettings, PolicySpec},
+    engine::{
+        Candidate, Constraints, Identity, PoolFacts, RequestFacts, Role, Scratch, Target, WorkerId,
+    },
 };
 use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
     model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerStatus},
+    worker::{ConnectionMode, HealthCheckConfig, WorkerStatus, WorkerType},
 };
 
 mod engine_load;
 mod program;
+mod ring;
 
 /// The model the example's workers serve.
 const MODEL: &str = "model-a";
@@ -51,19 +66,26 @@ const MODEL: &str = "model-a";
 /// The worker that answers every send with a server error.
 const FAILING: &str = "http://worker-1:8000";
 
-/// A ready worker at `address` that serves [`MODEL`], with no health
-/// checker behind it.
-fn worker(address: &str) -> Arc<dyn Worker> {
+/// A ready worker of `kind` at `address` that serves [`MODEL`], dialed over
+/// `transport`, with no health checker behind it.
+fn dialed(address: &str, kind: WorkerType, transport: ConnectionMode) -> Arc<dyn Worker> {
     let health = HealthCheckConfig {
         disable_health_check: true,
         ..HealthCheckConfig::default()
     };
     let worker = <BasicWorkerBuilder>::new(address)
         .model(ModelCard::new(MODEL))
+        .worker_type(kind)
+        .connection_mode(transport)
         .health_config(health)
         .build();
     worker.set_status(WorkerStatus::Ready);
     Arc::new(worker)
+}
+
+/// [`dialed`] over HTTP.
+fn worker(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
+    dialed(address, kind, ConnectionMode::Http)
 }
 
 /// The example's network: a send is a line on the output.
@@ -84,23 +106,20 @@ fn own_stage() -> Result<(), Box<dyn Error>> {
     // A record made ready is an engine of its own. The two ranks state the
     // engine they share, and the worker behind them the next engine of the
     // list: an engine states its place among the engines of its list.
-    let rank = |position: u32, dp_rank: u16, in_flight: u32| Candidate {
-        engine: 0,
-        dp_rank,
-        dp_size: 2,
-        in_flight,
-        ..Candidate::ready(position, WorkerId(u64::from(position)), Role::Single)
+    let rank = |position: u32, dp_rank: u16, in_flight: u32| {
+        let mut row = Candidate::ready(position, WorkerId(u64::from(position)), Role::Single);
+        row.engine = 0;
+        row.dp_rank = dp_rank;
+        row.dp_size = 2;
+        row.in_flight = in_flight;
+        row
     };
-    let alone = Candidate {
-        engine: 1,
-        in_flight: 2,
-        ..Candidate::ready(2, WorkerId(2), Role::Single)
-    };
+    let mut alone = Candidate::ready(2, WorkerId(2), Role::Single);
+    alone.engine = 1;
+    alone.in_flight = 2;
     let records = [rank(0, 0, 3), rank(1, 1, 0), alone];
-    let facts = RequestFacts {
-        model: MODEL,
-        ..RequestFacts::default()
-    };
+    let mut facts = RequestFacts::default();
+    facts.model = MODEL;
     let (pool, cx) = (PoolFacts::default(), Constraints::default());
     let decision = engine.decide(&facts, &pool, &records, &cx, &mut Scratch::new());
     let first = decision.pick().and_then(|pick| pick.targets.first());
@@ -116,11 +135,13 @@ fn own_stage() -> Result<(), Box<dyn Error>> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // The document a configuration's `policy: round_robin` means.
-    let document = settings(PolicySettings::RoundRobin).policy_document()?;
-    let spec = AppliedSpec::validate(&document)?;
+    // The document a configuration's `policy: round_robin` means, and the
+    // kinds of worker its mode routes to: single workers.
+    let settings = settings(PolicySettings::RoundRobin);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
     // This program has no load monitor, so it hands the engine no channel.
-    let (program, task) = Program::start(spec, None, send);
+    let (program, task) = Program::start(plan, spec, None, send);
     #[expect(
         clippy::disallowed_methods,
         reason = "the engine's task runs for the life of the process"
@@ -129,7 +150,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let addresses = ["http://worker-0:8000", FAILING, "http://worker-2:8000"];
     for address in addresses {
-        assert!(program.join(worker(address)), "a free address joins");
+        let single = worker(address, WorkerType::Regular);
+        assert!(program.join(single), "a free address joins");
     }
     // The yield hands the engine's task its first poll: there it reads the
     // registry whole and tells the document's stages each worker.
@@ -137,6 +159,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let asked = Asked {
         model: MODEL,
         headers: None,
+        items: &[],
     };
     for request in 1..=4 {
         println!("request {request}:");
@@ -157,5 +180,198 @@ async fn main() -> Result<(), Box<dyn Error>> {
         answer.sent.len(),
         answer.unplaced
     );
+    pairs(&asked).await?;
+    encodes(&asked).await?;
+    in_turn(&asked).await?;
+    by_ring().await?;
+    on_one_wire(&asked).await?;
     own_stage()
+}
+
+/// The program over pairs: the same settings under the mode of a gateway
+/// that routes to a prefill worker and a decode worker, two of each. A
+/// request lends the two lists, and its one call names a prefill and a
+/// decode: both are sent, the prefill first.
+async fn pairs(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let settings = pair_settings(PolicySettings::RoundRobin);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let prefills = ["http://prefill-0:8000", "http://prefill-1:8000"];
+    let decodes = ["http://decode-0:8000", "http://decode-1:8000"];
+    for address in prefills {
+        let prefill = worker(address, WorkerType::Prefill);
+        assert!(program.join(prefill), "a free address joins");
+    }
+    for address in decodes {
+        let decode = worker(address, WorkerType::Decode);
+        assert!(program.join(decode), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    for request in 1..=2 {
+        println!("a pair's request {request}:");
+        let answer = program.serve(asked);
+        println!("  the client reads {}", answer.status);
+    }
+    Ok(())
+}
+
+/// The program over a pair behind encoders: the same settings under the
+/// mode of a gateway that sends a request's items to encode workers. Each
+/// request lends the three lists. One that carries an item states it, and
+/// its one call names the item's encoder beside the pair: this program
+/// sends the item first. The same request with no item is placed as its
+/// pair.
+async fn encodes(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let settings = encode_settings(PolicySettings::RoundRobin);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let fleet = [
+        ("http://encode-0:8000", WorkerType::Encode),
+        ("http://encode-1:8000", WorkerType::Encode),
+        ("http://prefill-0:8000", WorkerType::Prefill),
+        ("http://decode-0:8000", WorkerType::Decode),
+    ];
+    for (address, kind) in fleet {
+        assert!(program.join(worker(address, kind)), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    // An item's key is its caller's hash of the item's content.
+    let items = [Identity::plain("the hash of an item's content")];
+    let carrying = Asked {
+        items: &items,
+        ..*asked
+    };
+    println!("an encode request of one item:");
+    let answer = program.serve(&carrying);
+    println!("  the client reads {}", answer.status);
+    println!("the same request with no item:");
+    let answer = program.serve(asked);
+    println!("  the client reads {}", answer.status);
+    Ok(())
+}
+
+/// The program over a pair with two decodes, with a route that sends the
+/// decode behind its prefill's answer. The document picks the decode behind
+/// the prefill, which is the document's own word and no setting's. A
+/// request's one call books its prefill alone. Behind the prefill's answer
+/// the program states the request again and asks the placement for its
+/// decode: the decode that is sent is the one the engine names then.
+async fn in_turn(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let settings = pair_settings(PolicySettings::RoundRobin);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let mut document = settings.policy_document()?;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    let spec = AppliedSpec::validate(&document)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    let program = program.in_turn();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let fleet = [
+        ("http://prefill-0:8000", WorkerType::Prefill),
+        ("http://decode-0:8000", WorkerType::Decode),
+        ("http://decode-1:8000", WorkerType::Decode),
+    ];
+    for (address, kind) in fleet {
+        assert!(program.join(worker(address, kind)), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    for request in 1..=2 {
+        println!("a pair's request {request}, sent in turn:");
+        let answer = program.serve(asked);
+        println!("  the client reads {}", answer.status);
+    }
+    Ok(())
+}
+
+/// The program under `consistent_hashing` over three single workers, none
+/// of them [`FAILING`], each request under a routing key its header names.
+/// The program lends its own ring with the request, so a key's requests go
+/// to the worker that ring puts the key on: the first of the ring's walk
+/// from where the key stands. No send fails here, so no request walks on.
+async fn by_ring() -> Result<(), Box<dyn Error>> {
+    let settings = settings(PolicySettings::ConsistentHashing);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let addresses = [
+        "http://worker-0:8000",
+        "http://worker-2:8000",
+        "http://worker-3:8000",
+    ];
+    for address in addresses {
+        let single = worker(address, WorkerType::Regular);
+        assert!(program.join(single), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    for key in ["session-a", "session-b"] {
+        let lists = program.published(MODEL).ok_or("the model's generation")?;
+        let walk: Vec<&str> = lists.ring().walked(key).collect();
+        println!("the routing key {key}, whose walk of the program's ring is {walk:?}:");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", HeaderValue::from_static(key));
+        let asked = Asked {
+            model: MODEL,
+            headers: Some(&headers),
+            items: &[],
+        };
+        for _ in 0..2 {
+            let answer = program.serve(&asked);
+            println!("  the client reads {}", answer.status);
+        }
+    }
+    Ok(())
+}
+
+/// The program over single workers on two wires: two dialed over gRPC, one
+/// of which answers every send with a server error, and one over HTTP. A
+/// retry stays on the wire of the worker its request went to first, since
+/// the request a route keeps for a retry was built for that wire. So a
+/// request that meets the failing worker is asked again at the other
+/// worker over gRPC, and not at the one over HTTP, whose turn it is.
+async fn on_one_wire(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let settings = settings(PolicySettings::RoundRobin);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let fleet = [
+        (FAILING, ConnectionMode::Grpc),
+        ("http://worker-4:8000", ConnectionMode::Http),
+        ("http://worker-5:8000", ConnectionMode::Grpc),
+    ];
+    for (address, transport) in fleet {
+        let single = dialed(address, WorkerType::Regular, transport);
+        assert!(program.join(single), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    for request in 1..=3 {
+        println!("request {request}, over two wires:");
+        let answer = program.serve(asked);
+        println!("  the client reads {}", answer.status);
+    }
+    Ok(())
 }

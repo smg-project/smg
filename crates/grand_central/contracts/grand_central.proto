@@ -1,7 +1,6 @@
-// smg.policy.v1: Grand Central's gateway, ingestion, control and
+// smg.policy.v1: Grand Central's gateway, control and
 // replication protocol (design 5.2 and appendix A). The view and decision
-// vocabulary is in policy_plugin.proto; the relay frames carry the engine
-// wire's own messages (smg.grpc.common) unchanged.
+// vocabulary is in policy_plugin.proto.
 //
 // Versioning: design appendix A (additive within v1). The package is
 // pre-release until the first shipped release that carries it; the rule
@@ -11,12 +10,11 @@
 // FAILED_PRECONDITION, the status message naming the range and the
 // controller's version.
 //
-// Scopes and principals: design 5.2. Four credentialed scopes, each
+// Scopes and principals: design 5.2. Three credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
 // metadata, never a field a peer fills in. Gateway: Session, Decide,
 // WatchWorkers and Leader; a Hello whose gateway_id is not the verified
-// subject is refused with UNAUTHENTICATED and the stream closes. Ingestion:
-// PushLoad and PushKvEvents; the relay's subject is the RELAY origin.
+// subject is refused with UNAUTHENTICATED and the stream closes.
 // Control: `user` reads (GetSnapshot, Explain, GetPolicySpec, Leader,
 // WatchRegime), `admin` writes the rest; every call writes an audit event.
 // Replication: Replicate, whose stream carries a re-sync's snapshot in parts;
@@ -85,7 +83,7 @@
 // same), a veto of no kind, a Hello whose veto_count is not its list's
 // length, or a DecideRequest field out of its range in this protocol version
 // (the status message names the field, and the stream closes);
-// RESOURCE_EXHAUSTED a relay over its per-subscriber budget, a WatchWorkers
+// RESOURCE_EXHAUSTED a WatchWorkers
 // past its principal's ceiling of 4 open watches or past the replica's
 // ceiling of watching principals, a
 // Decide stream past its gateway's Welcome.max_decide_streams, a Session
@@ -115,7 +113,7 @@
 // call, a frame kind or a mode this build does not serve, or a spec call
 // of a controller given no spec source, by its name;
 // OUT_OF_RANGE and
-// DATA_LOSS raised by no handler, forwarded as RelayResync. The
+// DATA_LOSS raised by no handler. The
 // transport answers OUT_OF_RANGE itself to a request over its limit of
 // 4 MiB on a call of one request message; on a Session or Decide stream
 // the reader answers that finding RESOURCE_EXHAUSTED. Any other read of
@@ -128,7 +126,6 @@ syntax = "proto3";
 package smg.policy.v1;
 
 import "policy_plugin.proto";
-import "common.proto";
 
 service GrandCentral {
   // Gateway scope, one bidirectional stream per gateway: identity, leases,
@@ -142,9 +139,6 @@ service GrandCentral {
   // resumes after the last event it took. A principal holds at most 4
   // watches open at a replica: one more is refused RESOURCE_EXHAUSTED.
   rpc WatchWorkers(WatchWorkersRequest) returns (stream WorkerEvent);
-  // Ingestion scope (relays only), client streams answered once at the end.
-  rpc PushLoad(stream LoadReport) returns (Ack);
-  rpc PushKvEvents(stream RelayKvFrame) returns (Ack);
   // Control scope, unary. An answer says the row as written. A registration,
   // its refresh and a patch owe a build of the pools: it starts within one
   // publication window (20 ms) of their answer, and they are in force for
@@ -353,7 +347,10 @@ message Principal {
   enum Scope {
     SCOPE_UNSPECIFIED = 0;
     SCOPE_GATEWAY = 1;
-    SCOPE_INGESTION = 2;
+    // The ingestion scope's, which held two relay calls: no later scope
+    // takes its number or its name.
+    reserved 2;
+    reserved "SCOPE_INGESTION";
     SCOPE_CONTROL = 3;
     SCOPE_REPLICATION = 4;
   }
@@ -483,7 +480,11 @@ message DecideRequest {
   // the same lease id. A refusal is a Busy with a reason of its own, and a
   // decision that sheds is no refusal of the request, whose prefill runs:
   // behind either the gateway sends the decode the first pick named, and
-  // that Dispatched books the side. An id of 0 is out of range.
+  // that Dispatched books the side. A call whose frame names its worker
+  // (named_worker), under a spec whose binding holds the pair's decode side
+  // to that number, is refused so, as one whose decode side was never
+  // chosen: the decode stays the one the first pick named. An id of 0 is
+  // out of range.
   optional fixed64 decode_of = 6;
   // The items of an encode request. Its presence says that the request is
   // one, with a key or with none. Read on a frame of the encode phase, and
@@ -513,10 +514,28 @@ message DecideRequest {
   // worker, and neither its session key nor its client key is read. A text
   // that is no number is stated as 4294967295: it reaches no worker of any
   // list, as that text does. Absent, the request names no worker, so the
-  // frame of a host older than the field is decided as it was. Read on a
-  // frame that is decided over one list, a single request's and one that
-  // stands alone at a side's phase, under a spec whose binding for the
-  // frame names a target source, and on no other.
+  // frame of a host older than the field is decided as it was. Read under a
+  // spec whose binding for the frame names a target source: on a frame that
+  // is decided over one list, a single request's and one that stands alone
+  // at a side's phase, and on a pair's frame at its prefill. Not read on an
+  // encode request's frame.
+  //
+  // A pair's frame states the one number for its two sides, and each side
+  // whose profile is the plain hash ring reads it. The prefill's side counts
+  // the prefills the gateway can be sent to that pair with a decode it can
+  // be sent to, and those with such a decode among their first partners
+  // alone where there is one. The decode's side counts the partners so
+  // counted of the prefill reached. The decision is held to the two
+  // workers, or to the prefill alone where the decode's side does not read
+  // the number. Where the decode's side alone reads it, the decision counts
+  // it among the partners of the prefill it picks. A number that reaches no
+  // worker on a side sheds the pair with no endpoint, under
+  // `target-worker`, and so does a named worker that cannot take the
+  // request after all. Where no prefill can be counted, or none opens the
+  // pair, the pair is decided as one that names no worker, and its keys are
+  // read. Where every decode is over its thresholds and the spec steers
+  // such a pool, the decode goes by load and its number is not read. The
+  // pair's decode_later stands as it is stated.
   optional uint32 named_worker = 8;
 }
 
@@ -530,7 +549,9 @@ message EncodeItems {
   // The items taken as one: the caller's digest over them. A class of
   // encoders that takes them as one places it in the items' stead, so
   // callers that share a fleet agree on it. Absent where each item is
-  // encoded on its own.
+  // encoded on its own. A digest with no form is present all the same: it
+  // still says that the items are taken as one, and such a class places
+  // them once, with no affinity.
   Identity one = 2;
   // The items are references an encoder processes itself.
   bool references = 3;
@@ -790,13 +811,9 @@ message Reachability {
   }
 }
 
-// What one PD worker offers a rendezvous partner, and the store's class.
-// The store derives the class where the membership moves a member or an
-// offer, and again when a generation moves the pairing mode: the classes
-// then move at the same membership epoch and no watch event says so. A
-// registration hands none in. pair_class is the worker's one class on its
-// side, 0 outside any pairing: the decodes a prefill pairs with are the
-// snapshot's PairRow.decodes.
+// What one PD worker offers a rendezvous partner. A pair's classes are no
+// part of it: the holder of the worker objects derives them under the
+// pairing mode in force.
 message PairingDescriptor {
   string protocol = 1;
   string connector = 2;
@@ -805,7 +822,11 @@ message PairingDescriptor {
   uint32 bootstrap_port = 5;
   string bootstrap_host = 6;
   map<string, string> kv_layout = 7;
-  uint32 pair_class = 8;
+  // The pair class, which no writer filled: no later field takes its
+  // number or its name. A registration or a told row that still states it
+  // is read as one that states none.
+  reserved 8;
+  reserved "pair_class";
   bool ec_producer = 9;
   bool ec_consumer = 10;
   bool vision = 11;
@@ -863,63 +884,6 @@ message Signals {
   uint32 scrape_interval_ms = 4;
   // The scrape source's engine-family name.
   string scrape_family = 5;
-}
-
-// --- Ingestion scope: relays only -------------------------------------------
-
-// One load record of one rank: the engine wire's EngineLoad unchanged, with
-// the worker, the rank and the relay's receipt; a gateway in front of a
-// host-local wire forwards what it received, its verified subject the origin.
-message LoadReport {
-  fixed64 worker_id = 1;
-  // When the relay has no id yet (a worker it registered itself).
-  string registration_key = 2;
-  uint32 dp_rank = 3;
-  smg.grpc.common.EngineLoad record = 4;
-  // EVENTS, POLL or SCRAPE at the relay; the controller records the RELAY hop.
-  SignalSource source = 5;
-  // The relay's receipt, microseconds since its stream opened.
-  uint64 received_offset_micros = 6;
-  uint64 relay_seq = 7;
-}
-
-// The engine wire's event batch unchanged, or the stream status the relay saw.
-message RelayKvFrame {
-  fixed64 worker_id = 1;
-  string registration_key = 2;
-  oneof frame {
-    smg.grpc.common.KvEventBatch batch = 3;
-    RelaySubscribed subscribed = 4;
-    RelayResync resync = 5;
-    RelayEnded ended = 6;
-  }
-  uint64 received_offset_micros = 7;
-}
-
-message RelaySubscribed {
-  uint64 start_sequence_number = 1;
-  bool loads_only = 2;
-  uint32 dp_size = 3;
-}
-
-// The engine wire's status codes and stream ends as frames.
-message RelayResync {
-  enum Reason {
-    REASON_UNSPECIFIED = 0;
-    REASON_OUT_OF_RANGE = 1;
-    REASON_DATA_LOSS = 2;
-    REASON_STREAM_ENDED = 3;
-    REASON_SNAPSHOT_ABANDONED = 4;
-    REASON_RELAY_RESTART = 5;
-    REASON_ENGINE_REPLACED = 6;
-  }
-  Reason reason = 1;
-  uint32 dp_rank = 2;
-  uint64 resume_from = 3;
-}
-
-message RelayEnded {
-  string reason = 1;
 }
 
 // --- Control scope: membership ----------------------------------------------
@@ -1072,6 +1036,7 @@ message SnapshotRequest {
     SLICE_LOADS = 3;
     SLICE_SESSIONS = 4;
     SLICE_LEASES = 5;
+    // Its rows left the answer (Snapshot's number 9): no build serves it.
     SLICE_PAIRS = 6;
     SLICE_SPEC = 7;
     SLICE_PLUGINS = 8;
@@ -1100,7 +1065,10 @@ message Snapshot {
   repeated LoadSample loads = 6;
   repeated SessionRow sessions = 7;
   repeated LeaseRow leases = 8;
-  repeated PairRow pairs = 9;
+  // The pair rows, which no writer filled: no later field takes their
+  // number or their name.
+  reserved 9;
+  reserved "pairs";
   SpecStatus spec = 10;
   repeated PluginState plugins = 11;
   KvIndexSummary kv_index = 12;
@@ -1163,12 +1131,8 @@ message LeaseRow {
   bool dispatched = 7;
 }
 
-message PairRow {
-  fixed64 prefill_id = 1;
-  repeated fixed64 decodes = 2 [packed = true];
-  uint32 pair_class = 3;
-  uint32 slots_free = 4;
-}
+// PairRow, the row of a snapshot's pairs, which no writer filled, left
+// with them: no later message takes its name.
 
 enum ApplyMode {
   APPLY_MODE_UNSPECIFIED = 0;

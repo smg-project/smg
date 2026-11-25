@@ -209,7 +209,7 @@ impl DispatchCredit {
     }
 
     pub(crate) fn membership(&self, change: &Membership<'_>) {
-        self.credits().membership(change, |_| {});
+        self.credits().membership(change);
     }
 
     /// Whether the profile sets a time limit or a report delay on its

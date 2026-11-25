@@ -15,7 +15,7 @@ use crate::{
         Constraints, EncodeItems, EncodeLists, EncodePlaced, EncoderFacts, Identity, InProcess,
         PairLists, Phase, Request, RequestFacts, Role, WorkerId,
     },
-    store::{EncodeHandoff, EncodeOffer, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{EncodeHandoff, EncodeOffer, Registrant, WorkerFacts, WorkersStore},
     worker_host::OpenAdmission,
 };
 
@@ -272,8 +272,7 @@ fn a_row_whose_encode_end_moves_gets_a_new_object_and_a_new_generation() {
 /// each named by its place in its list and by its row's id.
 #[test]
 fn the_lent_lists_and_the_holders_columns_place_an_item_of_one_fleet() {
-    let mut replica = Replica::new();
-    replica.objects = replica.objects.with_status_followed();
+    let replica = Replica::new();
     let sides = [
         (PREFILL, Role::Prefill, push(Role::Prefill, "a")),
         (PREFILL_1, Role::Prefill, push(Role::Prefill, "b")),
@@ -286,14 +285,17 @@ fn the_lent_lists_and_the_holders_columns_place_an_item_of_one_fleet() {
             max_running: Some(4_096),
             ..end(url, role, "one", offer)
         };
-        let id = replica.store.upsert(facts).id();
+        let written = replica
+            .objects
+            .upsert(&replica.store, facts, Registrant::Control);
+        let id = written.expect("the store takes the write").id();
         replica.store.publish_now();
         let row = replica.store.by_key(url).expect("a row");
-        let ready = WorkerStatus::Ready;
-        assert!(replica.store.set_status(id, ready, row.revision).is_some());
+        replica
+            .objects
+            .connect_row(&replica.store, id, row.revision);
         id
     });
-    replica.objects.follow(&replica.store);
     let preset = "least_load";
     let document = PolicySpec::epd_presets(preset, preset, preset).expect("the stock presets");
     let applied = || AppliedSpec::validate(&document).expect("the stock document");

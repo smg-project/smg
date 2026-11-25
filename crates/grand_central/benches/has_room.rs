@@ -77,17 +77,13 @@ fn rows(n: usize) -> Vec<Candidate> {
 /// Tells the engine of one send to each row, stated after every report of
 /// the fleet was sampled: the rule's count holds it at each decision.
 fn send_each(engine: &Engine, rows: &[Candidate]) {
-    let lease = Lease {
-        issued_micros: 999_500,
-        tokens: 379,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = 999_500;
+    lease.tokens = 379;
     for row in rows {
-        let target = Target {
-            id: row.id,
-            dp_rank: row.dp_rank,
-            ..Target::default()
-        };
+        let mut target = Target::default();
+        target.id = row.id;
+        target.dp_rank = row.dp_rank;
         engine.on_dispatched(&lease, &target, Side::Single, 0);
     }
 }
@@ -106,13 +102,11 @@ fn paths(c: &mut Criterion) {
     ];
     for &n in &SIZES {
         let view = rows(n);
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            // Every row of the bench's fleet reports a rate.
-            reported: true,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
+        // Every row of the bench's fleet reports a rate.
+        pool.reported = true;
         let cx = Constraints::default();
         for (path, with_rule, drawn, sends) in cells {
             let engine = policy(with_rule, drawn);
@@ -124,13 +118,11 @@ fn paths(c: &mut Criterion) {
                 let mut seed = 0u64;
                 b.iter(|| {
                     seed += 1;
-                    let facts = RequestFacts {
-                        model: "m",
-                        prompt_tokens: 512,
-                        seed,
-                        now_micros: 1_000_000,
-                        ..RequestFacts::default()
-                    };
+                    let mut facts = RequestFacts::default();
+                    facts.model = "m";
+                    facts.prompt_tokens = 512;
+                    facts.seed = seed;
+                    facts.now_micros = 1_000_000;
                     engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
                 });
             });

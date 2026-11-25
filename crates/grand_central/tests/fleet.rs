@@ -166,10 +166,6 @@ const READS_KEPT_LOADS: bool = false;
 /// placed anew at its first request behind an apply.
 const KEEPS_PINS_ACROSS_AN_APPLY: bool = false;
 
-/// A controller's decisions read no cache event yet: a prompt is not sent
-/// to the worker whose events say it holds the blocks.
-const READS_CACHE_EVENTS: bool = false;
-
 const MODEL: &str = "fleet-model";
 
 /// The model of the engines whose load reports count resident tokens.
@@ -1426,12 +1422,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             let pick = picked(&mut harness, ask)
                 .await
                 .expect("a pick answers an ask over a ready fleet");
-            if READS_CACHE_EVENTS {
-                assert_eq!(
-                    pick.engine, busy,
-                    "a prompt goes to the engine that holds its blocks: {pick:?}"
-                );
-            }
+            assert_eq!(
+                pick.engine, busy,
+                "a prompt goes to the engine that holds its blocks: {pick:?}"
+            );
             let pick = picked(&mut harness, nth("unheld", n))
                 .await
                 .expect("a pick answers an ask over a ready fleet");
@@ -2806,10 +2800,11 @@ async fn a_handle_over_a_link_ends_a_lease_its_alternate_served() {
         for id in ["held-0", "held-1", "held-2"] {
             let asked = Request {
                 id: id.as_bytes(),
-                facts: RequestFacts {
-                    model: MODEL,
-                    budget_micros: 5_000_000,
-                    ..RequestFacts::default()
+                facts: {
+                    let mut facts = RequestFacts::default();
+                    facts.model = MODEL;
+                    facts.budget_micros = 5_000_000;
+                    facts
                 },
                 constraints: Default::default(),
             };
@@ -2898,10 +2893,11 @@ async fn a_handle_over_a_link_is_answered_the_worker_its_request_names() {
         for (id, named) in asks {
             let asked = Request {
                 id: id.as_bytes(),
-                facts: RequestFacts {
-                    model: MODEL,
-                    budget_micros: 5_000_000,
-                    ..RequestFacts::default()
+                facts: {
+                    let mut facts = RequestFacts::default();
+                    facts.model = MODEL;
+                    facts.budget_micros = 5_000_000;
+                    facts
                 },
                 constraints: Default::default(),
             };
@@ -3140,9 +3136,10 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         let now = Instant::now();
         leases
             .issue(LeaseRecord {
-                lease: Lease {
-                    id: LeaseId(1),
-                    ..Lease::default()
+                lease: {
+                    let mut lease = Lease::default();
+                    lease.id = LeaseId(1);
+                    lease
                 },
                 gateway,
                 request: 1,

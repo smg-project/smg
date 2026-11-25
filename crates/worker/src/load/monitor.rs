@@ -59,7 +59,9 @@
 //! [`LEAST_POLL_INTERVAL`]. A tick ends at the next one at the latest. A
 //! fetch still open then is kept: its answer is a batch when it comes, and
 //! its engine is asked again behind it, at once where the tick it comes in
-//! has not ended.
+//! has not ended. Where another worker holds the worker's URL by then, an
+//! answer is not told to the sink and nothing of it is published; a fetch
+//! that failed is said as one, as at any tick.
 //!
 //! ## The port
 //!
@@ -998,7 +1000,7 @@ impl<G: Generation> WorkerMonitor<G> {
         // A record feeds the DP-rank token cache nothing. The cache's one
         // reader is the HTTP pair router's rank pick, and a stream is opened
         // for a gRPC worker alone: no pick reads a pushing worker's entry. A
-        // poll feeds the cache (`poll_group_once`).
+        // poll feeds the cache (`poll_group`).
         //
         // The window's publish takes the report once, under the incarnation
         // that pushed last: the file's pusher, queued once a window.
@@ -3091,6 +3093,7 @@ impl OpenFetches {
 
 /// One whole tick of a group at `now`: every engine it asks is awaited, and
 /// their answers are one publish.
+#[cfg(any(test, feature = "test-util"))]
 async fn poll_group_once<G: Generation>(
     monitor: &Arc<WorkerMonitor<G>>,
     group_key: &WorkerGroupKey,
@@ -3167,8 +3170,9 @@ async fn poll_group<G: Generation>(
     // here touches its entry. The others are polled: no record ever
     // (`poll`) or records gone quiet (`fallback`). A worker whose engine
     // has not answered an earlier tick has no decision at this one, nor
-    // has a worker that took its URL since: the answer is published when
-    // it comes, and the engine is asked again behind it.
+    // has a worker that took its URL since. The answer that comes is
+    // published for a worker that holds its URL still, and the engine is
+    // asked again behind it.
     if asks {
         if open.asked.is_empty() {
             open.ask(monitor, group_key, interval, now, &workers);
@@ -3234,7 +3238,35 @@ async fn poll_group<G: Generation>(
         // beside the entries.
         let mut failed: Vec<Arc<dyn Worker>> = Vec::new();
         for (asked_at, mut engine) in engines {
-            let carries_rank_capacity = monitor.reconcile_engine(&mut engine, asked_at);
+            // A fetch that failed is said to the sink for the workers it
+            // was asked for, as at any tick: that word names workers and
+            // lays nothing at a URL.
+            let failed_fetch = engine.iter().all(|(_, response)| response.is_none());
+            if failed_fetch {
+                monitor.reconcile_engine(&mut engine, asked_at);
+            }
+            // An answer for a worker whose URL another worker holds by now
+            // says nothing at that URL: the rank counts and the row there
+            // are the other worker's once its own poll wrote them, and what
+            // the worker that left still has there goes with its eviction.
+            engine.retain(|(worker, _)| {
+                monitor
+                    .worker_registry
+                    .get_by_url(worker.url())
+                    .is_none_or(|holder| Arc::ptr_eq(&holder, worker))
+            });
+            // With no member left nothing is published, and an answer that
+            // came is not told to the sink, where an engine with no answer
+            // reads as a fetch that failed.
+            if engine.is_empty() {
+                continue;
+            }
+            // No member of a fetch that failed carries rank capacity.
+            let carries_rank_capacity = if failed_fetch {
+                vec![false; engine.len()]
+            } else {
+                monitor.reconcile_engine(&mut engine, asked_at)
+            };
             for ((worker, response), carries_rank_capacity) in
                 engine.into_iter().zip(carries_rank_capacity)
             {
@@ -3909,6 +3941,8 @@ mod native_loads_tests {
     struct SourceConnector {
         source: Option<Arc<HostLoads>>,
         asked: Mutex<Vec<String>>,
+        /// The runtime each ask named.
+        asked_as: Mutex<Vec<RuntimeType>>,
         /// How many of the next asks never answer.
         silent_asks: AtomicUsize,
     }
@@ -3921,6 +3955,7 @@ mod native_loads_tests {
                     calls: AtomicUsize::new(0),
                 })),
                 asked: Mutex::new(Vec::new()),
+                asked_as: Mutex::new(Vec::new()),
                 silent_asks: AtomicUsize::new(0),
             })
         }
@@ -3953,9 +3988,10 @@ mod native_loads_tests {
         async fn http_load_source(
             &self,
             base_url: &str,
-            _runtime: RuntimeType,
+            runtime: RuntimeType,
         ) -> Option<Arc<dyn LoadSource>> {
             self.asked.lock().push(base_url.to_string());
+            self.asked_as.lock().push(runtime);
             // One poll asks at a time in these cases: a read, then a write.
             if self.silent_asks.load(Ordering::Relaxed) > 0 {
                 self.silent_asks.fetch_sub(1, Ordering::Relaxed);
@@ -4966,6 +5002,55 @@ mod native_loads_tests {
         assert!(memo.is_empty());
     }
 
+    /// A registration's one read of an engine's load route asks the host's
+    /// connector first, with the engine's address and its runtime. While
+    /// the connector may still say, the engine is asked nothing. A
+    /// connector that has not said at the poll's deadline keeps no source
+    /// for this read: the engine's route is asked once, its answer by rank
+    /// is the read's, and the source is never called.
+    ///
+    /// The read builds under its step's feature, and so does this case.
+    #[cfg(feature = "workflow")]
+    #[tokio::test]
+    async fn a_registrations_read_asks_the_engine_once_its_connector_is_late_to_say() {
+        use crate::connection::client_factory::http_client;
+
+        let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
+        let late = SourceConnector::keeping(Some(host_answer(2)));
+        late.silent_asks.store(1, Ordering::Relaxed);
+        let client = http_client();
+        // The wait for the connector runs on a paused clock, and the engine
+        // is read on the running one: no request waits on a clock that jumps.
+        tokio::time::pause();
+        let read = WorkerMonitor::read_engine_loads(
+            late.as_ref(),
+            RuntimeType::Sglang,
+            &client,
+            &stub.url,
+            None,
+        );
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = &mut read => panic!("the read ended before the connector's deadline"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(*late.asked.lock(), [stub.url.as_str()]);
+        assert_eq!(*late.asked_as.lock(), [RuntimeType::Sglang]);
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 0);
+
+        tokio::time::advance(LOAD_POLL_DEADLINE + Duration::from_millis(1)).await;
+        tokio::time::resume();
+        let loads = read.await;
+        assert!(
+            matches!(&loads, Some(NativeLoads::Available(answer)) if answer.names_dp_ranks(2)),
+            "the engine's own answer by rank"
+        );
+        assert_eq!(stub.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(late.asked.lock().len(), 1);
+        assert_eq!(late.calls(), 0);
+    }
+
     /// A polled answer's named values stand under the bounds a pushed
     /// record's do, and what left them is counted for the worker. A
     /// `values` key of another shape is the engine's own: its rank is
@@ -5492,6 +5577,100 @@ mod native_loads_tests {
                     .select_and_increment_lowest_dp_load(worker.as_ref(), 1),
                 if missing { None } else { Some(1) },
             );
+        }
+    }
+
+    /// An engine can answer, or fail, after its worker left and another
+    /// worker took the URL, of another model or of the same. What comes late
+    /// says nothing at that URL: the worker that came keeps the row and the
+    /// rank counts its own poll wrote.
+    #[tokio::test]
+    async fn an_answer_for_a_worker_that_left_says_nothing_at_the_url_another_took() {
+        const LEFT: &str = r#"{"dp_rank_count":2,"loads":[
+            {"dp_rank":0,"num_used_tokens":900,"max_total_num_tokens":1000},
+            {"dp_rank":1,"num_used_tokens":100,"max_total_num_tokens":1000}]}"#;
+        const CAME: &str = r#"{"dp_rank_count":2,"loads":[
+            {"dp_rank":0,"num_used_tokens":100,"max_total_num_tokens":1000},
+            {"dp_rank":1,"num_used_tokens":900,"max_total_num_tokens":1000}]}"#;
+        let group = |model: &str| WorkerGroupKey {
+            model_id: model.to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        for late in [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE] {
+            for model_of_came in ["b", "a"] {
+                let case = format!("{late} behind a worker of model {model_of_came}");
+                // The engine holds its first answer until it is let go, gives
+                // it with the status `late`, and gives every later one at once.
+                let let_go = Arc::new(Notify::new());
+                let asked = Arc::new(AtomicUsize::new(0));
+                let app = axum::Router::new().route(
+                    "/v1/loads",
+                    axum::routing::get({
+                        let (let_go, asked) = (Arc::clone(&let_go), Arc::clone(&asked));
+                        move || {
+                            let first = asked.fetch_add(1, Ordering::SeqCst) == 0;
+                            let let_go = Arc::clone(&let_go);
+                            async move {
+                                if first {
+                                    let_go.notified().await;
+                                    (late, LEFT)
+                                } else {
+                                    (StatusCode::OK, CAME)
+                                }
+                            }
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test stub server lives for the duration of the test process"
+                )]
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.expect("stub serve");
+                });
+
+                let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+                let worker = gauge_worker(&url);
+                worker.set_status(WorkerStatus::Ready);
+                let left = registry.register(worker).unwrap();
+                let (of_left, of_came) = (group("a"), group(model_of_came));
+                let tick =
+                    poll_group_once(&monitor, &of_left, Duration::from_secs(10), Instant::now());
+                tokio::pin!(tick);
+                tokio::select! {
+                    () = &mut tick => panic!("the tick ended ahead of its engine's answer"),
+                    () = wait_until("the tick's fetch", || asked.load(Ordering::SeqCst) == 1) => {}
+                }
+
+                assert!(registry.remove(&left).is_some());
+                let came = gauge_worker_with_model(&url, model_of_came);
+                came.set_status(WorkerStatus::Ready);
+                registry.register(Arc::clone(&came)).unwrap();
+                poll_group_once(&monitor, &of_came, Duration::from_secs(10), Instant::now()).await;
+                let lighter_rank = || {
+                    monitor
+                        .worker_load_manager
+                        .select_and_increment_lowest_dp_load(came.as_ref(), 0)
+                };
+                let used_tokens = || {
+                    monitor.load_state.snapshot().get(&url).map(|row| {
+                        row.loads
+                            .iter()
+                            .map(|rank| rank.num_used_tokens)
+                            .collect::<Vec<_>>()
+                    })
+                };
+                assert_eq!(used_tokens(), Some(vec![100, 900]), "{case}");
+                assert_eq!(lighter_rank(), Some(0), "{case}");
+
+                let_go.notify_one();
+                tick.await;
+                assert_eq!(used_tokens(), Some(vec![100, 900]), "{case}");
+                assert_eq!(lighter_rank(), Some(0), "{case}");
+            }
         }
     }
 

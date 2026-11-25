@@ -117,9 +117,7 @@ serde_yaml = { workspace = true, optional = true }
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "time", "use-libc-auxv"], optional = true }
 
 # The binary's allocator, the one the gateway's binary registers, on the
-# targets the gateway registers it: a burst of registrations builds the
-# store's world again at every write, and the system allocator keeps resident
-# what those builds free.
+# targets the gateway registers it.
 [target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 
@@ -525,6 +523,13 @@ harness = false
 name = "in_process"
 harness = false
 required-features = ["in-process"]
+
+# A batch of cache events through the worker host's adapter, beside the same
+# writes on a bare chain index.
+[[bench]]
+name = "kv_adapter"
+harness = false
+required-features = ["worker-host"]
 
 [lints]
 workspace = true

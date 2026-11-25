@@ -245,9 +245,10 @@ impl Demands {
 /// Whether the worker takes
 /// images is no entry of the column: its row carries that bit
 /// ([`WorkerFacts::vision`](crate::store::WorkerFacts::vision)). Further
-/// demands add their fields: a host writes the rest of the type as
-/// `..DemandFacts::default()`.
+/// demands add their fields: a host starts from the default and assigns
+/// what it knows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DemandFacts {
     /// The worker's runtime as a number its registering host names: equal
     /// numbers are one runtime, and the crate reads no more of it. A host

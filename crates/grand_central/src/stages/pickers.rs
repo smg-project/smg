@@ -12,7 +12,6 @@ use crate::{
         view::{Candidate, PoolFacts, RequestFacts},
     },
     stages::lifecycle::Lifecycle,
-    tracking::in_flight::with_counts,
     Draw,
 };
 
@@ -701,52 +700,50 @@ impl Picker for CountFirst {
         candidates: &[Candidate],
         kept: &mut [u32],
     ) -> Shortlist {
-        with_counts!(facts, |counts| {
-            let count = |row: u32| counts(&candidates[row as usize]);
-            let Some(fewest) = kept.iter().map(|&row| count(row)).min() else {
-                return Shortlist::all(0);
-            };
-            let mut compared = 0usize;
-            for i in 0..kept.len() {
-                if count(kept[i]) == fewest {
-                    kept.swap(compared, i);
-                    compared += 1;
-                }
+        let count = |row: u32| facts.in_flight(&candidates[row as usize]);
+        let Some(fewest) = kept.iter().map(|&row| count(row)).min() else {
+            return Shortlist::all(0);
+        };
+        let mut compared = 0usize;
+        for i in 0..kept.len() {
+            if count(kept[i]) == fewest {
+                kept.swap(compared, i);
+                compared += 1;
             }
-            // The alternates the target list still has room for once the
-            // compared set is ordered: the next by count, equal counts drawn.
-            let alternates = MAX_TARGETS
-                .saturating_sub(compared)
-                .min(kept.len() - compared);
-            // The order of equal counts is drawn from a stream of its own, so it
-            // says nothing of the tie among the fewest (the seed's stream, which
-            // `pick` reads) nor of the draws a pair plan's decode side makes.
-            let mut draw = Draw::new(facts.seed ^ ALTERNATES_STREAM);
-            for slot in compared..compared + alternates {
-                let mut next = slot;
-                let mut tied = 1usize;
-                for i in slot + 1..kept.len() {
-                    match count(kept[i]).cmp(&count(kept[next])) {
-                        std::cmp::Ordering::Less => {
-                            next = i;
-                            tied = 1;
-                        }
-                        std::cmp::Ordering::Equal => {
-                            tied += 1;
-                            if draw.below(tied) == 0 {
-                                next = i;
-                            }
-                        }
-                        std::cmp::Ordering::Greater => {}
+        }
+        // The alternates the target list still has room for once the
+        // compared set is ordered: the next by count, equal counts drawn.
+        let alternates = MAX_TARGETS
+            .saturating_sub(compared)
+            .min(kept.len() - compared);
+        // The order of equal counts is drawn from a stream of its own, so it
+        // says nothing of the tie among the fewest (the seed's stream, which
+        // `pick` reads) nor of the draws a pair plan's decode side makes.
+        let mut draw = Draw::new(facts.seed ^ ALTERNATES_STREAM);
+        for slot in compared..compared + alternates {
+            let mut next = slot;
+            let mut tied = 1usize;
+            for i in slot + 1..kept.len() {
+                match count(kept[i]).cmp(&count(kept[next])) {
+                    std::cmp::Ordering::Less => {
+                        next = i;
+                        tied = 1;
                     }
+                    std::cmp::Ordering::Equal => {
+                        tied += 1;
+                        if draw.below(tied) == 0 {
+                            next = i;
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {}
                 }
-                kept.swap(slot, next);
             }
-            Shortlist {
-                compared,
-                alternates,
-            }
-        })
+            kept.swap(slot, next);
+        }
+        Shortlist {
+            compared,
+            alternates,
+        }
     }
 
     fn pick(
@@ -758,36 +755,34 @@ impl Picker for CountFirst {
         band: TieBand,
         out: &mut Targets,
     ) {
-        with_counts!(facts, |counts| {
-            let count = |row: u32| counts(&candidates[row as usize]);
-            // The ties are drawn from the seed's own stream, as the best picker
-            // draws them: the alternates' order has a stream of its own.
-            let mut draw = Draw::new(facts.seed);
-            // The narrowing leaves one count, and among equal counts the pick is
-            // the best picker's.
-            if kept.windows(2).all(|pair| count(pair[0]) == count(pair[1])) {
-                return push_ranked::<false>(draw, candidates, kept, scores, band, out);
-            }
-            // Rows that were never narrowed: the same rule a slot, among the
-            // fewest in flight of the rows left. Every row here came with a
-            // score, so equal counts past the fewest go by score too, where the
-            // narrowing draws them unscored.
-            let mut taken = [usize::MAX; MAX_TARGETS];
-            for slot in 0..MAX_TARGETS.min(kept.len()) {
-                let left = |i: usize| !taken[..slot].contains(&i);
-                let rows = kept.iter().enumerate();
-                let fewest = rows
-                    .filter(|&(i, _)| left(i))
-                    .map(|(_, &row)| count(row))
-                    .min();
-                let open = |i: usize| left(i) && Some(count(kept[i])) == fewest;
-                let Some(b) = draw_in_band(scores, band, &mut draw, open) else {
-                    break;
-                };
-                taken[slot] = b;
-                out.push(target_of(&candidates[kept[b] as usize]));
-            }
-        });
+        let count = |row: u32| facts.in_flight(&candidates[row as usize]);
+        // The ties are drawn from the seed's own stream, as the best picker
+        // draws them: the alternates' order has a stream of its own.
+        let mut draw = Draw::new(facts.seed);
+        // The narrowing leaves one count, and among equal counts the pick is
+        // the best picker's.
+        if kept.windows(2).all(|pair| count(pair[0]) == count(pair[1])) {
+            return push_ranked::<false>(draw, candidates, kept, scores, band, out);
+        }
+        // Rows that were never narrowed: the same rule a slot, among the
+        // fewest in flight of the rows left. Every row here came with a
+        // score, so equal counts past the fewest go by score too, where the
+        // narrowing draws them unscored.
+        let mut taken = [usize::MAX; MAX_TARGETS];
+        for slot in 0..MAX_TARGETS.min(kept.len()) {
+            let left = |i: usize| !taken[..slot].contains(&i);
+            let rows = kept.iter().enumerate();
+            let fewest = rows
+                .filter(|&(i, _)| left(i))
+                .map(|(_, &row)| count(row))
+                .min();
+            let open = |i: usize| left(i) && Some(count(kept[i])) == fewest;
+            let Some(b) = draw_in_band(scores, band, &mut draw, open) else {
+                break;
+            };
+            taken[slot] = b;
+            out.push(target_of(&candidates[kept[b] as usize]));
+        }
     }
 }
 

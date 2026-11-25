@@ -4,7 +4,7 @@
 //! and the `contention` bench, so all three measure one fleet.
 use smg_grand_central::{
     document::PolicySpec,
-    engine::{Candidate, Engine, Health, LoadRow, SignalSource, WorkerId},
+    engine::{Candidate, Engine, LoadRow, SignalSource, WorkerId},
 };
 
 /// What a host reads per worker before it writes a row.
@@ -43,27 +43,24 @@ pub fn fleet(n: usize) -> Vec<WorkerState> {
 pub fn build_view(fleet: &[WorkerState], out: &mut Vec<Candidate>) {
     out.clear();
     for (i, w) in fleet.iter().enumerate() {
-        out.push(Candidate {
-            position: i as u32,
-            id: WorkerId(w.id),
-            key: w.id as u32,
-            health: Health {
-                healthy: w.healthy,
-                ..Health::default()
-            },
-            in_flight: w.in_flight,
-            load: Some(LoadRow {
-                running: w.running,
-                queued: w.queued,
-                kv_usage_permille: w.kv_permille,
-                live_rate: w.live_rate,
-                report_age_ms: 5,
-                source: SignalSource::Events,
-                ..LoadRow::default()
-            }),
-            load_sampled_at_micros: w.sampled_at_micros,
-            ..Candidate::default()
+        let mut row = Candidate::default();
+        row.position = i as u32;
+        row.id = WorkerId(w.id);
+        row.key = w.id as u32;
+        row.health.healthy = w.healthy;
+        row.in_flight = w.in_flight;
+        row.load = Some({
+            let mut load = LoadRow::default();
+            load.running = w.running;
+            load.queued = w.queued;
+            load.kv_usage_permille = w.kv_permille;
+            load.live_rate = w.live_rate;
+            load.report_age_ms = 5;
+            load.source = SignalSource::Events;
+            load
         });
+        row.load_sampled_at_micros = w.sampled_at_micros;
+        out.push(row);
     }
 }
 

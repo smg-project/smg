@@ -65,7 +65,7 @@ use crate::{
         standard_filters,
     },
     stages::{lifecycle::Lifecycle, retired_workers::RetiredWorkers},
-    tracking::{in_flight::with_counts, lease::Membership},
+    tracking::lease::Membership,
     Draw,
 };
 
@@ -840,10 +840,10 @@ impl ConsistentHash {
             // counted in it: the larger of the two is the bound. The
             // product is taken as written, in 64-bit floats: an owner
             // at the bound's edge stands or falls by its last bit.
-            let total: u64 = with_counts!(facts, |counts| kept
+            let total: u64 = kept
                 .iter()
-                .map(|&k| u64::from(counts(&candidates[k as usize])))
-                .sum());
+                .map(|&k| u64::from(facts.in_flight(&candidates[k as usize])))
+                .sum();
             let mean = (total as f64 + 1.0) / kept.len() as f64;
             (mean * factor).max(mean + f64::from(margin))
         })

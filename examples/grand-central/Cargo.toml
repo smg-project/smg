@@ -34,8 +34,8 @@ tikv-jemallocator = { workspace = true }
 [dev-dependencies]
 mock-worker = { path = "../../crates/mock_worker" }
 serde_yaml = { workspace = true }
-smg-grpc-client = { workspace = true }
 smg-grand-central = { path = "../../crates/grand_central", features = ["client"] }
+smg-grpc-client = { workspace = true }
 smg-worker = { workspace = true, features = ["runtime", "test-util"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tonic = { workspace = true }

@@ -17,7 +17,10 @@ pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
-use smg_grand_central::engine::{DecisionEngine, InProcess, ShadowKind, ShadowSide};
+use smg_grand_central::engine::{
+    DecisionEngine, InProcess, ShadowKind, ShadowSide, POLICY_FAULTS_HELP, POLICY_FAULTS_TOTAL,
+    POLICY_FAULT_KINDS,
+};
 use smg_worker::metrics::{
     series as worker_series,
     series::{WorkerSeries, WorkerSeriesRecorder},
@@ -889,13 +892,7 @@ pub(crate) fn init_metrics() {
          the shadow is asked beside (single, prefill, decode, decode-again) and by kind \
          (agreed, other-target, other-outcome, skipped); a shadow that panicked is not counted"
     );
-    describe_counter!(
-        "smg_policy_faults_total",
-        "Panics Grand Central held and counted, by kind: decision (a decision that \
-         panicked, a shadow's beside a live decision among them), event (a stage at a lease \
-         event or a change of membership), upkeep (a step of the engine's upkeep: its sweep, \
-         the registry's follow, a load report, a fill of worker lists)"
-    );
+    describe_counter!(POLICY_FAULTS_TOTAL, POLICY_FAULTS_HELP);
     describe_histogram!(
         "smg_cache_aware_match_ratio",
         "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement). \
@@ -1190,12 +1187,9 @@ pub(super) fn record_policy_shadow_activity(engine: &InProcess, published: &Shad
 /// each series is set to its count as read, with no record of the scrapes
 /// before, and of two scrapes at once the larger read stands.
 pub(super) fn record_policy_fault_activity(engine: &InProcess) {
-    for (kind, held) in [
-        ("decision", engine.faults()),
-        ("event", engine.unheard()),
-        ("upkeep", engine.upkeep_faults()),
-    ] {
-        counter!("smg_policy_faults_total", "kind" => kind).absolute(held);
+    let held = [engine.faults(), engine.unheard(), engine.upkeep_faults()];
+    for (kind, held) in POLICY_FAULT_KINDS.into_iter().zip(held) {
+        counter!(POLICY_FAULTS_TOTAL, "kind" => kind).absolute(held);
     }
 }
 
@@ -2630,18 +2624,24 @@ pub(crate) mod test_support {
     }
 
     /// The shadow series of the second binding's single requests in a
-    /// scrape, by kind: agreed, other target, other outcome, skipped.
-    /// `None` where the scrape holds no such series.
+    /// scrape ([`side_kinds`]).
     pub(crate) fn shadow_kinds(rendered: &str) -> [Option<u64>; 4] {
+        side_kinds(rendered, 1, "single")
+    }
+
+    /// The shadow series of the binding at `binding`, asked beside `side`,
+    /// in a scrape, by kind: agreed, other target, other outcome, skipped.
+    /// `None` where the scrape holds no such series.
+    pub(crate) fn side_kinds(rendered: &str, binding: u32, side: &str) -> [Option<u64>; 4] {
         ["agreed", "other-target", "other-outcome", "skipped"].map(|kind| {
             let labels = [
-                r#"binding="1""#,
-                r#"side="single""#,
-                &format!(r#"kind="{kind}""#),
+                format!(r#"binding="{binding}""#),
+                format!(r#"side="{side}""#),
+                format!(r#"kind="{kind}""#),
             ];
             let of_kind = |line: &&str| {
                 line.starts_with("smg_policy_shadow_decisions_total{")
-                    && labels.iter().all(|label| line.contains(label))
+                    && labels.iter().all(|label| line.contains(label.as_str()))
             };
             let line = rendered.lines().find(of_kind)?;
             line.rsplit(' ').next()?.parse().ok()

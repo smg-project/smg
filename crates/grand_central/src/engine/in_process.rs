@@ -88,6 +88,8 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::Ro
 
 pub(crate) use self::document::Loaded;
 pub use self::document::SpecHandle;
+#[cfg(feature = "controller")]
+pub(crate) use self::document::StoodAt;
 // The count of a request that names its worker, for a controller's served
 // decision: the one the one call counts by.
 #[cfg(feature = "controller")]
@@ -96,6 +98,7 @@ use self::{
     document::InForce,
     encode::EncodeLists,
     overlap::{Affinity, PoolAffinity},
+    place::Made,
 };
 use super::{
     decision_engine::{
@@ -127,6 +130,51 @@ fn next_applied() -> u64 {
     APPLIED.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// The panics an engine's own catches held, one count a catch: a whole
+/// decision's ([`DecisionEngine::faults`]), a word's to the stages
+/// ([`InProcess::unheard`]) and a step's of the engine's own task
+/// ([`InProcess::upkeep_faults`]).
+///
+/// An engine counts into counts of its own. A host that builds an engine
+/// for each of its documents hands every one the same counts
+/// ([`InProcess::with_origin`]): a count then outlasts the document it
+/// rose under, and an engine a decision still holds past its document
+/// counts where the host reads.
+#[derive(Debug, Default)]
+pub(crate) struct HeldFaults {
+    decisions: AtomicU64,
+    words: AtomicU64,
+    upkeep: AtomicU64,
+}
+
+impl HeldFaults {
+    /// The three counts as one read answers them: the decisions', the
+    /// words' and the task's steps'.
+    pub(crate) fn read(&self) -> [u64; 3] {
+        [&self.decisions, &self.words, &self.upkeep].map(|count| count.load(Ordering::Relaxed))
+    }
+}
+
+/// The counter family a host publishes an engine's held panics under, one
+/// series a kind ([`POLICY_FAULT_KINDS`]). A gateway's metrics endpoint and
+/// a controller's publish this one family, so its name, its kinds and its
+/// description ([`POLICY_FAULTS_HELP`]) are said here once.
+pub const POLICY_FAULTS_TOTAL: &str = "smg_policy_faults_total";
+
+/// The description of [`POLICY_FAULTS_TOTAL`], the same on every page that
+/// publishes the family. It names the engine's own catches and no host's
+/// detail: which words and which steps pass those catches is each host's
+/// to say.
+pub const POLICY_FAULTS_HELP: &str = "Panics Grand Central held under its own catches, by kind: \
+    decision (a decision that panicked, a shadow's beside a live decision among them), event (a \
+    stage at a word Grand Central told it), upkeep (a step of Grand Central's upkeep)";
+
+/// The kinds of [`POLICY_FAULTS_TOTAL`], in the order of an engine's three
+/// counts: the decisions that panicked ([`DecisionEngine::faults`]), the
+/// words a stage did not hear ([`InProcess::unheard`]) and the steps of
+/// the upkeep that panicked ([`InProcess::upkeep_faults`]).
+pub const POLICY_FAULT_KINDS: [&str; 3] = ["decision", "event", "upkeep"];
+
 /// The engine that decides in its host's own process.
 ///
 /// Built once, at the gateway's start, from the document in force then. It
@@ -157,18 +205,18 @@ pub struct InProcess {
     /// The one clock of the engine's decisions: a decision's instant and a
     /// load report's sample instant are counted from its origin.
     clock: DecisionClock,
-    /// How many whole decisions panicked, and how many shadow profiles did
-    /// after a live decision that stood ([`DecisionEngine::faults`]).
-    faults: AtomicU64,
-    /// How many words of a lease and changes of membership panicked in a
-    /// stage that heard them.
-    unheard: AtomicU64,
-    /// How many steps of the engine's own task panicked: a run of the
-    /// upkeep, a step of the registry's follow, or a telling of load
-    /// reports ([`Self::upkeep_faults`]).
-    upkeep_faults: AtomicU64,
+    /// The panics the engine's catches held ([`HeldFaults`]). Its
+    /// decisions: how many whole decisions panicked, and how many shadow
+    /// profiles did after a live decision that stood
+    /// ([`DecisionEngine::faults`]). Its words: how many words of a lease
+    /// and changes of membership panicked in a stage that heard them
+    /// ([`Self::unheard`]). Its task's steps: a run of the upkeep, a step
+    /// of the registry's follow, or a telling of load reports
+    /// ([`Self::upkeep_faults`]). The engine's own, or its host's where the
+    /// host handed them ([`Self::with_origin`]).
+    held: Arc<HeldFaults>,
     /// The last lease id handed out. A pair's lease writes it, and a thread
-    /// once for a run of its single requests' ids ([`single::lease_id`]):
+    /// once for a run of its single requests' ids (`single::lease_id`):
     /// one atomic step, on cache lines of its own.
     leases: OwnWord,
     /// The session table, one for the engine's life: the pins of every key
@@ -297,8 +345,9 @@ impl PoolMembers {
 
     /// What a decision whose stages read affinity keeps of the list: each
     /// worker's number in its model's index of cache events and the list's
-    /// warming rows, as a ruling read again at most once a second
-    /// ([`PoolAffinity`]). A caller that asks a whole decision of its own
+    /// warming rows, as a ruling read again once a second, and once the
+    /// index handed a number on to another worker ([`PoolAffinity`]). A
+    /// caller that asks a whole decision of its own
     /// over the list's records hands it to [`overlap::decide`], as a single
     /// request's decision here does.
     #[must_use]
@@ -350,21 +399,25 @@ impl InProcess {
     /// caller's data. A program has its engine by [`Self::start`], which
     /// builds it here and makes every hand-over.
     #[must_use]
-    pub fn new(mut spec: AppliedSpec) -> Self {
+    pub fn new(spec: AppliedSpec) -> Self {
+        Self::over(spec, 0)
+    }
+
+    /// [`Self::new`], whose session table hears an older request's lease
+    /// from the generation `first` on ([`Engine::table_from`]).
+    fn over(mut spec: AppliedSpec, first: u64) -> Self {
         // The table takes the document's two times where the document's
         // engine takes the pointer.
         let sessions = Arc::new(SessionTable::new(0).with_shards(shards_for_this_host()));
         spec.share_sessions(Arc::clone(&sessions));
-        let document = InForce::of(spec);
+        let document = InForce::of(spec, first);
         Self {
             applied: AtomicU64::new(document.applied),
             document: ArcSwap::from_pointee(document),
             telling: Mutex::new(()),
             epochs: AtomicU64::new(0),
             clock: DecisionClock::new(),
-            faults: AtomicU64::new(0),
-            unheard: AtomicU64::new(0),
-            upkeep_faults: AtomicU64::new(0),
+            held: Arc::default(),
             leases: OwnWord(AtomicU64::new(0)),
             sessions,
             affinity: Affinity::default(),
@@ -381,11 +434,24 @@ impl InProcess {
     /// stages stamped and the next takes over, a profile's count of sends
     /// ([`Engine::succeed`](crate::engine::framework::Engine::succeed)),
     /// is read on the clock it was written on.
+    ///
+    /// The engine counts the panics it holds into `held`, the host's: every
+    /// engine the host builds counts there, and the three readers of each
+    /// ([`DecisionEngine::faults`], [`Self::unheard`],
+    /// [`Self::upkeep_faults`]) answer the counts of them all.
+    ///
+    /// The engine's session table is made with it, so a lease of an earlier
+    /// document tells that table nothing: the claim its first decision
+    /// made was made in the table of the engine its host built for that
+    /// document ([`Engine::table_from`]). The stages kept hear the lease
+    /// ([`Self::stood_at`]).
     #[must_use]
-    pub(crate) fn with_origin(spec: AppliedSpec, origin: Instant) -> Self {
+    pub(crate) fn with_origin(spec: AppliedSpec, origin: Instant, held: Arc<HeldFaults>) -> Self {
+        let first = spec.generation();
         Self {
             clock: DecisionClock::from_origin(origin),
-            ..Self::new(spec)
+            held,
+            ..Self::over(spec, first)
         }
     }
 
@@ -482,14 +548,14 @@ impl InProcess {
     /// what the word answers, and `None` where a stage panicked at it. The
     /// panic is held here and counted ([`Self::unheard`]). The stages behind
     /// the one that panicked do not hear the word, and what the word is of
-    /// goes on: a request, a registration or a removal.
+    /// goes on: a request, a registration, a removal or an apply.
     #[inline]
     fn word_caught<R>(&self, tell: impl FnOnce() -> R) -> Option<R> {
         match catch_unwind(AssertUnwindSafe(tell)) {
             Ok(answered) => Some(answered),
             Err(payload) => {
                 release(payload);
-                self.unheard.fetch_add(1, Ordering::Relaxed);
+                self.held.words.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
@@ -512,6 +578,23 @@ impl InProcess {
         let _held = self.telling.lock();
         self.hears(self.document.load().spec.engine(), word, |engine| {
             self.word_caught(|| engine.on_membership(word));
+        });
+    }
+
+    /// [`Self::on_membership`] for what the document in force built new:
+    /// the stages and the counts of sends made under its own generation,
+    /// and its session table ([`Engine::hearing`]). A store says the list
+    /// of its members through this at the document's apply: what the
+    /// document kept of the standing one heard each member as it came, and
+    /// is told nothing again. The word passes the same locks and the same
+    /// catch: a stage that panics at the list is held and counted.
+    pub(crate) fn on_membership_built_new(&self, word: &Membership<'_>) {
+        let _held = self.telling.lock();
+        let document = self.document.load();
+        let own = document.spec.generation();
+        let new = document.spec.engine().hearing(|made| made == own);
+        self.hears(&new, word, |new| {
+            self.word_caught(|| new.on_membership(word));
         });
     }
 
@@ -555,9 +638,9 @@ impl InProcess {
 
     /// How many words of a lease (its issue, its dispatch, its end, its
     /// release) and changes of membership panicked in a stage that heard
-    /// them. The word stands as said: the request, the registration or the
-    /// removal it is of goes on, and the stages after the one that panicked
-    /// did not hear it.
+    /// them. The word stands as said: the request, the registration, the
+    /// removal or the apply it is of goes on, and the stages after the one
+    /// that panicked did not hear it.
     ///
     /// A lease's issue is such a word at a first decision and at a decode's
     /// own call alike: the call answers its pick and the lease all the same
@@ -565,7 +648,7 @@ impl InProcess {
     /// [`DecisionEngine::decide_decode_under`]).
     #[must_use]
     pub fn unheard(&self) -> u64 {
-        self.unheard.load(Ordering::Relaxed)
+        self.held.words.load(Ordering::Relaxed)
     }
 
     /// The document in force, in a handle that keeps showing it whatever
@@ -798,7 +881,7 @@ impl InProcess {
             Ok(decided) => decided,
             Err(payload) => {
                 release(payload);
-                self.faults.fetch_add(1, Ordering::Relaxed);
+                self.held.decisions.fetch_add(1, Ordering::Relaxed);
                 Err(DecisionRefused::Faulted)
             }
         }
@@ -822,7 +905,9 @@ impl InProcess {
     ) -> Result<Decided, DecisionRefused> {
         let mut whole = None;
         let document = self.in_force();
-        let alone = self.under(&document).decide_into(maker, clock, &mut whole);
+        let alone = self
+            .under(&document)
+            .decide_into(maker, None, clock, &mut whole);
         // The document is let go ahead of the answer's making: an answer
         // made while it is held is moved once more behind its release.
         drop(document);
@@ -844,13 +929,20 @@ impl Loaded<'_, '_> {
     /// decision written into `whole` beside whether the request stated the
     /// later decode. Its caller hands `whole` empty, and only a whole
     /// decision fills it.
-    pub(super) fn decide_into(
+    ///
+    /// `late` is the request as the engine's own call made it, where that
+    /// call asks ([`place::decide`]): the lookup that names a request's
+    /// holders asks it for the block hashes its making left to the road
+    /// that reads them ([`Made::hashed_whole`]). A host's own maker hashes
+    /// its request itself and hands none.
+    fn decide_into(
         self,
         maker: &impl RequestMaker,
+        late: Option<&Made<'_, '_>>,
         clock: impl FnOnce() -> Instant,
         whole: &mut Option<(DecideOutcome, bool)>,
     ) -> Result<Option<AlonePick>, DecisionRefused> {
-        self.caught(|| self.placed_or(maker, clock, whole))
+        self.caught(|| self.placed_or(maker, late, clock, whole))
     }
 }
 
@@ -917,7 +1009,7 @@ impl InProcess {
                     // The engine's own value of the list, asked of its
                     // cell.
                     let members = own.members_of(lent);
-                    Ok(own.decide_made(maker, &mut request, members, now, &mut said))
+                    Ok(own.decide_made(maker, None, &mut request, members, now, &mut said))
                 }
                 // A pair is decided at its prefill, over its host's two
                 // lists, and so is a request that hands an encode
@@ -1023,6 +1115,7 @@ impl Loaded<'_, '_> {
     fn decide_made<'a>(
         self,
         maker: &impl RequestMaker,
+        late: Option<&Made<'_, '_>>,
         request: &mut Request<'a>,
         members: &'a PoolMembers,
         now: Instant,
@@ -1036,9 +1129,9 @@ impl Loaded<'_, '_> {
         let spec = &self.document.spec;
         let (model, phase) = (request.facts.model, request.facts.phase);
         if self.document.signals && members.reads_signal(spec, model, phase) {
-            return signals::decide(self, request, members, maker, loads, now, said);
+            return signals::decide(self, request, members, maker, late, loads, now, said);
         }
-        self.decide_with_loads(request, members, maker, loads, now, said)
+        self.decide_with_loads(request, members, maker, late, loads, now, said)
     }
 
     /// [`Self::decide_made`] behind its choice of the snapshot: the
@@ -1051,13 +1144,19 @@ impl Loaded<'_, '_> {
     /// `maker` is the request's own, handed on for its entry in a token
     /// tree its host lends. A copy that carries signal cells is decided
     /// inside that tree like the request it was made of, and hands its
-    /// maker as a trait object ([`signals::decide`]).
+    /// maker as a trait object ([`signals::decide`]). `late` is handed on
+    /// with it ([`Self::decide_into`]).
     #[inline]
-    pub(super) fn decide_with_loads(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a made request, its list, its maker and the request its call made, the loads, the instant and the shadow's word"
+    )]
+    fn decide_with_loads(
         self,
         request: &mut Request<'_>,
         members: &PoolMembers,
         maker: &(impl RequestMaker + ?Sized),
+        late: Option<&Made<'_, '_>>,
         loads: Option<&Arc<LoadSnapshot>>,
         now: Instant,
         said: &mut Option<Shadowed>,
@@ -1068,7 +1167,7 @@ impl Loaded<'_, '_> {
             let (model, phase) = (request.facts.model, request.facts.phase);
             if let Some(binding) = members.shadow(&self.document.spec, model, phase) {
                 let (decision, shadow) =
-                    with_shadow::decide(self, request, members, maker, loads, now, binding);
+                    with_shadow::decide(self, request, members, maker, late, loads, now, binding);
                 *said = shadow;
                 return decision;
             }
@@ -1078,6 +1177,7 @@ impl Loaded<'_, '_> {
             request,
             members,
             maker,
+            late,
             loads,
             now,
             single::WithoutShadow,
@@ -1090,6 +1190,7 @@ impl Loaded<'_, '_> {
     fn placed_or(
         self,
         maker: &impl RequestMaker,
+        late: Option<&Made<'_, '_>>,
         clock: impl FnOnce() -> Instant,
         whole: &mut Option<(DecideOutcome, bool)>,
     ) -> Result<Option<AlonePick>, DecisionRefused> {
@@ -1148,7 +1249,7 @@ impl Loaded<'_, '_> {
                     _ => self.members_of(lent),
                 };
                 let mut said = None;
-                let decision = self.decide_made(maker, &mut request, members, now, &mut said);
+                let decision = self.decide_made(maker, late, &mut request, members, now, &mut said);
                 // What a shadow said is counted behind the lease's issue.
                 if let Some(said) = said {
                     let decided = with_shadow::issued(self, decision, &request, now, said);
@@ -1333,7 +1434,7 @@ impl DecisionEngine for InProcess {
     }
 
     fn faults(&self) -> u64 {
-        self.faults.load(Ordering::Relaxed)
+        self.held.decisions.load(Ordering::Relaxed)
     }
 }
 

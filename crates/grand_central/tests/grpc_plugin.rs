@@ -41,9 +41,9 @@ use smg_grand_central::plugins::wasm;
 use smg_grand_central::{
     document::Needs,
     engine::{
-        Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
-        PairPools, Picker, Plan, PoolFacts, Profile, RequestFacts, Scorer, Scratch, ShedReason,
-        Target, Targets, TieBand, WeightedScorer, WorkerId,
+        Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Identity, PairPools,
+        Picker, Plan, PoolFacts, Profile, RequestFacts, Scorer, Scratch, ShedReason, Target,
+        Targets, TieBand, WeightedScorer, WorkerId,
     },
     plugins::{
         grpc::{
@@ -167,15 +167,10 @@ fn bound_profile(bound: Arc<PluginBinding>, stages: u32, fallbacks: bool) -> Pro
     } else {
         Box::new(Best)
     };
-    Profile {
-        name: "plugin".into(),
-        filters: vec![filter],
-        scorers: vec![WeightedScorer {
-            scorer,
-            weight: 1.0,
-        }],
-        picker,
-    }
+    let mut profile = Profile::of("plugin".into(), picker);
+    profile.filters = vec![filter];
+    profile.scorers = vec![WeightedScorer::of(scorer, 1.0)];
+    profile
 }
 
 fn profile(plugin: &Arc<Plugin>, stages: u32) -> Profile {
@@ -188,29 +183,24 @@ fn profile(plugin: &Arc<Plugin>, stages: u32) -> Profile {
 fn filter_then_picker(filter: &Arc<Plugin>, picker: &Arc<Plugin>) -> Profile {
     let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
     let best: Option<Box<dyn Picker>> = Some(Box::new(Best));
-    Profile {
-        name: "two-plugins".into(),
-        filters: vec![Box::new(GrpcFilter::new(filter.bind(), healthy))],
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(GrpcPicker::new(picker.bind(), best)),
-    }
+    let mut profile = Profile::of(
+        "two-plugins".into(),
+        Box::new(GrpcPicker::new(picker.bind(), best)),
+    );
+    profile.filters = vec![Box::new(GrpcFilter::new(filter.bind(), healthy))];
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    profile
 }
 
 fn binding(plan: Plan, decode_profile: Option<u16>) -> Binding {
-    Binding {
-        model: "*".into(),
-        phases: vec![],
-        plan,
-        profile: 0,
-        decode_profile,
-        shadow: None,
-        decode_shadow: None,
-        sessions: None,
-        overload: None,
-    }
+    let mut binding = Binding::of("*".into(), 0);
+    binding.phases = vec![];
+    binding.plan = plan;
+    binding.decode_profile = decode_profile;
+    binding.shadow = None;
+    binding.decode_shadow = None;
+    binding.sessions = None;
+    binding
 }
 
 fn single_engine(profile: Profile) -> Engine {
@@ -226,35 +216,31 @@ fn single_engine(profile: Profile) -> Engine {
 /// row 0 is the most loaded, the last row the least.
 fn pool(n: u32) -> Vec<Candidate> {
     (0..n)
-        .map(|i| Candidate {
-            position: i,
-            id: WorkerId(u64::from(i) + 100),
-            health: Health {
-                healthy: true,
-                ..Health::default()
-            },
-            in_flight: n - i,
-            ..Candidate::default()
+        .map(|i| {
+            let mut row = Candidate::default();
+            row.position = i;
+            row.id = WorkerId(u64::from(i) + 100);
+            row.health.healthy = true;
+            row.in_flight = n - i;
+            row
         })
         .collect()
 }
 
 fn facts(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        model: "m",
-        budget_micros: BUDGET_MICROS,
-        seed,
-        now_micros: 777_000,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.budget_micros = BUDGET_MICROS;
+    facts.seed = seed;
+    facts.now_micros = 777_000;
+    facts
 }
 
 fn pool_facts(candidates: &[Candidate]) -> PoolFacts<'static> {
-    PoolFacts {
-        pool_size: candidates.len() as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    }
+    let mut pool = PoolFacts::default();
+    pool.pool_size = candidates.len() as u32;
+    pool.generation = 1;
+    pool
 }
 
 fn decide_with(engine: &Engine, facts: &RequestFacts<'_>, candidates: &[Candidate]) -> Decision {
@@ -273,10 +259,8 @@ fn decide(engine: &Engine, candidates: &[Candidate], seed: u64) -> Decision {
 
 /// A decision under the short budget: the frame's deadline is 20 ms.
 fn decide_short(engine: &Engine, candidates: &[Candidate], seed: u64) -> Decision {
-    let short = RequestFacts {
-        budget_micros: SHORT_MICROS,
-        ..facts(seed)
-    };
+    let mut short = facts(seed);
+    short.budget_micros = SHORT_MICROS;
     decide_with(engine, &short, candidates)
 }
 
@@ -991,18 +975,16 @@ fn a_pair_asks_both_sides_at_once_on_one_stream() {
     for (i, c) in decodes.iter_mut().enumerate() {
         c.id = WorkerId(200 + i as u64);
     }
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 7;
+    pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = engine.decide_pair(
         &facts(9),
-        &PoolFacts {
-            pool_size: 7,
-            generation: 1,
-            ..PoolFacts::default()
-        },
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        &pool_facts,
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -1063,18 +1045,16 @@ fn decide_pair(plugin: &Arc<Plugin>, facts: &RequestFacts<'_>) -> Decision {
     for (i, c) in decodes.iter_mut().enumerate() {
         c.id = WorkerId(200 + i as u64);
     }
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 7;
+    pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     engine.decide_pair(
         facts,
-        &PoolFacts {
-            pool_size: 7,
-            generation: 1,
-            ..PoolFacts::default()
-        },
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        &pool_facts,
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -1140,18 +1120,16 @@ fn a_pick_only_frame_is_not_sent_once_the_plugin_failed_its_decision() {
     // A row the built-in filter drops on each side: each frame names it.
     prefills[0].health.healthy = false;
     decodes[0].health.healthy = false;
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 7;
+    pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = engine.decide_pair(
         &facts(9),
-        &PoolFacts {
-            pool_size: 7,
-            generation: 1,
-            ..PoolFacts::default()
-        },
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        &pool_facts,
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -1194,16 +1172,14 @@ fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
     served.behave(Behaviour::ScoreNan);
     let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
     let least: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
+    let mut profile = Profile::of("both-kinds".into(), Box::new(Best));
+    profile.filters = vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))];
+    profile.scorers = vec![WeightedScorer::of(
+        Box::new(GrpcScorer::new(remote.bind(), least)),
+        1.0,
+    )];
     let engine = Engine::new(
-        vec![Profile {
-            name: "both-kinds".into(),
-            filters: vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(GrpcScorer::new(remote.bind(), least)),
-                weight: 1.0,
-            }],
-            picker: Box::new(Best),
-        }],
+        vec![profile],
         vec![binding(Plan::PdPair, Some(0))],
         1,
         Needs::default(),
@@ -1217,18 +1193,16 @@ fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
         c.id = WorkerId(200 + i as u64);
     }
     let request = facts(9);
+    let mut pool_facts = PoolFacts::default();
+    pool_facts.pool_size = 7;
+    pool_facts.generation = 1;
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     let decision = engine.decide_pair(
         &request,
-        &PoolFacts {
-            pool_size: 7,
-            generation: 1,
-            ..PoolFacts::default()
-        },
-        PairPools {
-            prefills: &prefills,
-            decodes: &decodes,
-            ..PairPools::default()
-        },
+        &pool_facts,
+        pools,
         &Constraints::default(),
         &Constraints::default(),
         &mut Scratch::new(),
@@ -1269,10 +1243,8 @@ fn a_gone_budget_fails_its_decision_once_on_a_pair() {
         ..BreakerSpec::default()
     };
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
-    let gone = RequestFacts {
-        budget_micros: 0,
-        ..facts(9)
-    };
+    let mut gone = facts(9);
+    gone.budget_micros = 0;
     let decision = decide_pair(&plugin, &gone);
     assert!(decision.pick().is_some(), "the fallbacks placed the pair");
     let stats = plugin.stats();
@@ -1303,10 +1275,8 @@ fn an_opening_writes_one_line_under_the_plugins_name() {
     };
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
-    let gone = RequestFacts {
-        budget_micros: 0,
-        ..facts(1)
-    };
+    let mut gone = facts(1);
+    gone.budget_micros = 0;
     let candidates = pool(4);
     decide_with(&engine, &gone, &candidates);
     assert!(
@@ -1559,10 +1529,8 @@ fn a_missed_deadline_under_the_plugins_own_bound_is_one_failure_of_its_decision(
     );
     // A loaded host can hold the I/O thread under any one frame, and a held
     // miss is the host's: the next frame that leaves is judged.
-    let short = RequestFacts {
-        budget_micros: SHORT_MICROS,
-        ..facts(1)
-    };
+    let mut short = facts(1);
+    short.budget_micros = SHORT_MICROS;
     decide_until_judged(&engine, &plugin, &short, &pool(4), 1);
     let stats = plugin.stats();
     assert_eq!(
@@ -1601,10 +1569,8 @@ fn a_plugin_with_no_budget_is_waited_for_the_default_frame_under_a_request_with_
     let plugin = Plugin::load(&runtime, unset).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     // What a stage is shown for a request that states no budget.
-    let widest = RequestFacts {
-        budget_micros: u32::MAX,
-        ..facts(1)
-    };
+    let mut widest = facts(1);
+    widest.budget_micros = u32::MAX;
     let default = FrameBudget::DEFAULT_MICROS;
     let started = Instant::now();
     assert_eq!(
@@ -1658,10 +1624,8 @@ fn a_plugin_that_misses_every_deadline_opens_its_breaker_through_the_latency_sam
     let plugin = load(&runtime, &served, "always-late");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
-    let quick = RequestFacts {
-        budget_micros: 2_000,
-        ..facts(1)
-    };
+    let mut quick = facts(1);
+    quick.budget_micros = 2_000;
     // One sample per frame that left, each the whole budget: the window of
     // 64 reads slow at its first evaluation.
     decide_until_judged(&engine, &plugin, &quick, &candidates, 64);
@@ -1712,10 +1676,8 @@ fn a_plugin_that_misses_every_deadline_of_its_own_is_judged_under_a_request_with
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
     // What a stage is shown for a request that states no budget.
-    let widest = RequestFacts {
-        budget_micros: u32::MAX,
-        ..facts(1)
-    };
+    let mut widest = facts(1);
+    widest.budget_micros = u32::MAX;
     decide_until_judged(&engine, &plugin, &widest, &candidates, 64);
     let stats = plugin.stats();
     assert_eq!(
@@ -1762,10 +1724,8 @@ fn a_plugin_that_answers_past_half_the_budget_opens_its_breaker_through_the_late
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
-    let tight = RequestFacts {
-        budget_micros: 10_000,
-        ..facts(1)
-    };
+    let mut tight = facts(1);
+    tight.budget_micros = 10_000;
     // One sample per frame that left, each a round trip past half the
     // budget: the window of 64 reads slow at its first evaluation.
     decide_until_judged(&engine, &plugin, &tight, &candidates, 64);
@@ -1795,10 +1755,8 @@ fn frames_missed_across_a_hold_of_the_io_thread_are_the_hosts_and_open_nothing()
     let plugin = load(&runtime, &served, "held-io");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
-    let tight = RequestFacts {
-        budget_micros: 10_000,
-        ..facts(1)
-    };
+    let mut tight = facts(1);
+    tight.budget_micros = 10_000;
     let mut rounds = 0_u64;
     let more = |rounds: u64| {
         let stats = plugin.stats();
@@ -1850,10 +1808,8 @@ fn answers_that_cross_a_hold_of_the_io_thread_are_used_and_are_no_sample() {
     let plugin = load(&runtime, &served, "held-answers");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
-    let snug = RequestFacts {
-        budget_micros: 36_000,
-        ..facts(1)
-    };
+    let mut snug = facts(1);
+    snug.budget_micros = 36_000;
     let mut used = 0_u64;
     for round in 1..=64_u64 {
         runtime.hold_io(HOLD);
@@ -1929,10 +1885,8 @@ fn two_missed_frames_in_a_window_of_fast_answers_do_not_open_by_the_tail() {
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
-    let short = RequestFacts {
-        budget_micros: SHORT_MICROS,
-        ..facts(1)
-    };
+    let mut short = facts(1);
+    short.budget_micros = SHORT_MICROS;
     served.behave(Behaviour::Silent);
     decide_until_judged(&engine, &plugin, &short, &candidates, 2);
     served.behave(Behaviour::Honest);
@@ -1997,10 +1951,8 @@ fn late_answers_the_thread_finds_without_waiting_are_used_and_sampled_at_their_f
         .insert(0, Box::new(HoldsTheThread(Arc::clone(&hold))));
     let engine = single_engine(held);
     let candidates = pool(4);
-    let short = RequestFacts {
-        budget_micros: SHORT_MICROS,
-        ..facts(1)
-    };
+    let mut short = facts(1);
+    short.budget_micros = SHORT_MICROS;
     // The answer leaves three budgets after its frame, and the thread is
     // held ten.
     served.script(|s| s.delay = Duration::from_millis(60));
@@ -2067,10 +2019,8 @@ fn a_miss_under_the_remainders_clamp_is_the_decisions_budget_spent_and_no_failur
     };
     let picker = Plugin::load(&runtime, clamped).expect("the plugin loads");
     let engine = single_engine(filter_then_picker(&filter, &picker));
-    let short = RequestFacts {
-        budget_micros: SHORT_MICROS,
-        ..facts(1)
-    };
+    let mut short = facts(1);
+    short.budget_micros = SHORT_MICROS;
     // The picker is asked at the pick under the rest, three quarters of the
     // budget: a flight far longer than the I/O thread's promise.
     decide_until_judged(&engine, &picker, &short, &pool(4), 1);
@@ -2091,21 +2041,16 @@ fn a_miss_under_the_remainders_clamp_is_the_decisions_budget_spent_and_no_failur
 /// A profile whose filters are these plugins in order, each with its
 /// built-in fallback: every frame leaves at the decision's open.
 fn filters_of(plugins: &[&Arc<Plugin>]) -> Profile {
-    Profile {
-        name: "filters".into(),
-        filters: plugins
-            .iter()
-            .map(|plugin| {
-                let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
-                Box::new(GrpcFilter::new(plugin.bind(), healthy)) as Box<dyn Filter>
-            })
-            .collect(),
-        scorers: vec![WeightedScorer {
-            scorer: Box::new(LeastRequests),
-            weight: 1.0,
-        }],
-        picker: Box::new(Best),
-    }
+    let mut profile = Profile::of("filters".into(), Box::new(Best));
+    profile.filters = plugins
+        .iter()
+        .map(|plugin| {
+            let healthy: Option<Box<dyn Filter>> = Some(Box::new(Healthy));
+            Box::new(GrpcFilter::new(plugin.bind(), healthy)) as Box<dyn Filter>
+        })
+        .collect();
+    profile.scorers = vec![WeightedScorer::of(Box::new(LeastRequests), 1.0)];
+    profile
 }
 
 /// A frame sent with its whole budget is still the remainder's where the
@@ -2144,10 +2089,8 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
     let last = load(&runtime, &served, "starved");
     let engine = single_engine(filters_of(&[&front[0], &front[1], &front[2], &last]));
     let candidates = pool(4);
-    let short = RequestFacts {
-        budget_micros: SHORT_MICROS,
-        ..facts(1)
-    };
+    let mut short = facts(1);
+    short.budget_micros = SHORT_MICROS;
     // The window's first read is at its 64th sample. A round whose frame
     // the stream did not take (the I/O thread held, its window full) is no
     // sample and costs microseconds, so the loop is bounded on the clock:
@@ -2221,10 +2164,8 @@ fn a_frame_sent_under_the_rest_is_read_against_its_plugins_whole_frame() {
     };
     let picker = Plugin::load(&runtime, rest).expect("the plugin loads");
     let engine = single_engine(filter_then_picker(&filter, &picker));
-    let short = RequestFacts {
-        budget_micros: SHORT_MICROS,
-        ..facts(1)
-    };
+    let mut short = facts(1);
+    short.budget_micros = SHORT_MICROS;
     // The window's first read is at its 64th sample.
     decide_until_judged(&engine, &picker, &short, &pool(4), 64);
     let stats = picker.stats();
@@ -2331,10 +2272,8 @@ fn a_miss_too_short_for_the_witness_is_unread_and_the_decisions_budget_spent() {
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
-    let tight = RequestFacts {
-        budget_micros: 10_000,
-        ..facts(1)
-    };
+    let mut tight = facts(1);
+    tight.budget_micros = 10_000;
     // Up to the window's first read, at its 64th sample: an unread miss, or
     // a round answered in time. A round the I/O thread was seen late in is
     // charged nothing, answered or missed, so it is no sample.
@@ -2573,18 +2512,16 @@ fn a_frame_past_the_window_is_refused_without_a_fault() {
     let scorers = (0..9)
         .map(|_| {
             let fallback: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
-            WeightedScorer {
-                scorer: Box::new(GrpcScorer::new(binder.bind(), fallback)) as Box<dyn Scorer>,
-                weight: 1.0,
-            }
+            WeightedScorer::of(
+                Box::new(GrpcScorer::new(binder.bind(), fallback)) as Box<dyn Scorer>,
+                1.0,
+            )
         })
         .collect();
-    let engine = single_engine(Profile {
-        name: "nine".into(),
-        filters: vec![Box::new(Healthy)],
-        scorers,
-        picker: Box::new(Best),
-    });
+    let mut profile = Profile::of("nine".into(), Box::new(Best));
+    profile.filters = vec![Box::new(Healthy)];
+    profile.scorers = scorers;
+    let engine = single_engine(profile);
     assert_eq!(
         lead(&decide(&engine, &pool(4), 1)),
         Some(103),
@@ -2620,10 +2557,8 @@ fn a_gone_budget_sends_no_frame_and_counts_on_the_breaker() {
     };
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
-    let gone = RequestFacts {
-        budget_micros: 0,
-        ..facts(1)
-    };
+    let mut gone = facts(1);
+    gone.budget_micros = 0;
     let candidates = pool(4);
     assert!(matches!(
         decide_with(&engine, &gone, &candidates),
@@ -2792,10 +2727,8 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
     // whole budget: the window reads slow at its first read, which is at
     // the close of the decision that fills it.
     served.script(|s| s.delay = Duration::from_millis(6));
-    let tight = RequestFacts {
-        budget_micros: 10_000,
-        ..facts(2)
-    };
+    let mut tight = facts(2);
+    tight.budget_micros = 10_000;
     let candidates = pool(4);
     shared.armed.store(true, Ordering::Relaxed);
     let mut stopped = false;
@@ -3410,15 +3343,10 @@ fn an_adapter_needs_the_lifecycle_where_its_row_or_its_fallback_does() {
     assert!(!adapter(None).needs_lifecycle());
 
     let engine_of = |fallback: Option<Box<dyn Scorer>>| {
-        single_engine(Profile {
-            name: "adapted".into(),
-            filters: vec![],
-            scorers: vec![WeightedScorer {
-                scorer: Box::new(adapter(fallback)),
-                weight: 1.0,
-            }],
-            picker: Box::new(Best),
-        })
+        let mut profile = Profile::of("adapted".into(), Box::new(Best));
+        profile.filters = vec![];
+        profile.scorers = vec![WeightedScorer::of(Box::new(adapter(fallback)), 1.0)];
+        single_engine(profile)
     };
     assert!(engine_of(Some(Box::new(Kept))).needs_lifecycle());
     assert!(!engine_of(None).needs_lifecycle());
@@ -3687,10 +3615,8 @@ fn a_dispatch_tells_the_plugin_the_index_its_lease_names() {
     let runtime = runtime();
     let plugin = load(&runtime, &served, "second-target");
     let engine = single_engine(profile(&plugin, ALL));
-    let lease = Lease {
-        target_index: 1,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.target_index = 1;
     engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
     assert!(eventually(|| served.seen().events.len() == 1));
     let seen = served.seen();
@@ -4133,21 +4059,23 @@ fn the_exposure_withholds_what_the_row_does_not_reveal() {
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let headers = [
-        Header {
-            name: 2,
-            value: "exposed",
+        {
+            let mut header = Header::default();
+            header.name = 2;
+            header.value = "exposed";
+            header
         },
-        Header {
-            name: 9,
-            value: "hidden",
+        {
+            let mut header = Header::default();
+            header.name = 9;
+            header.value = "hidden";
+            header
         },
     ];
-    let request = RequestFacts {
-        tenant: Identity::plain("acme"),
-        session_key: Identity::plain("s-1"),
-        headers: &headers,
-        ..facts(1)
-    };
+    let mut request = facts(1);
+    request.tenant = Identity::plain("acme");
+    request.session_key = Identity::plain("s-1");
+    request.headers = &headers;
     let candidates = pool(4);
     assert_eq!(
         lead(&decide_with(&engine, &request, &candidates)),
@@ -4178,10 +4106,8 @@ fn the_exposure_withholds_what_the_row_does_not_reveal() {
 fn a_frame_carries_block_hashes_to_a_row_that_declares_them_alone() {
     let runtime = runtime();
     let hashes: Vec<u64> = (1..=300).collect();
-    let request = RequestFacts {
-        block_hashes: &hashes,
-        ..facts(1)
-    };
+    let mut request = facts(1);
+    request.block_hashes = &hashes;
     let candidates = pool(4);
     let sent = |name: &str, needs: Needs| {
         let served = TestPlugin::serve();
@@ -4213,14 +4139,10 @@ fn a_frame_carries_block_hashes_to_a_row_that_declares_them_alone() {
 /// row that withholds the session key withholds both.
 #[test]
 fn a_lease_and_its_request_show_one_session_value_or_none() {
-    let keyed = RequestFacts {
-        session_key: Identity::plain("s-1"),
-        ..facts(1)
-    };
-    let lease = Lease {
-        session: keyed.session(),
-        ..Lease::default()
-    };
+    let mut keyed = facts(1);
+    keyed.session_key = Identity::plain("s-1");
+    let mut lease = Lease::default();
+    lease.session = keyed.session();
     let value = lease.session.get();
     assert_ne!(value, 0, "a keyed request has a session");
     let runtime = runtime();
@@ -4591,10 +4513,8 @@ fn measure_the_round_trip_the_rss_per_stream_and_the_cpu_per_decision() {
     let (silent, plugin) = serve("ticks");
     silent.behave(Behaviour::Silent);
     let engine = single_engine(profile_of(&plugin, ALL, true));
-    let held = RequestFacts {
-        budget_micros: 2_000_000,
-        ..facts(1)
-    };
+    let mut held = facts(1);
+    held.budget_micros = 2_000_000;
     let flight0 = cpu_nanos_of(io);
     engine.decide(&held, &pool_facts, &candidates, &cx, &mut scratch);
     let flight = cpu_nanos_of(io) - flight0;

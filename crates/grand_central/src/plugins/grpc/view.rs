@@ -20,10 +20,7 @@ use crate::{
         shown_hashes, shown_size,
     },
     service::proto,
-    tracking::{
-        in_flight::with_counts,
-        lease::{wire, Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal},
-    },
+    tracking::lease::{wire, Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal},
 };
 
 /// The stage bits of the protocol, as `Stage` numbers them.
@@ -290,10 +287,10 @@ pub(crate) fn decide(
 ) -> proto::PluginDecide {
     // A candidate's affinity facts ride the request's column, by its
     // index: the same index reads the row and its entry.
-    let rows: Vec<proto::Candidate> = with_counts!(facts, |counts| (0u32..)
+    let rows: Vec<proto::Candidate> = (0u32..)
         .zip(candidates)
-        .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)))
-        .collect());
+        .map(|(index, c)| candidate(c, facts.affinity_at(index), facts.in_flight(c)))
+        .collect();
     proto::PluginDecide {
         decision_id,
         request: Some(request(facts, exposure, needs)),

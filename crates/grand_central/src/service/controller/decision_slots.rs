@@ -1497,19 +1497,24 @@ fn decode_alone(
 /// A decode call's decision and its side's issue, for the frame that names
 /// the decode side of `lease` (`DecideRequest.decode_of`). The store's own
 /// test of the lease comes first ([`MemoryStore::held_pair`]), so a call it
-/// refuses runs no stage. Then the decode is decided again behind the held
-/// prefill ([`frame_decision::decide_decode`]) and, for a pick, issued
-/// under the lease's id ([`frame_decision::issue_decode`]). The lease
-/// filed is the decode side's, and its issue's count comes beside it. The
-/// issue tests the lease again: one that moved under the decision is
-/// refused there, behind the stages.
+/// refuses runs no stage. A call whose frame names its worker where the
+/// decode's side reads the number is refused next, as one whose decode
+/// never stood chosen ([`frame_decision::names_decode`]): the decode its
+/// request named stands, and no stage runs. Then the decode is decided
+/// again behind the held prefill ([`frame_decision::decide_decode`]) and,
+/// for a pick, issued under the lease's id
+/// ([`frame_decision::issue_decode`]). The lease filed is the decode
+/// side's, and its issue's count comes beside it. The issue tests the
+/// lease again: one that moved under the decision is refused there, behind
+/// the stages.
 ///
 /// Out of line: no other request carries a part of it.
 ///
 /// # Errors
 ///
 /// The reason the call's answer is `Busy` under: one of its own for each
-/// refusal of the store ([`busy_of`]), at either test.
+/// refusal of the store ([`busy_of`]), at either test, and the one of a
+/// decode never chosen for a call that names its decode.
 #[inline(never)]
 fn decode_call(
     store: &MemoryStore,
@@ -1521,6 +1526,9 @@ fn decode_call(
     caught: &mut bool,
 ) -> Result<(Decision, Filed, FiledBeside), Reason> {
     let held = store.held_pair(taken.gateway, lease).map_err(busy_of)?;
+    if frame_decision::names_decode(world.spec(), taken.request) {
+        return Err(busy_of(DecodeRefused::NotChosen));
+    }
     let decided = frame_decision::decide_decode(world, objects, taken, held, frames, loads, own);
     let (decision, booked) = made(decided, caught)?;
     let issued = frame_decision::issue_decode(store, world, taken, lease, &decision, booked);
@@ -1532,7 +1540,10 @@ fn decode_call(
 
 /// The `Busy` a refused decode call leaves under: a reason of its own for
 /// each refusal of the store, never a decision that sheds. No policy spoke:
-/// the lease's own state refused the call, and the reason names which.
+/// the lease's own state refused the call, and the reason names which. A
+/// call that names its decode leaves under the reason of a side never
+/// chosen ([`decode_call`]): behind either its gateway sends the decode
+/// the first pick named.
 const fn busy_of(refused: DecodeRefused) -> Reason {
     match refused {
         DecodeRefused::NoLease => Reason::DecodeNoLease,
@@ -1545,9 +1556,10 @@ const fn busy_of(refused: DecodeRefused) -> Reason {
 /// Takes back the issue of a decode call whose answer does not leave: the
 /// side stands as the call found it and its booking is freed
 /// ([`MemoryStore::unissue_decode`]), then the engine that heard the issue
-/// is told the side's release, once: the engine of the lease's generation
-/// ([`issuing`]), where it still stands. A side that moved since was ended
-/// or issued anew by another hand, and nothing is told of it here.
+/// is told the side's release, once: the engine of the lease's generation,
+/// or what a later one kept of its stages ([`issuing`]). A side that moved
+/// since was ended or issued anew by another hand, and nothing is told of
+/// it here.
 fn take_back(
     store: &MemoryStore,
     world: &StoreSnapshot,
@@ -1557,7 +1569,7 @@ fn take_back(
     reason: ReleaseReason,
 ) {
     if store.unissue_decode(gateway, lease.id, issue) {
-        if let Some(engine) = issuing(world.spec(), lease) {
+        if let Some(engine) = issuing(world, lease).engine() {
             engine.on_released(lease, reason);
         }
     }
@@ -1596,7 +1608,7 @@ pub(crate) mod tests {
         panic::resume_unwind,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            mpsc as std_mpsc, Arc, Weak,
+            mpsc as std_mpsc, Arc, OnceLock, Weak,
         },
         thread,
         time::{Duration, Instant},
@@ -1637,6 +1649,7 @@ pub(crate) mod tests {
                     Gateways, Vetoed,
                 },
                 lifecycle,
+                standby::{self, Lag},
                 watch_workers::Feed,
                 wire::{self, Checked},
                 worker_objects::WorkerObjects,
@@ -1654,6 +1667,7 @@ pub(crate) mod tests {
     };
 
     pub(crate) mod encode;
+    mod named;
 
     /// How long a case waits for a decider before it fails.
     pub(crate) const PATIENCE: Duration = Duration::from_secs(20);
@@ -1753,6 +1767,28 @@ pub(crate) mod tests {
     ) -> (Arc<MemoryStore>, Feed, Arc<Objects<Members>>, LoadReceiver) {
         let objects = holder(&store);
         (store, feed, objects, frame_loads::silent())
+    }
+
+    /// `standing` with the rest of a run loop's side where no serve runs,
+    /// as the service's shared state takes the four: the listeners' close
+    /// nobody says, the role's word nobody tells, and a lag under the bound
+    /// of no load poll interval. The two words' senders stand to the
+    /// process's end, so a stream over the state reads no word and no end
+    /// of its telling.
+    pub(crate) fn unserved(
+        standing: watch::Receiver<ElectionObservation>,
+    ) -> (
+        watch::Receiver<ElectionObservation>,
+        watch::Receiver<bool>,
+        watch::Receiver<Option<u64>>,
+        Arc<Lag>,
+    ) {
+        static UNTOLD: OnceLock<(watch::Sender<bool>, watch::Sender<Option<u64>>)> =
+            OnceLock::new();
+        let (stop, role) =
+            UNTOLD.get_or_init(|| (watch::Sender::new(false), watch::Sender::new(None)));
+        let lag = Arc::new(Lag::new(standby::synced_within(Duration::ZERO)));
+        (standing, stop.subscribe(), role.subscribe(), lag)
     }
 
     /// A store, a candidate of its election and the deciders over both.
@@ -2862,6 +2898,29 @@ pub(crate) mod tests {
             .expect("the task ends at its stop")
             .expect("one task")
             .expect("it ended by itself");
+    }
+
+    /// A served engine's session table hears the store's word of a worker
+    /// that leaves and of its return. The worker a key is pinned on is
+    /// removed through the store: the table lists it absent. Registered
+    /// again under its id, it is listed no more.
+    #[tokio::test]
+    async fn the_session_table_lists_a_worker_the_store_removed_until_it_returns() {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 1;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let absent = |bed: &Bed| {
+            bed.store
+                .deciding(|world| world.spec().engine().sessions().absent())
+        };
+        let pinned = picked(&bed.ask(keyed(1, 1_001)).await);
+        assert_eq!(absent(&bed), 0, "every worker stands");
+        let row = WorkersStore::get(&*bed.store, pinned).expect("the row");
+        let removed = WorkersStore::remove(&*bed.store, pinned, row.revision);
+        assert!(removed.is_some(), "the store took the worker out");
+        assert_eq!(absent(&bed), 1, "the worker its key is pinned on left");
+        assert_eq!(bed.store.upsert(row.facts).id(), pinned, "its id again");
+        assert_eq!(absent(&bed), 0, "back under its id");
     }
 
     /// A decision waits in its stream's queue as it was made, with the
@@ -4818,8 +4877,9 @@ pub(crate) mod tests {
     }
 
     /// An abandoned lease is told to the engine whose generation issued it
-    /// and to no later one: a later generation's stages never saw the
-    /// issue. The lease is ended all the same.
+    /// and to no stage a later one built new: such a stage never saw the
+    /// issue. Each generation here is validated over a stage table of its
+    /// own, so the later one keeps none. The lease is ended all the same.
     #[tokio::test]
     async fn a_later_generations_engine_is_not_told_of_a_lease_it_did_not_issue() {
         let told = Arc::new(Mutex::new(Vec::new()));
@@ -4915,7 +4975,7 @@ pub(crate) mod tests {
 
     /// A decision can pick a worker the store's world does not list yet:
     /// the worker objects follow a registration as its write lands, and
-    /// the store builds the pools that list the row a window later. The
+    /// the store builds the pools that list it a window later. The
     /// lease of such a pick books the worker's count all the same, by the
     /// slot the registration filed: the next decision reads one request in
     /// flight on the worker, on its object and in its record. A lease that
@@ -4932,7 +4992,7 @@ pub(crate) mod tests {
         });
         let mut bed = bed(Some(spec), true, (1, 8), []);
         // One more member, alone under its model, written ready and never
-        // published: the build that lists its row is still owed.
+        // published: the build that lists it is still owed.
         let key = String::from("http://late:8000");
         let facts = WorkerFacts {
             key: key.clone(),
@@ -4953,7 +5013,7 @@ pub(crate) mod tests {
             moved.expect("the row stands");
         }
         let listed = bed.store.snapshot().booked_of(late);
-        assert_eq!(listed, None, "no world lists the row yet");
+        assert_eq!(listed, None, "no world lists the worker yet");
         for request in 1..=2u8 {
             let answer = bed.ask(frame_for(LATE, request, u64::from(request))).await;
             assert_eq!(picked(&answer), late);
@@ -5898,12 +5958,30 @@ pub(crate) mod tests {
         told: &Arc<Mutex<SideCalls>>,
         edit: impl FnOnce(&mut PolicySpec),
     ) -> AppliedSpec {
+        hearing_sides(&mut catalog, told);
+        later_spec_over(&catalog, generation, edit)
+    }
+
+    /// Adds to `catalog` the stage of [`later_bed`]'s decode side, which
+    /// keeps what its engine tells it in `told`.
+    fn hearing_sides(catalog: &mut StageRegistry, told: &Arc<Mutex<SideCalls>>) {
         let kept = Arc::clone(told);
         catalog
             .scorer("heard-sides", move || {
                 Box::new(HeardSides(Arc::clone(&kept)))
             })
             .expect("a free name");
+    }
+
+    /// The document of [`later_bed`] as `generation`, validated over
+    /// `catalog`, which holds its decode side's stage ([`hearing_sides`]).
+    /// Two documents validated over one catalog are a controller's: the
+    /// later one keeps the stages of a profile both state alike.
+    fn later_spec_over(
+        catalog: &StageRegistry,
+        generation: u64,
+        edit: impl FnOnce(&mut PolicySpec),
+    ) -> AppliedSpec {
         let mut document: PolicySpec = serde_json::from_str(
             r#"{
               "apiVersion": "smg.policy/v1",
@@ -5923,7 +6001,7 @@ pub(crate) mod tests {
         document.generation = generation;
         edit(&mut document);
         let digest = document.digest().expect("the document digests");
-        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+        AppliedSpec::validate_digested(&document, digest, catalog, &[])
             .expect("the catalog holds the stage")
     }
 
@@ -6125,7 +6203,7 @@ pub(crate) mod tests {
         let (mut bed, _, prefill) = later_bed();
         let (id, [chosen, other], _) = held(&mut bed).await;
         // One more decode, written ready and never published: the build
-        // that lists its row is still owed. A lease filed on the other
+        // that lists it is still owed. A lease filed on the other
         // decode leaves the new one alone with nothing in flight.
         let key = String::from("http://late:8000");
         let facts = WorkerFacts {
@@ -6147,7 +6225,7 @@ pub(crate) mod tests {
             moved.expect("the row stands");
         }
         let listed = bed.store.snapshot().booked_of(late);
-        assert_eq!(listed, None, "no world lists the row yet");
+        assert_eq!(listed, None, "no world lists the worker yet");
         file(&bed.store, 1, other, bed.script.taken);
         let answer = bed.ask(call(1, id)).await;
         assert_eq!(pair_of(&answer).0[0], (prefill.0, Some(late.0)));
@@ -6777,6 +6855,39 @@ pub(crate) mod tests {
         assert_eq!(booked(&bed, [prefill, chosen, other]), [2, 1, 0]);
         assert_eq!(*reloaded.lock(), []);
         assert_eq!(told.lock().len(), before);
+    }
+
+    /// A call's issue behind a reload that states the decode side's
+    /// profile as it stood is told to that profile's stage, which the
+    /// reload kept, and so is its take-back: the stage stood when the lease
+    /// was issued. Both documents are validated over one catalog, as a
+    /// controller validates its documents.
+    #[tokio::test]
+    async fn a_decode_issued_and_taken_back_behind_a_reload_is_told_to_the_stage_it_kept() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut catalog = StageRegistry::builtin();
+        hearing_sides(&mut catalog, &told);
+        let first = later_spec_over(&catalog, 1, |_| {});
+        let mut bed = bed(Some(first), true, (1, 8), []);
+        ready(&bed.store, "d1", MODEL, Role::Decode, WireModes::NONE);
+        let prefill = side_of(&bed, Role::Prefill);
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let before = told.lock().len();
+        let applied = store.apply(later_spec_over(&catalog, 2, |_| {}));
+        applied.expect("a later generation");
+        let steps = [Step::At(Duration::ZERO), Step::At(FENCED)];
+        bed.script.steps.lock().extend(steps);
+        let answer = bed.ask(call(1, id)).await;
+        assert_eq!(busy(&answer), Reason::NotLeader);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, chosen));
+        assert_eq!(booked(&bed, [prefill, chosen, other]), [2, 1, 0]);
+        // The side's issue on the decode the call picked, then its release.
+        let heard = told.lock()[before..].to_vec();
+        let [(Side::Decode, issued, None), (Side::Decode, released, Some(_))] = heard[..] else {
+            panic!("the stage kept heard {heard:?}");
+        };
+        assert_eq!((issued, released), (other, other));
     }
 
     /// A replica that does not lead says so for a request it has no
@@ -7535,6 +7646,32 @@ pub(crate) mod tests {
     /// verdict leaves it, and the store is told.
     fn set_status(bed: &Bed, worker: WorkerId, status: WorkerStatus) {
         stand(&bed.reads.objects, &bed.store, worker, status);
+    }
+
+    /// A worker told not ready, or draining, is passed over by the very
+    /// next decision, and the store publishes no world for its status: a
+    /// decision reads a worker's status on its worker object, so none waits
+    /// a publication for a worker that left rotation. Under `round_robin`
+    /// the three ready workers take requests by turns, so six in a row on
+    /// one worker show the two others passed over.
+    #[tokio::test]
+    async fn a_worker_told_out_of_rotation_is_passed_over_with_no_publication() {
+        for out in [WorkerStatus::NotReady, WorkerStatus::Draining] {
+            let mut bed = bed(Some(preset("round_robin", 1)), true, (1, 8), []);
+            let stays = bed.workers[0];
+            assert_eq!(bed.store.publish_due(), None, "no build waits");
+            let published = bed.store.publications();
+            for other in [bed.workers[1], bed.workers[2]] {
+                set_status(&bed, other, out);
+            }
+            let told = bed.store.publications();
+            assert_eq!(told, published, "{out:?}: a status published a world");
+            for request in 1..=6 {
+                let answer = bed.ask(frame(request, 1_000 + u64::from(request))).await;
+                assert_eq!(picked(&answer), stays, "{out:?}: request {request}");
+            }
+            assert_eq!(bed.store.publications(), published, "{out:?}");
+        }
     }
 
     /// The service counts a keyed single request for its key under any

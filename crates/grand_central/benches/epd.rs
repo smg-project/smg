@@ -63,11 +63,9 @@ fn epd(c: &mut Criterion) {
             let mut view = Vec::with_capacity(n);
             build_encode_view(&fleet, &mut view);
             let mut scratch = Scratch::new();
-            let pool = PoolFacts {
-                pool_size: n as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
+            let mut pool = PoolFacts::default();
+            pool.pool_size = n as u32;
+            pool.generation = 1;
             let cx = Constraints::default();
             for items in [1u64, 4, 16] {
                 group.throughput(Throughput::Elements(items));
@@ -81,14 +79,12 @@ fn epd(c: &mut Criterion) {
                             let mut picked = 0u32;
                             for item in 0..items {
                                 let key = (seed * 16 + item).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                                let facts = RequestFacts {
-                                    model: "m",
-                                    phase: Phase::Encode,
-                                    session_key: Identity::hashed(key | 1),
-                                    seed: seed ^ item,
-                                    now_micros: 1_000_000,
-                                    ..RequestFacts::default()
-                                };
+                                let mut facts = RequestFacts::default();
+                                facts.model = "m";
+                                facts.phase = Phase::Encode;
+                                facts.session_key = Identity::hashed(key | 1);
+                                facts.seed = seed ^ item;
+                                facts.now_micros = 1_000_000;
                                 let decision = engine.decide(
                                     &facts,
                                     &pool,

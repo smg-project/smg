@@ -206,8 +206,9 @@ use smg_grand_central::{
             Phase as WirePhase, RequestFacts as WireFacts, Side,
         },
     },
-    store::{GatewayId, Hand, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{GatewayId, Hand, MemoryStore, Registrant, WorkerFacts, WorkersStore},
     tracking::{LeaseId, ReleaseReason, Said},
+    worker_host::{Members, Objects},
 };
 use tokio::{
     runtime,
@@ -955,7 +956,7 @@ fn config(deciders: usize) -> Config {
     Config {
         controller_id: "bench-controller".to_owned(),
         listeners: vec![
-            listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+            listener("gateway", &[Scope::Gateway]),
             listener("control", &[Scope::Control]),
             listener("replication", &[Scope::Replication]),
         ],
@@ -1009,7 +1010,8 @@ fn bands(members: u32) -> Vec<u32> {
 }
 
 /// The shape's fleet: ready members under the row's preset as generation
-/// 1, their rows built. No report is written for them ([`READS_LOADS`]):
+/// 1, written through `objects`, the controller's holder of its worker
+/// objects. No report is written for them ([`READS_LOADS`]):
 /// the bands ([`bands`]) set each member's ceiling alone, at twice the
 /// highest band's report, where a row that tells its dispatches stands its
 /// bands apart ([`APART`]).
@@ -1017,7 +1019,7 @@ fn bands(members: u32) -> Vec<u32> {
 /// their own are the same count a model, over members that serve it
 /// alone. A pair plan's row holds that many members a side, under the pair
 /// cell's plan.
-fn fill(store: &MemoryStore, shape: Shape) {
+fn fill(store: &MemoryStore, objects: &Objects<Members>, shape: Shape) {
     let models: Vec<String> = (0..shape.models).map(model).collect();
     let fleets: Vec<(String, Vec<String>)> = match shape.fleet {
         Fleet::Shared => vec![(String::new(), models)],
@@ -1044,20 +1046,20 @@ fn fill(store: &MemoryStore, shape: Shape) {
             .flat_map(|&(role, name)| (0..shape.members).map(move |index| (role, name, index)));
         for (role, name, index) in rows {
             let key = format!("http://{name}-{fleet}{index}.fleet:8000");
-            let id = store
-                .upsert(WorkerFacts {
-                    key: key.clone(),
-                    engine: key,
-                    incarnation: 1,
-                    role,
-                    models: models.clone(),
-                    dp_size: 1,
-                    max_running: Some(ceiling),
-                    ..WorkerFacts::default()
-                })
-                .id();
+            let facts = WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                role,
+                models: models.clone(),
+                dp_size: 1,
+                max_running: Some(ceiling),
+                ..WorkerFacts::default()
+            };
+            let written = objects.upsert(store, facts, Registrant::Control);
+            let id = written.expect("the store takes the write").id();
             let revision = WorkersStore::get(store, id).expect("the row").revision;
-            store.set_status(id, WorkerStatus::Ready, revision);
+            objects.connect_row(store, id, revision);
         }
     }
     let mut document = if shape.pair {
@@ -1110,12 +1112,7 @@ fn serve(shape: Shape) -> Served {
                     .identity_as_told("gateway")
                     .expect("a listener of the configuration");
                 let store = controller.store();
-                fill(&store, shape);
-                // The fleet is written through the store's own entries, and
-                // no task of the serve lays a worker object: the holder
-                // follows the store here, as a host that writes its store
-                // does.
-                controller.workers().follow(&*store);
+                fill(&store, &controller.workers(), shape);
                 let addr = controller
                     .addresses()
                     .of(Scope::Gateway)

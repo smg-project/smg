@@ -17,9 +17,7 @@ use smg_grand_central::{
 /// The process's allocator, the one the stock controller's binary registers,
 /// on the targets where the settings below hold. An Apple target is left out:
 /// the allocator compiles no background thread there. The library registers
-/// none: a controller built on it chooses its own. A burst of registrations
-/// builds the store's world again at every write, and the system allocator
-/// keeps resident what those builds free.
+/// none: a controller built on it chooses its own.
 #[cfg(all(
     not(target_env = "msvc"),
     not(target_env = "musl"),
@@ -337,12 +335,14 @@ mod tests {
     /// ties.
     #[test]
     fn the_scorer_scores_a_workers_share_of_the_busiest_and_ties_an_idle_fleet() {
-        let row = |running: Option<u32>| Candidate {
-            load: running.map(|running| LoadRow {
-                running,
-                ..LoadRow::default()
-            }),
-            ..Candidate::default()
+        let row = |running: Option<u32>| {
+            let mut candidate = Candidate::default();
+            candidate.load = running.map(|running| {
+                let mut load = LoadRow::default();
+                load.running = running;
+                load
+            });
+            candidate
         };
         let scores = |rows: &[Candidate]| {
             let kept: Vec<u32> = (0..).take(rows.len()).collect();
@@ -466,7 +466,7 @@ mod tests {
         Config {
             controller_id: "example-0".to_owned(),
             listeners: vec![
-                listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
+                listener("gateway", &[Scope::Gateway]),
                 listener("control", &[Scope::Control]),
                 listener("replication", &[Scope::Replication]),
             ],

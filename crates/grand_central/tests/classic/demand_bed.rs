@@ -292,10 +292,11 @@ impl Bed {
             let asked = Asked {
                 request: Request {
                     id: &id,
-                    facts: RequestFacts {
-                        model: MODEL,
-                        seed: self.seed,
-                        ..RequestFacts::default()
+                    facts: {
+                        let mut facts = RequestFacts::default();
+                        facts.model = MODEL;
+                        facts.seed = self.seed;
+                        facts
                     },
                     constraints,
                 },

@@ -2,6 +2,7 @@
 //! paused clock, with the worker crate's test feed as the load monitor.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     future::Future,
     sync::{
@@ -543,6 +544,35 @@ async fn a_panic_in_the_upkeep_is_counted_and_the_task_goes_on() {
     assert_eq!(engine.upkeep_faults(), 4, "one run a second and no more");
     assert_eq!(engine.faults(), 0, "no decision panicked");
     task.abort();
+}
+
+thread_local! {
+    /// Armed by a case: the next upkeep a host runs on this thread panics.
+    static UPKEEP_FAULT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Raises the fault a case armed, once. [`InProcess::upkeep`] calls it
+/// ahead of the engine's own sweep, which no case can make panic.
+pub(super) fn raise_the_armed_fault() {
+    let armed = UPKEEP_FAULT.with(|armed| armed.replace(false));
+    assert!(!armed, "the upkeep's sweep");
+}
+
+/// A host that spawns no task of the engine runs the upkeep at a tick of
+/// its own. A panic in it is held and counted with the task's: the call
+/// returns to the host, and the host's next call sweeps.
+#[test]
+fn a_panic_in_a_hosts_upkeep_is_counted_and_the_call_returns() {
+    let engine = preset("least_load");
+    let now = Instant::now();
+    engine.upkeep(now);
+    assert_eq!(engine.upkeep_faults(), 0, "a sweep with no fault");
+    UPKEEP_FAULT.with(|armed| armed.set(true));
+    engine.upkeep(now);
+    assert_eq!(engine.upkeep_faults(), 1, "held and counted");
+    engine.upkeep(now);
+    assert_eq!(engine.upkeep_faults(), 1, "the fault was one call's");
+    assert_eq!(engine.faults(), 0, "no decision panicked");
 }
 
 /// A task that was not run for a while runs its upkeep once for the seconds

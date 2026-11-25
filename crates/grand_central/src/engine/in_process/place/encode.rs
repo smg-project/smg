@@ -1,9 +1,15 @@
 //! An encode request placed: a decision over its caller's three lists, each
 //! item's encoder, and the first of its pair's targets both of whose
 //! workers can be sent to. Where an encoder or every target cannot be sent
-//! to, the call decides again ([`place`]), three decisions at most: this
-//! call hands the decision of a request that carries items no places of
-//! the rule's, so none of them is held to the workers its rule takes.
+//! to, the call decides again ([`place`]), three decisions at most. Behind
+//! the first of them, and behind a first decision that sheds the request
+//! as saturated over a list of its pair, a rule the request states is
+//! asked of the pair's two lists once, and the call's later decisions are
+//! held to the workers it takes on each, as a pair's are and by the pair's
+//! own routine ([`pair::again`]). The rule is asked of no encoder there
+//! either, and no item is held to places of the rule's. So a shed made
+//! over the encoders stands, and no rule is asked behind it: the routine
+//! reads the decision's word of the list it shed over.
 //!
 //! The engine's entry for an encode request decides the pair and each
 //! item's encoder in one call ([`Loaded::decide_encode_at`]). The
@@ -43,9 +49,10 @@ use super::{
 };
 use crate::{
     engine::{
+        decision::ShedReason,
         framework::{EncodeItems, EncodePlaced},
         in_process::Loaded,
-        prefills_full, EncodeLists,
+        prefills_full, EncodeLists, WorkerLists,
     },
     tracking::{Encoders, Placement},
 };
@@ -60,7 +67,10 @@ thread_local! {
 /// its caller handed, with the `items` it carries: one decision told to
 /// leave out the workers the call missed so far ([`Call::missed`]), each
 /// item's encoder, and the first of the pair's targets both of whose
-/// workers can be sent to.
+/// workers can be sent to. The decision is lent `lent`: the request's own
+/// lists, or those lists with each side's places of the pair beside it
+/// ([`pair::again`]). The walk reads the caller's own lists: a place names
+/// the same worker in both.
 ///
 /// The placement names the request's routing value, the profile of its
 /// decode side by its label, and each item's encoder.
@@ -81,10 +91,11 @@ pub(super) fn ask<'a>(
     request: &PlaceRequest<'a>,
     lists: &EncodeLists<'_>,
     items: EncodeItems<'_>,
+    lent: &WorkerLists<'_>,
     call: &mut Call,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
     PLACED.with(|placed| match placed.try_borrow_mut() {
-        Ok(mut placed) => asked(engine, request, lists, items, call, &mut placed),
+        Ok(mut placed) => asked(engine, request, lists, items, lent, call, &mut placed),
         // A stage placed a request from inside a decision of this thread:
         // that request's encoders take a list of their own.
         Err(_) => asked(
@@ -92,6 +103,7 @@ pub(super) fn ask<'a>(
             request,
             lists,
             items,
+            lent,
             call,
             &mut EncodePlaced::new(),
         ),
@@ -104,10 +116,14 @@ fn asked<'a>(
     request: &PlaceRequest<'a>,
     lists: &EncodeLists<'_>,
     items: EncodeItems<'_>,
+    lent: &WorkerLists<'_>,
     call: &mut Call,
     placed: &mut EncodePlaced,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
-    let mut made = Made::asked(engine, request, call);
+    let mut made = Made {
+        lists: lent,
+        ..Made::asked(engine, request, call)
+    };
     let dated = Cell::new(None);
     let clock = || {
         let now = Instant::now();
@@ -183,14 +199,16 @@ fn asked<'a>(
     taken
 }
 
-/// The asks of one call for an encode request over `lists` ([`ask`]): where
-/// an ask takes no placement, the call's next ask answers in its place,
-/// three asks a call at most ([`Call::again`]).
+/// The asks of one call for an encode request over `lists` ([`asks`]): the
+/// first is lent the request's own lists.
 ///
 /// # Errors
 ///
 /// What an ask answers, and [`Unplaced::NoWorkers`] where the call's last
-/// ask takes no placement.
+/// ask takes no placement. A rule that takes no worker of one of the
+/// pair's two lists sheds the request with no endpoint, under `admits`
+/// ([`super::hold_to_rule`]), or leaves it its first decision's shed as
+/// saturated ([`pair::again`]).
 pub(super) fn place<'a>(
     engine: Loaded<'static, '_>,
     request: &PlaceRequest<'a>,
@@ -198,11 +216,45 @@ pub(super) fn place<'a>(
     items: EncodeItems<'_>,
     call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
-    match ask(engine, request, lists, items, call) {
-        Ok(Some(placement)) => Ok(placement),
-        Ok(None) => call.again(|call| place(engine, request, lists, items, call)),
-        Err(unplaced) => Err(unplaced),
-    }
+    asks(engine, request, lists, items, &request.lists, call)
+}
+
+/// An ask of a call for an encode request over `lists`, lent `lent`
+/// ([`ask`]), and the asks of the call behind it: where an ask takes no
+/// placement, the call's next ask answers in its place, three asks a call
+/// at most ([`Call::again`]). Behind the call's first ask a rule the
+/// request states is asked of the pair's two lists, and the later asks are
+/// lent the three lists with each side's places of the pair beside it: the
+/// pair's own routine does both ([`pair::again`]), whatever kept the ask
+/// from a placement, a side of the pair or an encoder. An ask that sheds
+/// the request as saturated goes there too. One made over a list of its
+/// pair judged the overload over the lists it was lent, which a rule may
+/// narrow. One made over the encoders stands there, and no rule is asked
+/// behind it. The routine tells the two by the decision's own word of the
+/// list it shed over ([`ShedOver`](crate::engine::framework::ShedOver)),
+/// whatever profiles the request's sides are decided under.
+fn asks<'a>(
+    engine: Loaded<'static, '_>,
+    request: &PlaceRequest<'a>,
+    lists: &EncodeLists<'_>,
+    items: EncodeItems<'_>,
+    lent: &WorkerLists<'_>,
+    call: &mut Call,
+) -> Result<Placement<'a>, Unplaced> {
+    let shed = match ask(engine, request, lists, items, lent, call) {
+        Ok(Some(placement)) => return Ok(placement),
+        Ok(None) => None,
+        Err(
+            shed @ Unplaced::Shed {
+                reason: ShedReason::Saturated,
+                ..
+            },
+        ) => Some(shed),
+        Err(unplaced) => return Err(unplaced),
+    };
+    let next =
+        |lent: &WorkerLists<'_>, call: &mut Call| asks(engine, request, lists, items, lent, call);
+    pair::again(request, &lists.pair, lent, call, shed, &next)
 }
 
 /// A request that hands an encode request's three lists: placed with the

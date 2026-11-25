@@ -201,6 +201,79 @@ fn a_worker_of_two_pools_is_read_in_each_pools_ask() {
     assert_eq!(prefills, 0);
 }
 
+/// A worker that lists a model twice has one place in that model's pool. A
+/// veto written on it is read once there, and in the pool of the model it
+/// lists behind the double too: a veto's write takes the worker's places
+/// pool by pool, and a second place in one pool would end it there. A
+/// membership build beside the standing veto reads it once as well.
+#[test]
+fn a_worker_that_lists_a_model_twice_is_read_once_in_each_pool() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + S;
+    let twice = admit(
+        &store,
+        facts("http://a:8000", Role::Single, &["one", "one", "two"]),
+    );
+    store.gateway_veto(ASKER, twice, Some(until));
+    let read_in = |model: &str| read(&store, model, ASKER, t0);
+    assert_eq!(read_in("one"), [hold(twice)]);
+    assert_eq!(read_in("two"), [hold(twice)]);
+    // The build of one more member derives every run again.
+    admit(&store, facts("http://b:8000", Role::Single, &["two"]));
+    assert_eq!(read_in("one"), [hold(twice)]);
+    assert_eq!(read_in("two"), [hold(twice)]);
+}
+
+/// A worker's places stand by pool whatever order it lists its models
+/// in. Two workers list two models in opposite orders, so one of them
+/// meets the pools against their order: a veto written on each is read
+/// in both pools.
+#[test]
+fn a_worker_that_lists_its_models_against_the_pools_order_is_read_in_each_pool() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + S;
+    let forth = admit(
+        &store,
+        facts("http://a:8000", Role::Single, &["one", "two"]),
+    );
+    let back = admit(
+        &store,
+        facts("http://b:8000", Role::Single, &["two", "one"]),
+    );
+    store.gateway_veto(ASKER, forth, Some(until));
+    store.gateway_veto(ASKER, back, Some(until));
+    let read_in = |model: &str| read(&store, model, ASKER, t0);
+    for model in ["one", "two"] {
+        let read = read_in(model);
+        assert_eq!(read.len(), 2, "{model}: {read:?}");
+        assert!(read.contains(&hold(forth)) && read.contains(&hold(back)));
+    }
+}
+
+/// A model listed twice with another between is one place in its pool: a
+/// veto written on the worker is read once there, through its own write
+/// and through a membership build beside it.
+#[test]
+fn a_worker_that_lists_a_model_twice_with_another_between_is_read_once_in_each_pool() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + S;
+    let twice = admit(
+        &store,
+        facts("http://a:8000", Role::Single, &["one", "two", "one"]),
+    );
+    store.gateway_veto(ASKER, twice, Some(until));
+    let read_in = |model: &str| read(&store, model, ASKER, t0);
+    assert_eq!(read_in("one"), [hold(twice)]);
+    assert_eq!(read_in("two"), [hold(twice)]);
+    // The build of one more member derives every run again.
+    admit(&store, facts("http://b:8000", Role::Single, &["two"]));
+    assert_eq!(read_in("one"), [hold(twice)]);
+    assert_eq!(read_in("two"), [hold(twice)]);
+}
+
 /// A veto that left is read no more: a departed worker's leaves with its
 /// row, a dropped gateway's with the gateway, and one past its end at the
 /// next window's publication.

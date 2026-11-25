@@ -705,7 +705,9 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// it from here. A dispatch said after that deadline already ended
     /// the lease meets no lease: the request runs unbooked, and its host
     /// is told nothing. Said once: a second call says nothing.
-    /// For a pair this says the prefill's dispatch.
+    /// For a pair this says the prefill's dispatch. A decode side issued
+    /// with that prefill stands on a controller's file from here while the
+    /// prefill runs, and has the deadline's span from the prefill's end.
     pub fn dispatched(&mut self, now: Instant) {
         self.owed = self.dispatch(self.owed, self.target.id, now);
     }
@@ -944,10 +946,24 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// controller older than the field reads none, and places the request
     /// by the rest of its document.
     ///
-    /// Only a frame decided over one list is read for the number: a single
-    /// request's, and one that stands alone at a side's phase. A pair's
-    /// frame is decided as one that names no worker, and its pick need not
-    /// be the worker the number names.
+    /// A pair's frame states the one number for its two sides. The
+    /// controller counts it as this process's one call counts a pair's
+    /// ([`InProcess::place`](crate::engine::InProcess::place)),
+    /// by those tests of its own, on each side whose profile is the plain
+    /// hash ring: the prefills this gateway can be sent to that pair with a
+    /// decode it can be sent to, those with such a decode among their first
+    /// partners alone where there is one, then the partners so counted of
+    /// the prefill reached. The decision is held to the two workers, or to
+    /// the prefill alone where the decode's side does not read the number.
+    /// Where the decode's side alone is that ring, the decision counts the
+    /// number among the partners of the prefill it picks. A number that
+    /// reaches no worker on a side sheds the pair with no endpoint, and so
+    /// does a named worker that cannot take the request after all. Where
+    /// no prefill is counted, or none opens the pair, the pair is decided
+    /// as one that names no worker, and keeps its keys. Where every decode
+    /// is over its thresholds and the binding steers such a pool, the
+    /// decode goes by load and its number is not read. An encode request's
+    /// frame is read for no number.
     ///
     /// The host's own rule for a worker is not asked there, and the
     /// controller's list need not stand in the order of the host's own. A

@@ -39,8 +39,8 @@ pub(crate) mod view;
 pub(crate) mod warm_up;
 
 pub use decision::{
-    Decision, LiftedVeto, Overlap, OverlapSource, Pair, Pick, PlacedBy, Queue, ShadowKind, Shed,
-    ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+    Decision, DecodePlacing, LiftedVeto, Overlap, OverlapSource, Pair, Pick, PlacedBy, Queue,
+    ShadowKind, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use decision_engine::{
     AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
@@ -54,10 +54,10 @@ pub use encode_classes::{hands_to, EncodeClasses, EncodeMember};
 pub use explain::{DecisionNames, DecisionRecord};
 pub use framework::{
     AloneProfile, Binding, DecisionScope, DrawUnit, EncodeItems, EncodePlaced, EncodePool,
-    EncoderFacts, Engine, Filter, FirstPartners, FirstPartnersError, InTheWay, NotAlone,
-    OverloadThresholds, PairPools, PairSide, PairTable, PairTableError, Picker, Place, Plan,
-    PoolRows, PoolWord, Profile, ScoreFront, ScoreSpread, Scorer, Scratch, Shortlist, TieBand,
-    WeightedScorer, DRAW_BOUND, DRAW_FROM, RANK_FROM,
+    EncoderFacts, Engine, Filter, FirstPartners, FirstPartnersError, InTheWay, NotAlone, PairPools,
+    PairSide, PairTable, PairTableError, Picker, Place, Plan, PoolRows, PoolWord, Profile,
+    ScoreFront, ScoreSpread, Scorer, Scratch, Shortlist, TieBand, WeightedScorer, DRAW_BOUND,
+    DRAW_FROM, RANK_FROM,
 };
 #[cfg(feature = "in-process")]
 pub use in_process::encode::EncodeLists;
@@ -68,11 +68,13 @@ pub use in_process::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffi
 #[cfg(feature = "in-process")]
 pub use in_process::pair::{prefills_full, PairAdmission, PairLists};
 #[cfg(feature = "in-process")]
-pub use in_process::place::{HeaderRead, PlaceRequest, Prompt, TokenEntry, Unplaced, WorkerRule};
+pub use in_process::place::{HeaderRead, PlaceRequest, Prompt, PromptEntry, Unplaced, WorkerRule};
 #[cfg(feature = "in-process")]
 pub use in_process::start::WorkerData;
 #[cfg(feature = "in-process")]
-pub use in_process::{InProcess, SpecHandle};
+pub use in_process::{
+    InProcess, SpecHandle, POLICY_FAULTS_HELP, POLICY_FAULTS_TOTAL, POLICY_FAULT_KINDS,
+};
 #[cfg(feature = "in-process")]
 pub use list_cell::{LentList, ListCell, ModelLists, PublishedList};
 pub use pair_classes::PartnerClasses;

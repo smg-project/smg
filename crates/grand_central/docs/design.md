@@ -399,7 +399,7 @@ What a policy remembers lives in several places, among them:
 
 | What | Where |
 |---|---|
-| what a stage remembers | its stage object, inside the `AppliedSpec`: it belongs to one generation of the document |
+| what a stage remembers | its stage object, inside the `AppliedSpec`. It belongs to one generation of the document, or to several where a document put in force on the same engine object keeps an unchanged profile's stages (section 5.1) |
 | what belongs to one worker list (round robin's counter) | the engine's value for that list (section 5.2) |
 | the record of sent prefixes | the engine object (section 5.1) |
 | a sessions rule's pins | the engine object: one table for the engine's life |
@@ -408,7 +408,13 @@ What a policy remembers lives in several places, among them:
 generations. It can keep the last eight generations in a folder, one file each, and roll back to
 one of them.
 
-A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). Either form is read into values first, and the document is built from those values by one typed read. So a YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map stands, a list item with nothing in it is refused in a list of the spec's own, and a tag is refused. A number reads one way in both forms and in every build: a whole number of 64 bits as itself, and any other as the nearest double. The crate's manifest asks the JSON library for its exact reading (`float_roundtrip`). A field of single precision takes the number by a cast, so one that rounds past the largest single reads as infinite there and the spec's check refuses it by its field. A key written twice is refused by name in both forms. Three numbers read apart, by the forms' own rules: a zero written `-0`, a number past a double, and a YAML whole number in hex, octal or binary. A refusal names the field by its path, or the line and column where the file itself does not read.
+A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). Either form is read into values first, and the document is built from those values by one typed read.
+
+So a YAML document reads as JSON does: text that looks like a number, a boolean or a null is written in quotes, a key with nothing under it is refused where a list or a map stands, a list item with nothing in it is refused in a list of the spec's own, and a tag is refused.
+
+A number reads one way in both forms and in every build: a whole number of 64 bits as itself, and any other as the nearest double. The crate's manifest asks the JSON library for its exact reading (`float_roundtrip`). A field of single precision takes the number by a cast, so one that rounds past the largest single reads as infinite there and the spec's check refuses it by its field.
+
+A key written twice is refused by name in both forms. Three numbers read apart, by the forms' own rules: a zero written `-0`, a number past a double, and a YAML whole number in hex, octal or binary. A refusal names the field by its path, or the line and column where the file itself does not read.
 
 ### 3.5 The stage interfaces
 
@@ -478,11 +484,12 @@ whether it is marked non-exhaustive and how code writes it:
 |---|---|---|---|
 | the events a stage hears | `Signal`, `Membership`, `ReleaseReason`, `TransportClass`, `EventKind` | yes | a `match` on one keeps an arm for the rest, and a case with named fields is matched with `..` and made by its call |
 | the answers a stage gives as an enum | `ScoreSpread`, `ScoreFront`, `DrawUnit` | yes | as the events are |
-| the records a caller builds | `Needs`, `Outcome` | yes | a stage writes its `Needs` as one chain from `Needs::NONE`, a call a flag. A host makes an `Outcome` by `Outcome::reported` |
+| the records a caller builds | `Needs`, `Outcome`, `Plain`, `TokenKey`, `TextKey`, `EncodeMember`, `PoolWord` | yes | a stage writes its `Needs` as one chain from `Needs::NONE`, a call a flag. A host makes an `Outcome` by `Outcome::reported`. Each of the other five is made by its call (`Plain::of`, `TokenKey::of`, `TextKey::of`, `EncodeMember::of`, `PoolWord::of`), which takes every field the record has today |
 | the records a stage answers with | `Shortlist`, `HeadRule` | yes | each is made by its call |
-| the records a stage only reads | `RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`, `AffinityFacts`, `Demands`, `DemandFacts`, `Target`, `Pair`, `Lease` | not yet | each gains fields, so code that builds one writes the rest as `..Default::default()` and never matches it whole |
-| what no caller builds or matches whole | `Pick`, `Overlap`, and every other public enum or record that no program outside the crate builds or matches whole | yes | a caller reads one by its fields, and starts one from its `Default` or its call where it has one. A `match` on one keeps an arm for the rest, and a pattern on one ends with `..` |
-| what a caller builds or matches whole | the lists a request lends, the settings, the parts of a decision, of a lease and of a binding, a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
+| the view a stage only reads | `RequestFacts`, `Candidate`, `Constraints`, `PoolFacts`, `LoadRow`, `AffinityFacts`, `AffinityRows`, `AffinityHolder`, `Health`, `MediaCounts`, `Header`, `ZoneCapacity`, and its enums `HashKind`, `SignalSource`, `OverloadRegime` | yes | code outside the crate starts a record from its `Default`, or a `Candidate` from `Candidate::ready`, and assigns the fields it knows. It never matches one whole, and a `match` on one of the enums keeps an arm for the rest |
+| the parts of a decision, of a lease and of a profile | `Target`, `Pair`, `Trace`, `Shed`, `Queue`, `LiftedVeto`, `DemandFacts`, `Lease`, `LeaseKind`, `Dispatch`, `WeightedScorer`, `Profile`, `Binding`, `PairPools`, `EncoderFacts`, `EncodePool`, `EncodeItems` | yes | code outside the crate starts a record from its `Default` or from its call (`Target::of`, `Pair::of`, `PairPools::of`, `WeightedScorer::of`, `Profile::of`, `Binding::of`) and assigns the fields it knows. A `Trace`, a `Shed` and a `Queue` are answers: a caller reads one and builds none. It never matches one whole, and a `match` on `LiftedVeto` or `LeaseKind` keeps an arm for the rest |
+| what no caller builds or matches whole | `Pick`, `Overlap`, `HeldDecision`, `HeldDecode`, `SessionRule`, and every other public enum or record that no program outside the crate builds or matches whole | yes | a caller reads one by its fields, and starts one from its `Default` or its call where it has one. A `match` on one keeps an arm for the rest, and a pattern on one ends with `..` |
+| what a caller builds or matches whole | the lists a request lends and its `Demands`, the settings, a lease as a store holds it, a store's checkpoint | not yet | each takes its mark with a call to start from, and its module or its own declaration says so |
 | the enums closed by design | `Decision`, `ShedReason`, `Side`, `Phase`, `Role`, `Said`, `Pairing`, `Head`, and the client's `Answer` | no | a caller answers every case of them, and a new case must stop its build |
 | the records closed by their shape | a record of one value: `WorkerId`, `LeaseId`, `GatewayId`, `TieBand`. A record with no field, as the stage `Best` | no | its one value, or its name, is the whole record |
 | a record closed by its own doc | `DispatchCounts` | no | a further number goes on `CreditedDispatches` |
@@ -624,15 +631,21 @@ sample 30 seconds old (decision 12).
 **Who opens the stream.** A worker pushes on a stream that its host opens to it. The worker
 crate's collector connects to the worker and subscribes, and the worker answers on that stream
 (`crates/worker/src/kv_events/`). It sends its cache events with the load records that ride
-them, or its load records alone, as its host asks. A gateway asks a worker for its cache events
+them, or its load records alone, as its host asks.
+
+A gateway asks a worker for its cache events
 where what places the worker reads them. Otherwise it asks for the load records alone, and opens
-no stream where its load monitor wants no loads of the worker. A controller asks a worker for
+no stream where its load monitor wants no loads of the worker.
+
+A controller asks a worker for
 its cache events where the worker's registration asks for them, or, for a worker its own
 discovery found, where the document in force at the find reads cache events for the worker's
 first model. Otherwise it asks for the load records alone, on every replica: its load monitor
 wants the loads of every worker the replica dials. It asks for an engine's cache events on one
 stream: a data-parallel engine's rank 0 streams every rank's events. For each rank above 0 it
-opens a stream of load records alone, and takes that rank's records from it. The collector
+opens a stream of load records alone, and takes that rank's records from it.
+
+The collector
 hands the load records to the load monitor and the cache events to the index of cache events
 (section 4.5). Only a worker dialed over gRPC has such a stream; the monitor polls the others.
 A worker dials nobody for this, so it needs no address of a gateway or of a controller.
@@ -695,9 +708,18 @@ For what it sent itself it keeps a record of its own: a hash table behind one lo
 
 1. It holds at most the first 256 blocks of a prompt (4,096 tokens by default). A match needs a
    0.3 share of the prompt, so past 13,653 tokens a prompt stops matching.
-2. Its write gives up when the lock is held, so writes are lost when many requests arrive at once.
-3. It is neither read nor written for a worker the index holds a block for. Under a document
-   whose prefix stage reads the record alone (`source: predictor`), such a worker is never named.
+2. Its write waits for no lock. On the cluster a write that met the lock held was lost, so writes
+   were lost when many requests arrived at once. The deciding thread now keeps what such a write
+   has left and writes it on behind a later pick of its own. Until that stands no other thread
+   reads it, and a thread keeps eight: what newer ones push out is lost.
+3. For a request that has token ids, a profile that reads cache events neither reads nor writes
+   it for a worker the index holds a block for. A profile that reads the record alone
+   (`source: predictor`) reads and writes it for every worker of its list. So does any profile
+   for a request given as text, which asks no index. One limit follows: a profile that reads
+   the record alone knows its own sends to a worker with a block, and none that a profile
+   reading cache events placed there over the same pool. A pair's decode side and a decode
+   request asked alone can be two such profiles. Classic keeps one policy for a model and one
+   for each side of a pair, so it has no twin for this limit.
 
 One more limit is in its reading of record A: it asks the index by at most the first 256 blocks of
 a prompt, where classic asks by every block. Two conversations alike in their first 4,096 tokens
@@ -728,7 +750,7 @@ request goes to.
   route's rule. So a call that decides again stores the prompt once, for the worker it sends
   to, and a call shed under the rule's name stores nothing. A maker that does not answer is
   stored for the pick's first target. A pick that a session's pin made ahead of the walk stores
-  nothing where a worker's leave was told in between: its worker may be the one that left.
+  nothing where a leave or the workers that stand were told in between: its worker may be gone.
 - **[built]** The one call takes a target by the answer the tree's walk was given on it: a
   worker's state is read, and its route's rule asked, once a decision. So the tree names the
   worker the prompt went to. A worker that stops being ready behind that read is still sent to,
@@ -738,17 +760,25 @@ request goes to.
 - **[built]** A request given as text is decided the same way in the string tree its host lends,
   where the host names the request's entry by its text (`RequestMaker::text_key`). The tree is
   asked for whatever the model's index holds: an index speaks of token blocks. A match is
-  counted as the bytes of text it holds, in the request's windows. **[planned]** The gateway
-  lends its string trees.
-- **[planned]** The hash table leaves the single decision. Until then a request of a model with
-  an index of cache events reads the index, where it has token ids, and the hash table for the
-  workers the index holds no block for, as today.
+  counted as the bytes of text it holds, in the request's windows. The gateway lends its string
+  trees, and names a request's entry there by classic's own key.
+- **[planned]** The hash table leaves the single decision. Until then a request with token ids
+  of a model with an index of cache events reads the index, and the hash table for the
+  workers the index holds no block for, as today. A request given as text asks no index: where
+  no lent string tree decides it, it reads the hash table for every worker of its list, and its
+  pick is written there for the worker it goes to, whatever the index holds for that worker. So
+  does a request with token ids under a profile that reads the hash table alone
+  (`source: predictor`).
 - **[built]** A prefill-decode pair decided over worker lists reads the host's index of cache
   events and the hash table for each side, by the side's own list: the index, where the request
-  has token ids, for the workers it holds a block for, and the hash table for the others. Behind
+  has token ids, for the workers it holds a block for, and the hash table for the others. A
+  request given as text reads the hash table for every worker of each side's list. So does a
+  side whose own profile reads the hash table alone, whichever profile a request of its phase
+  asked alone resolves to. Behind
   its pick it writes
   the first target its caller sends to into the hash table, a side at a time, where the index
-  does not speak for that side's worker. An encode
+  does not speak for that side's worker: it speaks for none on a request given as text, and for
+  none to a side whose profile reads the hash table alone. An encode
   request's first decision does the same for its pair. It writes neither side where its caller
   cannot send to an encoder the decision placed (`RequestMaker::sends_to_encoder`). Classic keeps
   trees for each side. **[planned]** The engine reads the host's trees for each side.
@@ -759,24 +789,29 @@ A decision of the engine publishes no insert to other gateways.
 events they push fill the index and nothing else. Records B and C are the deciding process's own
 account of the prompts it sent, written by its policy at each decision. No worker pushes them and
 no worker's stream carries them. In classic the gateway's policy keeps them. With the engine in
-the gateway the gateway keeps them and lends them to the engine. On main it lends the token tree
-alone, to a single request, under a document that reads the prefixes sent to each worker (section
-9.2). A single request with token ids is decided inside that tree, by classic's own key. That
-holds where its model has no index of cache events and its profile reads sent prefixes and names
-the holders' rows. A request given as text names no entry and still reads the hash table. A
-request of a model that has an index still reads the index, where the request has token ids,
-and the hash table for the workers the index holds no block for.
+the gateway the gateway keeps them and lends them to the engine. On main it lends both trees,
+to a single request, under a document that reads the prefixes sent to each worker (section
+9.2). A single request with token ids is decided inside its token tree, by classic's own key. That
+holds where its model has no index of cache events, or one that holds no block, and its profile
+reads sent prefixes and names the holders' rows. A request the gateway holds as text alone is
+decided inside its string tree, by classic's own key, under such a profile and whatever the
+model's index holds. Where no tree decides a request given as text, it reads the hash table, for
+every worker of its list whatever the index holds. A
+request with token ids of a model whose index holds a block still reads the index,
+and the hash table for the workers the index holds no block for:
+for every worker under a profile that reads the hash table alone.
 A prefill-decode pair is lent no tree: each of its sides
 reads the hash table, and the index where its model has one, by the side's own list, worker by
 worker as a single request does. An encode
 request's pair reads them the same way. A controller is to
 keep trees of its own **[planned]**, and section 11 says what its contract must hold for that. On
-main a controller's engine reads its hash table alone (section 10.1).
+main a controller's engine reads its hash table, and the index of cache events that its worker
+host keeps (section 10.1).
 
 One change was made outside the Grand Central crate first **[built]**: classic's trees moved out of
 its policy object into one store type of the kv-index crate (`ModelTrees`), with no behaviour
-change. Classic's policy object keeps its trees in that type. The gateway keeps the token trees
-it lends the engine in the same type **[built]**.
+change. Classic's policy object keeps its trees in that type. The gateway keeps the trees it
+lends the engine in the same type **[built]**.
 
 ### 4.6 Who writes and who reads
 
@@ -785,8 +820,8 @@ it lends the engine in the same type **[built]**.
 | a model's worker list | the registry, at each membership change | yes | yes, the same list |
 | the worker object's state | health checker, load monitor, load guard (on a controller, the leases on file), outcomes | yes | yes, at each decision, and once more for each worker of a target the placement call tests behind the pick |
 | `LoadSnapshot` | the load monitor | `least_load`, `cache_aware`, `power_of_two` | yes, the latest snapshot; a controller's deciding thread gives it with each request, where the document keeps no report |
-| the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex`; a controller's engine is lent none yet |
-| the two trees | the deciding policy: classic's, or the engine inside the tree's walk | `cache_aware` | the host's own trees, lent: the token tree **[built]**, the string tree **[built]** in the engine, its lending by the gateway **[planned]** |
+| the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex`; a controller lends its engines the index in its worker host's KV tables (`worker_host/kv_read.rs`) |
+| the two trees | the deciding policy: classic's, or the engine inside the tree's walk | `cache_aware` | the host's own trees, lent: the token tree **[built]**, the string tree **[built]** |
 
 ## 5. The engine
 
@@ -812,13 +847,15 @@ takes over the sends of a standing one (`Engine::succeed`). Profiles whose
 stages read a count under the same `sent_ttl_ms` and `sent_report_delay_ms` read one count, and a
 document that states neither, as the one built from the routing settings does, puts them all under
 one. It holds no worker of its own: the registry that its host hands it (section 8.1) holds them. A
-controller builds a new engine object for each document it applies, and every stage of it new
-(section 10.2).
+controller builds a new engine object for each document it applies. That object keeps the stages of
+an unchanged profile from the object before it, by the same rules (section 10.2).
 
-The host says who hears a word of a lease issued under an earlier document. On a controller, behind
-a new document the engine that issued the lease is gone, and the standing one counts the send. In a
-gateway's own process the stages kept since the lease's document hear the word, every count of
-sends in force takes a dispatch, the session table hears it, and a stage built since hears nothing.
+A word of a lease issued under an earlier document is told by one rule, in a gateway's own process
+and on a controller: the stages kept since the lease's document hear it, every count of sends in
+force takes a dispatch, and a stage built since hears nothing. The session table hears it where
+the table stood at the lease's issue. A gateway's engine keeps one table for its life. A
+controller's table is the new engine object's own: it starts empty and hears nothing of an earlier
+lease, whose first decision claimed in the table that left (section 10.2).
 
 An entry of the engine reads the document through a reference its own thread keeps. The engine
 holds the number of the document in force in one atomic word, written behind the document at an
@@ -839,21 +876,21 @@ report owed speaks for its lease, and at a thread's end.
 // engine/in_process.rs
 pub struct InProcess {
     document: ArcSwap<InForce>, // the validated document (profiles, bindings, stage objects and their state), its
-                          // number, what is read of it once (which lease events its stages need) and its
+                          // number, what is read of it once (which lease events it takes) and its
                           // shadow counts
     applied: AtomicU64,   // the number of the document in force: an entry compares it with the number of
                           // the document its thread read last
     clock: DecisionClock, // one clock for every decision and every load report's age
-    leases: OwnWord,      // the last lease id handed out: one atomic counter
+    leases: OwnWord,      // the last lease id taken, by a pair or in a thread's run: one atomic counter
     sessions: Arc<SessionTable>, // the pins of every key a sessions rule placed: one table for the
                           // engine's life
     affinity: Affinity,   // cache affinity: the host's index of cache events, and the engine's own
                           // record of the prefixes it sent, one for each model
     epochs: AtomicU64,    // how many list values were made
-    faults: AtomicU64,    // decisions that panicked
-    unheard: AtomicU64,   // lease events and membership changes that panicked inside a stage
-    upkeep_faults: AtomicU64, // steps of the engine's own task that panicked: the upkeep, the registry's follow,
-                          // a telling of load reports
+    held: Arc<HeldFaults>, // the panics the engine held, three counts: decisions that panicked, lease events
+                          // and membership changes that panicked inside a stage, and steps of the engine's
+                          // own task that panicked (the upkeep, the registry's follow, a telling of load
+                          // reports). A controller's store hands every engine it builds one set of them
     loads: task::Loads,   // the host's load channel, once handed, and the newest load snapshot
                           // the engine's own task keeps at hand
     members: membership::Handed, // the host's worker registry, once handed: the engine's own task
@@ -991,7 +1028,7 @@ pub struct Request<'a> {
     pub constraints: Constraints<'a>, // what only the deciding host knows
 }
 
-// engine/view.rs (the fields a stage reads; 30 in all)
+// engine/view.rs (31 fields in all)
 pub struct RequestFacts<'a> {
     pub model: &'a str,            // the resolved model id
     pub phase: Phase,              // Single, Prefill, Decode or Encode
@@ -1017,6 +1054,7 @@ pub struct RequestFacts<'a> {
     pub now_micros: u64,           // the host's clock at the decision
     pub ring: Option<&'a dyn LentRing>, // the hash ring the host keeps, lent to this decision
     pub ring_positions: &'a [u64], // where the request stands on that ring, as the host states it
+    pub decode_ring_positions: Option<&'a [u64]>, // a pair's decode side's own places, where its two sides read the ring by two words
     // six more fields: `affinity`, `named`, `signal_cells`, `session_counted`,
     // `session_key_from_rid` and `model_fingerprint`, which 5.8 removes
 }
@@ -1032,11 +1070,13 @@ pub struct Constraints<'a> {
     pub stalled: &'a [u32],       // positions the host itself holds back
     pub held: &'a [u32],          // those of `stalled` that no rule may lift
     pub places: Option<&'a [u32]>, // the places of the list the request may take; `None`: every place
+    pub target_worker: Option<u32>, // the number a pair names its decode by, where the prefill is the decision's own pick
 }
 ```
 
-What is not built in the engine that stays: a request that states a subset hint, or protocols
-that not every worker of its list serves is refused. The refusal names the input.
+What is not built in the engine: a request that states a subset hint is refused. So is one that
+states protocols where a worker of its list, or of either list of a pair, is dialed over one it
+does not state. The refusal names the input.
 A pair's demand is kept a side at a time: each side of its two lists is held to the
 workers that meet it as that side's role is held to it, and a side it leaves nobody sheds the pair
 under that demand's stage, the prefills' first.
@@ -1058,9 +1098,12 @@ its class. So what the encoders lack is named in the pass's own order, as classi
 whether a request states a fact as a demand or as its own: an encoder that would take the
 request but for its images (`encode-vision`), a pushing encoder that takes the media
 (`ec-compatible`), the media (`encode-media`), the encoders (`encoders`). No encoder is shed
-under a demand's own stage, and every answer for the encoders stands ahead of a side's. A
+under a demand's own stage. Three answers for the encoders stand ahead of a side's stage: a gap
+of their membership, encoders none of which is open, and a saturated fleet. A
 host's places for the encoders stand beside a demand as beside none: the pass reads every
-encoder for what the model takes, and the places for what the request may reach.
+encoder for what the model takes, and the places for what the request may reach. The
+encoders' `places` answer waits behind a side's stage, as it waits behind a gap of the pair's
+membership.
 A request with items that demands vision or a way of processing its
 references leaves that part of the demand to its encoders. A decode asked again takes no items
 and would hold the decode to the whole demand, so the decode of such a request is not asked
@@ -1074,7 +1117,6 @@ place in its list, and what its host says of it and of each prefill is laid by t
 host has no narrowed list to hand. The decision leaves out each encoder that serves no protocol
 the request states, and a request with items is refused under `wires` where the list holds
 encoders and none serves one. The pair's two lists are refused as a pair's are.
-The other inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
 names `places`, where the request is a pair or an encode request: one list of places cannot hold
 a pair's two lists, or an encode request's three. A single request that states places is decided
@@ -1085,7 +1127,9 @@ A pair's host states each list's places beside its two lists (`PairLists::prefil
 states its encoders' places as well (`EncodeLists::encoders_places`). The encode pass decides its
 pair over the workers it admits for the items, and numbers each side's places with them as it
 numbers a mask: a place whose worker it left out opens none. An item's encoder is one at the
-encoders' places, and a prefill that only other encoders hand to is not the pair's. Where a list's
+encoders' places, and a prefill that only other encoders hand to is not the pair's.
+
+Where a list's
 places name workers and none of them takes the request, though a worker outside them does, the
 request is shed under `places`: it is held off every worker that takes it. The places are its
 host's, or the ones its demand leaves. No gap of the membership
@@ -1095,6 +1139,7 @@ closes it. What the pair's own decision answers stays
 behind the pass, under places as under none. Places that name no worker of a list are no such
 case. Such places of a side shed the request as they shed its pair alone, and such places of the
 encoders shed it as a list with no open encoder does.
+
 A pair's host states its standing vetoes the same way, the places each list's vetoes mask and those
 a hold stands on (`PairLists::prefill_stalled`, `prefill_held`, `decode_stalled`, `decode_held`).
 Each side reads its own, under an encode request too, and a pair's or an encode request's own mask
@@ -1135,7 +1180,7 @@ pub enum ShedReason {
 }
 pub struct Trace {
     pub profile: u16,                      // which profile decided
-    pub survivors: Survivors,              // how many workers passed the filters
+    pub survivors: Survivors,              // how many workers passed the filters, or none behind a draw
     pub top: [(WorkerId, f32); TRACE_TOP], // the best workers and their scores
     pub top_len: u8,                       // how many of `top` are set
     pub seed: u64,
@@ -1153,9 +1198,14 @@ The HTTP status codes belong to the host. The engine only says why.
 The host calls `InProcess::decide_at(maker, clock)`. `maker` is the host's object for the
 request (section 8). The call runs on the caller's thread.
 
-The engine waits on no lock of its own. A stage that keeps state takes its own short lock (one
-shard of the session table, or the record of sent prefixes). A decision that meets the one build
-of a list's `records`, `wires` or `alone` waits for it (5.2).
+The engine waits on no lock of its own, but for these. Under a document that keeps a sample of its
+decisions (decision 7), a decision that is kept takes the one lock of the sample's ring for its
+push. A decision that finds a list no lookup table for cache affinity (5.2) reads one, and a table
+stands for a second, or until the index of cache events hands a worker's number on to another
+worker, before one decision reads it anew. Such a read takes the lock of the engine's
+map of the records of sent prefixes, once at most. A stage that keeps state takes its own short
+lock (one shard of the session table or the record of sent prefixes, among them). A decision that
+meets the one build of a list's value, or of a part of it, waits for it (5.2).
 
 **The short path.** A request is *plain* when it names no tried or excluded worker and states no
 hint, no demand, no lifted overload veto, no later decode, no held-back worker and no places of its
@@ -1176,7 +1226,7 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 
    | Picker | Its rule |
    |---|---|
-   | round robin | It takes the next turn of the list's counter and takes the worker it lands on if that worker is eligible. Where it is not, the engine reads the list once and the rotation picks among the eligible workers. A thread's first turns of a list are single steps of the counter, 64 for each worker; past them the thread takes 61 turns at once (67 where 61 divides the list's size, one where 67 does too) and plays them in order, for four lists at a time. |
+   | round robin | It adds one to the list's counter and takes the worker it lands on if that worker is eligible. Where it is not, the engine reads the list once and the rotation picks among the eligible workers. |
    | `random` | It draws a position below the list's size from the calling thread's own draw sequence, and again while the worker drawn is not eligible, eight draws at most. Past them the engine reads the list once and draws among the eligible workers. |
    | `passthrough` | It takes the first eligible worker in the list's order. |
 
@@ -1201,6 +1251,13 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 7. **Records.** One `Candidate` for each worker is written into the thread's buffer. Over a list
    of 16 workers or more, a profile whose picker draws first (`random`, `round-robin`,
    `passthrough`, power of two, `best` with a sample) has only the drawn workers' records written.
+   A request whose session key holds no pin is decided on a draw too, where its sessions rule
+   leaves a new key to a profile whose picker takes turns and whose filters are one test of a
+   worker's record. The worker the list's counter points at has its record written first, with no
+   turn taken. Where the filters keep that worker, the workers the draw then takes have theirs
+   written, and so has a worker that another request claimed for the key meanwhile. Where they
+   refuse it, or the worker the draw's own turn lands on, every worker's record is written
+   (decision 15).
    For a request held to places no worker is drawn first: every worker's record is written.
    Under a binding that names a shadow every worker's record is written, for the two decisions.
 8. **Filters.** Each filter removes records. If a filter leaves nothing, the binding's rule for a
@@ -1210,7 +1267,11 @@ On main three pickers say so: round robin, `random` and `passthrough`.
    lifted the overload veto for the request. The rule lifts nothing harder: a veto the host
    holds (`Constraints::held`), an open breaker, a worker that is not ready or is draining.
    Otherwise the decision is a refusal that names the filter: `Saturated` for the overload filter,
-   `NoEndpoints` for any other. A single request with a routing key keeps its key's worker over
+   `NoEndpoints` for any other. An encode request's encoders enter no such rule. Where the
+   overload filter leaves none of them, the refusal is `Saturated` under a binding that sheds
+   and `NoEndpoints` under `encoders` under one that steers. Classic answers a client the
+   same way: its overload shed with the shed option, and no available worker without it.
+   A single request with a routing key keeps its key's worker over
    the overload veto, beside free workers too, where its binding does not shed, the plain ring
    alone places its profile and every worker it may take is a single worker. A sessions rule adds
    conditions of its own. Over workers of another role the veto stands, and the key passes on to
@@ -1218,8 +1279,8 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 9. **Scorers and the picker.** Each scorer scores the survivors. The scores are combined by the
    document's weights. The picker orders up to four targets. No target is a refusal,
    `PolicyDeclined`, naming the picker.
-10. **The lease.** If a stage needs lease events and the decision is a pick, the engine issues a
-    lease (section 6) and tells the stages, unless a sessions rule keeps the pick from them.
+10. **The lease.** If the decision is a pick that has a lease (section 6), the engine issues it and
+    tells the stages, unless a sessions rule keeps the pick from them.
 11. The answer is the decision with its lease.
 
 **A retry** names the workers it tried and takes the full path. How its tried workers are widened:
@@ -1235,10 +1296,15 @@ On main three pickers say so: round robin, `random` and `passthrough`.
 
 A decision that panics is caught, counted and answered as refused. It never takes the host down.
 A stage that panics at a word of a lease, its issue among them, or at a change of membership is
-held and counted apart: the request keeps its decision and its lease, and a registration or a
-removal goes on. A gateway shows both counts and the count of its upkeep's panics at each scrape
-of its metrics endpoint, as the series `smg_policy_faults_total` by `kind`: `decision`, `event`
-and `upkeep`.
+held and counted apart: the request keeps its decision and its lease, and a registration, a
+removal or an apply goes on. A gateway shows both counts and the count of its upkeep's panics
+at each scrape of its metrics endpoint, as the series `smg_policy_faults_total` by `kind`:
+`decision`, `event` and `upkeep`. A controller shows the same series on its metrics page,
+counted over every engine its store built, so a count outlasts the document it rose under. Its
+`event` is a change of membership alone: a controller holds a stage's panic at a word of a
+lease under catches of its own, and counts it in series of its own. Where such a panic unwinds
+the decision that told the word, as at the issue of a single's or a pair's lease, the request
+is answered with no decision.
 
 A request whose host hands no list (`WorkerLists::None`) is decided over no worker: it is shed
 with no endpoint under the stage `none`, and its trace names no profile. A controller hands none
@@ -1248,17 +1314,24 @@ What one decision writes:
 
 - the thread's own buffer;
 - on the short path under `round-robin`, one atomic add on the list's counter;
-- one atomic add for a pair's lease id, or for each 64 ids a thread gives single requests, where a
-  stage needs lease events;
+- one atomic add for the lease id of a pair, an encode request's pair too, or for each run of 64
+  ids a thread takes for single requests, where a pick has a lease (section 6). A thread takes a
+  new run too where it issues a single request's lease under another document than its run was
+  taken under, and the ids left of its old run name no lease;
 - a session pin, where a sessions rule decides;
+- the sample's ring, for a decision that is kept (decision 7);
 - the record of sent prefixes, where a cache-affinity profile decides;
 - once for each new load snapshot and list, the converted load reports, which allocates.
 
-On the short path it allocates nothing. Under round robin not every decision writes the list's
-counter: past a thread's first turns of a list, 64 for each worker, the thread takes 61 turns of the
-counter in one write (67 where 61 divides the list's size, one where 67 does too), and between two
-such writes a pick writes the thread's own run alone. A thread keeps such runs for four lists; a
-fifth writes the counter on every pick until one of the four places goes unused.
+On the short path a decision allocates only for what is kept for later decisions, among it:
+
+- the calling thread's reference of the document in force, where the thread kept another document
+  or none;
+- a list's value, where the decision asks the list ahead of any task of the engine (section 5.2);
+- the model's name, which a list's value keeps beside the profile one pick decides;
+- the calling thread's list of the eligible workers, where the engine reads the list once (step 1);
+- the sample's ring, at the first decision a document keeps (decision 7).
+
 A draw that looked up load reports counts them toward its
 list's conversion where it takes the list's claim, which it tries and never waits for.
 
@@ -1267,7 +1340,7 @@ list's conversion where it takes the list's claim, which it tries and never wait
 Main has one engine, `InProcess`, behind the trait `DecisionEngine`
 (`engine/decision_engine.rs`). It decides over its host's worker objects, read in place. It keeps
 no lease: the host hands the lease back with each event. This document also calls it the kept
-engine.
+engine, its name while a second engine stood beside it.
 
 A second engine stood beside it: the store-backed engine, also called the old engine here. It
 decided over records copied into the policy store and kept its leases there. Its type is deleted,
@@ -1280,7 +1353,7 @@ The types the two engines shared stay where they were moved ahead of the deletio
 `DecideOutcome`, `DecisionRefused` and `DecodeRefused` in the trait's file, and
 `Said` (section 6) beside `Lease`. `GatewayId` is still defined in the store.
 
-### 5.8 What changes in the kept engine **[planned]**
+### 5.8 What changes in the engine **[partly]**
 
 - It honours what it once refused: an encode request's pair held to some workers of its two
   lists, and its encoders held to some of theirs (`EncodeLists::decide` decides the request
@@ -1309,10 +1382,14 @@ The types the two engines shared stay where they were moved ahead of the deletio
 - The record of sent prefixes leaves the single decision. The two trees a request is then
   decided in are the host's own, lent (section 4.5).
 
-`signal_cells` stays, and it is built for a single request: where the request's profile reads a
-named signal, the kept engine fills the field itself, from the reports of the load snapshot the
-decision holds. Such a decision converts its list's reports where no decision under its snapshot
-has, ahead of a routing key's short answer too. A row that is one rank of a data-parallel worker
+`signal_cells` stays, and it is built for a single request: where the request's profile or its
+binding's shadow reads a named signal, the engine fills the field itself, whatever cells its caller
+put there: from the reports of the load snapshot the decision holds, and with none under no
+snapshot. The cells are the list's own where the list holds the cells of the decision's snapshot.
+Where it does not, the decision converts the list's reports, ahead of a routing key's short answer
+too, and the decisions behind it read what it left. A decision that is not the one to convert
+writes cells of its own and waits for nothing: another is converting, or it began no later than the
+one whose cells the list holds. A row that is one rank of a data-parallel worker
 reads its own rank's values. A worker object that stands for several ranks reads one value a
 name: its ranks' values made one as the signal's `across_ranks` says, under the oldest sample
 among them. The worker crate's report states each rank's own sample instant, so a rank that
@@ -1323,9 +1400,10 @@ still to report. A report of several ranks is read of no other object, and a rep
 fewer ranks than it counts gives no value. A report of one rank is read as the worker's whole, so
 the first record of an object of several ranks stands for it until a second rank's record.
 
-A pair is lent them a side. Where the prefill profile reads a named signal, the prefill side
-reads its prefill list's cells, and the decode side reads its decode list's where the decode
-profile reads one. Both are of the snapshot the decision holds, and a decode decided again
+A pair is lent them a side. Where the prefill profile or the binding's prefill shadow reads a
+named signal, the prefill side reads its prefill list's cells, and the decode side reads its decode
+list's where the decode profile or the binding's decode shadow reads one. Both are of the snapshot
+the decision holds, and a decode decided again
 reads those of its own call. The pair's pools carry each side's cells
 (`PairPools::prefill_signal_cells`, `decode_signal_cells`), so the request is not copied.
 
@@ -1338,9 +1416,12 @@ encode phase first, and the engine's answer for an encode decision carries that 
 ## 6. The lease and its events **[built]**
 
 A lease is the engine's note that a decision's request is on its way. For a single request it
-exists only when a stage of the document wants to hear what became of requests, or its session
-table follows the pick's dispatch. A pair's pick always has one. On a controller every pick it
-answers has one on file: the leases on file are its count of requests in flight (section 4.2).
+exists only where the document takes a lease event. Where a stage or a count of sends takes one,
+every pick has a lease. Where the session table alone takes one, a pick the table is told nothing
+of has none, a request with no session key among them. The short path is the exception: its pick
+has a lease wherever the document takes a lease event (section 5.6). A pair's pick always has one.
+On a controller every pick it answers has one on file: the leases on file are its count of
+requests in flight (section 4.2).
 
 ```rust
 // tracking/lease.rs
@@ -1370,17 +1451,25 @@ pub enum Said {
 decide ──> lease issued ──> Dispatched ──> Completed
                 │                └───────> Released (client gone, send failed, worker removed)
                 └── never dispatched ──> Released when the host drops its guard
-                                         (a controller releases one on its file 5 s after issue)
+                                         (a controller releases one on its file 5 s after issue;
+                                          a pair's decode side behind its prefill, 5 s after
+                                          that prefill's end)
 ```
 
-The kept engine stores nothing about a lease. The host keeps what it was handed and hands it back
+A controller's deadline is the time to name a lease's first dispatch. A pair's decode side that
+was issued with its prefill is sent when that prefill has answered. So the file holds it while
+the prefill is dispatched, as its booking stands in a gateway's own process, and it has a whole
+deadline from the file's first pass behind the prefill's end. A side a decode call issued keeps
+the call's own deadline.
+
+The engine stores nothing about a lease. The host keeps what it was handed and hands it back
 with each event (`DecisionEngine::say`). The crate has a guard for that, `DecisionGuard`
 (`tracking/decision_guard.rs`): it holds one decision's lease, has `dispatched`, `completed` and
 `released`, and releases at its drop. A controller keeps its leases in a file. It lends a lease
 back from that file in the guard's form, so one rule tells a lease's events under either host
-(`lease_events::single`, `lease_events::pair`). The host says who hears: behind a new document
-the engine that issued the lease is gone, and the standing one counts the send. In a gateway's
-own process the stages a later document kept hear the word, and every count of sends in force
+(`lease_events::single`, `lease_events::pair`). The host says who hears. Behind a new document the
+stages that document kept of the ones that stood at the issue hear a lease's events, and no stage
+it built new: in a gateway's own process and on a controller alike. Every count of sends in force
 takes the dispatch (section 5.1). A file meets events no guard says. An end is told once for each
 side of a pair that is still live. A release of a decode side behind its dispatch names the worker
 that side went to. It states the side's claim only where the side claimed that worker: behind a
@@ -1390,9 +1479,9 @@ What an event does:
 
 | Event | What the stages do with it |
 |---|---|
-| Dispatched | the session's pin follows the worker the request went to; every count of sends takes it, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, where the request that met the cap was decided, to the worker it was placed on: the dispatch finds it there, or fronts the later target the request went to |
+| Dispatched | the session's pin follows the worker the request went to; every count of sends takes it, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, to the worker under the cap that the request which met the cap was placed on: where that request was decided, or for a pair's prefill side where the pair formed (decision 13). The dispatch finds the pin there, or fronts the later target the request went to. A request placed on another worker at the cap moves no pin |
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
-| Released | the same stages hear the reason. Under a sessions rule a commit that refused every target takes back the pin its decision claimed, on each side of a pair. A pair's later decode, issued no lease, gives its claim back with its prefill where the engine runs in its host's process, and keeps its own under a served controller |
+| Released | the same stages hear the reason. Under a sessions rule a commit that refused every target takes back the pin its decision claimed, on each side of a pair. A pair's later decode, issued no lease, gives its claim back with its prefill, or with a release that names it alone: a controller's file tells that word, and a request's guard says none for a later decode its host gives up by name |
 
 A count of sends holds a send until one of four ends: a load report of the worker sampled at or
 after the send (later by `sent_report_delay_ms`, where the profile sets it), the age `sent_ttl_ms`
@@ -1408,19 +1497,35 @@ the key. The rule says whether such a request is the profile's own (`rule_placed
 the default, it is: the stages hear its issue and its dispatch,
 every count of sends takes it, and its prompt is recorded as behind any pick. Under
 `untold` it is kept from the profile: no stage hears its issue or its dispatch, no count of sends
-takes it, and neither the engine's record of sent prefixes nor a lent token tree takes its prompt.
+takes it, and neither the engine's record of sent prefixes nor a lent tree takes its prompt.
 The session's pin still follows its dispatch, and its completion and its release are told as any
 request's, so a stage matches an end by the lease's id. The routing settings write `untold` for
 the sticky override's rule alone: a gateway's sticky map keeps a request it places from the
-gateway's policy. The kept engine keeps the word on the pick, and one function reads it
-(`lease_events::stages_hear`) at four places: a single's lease words, the record's two writes, the
-tree's store, and the hand-over of a pin followed by one row. Such a pin that is the profile's own
+gateway's policy. The engine keeps the word on the pick, and one function reads it
+(`lease_events::stages_hear`) wherever it is asked, among them a single's lease words, the record's
+two writes, a pair's two writes behind its pick, the tree's store, and the hand-over of a pin
+followed by its own row. Such a pin that is the profile's own
 goes through the lookup that names a request's holders with its answer made, so its prompt is
-recorded as a pin's the whole decision follows. A controller asks the same function where it files
-a pick's lease, and keeps the answer on the lease's record (`LeaseRecord::untold`): no stage hears
+recorded as a pin's the whole decision follows, unless a leave or the workers that stand were told
+meanwhile: the pin's worker may be gone, and the prompt is stored for no worker. A controller asks
+the same function where it files a single request's lease, and keeps the answer on the lease's
+record (`LeaseRecord::untold`): no stage hears
 that issue, and the dispatch it tells off the file moves the session's pin and reaches no stage
 and no count of sends. Its decision is the engine's own, so its record of sent prefixes follows the
 word too.
+
+Each side of a pair is placed by a decision of its own, under its own session, so the rule may
+place one side alone beside a side its stages placed. A pair's pick states a word for each side:
+its own for the prefill side, and its pairs' for the decode side (`Pair::decode_placing`). The same
+function reads the side's word at a pair's dispatch, at its two issues and a later decode's, and at
+each side's write of where the prompt went. A decode asked again states its own word of the decode
+side. Where it names the decode its pair holds, by worker and rank, it keeps that pair's word: the
+decision that put the request there stands, and the call placed nothing, whether it followed the
+claim that decision made or its own stages found the decode again. Its pick keeps the first
+decision's word of the prefill side for its guard and its host: the stages that hear the decode's
+issue are handed the pick ahead of that word. A controller's file keeps one word a lease, a
+single's, so a controller refuses a document whose rule states `untold` under `pd-pair`, by that
+field's name.
 
 The session table takes no new key once it holds 4,194,304 keys. A request of such a key is
 placed with no pin, until keys leave the table.
@@ -1477,7 +1582,8 @@ A host's start has these steps.
    - its worker registry (the host implements `Members`, and the worker crate's registry is one);
    - its load monitor's channel;
    - its indexes of cache events (the host implements `CacheIndexes` and `CacheIndex`). The same
-     hand-over also lends the token tree, where the host keeps one (`CacheIndexes::token_tree`).
+     hand-over also lends the host's two trees, where it keeps them (`CacheIndexes::token_tree`,
+     `CacheIndexes::string_tree`).
 
    A host with no load monitor or no index says `None`. The call answers the engine, which lives
    as long as the process, and the engine's own task.
@@ -1560,6 +1666,7 @@ trait for that call. A host writes `model` and `make`; every other method has a 
 pub trait RequestMaker {
     fn model(&self) -> &str;                          // the request's model
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w>; // builds the request
+    fn shadow_ring<'w>(&'w self, spec: &'w AppliedSpec, shadow: u16) -> Option<(&'w dyn LentRing, &'w [u64])>; // the ring it lends its binding's shadow profile and its places on it, by that profile's word
     fn plain(&self) -> Option<Plain>;                 // what a plain request states, if it is plain
     fn prompt_chars(&self) -> u32;                    // the length of its text in characters, asked for a plain request's lease
     fn prompt_bytes(&self) -> u32;                    // the same length in bytes
@@ -1593,8 +1700,9 @@ A host that calls the engine through this trait alone has more to do itself. Amo
 - turn a refusal into a status.
 
 That is too much. The gateway's earlier integration needed a module of its own of 19 files and
-13,856 lines (tests included) for it, and a branch in every route. For a single request and for a
-pair, `place` of section 8.2 now derives the key, hashes the prompt and tries the targets, and its
+13,856 lines (tests included) for it, and a branch in every route. For a single request, a pair
+and an encode request, `place` of section 8.2 now derives the key, hashes the prompt where a
+decision reads its hashes, and tries the targets, and its
 `Placement` keeps the lease. The host still says the two events and turns a refusal into a status.
 
 **A lent hash ring.** A host that keeps a hash ring of a model's workers can lend it with a
@@ -1623,10 +1731,17 @@ id as a source, the value it hands is no head: it names the session alone, as cl
 header's key and never the id's. A
 ring whose lender places no head answers nothing: such a request is lent no ring, the lender is
 asked about no further head, and the stage's own ring places the request. A request that has no
-head states no place and is lent no ring either. Neither is a pair whose two sides read the ring
-by two forms, or cut a prompt at two depths: each side's stage then places by its own ring.
+head states no place and is lent no ring either.
 The items of an encode request are placed on that one ring too, each by its own text, where the
 encode profile's ring stage reads it.
+
+A pair is lent the one ring for its two lists, and where its two sides read it by one word, one
+list of places is both sides'. Where they read it by two forms, or cut a prompt at two depths, each
+side is stated what a single request of its own profile is stated: the request's facts carry the
+decode side's list beside the prefill side's (`RequestFacts::decode_ring_positions`), and each
+side's stage walks the lent ring from its own places, as each classic policy walks the model's
+ring from its own. A side whose own profile reads the ring by two words is stated nothing, as a
+single request of that profile is, and its stage places by its own ring.
 
 ### 8.2 The contract as designed **[partly]**
 
@@ -1652,9 +1767,9 @@ The start answers the task, and the host spawns it on a runtime of its choice: t
 nothing. The call is marked `#[must_use]`, with the reason that the task does nothing until it is
 spawned. So the compiler warns a caller that drops the whole answer. It does not warn a caller
 that keeps the engine and drops the task. That caller's engine keeps no load snapshot, runs no
-upkeep, tells no policy a load report and fills no cell ahead of a request. It tells the
-policies no worker either, with one exception: a later document put in force has the policies it
-builds new told the workers that stand (section 8.1, step 6).
+upkeep, tells no policy a load report and fills no cell ahead of a request. By itself it tells
+the policies no worker either, with one exception: a later document put in force has the policies
+it builds new told the workers that stand (section 8.1, step 6).
 
 The start takes no worker lists. Each request gives its own. The engine's task asks only the
 lists a host hands it beside the start, to fill their cells (the fifth job below).
@@ -1774,7 +1889,8 @@ pub struct Placement<'a> {               // built, see part 3
     pub routing_key: Option<&'a str>,    // the key the document derived, for the in-flight counters
     pub profile: &'static str,           // the label of the profile that picked, for the host's own counts
     pub decode_profile: Option<&'static str>, // a pair's decode side's profile, by its label
-    // private: the lease, when a stage of the document wants events
+    pub overlap: Overlap,                // how many leading blocks of the request the worker it goes to holds, of how many
+    // private: the lease: a pair's always, a single request's only where the document takes a lease event (section 6)
 }
 
 pub enum Unplaced {
@@ -1786,14 +1902,14 @@ pub enum Unplaced {
 }
 ```
 
-Inside `place` the crate derives the routing key, hashes the prompt, decides, and tries the
+Inside `place` the crate derives the routing key, hashes the prompt where a decision reads its hashes, decides, and tries the
 targets best first: health and circuit breaker are read again, and the route's rule is asked of
 the picked worker. If none holds, it decides again over what is left. The host sees a worker or a
 reason.
 
 Built so far, for a single request, a pair over its two lists and an encode request over its three: the key, the hashes, the decision, and its targets tried
 best first by health, circuit breaker and the route's rule. Where none holds, a lease the pick was issued is given up at once and the decision is made again, told to leave out the workers that could not be sent to, three decisions a call at most; then the request has no worker
-(`NoWorkers`). Planned: the later decisions of an encode request that carries items held to the workers the rule takes.
+(`NoWorkers`).
 
 A pair's target holds where both its workers can be sent to.
 
@@ -1807,9 +1923,84 @@ or they were not ready, a rule the request states is asked of every worker of th
 decisions are held to the workers it takes. A pair's rule is asked of each of its two lists, among the places its host states for that side, and its later decisions are held to the workers it takes on each. A pair's first decision that sheds the request as saturated has the rule asked the same way: it judged the overload over the whole lists, and the next decision judges it over the workers the rule takes. So the rule's one worker of a long list is found, one
 over its overload thresholds is answered by the binding's rule for a list wholly over them, and
 one an earlier attempt tried is handed again where no other is left. A request whose rule takes
-no worker of a list is shed with no endpoint, under `admits`. A single request's later decision
-is given what the call has left of the request's budget, and a request with none left when a
-decision is due is shed under `budget`. A pair's decisions are each given the whole budget.
+no worker of a list is shed with no endpoint, under `admits`, but for two cases of a pair and of an
+encode request's pair. Both stand behind a first decision that shed the request as saturated and
+said the list it shed over, for a request that states no hard demand and whose host states no
+places of the prefills or the decodes, under a binding that sheds a list wholly over its
+thresholds, and in both that shed is the answer. In the first the rule takes no prefill, and the
+decision shed over the prefills. In the second the rule takes a prefill and no decode, and the
+decision said a list. There the shed is the answer where one of the rule's prefills can take the
+request and the decision shed over the decodes, and where none can, one of them is ready and every
+ready one is over its thresholds. A prefill that pairs with no decode is no prefill of the rule's
+there: a rule that takes only such prefills is answered as one that takes none.
+
+A decision that sheds a pair as saturated says the list it shed over where the gateway's own
+selection would read that list as wholly over its thresholds too. Of the prefills at the request's
+places it counts those that pair with a decode of the pool, and of the decodes the whole list at
+the request's places. In both it counts every worker that is ready with a closed breaker, one under
+a liveness doubt too: such a worker under its thresholds keeps its list from being wholly over
+them. The count asks each row the health stage's own test, with no doubt on the row, and a row that
+passes it the overload veto's own test. A decision says no list where an encode request's pass
+handed it a part of a list. A request's hard demand hands the decision a part of each list too, the
+workers that meet it, and the places its host states for the prefills or the decodes hand it the
+workers at them: for such a request the call acts on no word of the prefills or the decodes. A shed
+made over the encoders stands for it as for any, ahead of that test. Places of the encoders alone
+hold an encode request to no part of its pair's two lists: where the encoders at them leave a
+prefill or a decode out, the encode pass takes the word back itself, and where the word stays its
+shed stands. The gateway's own pair selection answers its overload shed in both cases, and over the
+lists as the decision counted them the shed stands in no case where that selection answers that it
+has no worker. It judges one list, the prefills where no prefill the rule takes can take the
+request and else the decodes, over the rule's workers of that list, and the list whole where the
+rule takes none of it (`pair_pass`, `model_gateway/src/routers/common/placement.rs:2866-2884` and
+`:2909-2936`; `admitted_pool`, `:1831-1852`; `all_overloaded`,
+`model_gateway/src/routers/common/overload.rs:58-74`; the prefills it holds,
+`model_gateway/src/routers/common/pair_index.rs:158-161`; on main `56773d28d`). A single request's
+later decision is given what the call has left of the request's budget, and a request with none
+left when a decision is due is shed under `budget`. A pair's decisions are each given the whole
+budget.
+
+Four answers of a pair stand open there under rule 6. In each the engine's answer is of another
+kind than the gateway's own selection's: a shed as saturated beside anything but its overload
+shed, or a shed with no endpoint beside anything but its answer that it has no worker.
+
+- No decision said a list. The rule takes only prefills over their thresholds and no decode,
+  behind a first decision that picked or behind one that shed the request as saturated and said
+  no list. The engine sheds the request with no endpoint, under `admits`: no decision judged the
+  rule's prefills. The gateway's own selection answers its overload shed, since it judges the
+  rule's prefills first (`:2866-2884`). One decision more, held to the rule's prefills, ends it
+  where that decision sheds as its count reads: the next answer's end.
+- A decision's own shed. A pair's decision sheds as saturated where the overload veto's stage left
+  its pass nobody, and names another stage else. The gateway's own selection sheds for overload by
+  its count over the list it judges (`overload.rs:58-74`, `pair_index.rs:158-161`). The two part
+  both ways: under no rule, among a rule's workers of each list, and ahead of a rule that is not
+  asked. The engine sheds as saturated where that selection has no worker: where every partner of
+  its prefills is over its thresholds beside a decode under them that pairs with no prefill, where
+  a worker under its thresholds is under a liveness doubt, and where the prefills over their
+  thresholds pair with no decode. The engine sheds with no endpoint where that selection sheds for
+  overload: under `healthy`, where every ready worker of the list is over its thresholds and under
+  a liveness doubt; and under `partnered`, where a prefill that pairs with no decode stands beside
+  paired prefills wholly over their thresholds, and where the decodes at the request's places pair
+  with no prefill that stands. It ends where a decision sheds as saturated exactly where its
+  count reads the list as wholly over its thresholds.
+- A rule that is not asked. Behind a first decision that sheds the request with no endpoint the
+  rule is asked of no list. Where the rule leaves a list only workers that are vetoed, one of them
+  by a liveness doubt alone, and the other list holds a partner that can take the request, the
+  gateway's own selection pairs: its fallback is judged over the rule's workers and crosses the
+  doubt (`relaxed_pair`, `:2129-2192`). The engine sheds the request with no endpoint, under
+  `healthy`. It ends where such a first decision is asked again among the rule's workers.
+- A part of a list. An encode request's pass hands the pair's decision the prefills an open encoder
+  serves and the decodes that take its images. A request's hard demand hands it the workers that
+  meet the demand, and the places its host states for the prefills or the decodes hand it the
+  workers at them. A list the decision counted may then be a part: it says no list behind an encode
+  request's cut, and the call acts on no word of the prefills or the decodes for a request that
+  states a hard demand or whose host states places of the prefills or the decodes, a word of a list
+  that stayed whole too. Where the rule takes no worker of a list the engine sheds such a request
+  with no endpoint, under `admits`, as it did before a shed stood behind a rule. The gateway's own
+  selection states no places: it holds such a need in its filter and its wire. It judges the
+  workers its filter takes, or the list on the wire whole where the filter takes nobody
+  (`admitted_pool`, `:1831-1852`), and sheds for overload where those are wholly over their
+  thresholds. It ends where the call holds the rule's workers to the part and reads the word of a
+  list that was whole.
 
 **[built]** A single request can name its worker.
 
@@ -1848,7 +2039,9 @@ side, each side's policy over its own workers (`pair_pass` in `placement.rs`), a
 holds is narrowed by no admission filter and by no retry (`strict_target`,
 `admission_prefilters`). A pair's binding names one list of sources for its two sides, so the
 target source is the side's whose profile is the hash ring keyed by no prefix
-(`Engine::names_worker_on`): classic's policy of that name alone reads the header. The call
+(`Engine::names_worker_on`): classic's policy of that name alone reads the header.
+
+The call
 counts the prefill's number as classic counts its candidates: the prefills that can be sent to
 and have a partner that can, at the places the caller states for each side, and those with such a
 partner among their first partners alone where there is one. A worker that fails a hard demand
@@ -1856,37 +2049,76 @@ its side's role is held to takes no number on that side: classic narrows both po
 pair to its wire ahead of the count. A place its host masks takes no number either, as one that
 fails its own test. The mask (`PairLists::prefill_stalled`, `PairLists::decode_stalled`) states a
 veto the host's worker objects do not carry, and classic's carry every veto its count reads.
+
 Where the decode's side is the ring's too, its number counts
 those partners of the prefill reached, and the pair's one decision is held to the two places
 (`PairLists::prefill_places`, `PairLists::decode_places`). Where it is not, the decision is held
-to the prefill's place and the decode is its own profile's pick. A named prefill at the admission
+to the prefill's place and the decode is its own profile's pick.
+
+A named prefill at the admission
 limit is waited for (`Unplaced::PrefillsFull`), as classic waits for it. A named decode with no
 free room is taken, because the `has-room` filter is soft (classic,
 `retain_decodes_with_a_room`). A retry is handed the pair again. A number that reaches no worker
-on a side sheds the pair under `target-worker`, as classic refuses it. Where no decode can be
+on a side sheds the pair under `target-worker`, as classic refuses it.
+
+Where no decode can be
 sent to, a decode over its thresholds alone counts as a partner, and the decode goes by load, as
 classic pairs such a pool. Under a binding that sheds a pool over its thresholds on every worker,
 no decode counts so, as under classic's shedding. Where no prefill is counted, the pair is placed
-as one that names no worker, and a pool its binding sheds is shed as for any pair. A pair held to
+as one that names no worker, and a pool its binding sheds is shed as for any pair.
+
+A pair held to
 the two workers it names books its decode with its prefill under every document, as classic picks
 a decode once, with its prefill: a decode asked again behind the prefill is refused as one that
 never stood chosen (`DecodeRefused::NotChosen`). Classic's side of every clause is `pair_pass`,
 and the cases name its lines (`place/tests/pair/named.rs`).
 
-Two things differ from classic there, by rule. **[planned]** A pair whose decode side alone is
-the plain hash ring is read for no target yet: its prefill is its profile's pick, known inside
-the decision alone, and classic counts the decode's number behind that pick (its case
+**[built]** Where the decode's side alone is the plain hash ring, the prefill is its own
+profile's pick, known inside a decision alone, and classic counts the decode's number behind
+that pick (`pair_pass`; its case
 `an_explicit_target_under_consistent_hashing_keeps_its_full_decode_partner` in `placement.rs`).
-**[planned]** The engine reads no encode request's header for a target yet. One limit is a
-supplied policy spec's own: a pair's target source holds a side only where that side's profile is
-the plain hash ring, because the spec has no word for a side.
 
-An encode request is placed over its three lists as a pair is over its two, each decision given the whole budget. Where it carries items its call makes three decisions at most, and none is held to the workers the rule takes. One
+The call lends the places of the decodes that can be sent to, counted as a pair named on both
+sides counts them (a hard demand a decode is held to, a place its host masks), and states the
+number to each of its decisions (`Constraints::target_worker`). A decision counts it among the
+partners at those places of the prefill it picks, its first partners where the pair is made
+among those, and its decode side keeps that one decode through every pass. It books that decode
+with its prefill under every document, as a pair held on both sides does.
+
+A number that reaches
+no partner sheds the pair under `target-worker`, and so does a decode the decision cannot name:
+the partners of no other prefill are asked, as classic refuses there. The pair's default for a
+pool its vetoes refuse reads no number, as classic's reads no header, and a decode pool all over
+its thresholds states none.
+
+The call states none either where no prefill opens the pair: none
+that can be sent to, read as a pair named on both sides reads its prefills, has a partner among
+the decodes counted. Classic reads no header there: it answers as for a pair that names no
+worker, and pairs by load a pool whose every worker is vetoed (`relaxed_pair`). So does the
+engine, whose default pairs over the caller's own places. A prefill over its thresholds alone
+opens the pair too where its profile weighs load itself and its binding steers, as classic
+lifts the veto for such a policy with its shedding off.
+
+A decision that states a number beside
+no places of its decode side is declined under `target-worker`, and so is an encode request's
+that states one. A controller's served decision is lent the same decodes and stated the number
+its pair's frame carries (section 10.1).
+
+One thing differs from classic there, by rule. **[planned]** The engine reads no encode
+request's header for a target yet. One limit is a supplied policy spec's own: a pair's target
+source holds a side only where that side's profile is the plain hash ring, because the spec has
+no word for a side.
+
+An encode request is placed over its three lists as a pair is over its two, each decision given the whole budget. Where it carries items its call makes three decisions at most, and the later ones are held to the workers the rule takes on each of its pair's two lists, as a pair's are: behind the first decision none of whose targets holds or whose encoder cannot be sent to, and behind a first decision that sheds the request as saturated over a list of its pair. The rule is asked of no encoder, and the encoders' list is decided as its caller lent it: a shed made over the encoders stands, by the decision's own word of it, and no rule is asked behind it. One
 decision names its pair and each item's encoder, and the pair's targets are tried as a pair's
-are. The placement names each item's encoder beside the pair (`Placement::encoders`). An item has
+are. The placement names each item's encoder beside the pair (`Placement::encoders`).
+
+An item has
 one encoder: where it cannot be sent to, the decision is given up and made again with that
 encoder left out, and each side of the pair that could not be sent to either. An encoder is read by its health and its circuit breaker alone: the route's
-rule is asked of the pair's two workers. Three lists with no item are placed as their pair. A
+rule is asked of the pair's two workers.
+
+Three lists with no item are placed as their pair. A
 request whose decode is held to the workers that take images books its decode with its prefill,
 whatever its caller states of asking the decode again: a decode asked again reads no image fact.
 So does a request with items that demands vision or a way of processing its references: its
@@ -1902,13 +2134,13 @@ its pair alone it states no item and is held as a pair is. Asked again with its 
 encoders are held to that number too.
 
 Two things keep the short path of section 5.6 as cheap as it is today. The route's rule is asked
-of the one picked worker, and of a whole list only behind a decision none of whose picks can be sent to; a rule that is the same for every request of a
+of the one picked worker, and of a whole list only behind a decision that leaves its call no placement: one none of whose picks can be sent to, an encode request's whose encoder cannot be, and the first of a pair's or of an encode request's that sheds the request as saturated over a list of the pair; a rule that is the same for every request of a
 route belongs to the list itself. And a plain request touches neither the load snapshot nor the
 other fields of the request, with one exception in a gateway's own process. Where a stage needs
 lease events, the lease states the text's bytes, and its characters where a stage reads a size.
 Counting the characters is the one pass over a plain request's text.
 
-A request decided inside a lent token tree has the rule asked inside the tree's walk, of the
+A request decided inside a lent tree has the rule asked inside the tree's walk, of the
 pick's targets best first, so the tree stores the prompt for a worker the rule takes. The call
 takes that answer and asks the rule of that worker no second time.
 
@@ -1923,6 +2155,8 @@ impl Placement<'_> {
     pub fn decode_id(&self) -> Option<WorkerId>; // a pair's decode worker's id
     pub fn owes_events(&self) -> bool;           // a side under a lease has not ended
     pub fn kept(self) -> Placement<'static>;     // without the borrowed key, to keep to the end
+    // a pair's decode stands chosen: decode_again may pick it again
+    pub fn decode_chosen(&self) -> bool;
     // a pair's decode decided again behind its prefill's answer, the request stated again
     pub fn decode_again(&mut self, request: &PlaceRequest<'_>) -> Result<(), Unplaced>;
     // dropped with a side not ended: the engine hears a release before the side went out,
@@ -1932,8 +2166,9 @@ impl Placement<'_> {
 
 What a placement holds, and so what these calls do, depends on the request:
 
-- **A single request.** Where the document's stages want no events, its placement holds no lease
-  and these calls do nothing.
+- **A single request.** Its placement holds a lease only where its pick has one (section 6). With
+  no lease, `sent` and `ended` tell the engine nothing. `decode_again` refuses a single request with
+  a lease or without one: it has no decode side.
 - **A pair.** Its placement always holds a lease (section 6).
 - **An encode request.** Its placement always holds a lease too: it reports its pair's two sides
   as a pair does, and nothing of an encode side. No lease stands for an encoder, so `sent` and
@@ -1987,6 +2222,8 @@ impl Placement<'static> {
 impl PlacementSide {
     pub fn sent(&mut self); // this side of the request went out
     pub fn profile(&self) -> &'static str; // the label of the profile that picked this side
+    // a pair's decode side: its decode stands chosen and may be decided again
+    pub fn decode_chosen(&self) -> bool;
     // a pair's decode side: its decode decided again, answered the decode the request goes to
     pub fn decode_again(&mut self, request: &PlaceRequest<'_>) -> Result<Arc<dyn Worker>, Unplaced>;
     pub fn side_end(&self) -> SideEnd; // a handle on this side's end
@@ -2023,9 +2260,11 @@ drop. One that never went out is released. So a host that sends a pair's decode 
 orders nothing by hand.
 
 A host that keeps sides asks the decode again on the pair's decode side, once the prefill
-side's send was said. It may let the prefill side go before that call or behind it. A prefill's
-end that waits is said behind the decode the call took. Behind a call that took none, it still
-waits. A side that is not a pair's decode side is refused by name, with no decision made.
+side's send was said. It asks first whether the decode still stands chosen (`decode_chosen`),
+and makes no call where it does not: the call would be refused by name, with no decision made.
+It may let the prefill side go before that call or behind it. A prefill's end that waits is said
+behind the decode the call took. Behind a call that took none, it still waits. A side that is
+not a pair's decode side is refused by name, with no decision made.
 
 Whatever a request lends that second decision (its rule, its headers, its ring, its lists'
 admission and their workers' own calls) is asked under the pair's lock. None of it may send or
@@ -2052,7 +2291,7 @@ The design adds no second mechanism where one exists.
 | the place where a worker is chosen | classic's four placement functions | one call in each |
 | the rank a request is sent with | the worker object's own rank, where its registration states one | nothing: no rank choice runs behind the pick of a worker registered rank by rank, and the classic rank option is refused at the start beside the engine (section 9.2 names the two places a rank is still chosen) |
 | the lease's reporting | `DecisionGuard` | `Placement`, which holds it |
-| proof against classic | classic's recorders and their sheets | replays through the kept engine |
+| proof against classic | classic's recorders and their sheets | replays through the engine |
 
 ## 9. The gateway as a host **[partly]**
 
@@ -2097,16 +2336,23 @@ request ──> route (HTTP or gRPC, any family)
 
 - **Start.** One function builds the engine from the routing settings or a supplied document and
   hands it the worker registry, the load monitor's channel and the cache-event monitor. With
-  the engine on, no classic policy object is built. So the start makes the token trees the
-  engine is lent **[built]**, where the document reads the prefixes sent to each worker. The
-  policy registry keeps them, classic's size pass runs over them on its timer, and a worker that
-  left is taken out of them. The trees take the document's numbers: its block size is a tree's
-  page, and a model's `index` entry states the size its tree is held to and how often.
+  the engine on, no classic policy object is built. So the start makes the trees the engine is
+  lent **[built]**, a token tree and a string tree for each model, where the document reads the
+  prefixes sent to each worker. The policy registry keeps them, classic's size pass runs over
+  them on its timer, and a worker that left is taken out of them. The trees take the document's
+  numbers: its block size is a token tree's page, and a model's `index` entry states the size
+  its trees are held to and how often.
 
   The start makes the Grand Central crate's one start call as the last step of the context's build. The document is checked first against the table of stages the gateway's host hands the start, or the stock table where it hands none, and a refused document ends the start before the gateway listens. The engine's task follows the registry's events and tells the document's stages a worker that joined and a worker that was removed. With the engine on, the gateway builds its policy registry with no classic policy object: a stand-in that places nothing stands in its default and encode slots, and a worker's registration and a router's build add no policy.
 
 - **Each request.** Three of the four functions ask the engine. They fill `PlaceRequest` from the inputs
   they already take. A route names the answer's type and makes its load guard from the answer, in the places it made one before.
+
+  Where the engine places no worker for a request, the gateway names the client's answer itself,
+  by classic's own judgement of the pool. The engine's word for the refusal goes to a log line
+  and no further: at `debug`, or at `warn` where the engine refused the decision itself. One word
+  is acted on, a pair's prefills all at their admission limit: the route waits for a slot, as
+  under classic.
 
   The fourth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the gateway does not yet hand the engine an encode request's three lists.
 
@@ -2130,7 +2376,9 @@ request ──> route (HTTP or gRPC, any family)
   pick, until a report of that worker sampled behind the pick, and takes no pick back (`decide` in
   `model_gateway/src/policies/least_load.rs`). The engine's counts of sends take a send at its
   dispatch. So a pair that a route refuses between its selection and its send stays in classic's
-  count and enters none of the engine's. That difference stands open under rule 6.
+  count and enters none of the engine's. The maintainer decided that difference on 2026-11-24
+  (decision 16): under `least_load` the engine's count stays, and a request that is never sent is
+  not counted.
 
   The regular HTTP router's typed route and its streamed pass-through tell the engine that end's
   outcome, through the handle of section 8.2: the status the route records on the worker, and its
@@ -2141,8 +2389,22 @@ request ──> route (HTTP or gRPC, any family)
   client's own body fault on the pass-through. These routes state no time to first token and no
   tokens.
 
+  A single request on the gRPC wire tells its end through its stream, an answer read whole too:
+  every answer of that wire is read through one stream. The execution stage asks the attempt's
+  selection for the handle once the dispatch has returned, and hands it to the stream its call
+  opened. The stream tells a clean end as the worker's 200, and a failed one by the status the
+  circuit breaker samples for it. A reader whose own stop ends the generation tells that good end
+  where it lets the engine go. The stage tells an attempt that opened no stream: a call that
+  failed, a deadline that passed before the call answered, an embedding's one sample. Where an
+  embedding's inputs fail in different ways, its status is that sample and its class the first
+  failure's. A batch of prompts is one placement, told as one status: the first failure one of its
+  streams meets, or the worker's 200 once every stream ended well. Nobody tells a client that
+  left, a reading the gateway gave up, or a failure the breaker takes no sample of: the request's
+  media, a constraint the engine could not continue under, a constraint the worker refused. This
+  wire states no time to first token and no tokens yet.
+
   A route tells every answer of its workers or none. The other routes tell no outcome yet
-  **[planned]**: the transcription route, the gRPC stages, the pair routes. There, and for an end
+  **[planned]**: the transcription route, the pair routes. There, and for an end
   nobody reported, a stage hears the end of a request that was sent as a cancelled completion,
   with the time since its dispatch and no other measure. So a plugin stage that learns from
   outcomes reads those requests as cancelled.
@@ -2153,7 +2415,7 @@ request ──> route (HTTP or gRPC, any family)
   The pair classes a gateway hands with a pair's two lists are derived under the pairing of the document in force: beside a supplied document the registry takes that document's `plans.pd_pair.pairing` at its build, and no request reads it.
 
   On the wire that carries one runtime's request the classes also state each prefill's first partners: its partners on its own known runtime (`PartnerClasses::number_first`). The engine makes a pair among the prefills with a first partner open and those partners while there is one, so a pair on one known runtime goes ahead of a pair with a worker whose runtime is unknown, as under classic. The other wire states no first partner, and a fleet whose every partner would go first states none either.
-- **The rank.** A data-parallel worker registered rank by rank (every registration reads the worker's width and registers one worker a rank; an HTTP worker whose load route does not hold a row for every rank stays one worker) is the shape the engine serves in full. Each rank is then a worker object, and a record of its own in its list (`Candidate::dp_rank`, section 5.3). The record reads its own rank's named values (section 5.8). A stage that keeps load reports is told each rank's own report, under that rank (`Signal::Load`). `Candidate::engine` is the same number on every rank of one such worker. The request is sent with the rank of the record the engine picked: where a record is one rank, no rank choice runs behind the pick. A rank is chosen behind the pick in two places, each by classic's own code, with the engine on as under classic, and each inside a worker registered once for all its ranks: on the HTTP pair route, under a connector that holds both sides of a pair to one rank, the route's own turn names the rank both sides are sent to; and under the gateway's `--grouped-dp-sticky hash`, the gRPC dispatch pins a single request that has a sticky key, and where the runtime allows it a pair's prefill side, to that key's rank. That option is refused beside a supplied document.
+- **The rank.** A data-parallel worker registered rank by rank (every registration reads the worker's width and registers one worker a rank; an HTTP worker whose load route does not hold a row for every rank stays one worker, unless its host keeps a load source of its own for it) is the shape the engine serves in full. Each rank is then a worker object, and a record of its own in its list (`Candidate::dp_rank`, section 5.3). The record reads its own rank's named values (section 5.8). A stage that keeps load reports is told each rank's own report, under that rank (`Signal::Load`). `Candidate::engine` is the same number on every rank of one such worker. The request is sent with the rank of the record the engine picked: where a record is one rank, no rank choice runs behind the pick. A rank is chosen behind the pick in two places, each by classic's own code, with the engine on as under classic, and each inside a worker registered once for all its ranks: on the HTTP pair route, under a connector that holds both sides of a pair to one rank, the route's own turn names the rank both sides are sent to; and under the gateway's `--grouped-dp-sticky hash`, the gRPC dispatch pins a single request that has a sticky key, and where the runtime allows it a pair's prefill side, to that key's rank. That option is refused beside a supplied document.
 
   The gateway's rank option (`dp_minimum_tokens_scheduler`) is refused at the start beside the engine, under the settings' own document and under a supplied one. A worker object that stands for several ranks states no rank, and outside those two places its request is sent with none. A route that can name no rank to its worker, the multipart transcription, sends with none to the engine of the record picked, a rank's record included: the engine places the request among its ranks, and the record's count holds it.
 
@@ -2169,13 +2431,14 @@ The bar for that change:
    pair routes between a prefill's answer and its decode's dispatch, where the document asks the
    decode again. A route that tells an outcome makes one more call where it records the status
    on the worker: on the answer it keeps, or on a handle it asked of the guard for its stream's
-   reader. A classic request makes the same call.
+   reader. On the gRPC wire the stream is that reader, and the execution stage hands it the
+   handle. A classic request makes the same call.
 3. With the engine off, a classic decision pays what rule 5 names and no more, counted in the
    gateway's decision bench.
 
-   With the engine off, neither pair route makes the one call of the second point. Each route asks the pair's first answer once, where it decides how the pair is sent, and builds no ask for a decode the classic policies picked. A classic pair sent prefill first still pays that test, the holder of its decode ahead of the send, and on the HTTP route the cell a moved decode is written to. That cost is counted under Callgrind, on the lines the second point added.
+   With the engine off, neither pair route makes the one call of the second point. Each route asks the pair's first answer once, where it decides how the pair is sent, and builds no ask for a decode the classic policies picked. A classic pair sent prefill first still pays that test, the holder of its decode ahead of the send, and on the HTTP route the cell a moved decode is written to. The decision bench runs no route's attempt, so it does not count that cost. It was counted once by a program built for the count, under Callgrind, on the lines the second point added.
 
-   With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A pair route's relay is handed an empty handle and pays its test. The decision bench's `--end` flag counts each against a cell that reports nothing.
+   With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A pair route's relay is handed an empty handle and pays its test. On the gRPC wire the stage's ask returns at the answer's first test, and the request's stream is left as it is. The decision bench's `--end` flag counts each against a cell that reports nothing.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
 
 ### 9.3 The options
@@ -2200,19 +2463,20 @@ switch is made in steps: 10.1 says what is on main.
 ### 10.1 On main
 
 It starts from a policy document (a watched file, or a folder it keeps). It serves gRPC on three
-listeners (gateways, operators, standbys; a fourth, for ingestion, only when asked for) and HTTP
+listeners (gateways, operators, standbys) and HTTP
 on an admin listener (probes, version, metrics). It elects a leader by a leader lease, held in the
 process, in a file, or in a Kubernetes Lease object. That lease is not the lease of section 6.
 
-Its data is one in-memory store (`store/memory.rs`):
+Its data stands in an in-memory store (`store/memory.rs`), in the worker crate's registry of worker
+objects and its load monitor, in the worker host's tables and in the engine's own tables:
 
 | Data | Filled by | Note |
 |---|---|---|
 | worker records | the `RegisterWorker`, `PatchWorker`, `DeregisterWorker` calls, and the leader's own discovery | discovery is behind a feature the image leaves out; a record it writes asks for the worker's cache events where the document in force at the find reads them for the worker's first model, and a document applied later does not write that word again |
-| worker objects | the write of each worker record, in one step with it: a call's or the discovery's on the leader, the applier's on a standby | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, which its start states (8 queued requests and 0.8 usage by its flags' defaults), an external record's over none, and the load monitor judges by them while the replica leads; an object's status leads its record's, and a single request's decision reads the workers here |
+| worker objects | the write of each worker record, in one step with it: a call's or the discovery's on the leader, the applier's on a standby | a second form of the same workers, of the worker crate's type; each states its registration's overload thresholds over one default, which its start states (8 queued requests and 0.8 usage by its flags' defaults), an external record's over none, as every record's is while the document in force switches the default off, and the load monitor judges by them while the replica leads; an object's status leads its record's, and a single request's decision reads the workers here |
 | health | the worker crate's health checker over the worker objects, on the leader | copied into the records |
-| loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' streams | `PushLoad` is not served; a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store holds no load table |
-| cache index | a follower of each worker's cache events | an index in the worker host's KV tables (`worker_host::KvTables`), which the holder of the worker objects is handed; `PushKvEvents` is not served; a single request's decision reads none yet, only the engine's own record of sent prompts |
+| loads | the worker crate's load monitor over the worker objects, while the replica leads: a poll every 10 seconds, and the load records on the workers' streams | a single request's decision is given the monitor's snapshot where the document reads reports and keeps none; the store holds no load table |
+| cache index | a follower of each worker's cache events | an index in the worker host's KV tables (`worker_host::KvTables`), which the holder of the worker objects is handed; a decision reads it through the engine's two index traits (`worker_host/kv_read.rs`), and the engine's own record of sent prompts for a worker the index holds no block for, and for every worker on a request given as text or under a profile that reads the record alone (`source: predictor`) |
 | leases | decisions | not replicated to a standby; a lease that counts for its session key steps that key's count on its worker's object, which a controller's in-flight cap reads (10.2); a single request's session pins are the engine's own table, one for each document |
 
 The gRPC service (`crates/grand_central/contracts/grand_central.proto`):
@@ -2227,7 +2491,7 @@ The gRPC service (`crates/grand_central/contracts/grand_central.proto`):
 | `GetSnapshot`, `Explain` | operators | served by the leader; `Explain` only for decisions that were sampled |
 | `Leader` | anyone | served by every replica |
 | `Replicate` (stream) | a standby follows the leader | served |
-| `PushLoad`, `PushKvEvents`, `StepDown`, `WatchRegime` | | not served |
+| `StepDown`, `WatchRegime` | | not served |
 
 A `Decide` request of the single phase is decided on one of a fixed set of threads (the model
 picks the thread) by `InProcess::decide_without_lease`, over the list of the model's workers
@@ -2262,7 +2526,9 @@ The crate's own client states the items. A handle asked over a link takes an enc
 prefill phase, as the engine's entry takes it in process, with its items
 (`DecisionGuard::asked_encode`), and its frame states the encode phase. A session key in its hash
 form crosses as the session's value under the encode phase. The controller reads the key back under
-that phase, so the pair's session is the one the request has in process. The handle is a pair's,
+that phase, so the pair's session is the one the request has in process. The items' one key
+crosses where the host states one, with a form or with none: one with no form still places the
+items as one, with no affinity, as in process. The handle is a pair's,
 and it reads each item's encoder from the answer, in the keys' order. The link refuses a frame whose
 items are out of range by the controller's own check and sends nothing, so no such frame ends its
 stream.
@@ -2272,22 +2538,51 @@ controller's prefix ring places that request by its prompt, as a gateway's own p
 (section 8.1). The frame of a host older than that field says nothing, and under it the id's key
 places as any other.
 
-A frame that is decided over one list may state the number its request names its worker by
-(`DecideRequest.named_worker`): a single request's frame, and one that stands alone at a side's
-phase. Its host reads the number under the target source of its binding (section 8.2) and states
-it. A text that is no number crosses as the widest number, which reaches no worker. Under a
-document whose binding for the frame names that source, the controller counts as the one call
-does, by the same function: from 0 and in the order of its own list, over the workers the asking
-gateway can be sent to. Those are the places the gateway may take by its reach and its wires, that
-none of its standing vetoes holds back, and whose worker object is available by its own test. The
-frame's one decision is held to the worker the number reaches. The request goes to that worker or
-is shed with no endpoint, under `target-worker`: where the number reaches no worker, or that
-worker cannot take the request after all. Where the gateway can be sent to no worker of the list,
-the request is decided as one that names none, and carries neither its session key nor its
-client's key. A frame that states no number is decided as it was, and the frame of a host older
-than the field states none. No pair's frame and no encode request's is read for the number.
+A frame may state the number its request names its worker by (`DecideRequest.named_worker`): a
+single request's frame, one that stands alone at a side's phase, and a pair's. Its host reads the
+number under the target source of its binding (section 8.2) and states it. A text that is no
+number crosses as the widest number, which reaches no worker. Under a document whose binding for
+the frame names that source, the controller counts as the one call does, by the same function.
 
-Four things differ there from a gateway's own process (section 8.2). Each is open under rule 6.
+For a frame decided over one list it counts from 0 and in the order of its own list, over the
+workers the asking gateway can be sent to. Those are the places the gateway may take by its reach
+and its wires, that none of its standing vetoes holds back, and whose worker object is available
+by its own test. The frame's one decision is held to the worker the number reaches. The request
+goes to that worker or is shed with no endpoint, under `target-worker`: where the number reaches
+no worker, or that worker cannot take the request after all. Where the gateway can be sent to no
+worker of the list, the request is decided as one that names none, and carries neither its
+session key nor its client's key.
+
+A frame that states no number is decided as it was, and the
+frame of a host older than the field states none. No encode request's frame is read for the
+number.
+
+A pair's frame states one number for its two sides, as one header gives a gateway's own process
+one (section 8.2). The controller counts it as the one call counts a pair's, by the same
+functions, over the two lists as the asking gateway may take them: each side's places by its
+reach and its wires, the places its standing vetoes hold back as that side's mask, and each
+worker object's own test. The frame's one decision is held to the places the count reaches: the
+prefill's and the decode's where both sides' profiles are the plain hash ring, and the prefill's
+alone where the decode's is not. Where the decode's side alone is the ring's, the decision is
+lent the decodes the gateway can be sent to and counts the number itself, behind the prefill it
+picks (`Constraints::target_worker`). A number that reaches no worker on a side sheds the pair
+with no endpoint, under `target-worker`, and so does a named worker that cannot take the request
+after all. Where no prefill is counted, or none opens the pair, the frame is decided as one that
+names none, and keeps its keys. Where every decode is over its thresholds and the binding steers
+such a pool, the decode goes by load and its number is not read. A pair's frame that states no
+number pays one test of it.
+
+A frame that states its later decode keeps that word (`DecideRequest.decode_later`). Its decode
+side is filed chosen, with the one decode the held decision named: it books nothing and waits
+under no dispatch deadline. A decode call behind it (`DecideRequest.decode_of`) is refused as
+one whose decode never stood chosen where the call's frame names its worker and the decode side
+of the binding reads the number, and the gateway sends the decode the first decision named. The
+call is judged by the policy spec in force at the call, whatever spec decided the first frame. A
+call whose frame leaves the number out is decided again as any pair's decode.
+
+Six things differ there from a gateway's own process (section 8.2). The first four are open
+under rule 6. The last two stand only behind a frame that states its later decode, which the
+crate's own client states for no request.
 
 - **The route's rule is not asked.** It is the gateway's own code and no frame states it yet, so
   the number counts a worker that rule refuses. It ends when the rule crosses as section 11 plans
@@ -2299,10 +2594,18 @@ Four things differ there from a gateway's own process (section 8.2). Each is ope
 - **No hard demand crosses.** A frame states none in this protocol version, and a host decides a
   request that states one by itself. So the controller's count leaves no worker out for a demand.
   It ends when a frame states a request's demands **[planned]**.
-- **A pair's frame is read for no number.** A gateway's own process holds a pair to the workers
-  its request names, a side at a time (section 8.2), and a controller decides a pair's frame as
-  one that names none. It ends when a controller counts a pair's two sides as the one call does
-  **[planned]**.
+- **A named prefill at its admission limit is not waited for.** A gateway's own process waits for
+  the prefill a pair names where it stands at that gateway's admission limit (section 8.2). A
+  controller keeps no gate: its count takes the prefill, and the gateway finds the limit. It ends
+  when a controller keeps a pair's admission **[planned]**.
+- **A later decode is booked at its dispatch.** A gateway's own process books the decode a pair
+  names with its prefill. A controller files it chosen, as the contract has a later decode, and
+  books it where a dispatch names it.
+- **A decode call is refused whatever the first decision counted.** Where the first decision
+  held no decode to the number (no prefill was counted or opened the pair, or every decode stood
+  over its thresholds), a gateway's own process asks the decode again as any pair's. A controller
+  refuses the call, and the gateway sends the first decision's decode. This is a named limit and
+  no cure is planned: the lease on file keeps no word of what its first decision counted.
 
 A gateway that decides by itself for lack of an answer (decision 6) counts over its own list by
 its own rule, so it can reach another worker than the controller's count reaches.
@@ -2315,10 +2618,10 @@ the worker crate's structures, and the one engine.
 | Data | On main | As designed |
 |---|---|---|
 | workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
-| lists | the store's published copy; a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, an encode request's those two and its encoders', and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
+| lists | a single request's decision reads the registry's published list of the model's single workers, a pair's, at its prefill and at its decode call, the lists of its two sides, an encode request's those two and its encoders', and a prefill or a decode request that stands alone the list of its own phase's workers | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome moves the object, the store's record is told the status that stands, and a decision reads the object's | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the worker crate's load monitor over the worker objects, while the replica leads, fed by its polls and by the load records on the workers' streams: a decision is given its snapshot where the document reads reports and keeps none, and reads the overload verdict on the object; the crate's own poller runs no more, and the store holds no load table | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10). Every worker is judged by the thresholds its object states, so the loads of every worker the controller dials are read: no new cost against classic as it runs by default, whose gateway hands each worker of an engine the same two defaults and an external worker none at its registration, as a controller's objects state them. A gateway started with `--disable-load-monitoring` polls by need, and this monitor polls every group |
-| cache events | an index in the worker host's KV tables; a decision reads none yet | the kv-index crate's index, filled by the worker crate's collector |
+| cache events | an index in the worker host's KV tables, which a decision reads through the engine's two index traits | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the engine's session table for a single request, one for each document | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
 | decisions | a single request, a pair at its prefill, its decode call, an encode request that carries its items, and a prefill or a decode request that stands alone: `InProcess` over the registry's lists; a frame of the encode phase that does not state `DecideRequest.encode`, and a decode request that names no lease under a pair plan: none, the request is answered `Busy` | `InProcess::decide_without_lease` over the registry's lists, and `decide_encode_without_lease` over an encode request's three |
@@ -2335,10 +2638,7 @@ streams its load records alone: the leader reads its load from that stream, and 
 while its records are not fresh. A worker that refuses that stream has none, and the leader polls
 it at every interval. A standby holds that stream too, so a take finds it open.
 
-The contract has two calls that would push the same data to a controller, `PushLoad` and
-`PushKvEvents`. They are a relay's calls, not a worker's. A relay is a gateway in front of a
-worker that only it can reach, and it would forward what that worker's stream brought. Neither
-call is served, and this design names no use for them.
+The contract has no call that would push the same data to a controller.
 
 What leaves the crate with that switch: the store's copies of the worker data that a worker
 object holds, and the adapters that write worker state into the
@@ -2353,8 +2653,13 @@ the store steps for each lease on file. A record made of a worker object states 
 no zone.
 The asking gateway's reach, its wires and its standing vetoes are stated to the engine as places
 of the list. A new document is a new engine object: its session pins and its record of sent
-prompts start empty. That engine runs no task of its own. The store tells it each word of its
-membership, so the record forgets a worker that leaves, is replaced or serves a model no more. The
+prompts start empty. The stages of a profile whose name and text did not change do not start
+empty, under the rules of section 5.1: the new object keeps them from the one before it, with what
+they hold, and tells the members that stand to the stages it built new alone. A lease issued under
+the earlier document is told to the stages kept, and writes nothing to the new session pins. That
+engine runs no task of its own. The store tells it each word of its
+membership, so the record forgets a worker that leaves, is replaced, serves a model no more or
+takes another role. The
 engine's upkeep runs at each pass of the presence sweep, a tenth of the grace period: once a
 second, the period of the engine's own task in a gateway's process. A sessions rule's cap reads a
 key's requests on the worker object too: the store steps that count for the lease of each keyed
@@ -2375,11 +2680,11 @@ tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
-| the worker record | the store's table of records (`store/memory.rs`) | the load poller, until it reads the worker objects; a first copy, for the status the log told of each record |
+| the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: the one record behind a write the store refuses, every record where a cut is laid whole, a record's status where a leader's log tells it, a host's own follow, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
-| the published copy of the records | the store | a pick's booking and a gateway's vetoes, among others; no request is decided over it |
+| the published copy: of a record its id alone, beside its slot in the counts and in a gateway's vetoes by pool; with them each pool's index by model and role, the generation and the clock | the store | a pick's booking and a gateway's vetoes; every other loader reads the generation; no row of a record stands in it and no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
 A leader's write of a record is decided over the worker object since step 1 below, and the
@@ -2387,8 +2692,9 @@ table follows it. The object leads a status too since step 3, and the table is t
 object leads a first copy's facts since the last part of step 2, and the log its statuses. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
 remainder is the copy that stays. The table of records and the second copy of the facts end
-with step 4 below. The published copy ends when its readers, a pick's booking and a gateway's
-vetoes among them, read the worker objects: a later step **[planned]**.
+with step 4 below. The published copy holds no row of a record, and a status change makes no
+publication. It ends when the two readers of what it holds of a worker, a pick's booking and
+a gateway's vetoes, read the worker objects: a later step **[planned]**.
 
 **What stands beside an object [built].** `RowRemainder` (`worker_host/remainder.rs`) holds
 what a registration stated and the worker object does not hold as stated. The code that keeps
@@ -2417,7 +2723,7 @@ whole record read back (step 1 below). Of the 24 facts a worker's record holds:
 | the wire modes | the one protocol the object speaks | the other protocols of the set |
 | the engine's kind | the runtime the worker crate reads the name as | a name that crate does not know, and a known name as it was written |
 | the health policy | the checks in whole seconds, each threshold at least one, off where the controller cannot dial the worker | a part of a second, a threshold of none, and the policy of a worker built with its checks off |
-| the overload thresholds | where a program asks for them, as the controller's does, an engine's worker's own over the program's defaults and an external worker's own alone | which of them an engine's worker stated |
+| the overload thresholds | where a program asks for them, as the controller's does, an engine's worker's own over the program's defaults, and its own alone for an external worker or while the document in force switches the defaults off | which of them an engine's worker stated |
 | the drain window | the window in force | a window stated equal to the object's default, which reads back as none |
 
 - Ten are not carried to the worker object: the incarnation, the zone, the pairing facts, the
@@ -2438,23 +2744,36 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    door's. It reads the record back from the object that stands, decides by the registration
    rule, builds the object of the record the change leaves, tells the store the decided
    change, and puts the object in the registry. A removal takes the object out first. So the
-   object stands when the write returns. The table of records follows on a leader as it does
-   on a standby, by one body, and the membership log is told from it. In a controller the
+   object stands when the write returns.
+
+   The table of records follows on a leader as it does
+   on a standby, by one body. The membership log is told the record the write handed that
+   body, ahead of the table's write, and the event of such a write tells no record read from
+   the table. The revision an event tells is the keeper's, of the write that made the record.
+
+   Two things are the table's until step 4: a status event comes with no record and tells the
+   table's, and the record a write takes out is the one the table held. In a controller the
    code that keeps the objects alone writes a worker object's own facts, so the record a change
    in place writes to the table is the object's record read back whole, less its status: the
    table keeps its own, and the object's is told behind the write. A second writer of an
    object's facts in a controller would break that, as a gateway's refresh of a worker's models
-   is one in a gateway. The locks in their
+   is one in a gateway.
+
+   The locks in their
    order: the door's turn, the keeper's turn, the store's membership lock, and no lock of the
    store over a write of the registry. The store takes a decided change only where the record
    it was decided over still stands at the revision the keeper read, tested under the
    membership lock: a write that landed between the two is never written over, and the keeper
-   reads the store again before it answers. A first copy is cut from the objects in the
+   reads that record again before it answers.
+
+   A first copy is cut from the objects in the
    keeper's turn, the last part of step 2. Since step 3 a status is the object's
    word: a drain and a connect signal write the object and tell the table, a key's next life
-   starts in the status its worker object stood in, and a call's answer waits on no follow. A
-   change the store took and the registry did not get is laid at the head of the keeper's
-   next turn, where it reads the store. A change that moves a fact the object holds builds the object again: the
+   starts in the status its worker object stood in, and a call's answer waits on no follow.
+
+   A change the store took and the registry did not get is laid where the store next refuses a
+   write of the record: the keeper reads that record again before it answers. A record with no
+   object at all is reached so by a registration under its key alone. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects **[built]**. A call reads the
@@ -2471,8 +2790,15 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    and an object, and the task that follows the table are deleted. The task is deleted
    **[built]**: the calls a record is written by are public, a host of the worker objects
    writes through them, and a served controller hands the code that keeps its objects. A
-   record written through the store's own entries gets its object where that code next reads
-   the store, and no task lays it.
+   record written through the store's own entries gets its object in three places: where the
+   store refuses the next write under its key, where a cut is laid whole, and where its host
+   reads the store's log. No task lays it. No turn that takes the controller's own store starts with
+   a read of its table **[built]**: a write call decides over the object that stands, a call's read
+   and a first copy read the objects, and a standby's applier lays its leader's event. A
+   turn of the keeper's own reads no log of the store's changes **[built]**: a refused write
+   reads its own record, a cut laid whole reads the store's records once, then the status the
+   table holds for each, and the call that lays a kept credential again reads the objects. A
+   host's follow still reads the store's log.
 
 **One rule for a registration's write [built].** What a registration makes of the record under
 its address is one function beside the other membership rules (`WorkerFacts::laid_over`,
@@ -2495,7 +2821,7 @@ part of step 2.
 **A call reads the worker objects [built].** A registration call reads the record that stands
 before it writes: the record under an address, the record under an id, and an engine's records.
 It reads them back from the worker objects (the second part of step 2), in the turn of the code
-that keeps them and behind that code's read of the store to its end. So a call's test and the
+that keeps them. So a call's test and the
 write behind it read the record from one copy, and a call that waited behind another writer reads what that
 writer left. A record read this way carries the status its worker object states (step 3).
 An engine's records are found by the list of ranks kept beside the objects,
@@ -2507,22 +2833,30 @@ is restored from and what an operator reads are cut from the worker objects and 
 remainders (the last part of step 2), in the turn of the code that keeps them. Every writer
 of a record's facts holds that turn from its decision to the log's telling. The store's own
 entries for a registration, a patch and a removal take no such turn: no product code calls
-them, and they end with step 4. A copy reads the log's place, the store's epoch and its
-history in one hold, and the code that keeps the objects reads the store again where the
-epoch or the history moved since its own read ended: every write of a record moves the one,
-a restore the other. So a copy holds
-each record the log told at the copy's place, and none it did not, beside any writer. A copy's statuses are the
+them, and they end with step 4.
+
+A copy reads the log's place and the store's epoch in one
+hold, and no record of the table. So a copy holds
+each record the log told at the copy's place, and none it did not, beside every writer that holds the turn. A
+record the store took and the registry did not get is in no copy until it is laid (step 1):
+one written through the store's own entries, once its host has had that code follow the
+store. A copy's statuses are the
 ones the log last told at its place, and not the objects': an object can stand one tell
 ahead of the log. The store keeps what the log last told of each record's status, beside its
-epoch and its tail. A copy reads the log's place, the epoch, the history and those statuses in one hold
+epoch and its tail. A copy reads the log's place, the epoch and those statuses in one hold
 of the membership lock, which it holds for one status a record and for no record. A copy
-takes no object's lock. Three writes move the log's place outside the keeper's turn, and a
+takes no object's lock.
+
+Three writes move the log's place outside the keeper's turn, and a
 copy stays whole beside each: a status tell changes no fact, and a generation's apply and a
-term's start change no record. The told status has five readers: the next status event, for
+term's start change no record.
+
+The told status has five readers: the next status event, for
 the status a record moved from, the event of a record changed in place, which carries it, a
 first copy, a tell the store refused, whose object takes it back, and a standby's applier or
 a watcher, which lays it on the object. No decision reads it. An operator's read of a few
-records is read the same way, and the store's own read for it is deleted. The store's own
+records is read as a first copy is cut, in the keeper's turn and with each record's told status,
+and the store's own read for it is deleted. The store's own
 cut of its table has no caller in the product and ends with step 4.
 
 **A watcher's events through the worker objects [built].** A gateway's watcher hands each
@@ -2542,8 +2876,12 @@ of is taken back in that same turn of the object's lock: the object takes the st
 record holds or, where no record stands for it, the status it left. A registration call's
 connect signal and its drain go through
 that entry too: the store is told first, and the object moves where the store took the
-status. The locks in their order: the object's own, then the store's membership lock. No
-holder of the store's lock takes an object's, and no decision takes one. From the table to an
+status.
+
+The locks in their order: the object's own, then the store's membership lock. No
+holder of the store's lock takes an object's, and no decision takes one.
+
+From the table to an
 object there are two ways, both of a told status. A standby's applier and a gateway's watcher
 lay each status their leader tells, the status of each record it tells, and each status of a
 first copy. A tell the store refuses gives the object the status its record holds. The
@@ -2610,8 +2948,8 @@ gateway                                           controller (leader)
   the gateway placed by itself holds no lease on file, so it enters no count of requests in
   flight: its dispatch names no worker (decision 6). Its completion names the worker that served
   it. Nothing counts it toward that worker's health yet **[planned]**. In process the regular HTTP
-  router's typed and pass-through routes tell the gateway's own engine the outcome, and its other
-  routes do not yet (section 9.2).
+  router's typed and pass-through routes and a single request on the gRPC wire tell the gateway's
+  own engine the outcome, and the other routes do not yet (section 9.2).
 - When no answer comes in time (no credit on the stream, a change of leader, the controller
   gone), the gateway decides by itself with the same engine, under the document the controller
   pushed, over the worker list it follows (decision 6). That list stops changing while the
@@ -2647,18 +2985,18 @@ classic code gave. A *recorder* is an ignored test beside classic's own code tha
 writes the sheet. The sheets are in `crates/grand_central/tests/classic/sheets/`. A crate
 test replays each line through the crate and compares.
 
-On main: 19 sheets, 489 lines.
+On main: 20 sheets, 512 lines.
 
 | | Sheets | Lines |
 |---|---|---|
-| replayed and passing | 18 | 484 |
+| replayed and passing | 19 | 507 |
 | recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
-| replayed through the engine that stays (`InProcess`) | **4**, and 31 lines of `prefix_hash` | **65** |
+| replayed through the engine (`InProcess`) | **6**, and 31 lines of `prefix_hash` | **140** |
 | replayed lines held to an answer of the crate's own, not classic's | | 7 |
 
-A replay of all fifteen decision sheets through `InProcess` over worker objects is in work and not on main yet: on main the three hard-demand sheets (`retry_wire`, `media_refs`, `context_window`; 26 lines), `sticky_rank` (8 lines) and 31 lines of `prefix_hash` replay through it. Measured
+A replay of all sixteen decision sheets through `InProcess` over worker objects is in work and not on main yet: on main the three hard-demand sheets (`retry_wire`, `media_refs`, `context_window`; 26 lines), `sticky_rank` (8 lines), `encode_pair` (52 lines), `pair_named` (23 lines) and 31 lines of `prefix_hash` replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that recorded a decision
-then (397 of the 415 of point 1 below, and the 11 of a rank sheet that has left with its rule), the engine answers 286 as classic recorded and 28 differently, and 94 cannot
+then (397 of the 438 of point 1 below, and the 11 of a rank sheet that has left with its rule), the engine answers 286 as classic recorded and 28 differently, and 94 cannot
 be asked yet. Of the 94, 25 are declined because the request states a hard demand, 16 need a
 word a request cannot state, 52 are encode requests and 1 is refused at validation. Runs with
 one input left off the worker objects (the requests in flight, the load reports, the status,
@@ -2666,32 +3004,27 @@ the ring) lose lines, so the replay can fail.
 
 Five things follow, and they are the first work of section 16.
 
-1. **Only the three hard-demand sheets, `sticky_rank` and 31 lines of `prefix_hash` (65 lines) go through the engine that stays** in main's own tests. The other replays
-   call the decision function over hand-built candidates. Fifteen sheets
-   (415 lines) record a decision, and each has to replay through `InProcess` over worker
+1. **Only the three hard-demand sheets, `sticky_rank`, `encode_pair`, `pair_named` and 31 lines of `prefix_hash` (140 lines) go through the engine** in main's own tests. The other replays of a decision sheet
+   call the decision function over hand-built candidates. Sixteen sheets
+   (438 lines) record a decision, and each has to replay through `InProcess` over worker
    objects. The other four (74 lines: `overload` 25, `pair_index` 23, `minimum_tokens` 18,
-   `sticky_rank` 8) record an answer of the host, which the kept engine is never asked for. It
+   `sticky_rank` 8) record an answer of the host. The engine
    reads the overload verdict that the host's load monitor wrote on the worker object. It is
    handed each prefill's partners with a pair's two lists. It names the rank a worker
    registered, never one of the ranks behind a worker that stands for all of them. In a host's
    own process those answers are classic's own code, which stays, so the 74 lines hold there
    with no replay. For the two rank sheets that rests on a rule of the gateway's change
-   (section 9.2). On main `pair_index` replays through the old engine's side, `sticky_rank` replays over rank objects through `InProcess`, and `overload` (25 lines) replays as recorded through the worker crate's load monitor, built as a host builds it, where the worker is one object for all its ranks. Eleven of its lines answer differently where each rank is a worker object, by the one rule stage 4's line names (section 16). `minimum_tokens` (18 lines) replays as recorded through the rank cache of that load monitor, where the worker is one object for all its ranks or the object of its one rank. No test replays it through the engine's pick among rank objects, which stage 4's line counts (section 16).
+   (section 9.2). On main `pair_index` replays through the pairing rule a controller derives its pair classes by (`PairClasses::derive`), `sticky_rank` replays over rank objects through `InProcess`, and `overload` (25 lines) replays as recorded through the worker crate's load monitor, built as a host builds it, where the worker is one object for all its ranks. Eleven of its lines answer differently where each rank is a worker object, by the one rule stage 4's line names (section 16). `minimum_tokens` (18 lines) replays as recorded through the rank cache of that load monitor, where the worker is one object for all its ranks or the object of its one rank. No test replays it through the engine's pick among rank objects, which stage 4's line counts (section 16).
 2. **23 lines were held to the crate's own answer** (`minimum_tokens` 10, `overload` 6,
-   `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The 16 of `minimum_tokens` and `overload` were held by the old engine's store. The 6 of `overload` replay as classic recorded now, through the host's load monitor (point 1). The 10 of `minimum_tokens` replay as classic recorded now too, through that monitor's rank cache (point 1); three of them are rules of the scorer and the picker, which the kept engine shares where it picks among rank objects. The 4 of `sticky_rank` are held the same through `InProcess`, by the ring and the picker. The
-   other three are the kept engine's. The 2 of `prefix_hash` differ from classic there too (a
+   `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The 16 of `minimum_tokens` and `overload` were held by the old engine's store. The 6 of `overload` replay as classic recorded now, through the host's load monitor (point 1). The 10 of `minimum_tokens` replay as classic recorded now too, through that monitor's rank cache (point 1); three of them are rules of the scorer and the picker, which the engine shares where it picks among rank objects. The 4 of `sticky_rank` are held the same through `InProcess`, by the ring and the picker. The
+   other three were the engine's. The 2 of `prefix_hash` differ from classic there too (a
    key folds whole blocks). One of them turns in the crate on a ring its caller lends
    (decision 3). The other measures which tokens are in a prompt's head, which is then the
    caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
    1 of `manual` replays as classic recorded now: a sessions rule runs on the two sides of a
    pair, each side by its own session and under its own cap.
-   One answer under a cap differs from classic's and stands open under rule 6. Classic's sticky
-   map moves a prefill side's pin at its cap where it selects the prefill
-   (`select_sticky`, `model_gateway/src/policies/registry.rs:816-818`, on main `bd55beae5`),
-   and a pair that fails behind that selection keeps the move
-   (`pair_pass`, `model_gateway/src/routers/common/placement.rs:3072-3078`). The engine moves the pin where
-   the pair forms, to the prefill the pair formed on, and a decision that forms no pair moves
-   none. Each
+   One answer under a cap differs from classic's, by decision 13 (section 15): the engine moves a
+   prefill side's pin where the pair forms, and classic where it selects the prefill. Each
    of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
    at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,
@@ -2718,8 +3051,10 @@ Five things follow, and they are the first work of section 16.
    With a lent ring a request's place is the host's to state, so these 16 test the host's
    recipe. In the crate they stay on the crate's own ring with its own hashes, which a caller
    that lends no ring still runs: 15 hold classic's shares, as on main, and one is held apart.
-   A gateway runs that ring for some requests, among them a pair whose two sides read the ring
-   by two forms, or cut a prompt at two depths: such a pair is lent no ring (section 8.1).
+   A gateway runs that ring for some requests, among them a shadow profile whose live profile
+   reads the ring too, by another word: such a shadow is lent no ring (`Engine::unlent`). A
+   single binding's shadow beside a live profile that reads no ring is lent it, and stated its
+   own place.
    Classic's key recipe and its ring lookup are functions that classic and the lender both call
    (`PrefixHashPolicy::ring_key` and `HashRing::walk_from` in `model_gateway/src/policies/`), and
    gateway tests place the policy's own requests through classic and through the engine, worker
@@ -2727,7 +3062,7 @@ Five things follow, and they are the first work of section 16.
    puts all 47 lines through both is not written **[planned]**.
 
 Hosted CI's first test line of the crate enables the feature `client`. It takes `controller`,
-which takes the feature the kept engine is behind, so that line runs that engine's own tests.
+which takes the feature the engine is behind, so that line runs the engine's own tests.
 Decision 11 says how this was closed.
 
 ### 13.2 Speed
@@ -2735,8 +3070,9 @@ Decision 11 says how this was closed.
 Classic's cost is counted in the gateway's decision bench: instructions for one decision, for
 each classic policy at 8, 64 and 512 workers. That count is the mark the engine has to meet.
 
-The crate gets one bench of the engine over worker objects **[planned]**. Every change to a
-policy shows its cell before and after, with classic's count beside it.
+The crate's bench of the engine over worker objects is `crates/grand_central/benches/in_process.rs`
+**[built]**: a cell is one document over a host's worker lists, with the request its callers make.
+Every change to a policy shows its cell before and after, with classic's count beside it.
 
 ### 13.3 On a cluster
 
@@ -2815,27 +3151,27 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Part | Mark | What is missing |
 |---|---|---|
 | The policy document: profiles, bindings by model and phase, plans, a binding's shed word and its refusal of an overload number, routing key, sessions | **[built]** | |
-| A binding's overload switch (`overload.enabled`) under worker objects | **[partly]** | a gateway that runs a supplied document reads it at its start, where it builds its workers' default: one word for the bindings a host runs (decision 10); a controller does not read it there yet |
+| A binding's overload switch (`overload.enabled`) under worker objects | **[built]** | |
 | Bindings by tenant, priority, header, prompt size, labels; a session id issued by the engine (`issue_session_id`) | **[planned]** | in the schema; a document that writes one is refused as not in this build |
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
-| `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; it runs a pair's shadows by side at the pair's first decision in a host's own process; no gateway takes a document that names them yet, and no served controller asks them, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where no route reads a record yet (decision 7) |
+| `shadow`, `explain.sample` | **[partly]** | the engine runs a single request's shadow, but not one that reads affinity rows of its own; it runs a pair's shadows by side at the pair's first decision, and the decode side's at a decode decided again, in a host's own process; a gateway takes a document that names them, and no served controller asks them, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where the gateway answers a record at `GET /policy/explain/{request_id}` (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, the gateway hands it its labels and puts the document in force, and a document put in force keeps the stages of a profile that did not change; open: a profile for each labelled model, and token trees made where a label's document first reads sent prefixes |
 | The stage interfaces and a builder's own stages | **[built]** | |
-| The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint and mixed protocols; of the recorded lines only the three hard-demand sheets and `sticky_rank` (34), and 31 lines of `prefix_hash`, replay through it |
+| The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint and mixed protocols; of the recorded lines only the three hard-demand sheets, `sticky_rank`, `encode_pair` and `pair_named` (109), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
-| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that it is read for no worker the index holds a block for: a request whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index. No gateway lends its string tree yet |
+| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults, the third being that a request with token ids reads it for no worker the index holds a block for, unless its profile reads the record alone: a request whose caller names no entry is one. A request its host holds as text is decided the same way in a lent string tree (`RequestMaker::text_key`), with or without an index. The gateway lends its string trees, and names the entry by classic's own key |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
-| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded, the 10 also over the classes a controller's pairing rule derives |
+| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded, the 10 also over the classes a controller's pairing rule derives; the 23 lines of a pair that names its worker (`pair_named`) replay through the engine's one call for a host in process |
 | Encode-prefill-decode on that engine | **[partly]** | `InProcess::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images, or where it carries items and demands vision or a way of processing its references: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most, and the later decisions of a single request and of a pair held to the workers the route's rule takes; the later decisions of an encode request that carries items held to them are not |
-| The crate's bench of the kept engine | **[planned]** | |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most, and the later decisions of a single request, of a pair and of an encode request held to the workers the route's rule takes; an encode request's header for a target is not read |
+| The crate's bench of the kept engine | **[built]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--grand-central on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
-| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill, its decode call and an encode request that carries its items are decided by `InProcess` over the registry's lists; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, as no stock stage does (section 10.2) |
+| The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill, its decode call and an encode request that carries its items are decided by `InProcess` over the registry's lists; a decision reads no load report under a document that holds a stage that keeps reports, as no stock stage does (section 10.2) |
 | The controller finding its own workers | **[partly]** | the image leaves the feature out; a worker's API key is refused; no flag sets a registration's timing |
 | A gateway under a controller | **[planned]** | section 11 |
 | User stages in WebAssembly and over gRPC | **[partly]** | library code that no document reaches |
@@ -2848,11 +3184,11 @@ and it has served traffic on a cluster beside classic.
 
 Each is the maintainer's. Work inside the crate goes on where a decision is not needed for it.
 
-All twelve at a glance. An answer can be as short as the numbers with their letters.
+All seventeen at a glance. An answer can be as short as the numbers with their letters.
 
 | # | Decision | Recommended | Needed for |
 |---|---|---|---|
-| 1 | The name of a cache partition | (a) the host hands the entry already named | the host's two trees, read for `cache_aware` (the token tree's entry is built) |
+| 1 | The name of a cache partition | (a) the host hands the entry already named | the host's two trees, read for `cache_aware` (both trees' entries are built) |
 | 2 | Recorders for the sheets that are missing | (a) new recorders beside classic's code, for the ring, the sticky override and `least_load`; (b) a crate test that names classic's rule, for `round_robin`, `random` and `passthrough` | proof against classic for those policies |
 | 3 | The hash ring | (a) the host lends its ring now; (b) one shared ring with the controller's switch | `consistent_hashing` and `prefix_hash` |
 | 4 | Where a placement stays during a request | (a) inside the load guard | the gateway's integration (stage 3) |
@@ -2862,8 +3198,13 @@ All twelve at a glance. An answer can be as short as the numbers with their lett
 | 8 | User stages in WebAssembly and over gRPC | (a) left as library code | nothing now |
 | 9 | The gateway's options | three with stage 3, the address and TLS options with stage 5 | stages 3 and 5 |
 | 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped; the other worker facts are kept beside the object; recommended: one set of overload thresholds for each worker | stage 4 |
-| 11 | The crate in CI and in the published set | closed inside the crate: the feature `controller` takes the engine's feature; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
+| 11 | The crate in CI and in the published set | closed inside the crate: the feature `controller` takes the engine's feature; (a) out of the published set until stage 3, and as it went (b): the crate stayed in it | CI's run of the kept engine's tests; stage 0 |
 | 12 | The last report of a worker whose load call fails | (a) the engine alone reads it, about 40 seconds at most at the default poll | rule 6, for the documents whose stages read load reports |
+| 13 | Where a capped sessions rule moves a pair's prefill pin | (a) where the pair forms | rule 6, for a pair under a sessions rule that states a cap |
+| 14 | Round robin's order across deciding threads | recorded, the answer is open: (b) every pick takes one step of the counter | rule 6, for `round_robin` where several threads decide |
+| 15 | The workers a session's first request reads | recorded, the answer is open: (a) the workers its turn asks about | rule 6, for a sessions rule that leaves a new key to round robin |
+| 16 | `least_load`'s count of a request that is never sent | decided 2026-11-24: (a) the engine counts a send at its dispatch | rule 6, for `least_load` where a route refuses a request behind its selection |
+| 17 | The pick among workers that tie at the fewest requests | decided 2026-11-25: (a) the engine draws among them | rule 6, for `prefix_hash` where it places a request by load |
 
 ### Decision 1: the name of a cache partition
 
@@ -2872,7 +3213,7 @@ request's entry in a tree must be named as classic names it.
 
 | Option | Cost |
 |---|---|
-| (a) The host hands the entry already named, with the length of the partition's marker at its start. The engine takes it as it takes the prompt's hash seeds today. | About 70 lines in the crate, and about 15 lines (an estimate) in the gateway's one integration, calling classic's own two naming functions. The naming is then the host's to keep: a host that hands a plain entry for a partitioned request lets two tenants' prompts match. |
+| (a) The host hands the entry already named, with the length of the partition's marker at its start. The engine takes it as it takes the prompt's hash seeds today. | About 70 lines in the crate, and about 15 lines (an estimate) in the gateway's one integration, calling classic's own two naming functions, one for each tree. The naming is then the host's to keep: a host that hands a plain entry for a partitioned request lets two tenants' prompts match. |
 | (b) Classic's naming (336 lines) and its two functions move into the kv-index crate. | A move across 12 files, 10 of them in the gateway. No behaviour changes. |
 
 Under (a) the engine also states for itself which of the three records a request reads (the rule
@@ -2907,9 +3248,27 @@ different modes would disagree.
 
 | Option | Cost |
 |---|---|
-| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only: one deletion and four changes. The crate's ring beside a worker list is deleted (1,728 lines removed, 230 added, 17 files). The four changes are about 580, 270, 450 and 550 changed lines, about 370 of them product code and 1,050 proof. The host lends its ring through one trait (`LentRing`) and states where a request stands on it. For such a request the crate then reads no ring of its own, so the request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines measure which tokens are in a key (15 lines) or how prompts spread over workers (1 line). In the crate they keep replaying on the crate's own ring. One of the 15 is held apart (section 13.1). The other 14 and the spread line hold classic's shares, as on main. For a gateway they are proven at stage 3 (section 13.1). On main classic's key recipe and its ring lookup are functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
+| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only: one deletion and four changes. The option in full follows the table. |
 | (b) Classic's ring (one file, 508 lines) moves to a crate both sides use. | A pure move, about 15 lines changed beside it. The gateway, the engine and the controller then build one ring type. |
 | (c) The crate's ring is changed to classic's hashes. | About 125 lines. Classic's recipe written twice; a gateway would keep two rings for a model. |
+
+Option (a) in full:
+
+- **The work.** The crate's ring beside a worker list is deleted (1,728 lines removed, 230 added,
+  17 files). The four changes are about 580, 270, 450 and 550 changed lines, about 370 of them
+  product code and 1,050 proof.
+- **What it gives.** The host lends its ring through one trait (`LentRing`) and states where a
+  request stands on it. For such a request the crate then reads no ring of its own, so the
+  request is placed on classic's own ring.
+- **The price in proof.** 16 of the 47 recorded `prefix_hash` lines measure which tokens are in a
+  key (15 lines) or how prompts spread over workers (1 line). In the crate they keep replaying on
+  the crate's own ring. One of the 15 is held apart (section 13.1). The other 14 and the spread
+  line hold classic's shares, as on main. For a gateway they are proven at stage 3 (section
+  13.1).
+- **Classic's own code.** On main classic's key recipe and its ring lookup are functions that
+  classic and the lender both call.
+- **A controller.** A controller has no classic ring to be lent: until (b) it keeps its own ring
+  and places a routing key on another worker than a gateway would.
 
 **Recommendation: (a) now, (b) with the controller's switch.** Not (c). Work on (a) is on main in
 the crate and in the gateway: the gateway lends the ring it keeps, for a key's own text and for a
@@ -2945,25 +3304,35 @@ too.
 | Option | Cost |
 |---|---|
 | (a) Refuse the request (503). | The simplest. Every blink of the controller is an outage of the gateways. |
-| (b) The gateway decides by itself with the same engine, under the document the controller pushed, over the worker list it follows. | The gateway has the engine from section 9. The document comes by the controller's push, which the contract has and the controller does not send yet. Gateways and controller must be built with the same stages. The gateway decides without load reports and cache events, over a worker list that no longer changes: a worker that dies meanwhile is seen by the gateway's circuit breaker only. The controller's in-flight counts miss a request that a gateway placed by itself: its dispatch message names no worker. |
+| (b) The gateway decides by itself with the same engine, under the document the controller pushed, over the worker list it follows. | The gateway has the engine from section 9. Its costs follow the table. |
 | (c) A fixed simple policy, such as round robin. | Small. The fallback behaves unlike the policy in force. |
+
+The costs of (b):
+
+- The document comes by the controller's push, which the contract has and the controller does not
+  send yet.
+- Gateways and controller must be built with the same stages.
+- The gateway decides without load reports and cache events, over a worker list that no longer
+  changes: a worker that dies meanwhile is seen by the gateway's circuit breaker only.
+- The controller's in-flight counts miss a request that a gateway placed by itself: its dispatch
+  message names no worker.
 
 **Recommendation: (b).** The contract was written for it: it has a push of the document "for
 every fallback engine".
 
 ### Decision 7: shadow and explain
 
-The kept engine runs a single request's shadow, and counts as skipped one that reads affinity
-rows of its own. It runs a pair's shadows by side at the pair's first decision, where a host
-decides in its own process, and counts them by side. A side its binding's sessions rule places
-has no shadow decision yet: it is counted as skipped. A host reads the shadow counts in one call
-of the engine (`InProcess::shadow_counts`). A gateway shows them at each scrape of its
-metrics endpoint, as the series `smg_policy_shadow_decisions_total`. A gateway still refuses a
-document that names a pair's shadows, and a served controller asks no side's shadow. The
-explain sample is kept by the served controller, and by the engine in a gateway's process for
-a single request and a pair's first decision. There an encode request decided with its items,
-a decode decided again and a pair's shadows are in no record, and no route of the gateway
-reads a record yet. A document
+The engine runs a single request's shadow, and counts as skipped one that reads affinity
+rows of its own. It runs a pair's shadows by side at the pair's first decision, and the decode
+side's at a decode decided again, where a host decides in its own process. It counts them by
+side, a decode decided again apart. A side its binding's sessions rule or its picker's
+assignment places has no shadow decision yet: it is counted as skipped. A host reads the shadow
+counts in one call of the engine (`InProcess::shadow_counts`). A gateway shows them at each
+scrape of its metrics endpoint, as the series `smg_policy_shadow_decisions_total`. A gateway
+takes a document that names a pair's shadows, and a served controller asks no side's
+shadow. The explain sample is kept by the served controller, and by the engine in a gateway's
+process for a single request and a pair's first decision. There an encode request decided with
+its items, a decode decided again and a pair's shadows are in no record. The gateway answers a kept record at `GET /policy/explain/{request_id}`, in the JSON the crate writes one in. It states no id of its own yet, so a request whose body states none is in no record. A document
 that writes `canary`, `override: allowed` or `admission` is refused. No engine runs them.
 
 | Option | Cost |
@@ -3002,7 +3371,7 @@ controller (section 11) brings `--grand-central-address` and three TLS options.
 |---|---|---|
 | A model's lists by role and protocol, with the engine's value beside each | one type in the worker crate that the gateway and the controller both use | 279 lines added; the gateway moves onto it at its integration |
 | A load monitor that a controller can stop when it stops leading, and start again | one public `stop()` on the worker crate's monitor | about 110 lines with its test |
-| The facts of a worker that a decision reads and a worker object does not hold as its record states them (zone, the encode offer, vision, the admission window, the demand facts, pairing) | the controller keeps them beside the object (10.3, built); a fact moves to a field of the worker crate's object when that crate has one that holds it as stated, checked against the crate first | 245 lines of code for what is kept beside the object |
+| The facts of a worker's record that a worker object does not hold as the record states them, among them zone, the encode offer, vision, the admission window, the demand facts and pairing | the controller keeps them beside the object (10.3, built); a fact moves to a field of the worker crate's object when that crate has one that holds it as stated, checked against the crate first | 245 lines of code for what is kept beside the object |
 
 One more point under this decision. A document can write an `overload` block for each binding, and
 a worker may state thresholds of its own. A worker object holds one set. **Recommendation:** one
@@ -3020,22 +3389,56 @@ registers it with no threshold at all. What that leaves of a binding's block:
   flags' defaults are 8 queued requests and 0.8 usage.
 - **Its shed word [built].** A binding keeps whether a request is shed when every worker is
   vetoed. A decision reads it.
-- **Its switch [partly].** Whether the program's default vetoes at all is one word for the
+- **Its switch [built].** Whether the program's default vetoes at all is one word for the
   bindings a host runs, because the default is the program's: one for every worker object that
   takes one. The host reads it where it
   builds that default. A gateway that runs a supplied document reads it at its start, and
   refuses a document whose bindings disagree on it, or on the shed word: its routes read one
   shed word for the process. It also refuses one whose block is on where the gateway states
   neither number. With the switch off the gateway builds its worker objects with no default. A
-  binding with no block says the defaults. A controller's reader of the switch is planned: it
-  does not read it on its worker objects yet. A worker's own thresholds veto either way.
+  binding with no block says the defaults. A standalone controller reads it at each document
+  that takes force: its document door states the word on the holder of its worker objects
+  behind each generation's entry, under the door's lock, and the objects the word changes are
+  built again before the entry returns. Its default is off where every binding switches it
+  off. A controller refuses a document whose bindings disagree on it, by the path of the first
+  binding that differs from the first, at every pass of its document door: a start, an apply,
+  a dry run, a rollback, a spec store's bind and a leader's generation that a standby follows.
+  At a standby's restore the snapshot's rows are built ahead of its generation: where that
+  generation moves the word, a row it changes is built twice. A worker's own thresholds veto
+  either way.
 
 ### Decision 11: the crate in CI and in the published set
 
-| Question | Fact | Options | Recommendation |
-|---|---|---|---|
-| How does CI run the kept engine's own tests? | The kept engine compiles only under the feature `in-process`. The feature `controller` takes it. The first of CI's four test lines of the crate in `scripts/ci_rust_tests.sh` enables `client`, which takes `controller`, so that line runs the cases behind `in-process` and the test target `caller`. | (a) The crate's default build includes the feature: one line in the crate's manifest. Measured: two of CI's four lines then run the 82 cases, in under a second more. But a default build of the crate goes from 147 to 272 packages, the controller's image and three bench workflows then build the engine in, and two READMEs become wrong, one of them outside the crate. (b) CI's first test line names the feature: one line in the script, outside the crate. That line builds the same 364 packages with it and without it, and nothing else builds differently. (c) The crate's test-only dependency on itself names the feature: inside the crate, and no product build changes. But every build that takes the crate's test-only dependencies then builds the engine too: CI's two lines that test one feature alone, the lint of `operator` alone, and the three bench workflows that (a) names. Not measured. | Closed a fourth way, inside the crate: `controller` takes `in-process` and `worker-host`, the two features the controller's switch (section 10.2) builds on. A build with `controller` or `client` then compiles the kept engine and the worker objects, and a controller built with `controller` alone keeps worker objects as the stock binary does. No line outside the crate changed. |
-| Is the crate published before it is ready? | The earlier integration added the crate to the published set: four lines in two release workflows and the release version check. | (a) Stage 0's change takes the four lines out, and they return with the gateway's integration (stage 3). (b) They stay. | (a). |
+**How does CI run the kept engine's own tests?**
+
+*The fact:* the kept engine compiles only under the feature `in-process`. The feature `controller`
+takes it. The first of CI's four test lines of the crate in `scripts/ci_rust_tests.sh` enables
+`client`, which takes `controller`, so that line runs the cases behind `in-process` and the test
+target `caller`.
+
+| Option | Cost |
+|---|---|
+| (a) The crate's default build includes the feature: one line in the crate's manifest. | Measured: two of CI's four lines then run the 82 cases, in under a second more. But a default build of the crate goes from 147 to 272 packages, the controller's image and three bench workflows then build the engine in, and two READMEs become wrong, one of them outside the crate. |
+| (b) CI's first test line names the feature: one line in the script, outside the crate. | That line builds the same 364 packages with it and without it, and nothing else builds differently. |
+| (c) The crate's test-only dependency on itself names the feature: inside the crate, and no product build changes. | But every build that takes the crate's test-only dependencies then builds the engine too: CI's two lines that test one feature alone, the lint of `operator` alone, and the three bench workflows that (a) names. Not measured. |
+
+**As taken.** Closed a fourth way, inside the crate: `controller` takes `in-process` and
+`worker-host`, the two features the controller's switch (section 10.2) builds on. A build with
+`controller` or `client` then compiles the kept engine and the worker objects, and a controller
+built with `controller` alone keeps worker objects as the stock binary does. No line outside the
+crate changed.
+
+**Is the crate published before it is ready?**
+
+*The fact:* the earlier integration added the crate to the published set: four lines in two
+release workflows and the release version check.
+
+- (a) Stage 0's change takes the four lines out, and they return with the gateway's integration
+  (stage 3).
+- (b) They stay.
+
+**Recommendation: (a).** As it went: (b). No change took the lines out, and the gateway's
+integration is on main.
 
 ### Decision 12: the last report of a worker whose load call fails
 
@@ -3070,6 +3473,155 @@ bounded by its own sample, and classic stays as recorded.
 **As taken.** (a) is on main: the monitor keeps the report, the engine's rows and signal cells take
 it, and classic's reads are as they were.
 
+### Decision 13: where a capped sessions rule moves a pair's prefill pin
+
+*Needed for:* rule 6 (section 1), for a pair under a sessions rule that states a cap.
+
+A key whose pin is at its rule's cap is placed again, and the pin moves where the request lands on
+another worker under the cap. For a single request and for a pair's decode side, classic and the
+engine both write that move where the side is decided. They differ on a pair's prefill side.
+
+Classic selects a pair's prefill first, and its sticky map moves the pin at that selection
+(`select_sticky` in `model_gateway/src/policies/registry.rs`). The pair can still fail behind it, as
+where the decode's policy declines (`pair_pass` in `model_gateway/src/routers/common/placement.rs`).
+The move stays, on a prefill that took no request.
+
+The engine's prefill side places the request again and moves no pin. A prefill whose partners
+leave no decode is passed over. The pin moves where the pair forms, to the prefill the pair formed
+on and ahead of any dispatch (`Engine::decide_pair` in `engine/framework.rs`). A decision that forms
+no pair moves none.
+
+So behind a pair that fails past its prefill's selection, the key's next request finds the pin
+moved under classic and where it stood under the engine.
+
+| Option | Cost |
+|---|---|
+| (a) The engine moves the pin where the pair forms. | Behind a pair that fails past its prefill's selection the engine differs from classic on the key's next request, by this decision. Classic's answers do not move. |
+| (b) The engine moves the pin at its prefill side's run, as classic does. | The key's next request finds the pin as classic's does. A prefill that is passed over then holds the pin while the decision runs. A request of the key decided in that time follows it there, and the pin is taken back from under that request or stays on a prefill the pair never formed on. |
+
+**Recommendation: (a).** A pin says where a session's requests went. A move for a pair that never
+formed names a prefill that took none.
+
+**As taken.** (a) is on main: the prefill side's run moves no pin, and the pair's decision moves it
+where the pair forms.
+
+### Decision 14: round robin's order across deciding threads
+
+*Needed for:* rule 6 (section 1), for `round_robin` where several threads decide.
+
+Classic's round robin takes one step of its list's counter at every pick
+(`model_gateway/src/policies/round_robin.rs`). Requests decided on any threads then take the list's
+workers in one order. Where every worker can take a request, the picks of two workers differ by one
+at most.
+
+The engine's round robin takes one step of its list's counter at every pick too
+(`policies/round_robin.rs`), so requests decided on any threads take the list's workers in one
+order as well, one after the other as the list holds them. The two start a list at workers of
+their own: classic starts its first list at that list's first worker, the engine starts each list
+at a drawn worker.
+
+The other form takes a thread's turns of a list in runs: single steps for the thread's first turns,
+64 for each worker, and past them a run of the counter's turns in one write, 61 as a rule, played
+in order. Between two such writes a pick whose turn the filters keep writes no word that the
+deciding threads share. Where several threads decide, the picks then follow no one order: inside a
+run a thread takes the list's workers one after the other, so two requests decided at one moment
+can go to one worker while another worker has none. Where the filters keep every worker and the
+counter has not wrapped, each worker still takes its even share, to within one pick and one more
+for each run that is not played out.
+
+| Option | Cost |
+|---|---|
+| (a) A thread takes a list's turns in runs. | Where several threads decide, the order of the picks differs from classic's: requests decided together can share a worker while another has none, and the even share is bounded as above and not exact. |
+| (b) Every pick takes one step of the counter, as classic does. | The two agree. Every pick writes one word that all deciding threads share, and a decision slows as deciding threads are added. |
+
+**Recorded, not decided.** (b) is on main. The maintainer's answer is open.
+
+### Decision 15: the workers a session's first request reads
+
+*Needed for:* rule 6 (section 1), for a sessions rule that leaves a new key to a round robin
+profile.
+
+A routing read of a worker moves its open circuit breaker to half-open once the breaker's timeout
+has passed (`CircuitBreaker::state` in the worker crate). So the workers a request reads decide
+when a tripped worker is tried again.
+
+For a key with no pin, classic's sticky map first lists the workers that can take the request, and
+reads every worker of the list for it (`select_sticky` in `model_gateway/src/policies/registry.rs`).
+Then its policy picks.
+
+The engine reads fewer workers where it draws for such a request. Over a list of 16 workers or
+more it reads the worker the list's counter points at, with no turn taken. Where the filters keep
+that worker, it reads the workers the draw then takes and a worker that another request claimed
+for the key meanwhile (`Engine::decide_claimed` in `engine/framework.rs`). Where they keep the
+worker the draw's own turn lands on too, the decision's cost does not grow with the list. In the
+other cases, a worker the filters refuse at either of those two reads among them, the engine
+reads every worker, as classic does.
+
+So a tripped worker whose timeout has passed turns half-open at any session's first request under
+classic, and under the engine at the first request that asks about that worker. An answer can
+differ. Behind a session's first request, a failure of an older request on such a worker opens its
+breaker again under classic and changes nothing under the engine. A request pinned to that worker
+is then placed on another worker by classic and on its pin by the engine.
+
+| Option | Cost |
+|---|---|
+| (a) The engine reads the workers its turn asks about. | A tripped worker is tried again at another request than under classic, by this decision. |
+| (b) The engine reads every worker, as classic does. | The two agree. The decision grows with the list: every worker's record is written and filtered before the profile takes its turn. |
+
+**Recorded, not decided.** (a) is on main. The maintainer's answer is open.
+
+### Decision 16: `least_load`'s count of a request that is never sent
+
+*Needed for:* rule 6 (section 1), for `least_load` where a route refuses a request behind its
+selection.
+
+Classic's `least_load` credits the worker it picks among several with the request's work at the
+pick (`decide` in `model_gateway/src/policies/least_load.rs`). The credit stays until a load report
+of that worker sampled behind the pick (a worker keeps its newest 8,192), and classic takes no pick
+back. So a request that is selected and never sent weighs on its worker until that report.
+
+The engine's counts of sends take a send at its dispatch (section 6). A request that is never sent
+enters none of them.
+
+So behind a request that a route refuses between its selection and its send, classic's next picks
+count that request on its worker and the engine's do not (section 9.2). An answer can differ until
+the worker's next report.
+
+| Option | Cost |
+|---|---|
+| (a) The engine counts a send at its dispatch. | Behind a request that is never sent the engine's picks can differ from classic's until the worker's next report, by this decision. Classic's answers do not move. |
+| (b) The engine credits a pick where it is decided, as classic does. | The two agree. A request that is never sent then weighs on its worker in the engine too, until the worker's next report. |
+
+**Decided 2026-11-24: (a).** The engine's count stays, and a request that is never sent is not
+counted.
+
+### Decision 17: the pick among workers that tie at the fewest requests
+
+*Needed for:* rule 6 (section 1), for `prefix_hash` where it places a request by load.
+
+Classic's `prefix_hash` places some requests by load, among them a request with nothing to hash: no
+routing key, no tokens and no text. For that request it takes the worker with the fewest requests in
+flight among those it may use, and of several at that count the first in the order of the list it is
+handed (`least_loaded_healthy` in `model_gateway/src/policies/prefix_hash.rs`). Classic's own
+`least_load` draws among the workers that tie, so that an idle fleet's requests spread
+(`TIE_EPSILON_SECS` in `model_gateway/src/policies/least_load.rs`).
+
+The engine's profile for `prefix_hash` adds the weighted scores of `consistent-hash` and
+`least-requests` (section 7). For such a request `consistent-hash` scores every worker alike, so
+`least-requests` orders them, and the picker `best` draws among the workers at the best score, from
+the decision's seed.
+
+So where several workers tie at the fewest requests in flight, classic takes the first of them and
+the engine draws one. That holds where the policy itself places: for a single request, and for each
+side of a pair.
+
+| Option | Cost |
+|---|---|
+| (a) The engine draws among the workers that tie. | Where several workers tie, the engine's pick can differ from classic's, by this decision. Classic's answers do not move. |
+| (b) The engine takes the first of them in its list's order, as classic does. | The two agree. Each request that finds its workers at one count then goes to the first of them. |
+
+**Decided 2026-11-25: (a).** The engine's draw stays.
+
 ## 16. The order of work
 
 The crate first (rule 7). Each stage ends with a test, and the next does not start before it.
@@ -3077,11 +3629,56 @@ The crate first (rule 7). Each stage ends with a test, and the next does not sta
 | Stage | Work | Ends when |
 |---|---|---|
 | 0 | The earlier gateway integration is taken out. | The gateway routes by classic alone; every classic test and bench cell is as before. |
-| 1 | **The policies, proven in the crate.** Each classic policy decided by `InProcess` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 15 sheets that record a decision (415 of section 13.1's 489) replays through the kept engine over worker objects. Each difference from classic is fixed or accepted as a named difference. Under decision 3 (a) the 16 `prefix_hash` lines that measure a key's tokens or a spread of prompts replay there with no ring lent, and their proof for a gateway is stage 3's. |
+| 1 | **The policies, proven in the crate.** Each classic policy decided by `InProcess` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the sheets that record a decision replays through the kept engine over worker objects. The end in full follows the table. |
 | 2 | **The host contract.** `place`, `Placement`, the engine's own upkeep and membership events (section 8.2). | A test host in the crate serves every plan through `place` alone. |
 | 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; under decision 3 (a), the 47 `prefix_hash` lines and the 12 ring lines of `all_vetoed` read as recorded, count for count, through the gateway's own entry with the engine on and the recorder's own workers and prompts; a cluster run beside classic. |
-| 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `InProcess`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. Differences are named so far on two of the sheets. The `sticky_rank` lines that the crate decides apart answer by the ring and the picker, where the gateway sets no rank (section 13.1). 11 `overload` lines answer by one rule: where ranks are worker objects, a threshold that judged an engine's summed queue judges each rank's own queue, and a usage threshold each rank's own usage in place of the mean (two ranks that queue 4 requests each under a threshold of 8 are vetoed as one worker and not as two). The 18 `minimum_tokens` lines are answered as recorded by the worker crate's rank cache behind that monitor, which no code of a controller asks. They are not answers of the engine: it serves no rank option (`refuse_unsupported` in `document/routing_settings.rs` refuses classic's at the start), and where ranks are worker objects it picks among them by its profile. That pick was measured once, on 2026-11-23 over `55c35100d`, outside the tests: under a resident-work profile with a picker of two it names the recorded ranks on 5 of the 18 lines and other ranks on 13, by four rules. On 6 lines classic finds no rank on a worker its cache holds nothing of, and the engine places on a ready object: one that has no report (`with_no_survivor_reporting_resident_tokens_the_in_flight_count_decides`) or, where the answer states no token capacity, one it scores by its resident tokens. On 3 a rank that the answer omits or reports with no token capacity is no rank to classic. The engine scores an omitted rank from its best reporting peer (`a_worker_without_resident_tokens_scores_from_the_best_reporting_peer`) and a rank with no token capacity by its resident tokens. On 3 the engine reads resident tokens and draws among equal ranks, where classic reads used tokens and takes the lowest rank (`equal_resident_work_ties_and_a_token_apart_does_not`). On 1 classic keeps a worker's last answer and its bookings behind a failed poll, and the monitor publishes no report of that worker (`publish_polled` in the worker crate's load monitor). It keeps none for the engine either: the line's report states no running or waiting request (decision 12). Three of the lines move with how the caller counts a pick in flight and with the picker, and the count stays at 5 or 6. |
+| 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `InProcess`; the store-backed engine is gone; each line of the four host sheets (section 13.1) is answered. The end in full follows the table. |
 | 5 | **A gateway under a controller** (section 11). | A cluster run: gateways under a controller beside classic, with the controller stopped and started under load. |
+
+**Stage 1's end.** Every line of the 16 sheets that record a decision (438 of section 13.1's 512)
+replays through the kept engine over worker objects. Each difference from classic is fixed or
+accepted as a named difference. Under decision 3 (a) the 16 `prefix_hash` lines that measure a
+key's tokens or a spread of prompts replay there with no ring lent, and their proof for a gateway
+is stage 3's.
+
+**Stage 4's end.** The controller's own tests pass on `InProcess`, and the store-backed engine is
+gone. Each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code
+that the controller takes from the worker crate, or by a rule of the crate's with its differences
+named.
+
+Differences are named so far on two of the sheets. The `sticky_rank` lines that the crate decides
+apart answer by the ring and the picker, where the gateway sets no rank (section 13.1). 11
+`overload` lines answer by one rule: where ranks are worker objects, a threshold that judged an
+engine's summed queue judges each rank's own queue, and a usage threshold each rank's own usage in
+place of the mean. For example, two ranks that queue 4 requests each under a threshold of 8 are
+vetoed as one worker and not as two.
+
+The 18 `minimum_tokens` lines are answered as recorded by the worker crate's load monitor's rank
+cache, which no code of a controller asks. They are not answers of the engine: it serves no rank
+option (`refuse_unsupported` in `document/routing_settings.rs` refuses classic's at the start), and
+where ranks are worker objects it picks among them by its profile.
+
+That pick was measured once, on 2026-11-23 over `55c35100d`, outside the tests. Under a
+resident-work profile with a picker of two it names the recorded ranks on 5 of the 18 lines and
+other ranks on 13, by four rules:
+
+- On 6 lines classic finds no rank on a worker its cache holds nothing of, and the engine places on
+  a ready object: one that has no report
+  (`with_no_survivor_reporting_resident_tokens_the_in_flight_count_decides`) or, where the answer
+  states no token capacity, one it scores by its resident tokens.
+- On 3 a rank that the answer omits or reports with no token capacity is no rank to classic. The
+  engine scores an omitted rank from its best reporting peer
+  (`a_worker_without_resident_tokens_scores_from_the_best_reporting_peer`) and a rank with no token
+  capacity by its resident tokens.
+- On 3 the engine reads resident tokens and draws among equal ranks, where classic reads used
+  tokens and takes the lowest rank (`equal_resident_work_ties_and_a_token_apart_does_not`).
+- On 1 classic keeps a worker's last answer and its bookings behind a failed poll, and the monitor
+  publishes no report of that worker (`publish_polled` in the worker crate's load monitor). It
+  keeps none for the engine either: the line's report states no running or waiting request
+  (decision 12).
+
+Three of the lines move with how the caller counts a pick in flight and with the picker, and the
+count stays at 5 or 6.
 
 ### Stage 1, the first changes
 
@@ -3111,5 +3708,5 @@ and the store's lease file into the kept engine's modules, with no behaviour cha
 
 Behind them, in the crate: `random` and `round_robin` details of the short path; pairs and encode
 requests over worker lists; the hash ring a host lends (decision 3). Waiting for a decision:
-new recorders (2), the controller's parts (5, 10), shadow and explain on the
-kept engine (7), the published set (11).
+new recorders (2), the controller's parts (10), shadow and explain on the
+kept engine (7).

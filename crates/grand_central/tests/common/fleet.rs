@@ -980,7 +980,7 @@ impl Replica {
         let config = |port: u16| Config {
             controller_id: id.to_owned(),
             listeners: vec![
-                listener("gateway", &[Scope::Gateway, Scope::Ingestion], 0),
+                listener("gateway", &[Scope::Gateway], 0),
                 listener("control", &[Scope::Control], 0),
                 listener("replication", &[Scope::Replication], port),
             ],

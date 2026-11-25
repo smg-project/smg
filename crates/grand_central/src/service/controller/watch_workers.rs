@@ -21,9 +21,7 @@
 //! parks its waker with the feed. A watched write wakes one task of the
 //! feed, once its store has let its locks go, and that task wakes the
 //! parked streams, as it does at the role's word: a write pays one wake
-//! however many watch, and none of it under the membership lock. Where the
-//! replica hosts worker objects the same write wakes their follower too,
-//! once and the same way. The task
+//! however many watch, and none of it under the membership lock. The task
 //! is the feed's. It is started with the feed's first watch, on that
 //! watch's runtime, and ended with the last feed; the serve does not tell
 //! it the stop and the drain does not join it, since it holds nothing a
@@ -856,17 +854,17 @@ pub(crate) mod tests {
             proto::{self, worker_event::Event},
         },
         store::{
-            Journal, LeasesStore, MembershipChange, MemoryStore, Position, WorkerFacts,
+            Journal, LeasesStore, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts,
             WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
-        worker_host::{Members, Objects},
+        worker_host::{stand, Members, Objects},
     };
 
     /// A replica that leads under term 1, its store standing in that term.
     struct Leader {
         store: Arc<MemoryStore>,
-        /// The holder a watch's first copy is cut from: it follows the
-        /// store, which a case writes itself.
+        /// The holder a watch's first copy is cut from. A case writes its
+        /// rows through it, as a registration call does.
         objects: Arc<Objects<Members>>,
         feed: Feed,
         elector: Elector,
@@ -932,33 +930,35 @@ pub(crate) mod tests {
             assert_eq!(self.watchers.open_of(&told(by)), want, "{by}'s watches");
         }
 
+        /// A registration of `facts` through the holder: the row's id.
+        fn lays(&self, facts: WorkerFacts) -> WorkerId {
+            let laid = self.objects.upsert(&self.store, facts, Registrant::Control);
+            laid.expect("a registration").id()
+        }
+
         fn register(&self, n: usize, incarnation: u64, model: &str) -> WorkerId {
-            self.store
-                .upsert(WorkerFacts {
-                    key: key(n),
-                    engine: key(n),
-                    incarnation,
-                    models: vec![model.to_owned()],
-                    dp_size: 1,
-                    ..WorkerFacts::default()
-                })
-                .id()
+            self.lays(WorkerFacts {
+                key: key(n),
+                engine: key(n),
+                incarnation,
+                models: vec![model.to_owned()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            })
         }
 
         /// A row whose URL alone passes half a page's bytes: it goes alone
         /// in a snapshot's page.
         fn register_wide(&self, n: usize) -> WorkerId {
             let url = format!("grpc://{n:03}.{}:8000", "u".repeat(PAGE_BYTES / 4));
-            self.store
-                .upsert(WorkerFacts {
-                    key: url.clone(),
-                    engine: url,
-                    incarnation: 1,
-                    models: vec!["model-a".to_owned()],
-                    dp_size: 1,
-                    ..WorkerFacts::default()
-                })
-                .id()
+            self.lays(WorkerFacts {
+                key: url.clone(),
+                engine: url,
+                incarnation: 1,
+                models: vec!["model-a".to_owned()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            })
         }
 
         fn head(&self) -> Position {
@@ -1180,10 +1180,7 @@ pub(crate) mod tests {
             (id.0, 1, proto::WorkerStatus::Pending as i32)
         );
 
-        leader
-            .store
-            .set_status(id, WorkerStatus::Ready, 1)
-            .expect("ready");
+        stand(&leader.objects, &leader.store, id, WorkerStatus::Ready);
         let ready = next(&mut stream).await;
         assert_eq!(
             ready.event,
@@ -1202,7 +1199,8 @@ pub(crate) mod tests {
         };
         // The status change moved no revision: the patch names the one the
         // registration gave.
-        leader.store.patch(id, patch, 1).expect("patched");
+        let patched = leader.objects.patch(&leader.store, id, patch, 1);
+        patched.expect("patched");
         let relabelled = next(&mut stream).await;
         let Some(Event::Relabelled(row)) = &relabelled.event else {
             panic!("a change in place: {relabelled:?}");
@@ -1212,7 +1210,8 @@ pub(crate) mod tests {
             (2, Some("gold"))
         );
 
-        leader.store.remove(id, 2).expect("removed");
+        let gone = leader.objects.remove(&leader.store, id, 2);
+        gone.expect("removed");
         let removed = next(&mut stream).await;
         assert_eq!(
             removed.event,
@@ -1462,10 +1461,7 @@ pub(crate) mod tests {
             } else {
                 WorkerStatus::NotReady
             };
-            leader
-                .store
-                .set_status(id, status, 1)
-                .expect("a status write");
+            stand(&leader.objects, &leader.store, id, status);
         }
         // It takes again: what its channel held, the word, the end.
         let word = loop {
@@ -1542,10 +1538,7 @@ pub(crate) mod tests {
         // A write about a row of another model is not told; the next about
         // its own is.
         for id in [other, mine] {
-            leader
-                .store
-                .set_status(id, WorkerStatus::Ready, 1)
-                .expect("ready");
+            stand(&leader.objects, &leader.store, id, WorkerStatus::Ready);
         }
         let status = next(&mut stream).await;
         let Some(Event::Status(status)) = status.event else {
@@ -1566,7 +1559,8 @@ pub(crate) mod tests {
             replaced.new.map(|row| row.models),
             Some(vec!["model-b".to_owned()])
         );
-        leader.store.remove(moved, 1).expect("removed");
+        let gone = leader.objects.remove(&leader.store, moved, 1);
+        gone.expect("removed");
         let again = leader.register(2, 1, "model-a");
         let registered = next(&mut stream).await;
         let Some(Event::Registered(row)) = registered.event else {
@@ -1587,10 +1581,7 @@ pub(crate) mod tests {
         turns().await;
         let (woken, waker) = Woken::waker();
         parks(&mut stream, &waker);
-        leader
-            .store
-            .set_status(id, WorkerStatus::Ready, 1)
-            .expect("ready");
+        stand(&leader.objects, &leader.store, id, WorkerStatus::Ready);
         // The write is over, and on this one thread no task has had a turn
         // since: the stream is parked still.
         assert_eq!(woken.wakes(), 0, "the write woke the watch itself");

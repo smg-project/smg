@@ -26,7 +26,6 @@ use crate::{
     },
     tracking::{
         dispatch_credit::{DispatchCredit, ReportedSends, SentSettings},
-        in_flight::with_counts,
         lease::{EventKind, EventSet, Lease, Membership, Side},
     },
 };
@@ -194,18 +193,16 @@ impl LeastLoad {
                 peer_baseline = 0.0;
             }
         }
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                if *slot == PENDING {
-                    *slot = self.unreported_cost(
-                        counts(&candidates[i as usize]),
-                        nominal,
-                        fleet_has_loads,
-                        peer_baseline,
-                    );
-                }
+        for (slot, &i) in out.iter_mut().zip(kept) {
+            if *slot == PENDING {
+                *slot = self.unreported_cost(
+                    facts.in_flight(&candidates[i as usize]),
+                    nominal,
+                    fleet_has_loads,
+                    peer_baseline,
+                );
             }
-        });
+        }
     }
 
     /// The cost of a candidate without a report: the reporting peers' baseline
@@ -273,20 +270,18 @@ impl LeastLoad {
     ) -> usize {
         let mean = u64::from(self.mean_prefill_tokens);
         let mut reporting = 0usize;
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(rows) {
-                let c = &candidates[i as usize];
-                *slot = match load(c) {
-                    Some(report) => {
-                        let sent = sends.reported(c);
-                        let tokens = sent.tokens + u64::from(sent.unsized_requests) * mean;
-                        reporting += 1;
-                        self.credit_work(report, counts(c), tokens, u64::from(sent.requests))
-                    }
-                    None => PENDING,
-                };
-            }
-        });
+        for (slot, &i) in out.iter_mut().zip(rows) {
+            let c = &candidates[i as usize];
+            *slot = match load(c) {
+                Some(report) => {
+                    let sent = sends.reported(c);
+                    let tokens = sent.tokens + u64::from(sent.unsized_requests) * mean;
+                    reporting += 1;
+                    self.credit_work(report, facts.in_flight(c), tokens, u64::from(sent.requests))
+                }
+                None => PENDING,
+            };
+        }
         reporting
     }
 

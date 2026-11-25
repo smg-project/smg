@@ -51,14 +51,13 @@ fn view_build(c: &mut Criterion) {
 }
 
 fn facts(seed: u64, held: &[AffinityFacts]) -> RequestFacts<'_> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 512,
-        seed,
-        now_micros: 1_000_000,
-        affinity: held,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.prompt_tokens = 512;
+    facts.seed = seed;
+    facts.now_micros = 1_000_000;
+    facts.affinity = held;
+    facts
 }
 
 fn decide(c: &mut Criterion) {
@@ -71,13 +70,11 @@ fn decide(c: &mut Criterion) {
         let mut held = Vec::with_capacity(n);
         build_column(&fleet, &mut held);
         let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            // Every row of the bench's fleet reports a rate.
-            reported: true,
-            ..PoolFacts::default()
-        };
+        let mut pool = PoolFacts::default();
+        pool.pool_size = n as u32;
+        pool.generation = 1;
+        // Every row of the bench's fleet reports a rate.
+        pool.reported = true;
         let cx = Constraints::default();
         // A column of another length is refused before any stage runs: the
         // cell would time the refusal.

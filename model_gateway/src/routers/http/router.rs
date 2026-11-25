@@ -130,6 +130,11 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// uploaders open a healthy worker's breaker.
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
 
+/// Error code of the 502 for a worker's body over the limit
+/// ([`worker_body_too_large`]): the worker answered, and the router refused
+/// what it gave ([`worker_answered`]).
+const WORKER_BODY_TOO_LARGE: &str = "upstream_response_too_large";
+
 /// How a worker response body is relayed to the client. Re-chunking exists
 /// on this regular HTTP relay only; the PD and gRPC relays do not apply it.
 #[derive(Clone, Copy)]
@@ -585,7 +590,7 @@ impl Router {
             && (self.policy_registry.engine().is_none()
                 || cache_namespace.is_some()
                 || self.policy_registry.any_policy_needs_request_text(None)))
-        .then(|| typed_req.extract_text_for_routing());
+        .then(|| typed_req.routing_text());
         let rid_key = self
             .policy_registry
             .derive_rid_key(typed_req.rid())
@@ -999,7 +1004,7 @@ impl Router {
         let status = response.status();
         if !head_success_recorded || !status.is_success() {
             ledger.record_outcome(worker.as_ref(), status.as_u16());
-            placed.ended(status.as_u16(), || is_upstream_answer(&response));
+            placed.ended(status.as_u16(), || worker_answered(&response));
         }
         // A definitive answer closes the retry window on this worker: the next
         // attempt goes to another available worker, or the answer stands.
@@ -1747,7 +1752,7 @@ impl Router {
                         "Rerank worker response exceeded the body limit"
                     );
                     return keep_worker(error::bad_gateway(
-                        "upstream_response_too_large",
+                        WORKER_BODY_TOO_LARGE,
                         format!("Rerank response from worker exceeded {max_body_bytes} bytes"),
                     ));
                 }
@@ -1831,9 +1836,19 @@ pub(super) fn worker_body_too_large(limit: usize, worker: &str) -> Response {
         limit, "Worker response exceeded the body limit"
     );
     error::bad_gateway(
-        "upstream_response_too_large",
+        WORKER_BODY_TOO_LARGE,
         format!("Response from worker exceeded {limit} bytes"),
     )
+}
+
+/// Whether the worker itself answered the request `response` ends, for
+/// Grand Central's hearing ([`placement::Placed::ended`]): the answer
+/// carries the worker's mark, or it is the router's refusal of a body the
+/// worker gave over the limit, known by its own code. That refusal carries
+/// no mark: the mark's other readers take it as before.
+fn worker_answered(response: &Response) -> bool {
+    is_upstream_answer(response)
+        || extract_error_code_from_response(response) == WORKER_BODY_TOO_LARGE
 }
 
 /// Post-dispatch inputs for the rerank response builder; the request itself
@@ -2498,7 +2513,7 @@ impl Router {
             // that relay's to report.
             if !head_success_recorded(&response) {
                 worker.record_outcome(status.as_u16());
-                placed.ended(status.as_u16(), || is_upstream_answer(&response));
+                placed.ended(status.as_u16(), || worker_answered(&response));
             }
             if status.is_server_error() {
                 Metrics::record_worker_error(
@@ -7763,6 +7778,82 @@ mod tests {
         );
     }
 
+    /// The limit of the cases below: under the long answer, and above the
+    /// router's own refusal, which the Decisions adapter reads whole.
+    const REFUSED_OVER: usize = 256;
+    const _: () = assert!(SIZED_DELTA_BODY.len() > REFUSED_OVER);
+
+    /// A worker whose good answer on `path` is longer than
+    /// [`REFUSED_OVER`].
+    async fn spawn_long_answer(path: &'static str) -> String {
+        spawn_cut_stub(path, "application/json", &[SIZED_DELTA_BODY], false).await
+    }
+
+    /// The router's 502 of a body over its limit, under its own code and
+    /// with no mark of the worker's.
+    fn assert_refused_over_the_limit(response: &Response) {
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(response),
+            "upstream_response_too_large"
+        );
+        assert!(!is_upstream_answer(response));
+    }
+
+    /// A body over the router's limit is the worker's answer, refused by
+    /// the router. The refusal carries no mark, and the route tells the
+    /// engine by the refusal's own code that the worker answered: the
+    /// engine hears the server's error, as it does for the Decisions
+    /// adapter's refusal, and no failed connection.
+    #[tokio::test]
+    async fn the_engine_hears_a_body_over_the_limit_as_the_servers_error() {
+        let url = spawn_long_answer("/generate").await;
+        let mut router = breaker_router(&[&url], fast_retry_config(1), 5);
+        router.max_payload_size = REFUSED_OVER;
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = generate(&router, "a prompt").await;
+
+        assert_refused_over_the_limit(&response);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 502"]
+        );
+    }
+
+    /// The Decisions adapter reads the router's refusal of a body over the
+    /// limit whole and mints it again under the same code, so the route
+    /// tells the engine the same: the server's error.
+    #[tokio::test]
+    async fn the_engine_hears_a_decisions_body_over_the_limit_as_the_servers_error() {
+        let url = spawn_long_answer(UPSTREAM_ROUTE).await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::Sglang)
+            .health_config(no_health_check())
+            .build();
+        let mut router = streaming_router(PolicyConfig::RoundRobin, REFUSED_OVER, vec![worker]);
+        router.retry_config = fast_retry_config(1);
+        let heard = hearing_engine_on(&router.policy_registry);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: DecisionsRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "The sky is blue.",
+            "questions": [{"type": "predicate", "instructions": "Is the sky blue?"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_decisions(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_refused_over_the_limit(&response);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 502"]
+        );
+    }
+
     /// Each attempt is a request of the engine's own: a first attempt its
     /// worker refused and a second one served are two leases, each with the
     /// end of its own answer.
@@ -8073,6 +8164,30 @@ mod tests {
         assert_eq!(
             heard_after(&heard, 3).await,
             ["issued", "dispatched Single", "completed Ok 200"]
+        );
+    }
+
+    /// The pass-through tells a body over the limit as the typed route
+    /// does: the worker answered, and the engine hears the server's error.
+    #[tokio::test]
+    async fn the_engine_hears_a_passed_through_body_over_the_limit_as_the_servers_error() {
+        let url = spawn_long_answer("/generate").await;
+        let router = streaming_router(
+            PolicyConfig::RoundRobin,
+            REFUSED_OVER,
+            vec![plain_worker(&url)],
+        );
+        let heard = hearing_engine_on(&router.policy_registry);
+
+        let response = router
+            .route_streaming_request(streamed_request(&[b"{}"]), "/generate", false)
+            .await
+            .unwrap();
+
+        assert_refused_over_the_limit(&response);
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 502"]
         );
     }
 

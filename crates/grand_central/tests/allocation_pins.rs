@@ -6,9 +6,8 @@
 //! (design 4.4: a scorer or picker allocates nothing per decision; the host
 //! keeps one scratch per thread so the framework allocates nothing after the
 //! first). The
-//! store's pins stand beside them: two membership writes are held to each
-//! other, a write that moves an offer to one that moves none and a
-//! registration into 512 workers to one into 8. A lease's life at the store
+//! store's pin stands beside them: a registration into 512 workers is held
+//! to one into 8. A lease's life at the store
 //! allocates nothing once its file is sized: its record filed, its
 //! dispatch and its completion handed to the file,
 //! and the sweep's pass. A host in process is pinned
@@ -27,9 +26,8 @@ use common::counting_alloc::{calls, Counting};
 use smg_grand_central::{
     document::{PolicySpec, PRESETS},
     engine::{
-        AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, Health,
-        LoadRow, PairPools, PoolFacts, RequestFacts, Role, Scratch, SignalSource, Target,
-        WireModes, WorkerId,
+        AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, LoadRow,
+        PairPools, PoolFacts, RequestFacts, Scratch, SignalSource, Target, WorkerId,
     },
     stages::Lifecycle,
     store::{
@@ -53,25 +51,24 @@ fn allocations_during<T>(work: impl FnOnce() -> T) -> (T, usize) {
 /// reads its pool between two reports.
 fn fleet(n: u32) -> Vec<Candidate> {
     (0..n)
-        .map(|i| Candidate {
-            position: i,
-            id: WorkerId(1_000 + u64::from(i)),
-            health: Health {
-                healthy: i % 6 != 5,
-                ..Health::default()
-            },
-            in_flight: i % 7,
-            load: Some(LoadRow {
-                running: i % 5,
-                queued: i % 3,
-                kv_usage_permille: (i * 37 % 900) as u16,
-                live_rate: 1_000 + i * 13 % 3_000,
-                report_age_ms: 5,
-                source: SignalSource::Events,
-                ..LoadRow::default()
-            }),
-            load_sampled_at_micros: 990_000 + u64::from(i % 9) * 1_000,
-            ..Candidate::default()
+        .map(|i| {
+            let mut row = Candidate::default();
+            row.position = i;
+            row.id = WorkerId(1_000 + u64::from(i));
+            row.health.healthy = i % 6 != 5;
+            row.in_flight = i % 7;
+            row.load = Some({
+                let mut load = LoadRow::default();
+                load.running = i % 5;
+                load.queued = i % 3;
+                load.kv_usage_permille = (i * 37 % 900) as u16;
+                load.live_rate = 1_000 + i * 13 % 3_000;
+                load.report_age_ms = 5;
+                load.source = SignalSource::Events;
+                load
+            });
+            row.load_sampled_at_micros = 990_000 + u64::from(i % 9) * 1_000;
+            row
         })
         .collect()
 }
@@ -84,21 +81,19 @@ fn engine_of(preset: &str) -> Engine {
 }
 
 fn facts(seed: u64) -> RequestFacts<'static> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 512,
-        seed,
-        now_micros: 1_000_000,
-        ..RequestFacts::default()
-    }
+    let mut facts = RequestFacts::default();
+    facts.model = "m";
+    facts.prompt_tokens = 512;
+    facts.seed = seed;
+    facts.now_micros = 1_000_000;
+    facts
 }
 
 fn pool(n: u32) -> PoolFacts<'static> {
-    PoolFacts {
-        pool_size: n,
-        generation: 1,
-        ..PoolFacts::default()
-    }
+    let mut pool = PoolFacts::default();
+    pool.pool_size = n;
+    pool.generation = 1;
+    pool
 }
 
 #[test]
@@ -139,18 +134,15 @@ fn a_least_cost_decision_after_the_first_allocates_nothing() {
         }
     }
     // Every row holds a send later than its report.
-    let lease = Lease {
-        issued_micros: 1_000_000,
-        tokens: 512,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = 1_000_000;
+    lease.tokens = 512;
     for row in &view {
-        let target = Target {
-            position: row.position,
-            id: row.id,
-            dp_rank: row.dp_rank,
-            pair: None,
-        };
+        let mut target = Target::default();
+        target.position = row.position;
+        target.id = row.id;
+        target.dp_rank = row.dp_rank;
+        target.pair = None;
         engine.on_dispatched(&lease, &target, Side::Single, 0);
     }
     let cx = Constraints::default();
@@ -188,18 +180,15 @@ fn a_decision_under_a_has_room_rule_allocates_nothing_after_the_first() {
             }
         }
         // Every row holds a send later than its report.
-        let lease = Lease {
-            issued_micros: 1_000_000,
-            tokens: 512,
-            ..Lease::default()
-        };
+        let mut lease = Lease::default();
+        lease.issued_micros = 1_000_000;
+        lease.tokens = 512;
         for row in &view {
-            let target = Target {
-                position: row.position,
-                id: row.id,
-                dp_rank: row.dp_rank,
-                pair: None,
-            };
+            let mut target = Target::default();
+            target.position = row.position;
+            target.id = row.id;
+            target.dp_rank = row.dp_rank;
+            target.pair = None;
             engine.on_dispatched(&lease, &target, Side::Single, 0);
         }
         let cx = Constraints::default();
@@ -263,49 +252,52 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
         let fastest = [n - 8, n - 16, n - 24, n - 32];
         let column = |blocks: u32| -> Vec<AffinityFacts> {
             (0..n)
-                .map(|i| AffinityFacts {
-                    overlap_blocks: if i % 8 == 0 { blocks } else { 0 },
-                    ..AffinityFacts::default()
+                .map(|i| {
+                    let mut affinity = AffinityFacts::default();
+                    affinity.overlap_blocks = if i % 8 == 0 { blocks } else { 0 };
+                    affinity
                 })
                 .collect()
         };
         let (cold, held) = (column(0), column(4));
-        let names = [AffinityHolder {
-            row: 0,
-            overlap_blocks: 4,
-            predicted_blocks: 0,
-        }];
+        let mut holder = AffinityHolder::default();
+        holder.row = 0;
+        holder.overlap_blocks = 4;
+        holder.predicted_blocks = 0;
+        let names = [holder];
         // Each first, and whether the host says the pool's fact of it.
         let firsts = [
             (
-                RequestFacts {
-                    affinity: &cold,
-                    ..facts(1)
+                {
+                    let mut request_facts = facts(1);
+                    request_facts.affinity = &cold;
+                    request_facts
                 },
                 true,
             ),
             (
-                RequestFacts {
-                    named: Some(AffinityRows {
-                        holders: &names,
-                        ..AffinityRows::default()
-                    }),
-                    ..facts(1)
+                {
+                    let mut request_facts = facts(1);
+                    request_facts.named = Some({
+                        let mut affinity_rows = AffinityRows::default();
+                        affinity_rows.holders = &names;
+                        affinity_rows
+                    });
+                    request_facts
                 },
                 true,
             ),
             (
-                RequestFacts {
-                    affinity: &cold,
-                    ..facts(1)
+                {
+                    let mut request_facts = facts(1);
+                    request_facts.affinity = &cold;
+                    request_facts
                 },
                 false,
             ),
         ];
-        let said = PoolFacts {
-            reported: true,
-            ..pool(n)
-        };
+        let mut said = pool(n);
+        said.reported = true;
         let unsaid = pool(n);
         let cx = Constraints::default();
         for (order, (first, reported)) in firsts.iter().enumerate() {
@@ -315,10 +307,8 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
                 .decide(first, of_first, &view, &cx, &mut scratch)
                 .pick()
                 .expect("the fleet routes");
-            let second = RequestFacts {
-                affinity: &held,
-                ..facts(2)
-            };
+            let mut second = facts(2);
+            second.affinity = &held;
             let (decision, allocations) =
                 allocations_during(|| engine.decide(&second, &said, &view, &cx, &mut scratch));
             let pick = decision.pick().expect("the fleet routes");
@@ -353,14 +343,10 @@ fn a_decision_after_a_soft_filter_fallback_allocates_nothing() {
         .filter(|c| c.health.healthy)
         .map(|c| c.id)
         .collect();
-    let first = RequestFacts {
-        tried: &tried,
-        ..facts(1)
-    };
-    let next = RequestFacts {
-        tried: &tried,
-        ..facts(2)
-    };
+    let mut first = facts(1);
+    first.tried = &tried;
+    let mut next = facts(2);
+    next.tried = &tried;
     let cx = Constraints::default();
     let mut scratch = Scratch::new();
     engine
@@ -409,10 +395,8 @@ fn a_round_robin_decision_over_a_changing_survivor_set_allocates_nothing() {
         let mut scratch = Scratch::new();
         let mut churn = |seed: u64| {
             let tried = [view[(seed % u64::from(n)) as usize].id];
-            let f = RequestFacts {
-                tried: &tried,
-                ..facts(seed)
-            };
+            let mut f = facts(seed);
+            f.tried = &tried;
             engine
                 .decide(&f, &pool(n), &view, &cx, &mut scratch)
                 .pick()
@@ -472,18 +456,15 @@ fn the_pass_behind_a_draw_that_keeps_nobody_allocates_nothing() {
 fn a_decision_over_credited_rows_allocates_nothing() {
     let engine = engine_of("least_load");
     let view = fleet(512);
-    let lease = Lease {
-        issued_micros: 1_000_000,
-        tokens: 512,
-        ..Lease::default()
-    };
+    let mut lease = Lease::default();
+    lease.issued_micros = 1_000_000;
+    lease.tokens = 512;
     for c in &view {
-        let target = Target {
-            position: c.position,
-            id: c.id,
-            dp_rank: c.dp_rank,
-            pair: None,
-        };
+        let mut target = Target::default();
+        target.position = c.position;
+        target.id = c.id;
+        target.dp_rank = c.dp_rank;
+        target.pair = None;
         engine.on_dispatched(&lease, &target, Side::Single, 0);
     }
     let cx = Constraints::default();
@@ -519,12 +500,10 @@ fn a_pair_decision_under_a_table_allocates_nothing_after_the_first() {
     let cx = Constraints::default();
     let mut scratch = Scratch::new();
     let mut decide = |decodes: &[Candidate], seed: u64| {
-        let pools = PairPools {
-            prefills: &prefills,
-            decodes,
-            table: smg_grand_central::engine::PairTable::new(&ends, &classes),
-            ..PairPools::default()
-        };
+        let mut pools = PairPools::default();
+        pools.prefills = &prefills;
+        pools.decodes = decodes;
+        pools.table = smg_grand_central::engine::PairTable::new(&ends, &classes);
         allocations_during(|| {
             engine.decide_pair(&facts(seed), &pool(80), pools, &cx, &cx, &mut scratch)
         })
@@ -562,11 +541,9 @@ fn a_pair_decision_after_the_first_allocates_nothing() {
     }
     let cx = Constraints::default();
     let mut scratch = Scratch::new();
-    let pools = PairPools {
-        prefills: &prefills,
-        decodes: &decodes,
-        ..PairPools::default()
-    };
+    let mut pools = PairPools::default();
+    pools.prefills = &prefills;
+    pools.decodes = &decodes;
     engine
         .decide_pair(&facts(1), &pool(80), pools, &cx, &cx, &mut scratch)
         .pick()
@@ -635,9 +612,10 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
             // An id of the host's own minting: the high bit.
             let lease = LeaseId(1 << 63 | u64::from(request));
             let filed = store.issue(LeaseRecord {
-                lease: Lease {
-                    id: lease,
-                    ..Lease::default()
+                lease: {
+                    let mut held_lease = Lease::default();
+                    held_lease.id = lease;
+                    held_lease
                 },
                 gateway,
                 request: u64::from(request),
@@ -651,11 +629,10 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
                 state: LeaseState::ISSUED,
             });
             assert_eq!(filed, Ok(()), "the store files the lease");
-            let dispatch = Dispatch {
-                target_index: 0,
-                side: Side::Single,
-                since_decision_micros: 100,
-            };
+            let mut dispatch = Dispatch::default();
+            dispatch.target_index = 0;
+            dispatch.side = Side::Single;
+            dispatch.since_decision_micros = 100;
             store.hand(&hand, lease, Said::Dispatched(dispatch, now));
             let outcome =
                 Outcome::reported(200, TransportClass::Ok).with_served(Side::Single, worker);
@@ -680,65 +657,12 @@ fn a_lease_filed_dispatched_and_completed_at_the_store_allocates_nothing() {
 }
 
 #[test]
-fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
-    // Pairs that name no runtime. One prefill names its runtime and unnames
-    // it in turn, which moves its offer at every write and no class: the
-    // writer derives for that worker alone from what it keeps, and hands
-    // back the classes it had.
-    for n in [8_usize, 64] {
-        let store = MemoryStore::new();
-        let facts_of = |index: usize, runtime: &str| {
-            let (role, key) = if index < n {
-                (Role::Prefill, format!("grpc://p{index}:9000"))
-            } else {
-                (Role::Decode, format!("grpc://d{index}:9000"))
-            };
-            WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                role,
-                wire_modes: WireModes::GRPC,
-                engine_kind: runtime.to_string(),
-                models: vec!["m".to_string()],
-                dp_size: 1,
-                ..WorkerFacts::default()
-            }
-        };
-        for index in 0..2 * n {
-            store.upsert(facts_of(index, ""));
-            store.publish_now();
-        }
-        // The fewest allocation calls of one write and the build it owes
-        // among a few: the store's change log grows by doubling, and one
-        // write in many pays for it.
-        let fewest = |runtimes: [&str; 2]| {
-            let one = |turn: usize| {
-                let facts = facts_of(n / 2, runtimes[turn % 2]);
-                allocations_during(|| {
-                    store.upsert(facts);
-                    store.publish_now();
-                })
-                .1
-            };
-            (0..8).map(one).min()
-        };
-        // The first writes size what the writer keeps of the derivation.
-        fewest(["rt-b", ""]);
-        let (kept, moved) = (fewest(["", ""]), fewest(["rt-b", ""]));
-        assert_eq!(
-            moved, kept,
-            "{n} a side: the written worker's derive allocated"
-        );
-    }
-}
-
-#[test]
 fn a_registrations_allocations_do_not_follow_the_fleet() {
-    // A membership write walks every member into its pool's list. A
-    // standing pool's list starts at the pool's last length and one more,
-    // so what a registration allocates does not follow the fleet: one into
-    // 512 workers makes the allocator calls of one into 8.
+    // A membership write walks every member once. Where no veto stands,
+    // each list that walk fills takes the members' count at once or is
+    // kept from the last build, so what a registration allocates does not
+    // follow the fleet: one into 512 workers makes the allocator calls of
+    // one into 8.
     let fewest = |n: usize| {
         let (store, _) = store_of(n);
         // The fewest allocation calls of one registration and the build it

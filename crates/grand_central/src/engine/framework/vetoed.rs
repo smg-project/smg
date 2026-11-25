@@ -51,7 +51,7 @@ use super::{
 };
 use crate::{
     engine::{
-        decision::{Decision, LiftedVeto, Pick, Survivors, Targets, Trace},
+        decision::{Decision, LiftedVeto, Pick, Placing, Survivors, Targets, Trace},
         sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Health, PoolFacts, RequestFacts, Role},
     },
@@ -78,8 +78,8 @@ pub(super) enum AllVetoed {
     /// No rule is asked: a pool a veto empties is shed at the stage that
     /// emptied it. A set's word, never a binding's. The rule's own passes
     /// carry it ([`Set::shedding`]), and so does a pass of a pair that says
-    /// no binding's word ([`Set::side`]): a prefill side's, one that only
-    /// names a shed's stage, a shadow's run, an encode item's.
+    /// no binding's word ([`Set::side`]): a prefill side's and its shadow's,
+    /// one that only names a shed's stage, an encode item's.
     Unasked,
 }
 
@@ -548,25 +548,86 @@ fn lifted_cx<'a>(cx: &Constraints<'a>, steers: bool, doubt: bool) -> Constraints
 }
 
 /// The rows as they read with no doubt, into `rows`: each row of
-/// `candidates` with its stalled bit cleared where its breaker bit is
-/// clear, in the same order, so a stage handed a row reads the lift
-/// whatever it reads of the row. A row that carries both bits is one a hold
-/// of the host stands on, where the host wrote its rows. It keeps both, as
-/// a held row stays in the mask beside lent rows. The pass that lifts the
-/// liveness veto is shown these where a row's own bit is set. Rows the
-/// host's mask alone doubts are read as they are, with the mask cut to the
-/// rows a hold stands on. A stage that answers from its own scope answers
-/// as it did: the scope was opened over the decision's rows. One pool of
-/// rows a scratch, sized at the first pass that needs it.
+/// `candidates` with no doubt on it ([`with_no_doubt`]), in the same
+/// order, so a stage handed a row reads the lift whatever it reads of the
+/// row. The pass that lifts the liveness veto is shown these where a row's
+/// own bit is set. Rows the host's mask alone doubts are read as they are,
+/// with the mask cut to the rows a hold stands on. A stage that answers
+/// from its own scope answers as it did: the scope was opened over the
+/// decision's rows. One pool of rows a scratch, sized at the first pass
+/// that needs it.
 fn undoubted(candidates: &[Candidate], rows: &mut Vec<Candidate>) {
     rows.clear();
-    rows.extend(candidates.iter().map(|row| Candidate {
+    rows.extend(candidates.iter().map(with_no_doubt));
+}
+
+/// A row as it reads with no doubt: its stalled bit cleared where its
+/// breaker bit is clear. A row that carries both bits is one a hold of the
+/// host stands on, where the host wrote its rows. It keeps both, as a held
+/// row stays in the mask beside lent rows.
+fn with_no_doubt(row: &Candidate) -> Candidate {
+    Candidate {
         health: Health {
             stalled: row.health.stalled && row.health.breaker_open,
             ..row.health
         },
         ..*row
-    }));
+    }
+}
+
+/// Whether the gateway's own pair selection would read `rows` as wholly
+/// over their thresholds: one of them is ready and over them, and none
+/// that is ready is under them (`all_overloaded`,
+/// `model_gateway/src/routers/common/overload.rs:58-74`, on main
+/// `56773d28d`). A pair's decision says the list it shed over by this
+/// count ([`Engine::decide_pair`]).
+///
+/// That selection counts a worker under a liveness doubt as ready. So a
+/// row is ready here as the pass that lifts the liveness veto reads it
+/// ([`doubted`]): by the health stage's own test of the row with no doubt
+/// on it ([`with_no_doubt`]), under that pass's constraints
+/// ([`lifted_cx`]), in which a hold of the host stays. A row is over its
+/// thresholds by the overload veto's own test, under the decision's
+/// constraints. Each test is its stage's, so the count and the stages
+/// cannot part.
+///
+/// A row under a doubt and under its thresholds keeps its list from being
+/// wholly over them, though the passes of the decision that shed kept no
+/// such row. Under a veto its host lifted no row is over its thresholds,
+/// and no list is wholly over them.
+///
+/// Cold and out of line: asked behind a pair's saturated shed alone.
+#[cold]
+#[inline(never)]
+pub(super) fn wholly_over<'a>(
+    rows: impl Iterator<Item = &'a Candidate>,
+    facts: &RequestFacts<'_>,
+    cx: &Constraints<'_>,
+) -> bool {
+    let lifted = lifted_cx(cx, false, true);
+    let mut over = false;
+    for row in rows {
+        if !Healthy.keep(facts, &with_no_doubt(row), &lifted) {
+            continue;
+        }
+        if NotOverloaded.keep(facts, row, cx) {
+            return false;
+        }
+        over = true;
+    }
+    over
+}
+
+/// Whether `row`, a prefill, has a decode to pair with anywhere in
+/// `decodes`, in whatever state and at whatever place. The gateway's list
+/// of the prefills that pair is the pool's own and no request's: it holds
+/// no prefill that pairs with no decode
+/// (`model_gateway/src/routers/common/pair_index.rs:158-161`, on main
+/// `56773d28d`).
+pub(super) fn pairs_in(row: &Candidate, table: &PairTable<'_>, decodes: &[Candidate]) -> bool {
+    let classes = table.of(&row.pair_class);
+    let mut decodes = decodes.iter();
+    decodes.any(|partner| classed(classes, partner.pair_class))
 }
 
 /// Whether the liveness veto alone refuses a row of these bits: the row
@@ -785,11 +846,7 @@ pub(super) fn paired(
     // The pools as the gateway judges them: the prefills at the places that
     // have a decode to pair with, in whatever state and at whatever place,
     // and every decode at the places.
-    let pairs = |row: &&Candidate| {
-        let classes = table.of(&row.pair_class);
-        let mut decodes = decode.rows.iter();
-        decodes.any(|partner| classed(classes, partner.pair_class))
-    };
+    let pairs = |row: &&Candidate| pairs_in(row, table, decode.rows);
     let mut prefills = prefill.places().filter(pairs);
     let stands = |side: &Half<'_>, row: &Candidate| side.stands(row, side.cx);
     if partnered.any(|row| prefill.stands(row, &lift))
@@ -845,7 +902,8 @@ pub(super) fn paired(
             .retain(|&at| classed(classes, decode.rows[at as usize].pair_class));
         let mut pair = steered(decode.index, decode.facts, pool, decode.rows, buf);
         if let Decision::Pick(pick) = &mut pair {
-            pick.targets.pair_under(&first, SessionVerdict::None);
+            pick.targets
+                .pair_under(&first, SessionVerdict::None, Placing::Stages);
             pick.trace = taken.trace;
         }
         return Some(pair);
@@ -1496,7 +1554,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -1642,7 +1699,6 @@ mod tests {
                 shadow: Some(3),
                 decode_shadow: Some(2),
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -2120,10 +2176,54 @@ mod tests {
             let scratch = &mut Scratch::new();
             let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
             assert_eq!(pair_of(&again), (1, first));
-            let live = again.pick().expect("a decode");
-            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, live, &cx, scratch);
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
             assert_eq!(later.map(|shadow| order(&shadow)[0]), Some(first));
         }
+    }
+
+    /// The shadow of a decode asked again reads the partners its call read
+    /// by the word that call left in the scratch, never by its pick. Where
+    /// every partner is doubted the call reads them all, and the rule's
+    /// liveness tier draws among equals: a draw that lands on a first
+    /// partner says nothing of the partners read. A twin of the live
+    /// profile names the live decode under every seed, behind a pair's
+    /// first decision that was made among first partners and left its own
+    /// word in the same scratch.
+    #[test]
+    fn a_later_decode_shadow_reads_every_partner_its_call_read_past_a_doubt() {
+        let engine = pair_engine(false);
+        let prefills = [classed(free(0, 0), 2), classed(free(1, 0), 1)];
+        let open = [classed(free(0, 0), 2), classed(free(1, 0), 1)];
+        // Two first partners of the held prefill and one partner that is
+        // none, equally loaded and all doubted.
+        let decodes = [
+            classed(doubted(0, 0), 1),
+            classed(doubted(1, 0), 1),
+            classed(doubted(2, 0), 2),
+        ];
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let held = prefills[1].id;
+        let mut among_first = 0;
+        for seed in 0..16 {
+            let (req, scratch) = (facts(seed), &mut Scratch::new());
+            let first_pair = first_pools(&prefills, &open);
+            let first = engine.decide_pair(&req, &pool, first_pair, &cx, &cx, scratch);
+            assert_eq!(pair_of(&first), (1, 1), "seed {seed}");
+            let pools = first_pools(&prefills, &decodes);
+            let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
+            assert_eq!(again.trace().lifted, LiftedVeto::Liveness, "seed {seed}");
+            let live = pair_of(&again).1;
+            among_first += u32::from(live != 2);
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
+            assert_eq!(
+                later.map(|shadow| order(&shadow)[0]),
+                Some(live),
+                "seed {seed}"
+            );
+        }
+        // The draws landed on a first partner, and on the partner that is
+        // none: the call read every partner.
+        assert!((1..16).contains(&among_first), "{among_first} of 16");
     }
 
     /// The pools of a first list that is no partner list of the table: the
@@ -2515,7 +2615,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -2928,13 +3027,16 @@ mod tests {
         }
     }
 
-    /// A pair the rule placed gets no decode shadow, at its first decision
-    /// and where its decode is asked again, under either lift: a shadow's
-    /// run says no binding's word, and a twin would shed the partners its
-    /// live side was steered among. Beside a pair no rule placed the twin
-    /// names the live decode.
+    /// A pair's decode shadow is put to its binding's rule as its live side
+    /// is, at the pair's first decision and where the decode is asked
+    /// again. Beside a decode the rule steered among partners over their
+    /// thresholds, the twin names that decode and the veto the rule lifted
+    /// for it. Where the decode is asked again past a doubt, the twin
+    /// follows it there too. A first decision's pair past a doubt is the
+    /// default's, and no shadow is said beside it. Beside a pair no rule
+    /// placed the twin names the live decode, and no veto.
     #[test]
-    fn a_pair_the_rule_placed_gets_no_decode_shadow() {
+    fn a_pairs_decode_shadow_is_put_to_its_bindings_rule() {
         let (engine, prefills) = (pair_engine(false), [classed(free(0, 0), 1)]);
         let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
         let shadows = |made: [fn(u32, u32) -> Candidate; 2]| {
@@ -2945,30 +3047,77 @@ mod tests {
                 ..PairPools::default()
             };
             let (held, side, scratch) = (prefills[0].id, PairSide::Decode, &mut Scratch::new());
+            // What a twin said beside `live`: its first decode and the veto
+            // its trace names. A twin that speaks names the live decode.
+            let beside = |live: &Decision, twin: Option<Decision>| {
+                twin.map(|twin| {
+                    assert_eq!(order(&twin)[0], pair_of(live).1);
+                    (order(&twin)[0], twin.trace().lifted)
+                })
+            };
             let first = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
-            // A first decision's pair past a doubt is the default's, and no
-            // shadow is said beside it either.
-            let twin = first.pick().map(|live| {
-                let said = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, live, scratch);
-                said.map(|shadow| order(&shadow)[0])
-            });
+            let pick = first.pick().expect("a pair");
+            let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch);
+            let twin = beside(&first, twin);
             let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
-            let live = again.pick().expect("a decode");
-            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, live, &cx, scratch);
-            let later = later.map(|shadow| order(&shadow)[0]);
-            (twin, later, live.trace.lifted == LiftedVeto::Liveness)
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
+            (twin, beside(&again, later))
         };
-        assert_eq!(shadows([free, over]), (Some(Some(0)), Some(0), false));
-        assert_eq!(shadows([over, over]), (Some(None), None, false));
-        assert_eq!(shadows([doubted, doubted]), (Some(None), None, true));
+        let none = Some((0, LiftedVeto::None));
+        assert_eq!(shadows([free, over]), (none, none));
+        let steered = Some((1, LiftedVeto::Overload));
+        assert_eq!(shadows([over, over]), (steered, steered));
+        // Past a doubt the first pair is the default's: its twin is silent.
+        let doubt = Some((1, LiftedVeto::Liveness));
+        assert_eq!(shadows([doubted, doubted]), (None, doubt));
+    }
+
+    /// The binding's word stands for a decode's shadow as for its live
+    /// side. A live decode side that reads no overload veto takes a busy
+    /// partner by its own stages. Its twin reads the veto, which leaves
+    /// the live prefill's partners nobody. Under a binding that steers
+    /// the rule takes the partner with the fewest requests for the twin,
+    /// and under one that sheds the twin is shed as saturated: at the
+    /// pair's first decision and where the decode is asked again.
+    #[test]
+    fn a_pairs_decode_shadow_reads_its_bindings_word() {
+        let prefills = [classed(free(0, 0), 1)];
+        let decodes = [over(0, 2), over(1, 1)].map(|worker| classed(worker, 1));
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+        let said = |shed: bool| {
+            let healthy: Vec<Box<dyn Filter>> = vec![Box::new(Healthy)];
+            let engine = pair_engine_of(shed, [vetoes(), healthy]);
+            let (held, side, scratch) = (prefills[0].id, PairSide::Decode, &mut Scratch::new());
+            let first = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
+            let live = first.pick().expect("a pair");
+            assert_eq!(live.trace.lifted, LiftedVeto::None);
+            let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, live, scratch);
+            let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
+            assert!(again.pick().is_some(), "a decode: {again:?}");
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, None, &cx, scratch);
+            [twin, later].map(|shadow| shadow.expect("the decode's shadow"))
+        };
+        for steered in said(false) {
+            let taken = (order(&steered)[0], steered.trace().lifted);
+            assert_eq!(taken, (1, LiftedVeto::Overload));
+        }
+        for shed in said(true) {
+            assert_eq!(shed_of(&shed), (ShedReason::Saturated, "not-overloaded"));
+        }
     }
 
     /// A pair the default made gets no shadow on either side: a twin
     /// decides by its profile where the live side was taken by load, and
     /// its stages shed a pool the vetoes refuse.
-    /// Beside a pair whose decode side alone the rule steered, the prefill's
-    /// shadow speaks: its live side was put to no rule. One scratch serves
-    /// both pairs, the default's first.
+    /// Beside a pair whose decode side alone the rule steered, both shadows
+    /// speak: the prefill's live side was put to no rule, and the decode's
+    /// shadow is put to its live side's. One scratch serves both pairs, the
+    /// default's first.
     #[test]
     fn a_pair_the_default_made_gets_no_shadow() {
         let (engine, scratch) = (pair_engine(false), &mut Scratch::new());
@@ -2992,7 +3141,7 @@ mod tests {
         // The default's pair: every prefill is over its thresholds.
         assert_eq!(said(over(0, 1), free(0, 0)), [None, None]);
         // The rule's pair: every decode is over, and the prefill side open.
-        assert_eq!(said(free(0, 0), over(0, 1)), [Some(0), None]);
+        assert_eq!(said(free(0, 0), over(0, 1)), [Some(0), Some(0)]);
     }
 
     /// An engine of one profile: `veto` and a filter that refuses every row,
@@ -3032,7 +3181,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -3329,7 +3477,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -3456,7 +3603,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -3732,7 +3878,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: None,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -3925,7 +4070,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: rule,
-                overload: None,
             }],
             1,
             Needs::default(),
@@ -4477,7 +4621,6 @@ mod tests {
                 shadow: None,
                 decode_shadow: None,
                 sessions: Some(rule),
-                overload: None,
             }],
             1,
             Needs::default(),

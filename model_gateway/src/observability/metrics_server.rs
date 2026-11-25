@@ -19,14 +19,14 @@ struct MetricsState {
     /// Grand Central, where the gateway started one, and what the
     /// scrapes so far published of its shadow counts. A scrape reads the
     /// engine's fault counts too, and keeps nothing of them.
-    shadows: Option<(&'static InProcess, Arc<ShadowsPublished>)>,
+    engine: Option<(&'static InProcess, Arc<ShadowsPublished>)>,
 }
 
 async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoResponse {
     super::metrics::record_tokenizer_cache_activity();
     super::metrics::record_detokenize_activity();
     super::metrics::record_tokenizer_encode_activity();
-    if let Some((engine, published)) = &state.shadows {
+    if let Some((engine, published)) = &state.engine {
         super::metrics::record_policy_shadow_activity(engine, published);
         super::metrics::record_policy_fault_activity(engine);
     }
@@ -89,7 +89,7 @@ pub async fn start_metrics_server(
 
     let prom_state = MetricsState {
         handle,
-        shadows: engine.map(|engine| (engine, Arc::default())),
+        engine: engine.map(|engine| (engine, Arc::default())),
     };
 
     let app = Router::new().route("/metrics", get(prometheus_handler).with_state(prom_state));

@@ -38,10 +38,13 @@
       }
     },
     "profiles": {
-      "description": "The profiles by name.",
+      "description": "The profiles by name, each of at least one character.",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/ProfileSpec"
+      },
+      "propertyNames": {
+        "minLength": 1
       }
     },
     "plans": {
@@ -733,7 +736,7 @@
           "const": "predictor"
         },
         {
-          "description": "Each worker by what it has: its cache events where it publishes\nthem, and the prefixes sent to it where it does not.",
+          "description": "Each worker by what it has: its cache events where it publishes\nthem, and the prefixes sent to it where it does not. A request\nhashed by its text reads the prefixes sent to every worker: cache\nevents are token blocks.",
           "type": "string",
           "const": "merged"
         }
@@ -1582,7 +1585,7 @@
       ]
     },
     "OverloadSpec": {
-      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. A gateway that runs a supplied document in its own\nprocess reads the switch where it builds its workers' default\nthresholds, and its routes read one shed word, both from that document:\nit refuses one whose bindings differ on either word. With no document\nsupplied it reads its own two settings. A controller that judges on its\nworker objects does not read the switch yet.",
+      "description": "What a binding says of the overload veto on the workers of the pools\ndecided under it, as its `overload` field: whether the default\nthresholds veto at all, and what a decision does where every worker is\nvetoed. The veto is evaluated per load report by the host and latched,\nnever per request. The block names no threshold: a worker's\nregistration states its own two, over its program's default where the\nprogram has one. A gateway that runs a supplied document in its own\nprocess reads the switch where it builds its workers' default\nthresholds, and its routes read one shed word, both from that document:\nit refuses one whose bindings differ on either word. With no document\nsupplied it reads its own two settings. A controller that judges on its\nworker objects reads the switch there too, at each document that takes\nforce: its default is off where every binding switches it off. It\nrefuses a document whose bindings differ on the switch, as a gateway\ndoes.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1659,7 +1662,7 @@
           "type": "boolean"
         },
         "target": {
-          "description": "A source that names the one worker the request goes to, and hands\nno key. The header's value is a number that counts, from 0 and in\nthe order of the request's list of workers, the workers that can\ntake the request when it arrives: so a number names another worker\nwhile one ahead of it is down. A request that carries it goes to\nthat worker and to no other. Where the value is no number, or\nfewer workers can take the request, it is shed under\n`target-worker`. Where no worker at all can take it, it is placed\nas a request that names none and carries no key. A header that is\nabsent, empty or not text names no worker. One entry a block,\nbeside the eight and never without one of them: a header alone,\nso `rid`, `max_bytes` and `client` are refused beside it. It is\nread for a request a program places in process: a single request,\nand a pair under the `pd-pair` plan, on each side whose profile\nscores by `consistent-hash` with no `prefix_tokens`, where its\nprefill side is one. A pair's prefill is counted among the prefills\nthat have a decode to pair with, and its decode among that\nprefill's partners. A pair whose prefill side is no such profile\nand a request under the `epd` plan are not read for it. Default\nfalse.",
+          "description": "A source that names the one worker the request goes to, and hands\nno key. The header's value is a number that counts, from 0 and in\nthe order of the request's list of workers, the workers that can\ntake the request when it arrives: so a number names another worker\nwhile one ahead of it is down. A request that carries it goes to\nthat worker and to no other. Where the value is no number, or\nfewer workers can take the request, it is shed under\n`target-worker`. Where no worker at all can take it, it is placed\nas a request that names none and carries no key. A header that is\nabsent, empty or not text names no worker. One entry a block,\nbeside the eight and never without one of them: a header alone,\nso `rid`, `max_bytes` and `client` are refused beside it. It is\nread for a request a program places in process: a single request,\nand a pair under the `pd-pair` plan, on each side whose profile\nscores by `consistent-hash` with no `prefix_tokens`. A pair's\nprefill is counted among the prefills that have a decode to pair\nwith. Its decode is counted among the partners of its prefill: the\none the request names, or the one the prefill's own profile picks.\nA request under the `epd` plan is not read for it. Default false.",
           "type": "boolean"
         }
       },
@@ -1718,7 +1721,7 @@
           "default": "original"
         },
         "rule_placed": {
-          "description": "Whether a single request this rule placed alone is the profile's\nown (default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent token tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. A pair's sides are\ntold under either word. A controller keeps the word on the lease it\nfiles, and tells such a request off its file by it all the same.",
+          "description": "Whether a request this rule placed alone is the profile's own\n(default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. Under the `pd-pair`\nplan each side of a pair follows the word on its own: a side the\nrule placed alone is kept from that side's profile, beside a side\nthe stages placed, which is told. A controller keeps the word on\nthe lease it files for a single request, and tells such a request\noff its file by it all the same. Its file keeps no word of a pair's\nside: a controller takes `told` alone under the `pd-pair` plan.",
           "$ref": "#/$defs/RulePlaced"
         }
       },
@@ -1758,7 +1761,7 @@
       ]
     },
     "RulePlaced": {
-      "description": "Whether a single request a sessions rule placed alone is the profile's\nown: a pin of the request's key followed, or the rule's own assignment.\nNo stage of the profile placed such a request.",
+      "description": "Whether a request a sessions rule placed alone is the profile's own: a\npin of the request's key followed, or the rule's own assignment. No\nstage of the profile placed such a request. A single request is such a\nrequest, and so is a side of a pair, each side by its own decision.",
       "oneOf": [
         {
           "description": "The profile's own: its stages hear the request's issue and its\ndispatch, it counts among the profile's sends, and its prompt is\nrecorded as behind any pick.",

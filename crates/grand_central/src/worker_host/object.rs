@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use smg_worker::{
+    health::overload::OverloadThresholds,
     identity::{basic::Worker, builder::BasicWorkerBuilder},
     model_card::ModelCard,
     worker::{
@@ -121,6 +122,20 @@ pub(super) fn thresholds(overload: &Overload) -> OverloadUpdate {
 /// ([`Objects::with_overload_thresholds`](super::Objects::with_overload_thresholds)).
 pub(super) fn external(facts: &WorkerFacts) -> bool {
     facts.engine_kind.parse() == Ok(smg_worker::worker::RuntimeType::External)
+}
+
+/// Whether an object built from `facts` states a threshold of `defaults`:
+/// an engine's row that names none for a signal `defaults` state. The rows
+/// a host's overload switch changes
+/// ([`Objects::state_overload_switch`](super::Objects::state_overload_switch)).
+pub(super) fn takes_default(facts: &WorkerFacts, defaults: OverloadThresholds) -> bool {
+    let Overload {
+        kv_usage_permille,
+        waiting_requests,
+    } = facts.overload;
+    let waiting = waiting_requests.is_none() && defaults.waiting_requests.is_some();
+    let usage = kv_usage_permille.is_none() && defaults.token_usage.is_some();
+    !external(facts) && (waiting || usage)
 }
 
 /// The store's role for a worker object.
