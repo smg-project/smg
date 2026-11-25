@@ -143,10 +143,9 @@ pub struct WorkerFacts {
     pub labels: BTreeMap<String, String>,
     pub zone: Option<String>,
     /// What the worker offers a prefill-decode partner, when the handshake
-    /// learned any of it. The store derives the pair classes from it, with
-    /// the engine kind as the runtime, where a membership write moves a
-    /// member or an offer and where a generation moves the pairing mode
-    /// ([`pairing`](super::pairing)): a registration hands no class in. The
+    /// learned any of it. A worker host derives its pair classes from it,
+    /// with the engine kind as the runtime ([`pairing`](super::pairing)): a
+    /// registration hands no class in, and the store derives none. The
     /// door drops a blank value and reads a name past its blanks. Behind a
     /// shared pointer: a worker that reports none holds one word for it,
     /// and every copy of a row shares the one its worker reported.

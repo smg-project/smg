@@ -662,6 +662,25 @@ fn a_key_registered_again_as_the_worker_it_was_takes_its_pins() {
     assert_eq!(pins_held(&store), 0, "the old worker's pin");
 }
 
+/// The store derives no pair class: the rows of a prefill and a decode
+/// that pair read class `0` in its world.
+#[test]
+fn a_row_of_the_stores_world_reads_pair_class_zero() {
+    let store = MemoryStore::new();
+    let join = |key: &str, role| {
+        let mut member = facts(key, 1);
+        member.role = role;
+        store.upsert(member).id()
+    };
+    let prefill = join("http://p:8000", Role::Prefill);
+    let decode = join("http://d:8000", Role::Decode);
+    store.publish_now();
+    let world = store.snapshot();
+    for id in [prefill, decode] {
+        assert_eq!(world.first_row_of(id).map(|row| row.pair_class), Some(0));
+    }
+}
+
 /// Two registrations of one key rename its session pins in their order.
 /// The second lands where the first has let the workers lock go, and the
 /// pin names the last life: in place, and for a key that left.

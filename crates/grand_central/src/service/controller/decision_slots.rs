@@ -2864,6 +2864,29 @@ pub(crate) mod tests {
             .expect("it ended by itself");
     }
 
+    /// A served engine's session table hears the store's word of a worker
+    /// that leaves and of its return. The worker a key is pinned on is
+    /// removed through the store: the table lists it absent. Registered
+    /// again under its id, it is listed no more.
+    #[tokio::test]
+    async fn the_session_table_lists_a_worker_the_store_removed_until_it_returns() {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 1;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let absent = |bed: &Bed| {
+            bed.store
+                .deciding(|world| world.spec().engine().sessions().absent())
+        };
+        let pinned = picked(&bed.ask(keyed(1, 1_001)).await);
+        assert_eq!(absent(&bed), 0, "every worker stands");
+        let row = WorkersStore::get(&*bed.store, pinned).expect("the row");
+        let removed = WorkersStore::remove(&*bed.store, pinned, row.revision);
+        assert!(removed.is_some(), "the store took the worker out");
+        assert_eq!(absent(&bed), 1, "the worker its key is pinned on left");
+        assert_eq!(bed.store.upsert(row.facts).id(), pinned, "its id again");
+        assert_eq!(absent(&bed), 0, "back under its id");
+    }
+
     /// A decision waits in its stream's queue as it was made, with the
     /// lease issued for its pick and what is left of that lease's span: its
     /// frame is its stream's to build. A `Busy` is handed over as its

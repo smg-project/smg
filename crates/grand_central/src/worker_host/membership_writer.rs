@@ -791,9 +791,9 @@ pub(crate) fn refresh(
 ///
 /// Labels are no part of a row's offer, and a patch writes them under the
 /// row's guard. A descriptor is part of it. Where it moved, the row takes
-/// the write a registration takes in place, and the store derives the
-/// row's pair classes again there. That write has no guard of its own: the
-/// door's turn holds the row as the guard read it.
+/// the write a registration takes in place, and the pair classes are
+/// derived again from the membership that write leaves. That write has no
+/// guard of its own: the door's turn holds the row as the guard read it.
 fn refresh_stated(
     turn: &impl Turn,
     seen: RowRevision,

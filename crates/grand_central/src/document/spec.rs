@@ -5594,7 +5594,7 @@ fn index_matching<'a>(
 /// number says which generation a replica runs, the digest which document,
 /// and one load reads the pair.
 ///
-/// It also holds what a store derives under, beside the engine: the
+/// It also holds what pair classes are derived under, beside the engine: the
 /// document's pairing mode ([`AppliedSpec::pairing`]). It says when a host
 /// asks a pair's decode ([`AppliedSpec::decode_pick`]). And it says how deep
 /// a host hashes a request for it ([`AppliedSpec::block_hashes_read`]).
@@ -5940,7 +5940,7 @@ impl AppliedSpec {
         self.names_target
     }
 
-    /// The mode a store derives its pair classes under while this
+    /// The mode a model's pair classes are derived under while this
     /// generation stands: the document's `plans.pd-pair.pairing`.
     #[must_use]
     pub fn pairing(&self) -> Pairing {
