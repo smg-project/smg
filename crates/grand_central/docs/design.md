@@ -834,7 +834,7 @@ pub struct InProcess {
     applied: AtomicU64,   // the number of the document in force: an entry compares it with the number of
                           // the document its thread read last
     clock: DecisionClock, // one clock for every decision and every load report's age
-    leases: OwnWord,      // the last lease id handed out: one atomic counter
+    leases: OwnWord,      // the last lease id taken, by a pair or in a thread's run: one atomic counter
     sessions: Arc<SessionTable>, // the pins of every key a sessions rule placed: one table for the
                           // engine's life
     affinity: Affinity,   // cache affinity: the host's index of cache events, and the engine's own
@@ -1252,8 +1252,10 @@ What one decision writes:
 
 - the thread's own buffer;
 - on the short path under `round-robin`, one atomic add on the list's counter;
-- one atomic add for a pair's lease id, or for each 64 ids a thread gives single requests, where a
-  pick has a lease (section 6);
+- one atomic add for the lease id of a pair, an encode request's pair too, or for each run of 64
+  ids a thread takes for single requests, where a pick has a lease (section 6). A thread takes a
+  new run too where it issues a single request's lease under another document than its run was
+  taken under, and the ids left of its old run name no lease;
 - a session pin, where a sessions rule decides;
 - the sample's ring, for a decision that is kept (decision 7);
 - the record of sent prefixes, where a cache-affinity profile decides;
@@ -1619,8 +1621,9 @@ A host that calls the engine through this trait alone has more to do itself. Amo
 - turn a refusal into a status.
 
 That is too much. The gateway's earlier integration needed a module of its own of 19 files and
-13,856 lines (tests included) for it, and a branch in every route. For a single request and for a
-pair, `place` of section 8.2 now derives the key, hashes the prompt and tries the targets, and its
+13,856 lines (tests included) for it, and a branch in every route. For a single request, a pair
+and an encode request, `place` of section 8.2 now derives the key, hashes the prompt where a
+decision reads its hashes, and tries the targets, and its
 `Placement` keeps the lease. The host still says the two events and turns a refusal into a status.
 
 **A lent hash ring.** A host that keeps a hash ring of a model's workers can lend it with a
@@ -2465,7 +2468,7 @@ tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
-| the worker record | the store's table of records (`store/memory.rs`) | the load poller, until it reads the worker objects; a first copy, for the status the log told of each record |
+| the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: the one record behind a write the store refuses, every record where a cut is laid whole, a record's status where a leader's log tells it, a host's own follow, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and no frame states a demand yet. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
@@ -2829,8 +2832,9 @@ Decision 11 says how this was closed.
 Classic's cost is counted in the gateway's decision bench: instructions for one decision, for
 each classic policy at 8, 64 and 512 workers. That count is the mark the engine has to meet.
 
-The crate gets one bench of the engine over worker objects **[planned]**. Every change to a
-policy shows its cell before and after, with classic's count beside it.
+The crate's bench of the engine over worker objects is `crates/grand_central/benches/in_process.rs`
+**[built]**: a cell is one document over a host's worker lists, with the request its callers make.
+Every change to a policy shows its cell before and after, with classic's count beside it.
 
 ### 13.3 On a cluster
 
@@ -2926,7 +2930,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Encode-prefill-decode on that engine | **[partly]** | `InProcess::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images, or where it carries items and demands vision or a way of processing its references: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most, and the later decisions of a single request, of a pair and of an encode request held to the workers the route's rule takes; an encode request's header for a target is not read |
-| The crate's bench of the kept engine | **[planned]** | |
+| The crate's bench of the kept engine | **[built]** | |
 | The gateway as a host | **[partly]** | section 9, behind `--grand-central on`, which is off by default: single requests and pairs on the HTTP and gRPC routes, a pair's decode asked again, a host's table of stages at the start; an encode request that carries an item is refused by name until the gateway hands the engine its three lists; every classic test of the gateway with the engine on (the bar's fourth point) is not met yet |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
 | The controller on the one engine and the worker crate's structures | **[partly]** | a single request, a pair at its prefill, its decode call and an encode request that carries its items are decided by `InProcess` over the registry's lists; a decision reads no cache event, and no load report under a document that holds a stage that keeps reports, as no stock stage does (section 10.2) |
