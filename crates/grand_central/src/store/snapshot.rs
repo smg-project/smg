@@ -1510,7 +1510,7 @@ impl Writer {
     }
 
     /// How many times the pools were built from the membership: a build an
-    /// ask or a window's end paid, or a generation of another pairing mode.
+    /// ask or a window's end paid, or one a laid snapshot made.
     pub(super) fn builds(&self) -> u64 {
         self.builds
     }
