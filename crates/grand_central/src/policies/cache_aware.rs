@@ -497,8 +497,12 @@ impl PrefixAffinity {
         };
         let predicted = match self.source {
             AffinitySource::Index => 0,
+            // A candidate that predicts no block holds none by this
+            // source whichever way its share reads: the share is not
+            // divided for it.
             AffinitySource::Predictor | AffinitySource::Merged
-                if whole.clears(held.predicted_blocks, self.threshold) =>
+                if held.predicted_blocks > 0
+                    && whole.clears(held.predicted_blocks, self.threshold) =>
             {
                 held.predicted_blocks
             }
@@ -509,9 +513,11 @@ impl PrefixAffinity {
 
     /// The stage's scores over what its two passes read of the kept rows.
     /// `feed` says whether anybody holds anything and carries the drawn
-    /// rows' mean where the engine set one. `reads` hands each pass a
-    /// reader of its own: a column's is a read by index, and the rows a
-    /// host named are walked beside the kept rows. One body a feed, the
+    /// rows' mean where the engine set one. `reads` hands the first pass
+    /// its reader: a column's is a read by index, and the rows a host
+    /// named are walked beside the kept rows. A row's entry is read once:
+    /// its match rides the row's score slot to the pass that scores, so
+    /// `out` holds a slot for every kept row. One body a feed, the
     /// feed chosen where the body is entered. The rows of a draw are
     /// scored by [`Self::rank_drawn`]. The count of the rows written the
     /// ceiling comes back beside the band: the entry that says the stage's
@@ -531,15 +537,17 @@ impl PrefixAffinity {
         let holds = !feed.is_empty();
         // Nobody holding anything, the deepest match is zero without a
         // pass; any other feed answers for every kept row.
-        let best = if holds {
+        let mut best = 0;
+        if holds {
+            // Each row's entry is read once: its match rides the row's
+            // score slot, bit for bit, to the pass that scores.
             let mut entry = reads();
-            kept.iter()
-                .map(|&i| self.matched(entry(i), whole))
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let matched = self.matched(entry(i), whole);
+                *o = f32::from_bits(matched);
+                best = best.max(matched);
+            }
+        }
         let avg = spill_mean(feed.drawn_mean(), facts, candidates, kept);
         // A decode worker prefills nothing again: its held prefix is not
         // priced.
@@ -549,16 +557,12 @@ impl PrefixAffinity {
         } else {
             0.0
         };
-        let mut entry = reads();
         let mut ceilings = 0u32;
         for (o, &i) in out.iter_mut().zip(kept) {
             let c = &candidates[i as usize];
             let load = facts.in_flight(c) as f32;
-            // A match above zero was read from a feed that holds entries.
-            *o = if best > 0
-                && self.matched(entry(i), whole) == best
-                && !self.gates.over(load, avg, held)
-            {
+            // A match above zero was read into this slot by the pass above.
+            *o = if best > 0 && o.to_bits() == best && !self.gates.over(load, avg, held) {
                 // Counted where it is written: a row under the ceiling
                 // adds nothing to the pass.
                 ceilings += 1;
@@ -619,8 +623,8 @@ impl PrefixAffinity {
     }
 
     /// The stage's scores over the rows a host named: a holder reads its
-    /// depth. Each pass walks the holders beside its kept rows where the
-    /// pool is read whole; behind a draw each row is searched once
+    /// depth. The first pass walks the holders beside the kept rows where
+    /// the pool is read whole; behind a draw each row is searched once
     /// ([`Self::rank_drawn`]). Out of line: see [`Scorer::score`] of this
     /// stage.
     #[inline(never)]
