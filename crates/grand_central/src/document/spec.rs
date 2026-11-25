@@ -6194,6 +6194,13 @@ impl ViewLists {
         self.labels.is_empty() && self.zones.is_empty() && self.engines.is_empty()
     }
 
+    /// Whether these lists can leave a worker outside them: they name an
+    /// engine family or a zone. Label selectors alone leave none outside.
+    #[must_use]
+    pub(crate) fn names_a_family_or_zone(&self) -> bool {
+        !self.zones.is_empty() || !self.engines.is_empty()
+    }
+
     /// A worker's three fields under these lists, from the engine family,
     /// the zone and the labels of its registration.
     #[must_use]
@@ -8077,6 +8084,14 @@ mod tests {
         let read = none.lists().positions("beta", Some("west"), &held);
         assert_eq!(read, ViewListPositions::default());
         assert_eq!(none.lists().outside("beta", Some("west")), (false, false));
+        // Lists name a family or a zone, or neither: label selectors alone
+        // name neither, and so does no list.
+        assert!(lists.names_a_family_or_zone());
+        assert!(!mixed.lists().names_a_family_or_zone());
+        assert!(!none.lists().names_a_family_or_zone());
+        // A family's position and a zone's are read from their own lists.
+        let crossed = lists.positions("alpha", Some("west"), &labels(&[]));
+        assert_eq!((crossed.engine_kind, crossed.zone), (1, 2));
     }
 
     #[test]

@@ -16,6 +16,11 @@
 //! This binary is built on the base branch with the pull request's bench
 //! sources, so a row here calls nothing the base's store lacks.
 //!
+//! `policy_store_labels/member_write/512` is the listed membership write
+//! under a generation that declares the label selectors and no family and
+//! no zone: no member stands outside such lists, and the write's build
+//! reads none under them. The gate leaves it out.
+//!
 //! `policy_store_pairs/kept/<n>` and `policy_store_pairs/moved/<n>` are
 //! one membership write of a fleet of pairs, `n` prefills and `n` decodes
 //! of one model that name no runtime: one prefill's registration written
@@ -278,12 +283,29 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
 /// worker joins the pool and leaves it in turn: the write's build reads
 /// that worker under the lists and carries what every other member read.
 fn member_write_under_lists(c: &mut Criterion) {
+    member_write_under(c, "policy_store", "member_write_listed", true);
+}
+
+/// `policy_store_labels/member_write/<n>` is that write under a generation
+/// that declares the eight selectors and no family and no zone, over the
+/// same members. No member stands outside such lists: the write's build
+/// reads no member under them, as under no list.
+fn member_write_under_labels_alone(c: &mut Criterion) {
+    member_write_under(c, "policy_store_labels", "member_write", false);
+}
+
+/// One membership write over 512 members of one pool under a generation's
+/// lists, as the cell `cell` of `group`: the eight selectors, and with
+/// `places` the two families and the four zones.
+fn member_write_under(c: &mut Criterion, group: &str, cell: &str, places: bool) {
     const MEMBERS: usize = 512;
     let store = MemoryStore::new();
     let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
     document.generation = 1;
-    document.view.engines = vec!["alpha".to_string(), "beta".to_string()];
-    document.view.zones = (0..4).map(|zone| format!("z{zone}")).collect();
+    if places {
+        document.view.engines = vec!["alpha".to_string(), "beta".to_string()];
+        document.view.zones = (0..4).map(|zone| format!("z{zone}")).collect();
+    }
     document.view.labels = (0..8).map(|key| format!("k{key}")).collect();
     let listing = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(listing).expect("applied");
@@ -318,17 +340,16 @@ fn member_write_under_lists(c: &mut Criterion) {
     }
     assert_eq!(store.publish_due(), None);
     filled::filled(&store, MODEL, Role::Single, MEMBERS);
-    // A fifth of the members state a zone the list does not name: the
-    // lists stand, and the store counts those members outside.
-    assert!(store.outside_lists().zones > 0);
+    // A fifth of the members state a zone the list of zones does not
+    // name: where that list stands, the store counts those members
+    // outside, and under the selectors alone it counts none.
+    assert_eq!(store.outside_lists().zones > 0, places);
     let joining = facts("http://joining-listed:8000".to_string(), MEMBERS);
     let mut joined = None;
-    let mut group = c.benchmark_group("policy_store");
-    group.bench_with_input(
-        BenchmarkId::new("member_write_listed", MEMBERS),
-        &MEMBERS,
-        |b, _| b.iter(|| join_or_leave(&store, &joining, &mut joined)),
-    );
+    let mut group = c.benchmark_group(group);
+    group.bench_with_input(BenchmarkId::new(cell, MEMBERS), &MEMBERS, |b, _| {
+        b.iter(|| join_or_leave(&store, &joining, &mut joined));
+    });
     group.finish();
 }
 
@@ -477,6 +498,7 @@ fn store_view(c: &mut Criterion) {
     writes_beside_vetoes(c, &mut fixtures);
     member_write_beside_spread_vetoes(c);
     member_write_under_lists(c);
+    member_write_under_labels_alone(c);
     pair_writes(c);
     member_write_beside_many_models(c);
 }
