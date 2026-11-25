@@ -31,13 +31,18 @@
 //! first two reads, once a generation, where it asks the holder for its
 //! lists ([`Objects::lent`]).
 //!
+//! # A number taken again
+//!
+//! An index id is free for the next row once its row leaves, and the engine
+//! maps ids to the workers of a list once a table, which stands up to a
+//! second. The chain index counts each freed id it hands to the next row,
+//! and a lending answers that count ([`CacheIndex::numbers_reused`]). The
+//! engine reads a table anew once the count moved, and a lookup it moved
+//! under names nobody. So an id taken again inside a table's second never
+//! reads as the worker that held it when the table was read.
+//!
 //! # Limits
 //!
-//! - An index id is free for the next row once its row leaves, and the
-//!   engine maps ids to the workers of a list once a table, which stands up
-//!   to a second. An id taken again inside that second reads as the worker
-//!   that held it when the table was read. A gateway's index has the same
-//!   window: its own table stands a second, by age alone.
 //! - The engine asks one index a list, by its first worker's model
 //!   ([`CacheIndexes::index`]), and a row is indexed under its first model.
 
@@ -108,6 +113,12 @@ impl<G: Generation> CacheIndex for EventIndex<G> {
         self.lent.number_of(row)
     }
 
+    /// The count of the chain the lanes write: it moves where a row takes
+    /// the id another row freed, ahead of that row's first block.
+    fn numbers_reused(&self) -> u64 {
+        self.lent.ids_reused()
+    }
+
     fn worker_blocks(&self, number: u32) -> usize {
         self.lent.blocks(number)
     }
@@ -137,11 +148,19 @@ impl<G: Generation> CacheIndex for EventIndex<G> {
 
 #[cfg(test)]
 mod tests {
-    use smg_worker::{kv_events::port::BatchOutcome, registry::WorkerRegistry};
+    use smg_worker::{
+        identity::basic::Worker, kv_events::port::BatchOutcome, registry::WorkerRegistry,
+        test_support::ready_worker,
+    };
 
     use super::*;
     use crate::{
-        engine::view::WorkerId,
+        document::spec::{AppliedSpec, PolicySpec},
+        engine::{
+            decision::{Decision, Shed, ShedReason, Trace},
+            view::{AffinityHolder, RequestFacts, WorkerId},
+            Affinity, PoolAffinity,
+        },
         store::{MemoryStore, Signals, WorkerFacts, WorkersStore},
         worker_host::{objects::stored_chain, Members},
     };
@@ -151,6 +170,8 @@ mod tests {
     const A: &str = "http://a:8000";
     const B: &str = "http://b:8000";
     const C: &str = "http://c:8000";
+    /// The instant every request of a case is decided at, in microseconds.
+    const NOW: u64 = 10_000_000;
 
     /// A store, the holder of its worker objects with the tables it was
     /// handed, and the indexes lent of both.
@@ -211,6 +232,74 @@ mod tests {
         /// The model's index as one table of the engine's is lent it.
         fn index(&self) -> Arc<dyn CacheIndex> {
             self.indexes.index(MODEL).expect("the model's index")
+        }
+
+        /// The engine's list of the workers at `A`, `B` and `C`, in that
+        /// order, under the cache-aware preset: lent the tables' indexes as
+        /// a controller lends them to its engines.
+        fn list(&self) -> List {
+            let affinity = Affinity::default();
+            let indexes = EventIndexes::new(Arc::clone(&self.tables), &self.objects);
+            affinity.set_indexes(Arc::new(indexes));
+            let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+            document.generation = 1;
+            List {
+                affinity,
+                pool: PoolAffinity::default(),
+                spec: AppliedSpec::validate(&document).expect("the preset validates"),
+                workers: [A, B, C].map(|address| ready_worker(address, MODEL)).into(),
+                ids: (1..=3).map(WorkerId).collect(),
+            }
+        }
+    }
+
+    /// One list of the engine's and what the engine keeps of it.
+    struct List {
+        affinity: Affinity,
+        pool: PoolAffinity,
+        spec: AppliedSpec,
+        workers: Vec<Arc<dyn Worker>>,
+        ids: Vec<WorkerId>,
+    }
+
+    impl List {
+        /// The holders the engine names a request of `hashes`: each one's
+        /// place in the list and its blocks in the index. Every request is
+        /// decided at one instant, so the table one request read stands for
+        /// the next by its age.
+        fn holders(&self, hashes: &[u64]) -> Vec<(u32, u32)> {
+            let mut facts = RequestFacts {
+                model: MODEL,
+                block_hashes: hashes,
+                now_micros: NOW,
+                ..RequestFacts::default()
+            };
+            let held = |holder: &AffinityHolder| (holder.row, holder.overlap_blocks);
+            let mut named = Vec::new();
+            overlap::decide(
+                &self.affinity,
+                &self.pool,
+                &self.spec,
+                &self.workers,
+                &self.ids,
+                &mut facts,
+                None,
+                |_| None,
+                || None,
+                |_| true,
+                |request| {
+                    let rows = request.named.expect("the preset is named its rows");
+                    named = rows.holders.iter().map(held).collect();
+                    Decision::Shed(Shed {
+                        reason: ShedReason::PolicyDeclined,
+                        emptied_by: "a case",
+                        retry_after_secs: 0,
+                        wait_allowed: false,
+                        trace: Trace::default(),
+                    })
+                },
+            );
+            named
         }
     }
 
@@ -273,31 +362,46 @@ mod tests {
         assert_eq!(deepest(&*index, &[1], 1 << quiet, 8), []);
     }
 
-    /// The limit the module names. A number is free for the next row once
-    /// its row leaves, and a lending keeps no count of takes: a lending
-    /// made before a worker left reads, under that worker's number, the
-    /// blocks of the row that took the number since. A gateway's own table
-    /// has the same window: it stands a second by age alone
-    /// (`model_gateway/src/policies/cache_aware.rs:165`, `:1146-1147`).
+    /// A number is free for the next row once its row leaves, and the next
+    /// row may take it while an engine's table stands. The lending says so:
+    /// its count of numbers handed out again moves at the take, and at no
+    /// removal. So the engine's next lookup, at the table's own instant,
+    /// reads the table anew and names the worker that took the number,
+    /// never the one that left. The engine's own cases hold the same for a
+    /// chain index (`a_number_that_changed_hands_names_its_new_worker`).
+    ///
+    /// The count alone tells the engine. A lending made before the worker
+    /// left reads, under that worker's number, the blocks of the row that
+    /// took the number since.
     #[test]
-    fn a_number_taken_again_reads_as_the_row_that_took_it_through_an_older_lending() {
+    fn a_number_taken_again_names_the_worker_that_took_it() {
         let bed = Bed::new();
         let (a, b) = (bed.row(A, MODEL), bed.row(B, MODEL));
         bed.stores(a, &[1, 2]);
         bed.stores(b, &[9]);
+        // The engine reads its table: nobody holds the request.
+        let list = bed.list();
+        assert_eq!(list.holders(&[5, 6, 7]), []);
         let older = bed.index();
         let number = older.worker_number(A).expect("a's number");
+        let reused = older.numbers_reused();
         bed.leaves(a);
         assert_eq!(older.worker_blocks(number), 0, "its blocks left with it");
+        assert_eq!(older.numbers_reused(), reused, "a removal alone");
         let c = bed.row(C, MODEL);
         bed.stores(c, &[5, 6, 7]);
         let newer = bed.index();
         assert_eq!(newer.worker_number(C), Some(number), "the freed number");
         assert_eq!(newer.worker_number(A), None);
+        // The table that stands gave the number to the list's first worker.
+        // The engine names its third, which holds the number now.
+        assert_eq!(list.holders(&[5, 6, 7]), [(2, 3)]);
         // The older lending reads the new row's blocks under the number it
-        // gave the worker that left.
+        // gave the worker that left, and says a number was handed on.
         assert_eq!(older.worker_blocks(number), 3);
         assert_eq!(deepest(&*older, &[5, 6, 7], 1 << number, 8), [(number, 3)]);
+        assert_eq!(older.numbers_reused(), reused + 1);
+        assert_eq!(newer.numbers_reused(), reused + 1);
     }
 
     /// A row has a number in the index its lane writes, and in no other: a
