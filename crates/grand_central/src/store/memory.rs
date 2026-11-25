@@ -511,6 +511,13 @@ impl MemoryStore {
     /// clock, behind the lock. Whether the change fit the tables, as
     /// [`Self::follow`] says it: one that does not writes nothing and tells
     /// the journal nothing.
+    ///
+    /// The journal is told the row its writer handed, with the admission
+    /// instant of the row it is laid over, and the table takes that row
+    /// behind the telling: the event of such a write tells no row read
+    /// from the table. Two things are the table's still. A status change
+    /// comes with no row, and its event tells the table's. The row a write
+    /// takes out is the one the table held.
     fn decided(
         &self,
         mut workers: Writing<'_>,
@@ -518,6 +525,8 @@ impl MemoryStore {
         change: MembershipChange,
         row: Option<WorkerRow>,
     ) -> bool {
+        use std::collections::hash_map::Entry;
+
         // The models a registration that stays under its id takes its
         // worker off, for the stages: here as in the leader's own write.
         let mut off = Vec::new();
@@ -525,7 +534,9 @@ impl MemoryStore {
         // they follow their worker between, and the ids they leave with.
         let mut follows = None;
         let mut ended = Vec::new();
-        let (change, left) = match (change, row) {
+        // The row the change leaves, as its writer handed it: the journal
+        // is told from it, and the table takes it behind the telling.
+        let (change, laid, left) = match (change, row) {
             (MembershipChange::Registered { id }, Some(row))
                 if row.id == id
                     && !workers.rows.contains_key(&id)
@@ -535,26 +546,22 @@ impl MemoryStore {
                 let (old, past) = workers.take_gone(&row.facts, now, self.pins_absence());
                 follows = old.map(|old| (old, id));
                 ended = past;
-                let slot = self.join(id);
-                workers.rows.insert(id, Row { row, slot });
-                (change, None)
+                (change, Some(row), None)
             }
             (
                 MembershipChange::Relabelled { id } | MembershipChange::Resized { id },
                 Some(mut row),
             ) if row.id == id => {
-                let held = workers.rows.get_mut(&id);
+                let held = workers.rows.get(&id);
                 let Some(held) = held.filter(|held| held.row.facts.key == row.facts.key) else {
                     return false;
                 };
                 let resized = held.row.facts.dp_size != row.facts.dp_size;
                 row.admitted_at = held.row.admitted_at;
-                let old = mem::replace(&mut held.row, row);
-                off = left_models(old.facts, &held.row.facts);
                 if resized {
-                    (MembershipChange::Resized { id }, None)
+                    (MembershipChange::Resized { id }, Some(row), None)
                 } else {
-                    (MembershipChange::Relabelled { id }, None)
+                    (MembershipChange::Relabelled { id }, Some(row), None)
                 }
             }
             (MembershipChange::Replaced { old, new }, Some(row))
@@ -573,10 +580,8 @@ impl MemoryStore {
                     ended.push(old);
                 }
                 workers.by_key.insert(row.facts.key.clone(), new);
-                let slot = self.join(new);
-                workers.rows.insert(new, Row { row, slot });
                 self.forget_worker(old);
-                (change, left)
+                (change, Some(row), left)
             }
             (MembershipChange::Removed { id }, None) => {
                 let Some(held) = workers.rows.remove(&id) else {
@@ -584,7 +589,7 @@ impl MemoryStore {
                 };
                 workers.by_key.remove(&held.row.facts.key);
                 self.forget_worker(id);
-                (change, Some(self.row_left(held)))
+                (change, None, Some(self.row_left(held)))
             }
             (MembershipChange::StatusChanged { id, from, to }, None) => {
                 let held = workers.rows.get_mut(&id);
@@ -594,11 +599,31 @@ impl MemoryStore {
                 // The revision counts a row's stated facts: a status
                 // change leaves it, here as in the leader's own write.
                 held.row.status = to;
-                (change, None)
+                (change, None, None)
             }
             _ => return false,
         };
-        workers.record_over(change, left.as_ref());
+        if matches!(change, MembershipChange::StatusChanged { .. }) {
+            // A status comes with no row of its writer's: its event tells
+            // the row as the table holds it.
+            workers.record(change);
+        } else {
+            workers.record_over(change, laid.as_ref(), left.as_ref());
+        }
+        // The table follows the row told: over the row that stood under
+        // its id, or under a new id with a count slot of its own.
+        if let Some(row) = laid {
+            match workers.rows.entry(row.id) {
+                Entry::Occupied(mut held) => {
+                    let old = mem::replace(&mut held.get_mut().row, row);
+                    off = left_models(old.facts, &held.get().row.facts);
+                }
+                Entry::Vacant(free) => {
+                    let slot = self.join(row.id);
+                    free.insert(Row { row, slot });
+                }
+            }
+        }
         // The build each write leaves, as the leader's own: a join, a
         // refresh and a patch owe it, and a leave pays its own before it is
         // told, a registration that takes its worker off a model among
@@ -1269,7 +1294,7 @@ struct Workers {
     history: u64,
     log: VecDeque<(u64, MembershipChange)>,
     /// The store's journal: every membership and status write passes
-    /// [`Writing::record`], which tells it.
+    /// [`Writing::record`] or [`Writing::record_over`], which tell it.
     journal: Option<Arc<dyn Journal>>,
 }
 
@@ -1459,26 +1484,43 @@ impl DerefMut for Writing<'_> {
 /// the membership lock bare has no way to journal a write, so none is
 /// journaled whose release the journal does not hear.
 impl Writing<'_> {
-    fn record(&mut self, change: MembershipChange) -> MembershipChange {
-        self.record_over(change, None)
-    }
-
-    /// [`Writing::record`] for a write that took a row out of the table (a
-    /// removal, a replacement): `left` is that row, for the journal.
-    fn record_over(
-        &mut self,
-        change: MembershipChange,
-        left: Option<&WorkerRow>,
-    ) -> MembershipChange {
+    /// The epoch `change` makes, with the change filed in the change log.
+    fn step(&mut self, change: MembershipChange) -> u64 {
         let workers = &mut *self.workers;
         workers.epoch += 1;
         if workers.log.len() == CHANGE_LOG {
             workers.log.pop_front();
         }
         workers.log.push_back((workers.epoch, change));
-        if let Some(journal) = &workers.journal {
-            let row = workers.rows.get(&change.id()).map(|row| &row.row);
-            journal.member(self.at, workers.epoch, change, row, left);
+        workers.epoch
+    }
+
+    /// Record a change that comes with no row of its writer's: a status,
+    /// which is the log's own word, and the store's own patch. The journal
+    /// is told the row as the table holds it.
+    fn record(&mut self, change: MembershipChange) -> MembershipChange {
+        let epoch = self.step(change);
+        if let Some(journal) = &self.workers.journal {
+            let row = self.workers.rows.get(&change.id()).map(|row| &row.row);
+            journal.member(self.at, epoch, change, row, None);
+        }
+        change
+    }
+
+    /// Record a change whose writer handed the row it leaves. The journal
+    /// is told `row`, that row (none for a removal), and `left`, the row
+    /// the write took out of the table (a removal's, a replacement's old
+    /// incarnation). No row of the table is read: the table takes `row`
+    /// behind the telling.
+    fn record_over(
+        &mut self,
+        change: MembershipChange,
+        row: Option<&WorkerRow>,
+        left: Option<&WorkerRow>,
+    ) -> MembershipChange {
+        let epoch = self.step(change);
+        if let Some(journal) = &self.workers.journal {
+            journal.member(self.at, epoch, change, row, left);
         }
         change
     }
@@ -1754,7 +1796,7 @@ impl WorkersStore for MemoryStore {
         // and before the removal is told: a veto keyed by an id that is
         // gone would stay for good, the next incarnation having a new id.
         self.forget_worker(id);
-        let change = workers.record_over(MembershipChange::Removed { id }, Some(&row.row));
+        let change = workers.record_over(MembershipChange::Removed { id }, None, Some(&row.row));
         let now = Instant::now();
         self.pay_leave(&workers, now);
         self.tell_membership(change);

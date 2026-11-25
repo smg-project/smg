@@ -323,16 +323,18 @@ pub(super) mod tests {
             self.objects.registry().get_id_by_url(url)
         }
 
-        /// The row under `url` where the journal's last word, the table and
-        /// the object agree on it, each fact and the status. No follow is
-        /// run: the holder's place stands behind the store.
+        /// The row under `url` where the journal's last word, the object
+        /// and the table agree on it, each fact and the status. The journal
+        /// is told the row the write handed, which the object read back
+        /// states, and the table takes it. No follow is run: the holder's
+        /// place stands behind the store.
         pub(crate) fn one_row(&self, url: &str) -> WorkerRow {
             let (_, told, _) = self.last();
             let table = self.store.by_key(url).expect("the table holds the row");
             let object = self.object(url).expect("the object stands with no follow");
             let read = self.objects.row_of(&object).expect("the object's row");
-            assert_eq!(told.as_ref(), Some(&table), "the journal against the table");
-            assert_eq!(read, table, "the object against the table");
+            assert_eq!(told.as_ref(), Some(&read), "the journal against the object");
+            assert_eq!(table, read, "the table against the object");
             let end = Some(self.store.epoch());
             assert_ne!(self.objects.read_to(), end, "no follow laid it");
             table

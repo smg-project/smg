@@ -2557,7 +2557,11 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    rule, builds the object of the record the change leaves, tells the store the decided
    change, and puts the object in the registry. A removal takes the object out first. So the
    object stands when the write returns. The table of records follows on a leader as it does
-   on a standby, by one body, and the membership log is told from it. In a controller the
+   on a standby, by one body. The membership log is told the record the write handed that
+   body, ahead of the table's write, and the event of such a write tells no record read from
+   the table. The revision an event tells is the keeper's, of the write that made the record.
+   Two things are the table's until step 4: a status event comes with no record and tells the
+   table's, and the record a write takes out is the one the table held. In a controller the
    code that keeps the objects alone writes a worker object's own facts, so the record a change
    in place writes to the table is the object's record read back whole, less its status: the
    table keeps its own, and the object's is told behind the write. A second writer of an
