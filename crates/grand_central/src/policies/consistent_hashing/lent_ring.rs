@@ -8,37 +8,7 @@
 
 use std::fmt;
 
-use crate::engine::WorkerId;
-
-/// What a lender's ring is asked the place of under the prefix form of the
-/// ring ([`LentRing::head_position`]): a head of the request's prompt, or
-/// its routing value. A head is a part of the request's own ids or text:
-/// nothing is copied for it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
-pub enum Head<'a> {
-    /// The first token ids of a tokenized prompt. The bytes a lender's
-    /// recipe reads are each id's four bytes in the machine's order, one id
-    /// after the other: the gateway's own policy casts the ids in place
-    /// (`model_gateway/src/policies/prefix_hash.rs`, lines 145 and 178 at
-    /// 882be6f4f).
-    Tokens(&'a [u32]),
-    /// The leading text of a prompt that carries no token ids, cut on a
-    /// character's edge, and the whole text of a routing value, which
-    /// leads every prompt (the same file, lines 358 to 360). A recipe
-    /// reads its bytes.
-    Text(&'a str),
-}
-
-/// Sizes alone: a client's tokens and text reach no log line.
-impl fmt::Debug for Head<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Tokens(ids) => write!(f, "Tokens({})", ids.len()),
-            Self::Text(text) => write!(f, "Text({})", text.len()),
-        }
-    }
-}
+use crate::{engine::WorkerId, policies::prefix_hash::Head};
 
 /// A hash ring of workers that a request's caller keeps and lends to a
 /// decision. It names a worker by the address it is registered at, and a
@@ -133,18 +103,5 @@ impl LentRing for InOrder {
     fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
         let (before, behind) = self.0.split_at(position as usize % self.0.len().max(1));
         let _ = behind.iter().chain(before).any(|address| take(address));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Head;
-
-    /// A head's debug form says its size and nothing it holds: a client's
-    /// token ids and text reach no log line through it.
-    #[test]
-    fn a_heads_debug_form_says_its_size_alone() {
-        assert_eq!(format!("{:?}", Head::Text("a client's words")), "Text(16)");
-        assert_eq!(format!("{:?}", Head::Tokens(&[7, 8, 9])), "Tokens(3)");
     }
 }
