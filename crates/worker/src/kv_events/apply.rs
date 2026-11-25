@@ -1030,6 +1030,14 @@ impl GroupsShown {
 /// store or on a second store of an indexed hash; an indexed block without
 /// an entry is a single device copy. A worker that never duplicates and
 /// never offloads pays one lookup per stored block and no memory.
+///
+/// Where the index declines a store at a size cap, the copy the store
+/// announced for each block it left out is forgotten, on the host tier too,
+/// unless the worker holds the block from an earlier store. A later device
+/// store of a forgotten block counts its device copy alone, and the removal
+/// of that copy evicts the block while the engine may still hold the host
+/// one: the index then names the worker for fewer blocks than it holds,
+/// never for one it does not hold.
 #[derive(Default)]
 pub struct WorkerIndexState<H: HeldBlocks> {
     /// The indexer's caller-owned reverse map for this worker.
