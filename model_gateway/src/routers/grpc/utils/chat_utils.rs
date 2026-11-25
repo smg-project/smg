@@ -794,17 +794,28 @@ fn resolve_template_thinking(
 /// ([`ProviderProfile::thinking_prefix`]) where the template has no thinking
 /// switch and the tokenizer has the marker as a token (an earlier model of
 /// the family has no such token and renders as before). A template with a
-/// switch writes its own prefix and gets none. The render writes it
+/// switch writes its own prefix and gets none. Neither does a prompt whose
+/// text `behind` the prefix (a prefill, a final message the renderer could
+/// not continue in place) holds a thought marker of the profile: that text
+/// states its thought itself, and the prompt renders as it does without the
+/// prefix. The render writes it
 /// ([`apply_chat_template_with_thinking_prefix`]) and the reasoning parser
 /// starts from the same answer (`parsers::reasoning_starts_in_prefill`).
 pub(crate) fn thinking_prefix(
     provider: ProviderProfile,
     thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
+    behind: Option<&str>,
 ) -> Option<&'static str> {
     provider.thinking_prefix(thinking).filter(|marker| {
         tokenizer.thinking_toggle() == ThinkingToggle::None
             && tokenizer.token_to_id(marker).is_some()
+            && !behind.is_some_and(|text| {
+                [true, false]
+                    .into_iter()
+                    .filter_map(|on| provider.thinking_prefix(Some(on)))
+                    .any(|marker| text.contains(marker))
+            })
     })
 }
 
@@ -822,10 +833,17 @@ pub(crate) fn thinking_prefix(
 ///   (`ChatTemplateOutput::continued_final_message` is false). The prefix
 ///   belongs between the two, so the prompt is rendered again the way the
 ///   renderer fell back: the conversation without the message, a generation
-///   prompt, the prefix, the message's text.
+///   prompt, the prefix, the message's text;
+/// - a prefill or such a message that holds a thought marker states its
+///   thought itself: the prompt takes no prefix and stands as the renderer
+///   wrote it;
+/// - a template that wrote the same marker behind its generation prompt (a
+///   checkpoint whose template for requests with tools has the switch its
+///   default one lacks) keeps its one.
 ///
 /// The reasoning parser reads where the prefix stands from the same two
-/// flags of the rendered prompt (`parsers::reasoning_starts_in_prefill`).
+/// flags of the rendered prompt and the text of a continued final message
+/// (`parsers::reasoning_starts_in_prefill`).
 pub(crate) fn apply_chat_template_with_thinking_prefix(
     tokenizer: &dyn Tokenizer,
     provider: ProviderProfile,
@@ -833,14 +851,18 @@ pub(crate) fn apply_chat_template_with_thinking_prefix(
     params: ChatTemplateParams<'_>,
     assistant_prefix: Option<String>,
 ) -> anyhow::Result<ChatTemplateOutput> {
-    let Some(marker) = thinking_prefix(provider, params.thinking, tokenizer) else {
+    let thinking = params.thinking;
+    let Some(marker) = thinking_prefix(provider, thinking, tokenizer, assistant_prefix.as_deref())
+        .filter(|_| params.add_generation_prompt || params.continue_final_message)
+    else {
         return tokenizer.apply_chat_template_with_encoding_owned(
             messages,
             params,
             assistant_prefix.as_deref(),
         );
     };
-    if params.continue_final_message {
+    let mut prefix = marker.to_owned();
+    let mut rendered = if params.continue_final_message {
         let fallen_back = ChatTemplateParams {
             add_generation_prompt: true,
             continue_final_message: false,
@@ -857,21 +879,32 @@ pub(crate) fn apply_chat_template_with_thinking_prefix(
         else {
             return Ok(rendered);
         };
-        let mut prefix = marker.to_owned();
-        if let Some(text) = last.get("content").cloned().and_then(prefill_text) {
-            prefix.push_str(&text);
+        let mut text = last
+            .get("content")
+            .cloned()
+            .and_then(prefill_text)
+            .unwrap_or_default();
+        text.push_str(assistant_prefix.as_deref().unwrap_or_default());
+        if thinking_prefix(provider, thinking, tokenizer, Some(&text)).is_none() {
+            return Ok(rendered);
         }
-        if let Some(text) = &assistant_prefix {
-            prefix.push_str(text);
-        }
-        return tokenizer.apply_chat_template_with_encoding(head, fallen_back, Some(&prefix));
-    }
-    let prefix = if params.add_generation_prompt {
-        Some(assistant_prefix.map_or_else(|| marker.to_owned(), |text| format!("{marker}{text}")))
+        prefix.push_str(&text);
+        tokenizer.apply_chat_template_with_encoding(head, fallen_back, Some(&prefix))?
     } else {
-        assistant_prefix
+        prefix.push_str(assistant_prefix.as_deref().unwrap_or_default());
+        tokenizer.apply_chat_template_with_encoding_owned(messages, params, Some(&prefix))?
     };
-    tokenizer.apply_chat_template_with_encoding_owned(messages, params, prefix.as_deref())
+    // The prefix ends the text of a prompt encoded from it; a deferred
+    // encoding has taken the prefix as it was handed over.
+    let own = rendered
+        .text
+        .strip_suffix(prefix.as_str())
+        .filter(|own| own.ends_with(marker))
+        .map(str::len);
+    if let Some(at) = own.filter(|_| matches!(rendered.encoding, PromptEncoding::FromText)) {
+        rendered.text.replace_range(at..at + marker.len(), "");
+    }
+    Ok(rendered)
 }
 
 /// Validate content sent to a model template, using the tool declarations

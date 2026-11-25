@@ -1,6 +1,6 @@
 //! Reasoning and tool parser helpers.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
@@ -10,7 +10,9 @@ use llm_tokenizer::{
 /// protocol crate; it is re-exported here, where the routers read it.
 pub use openai_protocol::worker::TagVocabulary;
 use openai_protocol::{
-    chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
+    chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, MessageContent},
+    common::ContentPart,
+    messages::{InputContent, InputContentBlock},
     model_card::ModelCard,
     profile::ProviderProfile,
     worker::{ConstrainedDecoding, GrammarStart},
@@ -563,7 +565,8 @@ fn resolve_thinking_pref(
 /// the prompt does that. Once the prompt is rendered it is the prompt's
 /// `continued_final_message`, not the request's ask: a template that cannot
 /// continue the message appends its text after the generation prompt, and
-/// the completion then starts wherever that prompt leaves it.
+/// the completion then starts wherever that prompt leaves it. `behind` is
+/// that text: the final message's, where the request continues one.
 pub fn reasoning_starts_in_prefill(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -571,6 +574,7 @@ pub fn reasoning_starts_in_prefill(
     continues_final_assistant: bool,
     tokenizer: &dyn Tokenizer,
     provider: ProviderProfile,
+    behind: Option<&str>,
 ) -> bool {
     if continues_final_assistant
         && tokenizer
@@ -586,8 +590,10 @@ pub fn reasoning_starts_in_prefill(
     // behind every generation prompt, the one a continuation falls back to
     // as well (`chat_utils::apply_chat_template_with_thinking_prefix`), and
     // a prompt without one, or one that continues its final message, never
-    // reaches this line.
-    if chat_utils::thinking_prefix(provider, thinking, tokenizer).is_some() {
+    // reaches this line. It writes none ahead of a text that states its
+    // thought itself, and the completion then starts as the template's own
+    // prompt leaves it.
+    if chat_utils::thinking_prefix(provider, thinking, tokenizer, behind).is_some() {
         return thinking == Some(true);
     }
     should_mark_reasoning_started(thinking, tokenizer)
@@ -648,6 +654,20 @@ pub fn chat_reasoning_starts_in_rendered_prefill_for(
     if !generation_prompt && !continued_final_message {
         return false;
     }
+    // The text of a final message the request continues, its text parts
+    // joined as the render joins them behind a generation prompt.
+    let behind = match request.messages.last() {
+        Some(ChatMessage::Assistant {
+            content: Some(content),
+            ..
+        }) if request.continue_final_message => Some(match content {
+            MessageContent::Text(text) => Cow::Borrowed(text.as_str()),
+            MessageContent::Parts(parts) => {
+                Cow::Owned(parts.iter().filter_map(ContentPart::text).collect())
+            }
+        }),
+        _ => None,
+    };
     reasoning_starts_in_prefill(
         request.chat_template_kwargs.as_ref(),
         request.effective_reasoning_effort(),
@@ -655,6 +675,7 @@ pub fn chat_reasoning_starts_in_rendered_prefill_for(
         continued_final_message,
         tokenizer,
         provider,
+        behind.as_deref(),
     )
 }
 
@@ -690,6 +711,24 @@ pub fn messages_reasoning_starts_in_prefill_for(
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
+    // The text of a final message the request continues, its text blocks
+    // joined as the render joins them.
+    let behind = request
+        .messages
+        .last()
+        .filter(|_| request.continues_final_assistant())
+        .map(|message| match &message.content {
+            InputContent::String(text) => Cow::Borrowed(text.as_str()),
+            InputContent::Blocks(blocks) => Cow::Owned(
+                blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        InputContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+        });
     reasoning_starts_in_prefill(
         None,
         request.reasoning_effort(),
@@ -697,6 +736,7 @@ pub fn messages_reasoning_starts_in_prefill_for(
         continued_final_message,
         tokenizer,
         provider,
+        behind.as_deref(),
     )
 }
 
