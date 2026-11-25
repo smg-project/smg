@@ -570,6 +570,12 @@ impl Readers {
         !self.held.lock().is_empty()
     }
 
+    /// Whether these are the readers of `feed`: a clone of a feed shares its
+    /// kept cut, so a clone of the feed they were built over is theirs too.
+    fn are_of(&self, feed: &Feed) -> bool {
+        Arc::ptr_eq(&self.feed.rows, &feed.rows)
+    }
+
     /// The snapshots' turn, for a case that fills it or holds it.
     #[cfg(test)]
     pub(crate) fn snapshots(&self) -> &SerialTurn {
@@ -605,7 +611,9 @@ impl Drop for WatchPlace {
 
 /// Opens the watch `by` asked for: from `start`, of the rows that serve one
 /// of `models`, or of every row when none is named. It takes one of the
-/// principal's seats among `readers`, or is refused by name.
+/// principal's seats among `readers`, or is refused by name. The source
+/// reads the feed those readers were built over, or the cut its watch
+/// keeps would not be the one its seat lets go: a debug build stops here.
 pub(crate) fn open(
     source: Source,
     readers: &Arc<Readers>,
@@ -613,6 +621,10 @@ pub(crate) fn open(
     start: Start,
     models: Vec<String>,
 ) -> Result<Watching, Status> {
+    debug_assert!(
+        readers.are_of(&source.feed),
+        "a watch's source reads the feed its readers were built over"
+    );
     let seat = readers.seat(by)?;
     // The role's word is the replica's, one for every watch: the feed's
     // task wakes the parked streams by it, and takes nothing else of this
@@ -1910,6 +1922,31 @@ pub(crate) mod tests {
         drop(second);
         leader.holds("gateway-b", 0);
         assert!(leader.feed.rows.lock().is_none(), "the last watch left");
+    }
+
+    /// A source over another feed than its readers' would keep a cut that
+    /// no seat lets go, and a snapshot beside its watch would share none: a
+    /// debug build stops at the open.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "the feed its readers were built over")]
+    async fn a_source_over_another_feed_than_its_readers_stops_a_debug_build() {
+        let (leader, other) = (leader(), leader());
+        let source = Source {
+            store: Arc::clone(&other.store),
+            objects: Arc::clone(&other.objects),
+            feed: other.feed.clone(),
+            fence: other.elector.fence(),
+            role: other.role.subscribe(),
+            term: 1,
+        };
+        let _ = open(
+            source,
+            &leader.readers,
+            &told("gateway-a"),
+            Start::Snapshot,
+            Vec::new(),
+        );
     }
 
     #[tokio::test]
