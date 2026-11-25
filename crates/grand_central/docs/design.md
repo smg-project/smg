@@ -799,7 +799,7 @@ lends the engine in the same type **[built]**.
 | Structure | Written by | Read by classic | Read by the engine |
 |---|---|---|---|
 | a model's worker list | the registry, at each membership change | yes | yes, the same list |
-| the worker object's state | health checker, load monitor, load guard (on a controller, the leases on file), outcomes | yes | yes, at each decision, and once more for each worker of a target the placement call tests behind the pick |
+| the worker object's state | health checker, load monitor, load guard (on a controller, the leases on file), outcomes | yes | yes, at each decision, and once more for each worker of a target the placement call tests behind the pick; the rows of a pair's decision and of an encode request's are filled with no read of it where every worker of their lists has published that it is available and no stage reads a count |
 | `LoadSnapshot` | the load monitor | `least_load`, `cache_aware`, `power_of_two` | yes, the latest snapshot; a controller's deciding thread gives it with each request, where the document keeps no report |
 | the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex`; a controller lends its engine the index in its worker host's KV tables (`worker_host/kv_read.rs`) |
 | the two trees | the deciding policy: classic's, or the engine inside the tree's walk | `cache_aware` | the host's own trees, lent: the token tree **[built]**, the string tree **[built]** |
@@ -985,6 +985,12 @@ reports are converted once for a list and cached. Until the list
 holds them, a record written alone takes its report by one read of the snapshot, which looks
 among the kept reports too where it holds no entry of the worker: a drawn
 worker's, a worker's that a routing key names, and the held prefill's of a decode decided again.
+
+A pair's decision and an encode request's fill their records with no read of a worker object
+where every worker of their lists has published that it is available and neither a stage of
+the document nor a sessions rule reads a count: the records are written ready
+(`PoolRecords::stands`). The first decision behind a change of any published state asks each
+worker of its lists once, and a host's admission reads its workers as it did.
 
 The field `engine` numbers the list's data-parallel engines: records that state one number are
 ranks of one engine. `InProcess` writes the numbers once for a list, where it finds the list's
