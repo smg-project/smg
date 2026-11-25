@@ -275,6 +275,16 @@ impl<G: Generation> ClassicLoadSink<G> {
     }
 }
 
+/// Whether two handles count their requests on one runtime: a same-URL
+/// `replace()` hands the worker that comes the runtime of the handle that
+/// leaves, and a worker registered anew counts on its own.
+fn counts_on_one_runtime(a: &dyn Worker, b: &dyn Worker) -> bool {
+    matches!(
+        (a.runtime_state(), b.runtime_state()),
+        (Some(one), Some(other)) if Arc::ptr_eq(&one, &other)
+    )
+}
+
 impl<G: Generation> LoadSink for ClassicLoadSink<G> {
     fn record(
         &self,
@@ -375,16 +385,23 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         // the safety net behind the load guard's completion report. It runs
         // for every worker, polled or served by its stream, whether or not a
         // fetch succeeded; the live count is the router's. A handle that
-        // left a URL another worker holds now is the one it skips.
+        // left a URL where another worker counts on its own now is the one
+        // it skips.
         for worker in tick.workers {
             // What is booked is kept by URL. Where the registry holds
             // another worker at this URL, the count of the handle that left
-            // says nothing of it: the worker that came is trimmed at its own
-            // tick.
+            // need not be that worker's. One registered anew counts on a
+            // runtime of its own and is trimmed at its own tick: the handle
+            // is skipped. A `replace()` hands the worker that comes the
+            // runtime of the handle that leaves: the handle's count is the
+            // live one, and it trims as before.
             if self
                 .worker_registry
                 .get_by_url(worker.url())
-                .is_some_and(|held| !Arc::ptr_eq(&held, worker))
+                .is_some_and(|held| {
+                    !Arc::ptr_eq(&held, worker)
+                        && !counts_on_one_runtime(held.as_ref(), worker.as_ref())
+                })
             {
                 continue;
             }
