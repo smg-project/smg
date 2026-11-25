@@ -40,11 +40,6 @@
 //! fact are compared for equality and never interpreted. Deriving a
 //! descriptor from what an engine reports is the registration handshake's.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
     collections::hash_map::Entry,
     fmt,
@@ -82,7 +77,11 @@ pub const LAYOUT_FACTS: [(&str, &str); 4] = [
 /// never meets one: the store's door hands it a normalized descriptor
 /// ([`PairingDescriptor::normalize`]), as the gateway's own derive drops a
 /// blank label where it makes a worker's descriptor.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct PairingDescriptor {
     /// The protocol an operator set. Two workers that both set one are
     /// compared on it whole.

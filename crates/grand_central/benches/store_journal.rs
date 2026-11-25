@@ -178,10 +178,9 @@ fn read(c: &mut Criterion) {
     }
     // The store took term 1 before its first write: every position stands
     // under it.
-    let after = Position {
-        seq: log.head().seq - 2_048,
-        term: 1,
-    };
+    let mut after = Position::default();
+    after.seq = log.head().seq - 2_048;
+    after.term = 1;
     for events in [16usize, 256] {
         let mut out = Vec::with_capacity(events);
         // Checked ahead of the timed id: a filtered run skips its routine.

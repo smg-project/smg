@@ -26,9 +26,10 @@ use smg_grand_central::{
         DrawUnit, EncodeMember, Health, LoadRow, Phase, Plain, PoolWord, Profile, ScoreFront,
         ScoreSpread, Shortlist, WeightedScorer, WireModes, WorkerId,
     },
+    load::SignalCell,
     policies::prefix_hash::HeadRule,
     stages::{Best, LeastRequests},
-    store::EncodeOffer,
+    store::{pairing::PairingDescriptor, EncodeHandoff, EncodeOffer, Position},
     tracking::{EventKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
 };
 
@@ -267,6 +268,83 @@ fn an_encode_member_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
     } = EncodeMember::of("a runtime", &offer);
     assert_eq!(runtime, "a runtime");
     assert!(std::ptr::eq(read, &offer));
+}
+
+/// A worker's encode offer starts from its default, which states nothing,
+/// and takes a field by assignment. It is read by a pattern that ends open.
+#[test]
+fn an_encode_offer_starts_from_its_default_and_takes_a_field_by_assignment() {
+    let mut offer = EncodeOffer::default();
+    offer.handoff = EncodeHandoff::Push;
+    offer.producer = true;
+    offer.connector = Some("a connector".to_owned());
+    let EncodeOffer {
+        handoff,
+        producer,
+        consumer,
+        connector,
+        references,
+        ..
+    } = offer;
+    assert_eq!(
+        (
+            handoff,
+            producer,
+            consumer,
+            connector.as_deref(),
+            references
+        ),
+        (EncodeHandoff::Push, true, false, Some("a connector"), false)
+    );
+}
+
+/// A worker's pairing descriptor starts from its default, which reports
+/// nothing, and takes a field by assignment. It is read by a pattern that
+/// ends open.
+#[test]
+fn a_pairing_descriptor_starts_from_its_default_and_takes_a_field_by_assignment() {
+    let mut descriptor = PairingDescriptor::default();
+    descriptor.transport = Some("a transport".to_owned());
+    let PairingDescriptor {
+        protocol,
+        transport,
+        version,
+        kv_layout,
+        ..
+    } = descriptor;
+    assert_eq!(
+        (protocol, transport.as_deref(), version),
+        (None, Some("a transport"), None)
+    );
+    assert!(kv_layout.iter().all(Option::is_none));
+}
+
+/// A place in a store's history starts from its default, the place before
+/// every write, and takes a field by assignment. It is read by a pattern
+/// that ends open.
+#[test]
+fn a_position_starts_from_its_default_and_takes_a_field_by_assignment() {
+    let mut position = Position::default();
+    position.seq = 9;
+    position.term = 2;
+    let Position { seq, term, .. } = position;
+    assert_eq!((seq, term), (9, 2));
+}
+
+/// A signal's cell is made by its call, which takes both of its fields, and
+/// read by a pattern that ends open. The cell of no value is its constant.
+#[test]
+fn a_signal_cell_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+    let SignalCell {
+        value,
+        sampled_at_micros,
+        ..
+    } = SignalCell::of(2.5, 40);
+    assert_eq!(
+        (value.to_bits(), sampled_at_micros),
+        (2.5_f64.to_bits(), 40)
+    );
+    assert!(SignalCell::NONE.is_none());
 }
 
 /// A pool's word is made by its call, as a program that implements a

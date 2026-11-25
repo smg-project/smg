@@ -59,10 +59,9 @@ type Offer = (String, Option<PairingDescriptor>);
 
 /// A descriptor that names `transport` and nothing else.
 fn on(transport: String) -> PairingDescriptor {
-    PairingDescriptor {
-        transport: Some(transport),
-        ..PairingDescriptor::default()
-    }
+    let mut descriptor = PairingDescriptor::default();
+    descriptor.transport = Some(transport);
+    descriptor
 }
 
 /// One fact a worker of the `widest` fleet names: the fact's number, of the
