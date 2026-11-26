@@ -724,6 +724,7 @@ pub(crate) fn test_components() -> Arc<super::context::SharedComponents> {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
     use openai_protocol::worker::WorkerStatus;
     use smg_worker::{
         identity::basic::{ConnectionMode, RuntimeType},
@@ -733,6 +734,7 @@ mod tests {
     use super::*;
     use crate::routers::{
         common::snapshot::WorkerRegistry,
+        error::extract_error_code_from_response,
         grpc::{backend_client::BasicWorkerBuilder, context::EncodeWorkerAssignment},
     };
 
@@ -819,7 +821,7 @@ mod tests {
 
         // Overloaded encoders remain ready when `--worker-overload-shed` is off (steering-only),
         // matching selection's overload fallback, and report not-ready when shedding is enabled.
-        let overloaded_registry = crate::routers::common::snapshot::WorkerRegistry::new();
+        let overloaded_registry = WorkerRegistry::new();
         for w in &ok {
             overloaded_registry.register(Arc::clone(w)).unwrap();
         }
@@ -1118,8 +1120,8 @@ mod tests {
         ] {
             let err = prepare_chat_json(bad).err().unwrap();
             let resp = err.into_response();
-            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-            let code = crate::routers::error::extract_error_code_from_response(&resp);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let code = extract_error_code_from_response(&resp);
             if expect_capability {
                 assert_eq!(code, "sglang_epd_capability");
             } else {
