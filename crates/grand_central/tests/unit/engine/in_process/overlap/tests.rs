@@ -2006,13 +2006,13 @@ fn a_column_reads_the_write_its_thread_keeps_and_the_next_turn_is_kept() {
 }
 
 /// A write whose naming a leave made stale takes no kept write of its
-/// thread with it. The thread fills a column for one request, a worker
-/// leaves, and the thread fills and writes for a second request, the first
-/// one's leading part, for the same worker: that write meets a held record
-/// and is kept, named on the record's count as it stands. The first
-/// request's write then stops at the record, and the kept one is written on
-/// behind it. So the worker holds the second request's blocks for a reader
-/// on another thread, and nothing is left out.
+/// thread with it. The thread fills a column for one request and a worker
+/// leaves. It then fills and writes for a second request, the first one's
+/// leading part, for the same worker. That write meets a held record and
+/// is kept, named on the record's count as it stands. The first request's
+/// write then stops at the record, and the kept one is written on behind
+/// it. So a reader on another thread finds the second request's blocks at
+/// the worker and no block more, and nothing is left out.
 #[test]
 fn a_write_a_leave_made_stale_takes_no_kept_write_with_it() {
     let (affinity, _, _) = hosted(false);
@@ -2035,13 +2035,101 @@ fn a_write_a_leave_made_stale_takes_no_kept_write_with_it() {
     }
     assert!(record.predictor.read().is_empty(), "the write waits");
     record_by_column(list, Phase::Single, &first, read, &column_of, id);
-    // What a thread that keeps no write reads.
+    // What a thread that keeps no write reads, of the leading part and of
+    // the whole request: the stale write gave the worker no block.
+    let held_of = |facts: &RequestFacts<'_>| held(&bed.column(facts, Phase::Single).0);
     let elsewhere = thread::scope(|scope| {
-        let reader = scope.spawn(|| held(&bed.column(&second, Phase::Single).0));
+        let reader = scope.spawn(|| (held_of(&second), held_of(&first)));
         reader.join().expect("a reader")
     });
-    assert_eq!(elsewhere, [(0, 0), (0, 2), (0, 0), (0, 0)]);
+    assert_eq!(elsewhere.0, [(0, 0), (0, 2), (0, 0), (0, 0)]);
+    assert_eq!(elsewhere.1, [(0, 0), (0, 2), (0, 0), (0, 0)]);
     assert_eq!(bed.affinity.left_out(), 0);
+}
+
+/// A write takes out the kept write it continues where a leave made that
+/// one stale, whatever its own count. Such a write can write nothing, and
+/// at the bound of eight it would hold a place. The thread keeps a write of
+/// another record, then seven of this one's, among them the leading part of
+/// a longer request. A worker leaves, and the longer request's write for
+/// the same worker meets the record held. It takes the leading part's place
+/// among the eight: the other record's write stays, and nothing is left out.
+#[test]
+fn a_stale_kept_write_leaves_for_the_write_that_continues_it() {
+    let (affinity, _, _) = hosted(false);
+    let (beside, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let other = Bed::new(beside, preset("cache_aware"), 4);
+    let (whole, leading) = (prompt(1_000, 4), prompt(1_000, 2));
+    // The first reads make the two records.
+    assert!(bed.holders(&whole, NOW).is_empty());
+    assert!(other.holders(&whole, NOW).is_empty());
+    thread::scope(|scope| {
+        let keeper = scope.spawn(|| {
+            other.affinity.while_held(|| {
+                bed.affinity.while_held(|| {
+                    // The oldest of the eight is the other record's.
+                    other.decide(&request(&prompt(8_000, 4), 7, NOW), Some(2));
+                    bed.decide(&request(&leading, 7, NOW), Some(1));
+                    for more in 2..8 {
+                        let asked = prompt(1_000 * more, 4);
+                        bed.decide(&request(&asked, 7, NOW), Some(2));
+                    }
+                });
+            });
+            bed.affinity.forget(bed.ids[3]);
+            other.affinity.while_held(|| {
+                bed.affinity.while_held(|| {
+                    bed.decide(&request(&whole, 7, NOW), Some(1));
+                    (other.affinity.left_out(), bed.affinity.left_out())
+                })
+            })
+        });
+        assert_eq!(keeper.join().expect("a keeper"), (0, 0));
+    });
+}
+
+/// A write whose naming a leave made stale is kept by no thread. Met at a
+/// held record it could write nothing, and at the bound of eight it would
+/// push a kept write out. A pair's prefill side fills its column and a
+/// worker leaves. Behind a held record the thread then keeps the writes of
+/// eight more columns, as the decisions a stage asks for inside the pair's
+/// own would leave them. The first column's write meets the record held
+/// too. The eight stay, the thread's next column still reads the oldest,
+/// and nothing is left out.
+#[test]
+fn a_stale_write_that_meets_a_held_record_is_not_kept() {
+    let (affinity, _, _) = hosted(false);
+    let prefills = Bed::new(affinity, paired(), 4);
+    let (stale, oldest) = (prompt(9_000, 4), prompt(1_000, 4));
+    let first = request(&stale, 7, NOW);
+    let (list, to) = (&prefills.pool, prefills.ids[2]);
+    // What the thread's next column reads of the oldest kept write.
+    let kept = || held(&prefills.column(&request(&oldest, 7, NOW), Phase::Prefill).0);
+    thread::scope(|scope| {
+        let keeper = scope.spawn(|| {
+            let (column_of, read) = prefills.column(&first, Phase::Prefill);
+            let read = read.expect("the record speaks for the prefills");
+            prefills.affinity.forget(prefills.ids[3]);
+            prefills.affinity.while_held(|| {
+                for more in 1..9 {
+                    let asked = prompt(1_000 * more, 4);
+                    let facts = request(&asked, 7, NOW);
+                    let (column, named) = prefills.column(&facts, Phase::Prefill);
+                    let named = named.expect("the record speaks for the prefills");
+                    record_by_column(list, Phase::Prefill, &facts, named, &column, to);
+                }
+                let eight = (prefills.affinity.left_out(), kept());
+                let id = prefills.ids[1];
+                record_by_column(list, Phase::Prefill, &first, read, &column_of, id);
+                (eight, (prefills.affinity.left_out(), kept()))
+            })
+        });
+        let (eight, behind) = keeper.join().expect("a keeper");
+        let at_the_third = vec![(0, 0), (0, 0), (0, 4), (0, 0)];
+        assert_eq!(eight, (0, at_the_third.clone()));
+        assert_eq!(behind, (0, at_the_third));
+    });
 }
 
 /// A pick of a worker the record holds the whole request for leaves nothing
