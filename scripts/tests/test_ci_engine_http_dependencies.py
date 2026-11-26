@@ -2246,3 +2246,144 @@ def test_hidden_dot_py_source_has_pip_legacy_deletion_targets(tmp_path, monkeypa
         verifier.native_repair_packages()
     assert (target / "keep").read_bytes() == b"not a bytecode file"
     assert native == [] and pip == []
+
+
+def test_native_planner_repairs_nonpinned_directory_with_pinned_header(tmp_path, monkeypatch):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    folder = root / "tilelang-0.1.15.dist-info"
+    wrong = root / "tilelang-0.1.14.dist-info"
+    folder.rename(wrong)
+    record = wrong / "RECORD"
+    record.write_text(record.read_text().replace(folder.name + "/", wrong.name + "/"))
+    for dist in verifier.md.distributions():
+        if dist._path == folder:
+            dist._path = wrong
+    _rewrite_fixture_record(root, wrong)
+    assert verifier.native_repair_packages() == ["tilelang"]
+    assert native == [] and pip == []
+
+
+@pytest.mark.parametrize("scope", ["package", "metadata"])
+def test_native_planner_unrecorded_payload_cannot_be_called_healthy(tmp_path, monkeypatch, scope):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    parent = root / ("tilelang" if scope == "package" else "tilelang-0.1.15.dist-info")
+    (parent / "unrecorded.txt").write_bytes(b"inert unmatched payload")
+    assert verifier.native_repair_packages() == ["tilelang"]
+    assert native == [] and pip == []
+
+
+def test_native_planner_unrecorded_cache_selects_repair_without_anchor_change(
+    tmp_path, monkeypatch
+):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    cache = Path(importlib.util.cache_from_source(str(root / "tilelang/__init__.py")))
+    cache.parent.mkdir()
+    cache.write_bytes(b"inert derived cache, never imported")
+    assert verifier.native_repair_packages() == ["tilelang"]
+    assert native == [] and pip == []
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_uninstall_record_utf8_is_independent_of_ascii_locale(tmp_path, invalid):
+    record = tmp_path / "RECORD"
+    record.write_bytes(b"tilelang/caf\xc3\xa9.txt,,\n" if not invalid else b"tilelang/\xff.txt,,\n")
+    script = """
+import importlib.util,json,locale,sys
+spec=importlib.util.spec_from_file_location('utf8_record_fixture',sys.argv[1])
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+assert sys.flags.utf8_mode == 0 and locale.getpreferredencoding(False).lower() in ('ansi_x3.4-1968','ascii')
+try:
+    rows=m.uninstall_record_rows(m.Path(sys.argv[2]))
+except UnicodeDecodeError:
+    assert sys.argv[3]=='invalid'
+    print(json.dumps({'invalid_rejected':True,'utf8_mode':sys.flags.utf8_mode}))
+else:
+    assert sys.argv[3]=='valid' and rows[0][0]=='tilelang/caf\\u00e9.txt'
+    print(json.dumps({'valid_utf8':True,'utf8_mode':sys.flags.utf8_mode}))
+"""
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONCOERCECLOCALE": "0"}
+    if "LD_LIBRARY_PATH" in os.environ:
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-X",
+            "utf8=0",
+            "-c",
+            script,
+            str(ROOT / "scripts/ci_verify_sglang_rocm_cohort.py"),
+            str(record),
+            "invalid" if invalid else "valid",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout)["invalid_rejected" if invalid else "valid_utf8"] is True
+
+
+@pytest.mark.parametrize("entry", ["empty", "nested", "linked"])
+@pytest.mark.parametrize("foreign_file", [False, True])
+def test_actual_pip_compaction_does_not_authorize_unlisted_cache_directories(
+    tmp_path, monkeypatch, entry, foreign_file
+):
+    from pip._internal.req.req_uninstall import (
+        StashedUninstallPathSet,
+        UninstallPathSet,
+        compact,
+        compress_for_rename,
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("readonly compaction proof must never remove/stash")
+
+    monkeypatch.setattr(UninstallPathSet, "remove", forbidden)
+    monkeypatch.setattr(StashedUninstallPathSet, "stash", forbidden)
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    folder = root / "torch_c_dlpack_ext-0.1.5.dist-info"
+    cache = root / "__pycache__"
+    foreign = cache / "unqualified-empty"
+    if entry == "linked":
+        target = tmp_path / "foreign-directory"
+        target.mkdir()
+        foreign.symlink_to(target, target_is_directory=True)
+    else:
+        foreign.mkdir()
+        if entry == "nested":
+            (foreign / "nested").mkdir()
+    if foreign_file:
+        (cache / "unqualified-file").write_bytes(b"not selected for deletion")
+    names = verifier.validate_uninstall_record(root, folder, "torch_c_dlpack_ext")
+    paths = {str(root / name) for name in names if (root / name).exists()}
+    compressed = compact(compress_for_rename(paths))
+    whole_cache = str(cache) + os.sep
+    assert (whole_cache in compressed) is not foreign_file
+    if foreign_file:
+        verifier.validate_effective_uninstall_targets(root, folder, "torch_c_dlpack_ext")
+    else:
+        with pytest.raises(RuntimeError, match="Unsafe uninstall compaction"):
+            verifier.validate_effective_uninstall_targets(root, folder, "torch_c_dlpack_ext")
+    assert foreign.is_symlink() or foreign.is_dir()
+    assert native == [] and pip == []
+    (tmp_path / "actual-compaction-proof.json").write_text(
+        json.dumps(
+            {
+                "pip_version": __import__("importlib.metadata", fromlist=["version"]).version(
+                    "pip"
+                ),
+                "entry": entry,
+                "foreign_file": foreign_file,
+                "selected": sorted(paths),
+                "compressed": sorted(compressed),
+                "whole_cache_selected": whole_cache in compressed,
+                "foreign_preserved": foreign.is_symlink() or foreign.is_dir(),
+                "remove_stash_calls": 0,
+            },
+            indent=2,
+        )
+    )

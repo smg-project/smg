@@ -79,7 +79,7 @@ def installed_cache_source(name):
 
 def uninstall_record_rows(record):
     """Use only path spellings whose full-text and pip line-based CSV parsing agree."""
-    text = record.read_text()
+    text = record.read_text(encoding="utf-8")
     try:
         rows = list(csv.reader(io.StringIO(text), strict=True))
         pip_rows = list(csv.reader(text.splitlines()))
@@ -473,9 +473,38 @@ def validate_uninstall_target(root, folder, package, name, names, consoles=()):
     )
 
 
+def validate_uninstall_compaction(targets):
+    """Qualify every directory entry pip could include when compacting file paths."""
+    files = {Path(path) for path in targets}
+    parents = {path.parent for path in files}
+
+    def unreadable(error):
+        raise RuntimeError("Unsafe unreadable uninstall compaction directory") from error
+
+    for parent in parents:
+        subdirectories = set()
+        for directory, directories, entries in os.walk(parent, onerror=unreadable):
+            subdirectories.update(Path(directory) / name for name in directories)
+            # Like pip, a remaining foreign file prevents this directory rename.
+            # Stop early rather than scan an unrelated installed SDK's payload.
+            if any(Path(directory) / name not in files for name in entries):
+                break
+        else:
+            # pip can rename this entire parent. Structural directories on paths
+            # to qualified files are covered; foreign empty trees/links are not.
+            require(
+                all(
+                    not child.is_symlink() and any(path.is_relative_to(child) for path in files)
+                    for child in subdirectories
+                ),
+                "Unsafe uninstall compaction includes unqualified directory entry",
+            )
+
+
 def validate_effective_uninstall_targets(root, folder, package, consoles=()):
     """Conservatively qualify pip's generated deletion paths before a selected repair."""
     names = validate_uninstall_record(root, folder, package, consoles)
+    effective = {os.path.abspath(root / name) for name in names if os.path.lexists(root / name)}
     for name in names:
         source = root / name
         if not str(source).endswith(".py"):
@@ -514,6 +543,9 @@ def validate_effective_uninstall_targets(root, folder, package, consoles=()):
                     "Unsafe unrecorded shared backend cache",
                 )
             validate_uninstall_target(root, folder, package, relative, names, consoles)
+            if os.path.lexists(target):
+                effective.add(os.path.abspath(target))
+    validate_uninstall_compaction(effective)
 
 
 def validate_repair_script_metadata(folder):
@@ -622,9 +654,21 @@ def native_repair_packages():
         needs_repair = False
         try:
             require(observed == version, "Native version differs")
+            require(
+                folder.name == name.replace("-", "_") + "-" + version + ".dist-info",
+                "Native distribution directory differs",
+            )
             names = verify_record(root, folder, consoles)
             if name == "torch-c-dlpack-ext":
                 verify_extension_payload(root, folder, names)
+            for parent in (root / package, folder):
+                require(
+                    all(
+                        not child.is_file() or str(child.relative_to(root)) in names
+                        for child in parent.rglob("*")
+                    ),
+                    "Unrecorded native payload",
+                )
             for key, expected in ANCHORS.items():
                 belongs = (
                     key.startswith(package + "/")
