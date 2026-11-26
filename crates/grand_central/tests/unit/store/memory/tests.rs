@@ -1,9 +1,87 @@
 use super::*;
 use crate::{
     engine::{decision_slot::DecisionSlot, view::WorkerId},
-    store::leases::PickRecord,
+    store::{
+        leases::PickRecord,
+        workers::{Registrant, WorkerPatch},
+    },
     tracking::lease::Lease,
 };
+
+/// The cases' road to the table of records: the five write entries the
+/// store's trait held, for a case that fills a store with no holder of
+/// worker objects. Each takes the write's hold, decides by the rule
+/// every writer decides by and hands the one body the change
+/// ([`MemoryStore::decided`]), as a holder's write call does. They
+/// leave with the table.
+impl MemoryStore {
+    /// The cases' road: a registration by a control call. It leaves with
+    /// the table.
+    pub(crate) fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
+        self.upsert_by(facts, Registrant::Control)
+    }
+
+    /// The cases' road: a registration or its refresh by `maker`, decided
+    /// over the table's own row. It leaves with the table.
+    pub(crate) fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange {
+        let workers = self.writing();
+        let standing = workers.by_key.get(&facts.key);
+        let standing = standing.and_then(|id| workers.rows.get(id));
+        let standing = standing.map(|held| &held.row);
+        let now = Instant::now();
+        let (change, row) = WorkerRow::laid_over(facts, standing, maker, now);
+        let fits = self.decided(workers, now, change, Some(row), None);
+        assert!(fits, "a change decided under the membership lock fits");
+        change
+    }
+
+    /// The cases' road: a patch of the row `id` where it stands at
+    /// `revision`. It leaves with the table.
+    pub(crate) fn patch(
+        &self,
+        id: WorkerId,
+        patch: WorkerPatch,
+        revision: u64,
+    ) -> Option<MembershipChange> {
+        let mut workers = self.writing();
+        let mut row = workers.guarded(id, revision)?.row.clone();
+        patch.laid_on(&mut row.facts);
+        row.revision += 1;
+        let change = MembershipChange::Relabelled { id };
+        self.decided(workers, Instant::now(), change, Some(row), None)
+            .then_some(change)
+    }
+
+    /// The cases' road: the removal of the row `id` where it stands at
+    /// `revision`. It leaves with the table.
+    pub(crate) fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
+        let mut workers = self.writing();
+        workers.guarded(id, revision)?;
+        let change = MembershipChange::Removed { id };
+        self.decided(workers, Instant::now(), change, None, None)
+            .then_some(change)
+    }
+
+    /// The cases' road: a status of the row `id` where it stands at
+    /// `revision`, as a holder tells one. It leaves with the table.
+    pub(crate) fn set_status(
+        &self,
+        id: WorkerId,
+        status: WorkerStatus,
+        revision: u64,
+    ) -> Option<MembershipChange> {
+        let mut workers = self.writing();
+        let from = workers.guarded(id, revision)?.row.status;
+        match workers.set_status(id, status) {
+            StatusSet::Moved => Some(MembershipChange::StatusChanged {
+                id,
+                from,
+                to: status,
+            }),
+            StatusSet::Stood | StatusSet::Refused => None,
+        }
+    }
+}
 
 #[test]
 fn the_lease_sweep_takes_only_a_file_with_a_due_lease() {

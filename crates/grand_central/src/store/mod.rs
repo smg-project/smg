@@ -10,7 +10,7 @@
 //!
 //! | trait | who calls | how often |
 //! |---|---|---|
-//! | [`WorkersStore`] | discovery and the registration handshake, the control scope's register, patch and deregister calls | per membership change; a rollout of 512 workers is under one change per second |
+//! | [`WorkersStore`] | the readers of a membership row: a host, and the holder of its worker objects for a row's status and its count. The trait holds no write: a row is written through that holder, or as a decided change ([`MemoryStore::follow`]) | per membership change or status tell, never per request |
 //! | [`HealthSink`] | every gateway's vetoes. A worker's status is its worker object's word, told by the holder of the objects | per veto a gateway sets or lifts |
 //! | [`LeasesStore`] | every decision, dispatch and completion report, the dispatch-deadline sweep, `Hello` pages | two to three frames per request |
 //!

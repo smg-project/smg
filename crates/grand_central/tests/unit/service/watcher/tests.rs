@@ -160,8 +160,8 @@ fn watching(told: &Told, rows: usize) -> Watcher<Members> {
 #[test]
 fn a_watcher_follows_a_fleet_from_a_snapshot_through_every_kind_of_change() {
     let mut told = Told::new();
-    let a = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1)).id();
-    let b = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.2:8000", 1)).id();
+    let a = told.store.upsert(facts("grpc://10.0.0.1:8000", 1)).id();
+    let b = told.store.upsert(facts("grpc://10.0.0.2:8000", 1)).id();
     let mut watcher = watching(&told, 1);
     let now = Instant::now();
     let mut follows = |told: &mut Told, change: MembershipChange, before: Option<&WorkerRow>| {
@@ -171,11 +171,11 @@ fn a_watcher_follows_a_fleet_from_a_snapshot_through_every_kind_of_change() {
         laid(&watcher);
     };
 
-    let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
+    let change = told.store.upsert(facts("grpc://10.0.0.3:8000", 1));
     follows(&mut told, change, None);
 
     let revision = told.row(a).revision;
-    let change = WorkersStore::set_status(&told.store, a, WorkerStatus::Ready, revision);
+    let change = told.store.set_status(a, WorkerStatus::Ready, revision);
     follows(&mut told, change.expect("a status change"), None);
 
     let patch = WorkerPatch {
@@ -184,16 +184,16 @@ fn a_watcher_follows_a_fleet_from_a_snapshot_through_every_kind_of_change() {
         overload: None,
     };
     let revision = told.row(b).revision;
-    let change = WorkersStore::patch(&told.store, b, patch, revision);
+    let change = told.store.patch(b, patch, revision);
     follows(&mut told, change.expect("a patch"), None);
 
     let old = told.row(a);
-    let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 2));
+    let change = told.store.upsert(facts("grpc://10.0.0.1:8000", 2));
     assert!(matches!(change, MembershipChange::Replaced { .. }));
     follows(&mut told, change, Some(&old));
 
     let last = told.row(b);
-    let change = WorkersStore::remove(&told.store, b, last.revision);
+    let change = told.store.remove(b, last.revision);
     follows(&mut told, change.expect("a removal"), Some(&last));
 
     // A generation's needs write no row, and their place is taken.
@@ -216,7 +216,7 @@ fn a_watcher_follows_a_fleet_from_a_snapshot_through_every_kind_of_change() {
 #[test]
 fn a_change_that_does_not_land_loses_the_place_and_a_snapshot_restores_it() {
     let mut told = Told::new();
-    let first = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1)).id();
+    let first = told.store.upsert(facts("grpc://10.0.0.1:8000", 1)).id();
     let mut watcher = watching(&told, 8);
     let object = |watcher: &Watcher<Members>| {
         let objects = watcher.objects();
@@ -226,9 +226,9 @@ fn a_change_that_does_not_land_loses_the_place_and_a_snapshot_restores_it() {
     let stood = object(&watcher);
     let now = Instant::now();
     // The watcher is not told this one.
-    let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.2:8000", 1));
+    let change = told.store.upsert(facts("grpc://10.0.0.2:8000", 1));
     let _untold = told.event(change, None);
-    let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
+    let change = told.store.upsert(facts("grpc://10.0.0.3:8000", 1));
     let event = told.event(change, None);
     assert_eq!(watcher.take(&event, now), Err(WatchPositionLost::Apart));
     assert_eq!(watcher.at(), None);
@@ -291,11 +291,11 @@ fn a_lease_filed_between_watch_snapshots_stays_on_file() {
 #[test]
 fn the_controllers_word_and_an_event_out_of_its_order_lose_the_place() {
     let mut told = Told::new();
-    WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1));
-    WorkersStore::upsert(&told.store, facts("grpc://10.0.0.2:8000", 1));
+    told.store.upsert(facts("grpc://10.0.0.1:8000", 1));
+    told.store.upsert(facts("grpc://10.0.0.2:8000", 1));
     let now = Instant::now();
     let pages = told.pages(1);
-    let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
+    let change = told.store.upsert(facts("grpc://10.0.0.3:8000", 1));
     let event = told.event(change, None);
 
     let mut watcher = over(Arc::new(MemoryStore::new()));
@@ -378,13 +378,13 @@ fn the_controllers_word_and_an_event_out_of_its_order_lose_the_place() {
 #[test]
 fn a_cut_snapshot_starts_again_and_a_refused_row_loses_the_place() {
     let mut told = Told::new();
-    WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1));
-    WorkersStore::upsert(&told.store, facts("grpc://10.0.0.2:8000", 1));
+    told.store.upsert(facts("grpc://10.0.0.1:8000", 1));
+    told.store.upsert(facts("grpc://10.0.0.2:8000", 1));
     let now = Instant::now();
     let mut watcher = over(Arc::new(MemoryStore::new()));
     assert_eq!(watcher.take(&told.pages(1)[0], now), Ok(()));
     assert_eq!(watcher.request().resume_seq, 0);
-    let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
+    let change = told.store.upsert(facts("grpc://10.0.0.3:8000", 1));
     let _told_to_others = told.event(change, None);
     for page in told.pages(2) {
         assert_eq!(watcher.take(&page, now), Ok(()));
@@ -432,11 +432,12 @@ fn a_cut_snapshot_starts_again_and_a_refused_row_loses_the_place() {
 fn a_stream_that_lost_the_place_tells_nothing_more() {
     let told = Told::new();
     for n in 1..=3 {
-        WorkersStore::upsert(&told.store, facts(&format!("grpc://10.0.0.{n}:8000"), 1));
+        told.store
+            .upsert(facts(&format!("grpc://10.0.0.{n}:8000"), 1));
     }
     let now = Instant::now();
     let mut watcher = over(Arc::new(MemoryStore::new()));
-    WorkersStore::upsert(&told.store, facts("grpc://10.0.0.4:8000", 1));
+    told.store.upsert(facts("grpc://10.0.0.4:8000", 1));
     let before = held(watcher.store());
     let pages = told.pages(1);
     let blank = proto::WorkerSnapshot {
@@ -469,7 +470,7 @@ fn a_stream_that_lost_the_place_tells_nothing_more() {
 #[test]
 fn a_snapshot_a_stores_journal_refuses_loses_the_place() {
     let told = Told::new();
-    WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1));
+    told.store.upsert(facts("grpc://10.0.0.1:8000", 1));
     let store = Arc::new(MemoryStore::journaled(Arc::new(Log::new(8))));
     let mut watcher = over(Arc::clone(&store));
     // A place under no term, which a log takes from nobody.
@@ -488,9 +489,9 @@ fn a_snapshot_a_stores_journal_refuses_loses_the_place() {
 /// the controller's side and that event.
 fn followed() -> (Told, Watcher<Members>, proto::WorkerEvent) {
     let mut told = Told::new();
-    WorkersStore::upsert(&told.store, facts("grpc://10.0.0.1:8000", 1));
+    told.store.upsert(facts("grpc://10.0.0.1:8000", 1));
     let mut watcher = watching(&told, 8);
-    let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.2:8000", 1));
+    let change = told.store.upsert(facts("grpc://10.0.0.2:8000", 1));
     let event = told.event(change, None);
     assert_eq!(watcher.take(&event, Instant::now()), Ok(()));
     (told, watcher, event)
@@ -524,7 +525,7 @@ fn a_place_not_past_the_last_and_an_epoch_held_already_lose_the_place() {
     lost(&mut watcher, &needs, WatchPositionLost::Order);
 
     let (mut told, mut watcher, _) = followed();
-    let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
+    let change = told.store.upsert(facts("grpc://10.0.0.3:8000", 1));
     let mut older = told.event(change, None);
     older.term = TERM - 1;
     lost(&mut watcher, &older, WatchPositionLost::Order);

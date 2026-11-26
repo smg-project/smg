@@ -5,7 +5,7 @@
 use super::StoreSnapshot;
 use crate::{
     engine::view::{Role, WorkerId},
-    store::{GatewayId, MemoryStore, WorkerFacts, WorkersStore},
+    store::{GatewayId, MemoryStore, WorkerFacts},
 };
 
 mod veto_reader;

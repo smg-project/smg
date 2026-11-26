@@ -148,6 +148,75 @@ pub(crate) fn lay_standing<G: Generation>(objects: &Objects<G>, store: &MemorySt
     objects.reconcile(store, &rows);
 }
 
+/// The cases' road to a store's table writes what the holder's write
+/// calls write. One registration, its refresh in place, a patch, a
+/// connect signal, the key's next life and a removal go through a
+/// holder. The same six go through the cases' road of a second store.
+/// The two tables hold the same rows, and the two journals were told
+/// the same.
+#[test]
+fn the_cases_road_writes_a_table_as_the_holders_write_calls_do() {
+    let replica = Replica::new();
+    let (held, objects) = (&replica.store, &replica.objects);
+    let told = Arc::new(Told::default());
+    let alone = MemoryStore::journaled(Arc::clone(&told) as _);
+    // A row but for the instant it was admitted at: each store reads
+    // its own clock.
+    let plain = |row: &WorkerRow| {
+        let row = row.clone();
+        (row.id, row.facts, row.status, row.revision, row.maker)
+    };
+    let words = |told: &Told| {
+        let told = told.0.lock();
+        let word = |(change, row, left): &Member| {
+            let (row, left) = (row.as_ref().map(plain), left.as_ref().map(plain));
+            (*change, row, left)
+        };
+        told.iter().map(word).collect::<Vec<_>>()
+    };
+    let same = || {
+        let rows = |store: &MemoryStore| store.all_rows().1.iter().map(plain).collect::<Vec<_>>();
+        assert_eq!(rows(held), rows(&alone), "the two tables");
+        assert_eq!(words(&replica.told), words(&told), "the two journals");
+    };
+    let maker = Registrant::Control;
+    // A new key, then its refresh in place.
+    for tier in ["gold", "iron"] {
+        let by_holder = objects.upsert(held, facts(1, tier), maker.clone());
+        let by_road = alone.upsert_by(facts(1, tier), maker.clone());
+        assert_eq!(by_holder, Some(by_road));
+        same();
+    }
+    // A patch at the row's revision.
+    let id = identity(A, 1);
+    let revision = held.get(id).expect("the row").revision;
+    let patch = WorkerPatch {
+        priority: Some(7),
+        ..WorkerPatch::default()
+    };
+    let by_holder = objects.patch(held, id, patch.clone(), revision);
+    assert_eq!(by_holder, alone.patch(id, patch, revision));
+    same();
+    // A status: the holder's connect signal, and the road's ready.
+    let revision = held.get(id).expect("the row").revision;
+    objects.connect_row(held, id, revision);
+    let by_road = alone.set_status(id, WorkerStatus::Ready, revision);
+    assert!(by_road.is_some(), "the status moved");
+    same();
+    // The key's next life, then its removal.
+    let by_holder = objects.upsert(held, facts(2, "iron"), maker.clone());
+    assert_eq!(by_holder, Some(alone.upsert_by(facts(2, "iron"), maker)));
+    same();
+    let next = identity(A, 2);
+    let revision = held.get(next).expect("the next life's row").revision;
+    assert_eq!(
+        objects.remove(held, next, revision),
+        alone.remove(next, revision)
+    );
+    same();
+    assert_eq!(told.0.lock().len(), 6, "each write was told once");
+}
+
 /// Each write of a row is decided over the objects: the object stands
 /// when the write returns, and the journal, the table
 /// and the object state one row. A row changed in place keeps its

@@ -253,7 +253,7 @@ fn a_refused_tell_behind_a_second_move_takes_nothing_back() {
     let first = (ObjectStatus::Pending, ObjectStatus::Ready);
     assert!(matches!(leader.probe(false), ProbeAnswer::Moved { .. }));
     // The store's own removal: the holder's object stands a while yet.
-    WorkersStore::remove(&leader.store, leader.row, 1).expect("removed");
+    leader.store.remove(leader.row, 1).expect("removed");
     let (store, objects) = (&leader.store, &leader.objects);
     let told = objects.tell_status(store, &leader.id, leader.revision, first, &|| true);
     assert_eq!(told, HealthWrite::NoRow);

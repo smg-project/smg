@@ -288,6 +288,33 @@ fn a_removal_the_store_does_not_take_leaves_the_row_an_object() {
     assert_eq!(standby.objects.row_of(&object), Some(row));
 }
 
+/// A removal the store does not take lays the row read off its object,
+/// and not the one the store holds under the id. The standby's table is
+/// handed a patch of the row around the holder, as a decided change, so
+/// the two rows differ. A removal out of place takes the object out and
+/// lays it again from the row it stated.
+#[test]
+fn a_removal_the_store_does_not_take_lays_the_row_read_off_its_object() {
+    let (leader, standby) = (Replica::new(), Replica::new());
+    leader.upsert(facts(1, "gold"));
+    follow(&standby, &leader);
+    let row = standby.one_row(A);
+    let mut around = row.clone();
+    around.facts = facts(1, "iron");
+    around.revision += 1;
+    let epoch = standby.store.epoch() + 1;
+    let patch = MembershipChange::Relabelled { id: row.id };
+    standby.store.follow(at(epoch), epoch, patch, Some(around));
+    let table = standby.store.get(row.id).expect("the row stands");
+    assert_eq!(table.facts, facts(1, "iron"), "the table's row moved");
+    let removal = MembershipChange::Removed { id: row.id };
+    assert!(!hand(&standby, 2, removal, None), "out of place");
+    let object = standby
+        .object(A)
+        .expect("the row that stands has an object");
+    assert_eq!(standby.objects.row_of(&object), Some(row));
+}
+
 /// The holder answers whether the store took an event, by each kind: a
 /// row, a status and a removal answer yes at the next epoch, and no at
 /// the epoch the store holds already, where nothing fits.
