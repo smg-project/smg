@@ -28,10 +28,6 @@ pub use answers::{
     ApplyCounts, ApplyOutcome, Document, DryRun, EnforceOutcome, EnforceRefused, NeedsRow, NotHeld,
     OnFile, SpecRejected, Status,
 };
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use document_manager::needs_rows;
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use document_manager::Validate;
 #[cfg(feature = "controller")]
 pub(crate) use document_manager::{above, Checked, Entered, FollowerTurn, Held, Line};
 pub use document_manager::{dry_run_against, DocumentManager};

@@ -20,9 +20,8 @@ pub(crate) use crate::document::operator::test_support::{
 };
 use crate::{
     document::operator::{
-        needs_rows,
-        test_support::{document_of, standing, stock},
-        ApplyCounts, NotHeld, OnFile, Validate,
+        test_support::{document_of, needs_rows, standing, stock, Validate},
+        ApplyCounts, NotHeld, OnFile,
     },
     engine::view::WorkerId,
     service::{
