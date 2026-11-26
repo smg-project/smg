@@ -1368,6 +1368,104 @@ fn a_newest_generation_that_does_not_run_refuses_the_bind() {
     assert!(!generations.writable() && !generations.bound());
 }
 
+/// A spec that writes a local tag in front of a key.
+const TAGGED_KEY: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default: {!mine pick: random}\n";
+/// The same spec with the tag taken out.
+const NO_TAG: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default: {pick: random}\n";
+
+/// What a start over the directory at `dir` runs: the generation of a new
+/// door bound there, or the bind's refusal as it prints.
+fn start(dir: &Path) -> Result<u64, String> {
+    let (store, generations) = generations();
+    let opened = SpecStore::open(dir.to_owned()).expect("the directory opens");
+    match generations.bind_store(opened, || false) {
+        Ok(()) => Ok(standing(&store).0),
+        Err(refused) => Err(refused.to_string()),
+    }
+}
+
+/// A store whose newest file writes a local tag in front of a key does
+/// not start. A start reads that file through the form's read, which
+/// refuses such a key by the tag's name, and the bind names the
+/// generation. A build that read the key as if its tag were not written
+/// applied such a spec and kept its bytes, tag and all: a store keeps a
+/// document as it was applied. The file here is written by the store's
+/// own writer, as that build's apply wrote it.
+#[test]
+fn a_newest_generation_with_a_local_tag_on_a_key_refuses_the_start() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut on_file = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+    let first = Persisted {
+        generation: 1,
+        format: Format::Yaml,
+    };
+    on_file
+        .persist(first, TAGGED_KEY.as_bytes())
+        .expect("it persists");
+    drop(on_file);
+
+    let refused = "generation 1: not a policy spec in yaml: profiles.default: the tag `!mine` is none JSON writes: take the tag out at line 3 column 12";
+    assert_eq!(start(dir.path()), Err(refused.to_owned()));
+}
+
+/// The way out of that refusal is taken on the build that reads the tagged
+/// file, ahead of the newer build's start: the same spec with the tag
+/// taken out, under the next generation's number. The two texts are one
+/// spec to that build. So with no number, or under the standing one, its
+/// apply changes nothing and writes no file: the newest file keeps its
+/// tag, and the newer build does not start. Under the next number its
+/// apply writes a file with no tag in it, and the newer build starts on
+/// that one.
+///
+/// That build's door is stood in for by this build's, bound while the
+/// first file holds the text with no tag. A door reads a file once, at its
+/// bind: behind the bind the file takes the tagged text that build's apply
+/// wrote. What an apply writes for a spec its door holds already is the
+/// same on both builds.
+#[test]
+fn a_store_with_a_tagged_key_starts_once_the_next_generation_writes_none() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let first = dir.path().join(name_of(1, "yaml"));
+    let before = || {
+        std::fs::write(&first, NO_TAG).expect("the file");
+        let (_, door) = generations();
+        bind(&door, dir.path());
+        std::fs::write(&first, TAGGED_KEY).expect("the file as that build wrote it");
+        door
+    };
+    let ran = |door: &DocumentManager, document: Vec<u8>| {
+        enforce(door, document).map(|(number, _)| number)
+    };
+
+    // With no number and under the standing one: the spec stands already.
+    let door = before();
+    for again in [NO_TAG.as_bytes().to_vec(), with_line(NO_TAG, 1)] {
+        assert_eq!(ran(&door, again), Ok(1));
+    }
+    drop(door);
+    assert_eq!(names(dir.path()), BTreeSet::from([name_of(1, "yaml")]));
+    let refused = start(dir.path()).expect_err("the newest file keeps its tag");
+    assert!(refused.starts_with("generation 1: "), "{refused}");
+    assert!(refused.contains("the tag `!mine`"), "{refused}");
+
+    // Under the next number: a new file, with no tag in it.
+    let door = before();
+    assert_eq!(ran(&door, with_line(NO_TAG, 2)), Ok(2));
+    drop(door);
+    let second = dir.path().join(name_of(2, "yaml"));
+    assert_eq!(
+        std::fs::read(&second).expect("the new file"),
+        with_line(NO_TAG, 2)
+    );
+    // The newer build starts on it. The first file stays as it was, and
+    // stops no start.
+    assert_eq!(start(dir.path()), Ok(2));
+    assert_eq!(
+        std::fs::read(&first).expect("the first file"),
+        TAGGED_KEY.as_bytes()
+    );
+}
+
 /// A number on file that this door did not write, as another process on
 /// the directory leaves one: the apply is refused by name, the file
 /// stays as it was, and the running generation stays.
