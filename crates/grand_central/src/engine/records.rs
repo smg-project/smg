@@ -1861,4 +1861,5 @@ fn claimed(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/engine/records/tests.rs"]
 mod tests;

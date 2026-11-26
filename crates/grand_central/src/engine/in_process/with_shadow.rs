@@ -252,4 +252,5 @@ pub(super) fn count(own: Loaded<'_, '_>, said: Shadowed, asked: ShadowSide) {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/with_shadow/tests.rs"]
 pub(super) mod tests;

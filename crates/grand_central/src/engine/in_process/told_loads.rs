@@ -210,4 +210,5 @@ impl InProcess {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/told_loads/tests.rs"]
 mod tests;

@@ -295,4 +295,5 @@ fn hand_back(request: &mut Request<'_>, lent: &Request<'_>) {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/signals/tests/mod.rs"]
 mod tests;

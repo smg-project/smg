@@ -76,6 +76,7 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "../../tests/unit/store/snapshot/tests/mod.rs"]
 mod tests;
 
 /// How long a build the membership writes left owed may wait for its

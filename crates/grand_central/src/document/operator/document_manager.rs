@@ -1231,4 +1231,5 @@ impl Held {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/document/operator/document_manager/tests/mod.rs"]
 mod tests;

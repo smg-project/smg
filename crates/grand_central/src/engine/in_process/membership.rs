@@ -924,4 +924,5 @@ impl InProcess {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/membership/tests/mod.rs"]
 pub(super) mod tests;
