@@ -3228,21 +3228,30 @@ fn fleet_with_config(
 const MAXIMAL_DIVERSION_PERIOD_CHILD: &str = "SMG_TEST_MAXIMAL_CACHE_AWARE_DIVERSION_PERIOD";
 
 /// Liveness budgets are first-set-wins process globals, so a child contains this test's value.
+/// The child's output is captured: its lines stay out of this run's own, and a failure shows them.
 #[test]
 fn a_maximal_cache_aware_diversion_period_does_not_overflow() {
     if std::env::var_os(MAXIMAL_DIVERSION_PERIOD_CHILD).is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "policies::cache_aware::tests::a_maximal_cache_aware_diversion_period_does_not_overflow",
-                "--nocapture",
             ])
             .env(MAXIMAL_DIVERSION_PERIOD_CHILD, "1")
-            .status()
+            .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            status.success(),
-            "isolated regression test failed: {status}"
+            output.status.success(),
+            "isolated regression test failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A name that matches no test also exits with success: the child
+        // must have run this one case.
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "the isolated child ran no test:\n{stdout}"
         );
         return;
     }
