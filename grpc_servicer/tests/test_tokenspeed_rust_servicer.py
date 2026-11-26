@@ -486,6 +486,58 @@ def test_server_facts_carry_the_grammar_backend_the_scheduler_runs(monkeypatch):
     assert json.loads(rust.server_facts(unset)["server_args_json"])["grammar_backend"] == "xgrammar"
 
 
+def test_server_facts_ask_the_engine_for_a_checkpoint_it_has_not_read(monkeypatch, caplog):
+    # An unset flag on a checkpoint the engine had not read when it parsed its
+    # arguments (a hub id its cache did not hold): the facts ask the engine's
+    # own method again, bare and on a deep copy, so the launch still finds its
+    # arguments unread and settles them itself.
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    monkeypatch.setattr(
+        "smg_grpc_servicer.constrained_decoding.installed_xgrammar_version", lambda: "0.1.32"
+    )
+    calls = []
+
+    class UnreadCheckpoint(_GrammarServerArgs):
+        def resolve_model_defaults(self, download=False):
+            calls.append(download)
+            self.nested.append("read")
+            if isinstance(self.outcome, Exception):
+                raise self.outcome
+            self._beam_checkpoint = self.outcome
+            if self.outcome:
+                self.grammar_backend = "xgrammar"
+
+    def facts_of(outcome, backend="none", unset=True, checkpoint=None):
+        calls.clear()
+        args = UnreadCheckpoint(grammar_backend=backend)
+        args._grammar_backend_unset, args._beam_checkpoint = unset, checkpoint
+        args.outcome, args.nested = outcome, []
+        facts = json.loads(rust.server_facts(args)["server_args_json"])
+        # The arguments handed in are as they were, down to a nested object.
+        assert (args.grammar_backend, args._beam_checkpoint, args.nested) == (
+            backend,
+            checkpoint,
+            [],
+        )
+        return facts.get("grammar_backend"), facts.get("structural_tag_vocabulary"), list(calls)
+
+    # The engine settles its default: the key and the vocabulary label of an
+    # older xgrammar follow what it settled.
+    assert facts_of(True) == ("xgrammar", "older", [False])
+    assert facts_of(False) == ("none", None, [False])
+    # A checkpoint the cache still does not hold (the method returns with its
+    # mark unset) and a refusal the method raises: nothing is written and
+    # nothing is logged, as before; the launch raises the refusal again.
+    with caplog.at_level("DEBUG"):
+        assert facts_of(None) == (None, "older", [False])
+        assert facts_of(ValueError("a flag this checkpoint refuses")) == (None, "older", [False])
+    assert not caplog.records
+    # A flag that was given and a checkpoint already read are not asked again.
+    assert facts_of(True, backend="xgrammar", unset=False) == ("xgrammar", "older", [])
+    assert facts_of(True, checkpoint=False) == ("none", None, [])
+
+
 def test_server_facts_never_carry_credentials(monkeypatch):
     """The Rust server reports the same server args as the Python one, so the
     in-engine RL control key and tokens must not leave the engine here either.
