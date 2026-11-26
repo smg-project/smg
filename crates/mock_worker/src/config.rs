@@ -766,7 +766,9 @@ impl Config {
     /// the worker's own KV pool (`--worker-kv-tokens`) and pass-time scale
     /// (`--worker-pass-time-scale`). Its own pool changes how much it holds,
     /// not how long its steps take: its decode cost keeps the fleet's pool as
-    /// its reference, unless a calibration gave the reference.
+    /// its reference, unless a calibration gave the reference. Its synthetic
+    /// output keeps to the ids the worker's tokenizer decodes, where
+    /// `--tokenizer` names local files.
     pub fn engine_for(&self, worker: &str) -> EngineParams {
         let mut params = self.engine.clone();
         if let Some(&tokens) = self.worker_kv_tokens.get(worker) {
@@ -778,6 +780,7 @@ impl Config {
         if let Some(&scale) = self.worker_pass_time_scale.get(worker) {
             params.pass_time_scale = scale;
         }
+        params.output_table = crate::script::output_table(self);
         params
     }
 
