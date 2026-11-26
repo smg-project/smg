@@ -282,7 +282,7 @@ A gateway you host can call the standalone service. Use the generated client or 
 | Gateway | `WatchWorkers` | Snapshot followed by membership and status changes, for all models or a named set. Resume from a term and sequence. A position outside the retained history can require a new snapshot. The service refuses `with_needs`. |
 | Control | `RegisterWorker` | `ADD` (default), `REPLACE`, or `UPSERT` by URL. An upsert with changed role, wire, models or demand facts makes a new incarnation. `wait_ready` requires probes disabled. |
 | Control | `PatchWorker`, `DeregisterWorker` | Guard by worker ID and revision. Patch sets and removes labels and can replace overload thresholds. Deregister can mark draining, or remove. A drain needs a later remove. A decision made behind an acknowledged registration, drain or removal reads the fleet that call left. |
-| Control | `GetSnapshot` | Leader's redacted `SLICE_WORKERS` and `SLICE_SPEC`. Name the slices explicitly. Empty requests ask for all ten and are refused. The spec slice includes retained generations with a store. |
+| Control | `GetSnapshot` | Leader's redacted `SLICE_WORKERS` and `SLICE_SPEC`. Name the slices explicitly. Empty requests ask for all nine and are refused. The spec slice includes retained generations with a store. |
 | Control | `Explain` | Read a sampled decision by gateway and request ID on the leader. |
 | Control | `ApplyPolicySpec`, `GetPolicySpec`, `RollbackPolicySpec` | Validate, read or change documents as described under [Updating a document](#updating-a-document). |
 | Control | `StepDown`, `WatchRegime` | Return `UNIMPLEMENTED` after admission. |
@@ -1145,7 +1145,7 @@ The leader's load monitor takes the load records on a worker's stream, and a sta
 - A driver for the leader's own doubt of a worker. The store takes no such write, and a standalone controller's decision reads a worker's stalled bit on the worker's own object and in the asking gateway's vetoes. The object's bit is written by the worker crate's liveness check, which runs with its load monitor: a replica runs that monitor while it leads.
 - A plugin named in the document. The format has no field for one.
 - Two calls of the contract: `StepDown` and `WatchRegime`. The stock controller answers each as not served.
-- Eight of the ten slices of the snapshot call, `GetSnapshot`. The stock controller serves the worker rows and the spec's status. It refuses a request for any other slice by the slice's name, and a request that names no slice asks for all ten. It also refuses a request for identifiers in clear.
+- Seven of the nine slices of the snapshot call, `GetSnapshot`. The stock controller serves the worker rows and the spec's status. It refuses a request for any other slice by the slice's name, and a request that names no slice asks for all nine. It also refuses a request for identifiers in clear.
 - The audit mode of the apply call.
 - A key for the workers discovery finds. The controller refuses one at its start. It keeps no worker key, and a replica that took the lead could not learn the key of a worker found before it: a pass registers no worker whose row stands.
 - Flags for the timing of a discovery registration, and a found worker's cache-event word written again at an apply.

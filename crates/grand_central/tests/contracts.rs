@@ -1818,6 +1818,40 @@ fn the_pair_class_and_the_pair_rows_keep_their_numbers_and_names_reserved() {
     );
 }
 
+/// The pair rows' slice left the snapshot request behind its rows: its
+/// number and its name stay reserved, so a later slice takes neither.
+#[test]
+fn the_snapshots_slices_keep_the_pair_slices_number_and_name_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    assert_eq!(
+        enum_values(controller, "SnapshotRequest.Slice"),
+        Some(vec![
+            ("SLICE_UNSPECIFIED".to_owned(), 0),
+            ("SLICE_WORKERS".to_owned(), 1),
+            ("SLICE_HEALTH".to_owned(), 2),
+            ("SLICE_LOADS".to_owned(), 3),
+            ("SLICE_SESSIONS".to_owned(), 4),
+            ("SLICE_LEASES".to_owned(), 5),
+            ("SLICE_SPEC".to_owned(), 7),
+            ("SLICE_PLUGINS".to_owned(), 8),
+            ("SLICE_KV_INDEX".to_owned(), 9),
+            ("SLICE_GATEWAYS".to_owned(), 10),
+        ])
+    );
+    let slices = message(controller, "SnapshotRequest")
+        .and_then(|request| request.enum_type.iter().find(|e| e.name() == "Slice"))
+        .expect("SnapshotRequest.Slice is in the controller file");
+    let reserved: Vec<i32> = slices
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..=range.end())
+        .collect();
+    assert_eq!(reserved, [6], "the reserved number");
+    assert_eq!(slices.reserved_name, strings(&["SLICE_PAIRS"]));
+}
+
 /// The packed request block's layout as the world's comment states it: an
 /// 80-byte header, the model bytes, zero bytes to the next multiple of 8,
 /// then the u64 sections. The arithmetic is mirrored here so the alignment
