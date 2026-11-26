@@ -465,7 +465,7 @@ pub trait Scorer: Lifecycle + Debug {
     /// How the stage cuts a request into the heads it places it by on a
     /// ring its caller lends ([`RequestFacts::ring`]): the prefix form of
     /// the hash ring, which reads where a head stands
-    /// ([`LentRing::head_position`](crate::policies::consistent_hashing::LentRing::head_position))
+    /// ([`crate::policies::consistent_hashing::LentRing::head_position`])
     /// and never where the routing value's own text does. What makes a
     /// request for its caller states a place for each head under such a
     /// stage ([`Engine::states_head_places`]). `None` from every other
