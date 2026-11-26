@@ -1114,12 +1114,13 @@ impl store::Journal for LosesTheLead {
     fn member(
         &self,
         at: Option<Position>,
+        term: Option<u64>,
         epoch: u64,
         change: store::MembershipChange,
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
-    ) {
-        self.log.member(at, epoch, change, row, left);
+    ) -> bool {
+        let goes_on = self.log.member(at, term, epoch, change, row, left);
         match self.holds.load(Ordering::Relaxed) {
             0 => {
                 let next = Position {
@@ -1131,6 +1132,7 @@ impl store::Journal for LosesTheLead {
             }
             more => self.holds.store(more - 1, Ordering::Relaxed),
         }
+        goes_on
     }
 
     fn generation(&self, at: Option<Position>, generation: u64) {
@@ -2888,6 +2890,205 @@ fn the_holders_public_connect_signal_and_drain_write_under_no_term() {
     assert_eq!(status(), Some(WorkerStatus::Ready));
     assert!(door.objects.drain_row(&store, id, revision));
     assert_eq!(status(), Some(WorkerStatus::Draining));
+}
+
+/// A term that ends by a later take of the store ([`LeavesAtATelling`]).
+const BY_A_RISE: usize = 1;
+/// A term that ends by the start of a later leader's term, which the store
+/// follows ([`LeavesAtATelling`]).
+const BY_A_FOLLOWED_TERM: usize = 2;
+
+/// The door's log as its store's journal, which leaves [`TERM`] in the
+/// telling of the next status once a case arms it: behind every ask of
+/// the writer's word, and ahead of the place the log gives the event.
+struct LeavesAtATelling {
+    log: Arc<replication::Log>,
+    /// How the term ends at the next status told, [`BY_A_RISE`] or
+    /// [`BY_A_FOLLOWED_TERM`], and zero once it has.
+    armed: AtomicUsize,
+}
+
+impl store::Journal for LeavesAtATelling {
+    fn member(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        change: store::MembershipChange,
+        row: Option<&WorkerRow>,
+        left: Option<&WorkerRow>,
+    ) -> bool {
+        if matches!(change, store::MembershipChange::StatusChanged { .. }) {
+            match self.armed.swap(0, Ordering::Relaxed) {
+                BY_A_RISE => self.log.term_rose(TERM + 1),
+                BY_A_FOLLOWED_TERM => {
+                    let next = Position {
+                        seq: self.log.head().seq + 1,
+                        term: TERM + 1,
+                    };
+                    let guard = self.log.adopt(next).expect("the next place");
+                    guard.mark();
+                }
+                _ => {}
+            }
+        }
+        self.log.member(at, term, epoch, change, row, left)
+    }
+
+    fn generation(&self, at: Option<Position>, generation: u64) {
+        self.log.generation(at, generation);
+    }
+
+    fn term_rose(&self, term: u64) {
+        self.log.term_rose(term);
+    }
+
+    fn term_followed(&self, at: Position) {
+        self.log.term_followed(at);
+    }
+
+    fn head(&self) -> Position {
+        self.log.head()
+    }
+
+    fn followed(&self) -> Option<u64> {
+        self.log.followed()
+    }
+
+    fn released(&self) {
+        self.log.released();
+    }
+
+    fn restart(&self, at: Position) -> bool {
+        self.log.restart(at).is_ok()
+    }
+}
+
+/// A door under [`TERM`] over a store whose journal leaves that term in
+/// the telling of a status, once a case arms it: the store, the door and
+/// the journal.
+fn leaving() -> (Arc<MemoryStore>, MembershipCalls, Arc<LeavesAtATelling>) {
+    let (_, feed) = journaled_from(&LeasePlace::Process, 0);
+    let journal = Arc::new(LeavesAtATelling {
+        log: Arc::clone(&feed.log),
+        armed: AtomicUsize::new(0),
+    });
+    let told: Arc<dyn store::Journal> = Arc::<LeavesAtATelling>::clone(&journal);
+    let store = Arc::new(MemoryStore::journaled(told).with_decision_slots(1));
+    store::LeasesStore::set_term(store.as_ref(), TERM);
+    let log = Arc::clone(&feed.log);
+    let door = MembershipCalls::based(Arc::clone(&store), log, 0, holder(&store));
+    (store, door, journal)
+}
+
+/// A connect signal whose term ends in its own telling writes nothing.
+/// Every ask of the door's word held: the term ended behind them, by a
+/// later take or by the start of a term the store follows, ahead of the
+/// place the log would give the status's event. The log takes no event
+/// and nothing moved. The row is pending on the object and in the table,
+/// the epoch counts the registration's write alone, and the log's head is
+/// the place that ended the term. The call that waits answers the row so.
+fn a_connect_signal_whose_term_ends_at_its_telling(ends: usize) {
+    let (store, door, journal) = leaving();
+    journal.armed.store(ends, Ordering::Relaxed);
+    let waits = proto::RegisterWorkerRequest {
+        wait_ready: true,
+        ..ask(unchecked(URL), Mode::Add)
+    };
+    let told = door
+        .register(&operator(), under(TERM), &waits)
+        .expect("registered");
+    let armed = journal.armed.load(Ordering::Relaxed);
+    assert_eq!(armed, 0, "the signal reached its telling: {ends}");
+    let row = row_of(&told);
+    assert_eq!(row.status, proto::WorkerStatus::Pending as i32, "{ends}");
+    let id = WorkerId(row.id);
+    let status = |row: Option<WorkerRow>| row.map(|row| row.status);
+    let pending = Some(WorkerStatus::Pending);
+    assert_eq!(
+        (status(store.get(id)), status(door.row(id))),
+        (pending, pending),
+        "{ends}"
+    );
+    assert_eq!(store.epoch(), 1, "the registration's write alone: {ends}");
+    // The term's start, the registration's write, then the event that
+    // ended the term: no status stands behind it.
+    let ended = Position {
+        seq: 3,
+        term: TERM + 1,
+    };
+    assert_eq!(journal.log.head(), ended, "{ends}");
+}
+
+/// A connect signal whose term a later take ends, in the signal's own
+/// telling, moves nothing.
+#[test]
+fn a_connect_signal_whose_term_a_later_take_ends_at_its_telling_moves_nothing() {
+    a_connect_signal_whose_term_ends_at_its_telling(BY_A_RISE);
+}
+
+/// A connect signal whose term the start of a followed term ends, in the
+/// signal's own telling, moves nothing.
+#[test]
+fn a_connect_signal_whose_term_a_followed_term_ends_at_its_telling_moves_nothing() {
+    a_connect_signal_whose_term_ends_at_its_telling(BY_A_FOLLOWED_TERM);
+}
+
+/// A drain whose term ends in its own telling writes nothing, as a
+/// connect signal there writes nothing. The call answers that the store
+/// does not lead the term, never that the row moved.
+fn a_drain_whose_term_ends_at_its_telling(ends: usize) {
+    let (store, door, journal) = leaving();
+    let row = row_of(
+        &door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered"),
+    );
+    let id = WorkerId(row.id);
+    let drain = proto::DeregisterWorkerRequest {
+        worker_id: row.id,
+        revision: row.revision,
+        drain: true,
+    };
+    let (epoch, head) = (store.epoch(), journal.log.head());
+    journal.armed.store(ends, Ordering::Relaxed);
+    let refused = door
+        .deregister(&operator(), under(TERM), &drain)
+        .expect_err("the term ended at the telling");
+    let armed = journal.armed.load(Ordering::Relaxed);
+    assert_eq!(armed, 0, "the drain reached its telling: {ends}");
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (Code::Unavailable, super::LEADS_NO_TERM),
+        "{ends}"
+    );
+    let status = |row: Option<WorkerRow>| row.map(|row| row.status);
+    let pending = Some(WorkerStatus::Pending);
+    assert_eq!(
+        (status(store.get(id)), status(door.row(id))),
+        (pending, pending),
+        "{ends}"
+    );
+    assert_eq!(store.epoch(), epoch, "{ends}");
+    let ended = Position {
+        seq: head.seq + 1,
+        term: TERM + 1,
+    };
+    assert_eq!(journal.log.head(), ended, "{ends}");
+}
+
+/// A drain whose term a later take ends, in the drain's own telling,
+/// moves nothing and is refused as not leading.
+#[test]
+fn a_drain_whose_term_a_later_take_ends_at_its_telling_is_refused_as_not_leading() {
+    a_drain_whose_term_ends_at_its_telling(BY_A_RISE);
+}
+
+/// A drain whose term the start of a followed term ends, in the drain's
+/// own telling, moves nothing and is refused as not leading.
+#[test]
+fn a_drain_whose_term_a_followed_term_ends_at_its_telling_is_refused_as_not_leading() {
+    a_drain_whose_term_ends_at_its_telling(BY_A_FOLLOWED_TERM);
 }
 
 #[test]
