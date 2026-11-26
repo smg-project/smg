@@ -88,7 +88,14 @@ def exercise_bake_processes(source, directory):
         p.__dict__,
         deadline=time.monotonic() + 30,
         output=output,
-        env={"CONTEXT": str(context)},
+        env={
+            "CONTEXT": str(context),
+            **(
+                {"LD_LIBRARY_PATH": os.environ["LD_LIBRARY_PATH"]}
+                if "LD_LIBRARY_PATH" in os.environ
+                else {}
+            ),
+        },
         event=lambda *_args, **_kwargs: None,
         state={"events": []},
         docker=["docker"],
@@ -128,6 +135,38 @@ class PublicationControls(unittest.TestCase):
             self.assertEqual(len(calls), 5)
             self.assertEqual([cwd for _, cwd in calls[:3]], [Path(directory) / "source"] * 3)
             self.assertEqual([cwd for _, cwd in calls[3:]], [None, None])
+
+    def test_bake_real_child_can_load_required_private_library(self):
+        actual_popen = subprocess.Popen
+        library = next(
+            Path(line.split()[-1])
+            for line in Path("/proc/self/maps").read_text().splitlines()
+            if "/libc.so." in line
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            loader = Path(directory) / "native-loader"
+            loader.mkdir()
+            (loader / "libmoriio_loader_fixture.so").symlink_to(library)
+
+            def loading_child(_argv, **kwargs):
+                return actual_popen(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-B",
+                        "-c",
+                        "import ctypes; ctypes.CDLL('libmoriio_loader_fixture.so'); print('{}')",
+                    ],
+                    **kwargs,
+                )
+
+            with (
+                mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": str(loader)}),
+                mock.patch.object(subprocess, "Popen", side_effect=loading_child),
+            ):
+                calls = exercise_bake_processes(inspect.getsource(p.publish), directory)
+            self.assertEqual(len(calls), 5)
 
     def test_actual_recipe_manifest_and_material_pins(self):
         self.assertEqual(len(p.check_recipe()), 64)
@@ -627,7 +666,15 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
         if (
             isinstance(node, ast.FunctionDef)
             and node.name
-            in {"persist", "event", "command", "inspect", "verify_owned", "interrupted"}
+            in {
+                "persist",
+                "event",
+                "command",
+                "inspect",
+                "verify_owned",
+                "registration_identity",
+                "interrupted",
+            }
         )
         or (
             isinstance(node, ast.Assign)
@@ -641,10 +688,41 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
         publish.body.index(next(n for n in publish.body if isinstance(n, ast.Try))) + 1 :
     ]
     output = Path(directory)
-    state = {"events": [], "public_pull_verified": True, "owned_builder_container_id": "a" * 64}
+    state = {
+        "events": [],
+        "public_pull_verified": True,
+        "owned_builder_container_id": "a" * 64,
+        "status": "candidate_published_requires_fresh_actual_GPU_qualification",
+    }
     buildx_config = output / "buildx-config"
     buildx_config.mkdir(mode=0o700)
     config_stat = buildx_config.lstat()
+    instances = buildx_config / "instances"
+    instances.mkdir(mode=0o700)
+    registration = instances / "smg-moriio-123-1"
+    registration.write_text(
+        json.dumps(
+            {
+                "Name": "smg-moriio-123-1",
+                "Driver": "docker-container",
+                "Nodes": [
+                    {
+                        "Name": "smg-moriio-123-10",
+                        "Endpoint": "unix:///var/run/docker.sock",
+                        "DriverOpts": {"image": "foreign" if foreign else p.BUILDKIT},
+                    }
+                ],
+            }
+        )
+    )
+    registration.chmod(0o600)
+    if fault == "registration_fifo":
+        registration.unlink()
+        os.mkfifo(registration, mode=0o600)
+    if fault == "registration_symlink":
+        target = output / "foreign-instances"
+        instances.rename(target)
+        instances.symlink_to(target, target_is_directory=True)
     namespace = dict(
         p.__dict__,
         buildx_config=buildx_config,
@@ -656,7 +734,7 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
         deadline=time.monotonic() + 15,
         builder="smg-moriio-123-1",
         name="buildx_buildkit_smg-moriio-123-10",
-        owned_id=None if fault.startswith("registration") else "a" * 64,
+        owned_id=None if fault.startswith(("registration", "unwitnessed")) else "a" * 64,
         creation_submitted=True,
         docker=["docker"],
         failure=None,
@@ -739,19 +817,7 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
             assert argv == ["docker", "stop", "--time", "5", "a" * 64]
             payload = "stopped"
         elif argv[1:3] == ["buildx", "inspect"]:
-            payload = json.dumps(
-                {
-                    "Name": namespace["builder"],
-                    "Driver": "docker-container",
-                    "Nodes": [
-                        {
-                            "Name": namespace["builder"] + "0",
-                            "Endpoint": "unix:///var/run/docker.sock",
-                            "DriverOpts": {"image": "foreign" if foreign else p.BUILDKIT},
-                        }
-                    ],
-                }
-            )
+            raise AssertionError("Buildx 0.21 inspect does not support --format")
         elif argv[1:3] == ["buildx", "ls"]:
             payload = ""
         elif argv[1:3] == ["buildx", "rm"]:
@@ -764,7 +830,7 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
             payload = "removed"
         elif argv[1] == "ps":
             assert "id=" + "a" * 64 in argv or "name=^/" + namespace["name"] + "$" in argv
-            payload = ""
+            payload = "a" * 64 if fault.startswith("unwitnessed") else ""
         else:
             raise AssertionError("No productive or unknown Docker command is allowed")
         code = "print(" + repr(payload) + ")"
@@ -782,7 +848,27 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
     }
     for sig in handlers:
         signal.signal(sig, namespace["interrupted"])
+    prior_trace = sys.gettrace()
+    terminal_assert = next(node for node in reversed(tail) if isinstance(node, ast.Assert))
+    namespace["final_signal_injections"] = 0
+
+    def final_return_signal(frame, event, _arg):
+        nonlocal interrupted
+        if (
+            fault == "post_final_check_signal"
+            and not interrupted
+            and event == "line"
+            and frame.f_code.co_filename == "<exact publisher finally and outcome>"
+            and frame.f_lineno == terminal_assert.test.lineno
+        ):
+            interrupted = True
+            namespace["final_signal_injections"] += 1
+            os.kill(os.getpid(), signal.SIGTERM)
+        return final_return_signal
+
     try:
+        if fault == "post_final_check_signal":
+            sys.settrace(final_return_signal)
         with (
             mock.patch.object(p, "write_json", side_effect=record_write),
             mock.patch.object(Path, "open", open_with_failed_log),
@@ -800,6 +886,7 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
     except BaseException as exc:
         error = exc
     finally:
+        sys.settrace(prior_trace)
         signal.setitimer(signal.ITIMER_REAL, 0)
         for sig, previous in handlers.items():
             signal.signal(sig, previous)
@@ -1033,6 +1120,30 @@ class CurrentBoundaryControls(unittest.TestCase):
             self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
             self.assertFalse(any(a[1:3] == ["buildx", "rm"] for a in calls))
 
+    def test_symlinked_registration_store_cannot_authorize_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "registration_symlink")
+            self.assertIsInstance(error, OSError)
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1] == "stop" or a[1:3] == ["buildx", "rm"] for a in calls))
+
+    def test_nonregular_registration_cannot_block_before_identity_check(self):
+        code = (
+            "import importlib.util,tempfile\n"
+            f"s=importlib.util.spec_from_file_location('owned_fixture', {__file__!r})\n"
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+            "with tempfile.TemporaryDirectory() as directory:\n"
+            " ns,calls,error=m.exercise_owned_cleanup_fault(directory,'registration_fifo')\n"
+            " assert isinstance(error,AssertionError),repr(error)\n"
+            " assert not any(a[1]=='stop' or a[1:3]==['buildx','rm'] for a in calls)\n"
+            " print('FIFO rejected before removal')\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            result = self.run_owned(directory, ns, code, until=time.monotonic() + 4)
+            self.assertIn(b"FIFO rejected before removal", result)
+            self.assert_closed(ns)
+
     def test_closed_fallback_stderr_preserves_first_receipt_error(self):
         closed = io.StringIO()
         closed.close()
@@ -1043,6 +1154,26 @@ class CurrentBoundaryControls(unittest.TestCase):
             self.assertIn("original persistent receipt fault", str(error))
             self.assertTrue(ns["state"]["cleanup_verified_absent"])
             self.assertTrue(ns["state"]["fallback_receipt_unavailable"])
+
+    def test_unwitnessed_matching_container_is_not_adopted_or_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "unwitnessed")
+            self.assertFalse(any(a[1] == "stop" or a[1:3] == ["buildx", "rm"] for a in calls))
+            self.assertIsInstance(error, RuntimeError)
+            self.assertTrue(ns["state"].get("cleanup_unwitnessed_container"))
+            self.assertIsNone(ns["owned_id"])
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1] == "stop" or a[1:3] == ["buildx", "rm"] for a in calls))
+
+    def test_signal_after_final_pending_check_persists_failure_before_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, _calls, error = exercise_owned_cleanup_fault(directory, "post_final_check_signal")
+            self.assertEqual(ns["final_signal_injections"], 1)
+            self.assertIsInstance(error, RuntimeError)
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(saved["pending_signal"], signal.SIGTERM)
+            self.assertEqual(saved["status"], "failed_or_published_incomplete_requires_readback")
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
 
 
 if __name__ == "__main__":

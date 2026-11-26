@@ -645,6 +645,44 @@ def publish(engine_checkout, output):
         assert owned_id and container["Id"] == owned_id
         assert container["Config"]["Image"] == BUILDKIT and container["Name"] == "/" + name
 
+    def registration_identity():
+        # Buildx store.NodeGroup is saved as JSON in BUILDX_CONFIG/instances/NAME.
+        # `buildx inspect --format` is not a supported interface in Buildx 0.21.
+        assert env["BUILDX_CONFIG"] == str(buildx_config)
+        config_dir = os.open(buildx_config, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            current = os.fstat(config_dir)
+            assert (current.st_dev, current.st_ino, current.st_uid) == builder_config_identity
+            assert current.st_uid == os.getuid() and stat.S_IMODE(current.st_mode) == 0o700
+            instances = os.open(
+                "instances",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=config_dir,
+            )
+            try:
+                current = os.fstat(instances)
+                assert current.st_uid == os.getuid() and stat.S_IMODE(current.st_mode) == 0o700
+                descriptor = os.open(
+                    builder, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=instances
+                )
+                with os.fdopen(descriptor, "rb") as stream:
+                    current = os.fstat(stream.fileno())
+                    assert stat.S_ISREG(current.st_mode) and current.st_uid == os.getuid()
+                    assert stat.S_IMODE(current.st_mode) == 0o600 and current.st_size <= 65536
+                    raw = stream.read(65537)
+                assert len(raw) <= 65536
+            finally:
+                os.close(instances)
+        finally:
+            os.close(config_dir)
+        registration = json.loads(raw)
+        assert registration["Name"] == builder and registration["Driver"] == "docker-container"
+        nodes = registration["Nodes"]
+        assert len(nodes) == 1 and nodes[0]["Name"] == builder + "0"
+        assert nodes[0]["Endpoint"] == "unix:///var/run/docker.sock"
+        assert nodes[0]["DriverOpts"]["image"] == BUILDKIT
+        event("cleanup_registration_identity", registration_sha256=digest(raw))
+
     def interrupted(signum, _frame):
         client_control["pending_signal"] = signum
         if (
@@ -652,7 +690,21 @@ def publish(engine_checkout, output):
             and not client_control["cleaning"]
             and client_control.get("primary_error") is None
         ):
-            raise RuntimeError("publisher interrupted " + str(signum))
+            error = RuntimeError("publisher interrupted " + str(signum))
+            client_control["primary_error"] = error
+            state.update(
+                status="failed_or_published_incomplete_requires_readback", pending_signal=signum
+            )
+            # This handler also covers the final return after the last pending check.
+            # Save failure before raising; receipt errors cannot replace cancellation.
+            client_control["critical"] = True
+            try:
+                persist()
+            except BaseException:
+                pass
+            finally:
+                client_control["critical"] = False
+            raise error
 
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
@@ -934,31 +986,7 @@ def publish(engine_checkout, output):
                         capture=True,
                     )
                     if not remaining.strip():
-                        current = buildx_config.lstat()
-                        assert not buildx_config.is_symlink() and stat.S_ISDIR(current.st_mode)
-                        assert (
-                            current.st_dev,
-                            current.st_ino,
-                            current.st_uid,
-                        ) == builder_config_identity
-                        assert (
-                            current.st_uid == os.getuid() and stat.S_IMODE(current.st_mode) == 0o700
-                        )
-                        assert env["BUILDX_CONFIG"] == str(buildx_config)
-                        registration = json.loads(
-                            command(
-                                "cleanup_registration_identity",
-                                docker + ["buildx", "inspect", builder, "--format", "{{json .}}"],
-                                cleanup_deadline - 10,
-                                capture=True,
-                            )
-                        )
-                        assert registration["Name"] == builder
-                        assert registration["Driver"] == "docker-container"
-                        nodes = registration["Nodes"]
-                        assert len(nodes) == 1 and nodes[0]["Name"] == builder + "0"
-                        assert nodes[0]["Endpoint"] == "unix:///var/run/docker.sock"
-                        assert nodes[0]["DriverOpts"]["image"] == BUILDKIT
+                        registration_identity()
                         command(
                             "cleanup_remove_registration",
                             docker + ["buildx", "rm", "--keep-daemon", builder],
@@ -991,12 +1019,10 @@ def publish(engine_checkout, output):
                         state["registration_cleanup_verified"] = True
                         state["cleanup_verified_absent"] = True
                     else:
-                        container = inspect("cleanup_discover", cleanup_deadline - 10)
-                        assert (
-                            container["Config"]["Image"] == BUILDKIT
-                            and container["Name"] == "/" + name
+                        state["cleanup_unwitnessed_container"] = True
+                        raise RuntimeError(
+                            "Builder container ownership is unconfirmed; leave untouched"
                         )
-                        owned_id = container["Id"]
                 if owned_id is not None:
                     container = inspect("cleanup_identity", cleanup_deadline - 10)
                     verify_owned(container)
