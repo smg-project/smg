@@ -27,7 +27,7 @@ use crate::{
     health::circuit_breaker::CircuitState,
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
-        endpoint::Endpoint,
+        endpoint::{Endpoint, Scheme},
         sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
     },
     metrics::writers::Metrics,
@@ -237,6 +237,9 @@ pub struct WorkerRegistry<G> {
 
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId, FxBuildHasher>>,
+    /// Orders a local URL reservation with the equivalent-URL check and
+    /// insertion of a new guarded mesh import. Held only while claiming a URL.
+    reservation_order: parking_lot::RwLock<()>,
 
     /// Per-worker-ID locks for serializing replace() operations.
     /// Only held during the in-memory model index diff (no I/O, microseconds).
@@ -352,6 +355,7 @@ impl<G: Generation> WorkerRegistry<G> {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            reservation_order: parking_lot::RwLock::new(()),
             worker_mutation_locks: Arc::new(DashMap::new()),
             model_overloaded: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             pool_sizes: pool::PoolSizes::default(),
@@ -524,6 +528,29 @@ impl<G: Generation> WorkerRegistry<G> {
     /// live workers alone. The exact URL, no scheme canonicalisation.
     pub fn get_id_by_url_or_reservation(&self, url: &str) -> Option<WorkerId> {
         self.url_to_id.get(url).map(|id| id.clone())
+    }
+
+    /// A pending local registration of this URL or its legacy scheme-less spelling.
+    pub fn has_pending_reservation(&self, url: &str) -> bool {
+        Self::any_matching_url(url, |candidate| {
+            self.get_id_by_url_or_reservation(candidate)
+                .is_some_and(|id| !self.workers.contains_key(&id))
+        })
+    }
+
+    /// A legacy bare URL can refer to any network transport. Two explicitly
+    /// schemed URLs match only when they name the same transport.
+    pub fn any_matching_url(url: &str, matches: impl Fn(&str) -> bool) -> bool {
+        matches(url)
+            || match Scheme::split_from(url) {
+                Some((Scheme::Http | Scheme::Https | Scheme::Grpc | Scheme::Grpcs, bare)) => {
+                    matches(bare)
+                }
+                None => ["http://", "grpc://", "https://", "grpcs://"]
+                    .iter()
+                    .any(|scheme| matches(&format!("{scheme}{url}"))),
+                _ => false,
+            }
     }
 
     /// Resolve a URL string to the `WorkerId` of a live worker.
@@ -1236,7 +1263,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// `StatusChanged` events before the `Registered` event for a
     /// concurrent same-ID operation.
     pub fn register(&self, worker: Arc<dyn Worker>) -> Option<WorkerId> {
-        self.register_inner(worker, WorkerOrigin::Local)
+        self.register_inner(worker, WorkerOrigin::Local, None)
     }
 
     /// Register or replace a worker (upsert).
@@ -1672,6 +1699,37 @@ impl<G: Generation> WorkerRegistry<G> {
         self.transition_under_lock(worker_id, Some(expected_revision), f)
     }
 
+    /// Run a status decision only on the registered object that the caller holds.
+    /// A mesh replay may advance that same object's revision before activation.
+    pub fn apply_if_current<T>(
+        &self,
+        worker_id: &WorkerId,
+        expected: &Arc<dyn Worker>,
+        decide: impl FnOnce(&Arc<dyn Worker>) -> (T, Option<WorkerStatus>),
+    ) -> Option<(T, Option<(WorkerStatus, WorkerStatus)>)> {
+        let (result, transition) = self.transition_under_lock(worker_id, None, |held| {
+            if Arc::ptr_eq(held, expected) {
+                let (value, status) = decide(held);
+                (Some(value), status)
+            } else {
+                (None, None)
+            }
+        })?;
+        Some((result?, transition))
+    }
+
+    /// Read the revision only while this exact worker is the registered
+    /// entry. Replacements share revision state, so both reads must hold
+    /// the mutation lock before a cleanup caller can pin the incarnation.
+    pub fn revision_if_current(
+        &self,
+        worker_id: &WorkerId,
+        expected: &Arc<dyn Worker>,
+    ) -> Option<u64> {
+        self.apply_if_current(worker_id, expected, |held| (held.revision(), None))
+            .map(|(revision, _)| revision)
+    }
+
     /// The one place a registered worker's status transitions. Under the
     /// worker's mutation lock: the worker is looked up (gone -> `None`), its
     /// revision checked when the caller names one (moved on -> `None`), `f`
@@ -1923,6 +1981,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// create the worker under this ID. Idempotent — repeated calls for
     /// the same URL return the same ID. Emits no events.
     pub fn reserve_id_for_url(&self, url: &str) -> WorkerId {
+        let _order = self.reservation_order.read();
         self.url_to_id.entry(url.to_string()).or_default().clone()
     }
 
@@ -2158,6 +2217,19 @@ impl<G: Generation> WorkerRegistry<G> {
         }
     }
 
+    /// Remove exactly this mesh import, without touching a local claim or replacement.
+    pub fn remove_remote_if_current(
+        &self,
+        worker_id: &WorkerId,
+        expected: &Arc<dyn Worker>,
+    ) -> Option<Arc<dyn Worker>> {
+        self.remove_inner(
+            worker_id,
+            Some(WorkerOrigin::Mesh),
+            Some(&|current| Arc::ptr_eq(current, expected)),
+        )
+    }
+
     // ───────────────────────────────────────────────────────────────────
     // 8. Internal helpers
     // ───────────────────────────────────────────────────────────────────
@@ -2256,16 +2328,34 @@ impl<G: Generation> WorkerRegistry<G> {
     /// `origin` records whether this is a local workflow registration or a
     /// mesh import; the outbound mesh sync consults it so imported workers
     /// are never re-published (which would version-bump the CRDT in a loop).
-    fn register_inner(&self, worker: Arc<dyn Worker>, origin: WorkerOrigin) -> Option<WorkerId> {
+    fn register_inner(
+        &self,
+        worker: Arc<dyn Worker>,
+        origin: WorkerOrigin,
+        mesh_claim: Option<(WorkerId, &str)>,
+    ) -> Option<WorkerId> {
         // Resolve (or reserve) the worker_id from url_to_id. The entry
         // API is atomic per bucket, so concurrent callers either reuse
         // the same existing_id or serialize on vacant insertion.
-        let worker_id = match self.url_to_id.entry(worker.url().to_string()) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
-                let new_id = WorkerId::new();
-                entry.insert(new_id.clone());
-                new_id
+        let worker_id = {
+            let _order = mesh_claim.as_ref().map(|_| self.reservation_order.write());
+            let url = worker.url();
+            if let Some((_, published_url)) = &mesh_claim {
+                let claimed = |url: &str| {
+                    Self::any_matching_url(url, |candidate| self.url_to_id.contains_key(candidate))
+                };
+                if claimed(url) || (*published_url != url && claimed(published_url)) {
+                    return None;
+                }
+            }
+            match self.url_to_id.entry(url.to_string()) {
+                Entry::Occupied(_) if mesh_claim.is_some() => return None,
+                Entry::Occupied(entry) => entry.get().clone(),
+                Entry::Vacant(entry) => {
+                    let id = mesh_claim.map(|(id, _)| id).unwrap_or_default();
+                    entry.insert(id.clone());
+                    id
+                }
             }
         };
 
@@ -2809,6 +2899,25 @@ impl<G: Generation> WorkerRegistry<G> {
     /// spec (falling back to a minimal builder if the spec is absent or
     /// invalid).
     pub fn on_remote_worker_state(&self, state: &RemoteWorkerState) {
+        let _ = self.import_remote_worker_state(state, false, |_| true);
+    }
+
+    /// Apply a remote publication only when its actual worker can be admitted.
+    /// A blocked candidate is returned without publishing it to any index.
+    pub fn on_remote_worker_state_if(
+        &self,
+        state: &RemoteWorkerState,
+        can_install: impl FnMut(&Arc<dyn Worker>) -> bool,
+    ) -> Option<Arc<dyn Worker>> {
+        self.import_remote_worker_state(state, true, can_install)
+    }
+
+    fn import_remote_worker_state(
+        &self,
+        state: &RemoteWorkerState,
+        respect_reservations: bool,
+        mut can_install: impl FnMut(&Arc<dyn Worker>) -> bool,
+    ) -> Option<Arc<dyn Worker>> {
         // ZMQ is a same-host transport: its `ipc://` endpoint names a socket
         // on the publisher's machine, so importing it here would advertise a
         // route that can never reach the engine. Publishers filter these out;
@@ -2818,7 +2927,7 @@ impl<G: Generation> WorkerRegistry<G> {
                 url = %Endpoint::redacted_str(&state.url),
                 "Ignoring mesh state for host-local ZMQ worker"
             );
-            return;
+            return None;
         }
 
         // If worker already exists at this URL, update its health
@@ -2840,7 +2949,7 @@ impl<G: Generation> WorkerRegistry<G> {
                     url = %Endpoint::redacted_str(&state.url),
                     "Ignoring mesh state for locally-owned worker"
                 );
-                return;
+                return None;
             }
             // An owner that replaces a worker in place (a new model, role,
             // bootstrap port or labels under the same address) publishes
@@ -2858,11 +2967,14 @@ impl<G: Generation> WorkerRegistry<G> {
             // higher one, and a local claim in between is never written
             // over.
             if self.is_newer_publication_of_import(&existing_id, state) {
-                match Self::importable_spec(state) {
-                    PublishedSpec::HostLocal => return,
+                match Self::importable_spec(state, respect_reservations) {
+                    PublishedSpec::HostLocal => return None,
                     PublishedSpec::Spec(spec) => {
                         let replacement: Arc<dyn Worker> =
                             Arc::new(self.import_from(state, Some(*spec)));
+                        if !can_install(&replacement) {
+                            return Some(replacement);
+                        }
                         let record = ImportRecord {
                             version: state.version,
                             from_spec: true,
@@ -2888,7 +3000,13 @@ impl<G: Generation> WorkerRegistry<G> {
                     // tells the two apart under the lock and records the
                     // version either way, so the pass does not read these
                     // bytes again every interval.
-                    PublishedSpec::Absent => self.rebuild_minimal_import(&existing_id, state),
+                    PublishedSpec::Absent => {
+                        if let Some(blocked) =
+                            self.rebuild_minimal_import_if(&existing_id, state, &mut can_install)
+                        {
+                            return Some(blocked);
+                        }
+                    }
                     PublishedSpec::Undecodable(err) => {
                         tracing::warn!(
                             worker_id = %existing_id.as_str(),
@@ -2897,7 +3015,11 @@ impl<G: Generation> WorkerRegistry<G> {
                             %err,
                             "the owner's replacement of a mesh-synced worker carries a spec this node cannot decode"
                         );
-                        self.rebuild_minimal_import(&existing_id, state);
+                        if let Some(blocked) =
+                            self.rebuild_minimal_import_if(&existing_id, state, &mut can_install)
+                        {
+                            return Some(blocked);
+                        }
                     }
                 }
             }
@@ -2932,7 +3054,7 @@ impl<G: Generation> WorkerRegistry<G> {
                     healthy = state.health,
                     "Updated health for existing mesh-synced worker"
                 );
-                return;
+                return None;
             }
         }
 
@@ -2941,8 +3063,8 @@ impl<G: Generation> WorkerRegistry<G> {
         // id reservation below would outlive it and a legitimate worker
         // later arriving at this URL would silently inherit the rejected
         // publisher's id — breaking tombstone routing for it.
-        let spec = match Self::importable_spec(state) {
-            PublishedSpec::HostLocal => return,
+        let spec = match Self::importable_spec(state, respect_reservations) {
+            PublishedSpec::HostLocal => return None,
             PublishedSpec::Spec(spec) => Some(*spec),
             PublishedSpec::Absent => None,
             PublishedSpec::Undecodable(err) => {
@@ -2955,6 +3077,15 @@ impl<G: Generation> WorkerRegistry<G> {
             }
         };
 
+        // New worker — build from the full WorkerSpec if it decoded,
+        // otherwise fall back to the minimal builder.
+        let spec_applied = spec.is_some();
+        let worker: Arc<dyn Worker> = Arc::new(self.import_from(state, spec));
+
+        if !can_install(&worker) {
+            return Some(worker);
+        }
+
         // Adopt the publisher's worker id for the import so a later
         // tombstone for `worker:{id}` (which carries no value, only the
         // key) resolves to this worker. A pre-existing reservation for
@@ -2962,16 +3093,11 @@ impl<G: Generation> WorkerRegistry<G> {
         // remote tombstone for it will not resolve directly (rare; the
         // adapter's reconcile pass removes the import once its backing
         // key is gone).
-        if !state.worker_id.is_empty() {
+        if !respect_reservations && !state.worker_id.is_empty() {
             self.url_to_id
                 .entry(state.url.clone())
                 .or_insert_with(|| WorkerId::from_string(state.worker_id.clone()));
         }
-
-        // New worker — build from the full WorkerSpec if it decoded,
-        // otherwise fall back to the minimal builder.
-        let spec_applied = spec.is_some();
-        let worker: Arc<dyn Worker> = Arc::new(self.import_from(state, spec));
 
         // A `Mesh` origin keeps the outbound sync from re-publishing the
         // imported state (which would version-bump the CRDT in a loop),
@@ -2979,7 +3105,18 @@ impl<G: Generation> WorkerRegistry<G> {
         // per-worker mutation lock so in-process subscribers
         // (WorkerManager's health scheduler, etc.) pick up mesh-imported
         // workers via the same event path as any other registration.
-        if let Some(id) = self.register_inner(worker, WorkerOrigin::Mesh) {
+        let vacant_id = respect_reservations.then(|| {
+            if state.worker_id.is_empty() {
+                WorkerId::new()
+            } else {
+                WorkerId::from_string(state.worker_id.clone())
+            }
+        });
+        if let Some(id) = self.register_inner(
+            worker,
+            WorkerOrigin::Mesh,
+            vacant_id.map(|id| (id, state.url.as_str())),
+        ) {
             let record = ImportRecord {
                 version: state.version,
                 from_spec: spec_applied,
@@ -2994,6 +3131,7 @@ impl<G: Generation> WorkerRegistry<G> {
                 "Registered mesh-synced worker into local registry"
             );
         }
+        None
     }
 
     /// Whether `state` is the owner's newer publication of the key a mesh
@@ -3017,8 +3155,24 @@ impl<G: Generation> WorkerRegistry<G> {
     /// Rebuild a mesh import from its owner's publication without a usable
     /// spec: the minimal worker, through the replacement path
     /// (`import_rebuild_wanted` keeps an import built from a spec instead).
-    fn rebuild_minimal_import(&self, import_id: &WorkerId, state: &RemoteWorkerState) {
+    fn rebuild_minimal_import_if(
+        &self,
+        import_id: &WorkerId,
+        state: &RemoteWorkerState,
+        can_install: &mut impl FnMut(&Arc<dyn Worker>) -> bool,
+    ) -> Option<Arc<dyn Worker>> {
+        if self
+            .import_records
+            .get(import_id)
+            .is_some_and(|record| record.from_spec)
+        {
+            self.record_import_version(import_id, state.version);
+            return None;
+        }
         let replacement: Arc<dyn Worker> = Arc::new(self.import_from(state, None));
+        if !can_install(&replacement) {
+            return Some(replacement);
+        }
         let record = ImportRecord {
             version: state.version,
             from_spec: false,
@@ -3032,6 +3186,7 @@ impl<G: Generation> WorkerRegistry<G> {
                 "Rebuilt the minimal mesh-synced worker from its owner's replacement"
             );
         }
+        None
     }
 
     /// Under the worker's lock: whether a mesh import is rebuilt to the
@@ -3115,12 +3270,12 @@ impl<G: Generation> WorkerRegistry<G> {
     /// transport gate it declares. The caller says what it does without one:
     /// the import path builds the minimal worker, the rebuild keeps an
     /// import built from a spec as built and rebuilds a minimal one.
-    fn importable_spec(state: &RemoteWorkerState) -> PublishedSpec {
+    fn importable_spec(state: &RemoteWorkerState, guarded: bool) -> PublishedSpec {
         if state.spec.is_empty() {
             return PublishedSpec::Absent;
         }
         match serde_json::from_slice::<crate::worker::WorkerSpec>(&state.spec) {
-            Ok(spec) => {
+            Ok(mut spec) => {
                 // Same-host transport declared by the spec rather than by
                 // the URL scheme — not routable from this node.
                 if spec.connection_mode == ConnectionMode::Zmq {
@@ -3129,6 +3284,11 @@ impl<G: Generation> WorkerRegistry<G> {
                         "Ignoring mesh state for host-local ZMQ worker"
                     );
                     return PublishedSpec::HostLocal;
+                }
+                // A legacy spec can omit the envelope's transport. Guarded claims
+                // and the worker they publish must use the same explicit URL.
+                if guarded && Scheme::qualifies_bare_url(&state.url, &spec.url) {
+                    spec.url.clone_from(&state.url);
                 }
                 PublishedSpec::Spec(Box::new(spec))
             }

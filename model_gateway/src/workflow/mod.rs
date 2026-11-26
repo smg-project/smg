@@ -5,6 +5,7 @@ pub mod engines;
 pub mod job_queue;
 pub mod mcp_registration;
 pub mod steps;
+pub mod tokenizer_preparation;
 pub mod tokenizer_registration;
 pub mod wasm_module_registration;
 pub mod wasm_module_removal;

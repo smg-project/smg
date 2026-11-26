@@ -19,8 +19,8 @@ pub use local::{
     UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
 use local::{
-    CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, SubmitTokenizerJobStep,
-    CHECK_LOCAL_WORKER_STEP, ZMQ_LABELS_STEP,
+    CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, PrepareTokenizerStep,
+    SubmitTokenizerJobStep, CHECK_LOCAL_WORKER_STEP, ZMQ_LABELS_STEP,
 };
 use openai_protocol::worker::WorkerSpec;
 pub use shared::{
@@ -69,6 +69,8 @@ use crate::{
 ///       |                               |
 ///  ensure_harmony_encoding              |
 ///  (gRPC gpt-oss only)                  |
+///       |                               |
+///  prepare_tokenizer (when enabled)     |
 ///       +---------------+---------------+
 ///                        |
 ///                 register_workers  (shared)
@@ -116,7 +118,13 @@ pub fn create_worker_registration_workflow(
     .with_failure_action(FailureAction::FailWorkflow)
     .depends_on(&[CREATE_LOCAL_WORKER_STEP]);
 
-    worker_registration_workflow::<AppContext>(
+    let prepare = router_config.wait_for_tokenizer && !router_config.disable_tokenizer_autoload;
+    let before_publish = if prepare {
+        "prepare_tokenizer"
+    } else {
+        "ensure_harmony_encoding"
+    };
+    let workflow = worker_registration_workflow::<AppContext>(
         &settings,
         RegistrationGates {
             detection: Some("classify_worker_type"),
@@ -207,7 +215,7 @@ pub fn create_worker_registration_workflow(
         .with_failure_action(FailureAction::FailWorkflow)
         .depends_on(&[
             CHECK_LOCAL_WORKER_STEP,
-            "ensure_harmony_encoding",
+            before_publish,
             "create_external_workers",
         ]),
     )
@@ -243,7 +251,12 @@ pub fn create_worker_registration_workflow(
         .with_timeout(Duration::from_secs(5))
         .with_failure_action(FailureAction::FailWorkflow)
         .depends_on(&[REGISTER_WORKERS_STEP]),
-    )
+    );
+    if prepare {
+        workflow.add_step(PrepareTokenizerStep::definition())
+    } else {
+        workflow
+    }
 }
 
 /// Create initial workflow data for the unified worker registration workflow.
@@ -253,7 +266,12 @@ pub fn create_worker_workflow_data(
     app_context: Arc<AppContext>,
     asker: WorkerJobAsker,
 ) -> WorkerWorkflowData {
-    WorkerWorkflowData::new(config, registration_mode, app_context, asker)
+    let preparation = (app_context.router_config.wait_for_tokenizer
+        && !app_context.router_config.disable_tokenizer_autoload)
+        .then(|| super::tokenizer_preparation::TokenizerPreparation::new(&app_context));
+    let mut data = WorkerWorkflowData::new(config, registration_mode, app_context, asker);
+    data.host_notes.tokenizer_preparation = preparation;
+    data
 }
 
 #[cfg(test)]

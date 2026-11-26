@@ -281,90 +281,104 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         &self,
         context: &mut WorkflowContext<TokenizerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let config = &context.data.config;
         let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
-
-        info!(
-            "Loading tokenizer '{}' (id: {}) from source: {}{}",
-            config.name,
-            config.id,
-            config.source,
-            if config.cache_config.is_some() {
-                " with caching"
-            } else {
-                ""
-            }
-        );
-
-        // Clone needed values before async move
-        let id = config.id.clone();
-        let name = config.name.clone();
-        let source = config.source.clone();
-        let chat_template = config.chat_template_path.clone();
-        let cache_config = config.cache_config.clone();
-        let for_worker = config.for_worker;
-
-        // Load the tokenizer using the registry's load method
-        // This handles: validation, deduplication, and loading
-        let result = app_context
-            .tokenizer_registry
-            .load(&id, &name, &source, || {
-                let source = source.clone();
-                let chat_template = chat_template.clone();
-                let cache_cfg = cache_config.clone();
-                let app_context = app_context.clone();
-                let name = name.clone();
-                let id = id.clone();
-                async move {
-                    let tokenizer = load_tokenizer(
-                        &app_context,
-                        &id,
-                        &name,
-                        &source,
-                        chat_template.as_deref(),
-                        cache_cfg,
-                    )
-                    .await?;
-                    // Recorded under the registry's per-name lock, before the
-                    // entry is published: a reader that sees the entry sees
-                    // the record.
-                    if for_worker {
-                        app_context.worker_loaded_tokenizers.insert(id);
-                    }
-                    Ok(tokenizer)
-                }
-            })
-            .await;
-
-        match result {
-            Ok(outcome) => {
-                let vocab_size = note_load_outcome(&app_context, config, &outcome)?;
-                // A worker's load looks at the worker registry again once it
-                // has published: the removal of the model's last worker while
-                // the load ran found no entry to take.
-                if for_worker && matches!(outcome, LoadOutcome::Loaded { .. }) {
-                    ReleaseTokenizerStep::release_if_unserved(&app_context, &name);
-                }
-
-                // Store vocab size in typed data
-                if let Some(size) = vocab_size {
-                    context.data.vocab_size = Some(size);
-                }
-
-                Ok(StepResult::Success)
-            }
-            Err(e) => {
-                error!("Failed to load tokenizer '{}': {}", name, e);
-                Err(WorkflowError::StepFailed {
-                    step_id: StepId::new("load_tokenizer"),
-                    message: e.to_string(),
-                })
-            }
-        }
+        context.data.vocab_size =
+            register_tokenizer(&app_context, &context.data.config, &[]).await?;
+        Ok(StepResult::Success)
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true // Network/IO errors are retryable
+    }
+}
+
+/// The canonical registry load, also used inline before a worker is published.
+pub(crate) async fn register_tokenizer(
+    app_context: &Arc<AppContext>,
+    config: &TokenizerConfigRequest,
+    candidates: &[Arc<dyn Worker>],
+) -> WorkflowResult<Option<usize>> {
+    info!(
+        "Loading tokenizer '{}' (id: {}) from source: {}{}",
+        config.name,
+        config.id,
+        config.source,
+        if config.cache_config.is_some() {
+            " with caching"
+        } else {
+            ""
+        }
+    );
+
+    // Clone needed values before async move
+    let id = config.id.clone();
+    let name = config.name.clone();
+    let source = config.source.clone();
+    let chat_template = config.chat_template_path.clone();
+    let cache_config = config.cache_config.clone();
+    let for_worker = config.for_worker;
+
+    // Load the tokenizer using the registry's load method
+    // This handles: validation, deduplication, and loading
+    let result = app_context
+        .tokenizer_registry
+        .load(&id, &name, &source, || {
+            let source = source.clone();
+            let chat_template = chat_template.clone();
+            let cache_cfg = cache_config.clone();
+            let app_context = app_context.clone();
+            let name = name.clone();
+            let id = id.clone();
+            let candidates = candidates.to_vec();
+            async move {
+                // Acquire after the per-name registry lock, so replicas
+                // waiting for one load do not occupy the cold-load pool.
+                let _load_slot = if app_context.router_config.wait_for_tokenizer {
+                    Some(app_context.tokenizer_preparations.load_slot().await?)
+                } else {
+                    None
+                };
+                let tokenizer = load_tokenizer(
+                    &app_context,
+                    &id,
+                    &name,
+                    &source,
+                    chat_template.as_deref(),
+                    cache_cfg,
+                    &candidates,
+                )
+                .await?;
+                // Recorded under the registry's per-name lock, before the
+                // entry is published: a reader that sees the entry sees
+                // the record.
+                if for_worker {
+                    app_context.worker_loaded_tokenizers.insert(id);
+                }
+                Ok(tokenizer)
+            }
+        })
+        .await;
+
+    match result {
+        Ok(outcome) => {
+            let vocab_size = note_load_outcome(app_context, config, &outcome)?;
+            app_context.tokenizer_load_failures.clear(&name);
+            // A worker's load looks at the worker registry again once it
+            // has published: the removal of the model's last worker while
+            // the load ran found no entry to take.
+            if for_worker && matches!(outcome, LoadOutcome::Loaded { .. }) {
+                ReleaseTokenizerStep::release_if_unserved(app_context, &name);
+            }
+
+            Ok(vocab_size)
+        }
+        Err(e) => {
+            error!("Failed to load tokenizer '{}': {}", name, e);
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("load_tokenizer"),
+                message: e.to_string(),
+            })
+        }
     }
 }
 
@@ -379,6 +393,7 @@ async fn load_tokenizer(
     source: &str,
     chat_template: Option<&str>,
     cache_cfg: Option<TokenizerCacheConfig>,
+    candidates: &[Arc<dyn Worker>],
 ) -> Result<Arc<dyn Tokenizer>, String> {
     let base_tokenizer = match factory::create_tokenizer_async_with_chat_template(
         source,
@@ -393,7 +408,7 @@ async fn load_tokenizer(
                     source, local_err
                 );
 
-            fetch_tokenizer_from_worker(app_context, tokenizer_id, model_id, chat_template)
+            fetch_tokenizer_from_worker(app_context, tokenizer_id, model_id, chat_template, candidates)
                     .await
                     .map_err(|worker_err| {
                         format!(
@@ -554,8 +569,36 @@ async fn fetch_tokenizer_from_worker(
     tokenizer_id: &str,
     model_id: &str,
     chat_template_path: Option<&str>,
+    candidates: &[Arc<dyn Worker>],
 ) -> Result<Arc<dyn Tokenizer>, String> {
-    let workers = tokenizer_workers(&app_context.worker_registry, model_id);
+    let registered = tokenizer_workers(&app_context.worker_registry, model_id);
+    let workers = if app_context.router_config.wait_for_tokenizer {
+        // A preparing card names a canonical model even if the same name is
+        // currently an alias in the registry. GetTokenizer serves only a
+        // worker's primary model.
+        let preparing = candidates.iter().any(|worker| {
+            worker.model_id() == model_id || worker.models().iter().any(|card| card.id == model_id)
+        });
+        let alias = if preparing {
+            None
+        } else {
+            app_context.worker_registry.resolve_model_alias(model_id)
+        };
+        let canonical = alias.as_deref().unwrap_or(model_id);
+        let mut endpoints = std::collections::HashSet::new();
+        candidates
+            .iter()
+            .cloned()
+            .chain(registered)
+            .filter(|worker| {
+                *worker.connection_mode() == ConnectionMode::Grpc
+                    && worker.model_id() == canonical
+                    && endpoints.insert(worker.base_url().to_owned())
+            })
+            .collect()
+    } else {
+        registered
+    };
 
     if workers.is_empty() {
         return Err(format!(
@@ -792,6 +835,133 @@ mod tests {
         app_context::testing::app_context_for_tests, config::RouterConfig,
         routers::grpc::backend_client::BasicWorkerBuilder,
     };
+
+    #[tokio::test]
+    async fn an_alias_can_fetch_only_its_canonical_primary_workers_bundle() {
+        for primary in [true, false] {
+            let registry = Arc::new(WorkerRegistry::new());
+            let mut canonical = ModelCard::new("canonical");
+            canonical.aliases = vec!["alias".into()];
+            let models = if primary {
+                vec![canonical]
+            } else {
+                vec![ModelCard::new("unrelated"), canonical]
+            };
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .models(models)
+                    .build(),
+            );
+            assert_eq!(
+                worker.model_id(),
+                if primary { "canonical" } else { "unrelated" }
+            );
+            assert_eq!(worker.models().len(), if primary { 1 } else { 2 });
+            registry.register(worker).unwrap();
+            let app = app_context_for_tests(
+                RouterConfig::builder()
+                    .wait_for_tokenizer(true)
+                    .build_unchecked(),
+                registry,
+                None,
+            );
+            let failure = fetch_tokenizer_from_worker(&app, "tokenizer-id", "alias", None, &[])
+                .await
+                .err()
+                .expect("the unreachable worker cannot return a bundle");
+            if primary {
+                assert!(
+                    failure.contains("for model 'alias' from 1 ready or pending gRPC worker(s)"),
+                    "{failure}"
+                );
+                for prepared_primary in [true, false] {
+                    let models = if prepared_primary {
+                        vec![ModelCard::new("alias")]
+                    } else {
+                        vec![ModelCard::new("preparing-other"), ModelCard::new("alias")]
+                    };
+                    let candidate: Arc<dyn Worker> = Arc::new(
+                        BasicWorkerBuilder::new("grpc://127.0.0.1:2")
+                            .connection_mode(ConnectionMode::Grpc)
+                            .models(models)
+                            .build(),
+                    );
+                    let failure = fetch_tokenizer_from_worker(
+                        &app,
+                        "new-tokenizer",
+                        "alias",
+                        None,
+                        &[candidate],
+                    )
+                    .await
+                    .err()
+                    .expect("the unreachable preparing worker cannot return a bundle");
+                    assert!(
+                        !failure.contains("grpc://127.0.0.1:1"),
+                        "the serving alias must not supply the new canonical model: {failure}"
+                    );
+                    if prepared_primary {
+                        assert!(
+                            failure.contains("grpc://127.0.0.1:2"),
+                            "the exact preparing primary was attempted: {failure}"
+                        );
+                    } else {
+                        assert!(
+                            failure.contains("No ready or pending gRPC worker available"),
+                            "a secondary has no primary bundle: {failure}"
+                        );
+                    }
+                }
+            } else {
+                assert!(
+                    failure.contains("No ready or pending gRPC worker available"),
+                    "{failure}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_tries_its_candidate_first_and_each_endpoint_only_once() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = |url, status| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("m"))
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .status(status)
+                    .build(),
+            )
+        };
+        let url = "grpc://127.0.0.1:9";
+        let candidate = worker(url, WorkerStatus::Pending);
+        registry
+            .register(worker(url, WorkerStatus::Pending))
+            .unwrap();
+        registry
+            .register(worker("grpc://127.0.0.1:11", WorkerStatus::Ready))
+            .unwrap();
+        let app = app_context_for_tests(
+            RouterConfig::builder()
+                .wait_for_tokenizer(true)
+                .build_unchecked(),
+            registry,
+            None,
+        );
+        let error = fetch_tokenizer_from_worker(&app, "t", "m", None, &[candidate])
+            .await
+            .err()
+            .expect("neither endpoint serves a bundle");
+        assert!(
+            error.contains("from 2 ready or pending gRPC worker(s), first failure: "),
+            "{error}"
+        );
+        assert!(error.contains("grpc://127.0.0.1:9 (runtime"), "{error}");
+        assert!(!error.contains("grpc://127.0.0.1:11 (runtime"), "{error}");
+    }
 
     #[test]
     fn tokenizer_sources_prefer_ready_and_skip_unhealthy_workers() {
@@ -1233,7 +1403,7 @@ mod tests {
                 ))
                 .expect("register worker");
         }
-        let error = fetch_tokenizer_from_worker(&app_context(workers), "t", "m", None)
+        let error = fetch_tokenizer_from_worker(&app_context(workers), "t", "m", None, &[])
             .await
             .err()
             .expect("no worker serves a tokenizer");

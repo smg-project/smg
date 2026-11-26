@@ -44,6 +44,9 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
 
         let labels = &context.data.final_labels;
         let app_context = require_app_context(context.data.host.as_ref())?;
+        if app_context.router_config.wait_for_tokenizer {
+            return Ok(StepResult::Skip);
+        }
         let workers = context
             .data
             .actual_workers
@@ -178,7 +181,7 @@ pub(crate) async fn submit_tokenizer_job(
 /// worker's own bundle (`fetch_tokenizer_from_worker`); a ZMQ worker's id has
 /// to be a path or hub id the gateway itself can load. Coming last, the id
 /// never displaces an operator's flag.
-fn tokenizer_source<'a>(
+pub(crate) fn tokenizer_source<'a>(
     labels: &'a HashMap<String, String>,
     router_tokenizer_path: Option<&'a str>,
     router_model_path: Option<&'a str>,

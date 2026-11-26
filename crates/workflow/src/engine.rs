@@ -887,7 +887,16 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             "Workflow deadlocked: no steps ready and none running"
         };
 
-        self.mark_failed(instance_id, failed_step.as_ref()).await?;
+        if !self
+            .set_terminal_status_if_active(
+                instance_id,
+                WorkflowStatus::Failed,
+                failed_step.as_ref(),
+            )
+            .await?
+        {
+            return Ok(());
+        }
         self.event_bus
             .publish(WorkflowEvent::WorkflowFailed {
                 instance_id,
@@ -895,26 +904,6 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 error: error_message.to_string(),
             })
             .await;
-        Ok(())
-    }
-
-    /// Mark the run failed. Its current step becomes the first step that
-    /// failed, where one did: an attempt of another branch that began later
-    /// does not name the run's failure. A deadlock with no failed step keeps
-    /// the last step an attempt named.
-    async fn mark_failed(
-        &self,
-        instance_id: WorkflowInstanceId,
-        failed_step: Option<&StepId>,
-    ) -> WorkflowResult<()> {
-        self.state_store
-            .update(instance_id, |s| {
-                s.status = WorkflowStatus::Failed;
-                if let Some(step) = failed_step {
-                    s.current_step = Some(step.clone());
-                }
-            })
-            .await?;
         Ok(())
     }
 
@@ -1132,7 +1121,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let failed_step = tracker.read().first_failed.clone();
 
         if let Some(ref step) = failed_step {
-            self.mark_failed(instance_id, Some(step)).await?;
+            if !self
+                .set_terminal_status_if_active(instance_id, WorkflowStatus::Failed, Some(step))
+                .await?
+            {
+                return Ok(());
+            }
             self.event_bus
                 .publish(WorkflowEvent::WorkflowFailed {
                     instance_id,
@@ -1141,11 +1135,12 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 })
                 .await;
         } else {
-            self.state_store
-                .update(instance_id, |s| {
-                    s.status = WorkflowStatus::Completed;
-                })
-                .await?;
+            if !self
+                .set_terminal_status_if_active(instance_id, WorkflowStatus::Completed, None)
+                .await?
+            {
+                return Ok(());
+            }
 
             let duration = start_time.elapsed();
             self.event_bus
@@ -1480,19 +1475,62 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
     }
 
-    /// Cancel a running workflow
+    /// Honor an explicit cancellation, including a workflow that settled
+    /// after the caller selected it. Deadline cancellation should use
+    /// [`Self::cancel_workflow_if_active`] instead.
     pub async fn cancel_workflow(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()> {
         self.state_store
-            .update(instance_id, |s| {
-                s.status = WorkflowStatus::Cancelled;
+            .update(instance_id, |state| {
+                state.status = WorkflowStatus::Cancelled;
             })
             .await?;
-
         self.event_bus
             .publish(WorkflowEvent::WorkflowCancelled { instance_id })
             .await;
-
         Ok(())
+    }
+
+    /// Cancel only if a terminal outcome has not already won. The status
+    /// check and write share the state store's update lock.
+    pub async fn cancel_workflow_if_active(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<bool> {
+        let cancelled = self
+            .set_terminal_status_if_active(instance_id, WorkflowStatus::Cancelled, None)
+            .await?;
+        if cancelled {
+            self.event_bus
+                .publish(WorkflowEvent::WorkflowCancelled { instance_id })
+                .await;
+        }
+        Ok(cancelled)
+    }
+
+    /// Completion, failure and cancellation compete under the same lock;
+    /// a task finishing after cancellation cannot overwrite its outcome.
+    async fn set_terminal_status_if_active(
+        &self,
+        instance_id: WorkflowInstanceId,
+        status: WorkflowStatus,
+        failed_step: Option<&StepId>,
+    ) -> WorkflowResult<bool> {
+        let mut changed = false;
+        self.state_store
+            .update(instance_id, |s| {
+                if matches!(
+                    s.status,
+                    WorkflowStatus::Pending | WorkflowStatus::Running | WorkflowStatus::Paused
+                ) {
+                    s.status = status;
+                    if let Some(step) = failed_step {
+                        s.current_step = Some(step.clone());
+                    }
+                    changed = true;
+                }
+            })
+            .await?;
+        Ok(changed)
     }
 
     /// Get workflow status
@@ -1691,6 +1729,55 @@ mod scheduler_tests {
     impl WorkflowData for Data {
         fn workflow_type() -> &'static str {
             "scheduler-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_terminal_update_wins() {
+        for first in [
+            WorkflowStatus::Completed,
+            WorkflowStatus::Failed,
+            WorkflowStatus::Cancelled,
+        ] {
+            let engine = WorkflowEngine::<Data>::new();
+            let id = WorkflowInstanceId::new();
+            engine
+                .state_store
+                .save(WorkflowState::new(id, WorkflowId::new("race"), Data))
+                .await
+                .unwrap();
+            assert!(engine
+                .set_terminal_status_if_active(id, first, None)
+                .await
+                .unwrap());
+            let cancelled = engine.cancel_workflow_if_active(id).await.unwrap();
+            assert!(!cancelled, "a terminal status is never cancelled again");
+            let tracker = Arc::new(RwLock::new(StepTracker::default()));
+            engine
+                .finish(id, &tracker, std::time::Instant::now())
+                .await
+                .unwrap();
+            assert_eq!(engine.get_status(id).await.unwrap().status, first);
+            let (tx, _rx) = mpsc::channel(1);
+            WorkflowEngine::<Data>::settle(
+                &tracker,
+                &tx,
+                &StepId::new("failed"),
+                StepResult::Failure,
+            );
+            engine
+                .finish(id, &tracker, std::time::Instant::now())
+                .await
+                .unwrap();
+            assert_eq!(engine.get_status(id).await.unwrap().status, first);
+            engine.fail_blocked(id, &tracker).await.unwrap();
+            assert_eq!(engine.get_status(id).await.unwrap().status, first);
+            engine.cancel_workflow(id).await.unwrap();
+            assert_eq!(
+                engine.get_status(id).await.unwrap().status,
+                WorkflowStatus::Cancelled,
+                "an explicit DELETE's cancellation still owns its selected registration"
+            );
         }
     }
 

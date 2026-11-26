@@ -722,6 +722,93 @@ fn mesh_import_adopts_publisher_worker_id() {
 }
 
 #[test]
+fn guarded_mesh_import_cannot_adopt_a_local_reservation_made_during_admission() {
+    let registry = WorkerRegistry::new();
+    let url = "http://pending-local:8080";
+    let mut reserved = None;
+    registry.on_remote_worker_state_if(&remote_state("peer-w1", url, true, vec![]), |_| {
+        // A POST reserves this address after the import's initial URL read,
+        // while its admission predicate is evaluating the candidate.
+        reserved = Some(registry.reserve_id_for_url(url));
+        true
+    });
+    let id = reserved.unwrap();
+    assert_eq!(registry.get_id_by_url_or_reservation(url), Some(id.clone()));
+    assert!(registry.get(&id).is_none());
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    assert_eq!(registry.register(worker), Some(id.clone()));
+    assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Local));
+
+    // Default imports retain their existing pre-reservation behavior.
+    let legacy = WorkerRegistry::new();
+    let id = legacy.reserve_id_for_url(url);
+    legacy.on_remote_worker_state(&remote_state("peer-w1", url, true, vec![]));
+    assert_eq!(legacy.get_id_by_url(url), Some(id));
+}
+
+#[test]
+fn a_legacy_mesh_url_cannot_take_an_endpoint_reserved_during_admission() {
+    use crate::worker::WorkerSpec;
+
+    let bare = "engine:8080";
+    for local in [
+        "http://engine:8080",
+        "grpc://engine:8080",
+        "grpcs://engine:8080",
+    ] {
+        for spec_url in [None, Some(bare), Some(local)] {
+            let registry = WorkerRegistry::new();
+            let spec = spec_url
+                .map(|url| serde_json::to_vec(&WorkerSpec::new(url)).unwrap())
+                .unwrap_or_default();
+            let state = remote_state("peer-id", bare, true, spec);
+            let mut reserved = None;
+            registry.on_remote_worker_state_if(&state, |_| {
+                reserved = Some(registry.reserve_id_for_url(local));
+                true
+            });
+            assert!(registry.get_all().is_empty());
+            assert_eq!(
+                registry.register(Arc::new(BasicWorkerBuilder::new(local).build())),
+                reserved
+            );
+
+            let free = WorkerRegistry::new();
+            free.on_remote_worker_state_if(&state, |_| true);
+            assert_eq!(
+                free.get_id_by_url(spec_url.unwrap_or(bare))
+                    .unwrap()
+                    .as_str(),
+                "peer-id"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_legacy_mesh_url_cannot_duplicate_a_local_worker_registered_during_admission() {
+    let registry = WorkerRegistry::new();
+    let url = "http://engine:8080";
+    let state = remote_state("peer-id", "engine:8080", true, vec![]);
+    registry.on_remote_worker_state_if(&state, |_| {
+        let reserved = registry.reserve_id_for_url(url);
+        assert_eq!(
+            registry.register(Arc::new(BasicWorkerBuilder::new(url).build())),
+            Some(reserved)
+        );
+        true
+    });
+    let workers = registry.get_all_with_ids();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].1.url(), url);
+    assert_eq!(registry.origin_of(&workers[0].0), Some(WorkerOrigin::Local));
+
+    let grpc = "grpc://engine:8080";
+    registry.on_remote_worker_state_if(&remote_state("grpc-peer", grpc, true, vec![]), |_| true);
+    assert_eq!(registry.get_id_by_url(grpc).unwrap().as_str(), "grpc-peer");
+}
+
+#[test]
 fn mesh_state_for_zmq_worker_is_never_imported() {
     // ZMQ is same-host: an `ipc://` endpoint published by a peer names a
     // socket path on that peer's machine, so importing it would advertise

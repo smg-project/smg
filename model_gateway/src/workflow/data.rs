@@ -46,6 +46,13 @@ pub(crate) fn require_app_context(
 /// Implemented by `WorkerWorkflowData`, allowing shared steps
 /// (register, activate, update policies) to work generically.
 pub trait WorkerRegistrationData: WorkflowData {
+    /// A preparation whose tokenizers must remain pinned through publication.
+    fn tokenizer_preparation(
+        &self,
+    ) -> Option<&Arc<super::tokenizer_preparation::TokenizerPreparation>> {
+        None
+    }
+
     /// Get the application context (transient, not serialized).
     fn get_app_context(&self) -> Option<&Arc<AppContext>>;
 
@@ -77,6 +84,8 @@ pub trait WorkerRegistrationData: WorkflowData {
 /// What the gateway's own steps keep on a registration between them.
 #[derive(Debug, Clone, Default)]
 pub struct RegistrationNotes {
+    pub(crate) tokenizer_preparation:
+        Option<Arc<super::tokenizer_preparation::TokenizerPreparation>>,
     /// Under Symphony, the table whose failure classes the registration step
     /// publishes at zero once the worker is in the registry (the create step
     /// resolves it from the model card and the names; none for an HTTP
@@ -93,6 +102,21 @@ pub struct RegistrationNotes {
 pub type WorkerWorkflowData = worker_workflow::WorkerRegistrationWorkflowData<AppContext>;
 
 impl WorkerRegistrationData for WorkerWorkflowData {
+    fn tokenizer_preparation(
+        &self,
+    ) -> Option<&Arc<super::tokenizer_preparation::TokenizerPreparation>> {
+        (self.worker_kind == Some(worker_workflow::WorkerKind::Local)
+            && self
+                .connection_mode
+                .is_some_and(|mode| mode.uses_grpc_pipeline())
+            && self.host.as_ref().is_some_and(|app| {
+                app.router_config.wait_for_tokenizer
+                    && !app.router_config.disable_tokenizer_autoload
+            }))
+        .then_some(self.host_notes.tokenizer_preparation.as_ref())
+        .flatten()
+    }
+
     fn get_app_context(&self) -> Option<&Arc<AppContext>> {
         self.host.as_ref()
     }

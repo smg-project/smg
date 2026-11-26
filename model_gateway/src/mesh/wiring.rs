@@ -81,6 +81,24 @@ impl MeshAdapters {
         cluster_state: ClusterState,
         policy_registry: Arc<PolicyRegistry>,
     ) -> Arc<Self> {
+        Self::start_with_context(
+            mesh_kv,
+            node_name,
+            worker_registry,
+            cluster_state,
+            policy_registry,
+            std::sync::Weak::new(),
+        )
+    }
+
+    pub(crate) fn start_with_context(
+        mesh_kv: &MeshKV,
+        node_name: String,
+        worker_registry: Arc<WorkerRegistry>,
+        cluster_state: ClusterState,
+        policy_registry: Arc<PolicyRegistry>,
+        app_context: std::sync::Weak<crate::app_context::AppContext>,
+    ) -> Arc<Self> {
         let worker_ns = mesh_kv.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
         let td_ns = mesh_kv.configure_stream_prefix(
             TENANT_DELTA_PREFIX,
@@ -103,11 +121,12 @@ impl MeshAdapters {
                 routing: StreamRouting::Targeted,
             },
         );
-        let worker = WorkerSyncAdapter::new(
+        let worker = WorkerSyncAdapter::new_with_context(
             worker_ns,
             worker_registry,
             node_name.clone(),
             cluster_state.clone(),
+            app_context,
         );
         let peers: Arc<dyn PeerList> =
             Arc::new(ClusterStatePeerList::new(cluster_state, node_name.clone()));

@@ -23,7 +23,10 @@ use crate::{
         common::{pd_admission, snapshot::WorkerRegistry},
         grpc::regular::symphony::telemetry,
     },
-    workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
+    workflow::{
+        data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
+        steps::local::ReleaseTokenizerStep,
+    },
 };
 
 /// Unified step to register workers in the registry.
@@ -64,8 +67,8 @@ pub fn registered_entries<D: WorkerRegistrationData>(
         .flatten()
         .filter_map(|worker| {
             let id = registry.get_id_by_url(worker.url())?;
-            let entry = registry.get(&id)?;
-            Arc::ptr_eq(&entry, worker).then(|| (id.as_str().to_string(), entry.revision()))
+            let revision = registry.revision_if_current(&id, worker)?;
+            Some((id.as_str().to_string(), revision))
         })
         .collect()
 }
@@ -331,22 +334,28 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         }
 
         let registration_mode = context.data.registration_mode();
-
-        // Read before the registry is written: only the registry as it is
-        // now knows the workers this registration replaces.
-        let left_models = models_left(&app_context.worker_registry, workers);
-
-        write_batch(
-            &app_context,
-            workers,
-            &registration_mode,
-            context.data.symphony_table(),
-        )?;
+        let commit = || {
+            let left = models_left(&app_context.worker_registry, workers);
+            write_batch(
+                &app_context,
+                workers,
+                &registration_mode,
+                context.data.symphony_table(),
+            )?;
+            Ok(left)
+        };
+        let left_models = match context.data.tokenizer_preparation() {
+            Some(preparation) => preparation.commit(commit)?,
+            None => commit()?,
+        };
 
         // A replacement that moved a worker to another model, or that lists
         // a model fewer, takes the policy of each model no worker of this
         // node serves any more, as the worker's removal would.
         for model_id in &left_models {
+            if app_context.router_config.wait_for_tokenizer {
+                ReleaseTokenizerStep::release_if_unserved(&app_context, model_id);
+            }
             if !app_context.worker_registry.serves_model_locally(model_id) {
                 app_context.policy_registry.on_model_unserved(model_id);
             }
@@ -415,6 +424,31 @@ mod tests {
             registered_entries(&registry, &state),
             HashMap::from([(id.as_str().to_string(), worker.revision())]),
             "the registration's worker is the entry under its URL"
+        );
+        let entries = registry.with_another_write_before_the_lock(
+            |registry| registered_entries(registry, &state),
+            |_| {
+                worker.raise_revision_to(worker.revision() + 1);
+            },
+        );
+        assert_eq!(
+            entries,
+            HashMap::from([(id.as_str().to_string(), worker.revision())]),
+            "an in-place revision raise keeps the exact worker eligible for cleanup"
+        );
+        let entries = registry.with_another_write_before_the_lock(
+            |registry| registered_entries(registry, &state),
+            |registry| {
+                registry.register_or_replace(Arc::new(BasicWorkerBuilder::new(url).build()));
+            },
+        );
+        assert!(
+            entries.is_empty(),
+            "a same-ID replacement cannot donate its revision to the old worker's removal pin"
+        );
+        assert!(
+            registered_entries(&registry, &state).is_empty(),
+            "the replaced worker shares the new revision but not the registry entry's identity"
         );
         registry.remove(&id);
         let other: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());

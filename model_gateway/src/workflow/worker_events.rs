@@ -87,15 +87,50 @@ async fn load_tokenizer_of_import(
         return;
     };
     let spec = &worker.metadata().spec;
-    // The card's template is a path on the owner's node: it is the model's own
-    // where the file stands here too; where not, this node's template is first.
     let card = spec
         .models
         .primary()
-        .and_then(|card| card.chat_template.clone());
-    let chat_template = match card {
-        Some(path) if tokio::fs::try_exists(&path).await.unwrap_or(false) => Some(path),
-        card => context.router_config.chat_template.clone().or(card),
-    };
+        .and_then(|card| card.chat_template.as_deref());
+    let chat_template =
+        imported_chat_template(card, context.router_config.chat_template.as_deref()).await;
     submit_tokenizer_job(context, job_queue, model_id, &spec.labels, chat_template).await;
+}
+
+/// A published template path is local to the owner. Prefer this gateway's
+/// override if that file is absent here.
+pub(crate) async fn imported_chat_template(
+    card: Option<&str>,
+    local: Option<&str>,
+) -> Option<String> {
+    match card {
+        Some(path) if tokio::fs::try_exists(path).await.unwrap_or(false) => Some(path.to_owned()),
+        _ => local.or(card).map(str::to_owned),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::imported_chat_template;
+
+    #[tokio::test]
+    async fn an_import_uses_a_shared_card_template_then_the_receiving_gateways_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("owner.jinja");
+        let owner = file.to_str().unwrap();
+        let local = Some("receiver.jinja");
+        assert_eq!(
+            imported_chat_template(Some(owner), local).await.as_deref(),
+            local
+        );
+        assert_eq!(
+            imported_chat_template(Some(owner), None).await.as_deref(),
+            Some(owner)
+        );
+        std::fs::write(&file, "shared template").unwrap();
+        assert_eq!(
+            imported_chat_template(Some(owner), local).await.as_deref(),
+            Some(owner)
+        );
+        assert_eq!(imported_chat_template(None, local).await.as_deref(), local);
+    }
 }

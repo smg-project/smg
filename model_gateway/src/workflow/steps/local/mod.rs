@@ -2,6 +2,7 @@ mod check_local_worker;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod forget_cache_events;
+mod prepare_tokenizer;
 mod rediscover_labels;
 mod release_tokenizer;
 mod remove_from_policy_registry;
@@ -19,6 +20,7 @@ pub(crate) use check_local_worker::{CheckLocalWorkerStep, CHECK_LOCAL_WORKER_STE
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 use openai_protocol::worker::WorkerUpdateRequest;
+pub use prepare_tokenizer::PrepareTokenizerStep;
 pub use rediscover_labels::RediscoverLabelsStep;
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;

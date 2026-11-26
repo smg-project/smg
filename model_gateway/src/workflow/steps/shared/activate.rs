@@ -31,7 +31,11 @@ fn activation_status(worker: &Arc<dyn Worker>) -> Option<WorkerStatus> {
     if *worker.connection_mode() == ConnectionMode::Zmq {
         return None;
     }
-    (worker.status() != WorkerStatus::Ready).then_some(WorkerStatus::Ready)
+    (!matches!(
+        worker.status(),
+        WorkerStatus::Ready | WorkerStatus::Draining
+    ))
+    .then_some(WorkerStatus::Ready)
 }
 
 #[async_trait]
@@ -49,68 +53,44 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         // capacity on it (a worker flipped Ready directly was counted only
         // if the tracker's recompute for the `Registered` event happened to
         // run after the flip, so a second worker's slots were often never
-        // added), and so does every other subscriber. A worker the registry
-        // no longer holds is flipped directly, as before.
+        // added), and so does every other subscriber.
         let registry = &app_context.worker_registry;
         let mut activated = 0;
+        let mode = context.data.registration_mode();
         for worker in workers {
-            // A PUT's replacement shares the status of the worker it
-            // replaced: a removal's Draining mark behind the PUT's write
-            // stands and fails the step, decided under the worker's lock.
-            if let WorkerRegistrationMode::ReplaceById { worker_id, .. } =
-                context.data.registration_mode()
-            {
-                let worker_id = WorkerId::from_string(worker_id);
-                let status = activation_status(worker);
-                let decide = |held: &Arc<dyn Worker>| {
-                    let mine = Arc::ptr_eq(held, worker);
-                    let leaving = mine && held.status() == WorkerStatus::Draining;
-                    (leaving, status.filter(|_| mine && !leaving))
-                };
-                // The revision is only the call's precondition (`ptr_eq` is
-                // the identity test), and a mesh publication can raise it in
-                // place behind the read: it is read once more.
-                let outcome = registry
-                    .apply_if_revision(&worker_id, worker.revision(), decide)
-                    .or_else(|| registry.apply_if_revision(&worker_id, worker.revision(), decide));
-                match outcome {
-                    Some((true, _)) => {
-                        return Err(WorkflowError::StepFailed {
-                            step_id: StepId::new(ACTIVATE_WORKERS_STEP),
-                            message: format!(
-                                "Worker {} at {} is being removed, so its replacement was not \
-                                 activated",
-                                worker_id.as_str(),
-                                worker.redacted_url()
-                            ),
-                        })
-                    }
-                    Some((false, Some(_))) => activated += 1,
-                    // Nothing to write, or superseded since: the status is
-                    // its successor's.
-                    Some((false, None)) => {}
-                    None => debug!(
-                        worker_id = %worker_id.as_str(),
-                        worker_url = worker.redacted_url(),
-                        "Replacement not activated: the worker is gone or its revision moved behind both reads"
-                    ),
+            let worker_id = match &mode {
+                WorkerRegistrationMode::ReplaceById { worker_id, .. } => {
+                    WorkerId::from_string(worker_id.clone())
                 }
-                continue;
-            }
-            if let Some(status) = activation_status(worker) {
-                // Only the worker this workflow registered: an upsert of the
-                // same URL that raced it (discovery beside an API call) must
-                // not have its own worker flipped from here.
-                match registry
-                    .get_id_by_url(worker.url())
-                    .filter(|id| registry.get(id).is_some_and(|w| Arc::ptr_eq(&w, worker)))
-                {
-                    Some(worker_id) => {
-                        registry.transition_status(&worker_id, status);
-                    }
-                    None => worker.set_status(status),
+                _ => {
+                    let Some(id) = registry.get_id_by_url(worker.url()) else {
+                        continue;
+                    };
+                    id
                 }
-                activated += 1;
+            };
+            let outcome = registry.apply_if_current(&worker_id, worker, |held| {
+                (
+                    held.status() == WorkerStatus::Draining,
+                    activation_status(held),
+                )
+            });
+            match outcome {
+                Some((true, _)) if matches!(mode, WorkerRegistrationMode::ReplaceById { .. }) => {
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new(ACTIVATE_WORKERS_STEP),
+                        message: format!(
+                            "Worker {} at {} is being removed, so its replacement was not activated",
+                            worker_id.as_str(),
+                            worker.redacted_url()
+                        ),
+                    });
+                }
+                Some((_, Some(_))) => activated += 1,
+                Some((_, None)) => {}
+                None => {
+                    debug!(worker_id = %worker_id.as_str(), "Worker removed or replaced before activation");
+                }
             }
         }
 
@@ -225,10 +205,15 @@ mod tests {
         data.actual_workers = Some(vec![Arc::clone(&worker)]);
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
-        ActivateWorkersStep
-            .execute(&mut context)
-            .await
-            .expect("activation");
+        let runtime = tokio::runtime::Handle::current();
+        registry.with_another_write_before_the_lock(
+            |_| {
+                runtime
+                    .block_on(ActivateWorkersStep.execute(&mut context))
+                    .expect("activation")
+            },
+            |_| worker.raise_revision_to(worker.revision() + 1),
+        );
 
         assert_eq!(worker.status(), WorkerStatus::Ready);
         let transition =
