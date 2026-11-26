@@ -1340,6 +1340,15 @@ impl Buffers {
         }
     }
 
+    /// Takes the word of whether nobody reads the best rows of a trace
+    /// made with these buffers, as the scratch states it
+    /// ([`Scratch::unread`]). [`Buffers::traced`] reads it.
+    #[cfg(feature = "in-process")]
+    #[inline(always)]
+    fn set_unread(&mut self, unread: bool) {
+        self.unread = unread;
+    }
+
     /// Room in every buffer for the whole pass over a pool of `rows`. A
     /// decision that draws first writes a few rows and asks for the room
     /// all the same: the pass it widens to may be many decisions away, and
@@ -1384,7 +1393,7 @@ impl Scratch {
     #[cfg(feature = "in-process")]
     #[inline(always)]
     pub(crate) fn unread(&mut self, unread: bool) {
-        self.single.unread = unread;
+        self.single.set_unread(unread);
     }
 
     /// The list the last pair's decision or encode decision made with
