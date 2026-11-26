@@ -3097,7 +3097,7 @@ const DRAWS_TWO: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
 /// may refuse a row by a fact no word of the list says. A pool whose host
 /// lists its engines is not meant under `power-of-two`, which decides a
 /// pair over them at any size; `power-of-two-count-first` names no unit
-/// and draws that pool's rows. A host that
+/// and draws that pool's rows from [`DRAW_FROM`] on. A host that
 /// writes a row's record when the decision asks about the row pays the
 /// whole pass one write a row beside the pass's own reading, and the draw
 /// the rows it lands on: so its draw wins under [`DRAW_FROM`] rows, where a
@@ -3109,7 +3109,8 @@ const DRAWS_TWO: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
 /// excluded, carries no session key, is held to no places and stands under
 /// no veto of its host,
 /// over a list whose every worker publishes its routing state available
-/// (`PoolRecords::stands`). Every other decision there is written whole
+/// (`PoolRecords::stands`) and that holds no engine's ranks
+/// (`PoolRecords::has_ranks`). Every other decision there is written whole
 /// and read by the pass: no refused row costs a draw, and the pick of a
 /// seed is the pass's in each. What it costs: a worker whose state moves
 /// behind the list's answer may still refuse a row to the draw, which
@@ -3971,7 +3972,10 @@ pub struct Engine {
     /// under a picker that draws two rows ([`DRAWS_TWO`]) where every
     /// profile of the document draws first under such a picker and keeps a
     /// row by the one folded test, and from [`DRAW_FROM`] in every other
-    /// case.
+    /// case. So the profiles of one document that are asked hold one
+    /// floor, [`Self::written_least`]: it stands per profile for the one
+    /// compare that tells [`Engine::drawn_for`] both whether a profile is
+    /// asked and from what size.
     #[cfg(feature = "in-process")]
     written_from: Box<[usize]>,
     /// The least of [`Self::written_from`]: a smaller pool is no draw's
