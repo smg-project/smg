@@ -3090,7 +3090,7 @@ hands the store the event at its place in the log, and puts the object in the re
 the store took the event. A removal's object leaves the registry first. A record changed in
 place keeps the instant it was admitted at. A status the leader tells is written to the table and
 laid on the object in the same turn. A restore is the store's restore and the lay of the cut's own
-records in one turn of that code. No record is read back. A record of a watch's snapshot whose
+records in one turn of that code. No record is read back to lay an object: each record's status is read off the table. A record of a watch's snapshot whose
 object stands keeps the instant it was admitted at: that code states it before the store takes
 the snapshot. A first copy is cut from the objects, by the last
 part of step 2.
