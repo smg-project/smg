@@ -1066,5 +1066,5 @@ impl Scorer for Bucket {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/policies/bucket/tests.rs"]
+#[path = "../../tests/unit/policies/bucket/tests/mod.rs"]
 mod tests;
