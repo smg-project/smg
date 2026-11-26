@@ -1863,6 +1863,124 @@ fn test_remove_workers_from_model_does_not_mutate_other_models() {
         .is_some_and(|placements| !placements.is_empty()));
 }
 
+/// Workers removed by URL as one batch leave every model together: each
+/// one's tenant of the string tree and of the token tree, and its hash
+/// placements. A worker the batch does not name keeps all three, and a batch
+/// that names nobody removes nothing. Workers kept by URL are the same pass
+/// turned round: every worker the list does not name leaves the three.
+#[test]
+fn workers_removed_by_url_as_a_batch_leave_every_model() {
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    let urls = [
+        "http://w1:8000",
+        "http://w2:8000",
+        "http://w3:8000",
+        "http://w4:8000",
+    ];
+    let models = ["first-model", "second-model"];
+    for model_id in models {
+        for (at, url) in urls.into_iter().enumerate() {
+            let tokens: Vec<u32> = (0..32).map(|token| token + 100 * at as u32).collect();
+            policy
+                .trees
+                .string_tree_or_new(model_id)
+                .insert_text(&format!("prefix {at}"), url);
+            policy
+                .trees
+                .token_tree_or_new(model_id)
+                .insert_tokens(&tokens, url);
+            policy.record_placement(model_id, None, &tokens, &[16], url, Instant::now());
+        }
+    }
+    // Whether `url` stands in `model_id`'s string tree, token tree and hash
+    // placements.
+    let remembered = |model_id: &str, url: &str| {
+        let string = policy.trees.string_tree(model_id).unwrap();
+        let token = policy.trees.token_tree(model_id).unwrap();
+        let placed = policy
+            .placement_index
+            .get(model_id)
+            .unwrap()
+            .iter()
+            .any(|placement| placement.value().iter().any(|h| h.worker_url == url));
+        [
+            string.get_tenant_char_count().contains_key(url),
+            token.get_tenant_token_counts().contains_key(url),
+            placed,
+        ]
+    };
+
+    policy.remove_workers_by_url(&HashSet::new());
+    for model_id in models {
+        for url in urls {
+            assert_eq!(remembered(model_id, url), [true; 3], "{url}, {model_id}");
+        }
+    }
+
+    policy.remove_workers_by_url(&HashSet::from([urls[0].to_owned(), urls[2].to_owned()]));
+    for model_id in models {
+        assert_eq!(remembered(model_id, urls[0]), [false; 3], "{model_id}");
+        assert_eq!(remembered(model_id, urls[1]), [true; 3], "{model_id}");
+        assert_eq!(remembered(model_id, urls[2]), [false; 3], "{model_id}");
+        assert_eq!(remembered(model_id, urls[3]), [true; 3], "{model_id}");
+    }
+
+    policy.keep_workers_by_url(&HashSet::from([urls[1].to_owned()]));
+    for model_id in models {
+        assert_eq!(remembered(model_id, urls[1]), [true; 3], "{model_id}");
+        assert_eq!(remembered(model_id, urls[3]), [false; 3], "{model_id}");
+    }
+}
+
+/// Workers kept by URL in hash mode, which keeps no tree: a worker the list
+/// does not name leaves the load scorer and the hash placements all the
+/// same, and a listed worker keeps both.
+#[test]
+fn workers_kept_by_url_in_hash_mode_leave_the_load_scorer() {
+    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let model = normalize_model_key(workers[0].model_id());
+    // One request sent to each worker: a dispatch the scorer notes and a
+    // placement.
+    for (at, worker) in workers.iter().enumerate() {
+        let tokens: Vec<u32> = (0..16).map(|token| token + 100 * at as u32).collect();
+        assert_eq!(
+            route_tokens(&policy, std::slice::from_ref(worker), &tokens),
+            0
+        );
+    }
+    // The requests the scorer counts for `url`, and whether a placement
+    // names it.
+    let remembered = |url: &str| {
+        let placed = policy
+            .placement_index
+            .get(model)
+            .unwrap()
+            .iter()
+            .any(|placement| placement.value().iter().any(|h| h.worker_url == url));
+        (policy.load_scorer.load_state_for_test(url).2, placed)
+    };
+    for worker in &workers {
+        assert_eq!(remembered(worker.url()), (1, true), "{}", worker.url());
+    }
+    assert_eq!(
+        policy.trees.string_tree_count(),
+        0,
+        "hash mode keeps no tree"
+    );
+
+    policy.keep_workers_by_url(&HashSet::from([workers[1].url().to_owned()]));
+    assert_eq!(
+        remembered(workers[0].url()),
+        (0, false),
+        "the one not listed"
+    );
+    assert_eq!(remembered(workers[1].url()), (1, true), "the one listed");
+}
+
 #[test]
 fn test_apply_known_remote_insert_round_trip() {
     // Seed both kinds via `apply_repair_page` (the cold-start path,

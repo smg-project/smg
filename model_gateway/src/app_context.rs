@@ -628,6 +628,9 @@ impl AppContextBuilder {
         // and the first reader of a generation fills its ring.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             policy_registry.keep_rings_warm(&worker_registry, &runtime);
+            // A worker the registry lost leaves what the classic
+            // cache_aware policies remember of it, whichever way it left.
+            policy_registry.follow_removals(&worker_registry, &runtime);
         }
 
         // Create WorkerService from the already-built components
@@ -1126,7 +1129,7 @@ impl AppContextBuilder {
         spec: &AppliedSpec,
         events: Option<&Arc<KvEventMonitor>>,
         policies: &PolicyRegistry,
-        workers: &WorkerRegistry,
+        workers: &Arc<WorkerRegistry>,
     ) -> Option<Arc<dyn CacheIndexes>> {
         let trees = spec
             .needs()
