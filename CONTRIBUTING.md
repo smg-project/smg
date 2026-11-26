@@ -184,7 +184,8 @@ checks pass, the normal Go job may be enabled to qualify its original Llama
 model and all 23 test methods. Keep the original assertions and expected-failure
 rules. Require actual model results and complete owned cleanup before accepting
 GPU coverage or steady rollout. The caller requires the separately reviewed strict
-owned-process cleanup helper and uses a fresh UUID marker; successful process
+owned-process cleanup helper and uses a fresh UUID marker. The AMD Go job sets
+`SPT_NOENV=1` before Python startup so process-title changes preserve that marker; successful process
 cleanup is not proof of physical GPU memory or shared-lease release. Shared-host
 admission, lease, time windows and approved CI limits still apply to this first run.
 

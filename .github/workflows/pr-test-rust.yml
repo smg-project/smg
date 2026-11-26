@@ -2545,6 +2545,7 @@ jobs:
     permissions:
       contents: read
     env:
+      SPT_NOENV: '1'
       E2E_ENGINE: sglang
       E2E_RUNTIME: sglang
       E2E_GPU_VENDOR: amd

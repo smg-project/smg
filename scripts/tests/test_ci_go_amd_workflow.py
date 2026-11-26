@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -82,6 +84,7 @@ def test_go_amd_original_suite_and_finish_are_not_advisory():
     assert "-k " not in step["run"]
     assert job["env"]["E2E_MIN_SELECTED"] == "23"
     assert job["env"]["E2E_AMD_REQUIRE_PASSING_CALL"] == "1"
+    assert job["env"]["SPT_NOENV"] == "1"
     assert "e2e-go-bindings-amd" in jobs["finish"]["needs"]
     check = next(s["run"] for s in jobs["finish"]["steps"] if s.get("name") == "Check CI result")
     assert '"${{ needs.e2e-go-bindings-amd.result }}" =~ $bad' in check
@@ -150,3 +153,70 @@ def test_go_amd_marker_uses_a_fresh_uuid_for_each_invocation(tmp_path):
     values = output.read_text().splitlines()
     assert len(values) == 2 and len(set(values)) == 2
     assert all(re.fullmatch(r"E2E_JOB_MARKER=go-amd-[0-9a-f]{32}", value) for value in values)
+
+
+@pytest.mark.parametrize("drop_preservation", [False, True])
+def test_go_amd_caller_marker_survives_real_process_title_only_with_preservation(
+    tmp_path, drop_preservation
+):
+    # This is a bounded own child, not Go/FFI/model/worker execution. The runtime
+    # is selected from PATH so matching caller-environment qualification can
+    # bind it; ordinary tooling without this optional native package is unproved.
+    root = Path(__file__).resolve().parents[2]
+    job = yaml.safe_load((root / ".github/workflows/pr-test-rust.yml").read_text())["jobs"][
+        "e2e-go-bindings-amd"
+    ]
+    command = next(s["run"] for s in job["steps"] if s.get("name") == "Mark owned processes")
+    output = tmp_path / "github-env"
+    environment = {
+        "PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin",
+        "GITHUB_ENV": str(output),
+    }
+    if "SPT_NOENV" in job["env"]:
+        environment["SPT_NOENV"] = job["env"]["SPT_NOENV"]
+    marked = subprocess.run(
+        ["/usr/bin/bash", "-e", "-c", command],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert marked.returncode == 0, marked.stderr
+    (marker,) = output.read_text().splitlines()
+    key, value = marker.split("=", 1)
+    assert key == "E2E_JOB_MARKER" and re.fullmatch(r"go-amd-[0-9a-f]{32}", value)
+    environment[key] = value
+    if drop_preservation:
+        environment.pop("SPT_NOENV", None)
+    marker_python = shutil.which("python3")
+    assert marker_python is not None
+    probe = subprocess.run(
+        [marker_python, "-I", "-B", "-c", "import setproctitle"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if probe.returncode:
+        pytest.skip("setproctitle unavailable: actual caller-environment coverage not established")
+    child = subprocess.run(
+        [
+            marker_python,
+            "-I",
+            "-B",
+            "-c",
+            "import os,pathlib,json,setproctitle; "
+            "marker=os.environ['E2E_JOB_MARKER']; "
+            "setproctitle.setproctitle('smg::router'); "
+            "print(json.dumps({'present': ('E2E_JOB_MARKER='+marker).encode() "
+            "in pathlib.Path('/proc/self/environ').read_bytes()}))",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout)["present"] is (not drop_preservation)
