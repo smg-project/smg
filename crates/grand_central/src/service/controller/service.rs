@@ -91,8 +91,9 @@ use crate::{
 /// store's entry into the term.
 const NOT_IN_TERM: &str = "this replica leads a term its store has not entered yet";
 
-/// A leader's refusal for its whole lead, where its take started no term in
-/// its store's log: the log followed a term at or above the one taken.
+/// A leader's refusal where its take started no term in its store's log:
+/// the log followed a term at or above the one taken. The election leaves
+/// that lease in the take's step.
 const NO_TERM_LED: &str =
     "this replica holds the lease and its store leads no term: this call is not served until a later take";
 
@@ -1163,7 +1164,7 @@ impl GrandCentral for Service {
         let term = self.leading(Instant::now())?;
         self.shared
             .replication
-            .replicate(term, &standby, request.into_inner())
+            .replicate(&self.shared.floors, term, &standby, request.into_inner())
             .await
             .map(Response::new)
     }

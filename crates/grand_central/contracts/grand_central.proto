@@ -106,8 +106,9 @@
 // term, on a membership write, a spec write, its dry run and a rollback,
 // Replicate and the open of a WatchWorkers (the moment after
 // its take, until its store is told the term, and a call admitted under a
-// take its store has since passed: retry; or its whole lead, until a later
-// take, where its log followed a term at or above the one it took), or a
+// take its store has since passed: retry; or the one step of a lead whose
+// log followed a term at or above the one it took, which the election
+// leaves for a take above that term), or a
 // Decide stream open when the controller closes its listeners at its
 // shutdown (its gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read

@@ -19,6 +19,10 @@
 //! outlives every process, so no floor moves the lease past a mark either
 //! ([`FLOOR_REACH`]): the terms above it are kept for hand-overs, whatever
 //! any process said before.
+//!
+//! A standby's hello that states a term above the leader's is one more such
+//! word. It is said through the same door, within the same range, budget and
+//! reach, and its answer to the standby stays the refusal it was.
 
 use std::sync::OnceLock;
 

@@ -27,6 +27,12 @@
 //! ids pass their mark: the next take brings a term whose ids start again. The
 //! hand-over names that term, and the thread drops one whose term this replica
 //! no longer holds the lease under: that lease is left already.
+//!
+//! The thread leaves one lease with no word: a take that starts no term in
+//! the store's log. The log followed a term at or above the take's, so
+//! another replica led that term. The thread leaves in the take's own step,
+//! ahead of the standing, as at a word of a term seen. The next take stands
+//! above the followed term, and the log leads it.
 
 #![expect(
     clippy::exhaustive_structs,
@@ -436,6 +442,9 @@ fn run_loop(
         // step then answered, an error too, and its own lead's term: no
         // holder restored under a lower term is named.
         seen.term = seen.term.max(elector.highest_term());
+        // Whether this step left a lease that no other candidate can take:
+        // the next step then follows at once.
+        let mut again = false;
         match ticked {
             Ok(tick) => {
                 failing = false;
@@ -510,7 +519,7 @@ fn run_loop(
                     // counted above with every step's.
                     None => seen.holder.clear(),
                 }
-                report(
+                let followed = report(
                     elector,
                     &tick,
                     store,
@@ -518,6 +527,27 @@ fn run_loop(
                     &mut streak,
                     &mut leading,
                 );
+                if let (Some(followed), TickOutcome::Acquired { term }) = (followed, &tick) {
+                    // The log is one more witness of a term. The replica
+                    // leaves as at a word of a term seen, ahead of the
+                    // standing: no reader is shown this leader. A followed
+                    // term above the take's is said, and the elector counts
+                    // it. At the take's own term none is said, as a planned
+                    // hand-over says none: a holder told its own term keeps
+                    // on.
+                    let above = (followed > *term).then_some(followed);
+                    match leaves(elector, above, &mut leading, &mut seen) {
+                        Some(left) => again = left.alone,
+                        // A term that leaves none to take: the replica
+                        // leads on as it stands.
+                        None => warn!(
+                            identity = elector.identity(),
+                            term,
+                            followed,
+                            "the election refused the term the log followed: this replica keeps the lease, its writes stand under no term and no standby follows them until a later take"
+                        ),
+                    }
+                }
             }
             Err(error) => {
                 // One line a streak: the step repeats every renew period.
@@ -533,6 +563,11 @@ fn run_loop(
             }
         }
         standing.send_replace(seen.clone());
+        // No other candidate can take the lease this step left: the time
+        // with no leader ends at this replica's own take.
+        if again {
+            continue;
+        }
         // A step that took the period or more is followed at once, never
         // sooner. A word to leave is taken when it comes, and the wait for
         // the next step goes on: but for a replica alone over its lease
@@ -560,26 +595,15 @@ fn run_loop(
             };
             // A word the elector refused counts nothing here
             // either.
-            let Some(left) = step_down(elector, above) else {
+            let Some(left) = leaves(elector, above, &mut leading, &mut seen) else {
                 continue;
             };
-            // The fence closed at the word: the take that opens it
-            // again says so, as the first take did.
-            if left {
-                leading = false;
-            }
-            // A lease this replica left names nobody, and so does a
-            // term above the one the holder is named under: the
-            // elector counted the term said.
-            let highest = elector.highest_term();
-            if left || highest > seen.term {
-                seen.holder.clear();
-                seen.term = seen.term.max(highest);
+            if left.moved {
                 standing.send_replace(seen.clone());
             }
             // No other candidate can take the lease this replica left: the
             // time with no leader ends at its own take.
-            if left && elector.is_alone() {
+            if left.alone {
                 break false;
             }
         };
@@ -616,8 +640,9 @@ enum Streak {
 }
 
 /// One line a change of role, a gone streak or a waiting one; a take's term
-/// to the store, and one warning where that take started no term in the
-/// store's log.
+/// to the store. Where that take started no term in the store's log: one
+/// warning, and the term the log followed, which the loop leaves the lease
+/// for.
 fn report(
     elector: &Elector,
     tick: &TickOutcome,
@@ -625,24 +650,26 @@ fn report(
     following: &mut String,
     streak: &mut Streak,
     leading: &mut bool,
-) {
+) -> Option<u64> {
     let now = match tick {
         TickOutcome::Gone { .. } => Streak::Gone,
         TickOutcome::Waiting { .. } => Streak::Waiting,
         _ => Streak::None,
     };
     let was = std::mem::replace(streak, now);
+    let mut followed = None;
     match tick {
         TickOutcome::Acquired { term } => {
             following.clear();
             store.set_term(*term);
             // The take started no term in the store's log.
-            if let Some(followed) = store.followed() {
+            followed = store.followed();
+            if let Some(followed) = followed {
                 warn!(
                     identity = elector.identity(),
                     term,
                     followed,
-                    "the take started no term in the log: the log followed a term at or above it, so its writes stand under no term and no standby follows them until a later take"
+                    "the take started no term in the log: the log followed a term at or above it, so another replica led that term and this one leaves the lease"
                 );
             }
         }
@@ -697,6 +724,9 @@ fn report(
     // take it made: after a slow step the fence reads closed here as well,
     // with no wait to name, and the next renewal leads.
     match tick {
+        // A take the loop leaves in this step says no line of a lead. Where
+        // the elector refuses that leave, the next renewal says it.
+        TickOutcome::Acquired { .. } if followed.is_some() => {}
         TickOutcome::Acquired { term } | TickOutcome::Renewed { term } => {
             if !*leading {
                 *leading = elector.fence().leader_term(Instant::now()).is_some();
@@ -713,6 +743,45 @@ fn report(
         }
         _ => *leading = false,
     }
+    followed
+}
+
+/// What a leave of the thread's came to ([`leaves`]).
+#[derive(Clone, Copy)]
+struct Left {
+    /// Whether the standing changed: a lease was left, or a term was counted
+    /// above the one its holder is named under.
+    moved: bool,
+    /// Whether this replica left a lease that no other candidate can take.
+    alone: bool,
+}
+
+/// A leave the thread makes ([`step_down`]): at a word, or of a take that
+/// started no term in the store's log. The fence closed where a lease was
+/// left: the take that opens it again says so, as the first take did. A
+/// lease this replica left names nobody in `seen`, and so does a term above
+/// the one the holder is named under: the elector counted the term said.
+/// `None` where the elector refused the term: nothing was counted.
+fn leaves(
+    elector: &mut Elector,
+    above: Option<u64>,
+    leading: &mut bool,
+    seen: &mut ElectionObservation,
+) -> Option<Left> {
+    let left = step_down(elector, above)?;
+    if left {
+        *leading = false;
+    }
+    let highest = elector.highest_term();
+    let moved = left || highest > seen.term;
+    if moved {
+        seen.holder.clear();
+        seen.term = seen.term.max(highest);
+    }
+    Some(Left {
+        moved,
+        alone: left && elector.is_alone(),
+    })
 }
 
 /// Whether this replica holds the lease under the term `under`, the term a

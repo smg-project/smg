@@ -2675,6 +2675,12 @@ listeners (gateways, operators, standbys) and HTTP
 on an admin listener (probes, version, metrics). It elects a leader by a leader lease, held in the
 process, in a file, or in a Kubernetes Lease object. That lease is not the lease of section 6.
 
+A take of the lease stands above every term its replica saw. Three witnesses can show a leader a
+term its lease's record never did: a gateway's term floor, a standby's hello and the leader's own
+log. The leader then leaves the lease, and the next take stands above that term. A floor or a
+hello's term is believed within a range, and the terms one process moves this way have a budget.
+The log's word is the replica's own: its take is left in its own step.
+
 Its data stands in an in-memory store (`store/memory.rs`), in the worker crate's registry of worker
 objects and its load monitor, in the worker host's tables and in the engine's own tables:
 
