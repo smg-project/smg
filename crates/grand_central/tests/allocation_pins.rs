@@ -15,30 +15,80 @@
 //! with the `in-process` feature: a request held from its decision to its
 //! completion allocates nothing after the first ones. A separate
 //! executable, so it can declare the counting allocator the pins need.
+//!
+//! One pin reads frees: a decision that spans a write frees nothing on its
+//! thread. The allocator here counts each thread's frees for it.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
+    time::{Duration, Instant},
+};
 
 use common::counting_alloc::{calls, Counting};
 use smg_grand_central::{
-    document::{PolicySpec, PRESETS},
+    document::{AppliedSpec, PolicySpec, PRESETS},
     engine::{
         AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, LoadRow,
         PairPools, PoolFacts, RequestFacts, Scratch, SignalSource, Target, WorkerId,
     },
     stages::Lifecycle,
     store::{
-        GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
+        GatewayId, Hand, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
         WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::{Dispatch, Lease, LeaseId, Outcome, Said, Side, TransportClass},
 };
 
+thread_local! {
+    /// Frees this thread made. A constant without a destructor, so the
+    /// allocator reaches it without one.
+    static FREES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Frees the calling thread has made so far.
+fn frees() -> usize {
+    FREES.with(Cell::get)
+}
+
+/// The pins' counting allocator, which counts each thread's frees too. The
+/// count of frees is this executable's own. A bench registers [`Counting`]
+/// itself, and a count there would stand in every free the bench measures.
+struct CountingFrees(Counting);
+
+#[expect(
+    unsafe_code,
+    reason = "a counting global allocator is the only way to see what a decision freed"
+)]
+unsafe impl GlobalAlloc for CountingFrees {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the same layout contract as the caller's, forwarded to the allocator counted over.
+        unsafe { self.0.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the same layout contract as the caller's.
+        unsafe { self.0.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        FREES.with(|frees| frees.set(frees.get() + 1));
+        // SAFETY: `ptr` came from `alloc` with this layout.
+        unsafe { self.0.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: `ptr` came from `alloc` with this layout; the caller upholds `new_size`.
+        unsafe { self.0.realloc(ptr, layout, new_size) }
+    }
+}
+
 #[global_allocator]
-static GLOBAL: Counting = Counting(std::alloc::System);
+static GLOBAL: CountingFrees = CountingFrees(Counting(System));
 
 /// What `work` returns, and the allocation calls this thread made during it.
 fn allocations_during<T>(work: impl FnOnce() -> T) -> (T, usize) {
@@ -688,6 +738,75 @@ fn a_registrations_allocations_do_not_follow_the_fleet() {
     };
     let (few, many) = (fewest(8), fewest(512));
     assert_eq!(many, few, "a registration's allocations follow the fleet");
+}
+
+/// A generation of the round-robin preset under `number`.
+fn generation(number: u64) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    AppliedSpec::validate(&document).expect("a preset validates")
+}
+
+/// A decision that spans a write frees nothing on its thread. The decision
+/// borrows the world of its instant ([`MemoryStore::deciding`]). A write
+/// that publishes meanwhile replaces that world, so the decision is its
+/// last reader. The writer keeps a replaced world a reader holds until a
+/// later publication finds nobody on it. So the decision's end frees
+/// neither the world, its vetoes, its derived tables nor its generation.
+#[test]
+fn a_decision_that_spans_a_write_frees_nothing_on_its_thread() {
+    let (store, ids) = store_of(64);
+    let gateway = GatewayId(7);
+    let until = Some(Instant::now() + Duration::from_secs(7_200));
+    let member = |key: String, incarnation: u64| WorkerFacts {
+        key: key.clone(),
+        engine: key,
+        incarnation,
+        models: vec!["m".to_string()],
+        dp_size: 1,
+        ..WorkerFacts::default()
+    };
+    let write = |kind: usize, turn: usize| match kind {
+        // A veto of the asking gateway.
+        0 => store.gateway_veto(gateway, ids[10 + turn], until),
+        // A membership write, and the build it owes.
+        1 => {
+            store.upsert(member(format!("http://new{turn}:8000"), 1));
+            store.publish_now();
+        }
+        // A generation applied.
+        2 => store
+            .apply(generation(turn as u64 + 1))
+            .expect("above the standing one"),
+        // A leave: it pays its build at its answer.
+        3 => {
+            let id = ids[40 + turn];
+            let revision = WorkersStore::get(&store, id).expect("the row").revision;
+            store.remove(id, revision).expect("removed");
+        }
+        // A new incarnation: the write pays its build at its answer.
+        _ => {
+            store.upsert(member(format!("http://w{}:8000", 20 + turn), 2));
+        }
+    };
+    for kind in 0..5 {
+        for turn in 0..3 {
+            // The decision holds its world across the write: it is the last
+            // reader of the world the write replaces.
+            let freed = store.deciding(|world| {
+                write(kind, turn);
+                let standing = store.snapshot();
+                assert!(!std::ptr::eq(world, &*standing), "write {kind} published");
+                drop(standing);
+                frees()
+            });
+            assert_eq!(
+                frees() - freed,
+                0,
+                "a decision that spanned write {kind} freed on its thread"
+            );
+        }
+    }
 }
 
 /// A validation builds an index key's error path at the key's refusal
