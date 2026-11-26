@@ -10,6 +10,7 @@ import importlib.util
 import inspect
 import json
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -382,20 +383,29 @@ class Guard:
                     # The SDK precheck can precede a concurrent failed request.
                     # Order the actual reservation commit with local stop publication.
                     with guard._admission_lock:
-                        if guard.failed:
-                            raise BudgetError("This process has stopped paid admission")
-                        guard.ledger.reserve(
-                            request_id,
-                            guard.arm,
-                            "openai/" + model,
-                            guard.contexts["models"][model]["context_tokens"],
-                            data["max_completion_tokens"],
-                            num_retries=0,
-                            output_limit_verified=True,
-                            metadata=metadata,
+                        try:
+                            if guard.failed:
+                                raise BudgetError("This process has stopped paid admission")
+                            guard.ledger.reserve(
+                                request_id,
+                                guard.arm,
+                                "openai/" + model,
+                                guard.contexts["models"][model]["context_tokens"],
+                                data["max_completion_tokens"],
+                                num_retries=0,
+                                output_limit_verified=True,
+                                metadata=metadata,
+                            )
+                        except BaseException:
+                            guard.failed = True
+                            raise
+                except BaseException as error:
+                    try:
+                        guard.stop_paid()
+                    except BaseException as halt_error:
+                        error.add_note(
+                            "Shared paid halt NOT_ATTESTED: " + type(halt_error).__name__
                         )
-                except BudgetError:
-                    guard.stop_paid()  # budget refusal must not become a valid zero reward
                     raise
                 outcome = {}
                 try:
@@ -441,7 +451,18 @@ class Guard:
                         if not isinstance(error, Exception):
                             raise error
                     raise
-                guard.ledger.finish(request_id, prompt, completion, outcome=outcome)
+                try:
+                    guard.ledger.finish(request_id, prompt, completion, outcome=outcome)
+                except BaseException as error:
+                    # This settlement may have committed. Stop before SDK unwind,
+                    # preserving the error and never attempting a second finish.
+                    try:
+                        guard.stop_paid()
+                    except BaseException as halt_error:
+                        error.add_note(
+                            "Shared paid halt NOT_ATTESTED: " + type(halt_error).__name__
+                        )
+                    raise
                 return response
 
             def close(self):
@@ -598,10 +619,36 @@ class Guard:
         original_exit = batch.os._exit
 
         def stop_before_hard_exit(code):
-            # The pinned runner uses this only for Ctrl+C. Its worker threads
-            # cannot unwind after os._exit, so publish from the main exit boundary.
+            # Only the pinned batch main-thread Ctrl+C boundary. Keep the stop
+            # worker independent of later Python KeyboardInterrupts in the main
+            # thread, and wait for its actual completion event, not Thread.join
+            # (which can report a stopped thread after an interrupted join).
+            previous_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            done = threading.Event()
+            failures = []
+
+            def ordered_stop():
+                try:
+                    self.stop_paid()
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    done.set()
+
             try:
-                self.stop_paid()
+                worker = threading.Thread(
+                    target=ordered_stop, daemon=True, name="tau2-ordered-stop"
+                )
+                worker.start()
+                completed = done.wait(10)
+                if not completed or failures:
+                    reason = type(failures[0]).__name__ if failures else "ordering-or-IO-timeout"
+                    print(
+                        "Shared paid halt before hard exit NOT_ATTESTED: " + reason,
+                        file=sys.stderr,
+                        flush=True,
+                    )
             except BaseException as error:
                 print(
                     "Shared paid halt before hard exit NOT_ATTESTED: " + type(error).__name__,
@@ -609,7 +656,11 @@ class Guard:
                     flush=True,
                 )
             finally:
-                original_exit(code)
+                try:
+                    original_exit(code)
+                finally:
+                    # Only reached by controlled tests when their exit hook returns.
+                    signal.signal(signal.SIGINT, previous_sigint)
 
         # Only this qualified module's exit call is adapted; global os._exit,
         # on-disk SDK source and legacy/opt-out execution remain unchanged.

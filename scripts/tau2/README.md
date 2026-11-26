@@ -177,8 +177,13 @@ No real prices, provider limits or spending approval are supplied here:
 - `--ledger`: one absolute SQLite file shared by both arms, every domain
   and both sequential score processes. The explicit guarded `--initialize` entry creates it once using an exclusive
   new file before either arm; live scoring, guarded children and saved-score
-  acceptance open an existing file only. Do not rerun initialization after loss of a live ledger; restore its state or
-  obtain a new scope/approval. An old or missing/incompatible ledger is not reset or silently recreated at acceptance.
+  acceptance open an existing file only. The SQLite database, its normal SQLite
+  recovery files, `<ledger>.fail-stop` sidecar and complete reservation history
+  together are authoritative. Recovery must preserve both history and halt state;
+  restoring only SQLite is insufficient. If either cannot be established, keep
+  this scope on paid hold pending reconciliation. Do not delete the sidecar,
+  refund reservations, reset a live scope or silently recreate missing state.
+  A new scope requires a separate reviewed approval.
 - `--scope`: the exact approved comparison scope matching the policy.
   In CI it is `<run_id>:<run_attempt>:<matrix.name>`. Approval is either for
   that exact job or an explicit standing per-job allowance resolved by the guard;
@@ -246,3 +251,13 @@ implementation. Unknown request outcomes keep their reservation. If both
 persistent ordering paths are unavailable, cross-process stop is NOT_ATTESTED;
 paid admission remains on hold pending owner reconciliation. This cut supplies
 no prices, provider contracts, approval, GPU use or new service.
+
+The pinned batch hard-exit adapter ignores additional SIGINT while an independent
+stop worker publishes the ordered shared halt. It waits at most ten seconds for
+that worker before exiting 130; repeated Ctrl+C cannot cancel the worker's lock
+wait or publication. This bound excludes blocking stderr/OS shutdown operations.
+A timeout or either halt-store error is reported as `NOT_ATTESTED`, with paid
+admission held for reconciliation. Both stores unavailable, blocking I/O,
+SIGKILL and host loss do not have an unconditional durable-stop guarantee.
+Calls admitted before STOP_PENDING may settle; settlement is never retried after
+a reported error because its original transaction may already have committed.

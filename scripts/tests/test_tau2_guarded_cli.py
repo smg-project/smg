@@ -1604,7 +1604,7 @@ try:
  l.reserve("after-hard-exit", "smg", "openai/gpt-5.2", 10, 2,
            num_retries=0, output_limit_verified=True)
 except gc.BudgetError as error:
- print(json.dumps({"refused": True, "error": str(error)}))
+ print(json.dumps({"refused": "halted" in str(error).lower(), "error": str(error)}))
 else:
  print(json.dumps({"refused": False}))
 """
@@ -1640,6 +1640,7 @@ else:
         )
     )
     assert outcome["refused"], outcome
+    assert ledger.summary()["halted"]
     assert ledger.summary()["calls"] == 1
     assert ledger.summary()["allocated_nusd"] == 12000
     assert ledger.audit()["pending"] == 1
@@ -1690,3 +1691,295 @@ def test_hard_exit_halt_failure_preserves_exit_and_unattested_reservation(
     finally:
         guard.close()
     assert batch.os is fake_os
+
+
+def direct_paid_request(guard):
+    import httpx
+
+    role = gc.ROLE.set("user")
+    task = gc.TASK.set(("direct-stop-boundary", 0))
+    try:
+        return guard.transport().handle_request(
+            httpx.Request(
+                "POST",
+                "https://api.openai.com/v1/chat/completions",
+                json={
+                    "model": "gpt-5.2",
+                    "messages": [{"role": "user", "content": "offline"}],
+                    "service_tier": "default",
+                    "max_completion_tokens": 2,
+                },
+            )
+        )
+    finally:
+        gc.TASK.reset(task)
+        gc.ROLE.reset(role)
+
+
+def test_reserve_refusal_sets_failed_before_unlock_handoff(installed, monkeypatch):
+    import threading
+
+    guard, sent = installed
+    unlocked, sibling_done = threading.Event(), threading.Event()
+    real_lock = threading.Lock()
+    first_release = True
+    errors = []
+
+    class HandoffLock:
+        def __enter__(self):
+            real_lock.acquire()
+
+        def __exit__(self, *args):
+            nonlocal first_release
+            handoff = threading.current_thread().name == "refused-reserver" and first_release
+            if handoff:
+                first_release = False
+            real_lock.release()
+            if handoff:
+                unlocked.set()
+                assert sibling_done.wait(10)
+
+    guard._admission_lock = HandoffLock()
+    original_reserve = guard.ledger.reserve
+
+    def transient(*args, **kwargs):
+        if threading.current_thread().name == "refused-reserver":
+            raise gc.BudgetError("offline transient reservation failure")
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(guard.ledger, "reserve", transient)
+
+    def first():
+        try:
+            direct_paid_request(guard)
+        except BaseException as error:
+            errors.append(error)
+
+    def second():
+        try:
+            assert unlocked.wait(10)
+            direct_paid_request(guard)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            sibling_done.set()
+
+    threads = [
+        threading.Thread(target=first, name="refused-reserver"),
+        threading.Thread(target=second, name="handoff-sibling"),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for thread in threads:
+            thread.join(12)
+    finally:
+        sibling_done.set()
+        for thread in threads:
+            thread.join(2)
+    assert not any(thread.is_alive() for thread in threads)
+    assert not sent, "a reservation admitted after the failed reserver unlocked"
+    assert len(errors) == 2 and all(isinstance(e, gc.BudgetError) for e in errors)
+    assert guard.failed and guard.ledger.summary()["halted"]
+    assert guard.ledger.summary()["calls"] == 0
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_success_response_finish_failure_stops_before_sdk_unwind(installed, monkeypatch, committed):
+    guard, sent = installed
+    original_finish = guard.ledger.finish
+    finish_calls = []
+
+    def unavailable(*args, **kwargs):
+        finish_calls.append(args[0])
+        if committed:
+            original_finish(*args, **kwargs)
+        raise gc.BudgetError("offline settlement cleanup error")
+
+    monkeypatch.setattr(guard.ledger, "finish", unavailable)
+    with pytest.raises(gc.BudgetError, match="settlement cleanup"):
+        direct_paid_request(guard)
+    assert guard.failed, "successful-response settlement failure escaped without STOP_PENDING"
+    assert guard.ledger.summary()["halted"]
+    with pytest.raises(gc.BudgetError, match="stopped paid admission"):
+        direct_paid_request(guard)
+    assert len(sent) == 1 and len(finish_calls) == 1, "must not retry possibly committed finish"
+    audit = guard.ledger.audit()
+    assert audit["pending"] == (0 if committed else 1)
+    assert guard.ledger.summary()["calls"] == 1
+    assert guard.ledger.summary()["allocated_nusd"] == 12000
+
+
+def test_pinned_batch_double_sigint_waits_for_ordered_halt(configured, tmp_path):
+    policy, contexts, digest, ledger, _ = configured
+    witness = tmp_path / "pending-hardexit.json"
+    script = r"""
+import hashlib, json, os, signal, socket, sys, threading, types, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import guarded_cli as gc
+import httpx
+from tau2.runner import batch
+from tau2.user import user_simulator
+from tau2.data_model.message import AssistantMessage, SystemMessage
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("real socket forbidden")
+socket.socket.connect = forbidden
+socket.create_connection = forbidden
+os.environ["OPENAI_API_KEY"] = "offline-test-key"
+p, contexts = gc.load_policy(sys.argv[2], sys.argv[3], sys.argv[4])
+ledger = gc.Ledger(sys.argv[5], p, create=False)
+pending = threading.Event()
+lock_held = threading.Event()
+release_lock = threading.Event()
+stop_entered = threading.Event()
+original_exit = os._exit
+
+def transport(request):
+    Path(sys.argv[6]).write_text(json.dumps({
+        "pid": os.getpid(),
+        "start": Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19],
+        "audit": ledger.audit(),
+        "batch_sha256": hashlib.sha256(Path(batch.__file__).read_bytes()).hexdigest(),
+        "global_os_exit_unchanged": os._exit is original_exit,
+    }))
+    pending.set()
+    with guard._admission_lock:
+        lock_held.set()
+        assert release_lock.wait(12)
+    threading.Event().wait(30)
+    raise AssertionError("worker should end only with its owned process")
+
+guard = gc.Guard(ledger, contexts, arm="vllm", domain="retail",
+                 invocation_id="offline-hardexit", local_model="local-model",
+                 local_url="http://127.0.0.1:8000",
+                 transport_factory=lambda: httpx.MockTransport(transport))
+guard.install()
+original_stop = guard.stop_paid
+def witnessed_stop():
+    stop_entered.set()
+    return original_stop()
+guard.stop_paid = witnessed_stop
+assert os._exit is original_exit
+
+def unit(*args, **kwargs):
+    token = gc.TASK.set(("task0", 0))
+    try:
+        state = types.SimpleNamespace(messages=[],
+            system_messages=[SystemMessage(role="system", content="offline")],
+            flip_roles=lambda: [])
+        user = types.SimpleNamespace(llm="gpt-5.2", tools=[], llm_args={"temperature": 0.0})
+        return user_simulator.UserSimulator._generate_next_message(
+            user, AssistantMessage(role="assistant", content="offline"), state)
+    finally:
+        gc.TASK.reset(token)
+
+batch.run_unit = unit  # Only task/model execution; real batch loop/exit remain.
+task = types.SimpleNamespace(id="task0")
+result = types.SimpleNamespace(simulations=[], info=None)
+work = batch.WorkUnit(unit_id="offline/task0/t0", run_id="offline",
+                      task_id="task0", trial=0, seed=1)
+prep = types.SimpleNamespace(tasks=[task], simulation_results=result, done_runs=[],
+    user_voice_settings=None, user_persona_config=None, save_fn=None, units=[work])
+batch.prepare_batch = lambda *args, **kwargs: prep
+class Monitor:
+    def __init__(self, *args, **kwargs): pass
+    def set_results(self, *args): pass
+    def start(self): pass
+    def stop(self): pass
+batch.StatusMonitor = Monitor
+
+def interrupt():
+    if not pending.wait(15):
+        return
+    assert lock_held.wait(10)
+    os.kill(os.getpid(), signal.SIGINT)
+    assert stop_entered.wait(10)
+    os.kill(os.getpid(), signal.SIGINT)
+    Path(sys.argv[6] + ".second-signal").write_text("two actual SIGINTs sent while admission lock held")
+    time.sleep(0.05)
+    release_lock.set()
+
+signal.signal(signal.SIGINT, signal.default_int_handler)
+threading.Thread(target=interrupt, daemon=True).start()
+batch.run_tasks(types.SimpleNamespace(log_level="ERROR", num_trials=1,
+    workers=0, max_concurrency=1), [task])
+raise AssertionError("pinned hard exit did not happen")
+"""
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(Path(gc.__file__).parent),
+            str(policy),
+            str(contexts),
+            digest,
+            str(ledger.path),
+            str(witness),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=25,
+        env={**os.environ, "PYTHONPATH": "", "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert child.returncode == 130, child.stdout + child.stderr
+    observed = json.loads(witness.read_text())
+    assert observed["global_os_exit_unchanged"]
+    assert observed["batch_sha256"] == gc.TAU2_SHA["runner/batch.py"]
+    assert observed["audit"]["pending"] == 1
+    assert not Path(f"/proc/{observed['pid']}").exists()
+    sibling = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import guarded_cli as gc
+p, _ = gc.load_policy(sys.argv[2], sys.argv[3], sys.argv[4])
+l = gc.Ledger(sys.argv[5], p, create=False)
+try:
+ l.reserve("after-hard-exit", "smg", "openai/gpt-5.2", 10, 2,
+           num_retries=0, output_limit_verified=True)
+except gc.BudgetError as error:
+ print(json.dumps({"refused": "halted" in str(error).lower(), "error": str(error)}))
+else:
+ print(json.dumps({"refused": False}))
+"""
+    peer = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            sibling,
+            str(Path(gc.__file__).parent),
+            str(policy),
+            str(contexts),
+            digest,
+            str(ledger.path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert peer.returncode == 0, peer.stderr
+    outcome = json.loads(peer.stdout)
+    (tmp_path / "hard-exit-result.json").write_text(
+        json.dumps(
+            {
+                "child_returncode": child.returncode,
+                "pending_witness": observed,
+                "sibling": outcome,
+                "final_audit": ledger.audit(),
+                "final_summary": ledger.summary(),
+            },
+            indent=2,
+        )
+    )
+    assert outcome["refused"], outcome
+    assert ledger.summary()["halted"]
+    assert Path(str(witness) + ".second-signal").read_text().startswith("two actual")
+    assert ledger.summary()["calls"] == 1
+    assert ledger.summary()["allocated_nusd"] == 12000
+    assert ledger.audit()["pending"] == 1
