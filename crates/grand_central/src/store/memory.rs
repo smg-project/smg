@@ -472,21 +472,25 @@ impl MemoryStore {
         change: MembershipChange,
         row: Option<WorkerRow>,
     ) {
-        self.follow_landed(at, epoch, change, row);
+        self.follow_landed(at, epoch, change, row, None);
     }
 
     /// [`Self::follow`], and whether the change landed. A holder of worker
     /// objects asks it: the object of the row a change leaves is put in
-    /// its registry only where the store took the change.
+    /// its registry only where the store took the change. `left` is the
+    /// row the change takes out, as the holder read it back from its
+    /// object: a removal's row, a replacement's old life. The journal is
+    /// told it, as at a leader's write (`MemoryStore::follow_objects`).
     pub(crate) fn follow_landed(
         &self,
         at: Position,
         epoch: u64,
         change: MembershipChange,
         row: Option<WorkerRow>,
+        left: Option<&mut WorkerRow>,
     ) -> bool {
         let workers = self.writing_at(Some(at));
-        epoch == workers.epoch + 1 && self.decided(workers, Instant::now(), change, row)
+        epoch == workers.epoch + 1 && self.decided(workers, Instant::now(), change, row, left)
     }
 
     /// A decided membership change, written under the write's hold of the
@@ -506,15 +510,24 @@ impl MemoryStore {
     /// The journal is told the row its writer handed, with the admission
     /// instant of the row it is laid over, and the table takes that row
     /// behind the telling: the event of such a write tells no row read
-    /// from the table. Two things are the table's still. A status change
-    /// comes with no row, and its event tells the table's. The row a write
-    /// takes out is the one the table held.
+    /// from the table. The row a write takes out is told as its writer
+    /// handed it too, where one did: `left`, which a holder of worker
+    /// objects read back from the object, on a leader and on a standby.
+    /// The status the table held is laid over it here: the status the log
+    /// last told of a row is the log's own word, which the table holds for
+    /// it. A row changed in place is laid no status here: a standby's told
+    /// row comes in its leader's status, and a leader's holder lays the
+    /// table's in its own entry (`MemoryStore::follow_objects`). A writer
+    /// that hands none tells the row the table held: the store's own
+    /// entries, and a holder with no object under the row's id. A status
+    /// change comes with no row, and its event tells the table's.
     fn decided(
         &self,
         mut workers: Writing<'_>,
         now: Instant,
         change: MembershipChange,
         row: Option<WorkerRow>,
+        left: Option<&mut WorkerRow>,
     ) -> bool {
         use std::collections::hash_map::Entry;
 
@@ -526,8 +539,9 @@ impl MemoryStore {
         let mut follows = None;
         let mut ended = Vec::new();
         // The row the change leaves, as its writer handed it: the journal
-        // is told from it, and the table takes it behind the telling.
-        let (change, laid, left) = match (change, row) {
+        // is told from it, and the table takes it behind the telling. With
+        // it, the row the table held where the write takes one out.
+        let (change, laid, held) = match (change, row) {
             (MembershipChange::Registered { id }, Some(row))
                 if row.id == id
                     && !workers.rows.contains_key(&id)
@@ -563,16 +577,16 @@ impl MemoryStore {
                         .get(&old)
                         .is_some_and(|held| held.row.facts.key == row.facts.key) =>
             {
-                let left = workers.rows.remove(&old).map(|held| self.row_left(held));
-                let same = |left: &WorkerRow| same_worker(&left.facts, &row.facts);
-                if left.as_ref().is_some_and(same) {
+                let held = workers.rows.remove(&old).map(|held| self.row_left(held));
+                let same = |held: &WorkerRow| same_worker(&held.facts, &row.facts);
+                if held.as_ref().is_some_and(same) {
                     follows = Some((old, new));
                 } else {
                     ended.push(old);
                 }
                 workers.by_key.insert(row.facts.key.clone(), new);
                 self.forget_worker(old);
-                (change, Some(row), left)
+                (change, Some(row), held)
             }
             (MembershipChange::Removed { id }, None) => {
                 let Some(held) = workers.rows.remove(&id) else {
@@ -599,13 +613,45 @@ impl MemoryStore {
             // the row as the table holds it.
             workers.record(change);
         } else {
-            workers.record_over(change, laid.as_ref(), left.as_ref());
+            // The row the write took out is told as its writer handed it,
+            // in the status the table held, and as the table held it where
+            // the writer handed none.
+            let told = match (left, held.as_ref()) {
+                (Some(left), Some(held)) => {
+                    left.status = held.status;
+                    // While the table stands, a debug build holds a handed
+                    // row to the one the table held, where an entry is
+                    // told: the two are one row. A host with no journal
+                    // tells nothing, and a gateway's refresh of a worker's
+                    // models sets a fact of its object behind the build.
+                    debug_assert!(
+                        workers.journal.is_none() || *left == *held,
+                        "a row its holder read back is the row the table held"
+                    );
+                    Some(&*left)
+                }
+                (left, held) => {
+                    debug_assert!(
+                        left.is_none(),
+                        "a row is handed as taken out by a write that takes one out"
+                    );
+                    held
+                }
+            };
+            workers.record_over(change, laid.as_ref(), told);
         }
         // The table follows the row told: over the row that stood under
         // its id, or under a new id with a count slot of its own.
         if let Some(row) = laid {
             match workers.rows.entry(row.id) {
                 Entry::Occupied(mut held) => {
+                    debug_assert!(
+                        matches!(
+                            change,
+                            MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. }
+                        ),
+                        "a row laid over the one that stands under its id is a change in place"
+                    );
                     let old = mem::replace(&mut held.get_mut().row, row);
                     off = left_models(old.facts, &held.get().row.facts);
                 }
@@ -628,7 +674,7 @@ impl MemoryStore {
                 // A replacement that takes its worker off a model says so
                 // for the new id, behind the build it pays and behind its
                 // own word, as at the leader's own write.
-                let models = Self::replaced_models(left, workers.rows.get(&new));
+                let models = Self::replaced_models(held, workers.rows.get(&new));
                 self.pay_leave(&workers, now);
                 self.tell_membership(change);
                 self.tell_left(new, &models);
@@ -643,7 +689,7 @@ impl MemoryStore {
                 self.pay_leave(&workers, now);
                 self.tell_membership(change);
                 // The key is filed as gone, by this store's own clock.
-                if let Some(row) = left {
+                if let Some(row) = held {
                     ended = workers.file_gone(row.facts, id, now, self.pins_absence());
                 }
             }
@@ -1523,9 +1569,10 @@ impl Writing<'_> {
 
     /// Record a change whose writer handed the row it leaves. The journal
     /// is told `row`, that row (none for a removal), and `left`, the row
-    /// the write took out of the table (a removal's, a replacement's old
-    /// incarnation). No row of the table is read: the table takes `row`
-    /// behind the telling.
+    /// the write took out (a removal's, a replacement's old incarnation):
+    /// as its writer handed it, or as the table held it where the writer
+    /// handed none. No row of the table is read here: the table takes
+    /// `row` behind the telling.
     fn record_over(
         &mut self,
         change: MembershipChange,
@@ -1686,12 +1733,20 @@ impl MemoryStore {
     /// call: a caller of the store's own registration, patch or removal
     /// takes no turn of the holder.
     ///
+    /// `left` is the row the write takes out, as the holder read it back
+    /// in its turn: a removal's row, a replacement's old life, and none
+    /// for any other change. The journal is told it: of the rows such a
+    /// write tells, the table gives a status alone.
+    ///
     /// A worker object's status leads its row's. The holder read `row`'s
     /// off the object, and the rule every writer decides by handed it on
     /// to a key's next life ([`WorkerRow::hands_on`]): the store takes
     /// that. A row changed in place keeps the status the table holds: a
     /// status moves by its own event alone, and the holder tells the
-    /// object's behind the write ([`Self::status_told`]).
+    /// object's behind the write ([`Self::status_told`]). A row the write
+    /// takes out is told in the status the table held too, which the one
+    /// body lays over it for a leader and a standby alike
+    /// ([`Self::decided`]).
     ///
     /// Whether the store took the change. One it does not take writes
     /// nothing: another writer moved the row under the holder's turn, or
@@ -1701,6 +1756,7 @@ impl MemoryStore {
         change: MembershipChange,
         mut row: Option<WorkerRow>,
         seen: Option<u64>,
+        left: Option<&mut WorkerRow>,
     ) -> bool {
         let workers = self.writing();
         let table = |id: WorkerId| workers.rows.get(&id).map(|held| &held.row);
@@ -1722,7 +1778,7 @@ impl MemoryStore {
                 row.status = over.status;
             }
         }
-        self.decided(workers, Instant::now(), change, row)
+        self.decided(workers, Instant::now(), change, row, left)
     }
 
     /// The status this replica's worker object states for the row `id`,
@@ -1784,7 +1840,7 @@ impl WorkersStore for MemoryStore {
         let standing = standing.map(|held| &held.row);
         let now = Instant::now();
         let (change, row) = WorkerRow::laid_over(facts, standing, maker, now);
-        let fits = self.decided(workers, now, change, Some(row));
+        let fits = self.decided(workers, now, change, Some(row), None);
         debug_assert!(fits, "a change decided under the membership lock fits");
         change
     }

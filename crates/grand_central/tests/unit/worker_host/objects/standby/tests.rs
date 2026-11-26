@@ -14,7 +14,7 @@ use smg_worker::{
 use super::{
     super::{
         tests::stored_chain,
-        write::tests::{facts, Replica, A},
+        write::tests::{facts, refresh, Replica, A},
     },
     *,
 };
@@ -345,6 +345,91 @@ fn a_told_row_lays_the_status_its_leader_holds() {
     let object = registry.get(&laid).expect("it stands");
     assert_eq!(object.status(), ObjectStatus::Pending);
     assert_eq!(standby.one_row(A), leader.one_row(A));
+}
+
+/// A told change that takes a row out tells the standby's own log that
+/// row in the status the standby's table holds, by a removal and by a
+/// key's next life. A probe of a term that ended moved the object ahead
+/// of the table: the row read back states the object's status, and the
+/// log is told the table's.
+#[test]
+fn a_row_a_told_change_takes_out_is_told_in_the_status_the_table_holds() {
+    for next_life in [false, true] {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        leader.upsert(facts(1, "gold"));
+        follow(&standby, &leader);
+        let id = standby.object(A).expect("the row's object");
+        let registry = standby.objects.registry();
+        let revision = registry.get(&id).expect("it stands").revision();
+        let ready = |_: &Arc<dyn Worker>| ((), Some(ObjectStatus::Ready));
+        registry.apply_if_revision(&id, revision, ready);
+        let stood = standby.store.by_key(A).expect("the row stands");
+        assert_eq!(stood.status, WorkerStatus::Pending, "the table's word");
+        let read = standby.objects.row_of(&id).expect("the object's row");
+        assert_eq!(read.status, WorkerStatus::Ready, "the object's word");
+        if next_life {
+            leader.upsert(facts(2, "gold"));
+        } else {
+            let row = leader.one_row(A);
+            leader.objects.remove(&leader.store, row.id, row.revision);
+        }
+        follow(&standby, &leader);
+        let (_, _, left) = standby.last();
+        assert_eq!(left, Some(stood), "a next life: {next_life}");
+    }
+}
+
+/// While the table stands, a debug build holds the row a standby's
+/// holder hands to the row its table held, as on a leader. Here another
+/// writer of the registry set the object's models behind its build: the
+/// told removal that hands the row read back stops.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a row its holder read back is the row the table held")]
+fn a_told_removal_that_hands_a_row_the_table_does_not_hold_stops_a_debug_build() {
+    let (leader, standby) = (Replica::new(), Replica::new());
+    leader.upsert(facts(1, "gold"));
+    follow(&standby, &leader);
+    refresh(&standby);
+    let row = leader.one_row(A);
+    leader.objects.remove(&leader.store, row.id, row.revision);
+    follow(&standby, &leader);
+}
+
+/// The same for a told next life of a key, which hands the old life's
+/// row.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a row its holder read back is the row the table held")]
+fn a_told_next_life_that_hands_a_row_the_table_does_not_hold_stops_a_debug_build() {
+    let (leader, standby) = (Replica::new(), Replica::new());
+    leader.upsert(facts(1, "gold"));
+    follow(&standby, &leader);
+    refresh(&standby);
+    leader.upsert(facts(2, "gold"));
+    follow(&standby, &leader);
+}
+
+/// A gateway's watcher follows through the same entry, and its store
+/// tells no entry: the row its holder hands is held to nothing there.
+/// Its refresh of a worker's models sets a fact of the object behind
+/// the build, and a told next life and a told removal are taken behind
+/// it, in a debug build too.
+#[test]
+fn a_host_that_tells_no_entry_takes_a_told_change_behind_a_refresh() {
+    let (leader, watcher) = (Replica::new(), Replica::untold());
+    leader.upsert(facts(1, "gold"));
+    follow(&watcher, &leader);
+    refresh(&watcher);
+    leader.upsert(facts(2, "gold"));
+    let (change, row) = told(&leader);
+    assert!(hand(&watcher, 1, change, row), "a next life");
+    refresh(&watcher);
+    let row = leader.one_row(A);
+    leader.objects.remove(&leader.store, row.id, row.revision);
+    let (change, row) = told(&leader);
+    assert!(hand(&watcher, 1, change, row), "a removal");
+    assert!(watcher.objects.is_empty());
 }
 
 /// A restore lays the cut's rows in its own turn: each has its object

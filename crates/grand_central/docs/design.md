@@ -2950,8 +2950,22 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    body, ahead of the table's write, and the event of such a write tells no record read from
    the table. The revision an event tells is the keeper's, of the write that made the record.
 
-   Two things are the table's until step 4: a status event comes with no record and tells the
-   table's, and the record a write takes out is the one the table held. In a controller the
+   The record a leader's write takes out is handed too: a removal's record, and the old life
+   that a key's next life replaces, are told as the keeper read them back, in the status the
+   log last told of the record. A standby's applier hands its own log the record its applied
+   change takes out the same way, read back from the object.
+
+   The table still gives an event five things until step 4. The status told with a handed
+   record is the first: it is the log's own word, which the table holds for the log. The
+   second is the instant a record changed in place was admitted at: the one body lays the
+   table's over every writer's record, and a keeper and a standby's applier hand that same
+   instant. The third is the record of a status event, on a leader and on a standby, until a
+   status entry holds what its readers read **[planned]**. The fourth is every record the
+   store's own write entries tell: no product code calls them, and they end with the table.
+   The fifth is the record a standby's applied change takes out where that record has no
+   object.
+
+   In a controller the
    code that keeps the objects alone writes a worker object's own facts, so the record a change
    in place writes to the table is the object's record read back whole, less its status: the
    table keeps its own, and the object's is told behind the write. A second writer of an

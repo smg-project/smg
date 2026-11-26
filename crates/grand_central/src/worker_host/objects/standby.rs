@@ -9,7 +9,10 @@
 //! object of the row the event tells, hands the store the event
 //! ([`MemoryStore::follow_landed`]), and puts the object in the registry
 //! where the store took it. So the object stands when the applier goes on
-//! to its next event.
+//! to its next event. With a change that takes a row out, a removal or a
+//! key's next life, the holder hands the store that row as read back from
+//! its object, as at a leader's write: the standby's own log is told from
+//! it. Where no object stands under the row's id, the store tells its own.
 //!
 //! The order is the one of a leader's write. The store is told between the
 //! build and the registry's write, and a removal's object leaves the
@@ -79,10 +82,12 @@ impl<G: Generation> Objects<G> {
     ) -> bool {
         let _turn = self.turn.lock();
         match (change, row) {
-            // The object leaves the registry, then the store is told.
+            // The row is read back, the object leaves the registry, then
+            // the store is told and handed the row.
             (MembershipChange::Removed { id }, None) => {
+                let mut left = self.row(id);
                 self.end(id);
-                let landed = store.follow_landed(at, epoch, change, None);
+                let landed = store.follow_landed(at, epoch, change, None, left.as_mut());
                 if !landed {
                     self.settle(store, id);
                 }
@@ -98,8 +103,15 @@ impl<G: Generation> Objects<G> {
                         row.admitted_at = stood.admitted_at;
                     }
                 }
+                // A key's next life takes the old life's row out: the store
+                // is handed that row, read back from its object.
+                let mut left = match change {
+                    MembershipChange::Replaced { old, .. } => self.row(old),
+                    _ => None,
+                };
                 let built = self.build(&row);
-                let landed = store.follow_landed(at, epoch, change, Some(row.clone()));
+                let told = Some(row.clone());
+                let landed = store.follow_landed(at, epoch, change, told, left.as_mut());
                 if landed {
                     self.put(store, &row, built);
                     // The row's status is the leader's word too.
@@ -109,7 +121,7 @@ impl<G: Generation> Objects<G> {
             }
             // A told status: the table takes it, and the object behind it.
             (change, None) => {
-                let landed = store.follow_landed(at, epoch, change, None);
+                let landed = store.follow_landed(at, epoch, change, None, None);
                 if let (true, MembershipChange::StatusChanged { id, .. }) = (landed, change) {
                     self.copy_status(store, id);
                 }

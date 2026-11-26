@@ -16,9 +16,10 @@ pub(crate) const A: &str = "http://a:8000";
 /// row it left and the row it took out.
 pub(crate) type Member = (MembershipChange, Option<WorkerRow>, Option<WorkerRow>);
 
-/// A journal that keeps what it was told of the membership.
+/// A journal that keeps what it was told of the membership, and where
+/// the row its last write took out stood when it was told.
 #[derive(Default)]
-struct Told(Mutex<Vec<Member>>);
+struct Told(Mutex<Vec<Member>>, Mutex<Option<usize>>);
 
 impl Journal for Told {
     fn member(
@@ -30,6 +31,7 @@ impl Journal for Told {
         left: Option<&WorkerRow>,
     ) {
         self.0.lock().push((change, row.cloned(), left.cloned()));
+        *self.1.lock() = left.map(|left| std::ptr::from_ref(left).addr());
     }
 
     fn generation(&self, _: Option<Position>, _: u64) {}
@@ -69,6 +71,15 @@ impl Replica {
         }
     }
 
+    /// A host that tells no entry, as a gateway keeps one: the same
+    /// holder over a store with no journal.
+    pub(crate) fn untold() -> Self {
+        Self {
+            store: MemoryStore::default(),
+            ..Self::new()
+        }
+    }
+
     pub(crate) fn upsert(&self, facts: WorkerFacts) -> Option<MembershipChange> {
         self.objects.upsert(&self.store, facts, Registrant::Control)
     }
@@ -81,6 +92,12 @@ impl Replica {
             .last()
             .cloned()
             .expect("a write was told")
+    }
+
+    /// Where the row the last membership write took out stood when the
+    /// journal was told it.
+    fn took_at(&self) -> Option<usize> {
+        *self.told.1.lock()
     }
 
     pub(crate) fn object(&self, url: &str) -> Option<ObjectId> {
@@ -242,7 +259,8 @@ fn a_keys_next_life_is_handed_the_status_its_worker_stood_in() {
 /// A status moves by its own event alone: a row changed in place keeps
 /// the status the table holds, whatever its decided row says. A key's
 /// next life starts in the status its decided row states: the one the
-/// holder's rule handed on from the object.
+/// holder's rule handed on from the object. The old life it takes out
+/// is told in the status the table held, whatever the handed row says.
 #[test]
 fn a_row_in_place_keeps_the_tables_status_and_a_next_life_takes_its_rows() {
     let replica = Replica::new();
@@ -256,11 +274,11 @@ fn a_row_in_place_keeps_the_tables_status_and_a_next_life_takes_its_rows() {
         ..row
     });
     let relabelled = MembershipChange::Relabelled { id };
-    assert!(store.follow_objects(relabelled, stale, Some(1)));
+    assert!(store.follow_objects(relabelled, stale, Some(1), None));
     let status = |url: &str| store.by_key(url).map(|row| row.status);
     assert_eq!(status(A), Some(WorkerStatus::Ready));
     // The next life, decided over that same reading.
-    let standing = store.by_key(A).map(|row| WorkerRow {
+    let mut standing = store.by_key(A).map(|row| WorkerRow {
         status: WorkerStatus::Pending,
         ..row
     });
@@ -272,12 +290,112 @@ fn a_row_in_place_keeps_the_tables_status_and_a_next_life_takes_its_rows() {
         now,
     );
     assert_eq!(next.status, WorkerStatus::Pending, "as the holder read it");
-    assert!(store.follow_objects(change, Some(next), Some(2)));
+    assert!(store.follow_objects(change, Some(next), Some(2), standing.as_mut()));
     assert_eq!(status(A), Some(WorkerStatus::Pending));
-    assert_eq!(
-        replica.last().1.map(|row| row.status),
-        Some(WorkerStatus::Pending)
-    );
+    let (_, laid, left) = replica.last();
+    assert_eq!(laid.map(|row| row.status), Some(WorkerStatus::Pending));
+    assert_eq!(left.map(|row| row.status), Some(WorkerStatus::Ready));
+}
+
+/// The row a holder's write takes out is told as the holder handed it:
+/// the journal is told that very row, with the status the table held
+/// laid over it. So a removal reads as draining only where the log
+/// told a drain.
+#[test]
+fn a_row_a_write_takes_out_is_told_as_handed_in_the_status_the_table_holds() {
+    let replica = Replica::new();
+    let store = &replica.store;
+    let id = replica.upsert(facts(1, "gold")).expect("registered").id();
+    replica.objects.connect_row(store, id, 1);
+    // The holder's read of a row whose object drains ahead of the log.
+    let mut read = store.by_key(A).map(|row| WorkerRow {
+        status: WorkerStatus::Draining,
+        ..row
+    });
+    let handed = read.as_ref().map(|row| std::ptr::from_ref(row).addr());
+    let removed = MembershipChange::Removed { id };
+    assert!(store.follow_objects(removed, None, Some(1), read.as_mut()));
+    assert_eq!(replica.took_at(), handed, "the handed row itself");
+    let (_, _, left) = replica.last();
+    assert_eq!(left, read, "as the store left the handed row");
+    let told = left.map(|row| row.status);
+    assert_eq!(told, Some(WorkerStatus::Ready), "the table's status");
+}
+
+/// While the table stands, a debug build holds the row a holder hands
+/// to the row the table held, where an entry is told. Nothing in a
+/// controller sets a fact of an object behind its build. Here another
+/// writer does, as a gateway's refresh of a worker's models: the row
+/// read back states models the table's row does not, and the removal
+/// that hands it stops.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a row its holder read back is the row the table held")]
+fn a_removal_that_hands_a_row_the_table_does_not_hold_stops_a_debug_build() {
+    let replica = Replica::new();
+    let (store, objects) = (&replica.store, &replica.objects);
+    let id = replica.upsert(facts(1, "gold")).expect("registered").id();
+    refresh(&replica);
+    objects.remove(store, id, 1);
+}
+
+/// The same for a key's next life, which hands the old life's row.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a row its holder read back is the row the table held")]
+fn a_next_life_that_hands_a_row_the_table_does_not_hold_stops_a_debug_build() {
+    let replica = Replica::new();
+    replica.upsert(facts(1, "gold")).expect("registered");
+    refresh(&replica);
+    replica.upsert(facts(2, "gold"));
+}
+
+/// A writer hands a row as taken out only with a write that takes one
+/// out, a removal or a key's next life: one handed with a change in
+/// place stops a debug build.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a row is handed as taken out by a write that takes one out")]
+fn a_row_handed_with_a_change_in_place_stops_a_debug_build() {
+    let replica = Replica::new();
+    let store = &replica.store;
+    let id = replica.upsert(facts(1, "gold")).expect("registered").id();
+    let mut standing = store.by_key(A);
+    let next = standing.clone().map(|row| WorkerRow { revision: 2, ..row });
+    let relabelled = MembershipChange::Relabelled { id };
+    assert!(store.follow_objects(relabelled, next, Some(1), standing.as_mut()));
+}
+
+/// A host with no journal tells no entry, so the row its holder hands
+/// is held to nothing there. A gateway's refresh of a worker's models
+/// sets a fact of its object behind the build: the key's next life and
+/// the removal behind it are taken, in a debug build too.
+#[test]
+fn a_host_that_tells_no_entry_takes_a_handed_row_its_table_does_not_hold() {
+    let replica = Replica::untold();
+    let (store, objects) = (&replica.store, &replica.objects);
+    let first = replica.upsert(facts(1, "gold")).expect("registered").id();
+    refresh(&replica);
+    let second = identity(A, 2);
+    let replaced = MembershipChange::Replaced {
+        old: first,
+        new: second,
+    };
+    assert_eq!(replica.upsert(facts(2, "gold")), Some(replaced));
+    refresh(&replica);
+    let removed = MembershipChange::Removed { id: second };
+    assert_eq!(objects.remove(store, second, 1), Some(removed));
+    assert_eq!((replica.object(A), store.by_key(A)), (None, None));
+}
+
+/// Another writer of the registry sets the models of the object under
+/// `A` behind its build.
+pub(crate) fn refresh(replica: &Replica) {
+    let registry = replica.objects.registry();
+    let object = replica.object(A).expect("the object stands");
+    let worker = registry.get(&object).expect("the worker");
+    let card = openai_protocol::model_card::ModelCard::new;
+    assert!(registry.refresh_models(&worker, vec![card("m"), card("late")]));
 }
 
 /// A patch and a removal are guarded by the revision the object was
@@ -314,7 +432,7 @@ fn a_row_with_no_object_is_laid_where_its_registration_is_refused() {
     let (store, objects) = (&replica.store, &replica.objects);
     let now = Instant::now();
     let (change, row) = WorkerRow::laid_over(facts(1, "gold"), None, Registrant::Control, now);
-    assert!(store.follow_objects(change, Some(row.clone()), None));
+    assert!(store.follow_objects(change, Some(row.clone()), None, None));
     let id = change.id();
     let patch = WorkerPatch {
         priority: Some(7),
@@ -356,7 +474,7 @@ fn a_write_over_a_row_another_writer_moved_is_refused_and_reads_it() {
         let seen = Some(read.revision);
         replica
             .objects
-            .lay_decided(&replica.store, change, &row, seen)
+            .lay_decided(&replica.store, change, &row, seen, None)
     }
     let writes: [(&str, Write); 4] = [
         ("a registration in place", |replica, read| {
@@ -369,13 +487,13 @@ fn a_write_over_a_row_another_writer_moved_is_refused_and_reads_it() {
             let change = MembershipChange::Relabelled { id: read.id };
             replica
                 .objects
-                .lay_decided(&replica.store, change, &read, seen)
+                .lay_decided(&replica.store, change, &read, seen, None)
         }),
         ("a key's next life", |replica, read| {
             lay(replica, facts(2, "gold"), &read)
         }),
-        ("a removal", |replica, read| {
-            replica.objects.take_decided(&replica.store, &read)
+        ("a removal", |replica, mut read| {
+            replica.objects.take_decided(&replica.store, &mut read)
         }),
     ];
     let others: [(&str, Other); 2] = [
@@ -477,7 +595,7 @@ fn a_refused_write_reads_the_row_under_its_own_key_alone() {
     let now = Instant::now();
     for key in [A, B, C] {
         let (change, row) = WorkerRow::laid_over(keyed(key), None, Registrant::Control, now);
-        assert!(store.follow_objects(change, Some(row), None));
+        assert!(store.follow_objects(change, Some(row), None, None));
     }
     assert_eq!(replica.upsert(facts(1, "iron")), None, "refused once");
     assert!(replica.object(A).is_some(), "the row under its key is laid");

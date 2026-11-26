@@ -26,8 +26,8 @@ pub enum Event {
         /// The row the change is about, as the write leaves it; `None` for
         /// a removal.
         row: Option<Arc<WorkerRow>>,
-        /// The row the write took out of the table: a removal's row, a
-        /// replacement's old incarnation.
+        /// The row the write took out: a removal's row, a replacement's old
+        /// incarnation.
         left: Option<Arc<WorkerRow>>,
     },
     /// The store's term rose: the first position of a term, one of the
