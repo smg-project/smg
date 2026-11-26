@@ -539,26 +539,60 @@ fn demanded() -> (proto::Demands, Demands) {
     (stated, read)
 }
 
-/// A single request's frame states its hard demands, and the request
-/// its maker makes carries each part to the engine. A frame that states
-/// no message, or one with no part, demands nothing. Each place a
-/// request's media by reference may be processed crosses by its own
-/// number.
+/// A frame states its request's hard demands, and the request its
+/// maker makes carries each part to the engine. Six kinds of frame do:
+/// a single request's, a prefill frame, a decode frame, a decode call,
+/// a decode call of the encode phase, and one that names its worker. A
+/// frame that states no message, or one with no part, demands nothing.
+/// Each place a request's media by reference may be processed crosses
+/// by its own number.
 #[test]
-fn a_single_requests_frame_states_its_demands_and_its_request_carries_them() {
-    let read = |stated: Option<proto::Demands>| {
-        let mut frame = with(|facts| facts.phase = proto::Phase::Single.into());
+fn a_frame_states_its_demands_and_its_request_carries_them() {
+    type Edit = fn(&mut proto::DecideRequest);
+    let kinds: [(&str, proto::Phase, Edit); 6] = [
+        ("a single request's frame", proto::Phase::Single, |_| {}),
+        ("a prefill frame", proto::Phase::Prefill, |_| {}),
+        ("a decode frame", proto::Phase::Decode, |_| {}),
+        ("a decode call", proto::Phase::Decode, |frame| {
+            frame.decode_of = Some(1 << 32 | 7);
+        }),
+        // A decode call is read at the decode phase, whatever its
+        // facts say: it is no encode request's frame.
+        (
+            "a decode call of the encode phase",
+            proto::Phase::Encode,
+            |frame| {
+                frame.decode_of = Some(1 << 32 | 7);
+            },
+        ),
+        (
+            "a frame that names its worker",
+            proto::Phase::Single,
+            |frame| {
+                frame.named_worker = Some(0);
+            },
+        ),
+    ];
+    let read_at = |phase: proto::Phase, edit: Edit, stated: Option<proto::Demands>| {
+        let mut frame = with(|facts| facts.phase = phase.into());
+        edit(&mut frame);
         frame.demands = stated;
         let frame = Checked::new(frame).expect("no word is a field out of its range");
         let left = std::time::Duration::from_millis(5);
-        made(&frame, &mut Lists::default(), left, |_, constraints| {
+        let carried = made(&frame, &mut Lists::default(), left, |_, constraints| {
             constraints.demands
-        })
+        });
+        assert_eq!(frame.demands(), carried, "the frame's own reader");
+        carried
     };
     let (stated, demands) = demanded();
-    assert_eq!(read(Some(stated)), demands);
-    assert_eq!(read(None), Demands::default());
-    assert_eq!(read(Some(proto::Demands::default())), Demands::default());
+    for (kind, phase, edit) in kinds {
+        assert_eq!(read_at(phase, edit, Some(stated)), demands, "{kind}");
+        assert_eq!(read_at(phase, edit, None), Demands::default(), "{kind}");
+        let no_part = Some(proto::Demands::default());
+        assert_eq!(read_at(phase, edit, no_part), Demands::default(), "{kind}");
+    }
+    let read = |stated| read_at(proto::Phase::Single, |_| {}, stated);
     let places = [
         (proto::demands::References::None, References::None),
         (proto::demands::References::Any, References::Any),
@@ -574,45 +608,29 @@ fn a_single_requests_frame_states_its_demands_and_its_request_carries_them() {
     }
 }
 
-/// No demand is dropped in silence: a frame of a kind whose decision
-/// holds none yet is refused by the field where it states one. The
-/// kinds are five: a prefill frame, a decode frame, a decode call, an
-/// encode request's frame and a frame that names its worker. A decode
-/// call is one whatever phase its facts state, the single phase too. A message
-/// with no part demands nothing, and passes on each of them. A part out
-/// of its own range is refused by its name, on a single request's frame
-/// too.
+/// No demand is dropped in silence: an encode request's frame, whose
+/// decision holds none yet, is refused by the field where it states
+/// one. It is refused with its items and with none, and where it names
+/// its worker. A message with no part demands nothing, and passes on
+/// each of them. A part out of its own range is refused by its name, on
+/// a single request's frame and on a pair's.
 #[test]
-fn a_demand_on_a_frame_whose_decision_holds_none_yet_is_refused_by_the_field() {
+fn a_demand_on_an_encode_requests_frame_is_refused_by_the_field() {
     type Edit = fn(&mut proto::DecideRequest);
     let (stated, _) = demanded();
-    let kinds: [(&str, proto::Phase, Edit); 6] = [
-        ("a prefill frame", proto::Phase::Prefill, |_| {}),
-        ("a decode frame", proto::Phase::Decode, |_| {}),
-        ("a decode call", proto::Phase::Decode, |frame| {
-            frame.decode_of = Some(1 << 32 | 7);
-        }),
-        (
-            "a decode call whose facts state the single phase",
-            proto::Phase::Single,
-            |frame| {
-                frame.decode_of = Some(1 << 32 | 7);
-            },
-        ),
-        ("an encode request's frame", proto::Phase::Encode, |frame| {
+    let kinds: [(&str, Edit); 3] = [
+        ("an encode request's frame", |frame| {
             frame.encode = Some(proto::EncodeItems::default());
         }),
-        (
-            "a frame that names its worker",
-            proto::Phase::Single,
-            |frame| {
-                frame.named_worker = Some(0);
-            },
-        ),
+        ("a frame of the encode phase with no items", |_| {}),
+        ("an encode request's frame that names its worker", |frame| {
+            frame.encode = Some(proto::EncodeItems::default());
+            frame.named_worker = Some(0);
+        }),
     ];
-    for (kind, phase, edit) in kinds {
+    for (kind, edit) in kinds {
         let refused = |demands: proto::Demands| {
-            let mut frame = with(|facts| facts.phase = phase.into());
+            let mut frame = with(|facts| facts.phase = proto::Phase::Encode.into());
             edit(&mut frame);
             frame.demands = Some(demands);
             Checked::new(frame).err()
@@ -628,23 +646,27 @@ fn a_demand_on_a_frame_whose_decision_holds_none_yet_is_refused_by_the_field() {
         assert_eq!(refused(proto::Demands::default()), None, "{kind}: no part");
     }
 
-    let single = |edit: fn(&mut proto::Demands)| {
-        let mut frame = with(|facts| facts.phase = proto::Phase::Single.into());
-        let mut demands = stated;
-        edit(&mut demands);
-        frame.demands = Some(demands);
-        Checked::new(frame).err()
-    };
-    assert_eq!(single(|_| {}), None);
-    assert_eq!(single(|demands| demands.decoding = 255), None);
-    assert_eq!(
-        single(|demands| demands.decoding = 256),
-        Some(Refusal::OutOfRange("demands.decoding"))
-    );
-    assert_eq!(
-        single(|demands| demands.references = 4),
-        Some(Refusal::OutOfRange("demands.references"))
-    );
+    for phase in [proto::Phase::Single, proto::Phase::Prefill] {
+        let ranged = |edit: fn(&mut proto::Demands)| {
+            let mut frame = with(|facts| facts.phase = phase.into());
+            let mut demands = stated;
+            edit(&mut demands);
+            frame.demands = Some(demands);
+            Checked::new(frame).err()
+        };
+        assert_eq!(ranged(|_| {}), None, "{phase:?}");
+        assert_eq!(ranged(|demands| demands.decoding = 255), None, "{phase:?}");
+        assert_eq!(
+            ranged(|demands| demands.decoding = 256),
+            Some(Refusal::OutOfRange("demands.decoding")),
+            "{phase:?}"
+        );
+        assert_eq!(
+            ranged(|demands| demands.references = 4),
+            Some(Refusal::OutOfRange("demands.references")),
+            "{phase:?}"
+        );
+    }
 }
 
 /// No lease has the id 0: a frame that names it is refused by its

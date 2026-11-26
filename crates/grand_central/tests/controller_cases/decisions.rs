@@ -392,13 +392,13 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
 /// that shed its request with no endpoint.
 type Named = Result<Vec<u64>, String>;
 
-/// One frame for `model` that states `demands`, numbered `n`, and what its
-/// answer names.
+/// One frame for `model` at `phase` that states `demands`, numbered `n`,
+/// and what its answer names.
 async fn demanded(
     requests: &mpsc::Sender<DecideRequest>,
     answers: &mut tonic::Streaming<proto::DecideAnswer>,
     n: u32,
-    model: &str,
+    (model, phase): (&str, proto::Phase),
     demands: Option<proto::Demands>,
 ) -> Result<Named, String> {
     requests
@@ -406,6 +406,7 @@ async fn demanded(
             request_id: n.to_be_bytes().to_vec(),
             facts: Some(RequestFacts {
                 model: model.to_owned(),
+                phase: phase.into(),
                 seed: u64::from(n),
                 budget_micros: 5_000_000,
                 ..RequestFacts::default()
@@ -445,17 +446,22 @@ async fn demanded(
 /// A frame states its request's hard demands, and a controller holds the
 /// request to the workers whose registrations meet them.
 ///
-/// Three workers are added through the control listener. One states a
-/// runtime, media by reference under its registering party's pipeline, a
-/// window and a way to decide a constraint. One states another runtime, a
-/// pipeline of its own and another way, and no window. One states nothing.
+/// Three single workers are added through the control listener. One
+/// states a runtime, media by reference under its registering party's
+/// pipeline, a window and a way to decide a constraint. One states another
+/// runtime, a pipeline of its own and another way, and no window. One
+/// states nothing. Two prefills are added beside them, each on one of the
+/// two runtimes.
 ///
 /// A gateway that speaks protocol 1 alone reads a `Leader` range of 1 to
 /// 2 and is welcomed on 1. A demand its frame states is read all the same.
 /// Every pick of a demand names workers that meet it and no other. A
 /// demand no worker meets is shed with no endpoint, under that demand's
-/// own stage. A frame at a side's phase that states a demand ends its
-/// stream by the field.
+/// own stage.
+///
+/// A prefill frame states its demand too, and its list is held as a
+/// prefill is: to a runtime, and to no way to decide a constraint. A frame
+/// of the encode phase that states a demand ends its stream by the field.
 #[tokio::test]
 async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations_meet_it() {
     use std::collections::BTreeSet;
@@ -552,30 +558,43 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
 
         // Three workers whose policy turns their probes off: each call's
         // connect signal readies its worker.
+        let on = |runtime: u32| DemandFacts {
+            runtime,
+            ..DemandFacts::default()
+        };
+        let (single, prefill) = (proto::Role::Single, proto::Role::Prefill);
         let stated = [
-            Some(DemandFacts {
-                runtime: 7,
-                references: true,
-                host_pipeline: true,
-                window: 4_096,
-                decoding: 3,
-            }),
-            Some(DemandFacts {
-                runtime: 8,
-                references: true,
-                host_pipeline: false,
-                window: 0,
-                decoding: 4,
-            }),
-            None,
+            (
+                single,
+                Some(DemandFacts {
+                    runtime: 7,
+                    references: true,
+                    host_pipeline: true,
+                    window: 4_096,
+                    decoding: 3,
+                }),
+            ),
+            (
+                single,
+                Some(DemandFacts {
+                    runtime: 8,
+                    references: true,
+                    host_pipeline: false,
+                    window: 0,
+                    decoding: 4,
+                }),
+            ),
+            (single, None),
+            (prefill, Some(on(7))),
+            (prefill, Some(on(8))),
         ];
         let mut ids = Vec::with_capacity(stated.len());
-        for (i, block) in stated.into_iter().enumerate() {
+        for (i, (role, block)) in stated.into_iter().enumerate() {
             let request = RegisterWorkerRequest {
                 spec: Some(WorkerSpec {
                     url: format!("http://d{i}.fleet:8000"),
                     wire: WireMode::Grpc as i32,
-                    role: proto::Role::Single as i32,
+                    role: role as i32,
                     models: vec![MODEL.to_owned()],
                     health_policy: Some(proto::HealthPolicy {
                         disabled: true,
@@ -600,8 +619,8 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
                 other => panic!("a registration's answer: {other:?}"),
             }
         }
-        let [first, second, third] = ids[..] else {
-            panic!("three workers");
+        let [first, second, third, ahead, beside] = ids[..] else {
+            panic!("five workers");
         };
         let all = BTreeSet::from([first, second, third]);
 
@@ -615,7 +634,8 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
                 asked < 4_096,
                 "the three workers are not decided: {named:?}"
             );
-            let answer = demanded(&requests, &mut answers, asked, MODEL, None).await;
+            let of = (MODEL, proto::Phase::Single);
+            let answer = demanded(&requests, &mut answers, asked, of, None).await;
             if let Ok(targets) = answer.expect("an answer") {
                 named.extend(targets);
             }
@@ -691,11 +711,31 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
                 BTreeSet::from([second]),
             ),
         ];
-        for (what, demands, meeting) in picks {
+        // A prefill frame stands alone under this document: a prefill holds
+        // a runtime, and no way to decide a constraint.
+        let sides = [
+            (
+                "a prefill's runtime",
+                Demands { runtime: 7, ..none },
+                BTreeSet::from([ahead]),
+            ),
+            (
+                "a way no prefill is held to",
+                Demands {
+                    decoding: 5,
+                    ..none
+                },
+                BTreeSet::from([ahead, beside]),
+            ),
+        ];
+        let alone = picks.map(|pick| (proto::Phase::Single, pick));
+        let sided = sides.map(|pick| (proto::Phase::Prefill, pick));
+        for (phase, (what, demands, meeting)) in alone.into_iter().chain(sided) {
             let mut named = BTreeSet::new();
             for _ in 0..ASKS {
                 asked += 1;
-                let answer = demanded(&requests, &mut answers, asked, MODEL, Some(demands)).await;
+                let of = (MODEL, phase);
+                let answer = demanded(&requests, &mut answers, asked, of, Some(demands)).await;
                 let answer = answer.expect("an answer");
                 named.extend(answer.unwrap_or_else(|stage| panic!("{what} is shed by {stage}")));
             }
@@ -726,18 +766,20 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
         ];
         for (what, demands, stage) in sheds {
             asked += 1;
-            let answer = demanded(&requests, &mut answers, asked, MODEL, Some(demands)).await;
+            let of = (MODEL, proto::Phase::Single);
+            let answer = demanded(&requests, &mut answers, asked, of, Some(demands)).await;
             assert_eq!(answer, Ok(Err(stage.to_owned())), "{what}");
         }
 
-        // A frame at a side's phase holds no demand yet: one that states a
-        // demand is out of range by the field, and its stream ends.
+        // An encode request's frame holds no demand yet: a frame of the
+        // encode phase that states a demand is out of range by the field,
+        // and its stream ends.
         requests
             .send(DecideRequest {
                 request_id: vec![0xd],
                 facts: Some(RequestFacts {
                     model: MODEL.to_owned(),
-                    phase: proto::Phase::Prefill.into(),
+                    phase: proto::Phase::Encode.into(),
                     budget_micros: 5_000_000,
                     ..RequestFacts::default()
                 }),

@@ -2783,20 +2783,22 @@ crate's own client states for no request.
   with the controller (10.2), and a gateway's own process counts in the order of its own list. It
   ends when a gateway under a controller follows the controller's list and keeps its order
   (section 11) **[planned]**.
-- **No hard demand crosses beyond a single request's frame that names no worker.** A single
-  request's frame that names none states its demands from protocol 2 **[built]**
-  (`DecideRequest.demands`), and the controller keeps the workers that meet them ahead of every
-  stage. A frame that names its worker states none yet, and neither does a pair's frame, a decode
-  call or an encode request's frame: such a frame that states one is refused by the field, and a
-  host decides its request by itself. So the controller's count leaves no worker out for a
-  demand. It ends when those frames state a request's demands **[planned]**. A frame that
-  demands vision is held to the workers that take images. No registration over the wire states
-  that bit, so such a frame is shed unless the controller's own host laid a worker that does.
-  The handle refuses that part by its name. A shed keeps its demand's stage through the handle,
-  and any other stage reads `controller` there. What a worker states for the other demands
-  crosses already **[built]**: a registration states it and the log's row tells it, so a standby
-  and a watcher hold it. A worker whose row states none meets no demand for a runtime, for media
-  by reference or for a way to decide a constraint, and it takes a request of any size.
+- **An encode request's frame states no hard demand.** Every other frame states its request's
+  demands from protocol 2 **[built]** (`DecideRequest.demands`). Those are a single request's
+  frame, a pair's, a decode call's, a side's that stands alone and one that names its worker. The
+  controller keeps the workers that meet them ahead of every stage, each side by its role's part.
+  Its count passes over a worker a demand leaves out, as a gateway's own process does. An encode
+  request's frame that states one is refused by the field, and a host decides its request by
+  itself. It ends when that frame states a request's demands **[planned]**. A frame that demands
+  vision is held to the workers that take images. No registration over the wire states that bit,
+  so such a frame is shed unless the controller's own host laid a worker that does. The handle
+  refuses that part by its name. A shed keeps its demand's stage through the handle, and any
+  other stage reads `controller` there. `wires` and `vision` also name the controller's own shed
+  of a gateway's reach and of an encode request's media, as they do in process. What a worker
+  states for the other demands crosses already **[built]**: a registration states it and the
+  log's row tells it, so a standby and a watcher hold it. A worker whose row states none meets no
+  demand for a runtime, for media by reference or for a way to decide a constraint. It takes a
+  request of any size.
 - **A named prefill at its admission limit is not waited for.** A gateway's own process waits for
   the prefill a pair names where it stands at that gateway's admission limit (section 8.2). A
   controller keeps no gate: its count takes the prefill, and the gateway finds the limit. It ends
@@ -2901,7 +2903,7 @@ tells the data once more:
 | the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: the one record behind a write the store refuses, a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
-| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a single request's frame that states a demand is held to it. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a frame that states a demand is held to it, every frame but an encode request's. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
 | the published copy: of a record its id alone, beside its slot in the counts and in a gateway's vetoes by pool; with them each pool's index by model and role, the generation and the clock | the store | a pick's booking and a gateway's vetoes; every other loader reads the generation; no row of a record stands in it and no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 

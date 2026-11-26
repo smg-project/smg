@@ -407,3 +407,163 @@ fn a_frame_that_stands_alone_counts_over_its_own_phases_list() {
     }
     assert_eq!(reached(proto::Phase::Decode, 2), Err(MISSED));
 }
+
+/// The number counts among the workers that meet the frame's hard demands,
+/// as the one call counts it in a host's own process. Of the six workers
+/// the asking gateway dials, three state the runtime 2 and the others the
+/// runtime 1. A frame that stays on a runtime counts the workers that
+/// state it, in the list's order, and a number past them is shed under
+/// `target-worker`. A frame that states no demand counts all six.
+///
+/// A worker that meets the demand takes no number where the gateway cannot
+/// be sent to it: one another gateway alone dials, and one under the
+/// asking gateway's veto. Where no worker states the frame's runtime there
+/// is none to count, and the frame is shed under the demand's own stage.
+///
+/// The one call:
+/// `the_number_counts_among_the_workers_that_meet_the_requests_demands` of
+/// `engine/in_process/place/tests/target.rs`.
+#[test]
+fn the_number_counts_among_the_workers_that_meet_the_frames_demands() {
+    use super::{demanding, stating_member};
+    use crate::engine::DemandFacts;
+
+    let store = ring_store();
+    let objects = holder(&store);
+    let stating = |name: &'static str, runtime: u32, only| {
+        let stated = DemandFacts {
+            runtime,
+            ..DemandFacts::default()
+        };
+        let id = stating_member(&store, &objects, name, Role::Single, only, stated);
+        ((name, id), runtime)
+    };
+    let stated = [
+        stating("s0", 1, None),
+        stating("s1", 2, None),
+        stating("s2", 1, None),
+        stating("s3", 2, None),
+        stating("s4", 2, None),
+        stating("s5", 1, None),
+        stating("s6", 2, Some(OTHER)),
+    ];
+    let members = stated.map(|(member, _)| member);
+    let theirs = members[6].1;
+    // The workers the asking gateway dials, in the order a number counts
+    // in, and those of them that state `runtime`.
+    let order = list_order(&objects, Role::Single, &members);
+    let dialed: Vec<WorkerId> = order.iter().copied().filter(|&id| id != theirs).collect();
+    let on = |runtime: u32| -> Vec<WorkerId> {
+        let states = |id: &WorkerId| {
+            let told = stated.iter().find(|((_, member), _)| member == id);
+            told.is_some_and(|(_, told)| *told == runtime)
+        };
+        dialed.iter().copied().filter(states).collect()
+    };
+    let now = Instant::now();
+    let reached = |number: u32, runtime: u32| {
+        let demands = proto::Demands {
+            runtime,
+            ..proto::Demands::default()
+        };
+        let frame = demanding(naming(frame_for(PAIRED, 1, 3), number), demands);
+        reached_by(&served(&store, &objects, frame, GATEWAY, (now, now), None))
+    };
+    let (two, one) = (on(2), on(1));
+    assert_eq!((two.len(), one.len()), (3, 3));
+    for (number, &worker) in (0..).zip(&two) {
+        assert_eq!(reached(number, 2), Ok(worker), "the runtime 2, {number}");
+    }
+    assert_eq!(reached(3, 2), Err(MISSED), "three state the runtime");
+    for (number, &worker) in (0..).zip(&one) {
+        assert_eq!(reached(number, 1), Ok(worker), "the runtime 1, {number}");
+    }
+    for (number, &worker) in (0..).zip(&dialed) {
+        assert_eq!(reached(number, 0), Ok(worker), "no demand, {number}");
+    }
+
+    store.gateway_veto(GATEWAY, two[1], Some(now + Duration::from_secs(60)));
+    assert_eq!(reached(1, 2), Ok(two[2]), "behind the veto");
+    assert_eq!(reached(2, 2), Err(MISSED), "two can be sent to");
+
+    let wires = Some((ShedReason::NoEndpoints, "wires"));
+    assert_eq!(reached(0, 3), Err(wires), "no worker states the runtime 3");
+}
+
+/// A frame that stands alone at a side's phase counts among the workers
+/// that meet what its phase's role is held to, as its decision judges
+/// them. One of three workers a side states a window of 16 tokens and the
+/// others one of 4,096.
+///
+/// A prefill holds the input alone. A prefill frame whose completion takes
+/// 8,192 tokens counts every prefill, and one whose input takes 1,024
+/// counts the two wide ones. A decode holds both bounds: a decode frame
+/// whose completion takes 1,024 tokens counts the two wide decodes.
+#[test]
+fn a_frame_that_stands_alone_counts_by_what_its_phases_role_is_held_to() {
+    use super::{demanding, stating_member};
+    use crate::engine::DemandFacts;
+
+    let store = ring_store();
+    let objects = holder(&store);
+    let stating = |name: &'static str, role, window: u32| {
+        let stated = DemandFacts {
+            window,
+            ..DemandFacts::default()
+        };
+        let id = stating_member(&store, &objects, name, role, None, stated);
+        (name, id)
+    };
+    let (prefill, decode) = (Role::Prefill, Role::Decode);
+    let prefills = [
+        stating("p0", prefill, 4_096),
+        stating("p1", prefill, 16),
+        stating("p2", prefill, 4_096),
+    ];
+    let decodes = [
+        stating("d0", decode, 4_096),
+        stating("d1", decode, 16),
+        stating("d2", decode, 4_096),
+    ];
+    let ahead = list_order(&objects, prefill, &prefills);
+    let behind = list_order(&objects, decode, &decodes);
+    // A side's workers but the narrow one, in the order a number counts in.
+    let wide = |order: &[WorkerId], narrow: WorkerId| -> Vec<WorkerId> {
+        order.iter().copied().filter(|&id| id != narrow).collect()
+    };
+    let now = Instant::now();
+    let reached = |phase: proto::Phase, number: u32, demands: proto::Demands| {
+        let frame = demanding(naming(alone_at(1, phase), number), demands);
+        reached_by(&served_alone(&store, &objects, frame, (GATEWAY, now), None))
+    };
+    let none = proto::Demands::default();
+    let (at_prefill, at_decode) = (proto::Phase::Prefill, proto::Phase::Decode);
+
+    let completion = proto::Demands {
+        output_window: 8_192,
+        ..none
+    };
+    for (number, &worker) in (0..).zip(&ahead) {
+        let answer = reached(at_prefill, number, completion);
+        assert_eq!(answer, Ok(worker), "no prefill's to hold, {number}");
+    }
+    let input = proto::Demands {
+        input_window: 1_024,
+        ..none
+    };
+    for (number, &worker) in (0..).zip(&wide(&ahead, prefills[1].1)) {
+        let answer = reached(at_prefill, number, input);
+        assert_eq!(answer, Ok(worker), "the input, {number}");
+    }
+    assert_eq!(reached(at_prefill, 2, input), Err(MISSED), "two hold it");
+
+    let short = proto::Demands {
+        output_window: 1_024,
+        ..none
+    };
+    for (number, &worker) in (0..).zip(&wide(&behind, decodes[1].1)) {
+        let answer = reached(at_decode, number, short);
+        assert_eq!(answer, Ok(worker), "the completion, {number}");
+    }
+    assert_eq!(reached(at_decode, 2, short), Err(MISSED), "two hold it");
+}

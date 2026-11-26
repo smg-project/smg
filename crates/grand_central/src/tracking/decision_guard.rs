@@ -910,25 +910,29 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// answer busy at its receipt. A request built for the door in process
     /// carries that budget unless its host states one.
     ///
-    /// A single request that states a hard demand states it in its frame
+    /// A request that states a hard demand states it in its frame
     /// (`DecideRequest.demands`), and the controller keeps the workers that
-    /// meet it. That takes a session whose welcome chose protocol 2, or a
-    /// later version the link's hello offered. Any other request that
-    /// states one is answered
+    /// meet it. Each side of a pair is held to its role's part of the
+    /// demand. A request that names its worker is counted over the workers
+    /// that meet it. That takes a session whose welcome chose protocol 2,
+    /// or a later version the link's hello offered.
+    ///
+    /// Three requests that state a demand are answered
     /// [`DecisionUnavailable::Unsent`] with [`Error::OutOfRange`] before
-    /// anything is sent, and its host decides it itself:
+    /// anything is sent, and their host decides them itself:
     ///
     /// - a request over a session on protocol 1, whose controller may read no
     ///   demand and would then pick among workers the demand rules out, or
     ///   on a version the hello did not offer
-    /// - a request at a side's phase, an encode request and one that names
-    ///   its worker, which a controller holds to no demand yet
+    /// - an encode request, which a controller holds to no demand yet
     /// - a request that demands vision, by that part's name, since no
     ///   registration over the wire states whether a worker takes images
     ///
     /// A shed keeps the stage of the demand that left nobody
     /// (`Shed::emptied_by`), as the door in process names it. Any other
-    /// stage of a controller's shed reads `controller`.
+    /// stage of a controller's shed reads `controller`. `wires` and
+    /// `vision` also name the controller's own shed of a gateway's reach
+    /// and of an encode request's media, as they do in process.
     ///
     /// A request's places and its stalled and held rows are positions of
     /// its host's own list. They cross with no request, with a demand or
@@ -1002,7 +1006,7 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         now: Instant,
         budget: Duration,
     ) -> Result<Self, DecisionUnavailable> {
-        Self::sendable(link, request, named.is_some())?;
+        Self::sendable(link, request, false)?;
         Self::answered(link, wire::request(request, named), now, budget, |_, _| {
             Ok(())
         })
@@ -1042,7 +1046,7 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         budget: Duration,
     ) -> Result<Self, DecisionUnavailable> {
         placed.clear();
-        Self::sendable(link, request, false)?;
+        Self::sendable(link, request, true)?;
         if request.facts.phase != Phase::Prefill {
             return Err(DecisionUnavailable::Unsent(Error::OutOfRange(
                 "facts.phase",
@@ -1057,12 +1061,12 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
 
     /// What a handle refuses of a request before anything is sent: a
     /// budget of 0, and a hard demand its controller would not hold
-    /// ([`Self::demands_sendable`]). `named` is whether the request names
-    /// its worker.
+    /// ([`Self::demands_sendable`]). `encode` is whether the request is an
+    /// encode request, whose frame states the encode phase.
     fn sendable(
         link: &Link,
         request: &Request<'_>,
-        named: bool,
+        encode: bool,
     ) -> Result<(), DecisionUnavailable> {
         if request.facts.budget_micros == 0 {
             return Err(DecisionUnavailable::Late);
@@ -1070,27 +1074,27 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         if request.constraints.demands.is_none() {
             return Ok(());
         }
-        Self::demands_sendable(link, request, named)
+        Self::demands_sendable(link, request, encode)
     }
 
-    /// Whether a request's hard demands go out in its frame. They do for a
-    /// single request that names no worker, over a session whose welcome
-    /// chose a protocol that states them. The part that demands vision
-    /// never does. Out of line: a request that demands nothing reads none
-    /// of it.
+    /// Whether a request's hard demands go out in its frame. They do over
+    /// a session whose welcome chose a protocol that states them, on every
+    /// frame but one that states the encode phase. The part that demands
+    /// vision never does. Out of line: a request that demands nothing reads
+    /// none of it.
     #[cold]
     #[inline(never)]
     fn demands_sendable(
         link: &Link,
         request: &Request<'_>,
-        named: bool,
+        encode: bool,
     ) -> Result<(), DecisionUnavailable> {
         let unsent = |field| Err(DecisionUnavailable::Unsent(Error::OutOfRange(field)));
         // A controller on protocol 1 reads no demand, and a welcome on a
         // version the hello did not offer says nothing of it. One on
-        // protocol 2 holds it on a single request's frame that names no
-        // worker. So no demand is dropped on the way.
-        if !reads_demands(link.welcome().protocol) || request.facts.phase != Phase::Single || named
+        // protocol 2 holds it on every frame but one of the encode phase,
+        // which it refuses. So no demand is dropped on the way.
+        if !reads_demands(link.welcome().protocol) || encode || request.facts.phase == Phase::Encode
         {
             return unsent("constraints.demands");
         }

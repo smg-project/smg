@@ -1412,61 +1412,81 @@ mod linked {
         }
     }
 
-    /// Over a session whose welcome chose protocol 2, a single request
-    /// that names no worker states its hard demands on its frame. Each
-    /// part goes as the request states it, and the ask is answered as
-    /// any ask is.
+    /// Over a session whose welcome chose protocol 2, a request states
+    /// its hard demands on its frame. The kinds are a single request,
+    /// a request at a side's phase and one that names its worker, by a
+    /// number or by a text that is none. Each part goes as the request
+    /// states it, the number beside it, and the ask is answered as any
+    /// ask is.
     #[tokio::test(start_paused = true)]
-    async fn a_single_requests_demands_go_out_on_its_frame_over_a_session_on_protocol_two() {
-        let mut peer = Peer::speaking(1, 2);
-        let mut ask = stated(&[1]);
-        ask.facts.budget_micros = 200_000;
-        ask.constraints.demands = Demands {
-            runtime: 7,
-            references: References::Caller,
-            input_window: 4_096,
-            output_window: 512,
-            decoding: 3,
-            ..Demands::default()
-        };
-        peer.read_hello().await;
-        let link = peer.link.clone();
-        let exchange = async {
-            let sent = peer.requests.next().await.expect("an ask went out");
-            peer.answer(1, link.term_floor(), Answer::Decision(picked()));
-            sent
-        };
-        let both = async {
-            let now = Instant::now();
-            let held = pin!(DecisionGuard::<&InProcess>::asked(
-                &link, &ask, now, PATIENCE
-            ));
-            tokio::join!(held, exchange)
-        };
-        let (handle, sent) = timeout(PATIENCE, both).await.expect("an answer came back");
-        assert!(handle.is_ok(), "the ask is answered: {:?}", handle.err());
-        assert_eq!(
-            sent.demands,
-            Some(proto::Demands {
+    async fn a_requests_demands_go_out_on_its_frame_over_a_session_on_protocol_two() {
+        let kinds = [
+            (Phase::Single, None),
+            (Phase::Prefill, None),
+            (Phase::Decode, None),
+            (Phase::Single, Some(Some(3))),
+            (Phase::Single, Some(None)),
+            (Phase::Prefill, Some(Some(3))),
+        ];
+        for (phase, named) in kinds {
+            let mut peer = Peer::speaking(1, 2);
+            let mut ask = stated(&[1]);
+            ask.facts.budget_micros = 200_000;
+            ask.facts.phase = phase;
+            ask.constraints.demands = Demands {
                 runtime: 7,
-                vision: false,
-                references: proto::demands::References::Caller.into(),
+                references: References::Caller,
                 input_window: 4_096,
                 output_window: 512,
                 decoding: 3,
-            })
-        );
+                ..Demands::default()
+            };
+            peer.read_hello().await;
+            let link = peer.link.clone();
+            let exchange = async {
+                let sent = peer.requests.next().await.expect("an ask went out");
+                peer.answer(1, link.term_floor(), Answer::Decision(picked()));
+                sent
+            };
+            let both = async {
+                let now = Instant::now();
+                let held = pin!(DecisionGuard::<&InProcess>::asked_naming(
+                    &link, &ask, named, now, PATIENCE
+                ));
+                tokio::join!(held, exchange)
+            };
+            let (handle, sent) = timeout(PATIENCE, both).await.expect("an answer came back");
+            assert!(
+                handle.is_ok(),
+                "{phase:?} {named:?}: the ask is answered: {:?}",
+                handle.err()
+            );
+            assert_eq!(
+                sent.demands,
+                Some(proto::Demands {
+                    runtime: 7,
+                    vision: false,
+                    references: proto::demands::References::Caller.into(),
+                    input_window: 4_096,
+                    output_window: 512,
+                    decoding: 3,
+                }),
+                "{phase:?} {named:?}"
+            );
+            let number = named.map(|number| number.unwrap_or(u32::MAX));
+            assert_eq!(sent.named_worker, number, "{phase:?} {named:?}");
+        }
     }
 
-    /// Over a session on protocol 2 the handle still refuses a demand
-    /// that a controller holds on no frame of the request's kind yet,
-    /// before anything is sent. The kinds are a request that names its
-    /// worker, a request at a side's phase and an encode request. The
-    /// part that demands vision is refused by its own name, on a single
-    /// request too: no registration states whether a worker takes
-    /// images.
+    /// Over a session on protocol 2 the handle still refuses two
+    /// demands before anything is sent. One is an encode request's,
+    /// which a controller holds on no frame yet: by its own ask, and by
+    /// a request that states the encode phase. The other is the part
+    /// that demands vision, by its own name, on a request of any kind:
+    /// no registration states whether a worker takes images.
     #[tokio::test(start_paused = true)]
-    async fn a_demand_no_frame_of_its_requests_kind_holds_yet_is_refused_before_anything_is_sent() {
+    async fn an_encode_requests_demand_and_a_demand_for_vision_are_refused_before_anything_is_sent()
+    {
         let mut peer = Peer::speaking(1, 2);
         let demand = Demands {
             runtime: 7,
@@ -1486,12 +1506,18 @@ mod linked {
         };
         let before = tokio::time::Instant::now();
         let asks = [
-            (Phase::Single, Some(Some(0)), demand, "constraints.demands"),
-            (Phase::Single, Some(None), demand, "constraints.demands"),
-            (Phase::Prefill, None, demand, "constraints.demands"),
-            (Phase::Decode, None, demand, "constraints.demands"),
+            (Phase::Encode, None, demand, "constraints.demands"),
+            (Phase::Encode, Some(Some(0)), demand, "constraints.demands"),
             (Phase::Single, None, vision, "constraints.demands.vision"),
             (Phase::Single, None, both, "constraints.demands.vision"),
+            (Phase::Prefill, None, vision, "constraints.demands.vision"),
+            (Phase::Decode, None, both, "constraints.demands.vision"),
+            (
+                Phase::Single,
+                Some(Some(0)),
+                vision,
+                "constraints.demands.vision",
+            ),
         ];
         for (phase, named, demands, refused) in asks {
             let mut ask = stated(&[1]);
