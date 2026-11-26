@@ -86,8 +86,9 @@ pub enum Failure {
 /// the mark.
 ///
 /// The record gains fields: code outside this crate starts from the default
-/// (five failures within ten seconds, a cool-down of thirty seconds) and
-/// assigns what it states otherwise, and a pattern of it ends with `..`.
+/// (five failures in one window of ten seconds, a cool-down of thirty
+/// seconds) and assigns what it states otherwise, and a pattern of it ends
+/// with `..`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BreakerSpec {

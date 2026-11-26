@@ -495,16 +495,18 @@ mod a_plugins_row {
     }
 
     /// The version of a module's interface is made by its call, which takes
-    /// both numbers, and read by a pattern that ends open. A version the
-    /// crate names is its constant.
+    /// both numbers and builds in a constant, and read by a pattern that
+    /// ends open. A version the crate names is its constant.
     #[cfg(feature = "wasm")]
     #[test]
     fn an_interface_version_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
         use smg_grand_central::plugins::wasm::Abi;
 
-        let Abi { major, minor, .. } = Abi::of(1, 2);
+        const PINNED: Abi = Abi::of(1, 2);
+
+        let Abi { major, minor, .. } = PINNED;
         assert_eq!((major, minor), (1, 2));
-        assert_eq!(Abi::of(1, 2), Abi::V1_2);
+        assert_eq!(PINNED, Abi::V1_2);
     }
 
     /// The TLS of a dial to a gRPC plugin is made by its call, which takes
@@ -610,7 +612,7 @@ mod a_controllers_start {
     }
 
     /// A configuration is made by its call, which takes the three fields
-    /// the crate states no value for. Each of the seven others reads the
+    /// a host must state. Each of the seven others reads the
     /// value the crate states once, and takes another by assignment.
     #[test]
     fn a_configuration_is_made_by_its_call_and_reads_the_crates_values_for_the_rest() {

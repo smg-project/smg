@@ -259,7 +259,7 @@ impl Config {
     }
 
     /// A configuration of `controller_id`, `listeners` and `admin`: the
-    /// three fields the crate states no value for. Each of the seven
+    /// three fields a host must state. Each of the seven
     /// others takes the value the crate states once, which the command
     /// line's flag takes too:
     ///
