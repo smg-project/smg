@@ -83,6 +83,15 @@ router routes by and workers that share a host do not collide; an explicit
 configuration is kept as given, its endpoint and off included, and
 `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off.
 
+`GenerateRequest.cache_salt` is the request's prefix-cache salt, under either
+implementation. Requests with different salts share no cached blocks. A salt
+has 1 to 128 characters and none of `@`, `/`, `\` and NUL. The prefix `mm:` is
+reserved. The servicer refuses any other salt with `INVALID_ARGUMENT`. The
+engine gets the salt verbatim, with one exception: a PD decode side that has
+media hashes and no tensors. There it gets `mm:` and a SHA-256 digest of the
+salt, if any, and the hashes. The worker advertises
+`cache_partition_fields=cache_salt` through `GetServerInfo`.
+
 #### Worker-side multimodal processing (media refs)
 
 By default the smg router fetches and preprocesses images itself and sends

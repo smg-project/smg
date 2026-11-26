@@ -43,6 +43,7 @@ mod test_support;
 mod tokenspeed;
 mod trtllm;
 mod vllm;
+mod vllm_cache_salt;
 
 pub use client::{
     connect_for_worker, connect_with_eos, kv_transfer_rejection_params, ZmqDialect,
@@ -79,3 +80,4 @@ pub use tokenspeed::{
 };
 pub use trtllm::{to_trtllm_response, TrtllmGenerateStream};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};
+pub use vllm_cache_salt::validate_cache_salt;

@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use engine_zmq_adapter::{
     fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
-    VllmGenerateStream, ZmqEngineClient,
+    validate_cache_salt, VllmGenerateStream, ZmqEngineClient,
 };
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
@@ -321,6 +321,12 @@ async fn submit(
                     notice.disarm();
                 }
             })?;
+    // Refuse a bad salt before the media stage fetches anything, and after
+    // the registry, which keeps a live id from getting a notice. The adapter
+    // checks the salt again for its direct-ZMQ lane.
+    if let Some(salt) = req.cache_salt.as_deref() {
+        validate_cache_salt(salt).map_err(Status::invalid_argument)?;
+    }
     // Worker-side media: the request's references become engine features
     // and its prompt the expanded one, before the frontend duties below.
     let (processed_media, media_identity) = match process_media_refs(state, &mut req).await? {

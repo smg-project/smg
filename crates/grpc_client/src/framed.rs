@@ -369,6 +369,7 @@ pub(crate) fn vllm_frames(req: vllm::GenerateRequest) -> Result<Vec<Bytes>, Stat
         extra_mm_inputs,
         ec_transfer_params_json,
         chat_template_kwargs_json,
+        cache_salt,
     } = req;
     // Fields 1-6, in prost's order, moved.
     vllm::GenerateRequest {
@@ -398,10 +399,11 @@ pub(crate) fn vllm_frames(req: vllm::GenerateRequest) -> Result<Vec<Bytes>, Stat
         out.length_delimited(11, inputs.encoded_len());
         inputs_frames(inputs, &mut out);
     }
-    // Fields 12-13.
+    // Fields 12-14.
     vllm::GenerateRequest {
         ec_transfer_params_json,
         chat_template_kwargs_json,
+        cache_salt,
         ..Default::default()
     }
     .encode_raw(&mut out.scratch);
@@ -1271,6 +1273,7 @@ mod tests {
                 data_parallel_rank: Some(1),
                 media_refs: Some(vllm::MediaRefs::default()),
                 chat_template_kwargs_json: Some("{}".into()),
+                cache_salt: Some("tenant-a".into()),
                 input: Some(vllm::generate_request::Input::Tokenized(
                     vllm::TokenizedInput {
                         original_text: "hi".into(),

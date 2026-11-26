@@ -14,7 +14,7 @@ import grpc
 import pytest
 from smg_grpc_proto import vllm_engine_pb2 as pb
 from smg_grpc_servicer.vllm.mm_keys import batches_missing_pixels, mm_batches
-from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload
+from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, request_cache_salt
 
 
 class _Aborted(Exception):
@@ -48,6 +48,7 @@ def _generate(**overrides):
         "grpc": grpc,
         "mm_batches": mm_batches,
         "has_preprocessed_mm_payload": has_preprocessed_mm_payload,
+        "request_cache_salt": request_cache_salt,
         "batches_missing_pixels": batches_missing_pixels,
         "params_from_request": lambda req: (
             json.loads(req.kv_transfer_params_json)

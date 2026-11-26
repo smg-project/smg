@@ -173,6 +173,8 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         engine_reasoning_parser: model.engine_reasoning_parser.clone(),
         constrained_decoding_start: model.constrained_decoding_start.clone(),
         structural_tag_vocabulary: model.structural_tag_vocabulary.clone(),
+        // The cache partition fields the adapter's translation reads.
+        cache_partition_fields: "cache_salt".to_string(),
         ..Default::default()
     }
 }

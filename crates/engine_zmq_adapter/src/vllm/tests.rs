@@ -1712,6 +1712,7 @@ fn fan_out_splits_n_into_single_sample_requests() {
         ..Default::default()
     });
     req.request_id = "r1".to_string();
+    req.cache_salt = Some("tenant-a".to_string());
 
     let subs = fan_out_requests(req);
     assert_eq!(subs.len(), 3);
@@ -1722,6 +1723,7 @@ fn fan_out_splits_n_into_single_sample_requests() {
         assert_eq!(sp.n, 1);
         assert_eq!(sp.seed, Some(7 + i as i32));
         // Everything else is shared verbatim.
+        assert_eq!(sub.cache_salt.as_deref(), Some("tenant-a"));
         assert_eq!(
             sub.input,
             Some(vllm::generate_request::Input::Tokenized(
@@ -2266,6 +2268,56 @@ fn malformed_reasoning_template_kwargs_are_rejected() {
             error.starts_with("invalid chat_template_kwargs_json:"),
             "{error}"
         );
+    }
+}
+
+/// Only a tensor-less identity payload changes the request salt. A side with
+/// pixels or a grid has its identity in `mm_features`.
+#[test]
+fn the_engine_keeps_the_request_salt_beside_the_media_identity() {
+    let tensor = |shape: &[u32], dtype: &str| vllm::TensorData {
+        shape: shape.to_vec(),
+        dtype: dtype.to_string(),
+        payload: Some(vllm::tensor_data::Payload::Inline(Bytes::from(vec![0; 24]))),
+    };
+    let no_hashes = vllm::MultimodalInputs::default();
+    let identity = vllm::MultimodalInputs {
+        mm_hashes: vec!["h1".to_string()],
+        ..Default::default()
+    };
+    let grid = vllm::MultimodalInputs {
+        mm_placeholders: vec![vllm::PlaceholderRange {
+            offset: 1,
+            length: 2,
+        }],
+        model_specific_tensors: HashMap::from([(
+            "image_grid_thw".to_string(),
+            tensor(&[1, 3], "int64"),
+        )]),
+        ..identity.clone()
+    };
+    let pixels = vllm::MultimodalInputs {
+        pixel_values: Some(tensor(&[1, 6], "float32")),
+        ..grid.clone()
+    };
+    for salt in [None, Some("tenant-a".to_string())] {
+        let composed = engine_cache_salt(salt.clone(), &identity.mm_hashes).expect("a salt");
+        assert_ne!(composed, salt);
+        for (media, expected) in [
+            (&no_hashes, &salt),
+            (&identity, &composed),
+            (&grid, &salt),
+            (&pixels, &salt),
+        ] {
+            let mut req = tokenized_req(vllm::SamplingParams::default());
+            req.cache_salt.clone_from(&salt);
+            req.mm_inputs = Some(media.clone());
+            req.kv_transfer_params_json = Some("{}".to_string());
+            let request =
+                translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+                    .expect("translated");
+            assert_eq!(&request.cache_salt, expected, "{salt:?} {media:?}");
+        }
     }
 }
 

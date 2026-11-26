@@ -169,6 +169,22 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
     assert info.mm_encoder_budget == 0
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_get_server_info_reports_the_cache_partition_fields(legacy):
+    """The handler names the field Generate reads, and leaves an older schema alone."""
+    missing = ("cache_partition_fields",) if legacy else ()
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype="torch.bfloat16", is_multimodal_model=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+    )
+    handler = _server_info_method(_response_type_without(*missing))
+    info = asyncio.run(handler(servicer, None, None))
+    assert getattr(info, "cache_partition_fields", None) == (None if legacy else "cache_salt")
+
+
 @pytest.mark.parametrize("ranks", [[0], [1], [0, 1], []])
 def test_ec_addresses_preserve_managed_global_rank_slots(monkeypatch, ranks):
     """External DP advertises only its own rank without renumbering DP-aware slots."""

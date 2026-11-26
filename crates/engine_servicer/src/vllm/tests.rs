@@ -1311,7 +1311,8 @@ async fn a_refused_decode_side_notifies_the_engine() {
 }
 
 /// A decode side refused as a duplicate id sends no rejection notice: the id
-/// names a request that is still live, and the notice would reuse it.
+/// names a request that is still live, and the notice would reuse it. A bad
+/// salt does not change that.
 #[tokio::test]
 async fn a_duplicate_decode_side_sends_no_rejection_notice() {
     let mut h = harness(model_info(), None).await;
@@ -1325,7 +1326,17 @@ async fn a_duplicate_decode_side_sends_no_rejection_notice() {
         .expect("generate")
         .into_inner();
     recv_add(&mut h.engine_in).await;
-    let status = h.client.generate(request).await.expect_err("duplicate id");
+    let status = h
+        .client
+        .generate(request.clone())
+        .await
+        .expect_err("duplicate id");
+    assert_eq!(status.code(), Code::AlreadyExists);
+    let salted = vllm::GenerateRequest {
+        cache_salt: Some("mm:x".to_string()),
+        ..request
+    };
+    let status = h.client.generate(salted).await.expect_err("duplicate id");
     assert_eq!(status.code(), Code::AlreadyExists);
     assert_engine_idle(&mut h.engine_in).await;
     drop(stream);
@@ -1429,6 +1440,7 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
     // A tensor-less identity batch (a grid-less PD decode side) rides the
     // cache salt; an empty extra batch is simply nothing to attach.
     let mut request = generate_request("mm2", false, Vec::new());
+    request.cache_salt = Some("tenant-a".to_string());
     request.mm_inputs = Some(vllm::MultimodalInputs {
         mm_hashes: vec!["h1".to_string(), "h2".to_string()],
         ..Default::default()
@@ -1442,7 +1454,49 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
         .into_inner();
     let engine_request = recv_add(&mut h.engine_in).await;
     assert!(engine_request.mm_features.is_none());
-    assert_eq!(engine_request.cache_salt.as_deref(), Some("mm:h1,h2"));
+    assert_eq!(
+        engine_request.cache_salt.as_deref(),
+        Some("mm:662beced721917156bf4b76f866d2c307d82dd3bcfa95262ec7104fa2ba0fa3f")
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The request salt reaches the engine on each choice. It replaces the salt a
+/// media processor gave. A bad salt reaches neither the media stage nor the
+/// engine.
+#[tokio::test]
+async fn the_request_salt_reaches_the_engine_or_is_refused() {
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    let salted = |id: &str, salt: &str| vllm::GenerateRequest {
+        cache_salt: Some(salt.to_string()),
+        ..generate_request(id, false, Vec::new())
+    };
+
+    let mut text = salted("text", "tenant-a");
+    text.sampling_params.as_mut().expect("sampling params").n = 2;
+    let _text = h.client.generate(text).await.expect("generate");
+    for _ in 0..2 {
+        let engine_request = recv_add(&mut h.engine_in).await;
+        assert_eq!(engine_request.cache_salt.as_deref(), Some("tenant-a"));
+    }
+
+    let mut refs = salted("refs", "tenant-a");
+    refs.media_refs = Some(media_refs(&["https://example.com/x.png"]));
+    let _refs = h.client.generate(refs).await.expect("generate");
+    let frames = h.engine_in.recv_frames().await.expect("add frames");
+    let engine_request: EngineCoreRequest = decode_msgpack(&frames[1]).expect("add payload");
+    assert_eq!(engine_request.cache_salt.as_deref(), Some("tenant-a"));
+
+    let mut bad = salted("bad", "mm:secret");
+    bad.media_refs = Some(media_refs(&["https://example.com/y.png"]));
+    let status = h.client.generate(bad).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(status.message().contains("cache_salt"), "{status}");
+    assert!(!status.message().contains("secret"), "{status}");
+    // The media stage never sees the refused request.
+    assert_eq!(processor.requests().len(), 1);
+    assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -2117,6 +2171,8 @@ async fn info_rpcs_report_config_and_handshake_facts() {
     assert_eq!(server.kv_engine_id, "eng-a");
     assert_eq!(server.kv_cache_dtype, "auto");
     assert_eq!(server.shm_namespace_id, "boot:42");
+    assert_eq!(server.cache_partition_fields, "cache_salt");
+    assert_eq!(labels["cache_partition_fields"], "cache_salt");
     // The running window the Router's PD admission gate bounds dispatch by:
     // the handshake's, for a launcher that reported none.
     assert_eq!(

@@ -327,6 +327,18 @@ mod tests {
         assert_eq!(labels["ec_role"], "ec_producer");
     }
 
+    /// A vLLM servicer that reads no cache partition field has no label.
+    #[test]
+    fn vllm_cache_partition_fields_flatten_into_a_label() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            cache_partition_fields: "cache_salt".into(),
+            ..Default::default()
+        }));
+        assert_eq!(info.to_labels()["cache_partition_fields"], "cache_salt");
+        let older = ServerInfo::Vllm(Box::default()).to_labels();
+        assert!(!older.contains_key("cache_partition_fields"));
+    }
+
     /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
     /// are: the engine's per-prompt media limits arrive as `mm_item_limits`
     /// and its encoder budget as `mm_encoder_budget`, and an engine without
