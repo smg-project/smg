@@ -281,11 +281,11 @@ struct Admitted {
     /// The rows here that a mask over the pool names, by their index here.
     masked: Vec<u32>,
     /// The rows here that the mask's held rows name, by their index here:
-    /// an earlier admission's where this one numbered no mask.
+    /// an earlier admission's where this one numbered nothing.
     held: Vec<u32>,
     /// The rows here at the places of the pool its host holds the request
     /// to, by their index here: an earlier admission's where this one
-    /// numbered no place.
+    /// numbered nothing.
     places: Vec<u32>,
 }
 
