@@ -878,7 +878,7 @@ def build_report(
         "",
         f"_N = simulations per arm (baseline/candidate) = tasks × {k} trials. "
         "Same model · engine · checkpoint · sampling · user-sim (gpt-5.2) on both arms "
-        "— a delta is comparable only when neither arm is marked incomplete._",
+        "— completeness and safety are gated separately from the computed quality delta._",
     ]
     overall_out = dict(overall)
     overall_out["n"] = {"baseline": nsum["b"], "candidate": nsum["c"]}
@@ -1040,7 +1040,7 @@ def write_report_and_gate(
 
     exit_code = EXIT_OK
     delta = payload["overall"]["passk"]["delta"]
-    if not payload["incomplete"] and delta is not None and delta < -args.tolerance:
+    if delta is not None and delta < -args.tolerance:
         print(
             f"\nREGRESSION: {candidate.name} pass^{k} {delta * 100:.2f}pp "
             f"below {baseline.name} (tol {args.tolerance * 100:.2f}pp)",
@@ -1048,7 +1048,7 @@ def write_report_and_gate(
         )
         exit_code = EXIT_REGRESSION
 
-    # An incomplete arm outranks a regression: there is no trustworthy delta to gate on.
+    # Hard incompleteness outranks regression; allowed quality diagnostics retain the delta gate.
     for name, reason in payload["incomplete"].items():
         print(f"\nINCOMPLETE: arm {name} — {reason}", file=sys.stderr)
     # Neither diagnostics nor a quality-tolerance flag can turn unscored

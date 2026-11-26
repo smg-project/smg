@@ -2577,3 +2577,173 @@ def test_saved_real_nightly_gate_keeps_clean_and_quality_regression_policy(
     assert parent.returncode == 0, (parent.stdout, parent.stderr)
     assert ("::warning::" in parent.stdout) is (expected == 1)
     assert run_ab.final_budget(*arms)["halted"] is False
+
+
+def _comparable_quality_driver_pair(tmp_path, monkeypatch, mode="regression"):
+    import os
+
+    def child(command, **kwargs):
+        domain = command[command.index("--domain") + 1]
+        name = command[command.index("--arm") + 1]
+        if domain == "retail":
+            folder = tmp_path / "simulations" / command[command.index("--save-to") + 1]
+            folder.mkdir(parents=True)
+            reward = 1.0 if name == "vllm" or mode == "healthy" else 0.0
+            (folder / "results.json").write_text(
+                json.dumps(
+                    {
+                        "simulations": [
+                            {
+                                "task_id": row["task_id"],
+                                "trial": row["trial"],
+                                "seed": row["seed"],
+                                "reward_info": {"reward": row["reward"]},
+                            }
+                            for row in _rows(reward=reward)
+                        ]
+                    }
+                )
+            )
+        return types.SimpleNamespace(
+            returncode=9 if mode == "safety" and name == "vllm" and domain == "airline" else 0
+        )
+
+    arms = []
+    with monkeypatch.context() as patch:
+        patch.setattr(run_ab.subprocess, "run", child)
+        for name in ("vllm", "smg"):
+            arm = run_ab.Arm(name, "http://unused.invalid")
+            for domain, task in (("retail", "task"), ("airline", "airline-task")):
+                _run_tau2(arm, tmp_path, domain=domain, num_trials=2, expected_task_ids=[task])
+            arms.append(arm)
+    assert all("retail" in arm.scores and "airline" not in arm.scores for arm in arms)
+    assert all(arm.invocations["retail"]["status"] == "completed" for arm in arms)
+    healthy = run_ab.final_budget(*arms)
+    assert healthy["pending"] == healthy["unknown"] == 0 and healthy["halted"] is False
+    if mode == "invalid_provenance":
+        arms[0].invocations["retail"]["invocation_id"] = "e" * 32
+    paths = []
+    for arm in arms:
+        path = tmp_path / ("scores_" + arm.name + ".json")
+        run_ab.save_scores(arm, path)
+        paths.append(path)
+    manifest = tmp_path / "expected-two-domains.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "seed": 300,
+                "num_trials": 2,
+                "domains": {"retail": ["task"], "airline": ["airline-task"]},
+            }
+        )
+    )
+    cli = [
+        sys.executable,
+        "-I",
+        "-B",
+        str(Path(run_ab.__file__).resolve()),
+        "--diff-baseline",
+        str(paths[0]),
+        "--diff-candidate",
+        str(paths[1]),
+        "--domains",
+        "retail,airline",
+        "--num-trials",
+        "2",
+        "--seed",
+        "300",
+        "--expected-tasks",
+        str(manifest),
+        "--tolerance",
+        "0.02",
+        "--json-out",
+        str(tmp_path / "quality-comparison.json"),
+    ]
+    if mode != "regression_strict":
+        cli.append("--allow-incomplete")
+    return arms, paths, cli, os.environ.copy(), healthy
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("regression", 1),
+        ("healthy", 0),
+        ("invalid_provenance", 2),
+        ("safety", 2),
+        ("regression_strict", 2),
+    ],
+)
+def test_comparable_quality_waiver_preserves_regression_and_hard_gates(
+    tmp_path, monkeypatch, mode, expected
+):
+    import subprocess
+
+    arms, paths, cli, env, healthy = _comparable_quality_driver_pair(tmp_path, monkeypatch, mode)
+    direct = subprocess.run(cli, env=env, capture_output=True, text=True, timeout=10, check=False)
+    assert run_ab.final_budget(*arms) == healthy
+    assert direct.returncode == expected, (direct.returncode, direct.stdout, direct.stderr)
+    if mode == "regression":
+        assert "REGRESSION:" in direct.stderr
+        report = json.loads((tmp_path / "quality-comparison.json").read_text())
+        assert report["overall"]["passk"]["delta"] == -1.0
+        assert set(report["incomplete"]) == {"vllm", "smg"}
+    elif mode == "healthy":
+        assert "REGRESSION:" not in direct.stderr
+
+
+def _literal_always_stage(root, tmp_path):
+    import os
+    import subprocess
+
+    workflow = (root / ".github/workflows/nightly-tau2.yml").read_text()
+    start = workflow.index("      - name: Stage results for upload")
+    end = workflow.index("      - name: Upload results (summary + scores + transcripts)", start)
+    block = workflow[start:end]
+    assert "        if: always()" in block
+    script = block.split("        run: |\n", 1)[1]
+    script = "\n".join(line[10:] for line in script.splitlines())
+    assert "          path: tau2_artifact/" in workflow[end:]
+    env = {**os.environ, "RUNNER_TEMP": str(tmp_path)}
+    return subprocess.run(
+        ["/usr/bin/bash", "-e", "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def test_failure_artifacts_keep_early_hard_arm_without_starting_pair(tmp_path):
+    parent, launches = _unified_real_parent(tmp_path, "hard")
+    assert parent.returncode == 2 and launches == ["vllm"]
+    # The original sequential score-arm command is unguarded. Its hard2 happens
+    # before any gate/diff call (the existing helper's gate stub is unreachable).
+    score = tmp_path / "scores_vllm.json"
+    before = score.read_bytes()
+    failed = json.loads(before)["invocations"]["retail"]
+    assert failed["status"] == "failed" and failed["halt_error"]
+    assert "scope_stop_state" in failed
+    assert not (tmp_path / "scores_smg.json").exists()
+    assert not (tmp_path / "tau2_ab.json").exists()
+    stage = _literal_always_stage(Path(run_ab.__file__).resolve().parents[2], tmp_path)
+    assert stage.returncode == 0, stage.stderr
+    assert (tmp_path / "tau2_artifact/scores_vllm.json").read_bytes() == before
+    assert not (tmp_path / "tau2_artifact/scores_smg.json").exists()
+
+
+def test_failure_artifacts_keep_both_actual_arm_outcome_files(tmp_path, monkeypatch):
+    arms, files, cli, env, healthy = _comparable_quality_driver_pair(
+        tmp_path, monkeypatch, "healthy"
+    )
+    assert all(arm.invocations["airline"]["failure_kind"] == "missing_results" for arm in arms)
+    before = {path.name: path.read_bytes() for path in files}
+    stage = _literal_always_stage(Path(run_ab.__file__).resolve().parents[2], tmp_path)
+    assert stage.returncode == 0, stage.stderr
+    assert all(
+        (tmp_path / "tau2_artifact" / name).read_bytes() == raw for name, raw in before.items()
+    )
+    assert run_ab.final_budget(*arms) == healthy

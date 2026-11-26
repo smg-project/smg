@@ -517,7 +517,8 @@ jobs:
           rm -rf -- "$OUT"
           mkdir -p "$OUT"
           copy_failed=0
-          for name in tau2_ab.md tau2_ab.json tau2_expected_tasks.json tau2_transcripts.tgz; do
+          for name in tau2_ab.md tau2_ab.json tau2_expected_tasks.json tau2_transcripts.tgz \
+            scores_vllm.json scores_smg.json; do
             if [ -f "$RUNNER_TEMP/$name" ]; then
               cp -- "$RUNNER_TEMP/$name" "$OUT/" || copy_failed=1
             fi
