@@ -367,12 +367,13 @@ worker labelled `after_reasoning`, whose way into the answer is optional.
 A registration warns once of a worker that names no start, where a
 gateway-shaped grammar reaches it: a worker on the gRPC pipeline, of a role
 that generates tokens, on a runtime whose request carries a constraint. It
-says nothing where the read of a gRPC engine failed: the engine has named
-nothing yet, and the label refresh of the worker's first transition into
-service reads it again. A ZMQ engine names no start at its handshake: its host
-writes what it knows ahead of the handshake, and a gateway writes
-`first_token`. To set the label by hand, put it among the labels of the
-worker's spec:
+says nothing where the read of a gRPC engine found nothing (its connection or
+its model info failed): the engine has named nothing yet, and the label
+refresh of the worker's first transition into service reads it again. A read
+whose server info alone failed keeps the model info and still warns. A ZMQ
+engine names no start at its handshake: its host writes what it knows ahead
+of the handshake, and a gateway writes `first_token`. To set the label by
+hand, put it among the labels of the worker's spec:
 
 ```json
 {"url": "grpc://worker:9000", "labels": {"constrained_decoding_start": "first_token"}}
