@@ -2096,13 +2096,20 @@ impl ExecutionResult {
             }
             Self::Batch { results } if !end.is_empty() => {
                 let shared = SharedEnd::among(end);
+                // Every reader takes its share before a layer is put. A
+                // layer may meet its stream's end where it is put, and a
+                // good end is the batch's only behind every reader's.
+                let streams = results.iter().filter(|result| {
+                    matches!(result, Self::Single { .. } | Self::PrefillDecode { .. })
+                });
+                let mut shares: Vec<_> = streams.map(|_| shared.reader()).collect();
                 for result in results {
                     match result {
                         Self::Single { stream, .. } => {
-                            stream.put_report_layer(RequestEnd::default(), Some(shared.reader()));
+                            stream.put_report_layer(RequestEnd::default(), shares.pop());
                         }
                         Self::PrefillDecode { decode, .. } => {
-                            decode.put_report_layer(RequestEnd::default(), Some(shared.reader()));
+                            decode.put_report_layer(RequestEnd::default(), shares.pop());
                         }
                         // A batch holds the streams of its sub-requests
                         // alone. A result of another kind takes no share

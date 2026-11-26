@@ -1007,6 +1007,34 @@ fn the_last_report_of_a_sides_handles_stands() {
     assert_eq!(host.words(), [("ended", single)]);
 }
 
+/// A side that several readers tell keeps a failure against a good
+/// report behind it, whichever handle reports last. A later failure
+/// writes an earlier one over, and so does a good report a good one.
+#[test]
+fn a_reported_failure_stands_against_a_later_good_report() {
+    const GOOD: TransportClass = TransportClass::Ok;
+    const SERVER: TransportClass = TransportClass::ServerError;
+    let rows: [(&[(u16, TransportClass)], u16); 4] = [
+        (&[(503, SERVER), (200, GOOD)], 503),
+        (&[(200, GOOD), (503, SERVER), (200, GOOD)], 503),
+        (&[(503, SERVER), (504, TransportClass::Timeout)], 504),
+        (&[(200, GOOD), (204, GOOD)], 204),
+    ];
+    for (reports, stands) in rows {
+        let host = Host::of_singles();
+        let mut side = host.single();
+        side.sent();
+        let first = side.side_end();
+        let second = first.clone();
+        for (turn, &(status, class)) in reports.iter().enumerate() {
+            let end = if turn % 2 == 0 { &first } else { &second };
+            end.reported_unless_failed(read(status, class));
+        }
+        drop((side, first, second));
+        assert_eq!(one_end(&host).status, stands, "{reports:?}");
+    }
+}
+
 /// An outcome reported of a side whose send was never said says the
 /// send first, as a placement's own end does, and states a span of
 /// zero.

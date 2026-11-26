@@ -523,8 +523,10 @@ pub(crate) fn accepted_by(
 /// nothing, and a report through it says nothing.
 ///
 /// Where the handle is not empty, the engine hears the request's end once
-/// the guard and every handle are gone: with the status last reported, or
-/// as it heard it before where nobody reported (a client that left).
+/// the guard and every handle are gone. It hears the status last reported,
+/// or the end as it heard it before where nobody reported (a client that
+/// left). A failure reported stands against a good answer reported behind
+/// it: a side several readers tell failed once one of them met a failure.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestEnd(SideEnd);
 
@@ -651,10 +653,11 @@ fn kept_side_end(guard: &WorkerLoadGuard) -> SideEnd {
         .map_or_else(SideEnd::default, |end| end.0.clone())
 }
 
-/// [`RequestEnd::report`] through a handle a stage hears, out of line.
+/// [`RequestEnd::report`] through a handle a stage hears, out of line. No
+/// good answer is written over a failure told on the same side.
 #[inline(never)]
 fn reported(end: &SideEnd, status: u16, answered: bool) {
-    end.reported(Outcome::reported(status, transport_class(status, answered)));
+    end.reported_unless_failed(Outcome::reported(status, transport_class(status, answered)));
 }
 
 /// The class of an end of `status`, the one mapping of the gateway: a

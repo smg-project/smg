@@ -2199,7 +2199,9 @@ async fn parallel_sides_answered(
         Ok(FirstItem::Response) => {
             workers.record_outcome_prefill(sides.ledger, 200);
             // The one place a prefill sent beside its decode is told its
-            // good answer. Its reader tells a failure it meets later.
+            // good answer. Its reader tells a failure it meets later. With
+            // the silence bound off nothing is read here: the side counts
+            // as answered where its call returned, and is told there.
             prefill_guard.end().report(200, || true);
         }
         Ok(FirstItem::Failure | FirstItem::End) => {}
@@ -7179,6 +7181,43 @@ pub(crate) mod tests {
                 "{statuses:?}, read {read:?}"
             );
         }
+    }
+
+    /// A batch's stream may hold its end before its layer is put: a decode
+    /// sent behind its prefill is waited for, and may end with nothing on
+    /// it. The layer meets that end where it is put. Every reader has its
+    /// share by then, so that end is no good end of the batch, and a
+    /// sibling that fails behind it is told.
+    #[tokio::test]
+    async fn a_batchs_stream_that_ended_ahead_of_its_layer_waits_for_its_siblings() {
+        let (heard, guard, end) = heard_request();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://d:30000").build());
+        let (ended, _first) = scripted_stream(Vec::new(), "0").await;
+        let mut ended = ended.tracked_decode_side(worker);
+        assert_eq!(ended.first_response().await, FirstItem::End);
+        let (failing, _second) = scripted_stream(vec![complete(0, "stop")], "13").await;
+        let unit = |stream| ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        };
+        let mut batch = ExecutionResult::Batch {
+            results: vec![unit(ended), unit(failing)],
+        };
+        batch.report_through(end);
+        let ExecutionResult::Batch { results } = &mut batch else {
+            panic!("a batch");
+        };
+        for result in results {
+            let ExecutionResult::Single { stream, .. } = result else {
+                panic!("a single request's result");
+            };
+            while stream.next().await.is_some() {}
+        }
+        drop((batch, guard));
+        assert_eq!(
+            heard_of(&heard),
+            ["issued", "dispatched Single", "completed ServerError 500"]
+        );
     }
 
     /// A failed embedding owes Grand Central the breaker's one sample,

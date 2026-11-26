@@ -224,8 +224,9 @@ impl PrefillLoadGuard {
     ///
     /// A replica asks the same side. It shares the reservation, or it is a
     /// guard of its own that keeps the first one's handle
-    /// ([`Self::replicate`]). A later report writes over an earlier one. A load
-    /// whose guard is gone holds no side and answers the empty handle.
+    /// ([`Self::replicate`]). A later report writes over an earlier one, but
+    /// no good answer over a failure. A load whose guard is gone holds no side
+    /// and answers the empty handle.
     #[inline]
     pub(crate) fn end(&self) -> RequestEnd {
         match self {
@@ -1604,16 +1605,19 @@ mod tests {
     /// Each child of a fan-out or a batch holds a replica of its request's
     /// one prefill load, and every replica asks the one prefill side. It
     /// may share the admission's reservation or be a guard of its own, and
-    /// it may be made of a replica. The last report stands: a child's
-    /// failure stands against the good answer a sibling told ahead of it,
-    /// and a sibling that never answered tells nothing. The side ends once,
-    /// behind the last child's load.
+    /// it may be made of a replica. A child's failure stands against a
+    /// sibling's good answer, told ahead of it or behind it, and a sibling
+    /// that never answered tells nothing. The side ends once, behind the
+    /// last child's load.
     #[tokio::test]
     async fn every_replica_of_a_prefills_load_tells_the_one_side() {
         const NEVER_SENT: &str = "released Decode Abandoned";
-        let orders = [(false, true), (false, false), (true, true), (true, false)];
-        for (admitted, good_first) in orders {
-            let order = format!("admission {admitted}, a good answer first {good_first}");
+        // Where the sibling's good answer is told: ahead of the failure,
+        // behind it, or never.
+        let told = [Some(true), Some(false), None];
+        let orders = [false, true].map(|admitted| told.map(|good_first| (admitted, good_first)));
+        for (admitted, good_first) in orders.into_iter().flatten() {
+            let order = format!("admission {admitted}, a good answer first {good_first:?}");
             let registry = one_pair();
             let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
             let heard = hearing_pair_sides_on(&policies);
@@ -1641,10 +1645,13 @@ mod tests {
             // A reservation is counted once, a guard of its own each time.
             let counted = if admitted { 1 } else { 3 };
             assert_eq!(prefill.load(), counted, "{order}");
-            if good_first {
+            if good_first == Some(true) {
                 load.end().report(200, || true);
             }
             of_a_replica.end().report(503, || true);
+            if good_first == Some(false) {
+                load.end().report(200, || true);
+            }
             drop(load);
             drop(of_a_replica);
             assert_eq!(

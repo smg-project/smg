@@ -2412,6 +2412,9 @@ impl PlacementSide {
 }
 impl SideEnd {
     pub fn reported(&self, outcome: Outcome); // the side ended with this outcome
+    // the same for a side several readers tell: a failure reported before stands against a
+    // good outcome
+    pub fn reported_unless_failed(&self, outcome: Outcome);
     pub fn is_empty(&self) -> bool;           // a report through it reaches nobody
 }
 ```
@@ -2426,6 +2429,9 @@ outcome last reported or, where none was, in the words of a dropped side: a rele
 class cancelled. Into a reported outcome the side writes its own name, the worker that served
 and the span from its dispatch to the report. A host that asks no handle, and a handle dropped
 with no report, change nothing.
+
+A side whose answer several readers tell is reported through `reported_unless_failed`. A failure
+then stands against a good outcome reported behind it.
 
 Under a document none of whose stages takes an end, a handle is empty and costs nothing: no
 allocation and no lock. Under one that does, a side shares its placement with its handles: one
@@ -2637,25 +2643,25 @@ request ──> route (HTTP or gRPC, any family)
 
   The prefill is told through its load. Its dispatch tells a failure where it records one, and
   its good answer once. That is at its drain where it goes out first, and at its first response
-  where both sides go out at once. A reader that meets a failure on the prefill's stream tells
-  it as that reader charges the breaker. A streamed answer tells the engine's own report of a
-  failed request, and a collected answer does not.
+  where both sides go out at once. With the prefill's silence bound off the route reads nothing
+  there: the good answer is told where the call returned, as the breaker samples it.
+
+  A reader that meets a failure on the prefill's stream tells it as that reader charges the
+  breaker. A streamed answer tells the engine's own report of a failed request, and a collected
+  answer does not.
 
   A request of several samples and a batch of prompts place each side once. Every child tells
   the pair's one prefill side: a replica of the prefill's load keeps the handle of the load it
-  was made of. Their decode streams tell one end between them. A side the gateway dropped is
-  told by nobody: the partner of a side that failed first, a decode never sent.
+  was made of. A child's failure stands against a sibling's good answer, whichever is told
+  last. Their decode streams tell one end between them, and each takes its share of that end
+  before any of them is read. A side the gateway dropped is told by nobody: the partner of a
+  side that failed first, a decode never sent.
 
   Three ends of such a pair are told otherwise than the breaker records them. A partner retired
   off the request path is told nothing, while the breaker still takes its late failure. A
   prefill told its good answer keeps it where its reader is dropped: a client that left, a
   decode that failed. A collected answer's failed prefill stream is one charge of its request
   on the breaker, and one end of each attempt for the engine.
-
-  One end is told wrong, by the order a wide request joins its children in. A fan-out or a
-  batch of more than thirty children hands on a child's failure only once every child ahead of
-  it has answered. A sibling's good answer may then be told over the failure, and the prefill
-  side ends well on a request that failed.
 
   A route tells every answer of its workers or none. One route tells no outcome yet
   **[planned]**: the transcription route. A stage hears a request sent there, like an end

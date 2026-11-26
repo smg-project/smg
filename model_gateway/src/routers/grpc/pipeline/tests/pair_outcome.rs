@@ -873,11 +873,10 @@ async fn a_failed_child_of_a_fan_out_or_a_batch_ends_its_side_once() {
 /// A fan-out of more than thirty samples joins its children in their
 /// order: a child's failure waits for every child ahead of it. Here the
 /// last child's prefill is refused at once and the others answer behind
-/// it, so their good answers are told over the failure. The request fails,
-/// and the engine hears its prefill side end well: the one place a pair's
-/// end is told wrong, by the join's order and not by this telling.
+/// it. Their good answers do not write the failure over: the request
+/// fails, and the engine hears its prefill side end with the refusal.
 #[tokio::test]
-async fn a_wide_fan_outs_late_good_answers_stand_over_an_early_failure() {
+async fn a_wide_fan_outs_early_failure_stands_against_late_good_answers() {
     const SAMPLES: usize = 31;
     let prefill = GatedScheduler {
         fail_call: Some(SAMPLES - 1),
@@ -893,7 +892,7 @@ async fn a_wide_fan_outs_late_good_answers_stand_over_an_early_failure() {
     assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         ends_at(&heard, 2).await,
-        [DECODE_DROPPED, "completed Prefill Ok 200"]
+        [DECODE_DROPPED, "completed Prefill ServerError 503"]
     );
 }
 
