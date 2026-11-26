@@ -4591,11 +4591,11 @@ const _: () = {
 
 /// What a binding's sessions rule reads for a decision of `phase` beyond
 /// its profile's stages: the key under the view's headers, and the per-key
-/// counts its assignment and cap compare; the validator's summary, per
-/// binding. Nothing for the encode side of the `epd` plan: there a rule
-/// places the pair's two sides and no item, which goes by its content. A
-/// single binding's rule places a request of every phase it covers, an
-/// encode request among them.
+/// counts its assignment and cap compare. It is the validator's summary,
+/// per binding. Nothing for the encode side of the `epd` plan: there a rule
+/// places the pair's two sides and no item, which goes by its side's
+/// policy. A single binding's rule places a request of every phase it
+/// covers, an encode request among them.
 fn session_needs(binding: &Binding, phase: Phase) -> Needs {
     let item = phase == Phase::Encode && matches!(binding.plan, Plan::Epd { .. });
     binding

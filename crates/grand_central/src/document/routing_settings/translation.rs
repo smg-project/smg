@@ -202,9 +202,9 @@ pub(super) fn both_families(
 /// A setting with no document under three sides leaves the plan where it
 /// is written, as one manual side of the pair's two does.
 ///
-/// The manual policy on both sides of the pair is planned: its rule places
+/// The manual policy on both sides of the pair is planned. Its rule places
 /// the pair's two sides, each by its own session, and the encode side
-/// places an item by its content.
+/// places an item by its own policy.
 pub(super) fn three_sided(
     config: &RoutingSettings,
 ) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
@@ -416,17 +416,17 @@ pub(super) fn written_with<'a>(
                         policy: policy.name(),
                         part: "profile",
                     })?;
-            // The encode side places an item by the item's content: it reads
-            // no key, the override never places it and no session rule does.
-            // So the manual policy is no encode side's, as the gateway's own
-            // check holds (`validate_encode_policy`,
-            // `model_gateway/src/config/validation.rs:319-328`).
+            // The encode side places an item by its own policy: it reads no
+            // key of the request's, the override never places it and no
+            // session rule does. So the manual policy is no encode side's, as
+            // the gateway's own check holds: `validate_encode_policy`
+            // (`model_gateway/src/config/validation.rs`).
             if side == ENCODE_SIDE {
                 if matches!(policy, PolicySettings::Manual { .. }) {
                     return Err(unsupported(
                         "encode_policy",
                         policy.name(),
-                        "a session rule places no item: an item goes to its encoder by its content",
+                        "a session rule places no item: an item goes to its encoder by its side's policy",
                     ));
                 }
                 shared.bound.encode_side = true;
@@ -1018,7 +1018,7 @@ impl Bound {
             return Err(unsupported(
                 "policy",
                 "manual",
-                "the manual policy places by the binding's one session rule, so every side of a plan is manual or none is",
+                "the manual policy places by the binding's one session rule, so both sides of a pair are manual or neither is",
             ));
         }
         let key = one_list(self.keys)?.ok_or(RoutingSettingsError::NoPart {

@@ -5175,10 +5175,10 @@ const UNTOLD_ON_FILE: &str =
 /// in flight, as a single's do.
 ///
 /// Under the `epd` plan the rule runs on the pair's two sides, each by its
-/// own session, and places no item: an item goes to its encoder by its
-/// content. It is in the build of a host that makes the lifecycle's calls,
+/// own session, and places no item. An item goes by its side's policy.
+/// The rule is in the build of a host that makes the lifecycle's calls,
 /// under either word. The build of a host that makes some only refuses it
-/// by the plan's name, with a cap or with none: the rule is not in that
+/// by the plan's name, with a cap or with none. The rule is not in that
 /// build at all, and an encode request's frame names no count of a key's
 /// requests on its rows.
 fn session_rule(

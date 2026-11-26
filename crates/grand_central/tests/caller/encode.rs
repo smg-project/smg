@@ -302,17 +302,22 @@ fn manual() -> PolicySettings {
 /// with no key go to a lighter worker on each side. An item goes to its
 /// encoder by its content, whatever the request's key.
 ///
-/// The classic router's `manual` policy keeps a key's worker under the role
-/// it is asked for, and places a key it has not seen, and a request with no
-/// key, by the configured assignment
-/// (`model_gateway/src/policies/manual.rs:381-402`, `:228-236`). Its
-/// three-sided selection asks those two policies for the pair
-/// (`worker_selection.rs:2660`), and places each item under the encode
-/// policy by its content's hash, with no key of the request's
-/// (`:2785-2808`). Its own check starts the mode under that policy on the
-/// prefill and the decode side, and on no encode side
-/// (`model_gateway/src/config/validation.rs:1001-1010`, `:319-328`). The
-/// lines are main's at `13f5cbe29`.
+/// The classic router's manual policy keeps a key's worker under the role
+/// it is asked for: `select_worker_impl`
+/// (`model_gateway/src/policies/manual.rs`). It places a key it has not
+/// seen, and a request with no key, by the configured assignment:
+/// `select_new_worker`, in the same file.
+///
+/// The classic router's three-sided selection asks the prefill's and the
+/// decode's policy for the pair: `placed_encode_prefill_decode_workers`
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`). It
+/// places each item under the encode policy by its content's hash, with no
+/// key of the request's: `assign_encode_workers`, in the same file.
+///
+/// The classic router's configuration check starts the mode under the
+/// manual policy on the prefill and the decode side, and on no encode side:
+/// `validate_mode` and `validate_encode_policy`
+/// (`model_gateway/src/config/validation.rs`).
 #[test]
 fn the_manual_policy_places_an_encode_requests_pair_by_its_key() {
     let fleet = fleet(3, 3, 3);
