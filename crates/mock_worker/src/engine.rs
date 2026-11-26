@@ -1403,7 +1403,9 @@ impl Engine {
     /// failure, or a cut when it names a token count), then the admission
     /// delay and rate. `Ok(true)` when the fault asks for a `finish=error`
     /// completion, counted as a cut; `Err` is the status to answer. The
-    /// engine never runs the prompt: nothing is admitted, no record is left.
+    /// engine runs no prompt here: nothing is admitted, no record is left
+    /// (a prefill worker under `--prefill-engine` submits its prompt after
+    /// these hooks).
     pub(crate) async fn admit_without_tokens(&self) -> Result<bool, u16> {
         let mut finish_error = false;
         if let Some(fault) = self.inject() {
