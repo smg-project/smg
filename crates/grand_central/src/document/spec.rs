@@ -589,7 +589,11 @@ pub struct IndexSpec {
     /// the engine's upkeep.
     #[schemars(range(min = 1))]
     pub max_size: u64,
-    /// The index's sweep cadence, in seconds.
+    /// The index's sweep cadence, in seconds. At each sweep the gateway trims
+    /// each tree of a model, by itself, toward `max_size`, and writes take a
+    /// tree past it until the next. At `4294967295` it starts no sweep: a
+    /// tree under such an entry is held to no size. The engine's record
+    /// keeps its bound at any cadence.
     #[schemars(range(min = 1))]
     pub sweep_s: u32,
 }

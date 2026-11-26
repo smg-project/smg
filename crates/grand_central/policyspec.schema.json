@@ -170,7 +170,7 @@
           "default": 67108864
         },
         "sweep_s": {
-          "description": "The index's sweep cadence, in seconds.",
+          "description": "The index's sweep cadence, in seconds. At each sweep the gateway trims\neach tree of a model, by itself, toward `max_size`, and writes take a\ntree past it until the next. At `4294967295` it starts no sweep: a\ntree under such an entry is held to no size. The engine's record\nkeeps its bound at any cadence.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
