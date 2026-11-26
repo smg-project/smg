@@ -142,11 +142,15 @@ pub struct KvAdapter {
     /// The rows the streams write: a row's stream and a stream's rows,
     /// which move together under this one lock.
     rows: Mutex<Rows>,
-    /// What the streams said of their models' block sizes.
-    sizes: Mutex<Sizes>,
-    /// The URL each open feed's worker is named by in the cache-event
-    /// series, by the feed's own row.
-    urls: Mutex<HashMap<WorkerId, Arc<str>>>,
+    /// What the streams said of their models' block sizes: the widest
+    /// block each model's stored blocks named, the engine's word, which
+    /// only rises. A learning and a model's departure hold it through
+    /// their calls of the tables.
+    sizes: Mutex<HashMap<Arc<str>, u32>>,
+    /// What each open feed was opened with, by the feed's own row. Taken
+    /// alone, or under `sizes` by a learning that asks whether its feed
+    /// still stands: never ahead of `sizes`.
+    feeds: Mutex<HashMap<WorkerId, Arc<Feed>>>,
     /// Where the ranks of an engine stand, where a host handed its holder.
     ranks: Option<Arc<dyn Ranks>>,
     tables: Arc<KvTables>,
@@ -334,22 +338,22 @@ impl<G: Generation> Ranks for Objects<G> {
     }
 }
 
-/// What the adapter keeps to name a model's block size from its streams.
-#[derive(Default)]
-struct Sizes {
-    /// The model each open row streams for.
-    models: HashMap<WorkerId, Arc<str>>,
-    /// The widest block a model's stored blocks named: the engine's word,
-    /// which only rises.
-    named: HashMap<Arc<str>, u32>,
+/// What a feed was opened with: one record, kept from its opening until
+/// its row's removal is told.
+struct Feed {
+    /// The model the feed's rows stream for: their stored blocks name its
+    /// block size.
+    model: Arc<str>,
+    /// The URL the feed's worker is named by in the cache-event series.
+    url: Box<str>,
 }
 
 impl KvAdapter {
     fn over(tables: Arc<KvTables>, ranks: Option<Arc<dyn Ranks>>) -> Self {
         Self {
             rows: Mutex::new(Rows::default()),
-            sizes: Mutex::new(Sizes::default()),
-            urls: Mutex::new(HashMap::new()),
+            sizes: Mutex::new(HashMap::new()),
+            feeds: Mutex::new(HashMap::new()),
             ranks,
             tables,
         }
@@ -505,17 +509,46 @@ impl KvAdapter {
         });
     }
 
-    /// A row `id`'s stream writes holds a block of record of `size` tokens:
-    /// what it says of the block size of the model the row streams for, by
-    /// the module's rule. A row no feed was opened for names no model.
-    fn learn(&self, id: WorkerId, size: u32) {
+    /// A feed opened for `row`, its own row: its stored blocks name
+    /// `model`'s block size, and its series go under `url`, its worker's.
+    /// The record stands until the row's removal is told: a collector
+    /// dropped with the stream open tells none, and the record stays.
+    fn opened(&self, row: WorkerId, model: &str, url: &str) {
+        let feed = Feed {
+            model: Arc::from(model),
+            url: Box::from(url),
+        };
+        self.feeds.lock().insert(row, Arc::new(feed));
+    }
+
+    /// The last events subscription of `model` ended: the engine's word
+    /// for it goes, and the tables' size of record with it, so a model
+    /// that returns names its size anew. Both go in one hold of the lock a
+    /// learning holds: a row that learns beside the departure writes ahead
+    /// of both removals or behind both, and behind them only where its
+    /// feed still stands ([`Self::learn`]).
+    fn model_left(&self, model: &str) {
+        let mut sizes = self.sizes.lock();
+        sizes.remove(model);
+        self.tables.forget_block_size(model);
+    }
+
+    /// A row of `feed`, the feed its batch found open for `row`, holds a
+    /// block of record of `size` tokens: what it says of the model's block
+    /// size, by the module's rule. A feed that is no longer `row`'s names
+    /// no size: its stream left behind the batch's start, and its model's
+    /// departure may have cleared the size since.
+    fn learn(&self, row: WorkerId, feed: &Arc<Feed>, size: u32) {
         // Held through the tables' calls: two rows of one model learn in turn.
         let mut sizes = self.sizes.lock();
-        let Sizes { models, named } = &mut *sizes;
-        let Some(model) = models.get(&id) else {
+        // Read under that hold, so a departure behind the stream's removal
+        // finds this write done or never made.
+        let stands = |held: &Arc<Feed>| Arc::ptr_eq(held, feed);
+        if !self.feeds.lock().get(&row).is_some_and(stands) {
             return;
-        };
-        let last = named.get(model).copied();
+        }
+        let model = &feed.model;
+        let last = sizes.get(model).copied();
         let word = last.map_or(size, |last| last.max(size));
         let of_record = self.tables.block_size(model);
         if of_record != Some(word) {
@@ -534,7 +567,7 @@ impl KvAdapter {
             );
         }
         if last != Some(word) {
-            named.insert(Arc::clone(model), word);
+            sizes.insert(Arc::clone(model), word);
         }
     }
 }
@@ -558,8 +591,10 @@ impl KvEventSink for KvAdapter {
         let Some((applied, kept)) = self.applied(id, row) else {
             return BatchOutcome::Skipped;
         };
-        // The stream's worker, as its series name it.
-        let url = self.urls.lock().get(&id).cloned();
+        // The stream's feed: its worker as its series name it, and the
+        // model its stores name a size for.
+        let feed = self.feeds.lock().get(&id).cloned();
+        let url = feed.as_deref().map(|feed| &*feed.url);
         let snapshot = facts.snapshot.is_some();
         // A batch that carries a store names the model's block size.
         let stores = batch
@@ -591,7 +626,7 @@ impl KvEventSink for KvAdapter {
             let worker = lane.worker();
             {
                 let lending = Lending::new(lane, state);
-                took = match &url {
+                took = match url {
                     // Applied and accounted for under the worker's name.
                     Some(url) => {
                         let (op, disposition) = if snapshot {
@@ -625,10 +660,12 @@ impl KvEventSink for KvAdapter {
                 if !kept {
                     self.keep(id, applied);
                 }
-                if let Some(width) = record.filter(|_| stores) {
-                    self.learn(id, width);
+                // A row no feed was opened for names no model, and neither
+                // does one whose feed left since the batch began.
+                if let (Some(feed), Some(width)) = (&feed, record.filter(|_| stores)) {
+                    self.learn(id, feed, width);
                 }
-                if let Some(url) = &url {
+                if let Some(url) = url {
                     // A live batch's duration is the stream's pace. A
                     // snapshot chunk publishes none.
                     if let Some(took) = took.filter(|_| !snapshot) {
@@ -641,13 +678,13 @@ impl KvEventSink for KvAdapter {
                 // A batch behind its lane's cursor. A row with no lane
                 // skips every batch and counts none.
                 let behind = || self.tables.cursor(row, rank).is_some();
-                if let Some(url) = url.as_ref().filter(|_| behind()) {
+                if let Some(url) = url.filter(|_| behind()) {
                     Metrics::record_kv_event_batch(url, "stale");
                 }
             }
             BatchOutcome::Gap { .. } => {
                 // The collector asks the publisher to replay from here.
-                if let Some(url) = &url {
+                if let Some(url) = url {
                     Metrics::record_kv_event_gap(url, "replay_requested", 0);
                 }
             }
@@ -662,8 +699,8 @@ impl KvEventSink for KvAdapter {
     }
 
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
-        if let Some(url) = self.urls.lock().get(&id) {
-            Metrics::record_kv_event_resync(url, reason.as_str());
+        if let Some(feed) = self.feeds.lock().get(&id) {
+            Metrics::record_kv_event_resync(&feed.url, reason.as_str());
         }
         match rank {
             // One rank's reset is its own row's, and a rank with no row
@@ -689,8 +726,7 @@ impl KvEventSink for KvAdapter {
     }
 
     fn removed(&self, id: WorkerId) {
-        self.sizes.lock().models.remove(&id);
-        self.urls.lock().remove(&id);
+        self.feeds.lock().remove(&id);
         // What the stream still writes goes with it, since no stream feeds
         // it now: the rows of other ranks, and its own unless another
         // stream took it. Each is marked in the one hold that reads the
@@ -852,11 +888,7 @@ where
         });
         match ticket {
             Ok(row) => {
-                // The model the row's stored blocks name a size for.
-                self.sink.sizes.lock().models.insert(row, Arc::from(model));
-                // The name the stream's series go under.
-                let url = Arc::from(worker.url());
-                self.sink.urls.lock().insert(row, url);
+                self.sink.opened(row, model, worker.url());
                 Some((Arc::clone(&self.sink), row))
             }
             Err(SkipReason::NoRow) => {
@@ -879,8 +911,7 @@ where
     }
 
     fn model_left(&self, model: &str) {
-        self.sink.sizes.lock().named.remove(model);
-        self.sink.tables.forget_block_size(model);
+        self.sink.model_left(model);
     }
 }
 
