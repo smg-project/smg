@@ -485,6 +485,17 @@ pub(crate) trait TagForStart: fmt::Debug + Send + Sync {
     /// engine's own, serialized only when a request takes it; `None` where
     /// no tag leaves the request unconstrained (the `auto` tag).
     fn schema(&self) -> Option<&serde_json::Value>;
+
+    /// Whether the engine's request says its grammar starts at the first
+    /// generated token, for an engine whose label names `start`, given
+    /// whether the table gave that engine a tag (`tagged`): a tag built for
+    /// a label that names the first token. A JSON answer that starts at once
+    /// whatever the label says (a table whose template leaves the thought to
+    /// the model, on a prompt that opened none) says so with its tag and
+    /// with the request's own schema alike.
+    fn starts_at_first_token(&self, start: GrammarStart, tagged: bool) -> bool {
+        tagged && start == GrammarStart::FirstToken
+    }
 }
 
 /// A request's tool constraint as each attempt's worker must take it. Request
@@ -505,8 +516,10 @@ pub(crate) enum ToolConstraintStamp {
         /// The configured tool parser the shaping reads its reasoning prefix from.
         parser: Option<String>,
         /// The table built the tag for an engine that starts the grammar at
-        /// the first token: the shaping leaves such a tag as it is, so every
-        /// retry says so with it (`regular::symphony::Prepared::Constraint`).
+        /// the first token, or, where its template leaves the thought to the
+        /// model, for the first token of a prompt that opened none: the
+        /// shaping leaves such a tag as it is, so every retry says so with
+        /// it (`regular::symphony::Prepared::Constraint`).
         first_token: bool,
     },
     /// The table's tag the selected worker took, shaped for where its engine
@@ -623,7 +636,7 @@ impl ToolConstraintStamp {
                 let shaped = tag
                     .tag_for(decoding.start, decoding.vocabulary)
                     .map_err(failed)?;
-                let first_token = shaped.is_some() && decoding.start == GrammarStart::FirstToken;
+                let first_token = tag.starts_at_first_token(decoding.start, shaped.is_some());
                 match (shaped, tag.schema()) {
                     // A JSON answer's: the tag, or the request's own schema
                     // where the table gives this worker none, the one in the

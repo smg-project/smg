@@ -51,11 +51,16 @@ the prompt left open on its way to the calls, whichever that was.
 
 With the prompt's reasoning closed and the thought left to the model, which a table says with two
 rows from the turn's own state, one opening the thought and one closing an empty one (MiniMax M3's;
-its generation prompt adds no opener), the tag admits first what the model would write: the thought, its text free of the table's markers, and its close;
-or the bare close the turn's start also has a row for, which the model writes for an empty
-thought; or nothing. Then the calls. A forced call is written at once, so without this the tag
-would take the thought away, and the model, held to the call from its first token, answers worse
-than it reasons.
+its generation prompt adds no opener), a call or an answer the request owes is written at once: the
+tag holds a thought only where the prompt opened one. A tag that offered the thought first held the
+model to it, and a model that never closed it spent its tokens there and never wrote the call; a
+request that wants the thought asks for it, and the prompt then opens it. The table says the
+property itself (`Format::leaves_the_thought_to_the_model`), and whoever sends what such a request
+owes starts the grammar at the first generated token on a prompt that opened no thought, whatever
+the engine says of where it starts one. Under `auto` nothing is owed, and the tag admits first
+what the model would write: the thought, its text free of the table's markers, and its close; or
+the bare close the turn's start also has a row for, which the model writes for an empty thought;
+or nothing. Then the calls.
 
 Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 trigger inside whatever message the model is writing. Mistral's named arguments take a tag per tool

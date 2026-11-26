@@ -11,10 +11,10 @@
 //! right before the trigger: a forced call's tag is written at once, so the separator the model
 //! writes first has to be the tag's own, while the block without it, which the grammar forced
 //! until now and which the table reads as well since it drops the separator wherever it stands,
-//! stays valid. What precedes that (the model's thought, or the bare close of an empty one, when
-//! the prompt leaves the thought to the model; the free text that closes a thought the prompt
-//! left open) is the table's ([`Format::grammar`](crate::Format::grammar)), the same under every
-//! syntax.
+//! stays valid. What precedes that (the free text that closes a thought the prompt left open;
+//! under `auto`, the model's thought, or the bare close of an empty one, when the prompt leaves
+//! the thought to the model) is the table's ([`Format::grammar`](crate::Format::grammar)), the
+//! same under every syntax.
 //!
 //! A value follows the property's type as the template writes it and the XML assembler reads it
 //! ([`tagged::xml`](crate::tagged::xml)): a string as it is, any text that holds neither the
@@ -478,8 +478,8 @@ mod tests {
         ]})
     }
 
-    /// What the tag admits before the block when the prompt leaves the thought to the model: the
-    /// thought, or the bare close of an empty one, or nothing.
+    /// What the `auto` tag admits before the block when the prompt leaves the thought to the
+    /// model: the thought, or the bare close of an empty one, or nothing.
     fn thought_first() -> Value {
         value!({"type": "optional", "content": {"type": "or", "elements": [
             {
@@ -516,7 +516,7 @@ mod tests {
             .grammar(tools, true, false)
             .expect("a grammar")
             .payload();
-        payload["format"]["elements"][1]["elements"][1]["tags"][0]["content"]["tags"][0].clone()
+        payload["format"]["elements"][1]["tags"][0]["content"]["tags"][0].clone()
     }
 
     #[test]
@@ -558,7 +558,7 @@ mod tests {
         });
         assert_eq!(
             payload,
-            value!({"format": {"type": "sequence", "elements": [thought_first(), block_of(value!({
+            value!({"format": block_of(value!({
                 "type": "triggered_tags",
                 "triggers": ["<tool_call>"],
                 "tags": [{
@@ -573,7 +573,7 @@ mod tests {
                     "end": format!("{SEP}</tool_call>"),
                 }],
                 "at_least_one": true,
-            }))]}})
+            }))})
         );
     }
 
@@ -696,22 +696,19 @@ mod tests {
     }
 
     #[test]
-    fn the_thought_open_takes_the_prefix_and_closed_admits_the_models_thought_first() {
-        // The prompt that leaves the thought to the model (the template's default): the thought,
-        // or the bare close of an empty one, or nothing, then the block, which a forced call
-        // writes at once. The prompt that opened the thought: free text that writes neither a
+    fn the_thought_open_takes_the_prefix_and_only_the_auto_tag_admits_the_models_thought_first() {
+        // The prompt that leaves the thought to the model (the template's default): a forced
+        // call is the block alone, written at once, since the tag holds a thought only where the
+        // prompt opened one. The prompt that opened the thought: free text that writes neither a
         // call marker nor the separator but may close the thought, nothing owed at its end, then
-        // the block as it is.
+        // the block as it is. Under `auto` nothing is owed, and the thought, or the bare close of
+        // an empty one, or nothing, stands before the block.
         let tools = weather_tools();
         let closed = formats::minimax_m3()
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
-        let block = closed["format"]["elements"][1].clone();
-        assert_eq!(
-            closed["format"],
-            value!({"type": "sequence", "elements": [thought_first(), block]})
-        );
+        let block = closed["format"].clone();
         assert_eq!(block, block_of(block["elements"][1].clone()));
         let triggered = &block["elements"][1];
         assert_eq!(triggered["type"], "triggered_tags");

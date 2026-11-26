@@ -550,7 +550,9 @@ impl ProtoGenerateRequest {
 
     /// Say whether the request's grammar starts at the first generated token
     /// whatever reasoning parser the engine runs: the gateway led it with the
-    /// model's thought and its close for a worker whose grammar starts there
+    /// model's thought and its close for a worker whose grammar starts there,
+    /// or the request owes a forced call or a JSON answer of a table whose
+    /// template leaves the thought to the model, on a prompt that opened none
     /// (`SamplingParams.grammar_from_first_token`). Only the dialect with a
     /// request-side switch for the gate behind its parser carries it; the
     /// others start every grammar where their engine does.

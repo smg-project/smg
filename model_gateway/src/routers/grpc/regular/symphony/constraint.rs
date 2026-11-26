@@ -122,10 +122,36 @@ pub(super) fn tagged(
     }
 }
 
+/// Where the engine starts the grammar of what a request owes (a forced call, a JSON answer): where
+/// the workers' label says (`start`), but for a table whose template leaves the thought to the
+/// model ([`Format::leaves_the_thought_to_the_model`]) on a prompt that leaves the model outside
+/// its thought (no marker, or the thought closed): the first generated token there, whatever
+/// the label says. The tag built for that start holds no thought and owes no text after a close
+/// nobody read, and the engine's request says its grammar starts there
+/// ([`WorkerConstraint::first_token`]). An engine that reads such a prompt as an open thought
+/// would otherwise hold the grammar back, and the model, free until it closed a thought, could
+/// spend its tokens there and never write what the request owes. Every other table, and a
+/// prompt inside the thought, start where the label says, as before.
+fn owed_start(format: &Format, reasoning_open: bool, start: GrammarStart) -> GrammarStart {
+    if owed_at_once(format, reasoning_open) {
+        GrammarStart::FirstToken
+    } else {
+        start
+    }
+}
+
+/// What a request owes starts at the first generated token whatever the workers' label says
+/// ([`owed_start`]): the table leaves the thought to the model and the prompt opened none.
+fn owed_at_once(format: &Format, reasoning_open: bool) -> bool {
+    !reasoning_open && format.leaves_the_thought_to_the_model()
+}
+
 /// The tag of a forced call to one of `tools`, at most one when `one_call`, with
 /// `reasoning_open` when the prompt leaves the model inside its thought and `thought_closed` when
 /// it closed the thought itself and wrote the template's text after it, in the `vocabulary` the
-/// worker's grammar compiler takes ([`tagged`]). A registry table's tag that opens with free
+/// worker's grammar compiler takes ([`tagged`]), built for where the engine starts it
+/// ([`owed_start`]: `start`, or the first token for a table that leaves the thought to the
+/// model on a prompt that opened none). A registry table's tag that opens with free
 /// text, the prefix an open thought takes on workers that name no one start for the grammar
 /// ([`opens_with_free_text`]), comes marked ([`Prepared::OpensWithFreeText`]): text that owes
 /// nothing at its end does not hold the model to the call, so preparation gives the call's
@@ -147,6 +173,7 @@ fn calls_tag(
     vocabulary: TagVocabulary,
     continues: bool,
 ) -> PreparedConstraint {
+    let start = owed_start(format, reasoning_open, start);
     let grammar = format.grammar_for(
         tools,
         Options {
@@ -293,6 +320,7 @@ fn answer_tag(
     vocabulary: TagVocabulary,
     continues: bool,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
+    let start = owed_start(format, reasoning_open, start);
     let grammar = format.answer_grammar_for(schema, reasoning_open, start);
     if !compiled && (continues || matches!(grammar, Some(Grammar::JsonSchema { .. }))) {
         return Ok(None);
@@ -945,7 +973,9 @@ pub(crate) enum Prepared {
     Constraint {
         constraint: ToolConstraint,
         /// The table built it for an engine that starts the grammar at the first token (the
-        /// thought, closed, ahead of the calls), the start the model's workers name together.
+        /// thought, closed, ahead of the calls), the start the model's workers name together, or,
+        /// where its template leaves the thought to the model, for the first token of a prompt
+        /// that opened none, whatever the workers name ([`owed_start`]).
         /// One no table built is shaped for the worker at request building, which says then
         /// whether it led the tag; here it is `false` ([`WorkerConstraint::first_token`]).
         first_token: bool,
@@ -1087,6 +1117,14 @@ impl TagForStart for AnswerTag {
             .map_err(String::from)
     }
 
+    /// The answer is owed: where it starts at once ([`owed_at_once`]) the engine's request says
+    /// so whatever the label says, with the tag and with the request's own schema where the
+    /// answer is the schema alone (`tagged` false); elsewhere the label decides for a tag.
+    fn starts_at_first_token(&self, start: WorkerGrammarStart, tagged: bool) -> bool {
+        owed_at_once(&self.format, self.reasoning_open)
+            || (tagged && start == WorkerGrammarStart::FirstToken)
+    }
+
     fn schema(&self) -> Option<&Value> {
         Some(self.schema.as_ref())
     }
@@ -1130,8 +1168,11 @@ pub(crate) struct WorkerConstraint {
     pub table_tag: Option<Arc<dyn TagForStart>>,
     /// The constraint is shaped for an engine that starts the grammar at the first generated
     /// token: the whole turn's grammar, a tag derived for [`GrammarStart::FirstToken`] (the
-    /// thought, closed, ahead of the answer or the calls), or the table's forced-call tag built
-    /// for a pool that starts there ([`Prepared::Constraint`]). The engine's request says so
+    /// thought, closed, ahead of the answer or the calls), the table's forced-call tag built
+    /// for a pool that starts there ([`Prepared::Constraint`]), or a forced call or a JSON
+    /// answer of a table that leaves the thought to the model on a prompt that opened none,
+    /// which starts there whatever the label says ([`owed_start`]), the answer also where it is
+    /// the request's own schema alone. The engine's request says so
     /// where its dialect has a switch for the gate behind a reasoning parser, so an engine that
     /// gates its grammars there starts this one at once; a constraint shaped for another start,
     /// or none, starts where the engine does. Never a constraint no table built: request
@@ -1326,7 +1367,10 @@ pub(crate) fn worker_constraint(
         }
         Prepared::Answer(answer) => {
             let tag = answer.for_start(start, vocabulary)?;
-            let first_token = derived_for_first_token(&tag);
+            // An answer that starts at once says so whatever the worker's label says, with its
+            // tag or with the request's own schema where it is the schema alone
+            // ([`owed_at_once`]); elsewhere the label decides for a tag.
+            let first_token = answer.starts_at_first_token(decoding.start, tag.is_some());
             let table = tag.is_some();
             (
                 tag,
@@ -2316,9 +2360,9 @@ mod tests {
     /// a message of its own (Inkling's), the tag admits it first and leaves the way into the
     /// answer to the engine unless it says it starts at the first token. A table whose output
     /// starts in content takes the tag with the thought's close before the schema when the prompt
-    /// leaves the thought open, and with the thought the model may write first where its table
-    /// admits one (MiniMax M3's); a table with no answer state and a prompt that continues the
-    /// assistant's message keep the engine's schema.
+    /// leaves the thought open, and holds no thought the prompt did not open where its table
+    /// leaves the thought to the model (MiniMax M3's: the schema alone); a table with no answer
+    /// state and a prompt that continues the assistant's message keep the engine's schema.
     #[test]
     fn a_json_response_format_takes_the_tables_answer_tag_unless_it_is_the_schema_alone() {
         let schema = json!({
@@ -2442,26 +2486,16 @@ mod tests {
         assert!(answer(&ModelNames::default(), content_first, true)
             .expect("read")
             .is_none());
-        // A table that admits a thought before its answer (MiniMax M3's) keeps that tag with the
-        // thought closed: the thought the model may write first, then the schema.
-        let thought_first = tag_of(answer(
+        // A table that leaves the thought to the model (MiniMax M3's) holds none before an answer
+        // the request owes on a prompt that opened none: the schema alone, the engine's own
+        // constraint, as for a table whose output starts in content.
+        assert!(answer(
             &ModelNames::default(),
             json!({"model": "MiniMaxAI/MiniMax-M3", "response_format": {"type": "json_object"}}),
             false,
-        ));
-        assert_eq!(
-            thought_first["format"]["type"], "sequence",
-            "{thought_first}"
-        );
-        assert_eq!(
-            thought_first["format"]["elements"][0]["type"], "optional",
-            "{thought_first}"
-        );
-        assert_eq!(
-            thought_first["format"]["elements"][1],
-            json!({"type": "json_schema", "json_schema": {"type": "object"}}),
-            "{thought_first}"
-        );
+        )
+        .expect("read")
+        .is_none());
         // No answer state (xLAM's list), a continued assistant message, or no JSON asked: the
         // engine's schema, or nothing.
         assert!(answer(
@@ -2486,6 +2520,232 @@ mod tests {
         )
         .expect("read")
         .is_none());
+    }
+
+    /// A JSON answer of a table whose template leaves the thought to the model (MiniMax M3's),
+    /// on a prompt that opened no thought, starts at the first token whatever the worker's label
+    /// says: the answer is the schema alone, the request's own, and the decision says the
+    /// engine's request starts it there, for the first attempt and for the worker a retry
+    /// takes. Inside the thought, and for every other table (Muse Spark's), the label decides
+    /// for a tag, as before.
+    #[test]
+    fn a_json_answer_starts_at_once_only_where_the_table_leaves_the_thought_to_the_model() {
+        use openai_protocol::worker::{
+            ConstrainedDecoding::Requested,
+            GrammarStart::{AfterReasoning, FirstToken, Unknown},
+        };
+        let muse = names(Some("muse_spark"), Some("muse_spark"));
+        let registry = ModelNames::default();
+        let decided = |leaves: bool, reasoning_open: bool, start: WorkerGrammarStart| {
+            let (table_names, model) = if leaves {
+                (&registry, "MiniMaxAI/MiniMax-M3")
+            } else {
+                (&muse, "muse-spark")
+            };
+            let prepared = super::constraint(
+                ParserChoice::Symphony,
+                table_names,
+                Asks::Chat(&request(json!({
+                    "model": model, "response_format": {"type": "json_object"}
+                }))),
+                &[],
+                reasoning_open,
+                false,
+                symphony::GrammarStart::Unknown,
+                TagVocabulary::Current,
+                &templates(),
+            );
+            worker_constraint(
+                WorkerDecoding {
+                    policy: Requested,
+                    start,
+                    vocabulary: TagVocabulary::Current,
+                },
+                prepared,
+                || Ok(None),
+                || -> AutoTag { panic!("the request asks: no auto tag") },
+            )
+            .expect("decided")
+        };
+        for start in [FirstToken, AfterReasoning, Unknown] {
+            let at_once = decided(true, false, start);
+            assert!(at_once.constraint.is_none(), "{start:?}: the schema alone");
+            assert!(at_once.first_token, "{start:?}: the request says so");
+            let retry = at_once.table_tag.as_ref().expect("the answer derives");
+            assert!(
+                retry.starts_at_first_token(start, false),
+                "{start:?}: a retry says so"
+            );
+        }
+        for (leaves, reasoning_open) in [(true, true), (false, false), (false, true)] {
+            for start in [FirstToken, AfterReasoning, Unknown] {
+                let cell = format!("{start:?}, leaves {leaves}, open {reasoning_open}");
+                let decided = decided(leaves, reasoning_open, start);
+                let tagged = decided.constraint.is_some();
+                assert_eq!(
+                    decided.first_token,
+                    tagged && start == FirstToken,
+                    "{cell}: the label decides"
+                );
+                let retry = decided.table_tag.as_ref().expect("the answer derives");
+                assert_eq!(
+                    retry.starts_at_first_token(start, tagged),
+                    tagged && start == FirstToken,
+                    "{cell}: on a retry too"
+                );
+            }
+        }
+    }
+
+    /// The reach of the rule, over every registry table: what a request owes starts at the
+    /// first token whatever the workers' label says only for a table whose template leaves the
+    /// thought to the model, on a prompt that opened no thought; every other table, and a
+    /// prompt inside the thought, take the tag built for the label and say the first token
+    /// where the label does. The test prints the tables the rule reaches.
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "the tables the rule reaches are the output"
+    )]
+    fn what_is_owed_starts_at_once_only_for_a_table_that_leaves_the_thought_to_the_model() {
+        use symphony::GrammarStart::{AfterReasoning, FirstToken, Unknown};
+        let tools = tools();
+        let schema = Arc::new(json!({"type": "object"}));
+        let mut reached = Vec::new();
+        for table in symphony::formats::Table::ALL {
+            let format = table.format();
+            let leaves = format.leaves_the_thought_to_the_model();
+            if leaves {
+                reached.push(table.name().to_string());
+            }
+            for (reasoning_open, thought_closed) in [(false, false), (false, true), (true, false)] {
+                for (start, label) in [
+                    (AfterReasoning, WorkerGrammarStart::AfterReasoning),
+                    (FirstToken, WorkerGrammarStart::FirstToken),
+                    (Unknown, WorkerGrammarStart::Unknown),
+                ] {
+                    let built_for = if leaves && !reasoning_open {
+                        FirstToken
+                    } else {
+                        start
+                    };
+                    let cell = format!(
+                        "{}, open {reasoning_open}, closed {thought_closed}, {start:?}",
+                        table.name()
+                    );
+                    for one_call in [true, false] {
+                        let expected = tagged(
+                            format.grammar_for(
+                                &tools,
+                                Options {
+                                    at_least_one: true,
+                                    reasoning_open,
+                                    thought_closed,
+                                    one_call,
+                                    start: built_for,
+                                },
+                            ),
+                            TagVocabulary::Current,
+                            false,
+                            "m",
+                            "a forced tool choice",
+                            false,
+                        );
+                        let (found, first_token) = match calls_tag(
+                            &format,
+                            false,
+                            "m",
+                            &tools,
+                            one_call,
+                            reasoning_open,
+                            thought_closed,
+                            start,
+                            TagVocabulary::Current,
+                            false,
+                        ) {
+                            Ok(Prepared::Constraint {
+                                constraint,
+                                first_token,
+                                ..
+                            })
+                            | Ok(Prepared::OpensWithFreeText {
+                                constraint,
+                                first_token,
+                            }) => (Ok(Some(constraint)), first_token),
+                            Ok(_) => (Ok(None), false),
+                            Err(refused) => (Err(refused), false),
+                        };
+                        assert_eq!(
+                            format!("{found:?}"),
+                            format!("{expected:?}"),
+                            "{cell}, one call {one_call}: the call's tag"
+                        );
+                        if matches!(found, Ok(Some(_))) {
+                            assert_eq!(
+                                first_token,
+                                built_for == FirstToken,
+                                "{cell}, one call {one_call}: the call's start"
+                            );
+                        }
+                    }
+                    let grammar = format.answer_grammar_for(&schema, reasoning_open, built_for);
+                    let expected = if matches!(grammar, Some(Grammar::JsonSchema { .. })) {
+                        Ok(None)
+                    } else {
+                        tagged(
+                            grammar,
+                            TagVocabulary::Current,
+                            false,
+                            "m",
+                            "a JSON answer",
+                            false,
+                        )
+                    };
+                    let found = answer_tag(
+                        &format,
+                        false,
+                        "m",
+                        &schema,
+                        reasoning_open,
+                        start,
+                        TagVocabulary::Current,
+                        false,
+                    );
+                    assert_eq!(
+                        format!("{found:?}"),
+                        format!("{expected:?}"),
+                        "{cell}: the answer's tag"
+                    );
+                    // What the engine's request says of the answer, on the first attempt and
+                    // on a retry: the label decides for a tag, and the rule alone says the
+                    // first token with the tag and with the request's own schema alike.
+                    let answer = AnswerTag {
+                        format: Arc::new(table.format()),
+                        compiled: false,
+                        model: "m".to_string(),
+                        schema: Arc::clone(&schema),
+                        reasoning_open,
+                        continues: false,
+                    };
+                    for tagged in [true, false] {
+                        assert_eq!(
+                            answer.starts_at_first_token(label, tagged),
+                            (leaves && !reasoning_open) || (tagged && start == FirstToken),
+                            "{cell}, tagged {tagged}: the answer's start"
+                        );
+                    }
+                }
+            }
+        }
+        println!(
+            "tables that leave the thought to the model: {reached:?} of {} registry tables",
+            symphony::formats::Table::ALL.len()
+        );
+        assert_eq!(
+            reached,
+            ["minimax_m3"],
+            "the reach of the rule is a decision: a table that joins it is named first"
+        );
     }
 
     /// For a worker on `always`, the calls a request may make under `auto` take the table's tag

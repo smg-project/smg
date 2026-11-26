@@ -890,11 +890,13 @@ pub(crate) fn translate_request_with_media(
         validate_sampling(sp, sp.max_tokens.unwrap_or(default_max_tokens))?;
     }
     // A grammar the gateway led with the model's thought for a worker whose
-    // grammar starts at the first token starts there whatever reasoning parser
-    // the engine runs: `reasoning_ended = true` is the engine's own switch for
-    // the gate behind its parser being passed. A request that constrains
-    // nothing, or whose grammar the gateway did not shape, says nothing of it,
-    // and the engine starts the grammar where it does.
+    // grammar starts at the first token, or a forced call or a JSON answer of
+    // a model whose template leaves the thought to it, on a prompt that opened
+    // none, starts there whatever reasoning parser the engine runs:
+    // `reasoning_ended = true` is the engine's own switch for the gate behind
+    // its parser being passed. A request that constrains nothing, or any
+    // other grammar, says nothing of it, and the engine starts the grammar
+    // where it does.
     let grammar_from_first_token = req
         .sampling_params
         .as_ref()

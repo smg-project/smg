@@ -406,8 +406,11 @@ pub(crate) struct Decided {
     pub whole_turn: bool,
     /// The constraint was shaped for an engine that starts the grammar at the
     /// first generated token (the thought, closed, ahead of the answer or the
-    /// calls; the whole turn's grammar): the engine's request says so where
-    /// its dialect has a switch for the gate behind a reasoning parser
+    /// calls; the whole turn's grammar), or it is a forced call or a JSON
+    /// answer of a table whose template leaves the thought to the model, on
+    /// a prompt that opened none, which starts there whatever the label
+    /// says: the engine's request says so where its dialect has a switch
+    /// for the gate behind a reasoning parser
     /// (`WorkerConstraint::first_token`).
     pub first_token: bool,
     /// Symphony's assignment, for the response spec; `None` where the legacy
@@ -1042,6 +1045,136 @@ mod tests {
             }))
             .expect("chat request"),
         )
+    }
+
+    /// The engine's request for a forced call of a table whose template leaves the thought to
+    /// the model (MiniMax M3's), by the prompt and the workers' label: on a prompt that opened
+    /// no thought (no marker, or the thought closed) the request says its grammar starts at the
+    /// first token whatever the label says, and its tag is the one workers that start there
+    /// take; an engine that reads such a prompt as an open thought would otherwise hold the
+    /// grammar back, and the model, free until it closed a thought, could spend its tokens
+    /// there. Inside the thought the label decides, as before.
+    #[tokio::test]
+    async fn a_forced_call_outside_the_thought_starts_at_the_first_token_whatever_the_label() {
+        use smg_grpc_client::FormatSetAside;
+
+        use crate::routers::grpc::{
+            context::{ClientSelection, ExecutionPlan, ExecutionPlanKind, PlanSettings},
+            proto_wrapper::ProtoRequest,
+            regular::stages::{backed_plan, testing::mock_backend_client},
+        };
+
+        const BARE: &str = "]~b]user\nhi[e~[\n]~b]ai\n";
+        const CLOSED: &str = "]~b]user\nhi[e~[\n]~b]ai\n</mm:think>";
+        const OPEN: &str = "]~b]user\nhi[e~[\n]~b]ai\n<mm:think>";
+        let tokenizer = hiding(&[]);
+        let (client, engine) = mock_backend_client(SERVED).await;
+        let mut built = Vec::new();
+        for start in [Some("first_token"), Some("after_reasoning"), None] {
+            for (prompt, inside) in [(BARE, false), (CLOSED, false), (OPEN, true)] {
+                let chat = forced(true);
+                let mut ctx = RequestContext::for_chat(
+                    Arc::clone(&chat),
+                    None,
+                    SERVED.into(),
+                    pool("minimax_m3", start),
+                );
+                ctx.state.parser = Some(ParserChoice::Symphony);
+                ctx.state.tokenizer = Some(Arc::clone(&tokenizer));
+                ctx.state.clients = Some(ClientSelection::Single {
+                    client: client.clone(),
+                });
+                let tools = chat.tools.clone().unwrap_or_default();
+                let prepared = prepare(
+                    &ctx,
+                    Asks::Chat(&chat),
+                    &tools,
+                    prompt,
+                    false,
+                    &tokenizer,
+                    "test",
+                )
+                .map_err(|response| response.status())
+                .expect("nothing refused");
+                ctx.state.parser_names = Some(prepared.names);
+                ctx.state.prompt_thought = Some(prepared.prompt_thought);
+                let decided = decide(
+                    &mut ctx,
+                    Asks::Chat(&chat),
+                    &tools,
+                    prompt,
+                    prepared.constraint,
+                    |_| panic!("the policy is requested: no auto tag"),
+                )
+                .map_err(|response| response.status())
+                .expect("nothing refused");
+                let (plan, _) = backed_plan::build(
+                    &mut ctx,
+                    backed_plan::Inputs {
+                        function: "test",
+                        id_prefix: "chatcmpl-",
+                        model: SERVED,
+                        processed_text: prompt.to_string(),
+                        return_prompt_text: false,
+                        token_ids: vec![1, 2, 3],
+                        tool_constraints: decided.tool_constraints,
+                        format_set_aside: FormatSetAside::default(),
+                        table_tag: decided.table_tag,
+                        first_token_tag: decided.first_token,
+                        require_reasoning: inside,
+                        multimodal_data: None,
+                        sampling_mask: None,
+                        settings: PlanSettings {
+                            inject_pd_metadata: false,
+                            plan_kind: ExecutionPlanKind::Single,
+                        },
+                    },
+                    |client, request_id, text, ids, options| {
+                        client.build_chat_request(request_id, &chat, text, ids, options)
+                    },
+                )
+                .map_err(|response| response.status())
+                .expect("built");
+                let ExecutionPlan::Single(ProtoRequest::Generate(request)) = plan else {
+                    panic!("a single generate plan")
+                };
+                built.push((
+                    start,
+                    prompt,
+                    request.grammar_from_first_token(),
+                    request.structural_tag().map(str::to_owned),
+                ));
+            }
+        }
+        engine.abort();
+        let tag_of = |start: Option<&str>, prompt: &str| {
+            built
+                .iter()
+                .find(|(s, p, _, _)| *s == start && *p == prompt)
+                .and_then(|(_, _, _, tag)| tag.clone())
+        };
+        for (start, prompt, gate, tag) in &built {
+            if *prompt == OPEN {
+                assert_eq!(
+                    *gate,
+                    *start == Some("first_token"),
+                    "{start:?}: inside the thought the label decides"
+                );
+                continue;
+            }
+            assert!(*gate, "{start:?}, {prompt:?}: the grammar starts at once");
+            assert!(tag.is_some(), "{start:?}, {prompt:?}: the table's tag");
+            assert_eq!(
+                *tag,
+                tag_of(Some("first_token"), prompt),
+                "{start:?}, {prompt:?}: the tag of a first-token start"
+            );
+            assert_ne!(
+                *tag,
+                tag_of(Some("first_token"), OPEN),
+                "{start:?}, {prompt:?}: no thought stands before the call"
+            );
+        }
     }
 
     /// A model no registry knows by its name: its card names the table.

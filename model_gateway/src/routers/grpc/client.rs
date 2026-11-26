@@ -60,7 +60,11 @@ pub struct GenerateRequestBuildOptions {
     pub format_set_aside: FormatSetAside,
     pub require_reasoning: bool,
     /// `tool_constraints` was led with the model's thought and its close for
-    /// a worker whose engine starts the grammar at the first generated token:
+    /// a worker whose engine starts the grammar at the first generated token,
+    /// or the request owes a forced call or a JSON answer of a table whose
+    /// template leaves the thought to the model, on a prompt that opened
+    /// none, which starts there whatever the worker's label says (the
+    /// answer's own schema included):
     /// the request says so where its dialect has a switch for the gate behind
     /// the engine's reasoning parser
     /// (`ProtoGenerateRequest::set_grammar_from_first_token`).

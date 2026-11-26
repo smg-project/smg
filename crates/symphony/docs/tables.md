@@ -383,15 +383,22 @@ What this table says beyond the DSML one:
   `start`, as in the primary's adaptive default.
 - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
   has it; the recorded outputs close the thought first.
-- **A forced call admits the thought first, and the separator.** The structural tag for a forced
-  or required call opens with the thought, or the bare `</mm:think>` of an empty one, or nothing,
-  then the separator the template writes before `<tool_call>`, optional, then the block; the
-  block without the separator, which the grammar forced until now, stays valid. With the thought
-  left open by the prompt, free text that may close it comes first instead (`docs/grammar.md`).
-  A JSON answer's tag (`response_format`) is led the same way. The thought-closed shape serves
-  both the adaptive default and `thinking_mode: disabled` (the generation prompt then ends with
-  `</mm:think>`): the thought, or a second close, is admitted in both, and an answer that writes
-  one with thinking off reads back as content, as the legacy parser's tag has it.
+- **A forced call is written at once, behind the separator.** The structural tag for a forced
+  or required call is the separator the template writes before `<tool_call>`, optional, then the
+  block; the block without the separator, which the grammar forced until now, stays valid. The
+  tag holds a thought only where the prompt opened one: with the thought left open by the
+  prompt, free text that may close it comes first (`docs/grammar.md`); on the adaptive default
+  and with `thinking_mode: disabled` (the generation prompt then ends with `</mm:think>`) the
+  block starts at once, since a tag that offered the thought first held the model to it, and a
+  model that never closed it spent its tokens there and never wrote the call. A JSON answer's
+  tag (`response_format`) is led the same way. `Format::leaves_the_thought_to_the_model` says
+  the property (the two rows of `start`, on the thought's opener and on its close), and whoever
+  sends what such a request owes starts the grammar at the first generated token on a prompt
+  that opened no thought, so an engine that would keep a grammar back until a thought ends does
+  not leave the model free until then. Under `auto` nothing is owed, and the tag still admits
+  the thought, or the bare `</mm:think>` of an empty one, or nothing, before the block. The
+  table reads a thought ahead of a forced call whatever the tag holds: an engine that keeps the
+  tag back until the thought ends lets the model think first.
 - **Two states for the calls, as for DSML:** `calls` is the template's wrapping (a newline after
   `<tool_call>` and after `</invoke>`), `invoke` one call's arguments, read by the XML assembler
   (`tagged::xml`); a second invoke before the first closed ends the first,
