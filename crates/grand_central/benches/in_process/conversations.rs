@@ -10,12 +10,9 @@
 //! call instead, which is handed the token ids and the turn's entry, and
 //! under `--entry place_ruled` a route's rule too.
 //!
-//! The host of the cell named `recorded` lends no tree. The engine then
-//! names a turn's holders by its own record of the prefixes it sent, and
-//! writes the record behind the pick. The host of the cell named `indexed`
-//! keeps an index of cache events that holds a block (`indexed.rs`): the
-//! index then names a turn alone, and the record is neither read nor
-//! written. The index of the cell named `held` holds every conversation
+//! The host of the cell named `indexed` keeps an index of cache events that
+//! holds a block (`indexed.rs`): the index then names a turn alone. The
+//! index of the cell named `held` holds every conversation
 //! whole, each for one worker, and the head for every worker, ahead of the
 //! list's first request ([`held`]): it names a turn its conversation's
 //! worker and holders of the head beside it.

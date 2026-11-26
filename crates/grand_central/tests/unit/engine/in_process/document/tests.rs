@@ -27,7 +27,8 @@ use crate::{
         in_process::{
             membership::tests::{handed, id, registry, remove},
             single::tests::{
-                decided, hearing_spec_at, hearing_stages, pool, request, Asks, Heard, MODEL,
+                decided, handed_whole_of, hearing_spec_at, hearing_stages, pool, request,
+                whole_cache_aware, Asks, Heard, MODEL,
             },
             task::tests::stock,
             InProcess,
@@ -511,10 +512,12 @@ fn a_decision_is_kept_by_the_document_it_began_under() {
 /// The record of sent prompts is the engine's and stands across a new
 /// document: a prompt sent under one document goes back to its worker
 /// under the next, at every seed. The next document's stages are built
-/// new: what they read of a prompt's worker is the engine's record.
+/// new: what they read of a prompt's worker is the engine's record. Both
+/// documents' profile is handed its column whole: a decision that is named
+/// its rows reads no record.
 #[test]
 fn a_prompt_goes_back_to_its_worker_under_the_next_document() {
-    let engine = InProcess::new(stock("cache_aware", 1));
+    let engine = InProcess::new(whole_cache_aware(1));
     let members = PublishedList::new(pool(8));
     let sent = |tokens: &[u32], seed: u64| {
         let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
@@ -531,7 +534,13 @@ fn a_prompt_goes_back_to_its_worker_under_the_next_document() {
     let picks: Vec<u32> = seeded.map(|(seed, tokens)| sent(tokens, seed)).collect();
     assert!(picks.iter().any(|&position| position != picks[0]));
 
-    let applied = engine.apply(stock_anew("cache_aware", 2));
+    // The next document's profile has another text: its stages are built new.
+    let mut next = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    next.generation = 2;
+    let profile = next.profiles.get_mut("cache_aware");
+    profile.expect("the preset's profile").filter.reverse();
+    let next = AppliedSpec::validate(&handed_whole_of(next)).expect("the document validates");
+    let applied = engine.apply(next);
     applied.expect("a number above the standing one");
     for seed in 100..104 {
         for (tokens, &position) in prompts.iter().zip(&picks) {

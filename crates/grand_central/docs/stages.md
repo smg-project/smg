@@ -264,10 +264,12 @@ Over the wire these rules hold:
 - A caller of the crate's shared link is refused it on its own side, and the stream it shares stays up.
 - The serial client sends it, reads the stream's refusal and opens another stream at its next ask.
 
-`prefix-affinity` reads these hashes through the record of sent prefixes, under `source: merged` or `predictor`.
+On a pair's side `prefix-affinity` reads these hashes through the record of sent prefixes, under `source: merged` or `predictor`. So it does for a single request whose profile is handed a whole column, as one that shows its rows to a plugin is.
+
+Under those two sources every other single text request is decided inside the string tree its host lends, where the host names the request's entry in that tree. With no tree lent, or no entry named, it is named no holder.
 
 - Cache events are token blocks, so the index of cache events is never asked for a text request.
-- The record of sent prefixes speaks for every worker of a text request's list, whatever the index holds for the worker.
+- Where `prefix-affinity` reads the record of sent prefixes, it speaks for every worker of a text request's list, whatever the index holds for the worker.
 - A text request under a cache partition is hashed under the partition's whole identity, the extra key included. So it shares no window with a request of another partition.
 
 ## Pickers

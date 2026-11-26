@@ -297,7 +297,7 @@ The lists below take the rows in that order.
 
 - An embedded host can supply an affinity column itself. It can also supply sent-prefix predictions.
 - With regular standalone ingestion, worker age is available.
-- The stock controller records the prefixes it sends. [The record of sent prefixes](#the-record-of-sent-prefixes) has the rules.
+- The stock controller records the prefixes it sends on each side of a pair. [The record of sent prefixes](#the-record-of-sent-prefixes) has the rules.
 - The stock controller asks its gRPC engines for cache events, by the rows [Cargo features](#cargo-features) names. A controller of your own built with the `controller` feature does too.
 
 **Membership.**
@@ -348,14 +348,14 @@ The lists below take the rows in that order.
 
 - A standalone controller's engine keeps a record of the prefixes sent to its workers. It keeps one for a pool whose prefix stage reads sent prefixes, under an index of the kind `tree`.
 - A stage that says `source: index` reads cache events alone, and no such record.
-- A decision can write a placement there: a single request's, and each side of a pair's.
+- A decision that reads a column can write a placement there: each side of a pair's, and a single request's whose profile is handed a whole column. A profile that shows its rows to a plugin is handed one.
 - It writes for the first target its maker says the caller sends to. On the stock controller that is the pick's first. Under an encode request it writes none where the maker says the caller sends to a placed encoder no more.
 - It writes none for a pick the sessions rule keeps from the profile.
 - The record has room for `max_size` over the block size placements, and for one at least.
 - A placement is a prediction made at the decision.
 - A decision turned back after its lease's issue keeps the placement it wrote. A later request with that prefix can read it as a predicted hit, which must exceed the stage's `threshold`.
-- A decision does not wait to write its placement: a write that meets the record's lock held is kept by its thread and written behind the thread's next picks. A write that eight newer ones push out, or that its thread ends with, is left out.
-- Which record names a request's holders, this one or the model's KV tables, is by the profile's prefix stages and by the request. [The cache records](design.md#45-the-cache-records) in the design has the rule.
+- A decision does not wait to write its placement. A write that meets the record's lock held is kept by its thread and written behind its next picks that write there. A write that eight newer ones push out, or that its thread ends with, is left out.
+- Which record names a request's holders, this one or the model's KV tables, is by the profile's stages and by the request. This one names none for a single request, unless its profile is handed a whole column. [The cache records](design.md#45-the-cache-records) in the design has the rule.
 - The store tells the engine each word of its membership. The record forgets a worker that left, was replaced, stopped serving a model or changed its role.
 - The record stands across a new spec.
 - A standby starts with an empty record.

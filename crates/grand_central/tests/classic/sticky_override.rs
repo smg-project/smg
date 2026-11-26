@@ -711,17 +711,19 @@ pub const INLINE: &str = r#"{
 /// whole.
 mod sends {
     use std::{
+        borrow::Cow,
         collections::{HashMap, VecDeque},
         sync::Arc,
         time::{Duration, Instant},
     };
 
+    use kv_index::TokenTree;
     use smg_grand_central::{
         document::{AppliedSpec, Assignment},
         engine::{
-            Constraints, DecisionEngine, HashSeeds, Identity, InProcess, LentList, ListCell,
-            PlacedBy, PromptHashes, Request, RequestFacts, RequestMaker, SessionVerdict,
-            WorkerLists,
+            CacheIndex, CacheIndexes, Constraints, DecisionEngine, HashSeeds, Identity, InProcess,
+            LentList, ListCell, Phase, PlacedBy, PromptHashes, Request, RequestFacts, RequestMaker,
+            SessionVerdict, TokenKey, WorkerLists,
         },
         store::GatewayId,
         tracking::{self, DecisionGuard, TransportClass},
@@ -753,12 +755,42 @@ mod sends {
         InProcess::new(AppliedSpec::validate(&document).expect("the document validates"))
     }
 
-    /// A request stated ahead, with the list its host lends and the reports
-    /// it hands.
+    /// A gateway's token tree of the prompts it sent its workers, lent to
+    /// its engine: the record the gateway's own policy keeps of a request
+    /// of token ids. The host keeps no index of cache events.
+    struct Lends(Arc<TokenTree>);
+
+    impl CacheIndexes for Lends {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            None
+        }
+
+        fn token_tree(&self, _: &str, _: Phase) -> Option<Arc<TokenTree>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    /// [`engine`] under a host that lends it a token tree of its own, a
+    /// page of sixteen tokens: the block of the settings' document.
+    fn lending(policy: &str, overridden: bool) -> InProcess {
+        let engine = engine(policy, overridden);
+        let tree = Arc::new(TokenTree::with_config(16, Default::default()));
+        engine.affinity().set_indexes(Arc::new(Lends(tree)));
+        engine
+    }
+
+    /// A request stated ahead, with the list its host lends, the reports
+    /// it hands, and the token ids its host names as the prompt's entry in
+    /// the token tree it lends, where the request has one.
     struct Asks<'a> {
         request: Request<'a>,
         members: LentList<'a>,
         loads: &'a Arc<LoadSnapshot>,
+        entry: Option<&'a [u32]>,
     }
 
     impl RequestMaker for Asks<'_> {
@@ -776,6 +808,10 @@ mod sends {
 
         fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
             Some(self.loads)
+        }
+
+        fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
+            Some(TokenKey::of(Cow::Borrowed(self.entry?), 0))
         }
     }
 
@@ -874,8 +910,34 @@ mod sends {
             &self,
             engine: &'e InProcess,
             members: LentList<'_>,
-            (key, tokens, nth): (&'static str, u32, u32),
+            asked: (&'static str, u32, u32),
             prompt: Option<&PromptHashes>,
+            by_id: bool,
+        ) -> Decided<'e> {
+            self.decide_stated(engine, members, asked, (prompt, None), by_id)
+        }
+
+        /// [`Self::decide`] for a request whose host names its prompt's
+        /// entry in the token tree it lends `engine`: the prompt's token
+        /// ids, `entry`. A header handed its key.
+        fn decide_entry(
+            &self,
+            engine: &'e InProcess,
+            members: LentList<'_>,
+            asked: (&'static str, u32, u32),
+            entry: &[u32],
+        ) -> Decided<'e> {
+            self.decide_stated(engine, members, asked, (None, Some(entry)), false)
+        }
+
+        /// A request that states its prompt by its blocks' hashes, by its
+        /// entry in a lent token tree, or not at all.
+        fn decide_stated(
+            &self,
+            engine: &'e InProcess,
+            members: LentList<'_>,
+            (key, tokens, nth): (&'static str, u32, u32),
+            (prompt, entry): (Option<&PromptHashes>, Option<&[u32]>),
             by_id: bool,
         ) -> Decided<'e> {
             let session_key = match key {
@@ -900,6 +962,7 @@ mod sends {
                 },
                 members,
                 loads: &self.loads,
+                entry,
             };
             let decided =
                 DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, self.at(nth));
@@ -1354,8 +1417,13 @@ mod sends {
     /// worker it placed the request on, and it is not asked at a pinned
     /// request (`:736-739`). So the twin is asked, and writes a prompt,
     /// wherever the engine under the override does: no pinned request's
-    /// prompt is in either record, and each request the policy places goes
+    /// prompt is in either tree, and each request the policy places goes
     /// to one worker under both.
+    ///
+    /// Each engine's host lends it a token tree of its own, as a gateway
+    /// lends its policy's ([`lending`]), and names each prompt's token ids
+    /// as its entry there. A decision of this policy keeps no record of
+    /// its own: under a host that lends no tree it is named no holder.
     ///
     /// Under its cap, and at it on even rounds, a key's request states a
     /// prompt of its own. At the cap on odd rounds it grows the key's first
@@ -1364,9 +1432,9 @@ mod sends {
     /// pinned request's on even rounds and one the policy placed on odd
     /// rounds:
     ///
-    /// - A pinned request's prompt is in no record, so the policy places
+    /// - A pinned request's prompt is in no tree, so the policy places
     ///   its repeat as a prompt nobody was sent, and on another worker than
-    ///   the pin's more often than not. An engine that recorded the pinned
+    ///   the pin's more often than not. An engine that stored the pinned
     ///   request would send the repeat to the pin's worker, and its twin
     ///   would not.
     /// - A prompt the policy placed goes back to its worker.
@@ -1381,20 +1449,19 @@ mod sends {
     #[test]
     fn cache_aware_places_under_the_override_as_the_policy_alone_places() {
         for workers in [3, 16] {
-            let (keyed, alone) = (engine("cache_aware", true), engine("cache_aware", false));
+            let (keyed, alone) = (lending("cache_aware", true), lending("cache_aware", false));
             let queued: Vec<i32> = (0..workers).map(|at| at * 700).collect();
             let mut host = Host::new(&queued);
             let (list, cell) = (Arc::clone(&host.list), ListCell::default());
             let members = lent(&list, &cell);
             // A prompt of its own: 1,024 tokens no other prompt holds. A
             // prompt that grows a key's first one: that prompt whole, then
-            // 256 tokens of its own. Hashed as each engine's document reads
-            // a prompt.
-            let prompt = |engine: &InProcess, (first, of): Stated| {
+            // 256 tokens of its own. Its token ids are its entry in each
+            // engine's lent tree.
+            let prompt = |(first, of): Stated| -> Vec<u32> {
                 let own = if first.is_some() { 256 } else { 1_024 };
                 let head = first.map_or(0..0, |first| first * 100_000..first * 100_000 + 1_024);
-                let tokens: Vec<u32> = head.chain(of * 100_000..of * 100_000 + own).collect();
-                engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN)
+                head.chain(of * 100_000..of * 100_000 + own).collect()
             };
             let mut pins = Pins::default();
             // Each key's first request, by its number.
@@ -1436,9 +1503,9 @@ mod sends {
                     None => (grows.then_some(first), nth),
                 };
                 let tokens = if stated.0.is_some() { 1_280 } else { 1_024 };
-                let hashes = prompt(&keyed, stated);
+                let entry = prompt(stated);
                 let asked = (key, tokens, nth);
-                let (guard, place, by) = host.decide_prompt(&keyed, members, asked, Some(&hashes));
+                let (guard, place, by) = host.decide_entry(&keyed, members, asked, &entry);
                 pins.rule(&host, key, (place, by));
                 pins.sent(&host, key, place, verdict(&guard));
                 let mut guards = vec![guard];
@@ -1446,10 +1513,8 @@ mod sends {
                     pinned += 1;
                     kept.push_back((stated, place));
                 } else {
-                    let hashes = prompt(&alone, stated);
                     let asked = ("", tokens, nth);
-                    let (twin, twin_place, _) =
-                        host.decide_prompt(&alone, members, asked, Some(&hashes));
+                    let (twin, twin_place, _) = host.decide_entry(&alone, members, asked, &entry);
                     assert_eq!(
                         place, twin_place,
                         "{workers} workers: request {nth}, {key:?}"

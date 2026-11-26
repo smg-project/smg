@@ -18,6 +18,7 @@ use crate::{
     engine::{
         decision::{OverlapSource, Pick, Shed, ShedReason, Target, Targets, Trace},
         framework::Scratch,
+        in_process::single::tests::handed_whole_of,
         prompt_hashes::{HashSeeds, PromptHashes},
         sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Health, PoolFacts},
@@ -170,8 +171,9 @@ fn lending(indexed: bool) -> (Affinity, Arc<TokenTree>) {
 }
 
 /// [`lending`], the host's tree made with pages of `page` tokens. The
-/// index it hands holds a block, as the trait asks of a host: it hands
-/// none while its index is empty ([`CacheIndexes::index`]).
+/// index it hands holds a block: its host hands none while its index is
+/// empty, the second of the two ways the trait gives a host
+/// ([`CacheIndexes::index`]).
 fn lending_by(page: usize, indexed: bool) -> (Affinity, Arc<TokenTree>) {
     let tree = Arc::new(TokenTree::with_config(page, Default::default()));
     let index = indexed.then(|| {
@@ -396,19 +398,8 @@ fn handed_whole() -> AppliedSpec {
 fn named_no_row(change: impl FnOnce(PolicySpec) -> PolicySpec) -> AppliedSpec {
     let mut document = PolicySpec::preset("cache_aware").expect("the preset");
     document.generation = 1;
-    let profile = document
-        .profiles
-        .get_mut("cache_aware")
-        .expect("the preset's profile");
-    profile.score.push(
-        ScoreStage::WarmupSlice(WarmupSliceParams {
-            weight: 1.0,
-            secs: Some(7),
-            ..WarmupSliceParams::default()
-        })
-        .into(),
-    );
-    let spec = AppliedSpec::validate(&change(document)).expect("the document validates");
+    let whole = change(handed_whole_of(document));
+    let spec = AppliedSpec::validate(&whole).expect("the document validates");
     assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 0);
     spec
 }
@@ -592,6 +583,53 @@ impl Bed {
     /// profile's stages, for a request that names no entry.
     fn states(&self, facts: &RequestFacts<'_>, row: u32) -> Overlap {
         self.stated(facts, None, picked(row, self.ids[row as usize]))
+    }
+
+    /// Decides `facts` under a profile that is handed its column whole, by
+    /// picking the worker at `target` or by a shed, and says what each row
+    /// of that column holds: by the index, then by the record. A pick is
+    /// written to the record of sent prefixes where it speaks for the
+    /// worker.
+    fn handed(&self, facts: &RequestFacts<'_>, target: Option<u32>) -> Vec<(u32, u32)> {
+        let mut seen = None;
+        let decision = decide(
+            &self.affinity,
+            &self.pool,
+            &self.spec,
+            &self.workers,
+            &self.ids,
+            &mut { *facts },
+            None,
+            |_| None,
+            || None,
+            |_| true,
+            |facts| {
+                seen = Some(held(facts.affinity));
+                match target {
+                    Some(position) => picked(position, self.ids[position as usize]),
+                    None => shed(),
+                }
+            },
+        );
+        assert_eq!(decision.pick().is_some(), target.is_some());
+        seen.expect("a decision")
+    }
+
+    /// The rows that hold anything of a request of `prompt` in the column
+    /// of a profile that is handed its column whole, decided by a shed:
+    /// each row, what the index holds for it, then the record.
+    fn holding(&self, prompt: &PromptHashes, now: u64) -> Vec<(u32, u32, u32)> {
+        self.holding_of(&request(prompt, 7, now))
+    }
+
+    /// [`Self::holding`] for the request `facts`, which names its own
+    /// model.
+    fn holding_of(&self, facts: &RequestFacts<'_>) -> Vec<(u32, u32, u32)> {
+        let column = self.handed(facts, None);
+        let rows = (0..).zip(column);
+        rows.filter(|&(_, held)| held != (0, 0))
+            .map(|(row, (index, record))| (row, index, record))
+            .collect()
     }
 
     /// The holders a request of `prompt` is named, decided by a shed.
@@ -870,27 +908,6 @@ fn a_held_request_is_named_its_warming_rows_among_its_places() {
     }
 }
 
-/// The workers sent a prefix are named among the places too. Twenty
-/// workers were sent the prompt, and a request held to two of them is named
-/// both under every seed, by the blocks they were sent. The classic policy
-/// takes every candidate among its tree's matched workers, with no cut
-/// (`model_gateway/src/policies/cache_aware.rs:2541-2552`).
-#[test]
-fn a_held_request_is_named_the_workers_sent_its_prefix_among_its_places() {
-    let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 20);
-    let asked = prompt(1_000, 4);
-    for at in 0..20 {
-        bed.decide(&request(&asked, 7, NOW), Some(at));
-    }
-    for seed in 0..32 {
-        let named = bed.held_to(&request(&asked, seed, NOW), &[3, 17]);
-        assert_eq!(named.holders, [(3, 0, 4), (17, 0, 4)], "seed {seed}");
-    }
-    // Stated to no place, the sample cuts the twenty to sixteen.
-    assert_eq!(bed.holders(&asked, NOW).len(), 16);
-}
-
 /// A token tree's workers are named among the places too. A tree hands the
 /// eight workers of its deepest node at most, so the built-in sample of
 /// sixteen never cuts them: under a sample of four, a request held to two of
@@ -920,37 +937,37 @@ fn a_held_request_is_named_a_trees_workers_among_its_places() {
     assert_eq!(bed.keyed(&asked, 0, None).len(), 4);
 }
 
-/// With no index the record of sent prefixes speaks for every worker: a
-/// pick writes the request's prefix for its worker, a later request that
-/// begins alike names that worker by the blocks it was sent, and a worker
-/// told gone is named no more.
+/// With no index the record of sent prefixes speaks for every worker of a
+/// column: a pick writes the request's prefix for its worker, the column of
+/// a later request that begins alike holds the blocks that worker was sent,
+/// and a worker told gone holds none. The profile is handed its column
+/// whole: a decision that is named its rows reads no record.
 #[test]
-fn the_record_names_the_worker_a_prefix_was_sent_to() {
+fn a_column_holds_the_worker_a_prefix_was_sent_to() {
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let bed = Bed::new(affinity, handed_whole(), 4);
     let asked = prompt(1_000, 4);
-    assert!(bed.holders(&asked, NOW).is_empty());
+    assert!(bed.holding(&asked, NOW).is_empty());
     // A shed writes nothing.
-    assert!(bed.holders(&asked, NOW).is_empty());
-    let named = bed.decide(&request(&asked, 7, NOW), Some(1));
-    assert!(named.expect("rows").holders.is_empty());
-    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
-    // A longer prompt that begins with it is named by the four blocks sent.
+    assert!(bed.holding(&asked, NOW).is_empty());
+    assert_eq!(bed.handed(&request(&asked, 7, NOW), Some(1)), [(0, 0); 4]);
+    assert_eq!(bed.holding(&asked, NOW), [(1, 0, 4)]);
+    // A longer prompt that begins with it is read by the four blocks sent.
     let longer = prompt(1_000, 6);
-    assert_eq!(bed.holders(&longer, NOW), [(1, 0, 4)]);
+    assert_eq!(bed.holding(&longer, NOW), [(1, 0, 4)]);
     // A second worker sent the longer prompt is the deeper holder of it,
     // and both hold the shorter one.
     bed.decide(&request(&longer, 7, NOW), Some(3));
-    assert_eq!(bed.holders(&longer, NOW), [(3, 0, 6)]);
-    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4), (3, 0, 4)]);
+    assert_eq!(bed.holding(&longer, NOW), [(3, 0, 6)]);
+    assert_eq!(bed.holding(&asked, NOW), [(1, 0, 4), (3, 0, 4)]);
     bed.affinity.forget(bed.ids[3]);
-    assert_eq!(bed.holders(&longer, NOW), [(1, 0, 4)]);
+    assert_eq!(bed.holding(&longer, NOW), [(1, 0, 4)]);
     bed.affinity.sweep();
-    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    assert_eq!(bed.holding(&asked, NOW), [(1, 0, 4)]);
     // A turn that goes on from a recorded prompt writes the blocks it adds
     // for the worker that holds the rest.
     bed.decide(&request(&longer, 7, NOW), Some(1));
-    assert_eq!(bed.holders(&longer, NOW), [(1, 0, 6)]);
+    assert_eq!(bed.holding(&longer, NOW), [(1, 0, 6)]);
     assert_eq!(bed.affinity.left_out(), 0);
 }
 
@@ -970,11 +987,13 @@ fn a_request_under_another_name_leaves_the_records_bound() {
     };
     document.index.insert("*".into(), one);
     document.index.insert(MODEL.into(), IndexSpec::default());
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    // The profile is handed its column whole, so its picks are recorded.
+    let whole = handed_whole_of(document);
+    let spec = AppliedSpec::validate(&whole).expect("the document validates");
     let bed = Bed::new(affinity, spec, 4);
     let asked = prompt(1_000, 4);
     bed.decide(&request(&asked, 7, NOW), Some(1));
-    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    assert_eq!(bed.holding(&asked, NOW), [(1, 0, 4)]);
     // A request with no prompt that names the model by another name.
     let other = RequestFacts {
         model: "another-name",
@@ -984,7 +1003,7 @@ fn a_request_under_another_name_leaves_the_records_bound() {
     };
     bed.decide(&other, None);
     bed.affinity.sweep();
-    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    assert_eq!(bed.holding(&asked, NOW), [(1, 0, 4)]);
 }
 
 /// A model its workers list behind their first reads its own record, and
@@ -992,6 +1011,8 @@ fn a_request_under_another_name_leaves_the_records_bound() {
 /// list: the workers of a shared model registered under different first
 /// models. Another name of the model's card reads the same record, and a
 /// card that lists the model's id as an alias takes none of its requests.
+/// The profile is handed its column whole: a decision that is named its
+/// rows reads no record.
 #[test]
 fn a_shared_model_of_its_workers_reads_its_own_record() {
     use smg_worker::{
@@ -1014,7 +1035,9 @@ fn a_shared_model_of_its_workers_reads_its_own_record() {
         document.index.insert(first.into(), one);
     }
     document.index.insert(SHARED.into(), IndexSpec::default());
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    // The profile is handed its column whole, so its picks are recorded.
+    let whole = handed_whole_of(document);
+    let spec = AppliedSpec::validate(&whole).expect("the document validates");
     let mut bed = Bed::new(affinity, spec, 2);
     for (at, first) in [MODEL, "model-b"].into_iter().enumerate() {
         // The first model's card lists the shared model's id as an alias,
@@ -1031,8 +1054,8 @@ fn a_shared_model_of_its_workers_reads_its_own_record() {
     };
     bed.decide(&shared, Some(1));
     bed.affinity.sweep();
-    let named = bed.decide(&shared, None).expect("rows named");
-    assert_eq!(named.holders, [(1, 0, 4)], "the shared model's own bound");
+    let named = bed.holding_of(&shared);
+    assert_eq!(named, [(1, 0, 4)], "the shared model's own bound");
     // The list is published again headed by the other worker.
     bed.workers.swap(0, 1);
     bed.ids.swap(0, 1);
@@ -1041,8 +1064,8 @@ fn a_shared_model_of_its_workers_reads_its_own_record() {
         model: ALIAS,
         ..request(&asked, 7, NOW)
     };
-    let named = bed.decide(&alias, None).expect("rows named");
-    assert_eq!(named.holders, [(0, 0, 4)], "one record a card");
+    let named = bed.holding_of(&alias);
+    assert_eq!(named, [(0, 0, 4)], "one record a card");
 }
 
 /// A host that keeps the trees of a model its workers list behind their
@@ -1165,7 +1188,9 @@ fn a_shared_models_record_is_held_by_the_smallest_block_size_of_its_heads() {
         ..IndexSpec::default()
     };
     document.index.insert("*".into(), small);
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    // The profile is handed its column whole, so its picks are recorded.
+    let whole = handed_whole_of(document);
+    let spec = AppliedSpec::validate(&whole).expect("the document validates");
     let mut bed = Bed::new(affinity, spec, 3);
     for (at, first) in [Some(MODEL), Some("model-b"), None].into_iter().enumerate() {
         let mut cards: Vec<_> = first.into_iter().map(ModelCard::new).collect();
@@ -1181,17 +1206,17 @@ fn a_shared_models_record_is_held_by_the_smallest_block_size_of_its_heads() {
     // Eight blocks go to the worker at 1, under the head of 16 tokens a
     // block.
     bed.decide(&asked, Some(1));
-    let named = bed.decide(&asked, None).expect("rows named");
-    assert_eq!(named.holders, [(1, 0, 8)], "headed by 16 tokens a block");
+    let named = bed.holding_of(&asked);
+    assert_eq!(named, [(1, 0, 8)], "headed by 16 tokens a block");
     // The worker of 32 tokens a block heads the list: the holder stands at 0.
     bed.workers.swap(0, 1);
     bed.ids.swap(0, 1);
     bed.pool = PoolAffinity::default();
-    let named = bed.decide(&asked, None).expect("rows named");
-    assert_eq!(named.holders, [(0, 0, 8)], "headed by 32 tokens a block");
+    let named = bed.holding_of(&asked);
+    assert_eq!(named, [(0, 0, 8)], "headed by 32 tokens a block");
     bed.affinity.sweep();
-    let named = bed.decide(&asked, None).expect("rows named");
-    assert_eq!(named.holders, [(0, 0, 8)], "behind a sweep");
+    let named = bed.holding_of(&asked);
+    assert_eq!(named, [(0, 0, 8)], "behind a sweep");
     // The worker that states the shared model first heads the list: the
     // holder stands at 2.
     bed.workers.swap(0, 2);
@@ -1199,12 +1224,8 @@ fn a_shared_models_record_is_held_by_the_smallest_block_size_of_its_heads() {
     bed.pool = PoolAffinity::default();
     bed.decide(&asked, None);
     bed.affinity.sweep();
-    let named = bed.decide(&asked, None).expect("rows named");
-    assert_eq!(
-        named.holders,
-        [(2, 0, 8)],
-        "headed by the shared model first"
-    );
+    let named = bed.holding_of(&asked);
+    assert_eq!(named, [(2, 0, 8)], "headed by the shared model first");
 }
 
 /// A shared record keeps the block size its own first model asked with. The
@@ -1242,7 +1263,9 @@ fn a_shared_models_record_keeps_the_block_size_its_own_head_asked_with() {
         ..IndexSpec::default()
     };
     document.index.insert("*".into(), small);
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    // The profile is handed its column whole, so its picks are recorded.
+    let whole = handed_whole_of(document);
+    let spec = AppliedSpec::validate(&whole).expect("the document validates");
     let mut bed = Bed::new(affinity, spec, 2);
     for (at, first) in [None, Some("model-b")].into_iter().enumerate() {
         let mut cards: Vec<_> = first.into_iter().map(ModelCard::new).collect();
@@ -1258,18 +1281,18 @@ fn a_shared_models_record_keeps_the_block_size_its_own_head_asked_with() {
     // Eight blocks go to the worker at 1, under the head of 16 tokens a
     // block, which states the shared model first.
     bed.decide(&asked, Some(1));
-    let named = bed.decide(&asked, None).expect("rows named");
-    assert_eq!(named.holders, [(1, 0, 8)], "headed by 16 tokens a block");
+    let named = bed.holding_of(&asked);
+    assert_eq!(named, [(1, 0, 8)], "headed by 16 tokens a block");
     // The worker of 32 tokens a block heads the list, the shared model
     // behind its first: the holder stands at 0.
     bed.workers.swap(0, 1);
     bed.ids.swap(0, 1);
     bed.pool = PoolAffinity::default();
-    let named = bed.decide(&asked, None).expect("rows named");
-    assert_eq!(named.holders, [(0, 0, 8)], "headed by 32 tokens a block");
+    let named = bed.holding_of(&asked);
+    assert_eq!(named, [(0, 0, 8)], "headed by 32 tokens a block");
     bed.affinity.sweep();
-    let named = bed.decide(&asked, None).expect("rows named");
-    assert_eq!(named.holders, [(0, 0, 8)], "behind a sweep");
+    let named = bed.holding_of(&asked);
+    assert_eq!(named, [(0, 0, 8)], "behind a sweep");
 }
 
 /// Two lists that size one shared record at the same time leave it held by
@@ -1312,128 +1335,93 @@ fn two_lists_that_size_a_shared_record_at_once_leave_it_at_the_smallest_size() {
 }
 
 /// A pick the binding's sessions rule placed alone is recorded by the
-/// rule's own word of it, at both of the record's writes: the one behind a
-/// decision named its rows, and the one behind a decision handed the column
-/// whole. A pick the rule keeps from the profile leaves no prefix. One that
-/// is the profile's own, the rule's default, is written as a pick by the
-/// profile's stages is. A pick is written for the first of its targets its
-/// caller sends to (`sends_to`), and for none where it sends to none. The
-/// lookup returns the answer it is handed either
+/// rule's own word of it, at the record's one write: the one behind a
+/// decision handed the column whole. A pick the rule keeps from the profile
+/// leaves no prefix. One that is the profile's own, the rule's default, is
+/// written as a pick by the profile's stages is. A pick is written for the
+/// first of its targets its caller sends to (`sends_to`), and for none where
+/// it sends to none. The lookup returns the answer it is handed either
 /// way, but for what the pick states of its first target
 /// ([`a_pick_its_rule_keeps_from_the_profile_states_nothing`]): a pin the
 /// keyed entry followed passes through it with its answer made. The live
-/// profile of the column form is named no row, and its prefix stage reads
-/// sent prefixes: the list keeps the record by that profile's own word,
-/// with a shadow beside it or none, and the column shows
-/// what that record holds. A gateway's sticky map hands a request it places
-/// to no policy, so the policy's record never takes it
+/// profile is named no row, and its prefix stage reads sent prefixes: the
+/// list keeps the record by that profile's own word, with a shadow beside
+/// it that is named its rows, and the column shows what that record holds.
+/// A gateway's sticky map hands a request it places to no policy, so the
+/// policy's record never takes it
 /// (`model_gateway/src/policies/registry.rs:791`, `:840`).
 #[test]
-fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes() {
-    for whole in [false, true] {
-        let spec = if whole {
-            // The shadow is the preset's profile, named rows. The live
-            // profile's two warm-up stages rule by different windows: it is
-            // named no row and reads the column whole.
-            let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-            document.generation = 1;
-            let twin = document.profiles["cache_aware"].clone();
-            document.profiles.insert("twin".into(), twin);
-            document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
-            let profile = document
-                .profiles
-                .get_mut("cache_aware")
-                .expect("the preset's profile");
-            profile.score.push(
-                ScoreStage::WarmupSlice(WarmupSliceParams {
-                    weight: 1.0,
-                    secs: Some(7),
-                    ..WarmupSliceParams::default()
-                })
-                .into(),
-            );
-            AppliedSpec::validate(&document).expect("the document validates")
-        } else {
-            preset("cache_aware")
-        };
-        let cap = spec.engine().affinity_rows_cap(MODEL, Phase::Single);
-        assert_eq!(cap == 0, whole, "the form of the write");
-        let record = spec.engine().pool_record_for(MODEL, Phase::Single);
-        assert!(record.is_some(), "whole: {whole}: the list keeps a record");
-        let (affinity, _, _) = hosted(false);
-        let bed = Bed::new(affinity, spec, 4);
-        // One decision of `asked` answered `answer`: the blocks the record
-        // held for each worker when it was asked. The lookup returns the
-        // answer it was handed.
-        let decided = |asked: &PromptHashes, answer: Decision| {
-            let mut held = vec![0; bed.ids.len()];
-            let returned = decide(
-                &bed.affinity,
-                &bed.pool,
-                &bed.spec,
-                &bed.workers,
-                &bed.ids,
-                &mut request(asked, 7, NOW),
-                None,
-                |_| None,
-                || None,
-                // The caller sends to every worker but the one at 3.
-                |target| target.position != 3,
-                |facts| {
-                    assert_eq!(facts.named.is_none(), whole);
-                    match facts.named {
-                        Some(rows) => {
-                            for holder in rows.holders {
-                                held[holder.row as usize] = holder.predicted_blocks;
-                            }
-                        }
-                        None => {
-                            for (row, worker) in facts.affinity.iter().enumerate() {
-                                held[row] = worker.predicted_blocks;
-                            }
-                        }
-                    }
-                    answer
-                },
-            );
-            assert_eq!(
-                unstated(returned),
-                answer,
-                "whole: {whole}: the answer handed"
-            );
-            held
-        };
-        let (kept, own) = (prompt(1_000, 4), prompt(2_000, 4));
-        // Kept from the profile: nothing is written, at one decision or two.
-        let untold = ruled(1, bed.ids[1], RulePlaced::Untold);
-        assert_eq!(decided(&kept, untold), [0; 4], "whole: {whole}");
-        assert_eq!(decided(&kept, untold), [0; 4], "whole: {whole}: kept");
-        assert_eq!(decided(&kept, shed()), [0; 4], "whole: {whole}: kept twice");
-        // The profile's own: written for the rule's worker.
-        let told = ruled(1, bed.ids[1], RulePlaced::Told);
-        assert_eq!(decided(&own, told), [0; 4], "whole: {whole}");
-        assert_eq!(decided(&own, shed()), [0, 4, 0, 0], "whole: {whole}: told");
-        // The stages' pick of the first prompt is written as that one was,
-        // behind a lead its caller passes over: the worker at 3.
-        let mut by_stages = picked(2, bed.ids[2]);
-        if let Decision::Pick(pick) = &mut by_stages {
-            pick.targets.lead(Target {
-                position: 3,
-                id: bed.ids[3],
-                ..Target::default()
-            });
-        }
-        assert_eq!(decided(&kept, by_stages), [0; 4], "whole: {whole}");
-        assert_eq!(
-            decided(&kept, shed()),
-            [0, 0, 4, 0],
-            "whole: {whole}: the stages'"
+fn a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word() {
+    // The shadow is the preset's profile, named rows. The live profile's
+    // two warm-up stages rule by different windows: it is named no row and
+    // reads the column whole.
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let twin = document.profiles["cache_aware"].clone();
+    document.profiles.insert("twin".into(), twin);
+    document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    let whole = handed_whole_of(document);
+    let spec = AppliedSpec::validate(&whole).expect("the document validates");
+    let cap = spec.engine().affinity_rows_cap(MODEL, Phase::Single);
+    assert_eq!(cap, 0, "the live profile is handed its column whole");
+    let record = spec.engine().pool_record_for(MODEL, Phase::Single);
+    assert!(record.is_some(), "the list keeps a record");
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, spec, 4);
+    // One decision of `asked` answered `answer`: the blocks the record
+    // held for each worker when it was asked. The lookup returns the
+    // answer it was handed.
+    let decided = |asked: &PromptHashes, answer: Decision| {
+        let mut held = vec![0; bed.ids.len()];
+        let returned = decide(
+            &bed.affinity,
+            &bed.pool,
+            &bed.spec,
+            &bed.workers,
+            &bed.ids,
+            &mut request(asked, 7, NOW),
+            None,
+            |_| None,
+            || None,
+            // The caller sends to every worker but the one at 3.
+            |target| target.position != 3,
+            |facts| {
+                assert!(facts.named.is_none(), "the column whole");
+                for (row, worker) in facts.affinity.iter().enumerate() {
+                    held[row] = worker.predicted_blocks;
+                }
+                answer
+            },
         );
-        // A pick whose one target its caller passes over: nothing is written.
-        let (lost, alone) = (prompt(3_000, 4), picked(3, bed.ids[3]));
-        assert_eq!(decided(&lost, alone), [0; 4], "whole: {whole}");
-        assert_eq!(decided(&lost, shed()), [0; 4], "whole: {whole}: to none");
+        assert_eq!(unstated(returned), answer, "the answer handed");
+        held
+    };
+    let (kept, own) = (prompt(1_000, 4), prompt(2_000, 4));
+    // Kept from the profile: nothing is written, at one decision or two.
+    let untold = ruled(1, bed.ids[1], RulePlaced::Untold);
+    assert_eq!(decided(&kept, untold), [0; 4]);
+    assert_eq!(decided(&kept, untold), [0; 4], "kept");
+    assert_eq!(decided(&kept, shed()), [0; 4], "kept twice");
+    // The profile's own: written for the rule's worker.
+    let told = ruled(1, bed.ids[1], RulePlaced::Told);
+    assert_eq!(decided(&own, told), [0; 4]);
+    assert_eq!(decided(&own, shed()), [0, 4, 0, 0], "told");
+    // The stages' pick of the first prompt is written as that one was,
+    // behind a lead its caller passes over: the worker at 3.
+    let mut by_stages = picked(2, bed.ids[2]);
+    if let Decision::Pick(pick) = &mut by_stages {
+        pick.targets.lead(Target {
+            position: 3,
+            id: bed.ids[3],
+            ..Target::default()
+        });
     }
+    assert_eq!(decided(&kept, by_stages), [0; 4]);
+    assert_eq!(decided(&kept, shed()), [0, 0, 4, 0], "the stages'");
+    // A pick whose one target its caller passes over: nothing is written.
+    let (lost, alone) = (prompt(3_000, 4), picked(3, bed.ids[3]));
+    assert_eq!(decided(&lost, alone), [0; 4]);
+    assert_eq!(decided(&lost, shed()), [0; 4], "to none");
 }
 
 /// A request's entry prints its sizes and none of its ids: no line the
@@ -1455,7 +1443,7 @@ fn an_entrys_debug_form_holds_no_token() {
 /// The host's token tree takes the prompt of a pick the binding's sessions
 /// rule placed alone by the rule's own word of it, as the record of hashed
 /// prefixes does
-/// ([`a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word_at_both_writes`]).
+/// ([`a_pick_the_sessions_rule_placed_is_recorded_by_the_rules_word`]).
 /// A pick the rule keeps from the profile leaves no prompt in the tree. One
 /// that is the profile's own is written as a pick by the profile's stages
 /// is. The lookup returns the answer it is handed either way, but for what
@@ -1513,8 +1501,8 @@ fn a_token_tree_names_the_worker_a_prefix_was_sent_to() {
     let short = &asked[..BLOCK as usize - 1];
     assert!(bed.keyed(short, 0, Some(2)).is_empty());
     assert!(bed.keyed(short, 0, None).is_empty());
-    // A host that names no entry reads the record of hashed prefixes, which
-    // no request above wrote.
+    // A request that names no entry is named nobody: no tree is read for
+    // it, and no record.
     assert!(bed.holders(&prompt(1_000, 4), NOW).is_empty());
 }
 
@@ -1810,8 +1798,8 @@ fn a_string_tree_names_the_worker_a_text_was_sent_to() {
     let short = &text(7_000, 1)[..WINDOW - 1];
     assert!(bed.worded(short, 0, Some(2)).is_empty());
     assert_eq!(bed.worded(short, 0, None), [(2, 0, 0)]);
-    // A host that names no entry reads the record of hashed windows, which
-    // no request above wrote.
+    // A request that names no entry is named nobody: no tree is read for
+    // it, and no record.
     assert!(bed.holders(&worded(&asked), NOW).is_empty());
 }
 
@@ -1819,8 +1807,8 @@ fn a_string_tree_names_the_worker_a_text_was_sent_to() {
 /// token blocks. So a host whose index holds a block still lends its string
 /// tree, and a request of text is decided inside it. A tokenized request
 /// under the same host is never asked for a text entry, and neither is a
-/// request of text whose host lends no string tree: that one is named its
-/// rows from the record of hashed windows, as before.
+/// request of text whose host lends no string tree: that one is named no
+/// holder.
 ///
 /// A host that keeps no index and lends both trees has each request
 /// decided in the tree of its kind. A request of text is asked for its
@@ -1862,11 +1850,11 @@ fn a_request_of_text_is_decided_in_the_string_tree_beside_an_index() {
     let (tokenized, of_text) = (prompt(1_000, 4), worded(&text(2_000, 4)));
     assert_eq!(asks(&bed, &request(&of_text, 7, NOW)), 1);
     assert_eq!(asks(&bed, &request(&tokenized, 7, NOW)), 0);
-    // A host that lends its token tree alone: the record takes the text.
+    // A host that lends its token tree alone: a text is named nobody.
     let (affinity, _tree) = lending(false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
     assert_eq!(asks(&bed, &request(&of_text, 7, NOW)), 0);
-    assert_eq!(bed.holders(&of_text, NOW), [(1, 0, 4)]);
+    assert!(bed.holders(&of_text, NOW).is_empty());
 
     // A host that lends both trees. How often a decision of `facts` asks
     // for each entry, the token tree's first, where the request names
@@ -2107,14 +2095,14 @@ fn a_held_request_of_text_is_named_a_trees_workers_among_its_places() {
 }
 
 /// A pick that meets a held record waits for nobody and leaves nothing out:
-/// its thread keeps the write, reads it at its own namings and writes it on
+/// its thread keeps the write, reads it in its own columns and writes it on
 /// behind its next pick. Until then another thread reads the record alone.
 #[test]
 fn a_pick_that_meets_a_held_record_keeps_its_prefix_for_its_thread() {
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let bed = Bed::new(affinity, handed_whole(), 4);
     let asked = prompt(1_000, 4);
-    assert!(bed.holders(&asked, NOW).is_empty());
+    assert!(bed.holding(&asked, NOW).is_empty());
     let record = {
         let records = bed.affinity.records.lock();
         Arc::clone(records.get(MODEL).expect("the model's record"))
@@ -2122,7 +2110,7 @@ fn a_pick_that_meets_a_held_record_keeps_its_prefix_for_its_thread() {
     // What a thread that keeps no write reads.
     let elsewhere = || {
         thread::scope(|scope| {
-            let reader = scope.spawn(|| bed.holders(&asked, NOW));
+            let reader = scope.spawn(|| bed.holding(&asked, NOW));
             reader.join().expect("a reader")
         })
     };
@@ -2131,7 +2119,7 @@ fn a_pick_that_meets_a_held_record_keeps_its_prefix_for_its_thread() {
         bed.decide(&request(&asked, 7, NOW), Some(2));
     }
     assert_eq!(bed.affinity.left_out(), 0);
-    assert_eq!(bed.holders(&asked, NOW), [(2, 0, 4)]);
+    assert_eq!(bed.holding(&asked, NOW), [(2, 0, 4)]);
     assert!(elsewhere().is_empty());
     // The thread's next pick writes the kept prefix on.
     bed.decide(&request(&asked, 7, NOW), Some(2));
@@ -2143,7 +2131,7 @@ fn a_pick_that_meets_a_held_record_keeps_its_prefix_for_its_thread() {
         bed.decide(&request(&asked, 7, NOW + 2 * SECOND), Some(2));
     }
     assert_eq!(bed.affinity.left_out(), 0);
-    // A leave stops a write a thread keeps: the thread names the worker no
+    // A leave stops a write a thread keeps: the thread reads the worker no
     // more, and the write goes uncounted with the thread's buffers.
     let longer = prompt(1_000, 6);
     thread::scope(|scope| {
@@ -2152,9 +2140,9 @@ fn a_pick_that_meets_a_held_record_keeps_its_prefix_for_its_thread() {
                 let _reader = record.predictor.read();
                 bed.decide(&request(&longer, 7, NOW + 2 * SECOND), Some(2));
             }
-            let kept = bed.holders(&longer, NOW + 2 * SECOND);
+            let kept = bed.holding(&longer, NOW + 2 * SECOND);
             bed.affinity.forget(bed.ids[2]);
-            (kept, bed.holders(&longer, NOW + 2 * SECOND))
+            (kept, bed.holding(&longer, NOW + 2 * SECOND))
         });
         let (kept, left) = keeper.join().expect("a keeper");
         assert_eq!(kept, [(2, 0, 6)]);
@@ -2166,18 +2154,18 @@ fn a_pick_that_meets_a_held_record_keeps_its_prefix_for_its_thread() {
 /// A thread keeps the newest eight writes. A longer prompt sent to the
 /// worker a kept write of its leading part waits for takes that write's
 /// place as the newest of them: the two turns are one write. A ninth write
-/// pushes the oldest out, which is counted, and the thread names its worker
+/// pushes the oldest out, which is counted, and the thread reads its worker
 /// no more.
 #[test]
 fn a_thread_keeps_eight_writes_and_a_conversations_turns_are_one() {
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let bed = Bed::new(affinity, handed_whole(), 4);
     let first = prompt(1_000, 4);
     let second = prompt(1_000, 6);
     let other = prompt(2_000, 4);
     let ninth = prompt(9_000, 4);
     // The first read makes the model's record.
-    assert!(bed.holders(&first, NOW).is_empty());
+    assert!(bed.holding(&first, NOW).is_empty());
     thread::scope(|scope| {
         let keeper = scope.spawn(|| {
             let eight = bed.affinity.while_held(|| {
@@ -2191,17 +2179,17 @@ fn a_thread_keeps_eight_writes_and_a_conversations_turns_are_one() {
                 }
                 let eight = (
                     bed.affinity.left_out(),
-                    bed.holders(&other, NOW),
-                    bed.holders(&second, NOW),
+                    bed.holding(&other, NOW),
+                    bed.holding(&second, NOW),
                 );
                 bed.decide(&request(&ninth, 7, NOW), Some(2));
                 eight
             });
             let nine = (
                 bed.affinity.left_out(),
-                bed.holders(&other, NOW),
-                bed.holders(&second, NOW),
-                bed.holders(&ninth, NOW),
+                bed.holding(&other, NOW),
+                bed.holding(&second, NOW),
+                bed.holding(&ninth, NOW),
             );
             (eight, nine)
         });
@@ -2340,22 +2328,22 @@ fn a_write_a_leave_made_stale_takes_no_kept_write_with_it() {
 fn a_stale_kept_write_leaves_for_the_write_that_continues_it() {
     let (affinity, _, _) = hosted(false);
     let (beside, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 4);
-    let other = Bed::new(beside, preset("cache_aware"), 4);
+    let bed = Bed::new(affinity, handed_whole(), 4);
+    let other = Bed::new(beside, handed_whole(), 4);
     let (whole, leading) = (prompt(1_000, 4), prompt(1_000, 2));
     // The first reads make the two records.
-    assert!(bed.holders(&whole, NOW).is_empty());
-    assert!(other.holders(&whole, NOW).is_empty());
+    assert!(bed.holding(&whole, NOW).is_empty());
+    assert!(other.holding(&whole, NOW).is_empty());
     thread::scope(|scope| {
         let keeper = scope.spawn(|| {
             other.affinity.while_held(|| {
                 bed.affinity.while_held(|| {
                     // The oldest of the eight is the other record's.
-                    other.decide(&request(&prompt(8_000, 4), 7, NOW), Some(2));
-                    bed.decide(&request(&leading, 7, NOW), Some(1));
+                    other.handed(&request(&prompt(8_000, 4), 7, NOW), Some(2));
+                    bed.handed(&request(&leading, 7, NOW), Some(1));
                     for more in 2..8 {
                         let asked = prompt(1_000 * more, 4);
-                        bed.decide(&request(&asked, 7, NOW), Some(2));
+                        bed.handed(&request(&asked, 7, NOW), Some(2));
                     }
                 });
             });
@@ -2363,7 +2351,7 @@ fn a_stale_kept_write_leaves_for_the_write_that_continues_it() {
             other.affinity.while_held(|| {
                 bed.affinity.while_held(|| {
                     let longer = request(&whole, 7, NOW);
-                    bed.decide(&longer, Some(1));
+                    bed.handed(&longer, Some(1));
                     let kept = held(&bed.column(&longer, Phase::Single).0);
                     (other.affinity.left_out(), bed.affinity.left_out(), kept)
                 })
@@ -2447,15 +2435,15 @@ fn a_stale_kept_write_met_held_leaves_and_the_write_behind_it_is_written() {
     for leading in [false, true] {
         let (affinity, _, _) = hosted(false);
         let (beside, _, _) = hosted(false);
-        let bed = Bed::new(affinity, preset("cache_aware"), 4);
-        let other = Bed::new(beside, preset("cache_aware"), 4);
+        let bed = Bed::new(affinity, handed_whole(), 4);
+        let other = Bed::new(beside, handed_whole(), 4);
         let (stale, behind) = (prompt(1_000, 4), prompt(8_000, 4));
         // The first reads make the two records.
-        assert!(bed.holders(&stale, NOW).is_empty());
-        assert!(other.holders(&behind, NOW).is_empty());
+        assert!(bed.holding(&stale, NOW).is_empty());
+        assert!(other.holding(&behind, NOW).is_empty());
         // What the record holds of the stale write's request ahead of it.
         let stood = if leading {
-            bed.decide(&request(&prompt(1_000, 2), 7, NOW), Some(1));
+            bed.handed(&request(&prompt(1_000, 2), 7, NOW), Some(1));
             vec![(1, 0, 2)]
         } else {
             Vec::new()
@@ -2463,18 +2451,18 @@ fn a_stale_kept_write_met_held_leaves_and_the_write_behind_it_is_written() {
         thread::scope(|scope| {
             let keeper = scope.spawn(|| {
                 bed.affinity
-                    .while_held(|| bed.decide(&request(&stale, 7, NOW), Some(1)));
+                    .while_held(|| bed.handed(&request(&stale, 7, NOW), Some(1)));
                 bed.affinity.forget(bed.ids[3]);
                 other
                     .affinity
-                    .while_held(|| other.decide(&request(&behind, 7, NOW), Some(2)));
+                    .while_held(|| other.handed(&request(&behind, 7, NOW), Some(2)));
                 // The pick that writes the kept writes on.
                 bed.affinity
-                    .while_held(|| other.decide(&request(&prompt(9_000, 4), 7, NOW), Some(3)));
+                    .while_held(|| other.handed(&request(&prompt(9_000, 4), 7, NOW), Some(3)));
                 // What a thread that keeps no write reads.
                 thread::scope(|scope| {
                     let reader =
-                        scope.spawn(|| (other.holders(&behind, NOW), bed.holders(&stale, NOW)));
+                        scope.spawn(|| (other.holding(&behind, NOW), bed.holding(&stale, NOW)));
                     reader.join().expect("a reader")
                 })
             });
@@ -2485,6 +2473,53 @@ fn a_stale_kept_write_met_held_leaves_and_the_write_behind_it_is_written() {
         let left_out = (bed.affinity.left_out(), other.affinity.left_out());
         assert_eq!(left_out, (0, 0), "leading: {leading}");
     }
+}
+
+/// A named decision writes no kept write on. A write that met its record
+/// held is written on behind its thread's next pick that writes a record: a
+/// pair side's, or a single decision's that is handed its column whole. A
+/// decision that is named its rows reads and writes no record, so it writes
+/// none on. A thread keeps a column decision's write and then decides a
+/// named request by a pick. The write still waits: a thread that keeps none
+/// reads nothing of it. The keeper's next column decision writes it on, and
+/// nothing is left out.
+///
+/// A gateway's own policy keeps no write for later: it stores a request in
+/// its tree inside the walk that selects its worker,
+/// `select_worker_with_tokens` (`model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn a_named_decision_writes_no_kept_write_on() {
+    let (affinity, _, _) = hosted(false);
+    let (beside, _, _) = hosted(false);
+    let bed = Bed::new(affinity, handed_whole(), 4);
+    let named = Bed::new(beside, preset("cache_aware"), 4);
+    let (kept, next) = (prompt(1_000, 4), prompt(2_000, 4));
+    // The first read makes the record.
+    assert!(bed.holding(&kept, NOW).is_empty());
+    thread::scope(|scope| {
+        let keeper = scope.spawn(|| {
+            bed.affinity
+                .while_held(|| bed.handed(&request(&kept, 7, NOW), Some(1)));
+            // What a thread that keeps no write reads of the kept one.
+            let elsewhere = || {
+                thread::scope(|scope| {
+                    let reader = scope.spawn(|| bed.holding(&kept, NOW));
+                    reader.join().expect("a reader")
+                })
+            };
+            // A named decision's pick: it writes no record, and none on.
+            let rows = named.decide(&request(&prompt(8_000, 4), 7, NOW), Some(2));
+            assert!(rows.is_some(), "the request is named its rows");
+            let waits = elsewhere();
+            // The keeper's next column decision writes the kept write on.
+            bed.handed(&request(&next, 7, NOW), Some(3));
+            (waits, elsewhere())
+        });
+        let (waits, written) = keeper.join().expect("a keeper");
+        assert!(waits.is_empty(), "the kept write waits: {waits:?}");
+        assert_eq!(written, [(1, 0, 4)]);
+    });
+    assert_eq!(bed.affinity.left_out(), 0);
 }
 
 /// A pick of a worker the record holds the whole request for leaves nothing
@@ -2519,9 +2554,9 @@ fn a_pick_of_a_holder_past_the_kept_rows_leaves_nothing_out() {
 #[test]
 fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let bed = Bed::new(affinity, handed_whole(), 4);
     let asked = prompt(1_000, 4);
-    let holders_behind = |leave: &dyn Fn()| {
+    let holding_behind = |leave: &dyn Fn()| {
         let decision = decide(
             &bed.affinity,
             &bed.pool,
@@ -2539,11 +2574,11 @@ fn a_worker_that_leaves_under_its_first_pick_is_given_no_place() {
             },
         );
         assert!(decision.pick().is_some());
-        bed.holders(&asked, NOW)
+        bed.holding(&asked, NOW)
     };
-    assert!(holders_behind(&|| bed.affinity.forget(bed.ids[2])).is_empty());
+    assert!(holding_behind(&|| bed.affinity.forget(bed.ids[2])).is_empty());
     let standing = [bed.ids[0], bed.ids[1], bed.ids[3]];
-    assert!(holders_behind(&|| bed.affinity.keep(&standing)).is_empty());
+    assert!(holding_behind(&|| bed.affinity.keep(&standing)).is_empty());
 }
 
 /// A worker that left behind a decision's read of the record is given no
@@ -2622,12 +2657,14 @@ fn a_record_made_anew_begins_past_the_greatest_count_that_left() {
 
 /// A pin's answer made ahead of a leave and handed through the lookup
 /// behind it gives its worker no place; with no leave between it writes.
+/// The profile is handed its column whole: behind a decision that is named
+/// its rows the lookup writes no record.
 #[test]
 fn an_answer_made_ahead_of_a_leave_gives_its_worker_no_place() {
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let bed = Bed::new(affinity, handed_whole(), 4);
     let asked = prompt(1_000, 4);
-    let holders_behind = |leave: &dyn Fn()| {
+    let holding_behind = |leave: &dyn Fn()| {
         let (leaves, made) = (bed.affinity.leaves(), picked(2, bed.ids[2]));
         leave();
         let decision = decide_behind(
@@ -2645,12 +2682,12 @@ fn an_answer_made_ahead_of_a_leave_gives_its_worker_no_place() {
             made,
         );
         assert!(decision.pick().is_some());
-        bed.holders(&asked, NOW)
+        bed.holding(&asked, NOW)
     };
-    assert_eq!(holders_behind(&|| bed.affinity.forget(bed.ids[2])), []);
+    assert_eq!(holding_behind(&|| bed.affinity.forget(bed.ids[2])), []);
     let standing = [bed.ids[0], bed.ids[1], bed.ids[3]];
-    assert_eq!(holders_behind(&|| bed.affinity.keep(&standing)), []);
-    assert_eq!(holders_behind(&|| ()), [(2, 0, 4)]);
+    assert_eq!(holding_behind(&|| bed.affinity.keep(&standing)), []);
+    assert_eq!(holding_behind(&|| ()), [(2, 0, 4)]);
 }
 
 /// A list of no worker is read no table: its request is named no holder, no
@@ -2673,7 +2710,7 @@ fn a_list_of_no_worker_keeps_no_record() {
 #[test]
 fn a_record_leaves_behind_its_models_last_worker() {
     let (affinity, _, _) = hosted(false);
-    let mut bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let mut bed = Bed::new(affinity, handed_whole(), 1);
     let asked = prompt(1_000, 4);
     bed.decide(&request(&asked, 7, NOW), Some(0));
     bed.affinity.records.lock()[MODEL]
@@ -2682,7 +2719,7 @@ fn a_record_leaves_behind_its_models_last_worker() {
     // The list is published again, with no table yet; its worker stands.
     bed.pool = PoolAffinity::default();
     bed.affinity.sweep();
-    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 4)]);
+    assert_eq!(bed.holding(&asked, NOW), [(0, 0, 4)]);
     bed.affinity.forget(bed.ids[0]);
     bed.affinity.sweep();
     assert_eq!(bed.affinity.records.lock().len(), 1, "a table reads it");
@@ -2698,20 +2735,20 @@ fn a_record_leaves_behind_its_models_last_worker() {
 #[test]
 fn a_long_prompt_is_recorded_whole() {
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let bed = Bed::new(affinity, handed_whole(), 4);
     let asked = prompt(1_000, 40);
     let blocks = hashes_of(&asked).len() as u32;
     assert!(blocks > 32, "the document reads {blocks} blocks");
     bed.decide(&request(&asked, 7, NOW), Some(2));
-    assert_eq!(bed.holders(&asked, NOW), [(2, 0, blocks)]);
+    assert_eq!(bed.holding(&asked, NOW), [(2, 0, blocks)]);
 }
 
 /// A single request of token ids under a model whose index holds a block
-/// is decided by the index alone: the record of sent prefixes is neither
-/// read nor written for it. A worker the record holds the request for is
-/// named no more once the index holds a block, and a pick beside the index
-/// leaves no entry. A request of text reads no index, and the record speaks
-/// for it as before.
+/// is decided by the index alone, where its profile is handed the column
+/// whole too: the record of sent prefixes is neither read nor written for
+/// it. A worker the record holds the request for is read no more once the
+/// index holds a block, and a pick beside the index leaves no entry. A
+/// request of text reads no index, and the record speaks for it as before.
 ///
 /// The classic policy takes its event path wherever the model's index
 /// holds a block and the request holds token ids, and reads no tree there
@@ -2722,18 +2759,18 @@ fn the_index_decides_a_single_request_of_token_ids_alone() {
     let (affinity, _, index) = hosted(true);
     let index = index.expect("the index");
     let asked = prompt(1_000, 4);
-    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let bed = Bed::new(affinity, handed_whole(), 4);
     // The index holds no block yet, so its host hands none: the record
     // takes the request's prefix for the fourth worker.
     bed.decide(&request(&asked, 7, NOW), Some(3));
-    assert_eq!(bed.holders(&asked, NOW), [(3, 0, 4)]);
+    assert_eq!(bed.holding(&asked, NOW), [(3, 0, 4)]);
     // A column filled beside no index keeps what it read of the record.
     let (filled_before, before) = bed.column(&request(&asked, 7, NOW), Phase::Single);
     let before = before.expect("the record speaks while the index holds no block");
     // The index holds two of the request's blocks for the first worker, and
     // decides alone from the table's next read.
     store(&index, 0, &hashes_of(&asked)[..2]);
-    assert_eq!(bed.holders(&asked, NOW + SECOND), [(0, 2, 0)]);
+    assert_eq!(bed.holding(&asked, NOW + SECOND), [(0, 2, 0)]);
     // The list's column reads no record either: the fourth worker's entry
     // holds no prefix.
     let later = request(&asked, 7, NOW + SECOND);
@@ -2747,7 +2784,7 @@ fn the_index_decides_a_single_request_of_token_ids_alone() {
     bed.decide(&later, Some(2));
     let (list, id) = (&bed.pool, bed.ids[1]);
     record_by_column(list, Phase::Single, &later, before, &filled_before, id);
-    assert_eq!(bed.holders(&asked, NOW + SECOND), [(0, 2, 0)]);
+    assert_eq!(bed.holding(&asked, NOW + SECOND), [(0, 2, 0)]);
     {
         let standing = bed.pool.table.load();
         let table = standing.as_deref().expect("the list's table");
@@ -2757,27 +2794,28 @@ fn the_index_decides_a_single_request_of_token_ids_alone() {
     // The same windows as text: the record takes the pick's write.
     let words = worded(&text(1_000, 4));
     bed.decide(&request(&words, 7, NOW + SECOND), Some(2));
-    assert_eq!(bed.holders(&words, NOW + SECOND), [(2, 0, 4)]);
+    assert_eq!(bed.holding(&words, NOW + SECOND), [(2, 0, 4)]);
 }
 
 /// A request hashed by its text asks no index, so the record of sent
-/// prefixes speaks for every worker of its list. The pick of a worker the
-/// index holds blocks for writes the text's prefix for it, and the repeat is
-/// named that worker. So is a write that met a held record and waits with
-/// its thread. The classic router sends a request with no token ids to its
-/// tree of sent texts whatever its index of cache events holds
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`), and reads and
-/// writes that tree for any worker of the list (`:3519-3596`).
+/// prefixes speaks for every worker of its list's column. The pick of a
+/// worker the index holds blocks for writes the text's prefix for it, and
+/// the column of the repeat holds it. So does a write that met a held
+/// record and waits with its thread. The classic router sends a request
+/// with no token ids to its tree of sent texts whatever its index of cache
+/// events holds (`select_worker_scanned` in
+/// `model_gateway/src/policies/cache_aware.rs`), and reads and writes that
+/// tree for any worker of the list (`select_worker_with_text`).
 ///
 /// A request hashed by token blocks answers as before beside it: its pick of
-/// that worker writes no entry, and the index alone names the worker.
+/// that worker writes no entry, and the index alone speaks for the worker.
 #[test]
 fn a_request_of_text_is_recorded_for_a_worker_the_index_holds_blocks_for() {
     let (affinity, _, index) = hosted(true);
     let index = index.expect("the index");
     let tokens = prompt(1_000, 4);
     store(&index, 0, &hashes_of(&tokens)[..2]);
-    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let bed = Bed::new(affinity, handed_whole(), 4);
     let said = text(1_000, 4);
     let asked = worded(&said);
     let facts = request(&asked, 7, NOW);
@@ -2786,11 +2824,11 @@ fn a_request_of_text_is_recorded_for_a_worker_the_index_holds_blocks_for() {
         (HashKind::Text, 4)
     );
     assert!(
-        bed.holders(&asked, NOW).is_empty(),
+        bed.holding(&asked, NOW).is_empty(),
         "nobody was sent the text, whatever the index holds"
     );
     bed.decide(&facts, Some(0));
-    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 4)]);
+    assert_eq!(bed.holding(&asked, NOW), [(0, 0, 4)]);
     let record = {
         let records = bed.affinity.records.lock();
         Arc::clone(records.get(MODEL).expect("the model's record"))
@@ -2798,7 +2836,7 @@ fn a_request_of_text_is_recorded_for_a_worker_the_index_holds_blocks_for() {
     assert_eq!(record.predictor.read().len(), 4, "one placement a window");
 
     bed.decide(&request(&tokens, 7, NOW), Some(0));
-    assert_eq!(bed.holders(&tokens, NOW), [(0, 2, 0)]);
+    assert_eq!(bed.holding(&tokens, NOW), [(0, 2, 0)]);
     assert_eq!(
         record.predictor.read().len(),
         4,
@@ -2813,130 +2851,26 @@ fn a_request_of_text_is_recorded_for_a_worker_the_index_holds_blocks_for() {
         bed.decide(&request(&waiting, 7, NOW), Some(0));
     }
     assert_eq!(record.predictor.read().len(), 4, "the write waits");
-    assert_eq!(bed.holders(&waiting, NOW), [(0, 0, 4)]);
+    assert_eq!(bed.holding(&waiting, NOW), [(0, 0, 4)]);
     assert_eq!(bed.affinity.left_out(), 0);
-}
-
-/// A profile whose prefix stage reads sent prefixes alone
-/// (`source: predictor`) is named the worker a request with token ids was
-/// sent to, though the index holds a block for that worker, and its pick of
-/// such a worker is written. No stage of it reads what the index holds, so
-/// the record speaks to it for every worker of its list. So does a write
-/// that met a held record and waits with its thread. Before, the record was
-/// neither read nor written for such a worker, and the request was never
-/// named one.
-///
-/// The gateway's own cache-aware selection reads its approximate token tree
-/// alone where the model has no index of cache events that holds a block
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1534`, `event_index_for`
-/// at `:1802-1818`). There one walk of the tree matches a request with token
-/// ids against every worker a prefix was sent to and stores it for the
-/// worker chosen (`select_worker_with_tokens`, `:3430-3516`). It has no
-/// setting that reads the tree alone beside an index that holds blocks, and
-/// it keeps one policy a model (`model_gateway/src/policies/registry.rs:242`):
-/// the reading beside an index is the engine's own.
-///
-/// The preset, whose prefix stage reads cache events too, answers as before
-/// over the same list: its pick of such a worker writes nothing. So the
-/// profile that reads alone knows no send the preset placed there. Once the
-/// index holds the request for the worker the record names, the two stand as
-/// one holder with both counts.
-#[test]
-fn a_profile_that_reads_sent_prefixes_alone_is_named_a_worker_the_index_holds_blocks_for() {
-    let (affinity, _, index) = hosted(true);
-    let index = index.expect("the index");
-    let other = hashes_of(&prompt(9_000, 1));
-    store(&index, 0, &other);
-    store(&index, 1, &other);
-    let asked = prompt(1_000, 4);
-    let facts = request(&asked, 7, NOW);
-
-    let merged = Bed::new(affinity, preset("cache_aware"), 2);
-    merged.decide(&facts, Some(1));
-    assert!(
-        merged.holders(&asked, NOW).is_empty(),
-        "the preset's pick of a worker with a block writes nothing"
-    );
-
-    // The same list, index and record under the profile that reads alone.
-    let alone = Bed {
-        pool: PoolAffinity::default(),
-        spec: alone_sampled(2),
-        ..merged
-    };
-    assert!(
-        alone.holders(&asked, NOW).is_empty(),
-        "no send the preset placed there is known"
-    );
-    alone.decide(&facts, Some(1));
-    assert_eq!(alone.holders(&asked, NOW), [(1, 0, 4)]);
-    let record = {
-        let standing = alone.pool.table.load();
-        let table = standing.as_deref().expect("the list's table");
-        assert!(
-            table.alone && !table.unheard_any,
-            "the index holds a block for every worker"
-        );
-        Arc::clone(table.record.as_ref().expect("the model's record"))
-    };
-    assert_eq!(record.predictor.read().len(), 4, "one placement a block");
-
-    // Another prompt's write meets a held record: its thread reads it kept.
-    let waiting = prompt(5_000, 4);
-    {
-        let _reader = record.predictor.read();
-        alone.decide(&request(&waiting, 7, NOW), Some(0));
-    }
-    assert_eq!(record.predictor.read().len(), 4, "the write waits");
-    assert_eq!(alone.holders(&waiting, NOW), [(0, 0, 4)]);
-
-    // The table read a second on finds the request's blocks in the index.
-    store(&index, 1, &hashes_of(&asked));
-    assert_eq!(alone.holders(&asked, NOW + SECOND), [(1, 4, 4)]);
-    assert_eq!(alone.affinity.left_out(), 0);
-}
-
-/// Under a profile that reads sent prefixes alone, a worker the record and
-/// the index both name stands once in a naming, with both counts. The
-/// record's holders are named first and the index is asked in the room they
-/// leave. Such a worker has taken two of the sample's places before the two
-/// are made one, so the naming can stand short of the sample, by an entry
-/// of the index's own.
-#[test]
-fn a_worker_the_record_and_the_index_both_name_stands_once_in_a_naming() {
-    let (affinity, _, index) = hosted(true);
-    let index = index.expect("the index");
-    let asked = prompt(1_000, 4);
-    for at in 0..3 {
-        store(&index, at, &hashes_of(&asked));
-    }
-    let bed = Bed::new(affinity, alone_sampled(2), 3);
-    bed.decide(&request(&asked, 7, NOW), Some(1));
-    let mut short = 0;
-    for seed in 0..32 {
-        let named = bed.decide(&request(&asked, seed, NOW), None);
-        match named.expect("rows").holders[..] {
-            // The index's one place went to the worker the record named.
-            [(1, 4, 4)] => short += 1,
-            [(0, 4, 0), (1, 0, 4)] | [(1, 0, 4), (2, 4, 0)] => {}
-            ref other => panic!("seed {seed}: {other:?}"),
-        }
-    }
-    assert!(
-        (1..32).contains(&short),
-        "{short} of 32 namings stand one short"
-    );
 }
 
 /// A profile that reads cache events too is named no send to a worker the
 /// index holds a block for, beside a profile that reads sent prefixes alone
-/// over the same list and record. The second sent a whole prompt to such a
-/// worker, and keeps another such write with its thread where it met a held
-/// record. A pair's decode side under the first reads past both: it still
-/// holds the shorter prefix it sent itself to a worker with no block, for
-/// that worker alone, in its list's column and in the holders a decode
-/// asked alone is named. A single request under the first is named no send
-/// at all: the index decides it alone.
+/// over the same list and record. The second is handed its column whole. It
+/// sent a whole prompt to such a worker, and keeps another such write with
+/// its thread where it met a held record. A pair's decode side under the
+/// first reads past both: its list's column still holds the shorter prefix
+/// it sent itself to a worker with no block, for that worker alone.
+///
+/// A decode asked alone is named its rows, so it reads no record: the index
+/// holds none of the prompt, and it is named nobody. The classic router
+/// keeps one policy object for a pair's decode side (`get_decode_policy`
+/// in `model_gateway/src/policies/registry.rs`), and a pair's selection
+/// asks it (`pair_pass` in `model_gateway/src/routers/common/placement.rs`):
+/// it has no decode asked alone under another policy. A single request
+/// under the first profile is named no send at all: the index decides it
+/// alone.
 #[test]
 fn a_profile_that_reads_cache_events_is_named_no_send_to_a_worker_the_index_holds_blocks_for() {
     let (affinity, _, index) = hosted(true);
@@ -2970,17 +2904,18 @@ fn a_profile_that_reads_cache_events_is_named_no_send_to_a_worker_the_index_hold
             (held(&column_of), named.holders)
         })
     };
-    let short = (vec![(0, 0), (0, 0), (0, 2)], vec![(2, 0, 2)]);
+    let short = (vec![(0, 0), (0, 0), (0, 2)], vec![]);
     assert_eq!(holds(&side), [short.clone(), short.clone()]);
 
-    // The profile that reads alone sends each whole prompt to a worker with
-    // a block: one write stands in the record, the other waits.
+    // The profile that reads alone is handed its column whole. It sends
+    // each whole prompt to a worker with a block: one write stands in the
+    // record, the other waits.
     let alone = Bed {
         pool: PoolAffinity::default(),
-        spec: alone_sampled(2),
+        spec: named_no_row(reading_alone),
         ..side
     };
-    alone.decide(&request(&written, 7, NOW), Some(1));
+    alone.handed(&request(&written, 7, NOW), Some(1));
     let record = {
         let standing = alone.pool.table.load();
         let table = standing.as_deref().expect("the list's table");
@@ -2989,14 +2924,15 @@ fn a_profile_that_reads_cache_events_is_named_no_send_to_a_worker_the_index_hold
     let placements = record.predictor.read().len();
     {
         let _reader = record.predictor.read();
-        alone.decide(&request(&waiting, 7, NOW), Some(0));
+        alone.handed(&request(&waiting, 7, NOW), Some(0));
     }
     assert_eq!(record.predictor.read().len(), placements, "the write waits");
-    assert_eq!(alone.holders(&written, NOW), [(1, 0, 4)]);
-    assert_eq!(alone.holders(&waiting, NOW), [(0, 0, 4)]);
+    let sent = |prompt| alone.handed(&request(prompt, 7, NOW), None);
+    assert_eq!(sent(&written), [(0, 0), (0, 4), (0, 0)]);
+    assert_eq!(sent(&waiting), [(0, 4), (0, 0), (0, 0)]);
 
     // The side holds no more: the second worker was sent the first prompt's
-    // two blocks too, and neither its entry nor a naming holds them.
+    // whole four blocks, and the side's column holds none of them.
     let side = Bed {
         pool: PoolAffinity::default(),
         spec: paired(),
@@ -3337,9 +3273,10 @@ fn lending_whenever() -> (Affinity, Arc<ChainIndex>, Arc<TokenTree>) {
 /// worker's events store a block, the next decision finds the index's word
 /// moved and reads the table again inside its second. The index then names
 /// the request's holder alone, and no tree's match is made. The classic
-/// policy asks its index before every request
-/// (`model_gateway/src/policies/cache_aware.rs:1802-1808`) and decides by
-/// the index alone once it holds a block (`:1516-1524`).
+/// policy asks its index before every request of token ids
+/// (`event_index_for` in `model_gateway/src/policies/cache_aware.rs`) and
+/// decides by the index alone once it holds a block
+/// (`select_worker_scanned`).
 #[test]
 fn a_models_first_block_decides_the_next_request_by_the_index() {
     let (affinity, index, _tree) = lending_whenever();
@@ -3397,9 +3334,9 @@ fn a_models_first_block_names_a_single_request_its_young_worker() {
 /// reads the table again inside its second, and is decided inside the lent
 /// token tree: it is named the worker the tree was written for, and not the
 /// worker picked under the index. The classic policy reads an index that
-/// holds no block as no index
-/// (`model_gateway/src/policies/cache_aware.rs:1806-1808`) and decides in
-/// its token tree (`:1525-1533`).
+/// holds no block as no index (`event_index_for` in
+/// `model_gateway/src/policies/cache_aware.rs`) and decides in its token
+/// tree (`select_worker_scanned`).
 #[test]
 fn the_last_blocks_leaving_returns_the_next_request_to_the_tree() {
     let (affinity, index, _tree) = lending_whenever();
@@ -3421,9 +3358,9 @@ fn the_last_blocks_leaving_returns_the_next_request_to_the_tree() {
 
 /// A table handed an index that holds no block reads as a table handed
 /// none. No worker is asked for its number and the index's lookup is not
-/// made. Under a host that lends no tree, the record of sent prefixes
-/// speaks for every worker of the list: a pick is written there, and the
-/// next request is named its worker.
+/// made, and its count of numbers handed on is read with the table and by
+/// no decision behind it. Under a host that lends no tree the request is
+/// named nobody, and its pick is written nowhere.
 #[test]
 fn an_index_that_holds_no_block_is_read_as_no_index() {
     /// An index that holds no block, and counts what it is asked.
@@ -3431,12 +3368,18 @@ fn an_index_that_holds_no_block_is_read_as_no_index() {
     struct Empty {
         numbers: AtomicUsize,
         lookups: AtomicUsize,
+        counts: AtomicUsize,
     }
 
     impl CacheIndex for Empty {
         fn worker_number(&self, _: &str) -> Option<u32> {
             self.numbers.fetch_add(1, Ordering::Relaxed);
             None
+        }
+
+        fn numbers_reused(&self) -> u64 {
+            self.counts.fetch_add(1, Ordering::Relaxed);
+            0
         }
 
         fn holds_a_block(&self) -> bool {
@@ -3481,9 +3424,11 @@ fn an_index_that_holds_no_block_is_read_as_no_index() {
     let asked = prompt(1_000, 4);
     let picked = bed.decide(&request(&asked, 7, NOW), Some(0));
     assert!(picked.expect("rows named").holders.is_empty());
-    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 4)], "by the record");
+    assert!(bed.holders(&asked, NOW).is_empty(), "nobody is named");
     assert_eq!(empty.numbers.load(Ordering::Relaxed), 0, "no number asked");
     assert_eq!(empty.lookups.load(Ordering::Relaxed), 0, "no lookup made");
+    let counts = empty.counts.load(Ordering::Relaxed);
+    assert_eq!(counts, 1, "the count is read with the table alone");
 }
 
 /// A host that hands no index while its index holds no block, and whose
@@ -3640,6 +3585,158 @@ fn a_decision_that_meets_a_table_being_read_decides_by_the_one_that_stands() {
     assert!(met.tree.is_some(), "inside the tree");
 }
 
+/// A profile that reads sent prefixes alone is decided inside the lent
+/// token tree under a model whose index holds a block too. No stage of it
+/// reads the index's holders, so its table asks for the tree beside
+/// the index: its request is named the worker the tree was written for,
+/// and not the index's holder of the same prompt. Where its host names no
+/// entry, it is named nobody: the index names it nothing. A profile that
+/// reads cache events is named the index's holder alone, over the same
+/// host. The classic policy names a request from one record of three
+/// (`select_worker_scanned` in `model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn a_reader_of_sent_prefixes_alone_is_decided_in_the_token_tree_beside_an_index() {
+    let (affinity, index, _tree) = lending_whenever();
+    let asked = tokens(1_000, 4);
+    // Worker 2 holds the prompt by its events.
+    store(&index, 2, &hashes_of(&hashed(&asked)));
+    let alone = Bed::new(affinity, alone_sampled(4), 4);
+    // The tree is written for worker 1, beside the index.
+    assert!(alone.keyed(&asked, 0, Some(1)).is_empty());
+    let in_tree = alone.keyed_whole(&asked, 0, None);
+    assert_eq!(in_tree.holders, [(1, 0, 4)]);
+    assert!(in_tree.tree.is_some(), "a tree's match");
+    assert!(alone.holders(&hashed(&asked), NOW).is_empty(), "no entry");
+
+    let events = Bed {
+        pool: PoolAffinity::default(),
+        spec: preset("cache_aware"),
+        ..alone
+    };
+    let by_index = events.keyed_whole(&asked, 0, None);
+    assert_eq!(by_index.holders, [(2, 4, 0)]);
+    assert_eq!(by_index.tree, None, "no tree's match under the index");
+}
+
+/// A filter or a picker that reads a request's holders from the cache
+/// events keeps the index's lookup beside a prefix stage that reads sent
+/// prefixes alone: a profile reads sent prefixes alone where no stage of
+/// it reads those holders, as its needs fold every stage
+/// (`Profile::needs`). So a filter its host registers is named the
+/// index's holder of a prompt. Named nobody, a filter that keeps a holder
+/// alone would refuse every worker.
+#[test]
+fn a_stage_that_reads_the_indexs_holders_keeps_the_lookup_beside_a_reader_of_sent_prefixes() {
+    use crate::{
+        document::{spec::ProfileSpec, Needs},
+        engine::{
+            decision::Targets,
+            framework::{Filter, Picker, TieBand},
+            view::{Candidate, Constraints},
+        },
+        stages::{lifecycle::Lifecycle, registry::StageRegistry},
+    };
+
+    /// A stage that declares that it reads a request's holders from the
+    /// cache events: a filter that keeps every row, and a picker.
+    #[derive(Debug)]
+    struct ReadsHolders;
+    fn declared() -> Needs {
+        Needs {
+            affinity: true,
+            events: true,
+            token_hashes: true,
+            ..Needs::default()
+        }
+    }
+    impl Filter for ReadsHolders {
+        fn name(&self) -> &'static str {
+            "reads-holders"
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            true
+        }
+
+        fn needs(&self) -> Needs {
+            declared()
+        }
+    }
+    impl Lifecycle for ReadsHolders {}
+    impl Picker for ReadsHolders {
+        fn name(&self) -> &'static str {
+            "picks-by-holders"
+        }
+
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            _: &[f32],
+            _: TieBand,
+            _: &mut Targets,
+        ) {
+        }
+
+        fn needs(&self) -> Needs {
+            declared()
+        }
+    }
+    let mut catalog = StageRegistry::builtin();
+    let added = catalog.filter("reads-holders", || Box::new(ReadsHolders));
+    let added =
+        added.and_then(|catalog| catalog.picker("picks-by-holders", || Box::new(ReadsHolders)));
+    added.expect("two free names");
+    // The cache-aware preset, its prefix stage reading sent prefixes
+    // alone, turned by `change`.
+    let under = |change: &dyn Fn(&mut ProfileSpec)| {
+        let mut document = reading_alone(PolicySpec::preset("cache_aware").expect("the preset"));
+        document.generation = 1;
+        let profile = document.profiles.get_mut("cache_aware");
+        change(profile.expect("the preset's profile"));
+        AppliedSpec::validate_in(&document, &catalog, &[]).expect("the document validates")
+    };
+    let alone = |spec: &AppliedSpec| spec.engine().reads_sent_alone_for(MODEL, Phase::Single);
+    assert!(alone(&under(&|_| {})), "no stage reads the holders");
+    let picked = under(&|profile| profile.pick = "picks-by-holders".into());
+    assert!(!alone(&picked), "the picker reads them");
+    let filtered = under(&|profile| profile.filter.push("reads-holders".into()));
+    assert!(!alone(&filtered), "a filter reads them");
+
+    let (affinity, index, _tree) = lending_whenever();
+    let asked = tokens(1_000, 4);
+    // Worker 2 holds the prompt by its events.
+    store(&index, 2, &hashes_of(&hashed(&asked)));
+    let bed = Bed::new(affinity, filtered, 4);
+    let by_index = bed.keyed_whole(&asked, 0, None);
+    assert_eq!(by_index.holders, [(2, 4, 0)]);
+    assert_eq!(by_index.tree, None, "no tree's match under the index");
+}
+
+/// A host that lends no tree is named no holder for a single request of
+/// text, or of token ids under a model whose index holds no block: the
+/// engine keeps no table of its own for a decision that is named its rows.
+/// A pick of such a request writes nothing, so the next one is named
+/// nobody too, and the model's record of sent prefixes stays empty. The
+/// classic policy keeps a tree of its own for each such request
+/// (`select_worker_scanned` in `model_gateway/src/policies/cache_aware.rs`):
+/// a host that wants those holders named lends its trees.
+#[test]
+fn a_host_that_lends_no_tree_is_named_no_holder_for_a_single_request() {
+    let (affinity, _, _) = hosted(true);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    for asked in [prompt(1_000, 4), worded(&text(1_000, 4))] {
+        let picked = bed.decide(&request(&asked, 7, NOW), Some(1));
+        assert!(picked.expect("rows named").holders.is_empty());
+        assert!(bed.holders(&asked, NOW).is_empty(), "nobody is named");
+    }
+    let standing = bed.pool.table.load();
+    let table = standing.as_deref().expect("the list's table");
+    let record = table.record.as_ref().expect("the model's record");
+    assert_eq!(record.predictor.read().len(), 0, "nothing is written");
+}
+
 /// A profile whose stages read no affinity is named no row: its decision
 /// is handed the request as it stands, and the host is asked nothing. Under
 /// a document none of whose bindings reads affinity, its list keeps no
@@ -3714,15 +3811,17 @@ fn records(ids: &[WorkerId]) -> Vec<Candidate> {
 
 /// The stock profile's whole decision over the rows named: a request goes
 /// to the worker that holds its prefix by the index, whatever the seed
-/// draws, and with no index to the worker its prefix was sent to before.
+/// draws, and under an index that holds no block to the worker its host's
+/// token tree was written for before.
 #[test]
 fn the_engine_decides_by_the_rows_named() {
     const WORKERS: usize = 32;
     for indexed in [true, false] {
-        let (affinity, _, index) = hosted(indexed);
-        let asked = prompt(1_000, 8);
-        if let Some(index) = &index {
-            store(index, 7, &hashes_of(&asked));
+        let (affinity, index, _tree) = lending_whenever();
+        let ids = tokens(1_000, 8);
+        let asked = hashed(&ids);
+        if indexed {
+            store(&index, 7, &hashes_of(&asked));
         }
         let bed = Bed::new(affinity, preset("cache_aware"), WORKERS);
         let rows = records(&bed.ids);
@@ -3742,7 +3841,12 @@ fn the_engine_decides_by_the_rows_named() {
                 &bed.ids,
                 &mut request,
                 None,
-                |_| None,
+                |_| {
+                    Some(TokenKey {
+                        tokens: Cow::Borrowed(&ids[..]),
+                        marker: 0,
+                    })
+                },
                 || None,
                 |_| true,
                 |request| {
@@ -4078,25 +4182,25 @@ fn a_sides_column_is_read_by_its_readers_word_of_the_record() {
     assert_eq!(prefills.affinity.left_out(), 0);
 }
 
-/// A single decision reads the record of sent prefixes by its own reader's
-/// word, and never by a pair's side's. A binding of the decode phase alone
-/// whose prefix stage reads cache events alone (`source: index`) is listed
-/// ahead of a pair whose decode profile reads sent prefixes alone. The
-/// decodes' pool keeps the record for that side, and a decode request asked
-/// alone is decided by a profile that reads none of it: the table's word is
-/// `false`. So that request is named the index's holder under a sample of
-/// one, though the side sent the prompt to another worker. Its pick of a
-/// worker the index holds a block for writes nothing, and its pick of a
-/// worker with no block is written, as under any profile that reads cache
-/// events. The side reads what it sent itself throughout.
+/// A decode asked alone reads no record of sent prefixes, whatever the
+/// pair's decode side reads. A binding of the decode phase alone whose
+/// prefix stage reads cache events alone (`source: index`) is listed ahead
+/// of a pair whose decode profile reads sent prefixes alone. The decodes'
+/// pool keeps the record for that side, and the table holds the two
+/// readers' words apart: `false` for the request asked alone, `true` for
+/// the side. That request is named its rows. So it is named the index's
+/// holder under a sample of one, though the side sent the prompt to another
+/// worker, and none of its picks is written: not of a worker the index
+/// holds a block for, and not of a worker with no block. The side reads
+/// what it sent itself throughout.
 ///
-/// Before, the pool's word there was the side's, and the record's holders
-/// were named ahead of the index's for that request. The classic router has
-/// no twin: it keeps one policy a side
-/// (`model_gateway/src/policies/registry.rs:1338-1354`), so no second
-/// profile decides over a side's list.
+/// The classic router has no twin: it keeps one policy object for a pair's
+/// decode side (`get_decode_policy` in
+/// `model_gateway/src/policies/registry.rs`), which a pair's selection asks
+/// (`pair_pass` in `model_gateway/src/routers/common/placement.rs`), so no
+/// second policy decides over a side's list.
 #[test]
-fn a_single_decision_reads_the_record_by_its_own_word_beside_a_pairs_side() {
+fn a_decode_asked_alone_reads_no_record_beside_a_pairs_side() {
     use crate::document::spec::{AffinitySource, BestParams, PickStage, ScoreSpec};
 
     let pair = PolicySpec::pair_presets("round_robin", "cache_aware");
@@ -4168,13 +4272,14 @@ fn a_single_decision_reads_the_record_by_its_own_word_beside_a_pairs_side() {
     let sent = [(0, 0), (0, 4), (4, 0), (0, 0)];
     assert_eq!(holds(), sent);
 
-    // The decode request asked alone is named the index's holder.
+    // The decode request asked alone is named the index's holder, and
+    // neither of its picks is written.
     let named = decodes.decide(&asked_alone, None).expect("rows");
     assert_eq!(named.holders, [(2, 4, 0)]);
     decodes.decide(&asked_alone, Some(0));
     assert_eq!(holds(), sent, "a pick of a worker with a block");
     decodes.decide(&asked_alone, Some(3));
-    assert_eq!(holds(), [(0, 0), (0, 4), (4, 0), (0, 4)]);
+    assert_eq!(holds(), sent, "a pick of a worker with no block");
 
     // The table holds the two words apart: the single decision's reader
     // reads no record alone, and the side's own profile does.
@@ -4243,79 +4348,6 @@ fn a_profile_named_no_row_is_handed_the_column() {
     assert!(decision.pick().is_none());
     let seen = seen.expect("a decision");
     assert_eq!(seen, [(0, 0), (0, 0), (4, 0), (0, 0)]);
-}
-
-/// A profile that is named no row and reads sent prefixes is handed what
-/// its own picks sent: a request's pick writes its prefix for its worker,
-/// and the column of the repeat holds it.
-#[test]
-fn a_profile_named_no_row_is_handed_the_prefix_its_pick_sent() {
-    let asked = prompt(1_000, 4);
-    let bed = Bed::new(hosted(false).0, handed_whole(), 4);
-    assert!(bed.decide(&request(&asked, 7, NOW), Some(1)).is_none());
-    let mut seen = None;
-    decide(
-        &bed.affinity,
-        &bed.pool,
-        &bed.spec,
-        &bed.workers,
-        &bed.ids,
-        &mut request(&asked, 7, NOW),
-        None,
-        |_| None,
-        || None,
-        |_| true,
-        |facts| {
-            seen = Some(held(facts.affinity));
-            shed()
-        },
-    );
-    assert_eq!(seen.expect("a decision"), [(0, 0), (0, 4), (0, 0), (0, 0)]);
-}
-
-/// A profile that is named no row is handed a text's prefix for a worker
-/// the index holds blocks for: its pick of that worker is written, and the
-/// column of the repeat holds it. A request hashed by its text asks no
-/// index, as under the classic router
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`).
-/// A request hashed by token blocks answers as before beside it: its pick
-/// of that worker writes nothing, and its column holds the index's blocks.
-#[test]
-fn a_profile_named_no_row_is_handed_a_text_sent_to_a_worker_the_index_holds_blocks_for() {
-    let (affinity, _, index) = hosted(true);
-    let index = index.expect("the index");
-    let tokens = prompt(1_000, 4);
-    store(&index, 1, &hashes_of(&tokens)[..2]);
-    let bed = Bed::new(affinity, handed_whole(), 4);
-    let said = text(1_000, 4);
-    let asked = worded(&said);
-    let handed = |prompt: &PromptHashes| {
-        let mut seen = None;
-        decide(
-            &bed.affinity,
-            &bed.pool,
-            &bed.spec,
-            &bed.workers,
-            &bed.ids,
-            &mut request(prompt, 7, NOW),
-            None,
-            |_| None,
-            || None,
-            |_| true,
-            |facts| {
-                seen = Some(held(facts.affinity));
-                shed()
-            },
-        );
-        seen.expect("a decision")
-    };
-    assert_eq!(handed(&asked), [(0, 0); 4]);
-    assert!(bed.decide(&request(&asked, 7, NOW), Some(1)).is_none());
-    assert_eq!(handed(&asked), [(0, 0), (0, 4), (0, 0), (0, 0)]);
-    let by_index = [(0, 0), (2, 0), (0, 0), (0, 0)];
-    assert_eq!(handed(&tokens), by_index);
-    assert!(bed.decide(&request(&tokens, 7, NOW), Some(1)).is_none());
-    assert_eq!(handed(&tokens), by_index);
 }
 
 /// A profile that is named no row and reads sent prefixes alone is handed
@@ -4438,9 +4470,7 @@ fn a_decode_request_asked_alone_writes_nothing_for_a_worker_the_index_holds_bloc
 /// stated by the blocks the index holds for it, of the request's blocks. A
 /// worker the rows do not name holds nothing: a miss of the request's
 /// blocks, which is not "nothing stated". The index decides such a
-/// request alone, so the miss's own pick writes nothing. Under a model
-/// with no index a worker is stated by the blocks it was sent, read from
-/// the predictor: there the miss's own pick wrote them. A shed holds no
+/// request alone, so the miss's own pick writes nothing. A shed holds no
 /// pick.
 #[test]
 fn a_pick_states_its_workers_entry_of_the_rows_the_engine_named() {
@@ -4462,12 +4492,6 @@ fn a_pick_states_its_workers_entry_of_the_rows_the_engine_named() {
     // That pick wrote nothing: the index decides the request alone.
     assert_eq!(bed.states(&facts, 0), holds(0, 4, OverlapSource::None));
     assert_eq!(bed.stated(&facts, None, shed()), Overlap::NONE);
-    // No index: the miss's pick wrote the request's prefix for its worker
-    // in the record.
-    let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 8);
-    assert_eq!(bed.states(&facts, 0), holds(0, 4, OverlapSource::None));
-    assert_eq!(bed.states(&facts, 0), holds(4, 4, OverlapSource::Predictor));
 }
 
 /// A pick states its worker's entry of a column the request's host filled,
@@ -4541,7 +4565,9 @@ fn a_pick_states_its_workers_entry_of_the_rows_its_host_named() {
 }
 
 /// A profile that is named no row is handed the column whole, and its pick
-/// states its worker's entry of that column.
+/// states its worker's entry of that column. Under a model with no index a
+/// worker is stated by the blocks it was sent, read from the predictor:
+/// there the miss's own pick wrote them.
 #[test]
 fn a_pick_states_its_workers_entry_of_the_column_the_engine_filled() {
     let (affinity, _, index) = hosted(true);
@@ -4552,6 +4578,12 @@ fn a_pick_states_its_workers_entry_of_the_column_the_engine_filled() {
     let facts = request(&asked, 7, NOW);
     assert_eq!(bed.states(&facts, 2), holds(3, 4, OverlapSource::Index));
     assert_eq!(bed.states(&facts, 1), holds(0, 4, OverlapSource::None));
+    // No index: the miss's pick wrote the request's prefix for its worker
+    // in the record.
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, handed_whole(), 4);
+    assert_eq!(bed.states(&facts, 0), holds(0, 4, OverlapSource::None));
+    assert_eq!(bed.states(&facts, 0), holds(4, 4, OverlapSource::Predictor));
 }
 
 /// What the lookup states of `answer`'s first target, for a request of
@@ -4599,8 +4631,8 @@ fn a_pick_made_inside_a_hosts_token_tree_states_the_matchs_tokens() {
     let longer = tokens(1_000, 6);
     let shared = holds(64, 96, OverlapSource::Tree);
     assert_eq!(stated_in_tree(&bed, &longer, 1), shared);
-    // No entry named: the record of hashed prefixes, which nothing wrote.
-    // Its rows carry no tree's match, and are read in whole blocks.
+    // No entry named: nobody is named. The rows carry no tree's match,
+    // and the pick states a miss in whole blocks.
     let hashes = hashed(&asked);
     assert_eq!(bed.states(&request(&hashes, 7, NOW), 1), miss);
     let named = bed.decide(&request(&hashes, 7, NOW), None);
@@ -4644,7 +4676,7 @@ fn a_pick_made_inside_a_hosts_string_tree_states_the_matchs_chars() {
         // The match names the first worker alone, and the pick is the second.
         assert_eq!(stated(&asked, 2), miss, "{fill}");
     }
-    // No entry named: the record of hashed windows, which nothing wrote.
+    // No entry named: nobody is named, and the pick states a miss.
     let hashes = worded(&text(1_000, 4));
     assert_eq!(bed.states(&request(&hashes, 7, NOW), 1), miss);
 }
@@ -5025,22 +5057,28 @@ fn a_shadow_that_reads_affinity_states_nothing_of_the_live_pick() {
     }
 }
 
-/// Three workers publish no blocks on their cache event streams.
-/// The lightest worker takes the cold prompt. All 39 repeats stay there
-/// after it becomes the heaviest worker.
+/// Three workers publish no blocks on their cache event streams, and
+/// their host lends its token tree of sent prompts beside the index that
+/// holds no block. The lightest worker takes the cold prompt. All 39
+/// repeats stay there after it becomes the heaviest worker: the tree's
+/// match names it. The classic policy reads its own token tree while its
+/// index holds no block (`select_worker_scanned` in
+/// `model_gateway/src/policies/cache_aware.rs`). Under a host that lends
+/// no tree nobody is named, and a repeat goes by load
+/// ([`a_host_that_lends_no_tree_is_named_no_holder_for_a_single_request`]).
 #[test]
 fn a_worker_that_asks_for_events_and_publishes_none_keeps_its_prompt() {
     use crate::engine::view::LoadRow;
 
-    let (affinity, _, index) = hosted(true);
+    let (affinity, index, _tree) = lending_whenever();
     let bed = Bed::new(affinity, preset("cache_aware"), 3);
-    let index = index.expect("the cache index");
     for worker in &bed.workers {
         let number = index.intern_worker(worker.url()).expect("a worker number");
         assert_eq!(index.worker_block_count(number), 0);
     }
 
-    let asked = prompt(1_000, 8);
+    let asked = tokens(1_000, 8);
+    let hashes = hashed(&asked);
     let mut rows = records(&bed.ids);
     let pool = PoolFacts {
         pool_size: 3,
@@ -5065,9 +5103,14 @@ fn a_worker_that_asks_for_events_and_publishes_none_keeps_its_prompt() {
             &bed.spec,
             &bed.workers,
             &bed.ids,
-            &mut request(&asked, 7, now),
+            &mut request(&hashes, 7, now),
             None,
-            |_| None,
+            |_| {
+                Some(TokenKey {
+                    tokens: Cow::Borrowed(&asked[..]),
+                    marker: 0,
+                })
+            },
             || None,
             |_| true,
             |facts| {
@@ -5092,9 +5135,9 @@ fn a_request_sent_a_moment_ago_writes_nothing() {
 
     for (last, depth_after_eviction) in [(NOW, 7), (NOW + (1 << 20), 8)] {
         let (affinity, _, _) = hosted(false);
-        let bed = Bed::new(affinity, preset("cache_aware"), 1);
+        let bed = Bed::new(affinity, handed_whole(), 1);
         bed.decide(&first, Some(0));
-        assert_eq!(bed.holders(&asked, NOW), [(0, 0, 8)]);
+        assert_eq!(bed.holding(&asked, NOW), [(0, 0, 8)]);
 
         bed.decide(&request(&marker, 7, NOW), Some(0));
         bed.decide(&first, Some(0));
@@ -5106,7 +5149,7 @@ fn a_request_sent_a_moment_ago_writes_nothing() {
         let record = bed.affinity.record_of(MODEL, 8, 1, false);
         record.predictor.write().sweep(1);
         assert_eq!(
-            bed.holders(&asked, last),
+            bed.holding(&asked, last),
             [(0, 0, depth_after_eviction)],
             "prompt depth after one eviction at {last} microseconds"
         );
@@ -5123,7 +5166,7 @@ fn a_long_request_is_written_in_slices_of_sixteen() {
         (3_000, 33, &[16, 32, 33]),
     ];
     let (affinity, _, _) = hosted(false);
-    let previous = Bed::new(affinity, preset("cache_aware"), 2);
+    let previous = Bed::new(affinity, handed_whole(), 2);
 
     // Give every block an older tick on a worker outside the next list.
     for &(first, blocks, _) in &cases {
@@ -5135,8 +5178,8 @@ fn a_long_request_is_written_in_slices_of_sixteen() {
     for (first, blocks, expected_ends) in cases {
         let asked = prompt(first, blocks);
         let facts = request(&asked, 7, NOW);
-        let cold = bed.decide(&facts, Some(0)).expect("named rows");
-        assert!(cold.holders.is_empty(), "cold prompt of {blocks} blocks");
+        let cold = bed.handed(&facts, Some(0));
+        assert_eq!(cold, [(0, 0)], "cold prompt of {blocks} blocks");
 
         // Only the ends of writes receive the new tick on existing blocks.
         let mut ends = Vec::new();
@@ -5160,37 +5203,33 @@ fn a_long_request_is_written_in_slices_of_sixteen() {
     bed.decide(&request(&marker, 7, NOW), Some(0));
     for end in [40, 16, 32] {
         let prefix = prompt(1_000, end);
-        let named = bed
-            .decide(&request(&prefix, 7, NOW), Some(0))
-            .expect("named rows");
-        assert_eq!(named.holders, [(0, 0, end)]);
+        assert_eq!(bed.handed(&request(&prefix, 7, NOW), Some(0)), [(0, end)]);
     }
 
     // A write at any repeated end puts it after the marker.
     let record = bed.affinity.record_of(MODEL, 1, 1, false);
     record.predictor.write().sweep(usize::MAX);
     assert_eq!(
-        bed.holders(&marker, NOW),
+        bed.holding(&marker, NOW),
         [(0, 0, 1)],
         "the marker stays newest"
     );
 }
 
-/// A repeat names the picked worker at a predicted depth of twelve blocks.
-/// Changing only the namespace seed leaves the holder list empty.
+/// A repeat's column holds the picked worker at a predicted depth of twelve
+/// blocks. Changing only the namespace seed leaves the column empty.
 #[test]
 fn a_namespace_keeps_its_prefixes_apart() {
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let bed = Bed::new(affinity, handed_whole(), 1);
     let asked = prompt(1_000, 12);
     let mut facts = request(&asked, 7, NOW);
 
     bed.decide(&facts, Some(0));
-    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 12)]);
+    assert_eq!(bed.holding(&asked, NOW), [(0, 0, 12)]);
 
     facts.namespace_seed ^= 1;
-    let named = bed.decide(&facts, None).expect("rows named");
-    assert!(named.holders.is_empty());
+    assert_eq!(bed.handed(&facts, None), [(0, 0)]);
 }
 
 /// A pick with no hashes leaves the prefix record empty.
@@ -5200,7 +5239,7 @@ fn a_text_request_is_recorded_and_absent_hashes_are_not() {
     use crate::engine::view::TEXT_BYTES_PER_TOKEN;
 
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let bed = Bed::new(affinity, handed_whole(), 1);
     let empty = PromptHashes::default();
     bed.decide(&request(&empty, 7, NOW), Some(0));
 
@@ -5226,16 +5265,18 @@ fn a_text_request_is_recorded_and_absent_hashes_are_not() {
         12,
         "one placement per window"
     );
-    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 12)]);
+    assert_eq!(bed.holding(&asked, NOW), [(0, 0, 12)]);
 }
 
-/// A shed leaves the first prompt's twelve prefix keys in the buffer.
-/// An unhashed least-load pick for another model leaves the first record empty.
-/// A repeat of the first prompt still names no holder.
+/// A shed over a column leaves the first prompt's twelve prefix keys in the
+/// buffer. An unhashed least-load pick for another model leaves the first
+/// record empty. A repeat of the first prompt still reads no holder.
 #[test]
 fn a_decision_that_names_no_row_writes_nothing_of_the_one_before() {
     let mut document = PolicySpec::preset("least_load").expect("least-load preset");
+    // The reader is handed its column whole: its fill folds the prefix keys.
     let reader = PolicySpec::preset("cache_aware").expect("cache-aware preset");
+    let reader = handed_whole_of(reader);
     let mut binding = reader.bindings[0].clone();
     binding.matcher.model = MODEL.into();
     document.bindings.insert(0, binding);
@@ -5245,11 +5286,11 @@ fn a_decision_that_names_no_row_writes_nothing_of_the_one_before() {
     let (affinity, _, _) = hosted(false);
     let bed = Bed::new(affinity, spec, 1);
     let asked = prompt(1_000, 12);
-    assert!(bed.holders(&asked, NOW).is_empty());
+    assert!(bed.holding(&asked, NOW).is_empty());
     assert_eq!(
         with_buffers(|buffers| buffers.keys.len()),
         12,
-        "the first lookup leaves its prefix keys"
+        "the first fill leaves its prefix keys"
     );
 
     let empty = PromptHashes::default();
@@ -5291,199 +5332,10 @@ fn a_decision_that_names_no_row_writes_nothing_of_the_one_before() {
         let record = records.get(MODEL).expect("the first model's record");
         assert!(record.predictor.read().is_empty());
     }
-    assert!(bed.holders(&asked, NOW).is_empty());
+    assert!(bed.holding(&asked, NOW).is_empty());
 }
 
-/// Under a source that reads the record alone the record's holders are
-/// named first, and where they fill the profile's sample the index is not
-/// asked. The decision is named the worker the prefix was sent to, though
-/// the index holds the whole request for another, and it still goes to
-/// that other worker where the filters refuse the named one.
-#[test]
-fn a_cap_the_records_holders_fill_is_not_read_past() {
-    use crate::document::spec::{AffinitySource, BestParams, PickStage, ScoreSpec};
-
-    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-    document.generation = 1;
-    let profile = document
-        .profiles
-        .get_mut("cache_aware")
-        .expect("the profile");
-    profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
-    for stage in &mut profile.score {
-        if let ScoreSpec::Params(ScoreStage::PrefixAffinity(prefix)) = stage {
-            prefix.source = Some(AffinitySource::Predictor);
-        }
-    }
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-
-    let (affinity, _, index) = hosted(true);
-    let index = index.expect("the index");
-    let asked = prompt(1_000, 4);
-    store(&index, 0, &hashes_of(&asked));
-    let bed = Bed::new(affinity, spec, 2);
-    let mut facts = request(&asked, 0, NOW);
-    let first = bed.decide(&facts, Some(1)).expect("rows");
-    assert_eq!(first.holders, [(0, 4, 0)]);
-
-    let mut rows = records(&bed.ids);
-    rows[1].health.healthy = false;
-    let pool = PoolFacts {
-        pool_size: 2,
-        generation: 1,
-        ..PoolFacts::default()
-    };
-    let decision = decide(
-        &bed.affinity,
-        &bed.pool,
-        &bed.spec,
-        &bed.workers,
-        &bed.ids,
-        &mut facts,
-        None,
-        |_| None,
-        || None,
-        |_| true,
-        |facts| {
-            assert_eq!(
-                facts.named.expect("rows").holders,
-                &[AffinityHolder {
-                    row: 1,
-                    overlap_blocks: 0,
-                    predicted_blocks: 4,
-                }]
-            );
-            bed.spec.engine().decide(
-                facts,
-                &pool,
-                &rows,
-                &Constraints::default(),
-                &mut Scratch::new(),
-            )
-        },
-    );
-    let pick = decision.pick().expect("a healthy worker");
-    assert_eq!(pick.targets.first().expect("a target").id, bed.ids[0]);
-
-    // The index was not asked again: a lookup empties its answer first,
-    // even under a cap of zero, and the first decision's answer stands.
-    with_buffers(|buffers| {
-        assert_eq!(buffers.kept.len(), 1, "the first index answer survives");
-    });
-}
-
-/// Under a source that reads the record alone the record's holders are
-/// named ahead of the index's, and the index is asked in the room they
-/// leave. Where the record names fewer holders than the profile's sample
-/// and the index holds the request for another worker, each holder stands
-/// in the naming once: the record is not read again behind the index.
-#[test]
-fn a_record_named_ahead_is_not_named_again_behind_the_index() {
-    use crate::document::spec::{AffinitySource, BestParams, PickStage, ScoreSpec};
-
-    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-    document.generation = 1;
-    let profile = document
-        .profiles
-        .get_mut("cache_aware")
-        .expect("the profile");
-    profile.pick = PickStage::Best(BestParams { sample: 3 }).into();
-    for stage in &mut profile.score {
-        if let ScoreSpec::Params(ScoreStage::PrefixAffinity(prefix)) = stage {
-            prefix.source = Some(AffinitySource::Predictor);
-        }
-    }
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 3);
-
-    let (affinity, _, index) = hosted(true);
-    let index = index.expect("the index");
-    let asked = prompt(1_000, 4);
-    store(&index, 0, &hashes_of(&asked));
-    let bed = Bed::new(affinity, spec, 3);
-    // The pick writes the record: the prefix was sent to the second worker.
-    let first = bed.decide(&request(&asked, 0, NOW), Some(1)).expect("rows");
-    assert_eq!(first.holders, [(0, 4, 0)]);
-    // One holder of the record and one of the index, under a sample of
-    // three: the room left is not filled by the record a second time.
-    assert_eq!(bed.holders(&asked, NOW), [(0, 4, 0), (1, 0, 4)]);
-}
-
-/// A naming is made once a decision, ahead of its filters. The holders the
-/// record names stand in it by row, each with its depth, and they stand
-/// whole where the filters refuse every worker. The model has no index: a
-/// single request of token ids beside one is named by the index alone.
-#[test]
-fn a_naming_the_record_fills_stands_whole_where_every_holder_is_refused() {
-    use crate::document::spec::{BestParams, PickStage};
-
-    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-    document.generation = 1;
-    let profile = document
-        .profiles
-        .get_mut("cache_aware")
-        .expect("the profile");
-    profile.pick = PickStage::Best(BestParams { sample: 2 }).into();
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 2);
-
-    let (affinity, _, _) = hosted(false);
-    let asked = prompt(1_000, 4);
-    let bed = Bed::new(affinity, spec, 2);
-    for row in 0..2 {
-        bed.decide(&request(&asked, 0, NOW), Some(row))
-            .expect("rows");
-    }
-
-    let pool = PoolFacts {
-        pool_size: 2,
-        generation: 1,
-        ..PoolFacts::default()
-    };
-    let named_when = |healthy| {
-        let mut rows = records(&bed.ids);
-        for row in &mut rows {
-            row.health.healthy = healthy;
-        }
-        let mut holders = Vec::new();
-        let decision = decide(
-            &bed.affinity,
-            &bed.pool,
-            &bed.spec,
-            &bed.workers,
-            &bed.ids,
-            &mut request(&asked, 0, NOW),
-            None,
-            |_| None,
-            || None,
-            |_| true,
-            |facts| {
-                for holder in facts.named.expect("rows").holders {
-                    holders.push((holder.row, holder.overlap_blocks, holder.predicted_blocks));
-                }
-                bed.spec.engine().decide(
-                    facts,
-                    &pool,
-                    &rows,
-                    &Constraints::default(),
-                    &mut Scratch::new(),
-                )
-            },
-        );
-        assert_eq!(
-            decision.pick().is_some(),
-            healthy,
-            "only healthy workers pass"
-        );
-        holders
-    };
-
-    let first = named_when(true);
-    assert_eq!(first, [(0, 0, 4), (1, 0, 4)]);
-    assert_eq!(named_when(false), first);
-}
-
-/// A list whose every worker the index holds a block for still reads the
+/// A column whose every worker the index holds a block for still reads the
 /// record for a request hashed by its text, and writes its pick there: such
 /// a request asks the index nothing. The classic router reads its tree of
 /// sent texts for a request with no token ids, however many workers its
@@ -5498,20 +5350,20 @@ fn a_pool_whose_workers_are_all_heard_reads_the_record_for_a_request_of_text() {
     let other = hashes_of(&prompt(9_000, 1));
     store(&index, 0, &other);
     store(&index, 1, &other);
-    let bed = Bed::new(affinity, preset("cache_aware"), 2);
+    let bed = Bed::new(affinity, handed_whole(), 2);
     let said = text(1_000, 4);
     let asked = worded(&said);
     let tokens = prompt(1_000, 4);
 
-    let named = bed.decide(&request(&asked, 7, NOW), Some(1));
-    assert!(
-        named.expect("rows").holders.is_empty(),
+    assert_eq!(
+        bed.handed(&request(&asked, 7, NOW), Some(1)),
+        [(0, 0); 2],
         "nobody was sent the text before this pick"
     );
-    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    assert_eq!(bed.holding(&asked, NOW), [(1, 0, 4)]);
     bed.decide(&request(&tokens, 7, NOW), Some(1));
     assert!(
-        bed.holders(&tokens, NOW).is_empty(),
+        bed.holding(&tokens, NOW).is_empty(),
         "a token request's pick writes nothing"
     );
 
@@ -5524,8 +5376,13 @@ fn a_pool_whose_workers_are_all_heard_reads_the_record_for_a_request_of_text() {
     let record = table.record.as_ref().expect("the model's record");
     assert_eq!(record.predictor.read().len(), 4, "the text's four windows");
     let reads = |prompt: &PromptHashes| {
-        let mut buffers = Buffers::new();
-        let read = table.name(&request(prompt, 7, NOW), None, &mut buffers);
+        let (mut buffers, mut column) = (Buffers::new(), Vec::new());
+        let read = table.fill(
+            &request(prompt, 7, NOW),
+            table.alone,
+            &mut buffers,
+            &mut column,
+        );
         (read.is_some(), buffers.keys.len())
     };
     assert_eq!(reads(&asked), (true, 4), "a request of text reads it");
@@ -5534,15 +5391,15 @@ fn a_pool_whose_workers_are_all_heard_reads_the_record_for_a_request_of_text() {
 
 /// A single request of token ids under an index that holds a block reads
 /// no record and writes none, whoever of the list the index speaks for: a
-/// naming folds no key and a pick leaves no entry. Once the index holds no
-/// block it says so, the next decision reads the table again, and the
-/// record is read and written from that decision on: the table's second
-/// is not waited for.
+/// column's fill folds no key and a pick leaves no entry. Once the index
+/// holds no block it says so, the next decision reads the table again, and
+/// the record is read and written from that decision on: the table's
+/// second is not waited for. The profile is handed its column whole.
 #[test]
 fn a_list_under_an_index_that_holds_a_block_reads_no_record() {
     let (affinity, _, index) = hosted(true);
     let index = index.expect("the index");
-    let bed = Bed::new(affinity, preset("cache_aware"), 2);
+    let bed = Bed::new(affinity, handed_whole(), 2);
     let asked = prompt(1_000, 4);
     let other = hashes_of(&prompt(9_000, 1))[0];
 
@@ -5563,9 +5420,9 @@ fn a_list_under_an_index_that_holds_a_block_reads_no_record() {
 
     let check = |now, reads| {
         let facts = request(&asked, 7, now);
-        let named = bed.decide(&facts, Some(0)).expect("rows");
-        assert!(
-            named.holders.is_empty(),
+        assert_eq!(
+            bed.handed(&facts, Some(0)),
+            [(0, 0); 2],
             "no worker holds the prefix before this pick"
         );
 
@@ -5574,8 +5431,8 @@ fn a_list_under_an_index_that_holds_a_block_reads_no_record() {
         let record = table.record.as_ref().expect("the model's record");
         let placements = record.predictor.read().len();
 
-        let mut buffers = Buffers::new();
-        let read = table.name(&facts, None, &mut buffers);
+        let (mut buffers, mut column) = (Buffers::new(), Vec::new());
+        let read = table.fill(&facts, table.alone, &mut buffers, &mut column);
         assert_eq!(read.is_some(), reads, "record read at {now}");
         let blocks = if reads { 4 } else { 0 };
         assert_eq!(buffers.keys.len(), blocks, "folded keys at {now}");
@@ -5639,83 +5496,74 @@ fn an_empty_index_write_keeps_the_predicted_worker_named() {
     );
 }
 
-/// A worker the record names until the index holds blocks for it is named
-/// by the index alone from the next read of the table: its entry in the
-/// record names no second row.
+/// A worker the record speaks for until the index holds blocks for it is
+/// read by the index alone from the next read of the table: its entry in
+/// the record fills no second count of its row.
 #[test]
-fn a_stale_prediction_cannot_name_a_worker_the_index_already_names() {
+fn a_stale_prediction_is_not_read_for_a_worker_the_index_holds_blocks_for() {
     let (affinity, _, index) = hosted(true);
     let index = index.expect("the index");
-    let bed = Bed::new(affinity, preset("cache_aware"), 2);
+    let bed = Bed::new(affinity, handed_whole(), 2);
     let asked = prompt(1_000, 4);
 
-    bed.decide(&request(&asked, 7, NOW), Some(1))
-        .expect("rows named");
-    assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    bed.decide(&request(&asked, 7, NOW), Some(1));
+    assert_eq!(bed.holding(&asked, NOW), [(1, 0, 4)]);
 
     store(&index, 1, &hashes_of(&asked));
     assert_eq!(
-        bed.holders(&asked, NOW + SECOND),
+        bed.holding(&asked, NOW + SECOND),
         [(1, 4, 0)],
-        "only the index names row 1 after the refresh"
+        "only the index speaks for row 1 after the refresh"
     );
 }
 
 /// A list of more workers than one word of a mask holds is read whole.
-/// Under no sample each of seventy workers is named by the record, and by
-/// the index alone once its events arrived and the table is read again.
+/// In a column each of seventy workers is read by the record, and by the
+/// index alone once its events arrived and the table is read again.
 #[test]
 fn a_pool_past_one_word_of_workers_is_read_whole() {
     const WORKERS: usize = 70;
-
-    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-    let profile = document
-        .profiles
-        .get_mut("cache_aware")
-        .expect("the profile");
-    profile.pick = "best".into();
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
 
     let (affinity, _, index) = hosted(true);
     let index = index.expect("the index");
     for at in 0..WORKERS {
         index.intern_worker(&address(at)).expect("a worker number");
     }
-    let bed = Bed::new(affinity, spec, WORKERS);
+    let bed = Bed::new(affinity, handed_whole(), WORKERS);
     let asked = prompt(1_000, 4);
     let facts = request(&asked, 7, NOW);
     for at in 0..WORKERS {
-        bed.decide(&facts, Some(at as u32)).expect("rows");
+        bed.decide(&facts, Some(at as u32));
     }
 
     let predicted: Vec<_> = (0..WORKERS).map(|at| (at as u32, 0, 4)).collect();
-    assert_eq!(bed.holders(&asked, NOW), predicted);
+    assert_eq!(bed.holding(&asked, NOW), predicted);
 
     let hashes = hashes_of(&asked);
     for at in 0..WORKERS {
         store(&index, at, &hashes);
     }
     assert_eq!(
-        bed.holders(&asked, NOW),
+        bed.holding(&asked, NOW),
         predicted,
-        "the standing table still names the predictions"
+        "the standing table still reads the predictions"
     );
     let indexed: Vec<_> = (0..WORKERS).map(|at| (at as u32, 4, 0)).collect();
-    assert_eq!(bed.holders(&asked, NOW + SECOND), indexed);
+    assert_eq!(bed.holding(&asked, NOW + SECOND), indexed);
 }
 
-/// A list is named the deepest holder among its own workers: a worker of
-/// another list that was sent more of the request hides no shorter prefix
-/// a worker of this list was sent.
+/// A list's column holds the deepest holder among its own workers: a worker
+/// of another list that was sent more of the request hides no shorter
+/// prefix a worker of this list was sent.
 #[test]
 fn a_worker_outside_the_list_hides_no_shorter_prefix_inside_it() {
     let (affinity, _, _) = hosted(false);
-    let both = Bed::new(affinity, preset("cache_aware"), 2);
+    let both = Bed::new(affinity, handed_whole(), 2);
     let four = prompt(1_000, 4);
     let three = prompt(1_000, 3);
     both.decide(&request(&four, 7, NOW), Some(0));
     both.decide(&request(&three, 7, NOW), Some(1));
-    assert_eq!(both.holders(&four, NOW), [(0, 0, 4)], "the deeper holder");
+    assert_eq!(both.holding(&four, NOW), [(0, 0, 4)], "the deeper holder");
 
     // The second worker alone, as another list of the model: the model's
     // one record holds what both workers were sent.
@@ -5726,56 +5574,10 @@ fn a_worker_outside_the_list_hides_no_shorter_prefix_inside_it() {
         ..both
     };
     assert_eq!(
-        alone.holders(&four, NOW),
+        alone.holding(&four, NOW),
         [(0, 0, 3)],
         "its own three blocks"
     );
-}
-
-/// A profile whose prefix stage reads the record alone is named the
-/// record's holders ahead of the index's: at a sample of one the worker
-/// the prefix was sent to, and at two the index's holder beside it.
-#[test]
-fn a_source_that_reads_the_record_alone_names_its_holders_first() {
-    use crate::document::spec::{AffinitySource, BestParams, PickStage, ScoreSpec};
-
-    let spec = |sample| {
-        let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-        let profile = document
-            .profiles
-            .get_mut("cache_aware")
-            .expect("the preset's profile");
-        for stage in &mut profile.score {
-            if let ScoreSpec::Params(ScoreStage::PrefixAffinity(params)) = stage {
-                params.source = Some(AffinitySource::Predictor);
-            }
-        }
-        profile.pick = PickStage::Best(BestParams { sample }).into();
-        AppliedSpec::validate(&document).expect("the document validates")
-    };
-
-    let (affinity, _, index) = hosted(true);
-    let index = index.expect("the index");
-    let asked = prompt(1_000, 4);
-    store(&index, 0, &hashes_of(&asked));
-    let facts = request(&asked, 0, NOW);
-
-    let one = Bed::new(affinity, spec(1), 2);
-    one.decide(&facts, Some(1));
-    let named = one.decide(&facts, None).expect("rows at cap one");
-    assert_eq!(
-        named.holders,
-        [(1, 0, 4)],
-        "the recorded worker takes the slot"
-    );
-
-    let two = Bed {
-        pool: PoolAffinity::default(),
-        spec: spec(2),
-        ..one
-    };
-    let named = two.decide(&facts, None).expect("rows at cap two");
-    assert_eq!(named.holders, [(0, 4, 0), (1, 0, 4)]);
 }
 
 /// A removal takes a record's lock as a writer only where the record holds
@@ -5786,11 +5588,11 @@ fn a_removal_waits_for_no_decider_of_another_model() {
     const READER_MODEL: &str = "model-b";
 
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let bed = Bed::new(affinity, handed_whole(), 1);
     let asked = prompt(1_000, 4);
     let facts = request(&asked, 7, NOW);
     bed.decide(&facts, Some(0));
-    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 4)]);
+    assert_eq!(bed.holding(&asked, NOW), [(0, 0, 4)]);
 
     let reader_id = WorkerId(2);
     let reader_workers = [ready_worker(&address(1), READER_MODEL)];
@@ -5835,7 +5637,7 @@ fn a_removal_waits_for_no_decider_of_another_model() {
         ended
     });
     assert!(ended, "the removal waited for a reader of another model");
-    assert!(bed.holders(&asked, NOW).is_empty(), "the placement is gone");
+    assert!(bed.holding(&asked, NOW).is_empty(), "the placement is gone");
 }
 
 /// The cache-aware preset with a second prefix stage, which reads the
@@ -5889,79 +5691,18 @@ fn a_stage_that_reads_cache_events_keeps_the_index_holders_first() {
     assert_eq!(warm.holders, [(1, 4, 0)], "row 1 keeps the only slot");
 }
 
-/// Under the same profile a request of text reads no index. The stage that
-/// reads the record alone is named what the record holds: the record takes
-/// the request's pick, and the next request is named its worker.
-///
-/// The classic policy sends a request of text to its string tree, whatever
-/// its index holds (`select_worker_scanned` in
-/// `model_gateway/src/policies/cache_aware.rs`).
-#[test]
-fn a_mixed_profiles_request_of_text_reads_and_writes_the_record() {
-    let (affinity, _, index) = hosted(true);
-    let index = index.expect("the host index");
-    store(&index, 1, &hashes_of(&prompt(1_000, 4)));
-    let bed = Bed::new(affinity, mixed(), 2);
-    let words = worded(&text(1_000, 4));
-    let facts = request(&words, 0, NOW);
-
-    let cold = bed.decide(&facts, Some(0)).expect("named rows");
-    assert!(cold.holders.is_empty(), "the index holds no text");
-    let (column, _) = bed.column(&facts, Phase::Single);
-    assert_eq!(held(&column), [(0, 4), (0, 0)], "the record holds the pick");
-    let warm = bed.decide(&facts, None).expect("named rows");
-    assert_eq!(warm.holders, [(0, 0, 4)]);
-}
-
-/// Nor does the index decide alone while it holds no block: its host hands
-/// no index then, and the record takes a request of token ids as it does
-/// under a profile whose every prefix stage reads cache events.
-///
-/// The classic policy reads its token tree while its index is empty
-/// (`event_index_for` in `model_gateway/src/policies/cache_aware.rs`).
-#[test]
-fn a_mixed_profiles_request_under_an_empty_index_reads_and_writes_the_record() {
-    let (affinity, _, _) = hosted(true);
-    let bed = Bed::new(affinity, mixed(), 2);
-    let asked = prompt(1_000, 4);
-    let facts = request(&asked, 0, NOW);
-
-    let cold = bed.decide(&facts, Some(0)).expect("named rows");
-    assert!(cold.holders.is_empty(), "nothing is sent yet");
-    let (column, _) = bed.column(&facts, Phase::Single);
-    assert_eq!(held(&column), [(0, 4), (0, 0)], "the record holds the pick");
-    let warm = bed.decide(&facts, None).expect("named rows");
-    assert_eq!(warm.holders, [(0, 0, 4)]);
-}
-
 /// A pick of a worker the record holds no part of the request for is
 /// written, though the record holds the whole request for another worker
 /// at this tick: both then hold it.
 #[test]
 fn a_fresh_prefix_still_writes_for_a_new_target() {
-    use crate::document::spec::{BestParams, PickStage};
-
-    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-    let profile = document
-        .profiles
-        .get_mut("cache_aware")
-        .expect("the preset profile");
-    profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
-    let spec = AppliedSpec::validate(&document).expect("valid profile");
-
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, spec, 2);
+    let bed = Bed::new(affinity, handed_whole(), 2);
     let asked = prompt(1_000, 4);
     let facts = request(&asked, 7, NOW);
-    let cold = bed.decide(&facts, Some(0)).expect("named rows");
-    assert!(cold.holders.is_empty());
-    let warm = bed.decide(&facts, Some(1)).expect("named rows");
-    assert_eq!(warm.holders, [(0, 0, 4)]);
-    assert_eq!(
-        bed.holders(&asked, NOW).len(),
-        1,
-        "only one holder is named"
-    );
+    assert_eq!(bed.handed(&facts, Some(0)), [(0, 0); 2]);
+    assert_eq!(bed.handed(&facts, Some(1)), [(0, 4), (0, 0)]);
+    assert_eq!(bed.holding(&asked, NOW), [(0, 0, 4), (1, 0, 4)]);
 
     let standing = bed.pool.table.load();
     let table = standing.as_deref().expect("the list table");
@@ -5975,82 +5716,29 @@ fn a_fresh_prefix_still_writes_for_a_new_target() {
     assert_eq!(holders, bed.ids, "both workers hold the fourth block");
 }
 
-/// A pick of a worker that holds the whole request at this tick is a
-/// repeat and writes nothing, though the sample left that worker unnamed.
-/// A write would have moved the prompt's last use: the next block to leave
-/// a full record is the prompt's own last one.
-#[test]
-fn a_fresh_target_outside_the_holder_cap_writes_nothing() {
-    use crate::document::spec::{BestParams, PickStage};
-
-    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
-    let profile = document
-        .profiles
-        .get_mut("cache_aware")
-        .expect("the preset profile");
-    profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
-    // Four blocks per worker and one other block fill the record.
-    document.index.entry(MODEL.into()).or_default().max_size = 9 * u64::from(BLOCK);
-    let spec = AppliedSpec::validate(&document).expect("valid bounded profile");
-
-    let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, spec, 2);
-    let asked = prompt(1_000, 4);
-    let facts = request(&asked, 7, NOW);
-    for row in [0, 1] {
-        bed.decide(&facts, Some(row)).expect("named rows");
-    }
-    let (before, _) = bed.column(&facts, Phase::Single);
-    assert_eq!(held(&before), [(0, 4); 2]);
-
-    let newer = prompt(9_000, 1);
-    bed.decide(&request(&newer, 7, NOW), Some(0))
-        .expect("named rows");
-    let named = bed.holders(&asked, NOW);
-    assert_eq!(named.len(), 1);
-    let target = if named[0].0 == 0 { 1 } else { 0 };
-    let repeat = bed.decide(&facts, Some(target)).expect("named rows");
-    assert_eq!(
-        repeat.holders,
-        [(1 - target, 0, 4)],
-        "the picked holder is omitted"
-    );
-
-    let incoming = prompt(50_000, 1);
-    bed.decide(&request(&incoming, 7, NOW), Some(0))
-        .expect("named rows");
-    let (after, _) = bed.column(&facts, Phase::Single);
-    assert_eq!(
-        held(&after),
-        [(0, 3); 2],
-        "a repeat write would keep the fourth block"
-    );
-    assert_eq!(bed.holders(&newer, NOW), [(0, 0, 1)]);
-}
-
 /// A bound that came down forgets nothing by itself. The write that ends
 /// behind it sweeps one step (`PrefixRecord::SWEEP` placements): of a
 /// hundred placements at most the others stay.
 #[test]
 fn the_last_slice_sweeps_placements_owed_by_a_lower_bound() {
     let (affinity, _, _) = hosted(false);
-    let mut bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let mut bed = Bed::new(affinity, handed_whole(), 1);
     let first = prompt(1_000, 100);
-    bed.decide(&request(&first, 7, NOW), Some(0))
-        .expect("rows for the first pick");
+    bed.decide(&request(&first, 7, NOW), Some(0));
     let record = {
         let records = bed.affinity.records.lock();
         Arc::clone(records.get(MODEL).expect("the model's record"))
     };
 
-    let mut smaller = PolicySpec::preset("cache_aware").expect("the preset");
-    smaller.generation = 2;
-    smaller.index.entry(MODEL.into()).or_default().max_size = u64::from(BLOCK);
-    bed.spec = AppliedSpec::validate(&smaller).expect("the smaller document");
+    bed.spec = named_no_row(|mut smaller| {
+        smaller.generation = 2;
+        smaller.index.entry(MODEL.into()).or_default().max_size = u64::from(BLOCK);
+        smaller
+    });
 
     let cold = prompt(50_000, 4);
     let now = NOW + SECOND;
-    assert!(bed.holders(&cold, now).is_empty(), "the new prompt is cold");
+    assert!(bed.holding(&cold, now).is_empty(), "the new prompt is cold");
     assert_eq!(record.predictor.read().bound(), 1);
     assert_eq!(
         record.predictor.read().len(),
@@ -6058,8 +5746,7 @@ fn the_last_slice_sweeps_placements_owed_by_a_lower_bound() {
         "the sweep waits for the write"
     );
 
-    bed.decide(&request(&cold, 7, now), Some(0))
-        .expect("rows for the cold pick");
+    bed.decide(&request(&cold, 7, now), Some(0));
     let left = record.predictor.read().len();
     assert!(
         left <= 100 - PrefixRecord::SWEEP,
@@ -6119,10 +5806,9 @@ fn a_block_size_of_record_moves_the_records_bound() {
 #[test]
 fn a_lower_bound_keeps_its_sweep_past_a_decider_that_holds_the_record() {
     let (affinity, _, _) = hosted(false);
-    let bed = Bed::new(affinity, preset("cache_aware"), 1);
+    let bed = Bed::new(affinity, handed_whole(), 1);
     let first = prompt(1_000, 100);
-    bed.decide(&request(&first, 7, NOW), Some(0))
-        .expect("rows for the first pick");
+    bed.decide(&request(&first, 7, NOW), Some(0));
     let record = {
         let records = bed.affinity.records.lock();
         Arc::clone(records.get(MODEL).expect("the model's record"))

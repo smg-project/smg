@@ -47,7 +47,8 @@ struct PrefixPass {
     /// profile may hold two, and one's pass says nothing of the other's.
     /// Zero is no stage.
     stage: u32,
-    /// The deepest match of the pass's rows, in blocks.
+    /// The deepest match of the pass's rows, in blocks, or in a lent
+    /// tree's own unit where a tree's match named the rows.
     deepest: u32,
     /// The mean in flight the spill gate read.
     mean_in_flight: f32,
@@ -74,11 +75,12 @@ pub(crate) fn forget_prefix_pass() {
 }
 
 /// Keeps what a pass of `stage` measured: the deepest match of its rows, in
-/// blocks, and the mean in flight its spill gate read. The first stage to
-/// keep on a thread holds the slot until it withdraws its pass or its word
-/// is taken, and a later stage's pass says nothing of that one: no entry of
-/// the engine empties the slot between decisions now. A later pass of the
-/// same stage writes over its own numbers.
+/// blocks or in a lent tree's own unit where a tree's match named the rows,
+/// and the mean in flight its spill gate read. The first stage to keep on a
+/// thread holds the slot until it withdraws its pass or its word is taken,
+/// and a later stage's pass says nothing of that one: no entry of the
+/// engine empties the slot between decisions now. A later pass of the same
+/// stage writes over its own numbers.
 #[inline]
 pub(crate) fn keep_prefix_pass(stage: PrefixStageId, deepest: u32, mean_in_flight: f32) {
     let stands = LAST_PASS.get().stage;

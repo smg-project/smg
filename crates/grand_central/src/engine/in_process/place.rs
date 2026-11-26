@@ -202,10 +202,10 @@ pub struct Prompt<'a> {
     /// holds as text ([`CacheIndexes::string_tree`]). The caller's own
     /// rule names it as the seeds are: the same cache partition, for a
     /// tree's lookup. `None` from a caller that lends no tree: the
-    /// request is then named its holders from the record of hashed
-    /// prefixes. One entry answers for every tree the request is decided
-    /// in, a pair's two sides too when a pair reads one: the token tree's
-    /// page is that question's argument.
+    /// request is then named the holders its model's index of cache
+    /// events names, and no other. One entry answers for every tree the
+    /// request is decided in, a pair's two sides too when a pair reads
+    /// one: the token tree's page is that question's argument.
     ///
     /// It is asked once by each decision of the call that reads the tree,
     /// and never where no stage of the request's place reads the tree. The
@@ -699,12 +699,13 @@ impl<'r, 'a> Made<'r, 'a> {
     /// call's request of token ids that names its entry in a token tree,
     /// over one list, under a document none of whose stages reads the
     /// hashes itself ([`AppliedSpec::hashes_named_alone`]). That lookup
-    /// reads the list by an index of cache events and by the record of sent
-    /// prefixes, and reads none of it for a request it decides inside a
-    /// lent tree's match. Every other request is hashed at its making: a
-    /// pair's sides read the list in their columns, and a prompt of more
-    /// token ids than a request's size counts is sized by its list. The
-    /// asks of a call answer alike: its decisions are one document's.
+    /// reads the list by an index of cache events, and by the record of
+    /// sent prefixes where it fills a column whole. It reads none of it for
+    /// a request it decides inside a lent tree's match. Every other request
+    /// is hashed at its making: a pair's sides read the list in their
+    /// columns, and a prompt of more token ids than a request's size counts
+    /// is sized by its list. The asks of a call answer alike: its decisions
+    /// are one document's.
     fn leaves_hashes(&self, spec: &AppliedSpec) -> bool {
         let prompt = self.request.prompt;
         self.of_call.is_some()

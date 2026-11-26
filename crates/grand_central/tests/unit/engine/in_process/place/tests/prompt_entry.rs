@@ -9,15 +9,17 @@ use std::{
     cell::{Cell, RefCell},
 };
 
-use kv_index::TokenTree;
+use kv_index::{ChainBlockMap, ChainIndex, ContentHash, StoredBlock, TokenTree};
 
 use super::*;
 use crate::{
-    document::spec::{RulePlaced, WarmupSliceParams},
+    document::spec::RulePlaced,
     engine::{
         decision::{Overlap, OverlapSource},
         decision_engine::{TextKey, TokenKey},
-        in_process::single::tests::{default_under_sessions, lending, lending_text, lent, Also},
+        in_process::single::tests::{
+            handed_whole_of, lending, lending_text, lent, under_sessions, whole_cache_aware, Also,
+        },
     },
 };
 
@@ -326,13 +328,12 @@ fn a_call_whose_decision_reads_no_tree_never_asks_the_entry() {
     assert_eq!(asked_of("cache_aware", false), 0);
 }
 
-/// A request that states no entry is decided as before, by the engine's
-/// record of hashed prefixes, though its host lends a tree: the tree is
-/// neither read nor written. The record keeps its prompt for the worker it
-/// was sent to: a rule that refuses the prompt's worker is asked once a
-/// target, and the prompt's next request goes to the worker the rule took.
-/// A request that states one beside it is stored in the tree for the
-/// worker it was sent to.
+/// A request that states no entry is named no holder, though its host
+/// lends a tree: the tree is neither read nor written, and the engine
+/// keeps no record of its own for a decision that is named its rows. The
+/// prompt's next request states a miss of its blocks again. A request that
+/// states an entry beside it is stored in the tree for the worker it was
+/// sent to.
 #[test]
 fn a_request_that_states_no_entry_leaves_the_tree_alone() {
     let (engine, tree) = lent("cache_aware", Also::Nothing);
@@ -340,28 +341,18 @@ fn a_request_that_states_no_entry_leaves_the_tree_alone() {
     let list = pool(4);
     let members = PublishedList::new(Arc::clone(&list));
     let tokens: Vec<u32> = (0..256).collect();
-    let mut plain = PlaceRequest {
+    let plain = PlaceRequest {
         prompt: Prompt {
             tokens: Some(&tokens),
             ..Prompt::NONE
         },
         ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
     };
-    let first = engine.place(&plain).expect("a placement").id();
-    // The rule now refuses the prompt's worker: a longer prompt goes to the
-    // target behind it, and its next request goes there again.
-    let asked = RefCell::new(Vec::new());
-    let admits = |worker: &dyn Worker| {
-        asked.borrow_mut().push(worker_id(worker));
-        worker_id(worker) != first
-    };
-    let longer: Vec<u32> = (0..512).collect();
-    plain.prompt.tokens = Some(&longer);
-    plain.admits = Some(&admits);
-    let moved = engine.place(&plain).expect("a placement").id();
-    assert_eq!(*asked.borrow(), [first, moved]);
-    plain.admits = None;
-    assert_eq!(engine.place(&plain).expect("a placement").id(), moved);
+    for turn in 0..4 {
+        let placed = engine.place(&plain).expect("a placement");
+        let stated = (placed.overlap.blocks, placed.overlap.source);
+        assert_eq!(stated, (0, OverlapSource::None), "turn {turn}");
+    }
     assert!(tree.get_tenant_token_counts().is_empty());
 
     let entry = Entry::of(&tokens);
@@ -590,22 +581,117 @@ fn a_rule_that_panics_inside_the_lookup_leaves_no_lease_behind() {
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// A prompt is hashed where a lookup reads its hashes. A call's request of
-/// token ids that states its entry in a token tree is made with no block
-/// hashed, at its size in blocks: inside a lent tree's match no stage of
-/// the preset reads a hash. The host here lends its tree while the request
-/// is made and none behind that, so the call's ask is named by the record
-/// of sent prefixes: the list is hashed for it there, and the prompt sent
-/// again goes back to the worker that ask picked. A list whose lookup is
-/// first read while the host lends again is decided inside the tree's
-/// match, and no block is hashed for it.
+/// `holder`'s cache events store the prompt `tokens` whole in `index`, by
+/// the hashes `engine` reads a prompt under.
+fn stores(engine: &InProcess, index: &ChainIndex, holder: &dyn Worker, tokens: &[u32]) {
+    let number = index.intern_worker(holder.url()).expect("a worker number");
+    let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+    let mut stated = RequestFacts::default();
+    hashes.write_to(&mut stated);
+    let blocks: Vec<StoredBlock> = stated
+        .block_hashes
+        .iter()
+        .map(|&hash| StoredBlock {
+            seq_hash: hash.into(),
+            content_hash: ContentHash(hash),
+        })
+        .collect();
+    let mut map = ChainBlockMap::new();
+    index
+        .apply_stored(number, &blocks, None, &mut map)
+        .expect("the stored blocks");
+}
+
+/// A model's first block sends the next call to the block's holder. The
+/// host lends its token tree and hands its index of cache events whenever
+/// it is asked. While the index holds no block the engine reads it as
+/// none: a prompt's turns are placed inside the tree's match, on one
+/// worker. Another worker's events then store the prompt. The next call
+/// over the same list finds the index's word moved and is placed on the
+/// index's holder, and no call behind the block reads the tree. The
+/// classic policy asks its index before every request of token ids
+/// (`event_index_for` in `model_gateway/src/policies/cache_aware.rs`) and
+/// decides by the index once it holds a block (`select_worker_scanned`).
 #[test]
-fn a_prompt_is_hashed_where_a_lookup_reads_its_hashes() {
-    /// A host that lends its token tree until it is told to stop.
-    struct Lends(Arc<TokenTree>, atomic::AtomicBool);
+fn a_models_first_block_sends_the_next_call_to_its_holder() {
+    /// A host that lends its token tree, and hands its index of cache
+    /// events with or without a block.
+    struct Lends(Arc<TokenTree>, Arc<ChainIndex>);
     impl CacheIndexes for Lends {
         fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            Some(Arc::clone(&self.1) as Arc<dyn CacheIndex>)
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
             None
+        }
+
+        fn token_tree(&self, _: &str, _: Phase) -> Option<Arc<TokenTree>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+    let tree = Arc::new(TokenTree::with_config(16, Default::default()));
+    let index = Arc::new(ChainIndex::new());
+    let engine = preset("cache_aware");
+    let host = Lends(tree, Arc::clone(&index));
+    engine.affinity.set_indexes(Arc::new(host));
+    let engine = hosted(engine);
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let tokens: Vec<u32> = (0..1_600).collect();
+    let entry = Entry::of(&tokens);
+    let request = stating(&members, &entry, None);
+    let first = engine.place(&request).expect("a placement").id();
+    for turn in 1..5 {
+        let again = engine.place(&request).expect("a placement");
+        assert_eq!(again.id(), first, "turn {turn}: inside the tree");
+    }
+    assert_eq!(entry.asked.get(), 5, "each turn read the tree");
+    // The model's first block: another worker's events store the prompt.
+    let other = list
+        .iter()
+        .find(|worker| worker_id(worker.as_ref()) != first);
+    let holder = Arc::clone(other.expect("a second worker"));
+    stores(engine, &index, holder.as_ref(), &tokens);
+    for turn in 5..10 {
+        let next = engine.place(&request).expect("a placement");
+        let to = worker_id(holder.as_ref());
+        assert_eq!(next.id(), to, "turn {turn}: the index's holder");
+    }
+    assert_eq!(
+        entry.asked.get(),
+        5,
+        "no call behind the block read the tree"
+    );
+}
+
+/// A call's request of token ids that states its entry in a token tree is
+/// hashed where a lookup reads its hashes, and nowhere else. It is made
+/// with no block hashed, at its size in blocks: inside a lent tree's match
+/// no stage of the preset reads a hash. A request that states no entry is
+/// hashed at its making, as before. The host here lends its tree
+/// while the request is made and none behind that, and keeps an index of
+/// cache events that holds the prompt for one worker: the call's ask is
+/// named by the index's lookup, the list is hashed for it there, and the
+/// prompt goes to that worker at every turn. A list whose table is first
+/// read while the host lends again, and hands no index, is decided inside
+/// the tree's match, and no block is hashed for it. Nor is one hashed
+/// where the host lends no tree and hands no index: nobody is asked for a
+/// holder there.
+#[test]
+fn a_prompt_is_hashed_where_a_lookup_reads_its_hashes() {
+    /// A host that lends its token tree until it is told to stop, and
+    /// hands its index of cache events while it is told to.
+    struct Lends(
+        Arc<TokenTree>,
+        atomic::AtomicBool,
+        Arc<ChainIndex>,
+        atomic::AtomicBool,
+    );
+    impl CacheIndexes for Lends {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            let hands = self.3.load(atomic::Ordering::Relaxed);
+            hands.then(|| Arc::clone(&self.2) as Arc<dyn CacheIndex>)
         }
 
         fn block_size(&self, _: &str) -> Option<u32> {
@@ -617,13 +703,20 @@ fn a_prompt_is_hashed_where_a_lookup_reads_its_hashes() {
         }
     }
     let tree = Arc::new(TokenTree::with_config(16, Default::default()));
-    let host = Arc::new(Lends(tree, atomic::AtomicBool::new(false)));
+    let index = Arc::new(ChainIndex::new());
+    let host = Arc::new(Lends(
+        tree,
+        atomic::AtomicBool::new(false),
+        Arc::clone(&index),
+        atomic::AtomicBool::new(true),
+    ));
     let engine = preset("cache_aware");
     engine
         .affinity
         .set_indexes(Arc::clone(&host) as Arc<dyn CacheIndexes>);
     let engine = hosted(engine);
-    let members = PublishedList::new(pool(8));
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
     let tokens: Vec<u32> = (0..1_600).collect();
     let entry = Entry::of(&tokens);
     let request = stating(&members, &entry, None);
@@ -634,17 +727,24 @@ fn a_prompt_is_hashed_where_a_lookup_reads_its_hashes() {
         assert!(facts.block_hashes.is_empty(), "no block is hashed there");
         assert_eq!(facts.blocks(1) * facts.block_size, 1_600, "its size stays");
     }
+    // The index holds the whole prompt for the fourth worker of the list.
+    let holder = Arc::clone(&list[3]);
+    stores(engine, &index, holder.as_ref(), &tokens);
     host.1.store(true, atomic::Ordering::Relaxed);
     let asked = single(engine.loaded(), &request, Some(members.lent()), &mut call);
     let first = asked.expect("a placement").id();
+    assert_eq!(first, worker_id(holder.as_ref()), "the index's holder");
     let hashed = matches!(call.whole.get(), Some(Some(_)));
-    assert!(hashed, "the record's lookup hashed them");
+    assert!(hashed, "the index's lookup hashed them");
     for turn in 0..16 {
         let again = engine.place(&request).expect("a placement");
         assert_eq!(again.id(), first, "turn {turn}");
     }
     assert_eq!(entry.asked.get(), 0, "no decision read a tree");
+    // The host lends its tree again and hands no index: a new list's
+    // table takes the tree.
     host.1.store(false, atomic::Ordering::Relaxed);
+    host.3.store(false, atomic::Ordering::Relaxed);
     let lent = PublishedList::new(pool(8));
     let request = stating(&lent, &entry, None);
     let mut inside = Call::default();
@@ -652,6 +752,16 @@ fn a_prompt_is_hashed_where_a_lookup_reads_its_hashes() {
     asked.expect("a placement");
     assert!(entry.asked.get() > 0, "that ask read the tree");
     assert!(inside.whole.get().is_none(), "and hashed no block");
+    // No tree and no index: a third list's request is named nobody, and
+    // no block is hashed for it.
+    host.1.store(true, atomic::Ordering::Relaxed);
+    let bare = PublishedList::new(pool(8));
+    let request = stating(&bare, &entry, None);
+    let mut unread = Call::default();
+    let asked = single(engine.loaded(), &request, Some(bare.lent()), &mut unread);
+    asked.expect("a placement");
+    let hashed = matches!(unread.whole.get(), Some(Some(_)));
+    assert!(!hashed, "nobody reads the hashes there");
 }
 
 /// A prompt made with no block hashed is hashed where a column is filled
@@ -663,21 +773,7 @@ fn a_prompt_is_hashed_where_a_lookup_reads_its_hashes() {
 /// holds every block of it.
 #[test]
 fn a_prompt_is_hashed_where_a_column_is_filled() {
-    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
-    document.generation = 1;
-    let profile = document.profiles.get_mut("cache_aware");
-    profile.expect("the preset's profile").score.push(
-        ScoreStage::WarmupSlice(WarmupSliceParams {
-            weight: 1.0,
-            secs: Some(7),
-            ..WarmupSliceParams::default()
-        })
-        .into(),
-    );
-    let applied = AppliedSpec::validate(&document).expect("the document validates");
-    let cap = applied.engine().affinity_rows_cap(MODEL, Phase::Single);
-    assert_eq!(cap, 0, "the profile reads the column whole");
-    let engine = hosted(InProcess::new(applied));
+    let engine = hosted(InProcess::new(whole_cache_aware(1)));
     let members = PublishedList::new(pool(8));
     let tokens: Vec<u32> = (0..1_600).collect();
     let entry = Entry::of(&tokens);
@@ -696,17 +792,20 @@ fn a_prompt_is_hashed_where_a_column_is_filled() {
     assert_eq!((again.id(), again.overlap), (first, WHOLE));
 }
 
-/// A prompt made with no block hashed is hashed behind a pin's answer too.
+/// A prompt made with no block hashed is hashed behind a pin's answer too,
+/// where the answer is recorded: under a profile handed its column whole.
 /// Under the `manual` preset's sessions rule, with a new key's placement
 /// delegated to the profile's stages, a key's second request goes where
 /// the key is pinned, and the rule tells the profile's stages of it: the
 /// lookup hands the prompt to the record of sent prefixes behind that
-/// answer, and the list is hashed for the write. The same prompt under no
-/// key then goes to the pin's worker by the record alone, which holds
-/// every block of it.
+/// answer, and the list is hashed for the column's fill and the write. The
+/// same prompt under no key then goes to the pin's worker by the record
+/// alone, which holds every block of it.
 #[test]
 fn a_prompt_is_hashed_where_a_pins_answer_is_recorded() {
-    let engine = hosted(InProcess::new(default_under_sessions(RulePlaced::Told)));
+    let whole = handed_whole_of(under_sessions(RulePlaced::Told));
+    let whole = AppliedSpec::validate(&whole).expect("the document validates");
+    let engine = hosted(InProcess::new(whole));
     let members = PublishedList::new(pool(8));
     let keyed = [(MANUAL_SESSION_HEADER, "talk-7")];
     let (opening, fresh): (Vec<u32>, Vec<u32>) =

@@ -203,8 +203,8 @@ fn a_pool_keeps_the_record_for_its_shadow_where_the_live_profile_is_named_no_row
     let second = aware.profiles.values().next();
     let second = second.expect("the preset's profile").clone();
     let aware = aware.validate().expect("the preset validates");
-    // The preset reads each worker by what it has: the index's
-    // holders keep their place ahead of the record's.
+    // The preset reads cache events too: the pool keeps a record, and
+    // its reader does not read sent prefixes alone.
     assert_eq!(aware.pool_record_for("m", Phase::Single), Some(false));
 
     let mut document = PolicySpec::preset("least_load").expect("a preset");
@@ -216,8 +216,8 @@ fn a_pool_keeps_the_record_for_its_shadow_where_the_live_profile_is_named_no_row
     assert!(!engine.reads_sent_for("m", Phase::Single));
     assert_eq!(engine.pool_record_for("m", Phase::Single), Some(false));
 
-    // A shadow that reads the record alone is named its holders
-    // ahead of the index's.
+    // A shadow that reads sent prefixes alone: the pool's word is the
+    // shadow's.
     let mut by_record = second;
     let prefix = PrefixAffinityParams {
         weight: 4.0,
@@ -347,8 +347,8 @@ fn a_shadow_is_not_asked_where_a_live_profile_reads_its_models_record() {
 #[test]
 fn a_decode_pool_keeps_the_record_its_models_pair_reads() {
     use crate::document::spec::{AffinitySource, PrefixAffinityParams, ScoreStage, ShadowSpec};
-    // A profile that reads the record alone: its holders are named
-    // ahead of the index's, which the preset's are not.
+    // A profile that reads sent prefixes alone, which the preset does
+    // not.
     let aware = PolicySpec::preset("cache_aware").expect("a preset");
     let aware = aware.profiles.into_values().next();
     let aware = aware.expect("the preset's profile");

@@ -74,9 +74,8 @@ fn holders(program: &Program, said: &[u32]) -> Vec<String> {
 /// long it grows: the tree matches the whole prompt. Eight workers stand, and
 /// a conversation of a thousand pages grows a page a turn.
 ///
-/// A program that lends no tree is named a prompt's holders from the engine's
-/// own record of hashed prefixes. That record holds the first 256 blocks of a
-/// prompt: too small a share of this one to send it back.
+/// A program that lends no tree is named no holder for such a prompt where no
+/// index of cache events holds a block: nothing sends it back.
 ///
 /// A gateway's own policy sends a request to a worker its tree's match found,
 /// where the match is over its threshold: the test of `cache_threshold` in
