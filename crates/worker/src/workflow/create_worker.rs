@@ -28,7 +28,7 @@ use crate::{
     model_card::ModelCard,
     model_type::ModelType,
     registry::WorkerOrigin,
-    worker::{ConstrainedDecoding, HealthCheckConfig, WorkerSpec, WorkerType},
+    worker::{ConstrainedDecoding, GrammarStart, HealthCheckConfig, WorkerSpec, WorkerType},
     UNKNOWN_MODEL_ID,
 };
 
@@ -306,6 +306,16 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
             });
         }
 
+        if let Some(warning) = unnamed_grammar_start_warning(
+            &url,
+            *connection_mode,
+            runtime_type,
+            config.worker_type,
+            &labels,
+        ) {
+            warn!("{warning}");
+        }
+
         debug!(
             "Created {} worker(s) for {} ({:?}, {} labels)",
             workers.len(),
@@ -353,6 +363,48 @@ pub fn validate_constrained_decoding_label(
         }
         None => Ok(()),
     }
+}
+
+/// What a registration says, once, of a worker whose labels name no grammar
+/// start: its `constrained_decoding_start` label is neither `first_token` nor
+/// `after_reasoning`, so it is sent the grammars that fit an engine of either
+/// start ([`GrammarStart::Unknown`]) and nothing else tells its operator so.
+/// `None` for a worker that names its start, and for one no grammar of a
+/// gateway's shaping reaches: a worker off the gRPC pipeline (its engine's own
+/// server shapes the grammar), one of a role that generates no token, and one
+/// of a runtime whose request carries no constraint. The roles and the
+/// runtimes that owe the warning are allow-listed, so one added later owes
+/// none until it is named.
+fn unnamed_grammar_start_warning(
+    url: &str,
+    connection_mode: ConnectionMode,
+    runtime_type: RuntimeType,
+    worker_type: WorkerType,
+    labels: &HashMap<String, String>,
+) -> Option<String> {
+    let generates = matches!(worker_type, WorkerType::Regular | WorkerType::Decode);
+    let carries_a_constraint = matches!(
+        runtime_type,
+        RuntimeType::Vllm | RuntimeType::Sglang | RuntimeType::Trtllm | RuntimeType::TokenSpeed
+    );
+    let start = GrammarStart::from_label(labels.get(GrammarStart::LABEL).map(String::as_str));
+    if !connection_mode.uses_grpc_pipeline()
+        || !generates
+        || !carries_a_constraint
+        || start != GrammarStart::Unknown
+    {
+        return None;
+    }
+    Some(format!(
+        "Worker {} names no {} label ({} or {}): on a prompt that leaves the model inside its \
+         thought, a forced tool call or a JSON answer is held to its JSON schema alone, which an \
+         engine that starts a grammar at the first token applies before the model thinks; set \
+         the label on the worker to shape the grammar for its engine",
+        Endpoint::redacted_str(url),
+        GrammarStart::LABEL,
+        GrammarStart::FIRST_TOKEN,
+        GrammarStart::AFTER_REASONING,
+    ))
 }
 
 /// Treat an empty KV transfer value as unset, so a later report can fill it.

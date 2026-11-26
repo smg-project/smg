@@ -407,6 +407,93 @@ async fn a_refusal_names_the_workers_address_through_the_mask() {
     );
 }
 
+/// A registration says once that a worker a gateway-shaped grammar reaches
+/// names no `constrained_decoding_start`: one line for the address, however
+/// many rank workers stand for it, and none for a worker whose spec sets the
+/// label by hand.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_registration_warns_once_of_a_worker_that_names_no_grammar_start() {
+    let mut data = local_data(
+        WorkerSpec::new("worker-a:9000"),
+        ConnectionMode::Grpc,
+        ordinary_host(),
+    );
+    data.detected_runtime_type = Some(RuntimeType::Vllm.to_string());
+    data.discovered_labels = labels_of(&[("served_model_name", "m"), ("dp_size", "2")]);
+    data.dp_info = dp_info_from_labels(&data.discovered_labels).unwrap();
+    let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    assert_eq!(
+        CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+        StepResult::Success
+    );
+    assert_eq!(ctx.data.actual_workers.as_ref().unwrap().len(), 2);
+
+    let mut labelled = WorkerSpec::new("worker-b:9000");
+    labelled.labels = labels_of(&[(GrammarStart::LABEL, GrammarStart::FIRST_TOKEN)]);
+    let mut data = local_data(labelled, ConnectionMode::Grpc, ordinary_host());
+    data.detected_runtime_type = Some(RuntimeType::Vllm.to_string());
+    data.discovered_labels = labels_of(&[("served_model_name", "m")]);
+    let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    assert_eq!(
+        CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+        StepResult::Success
+    );
+
+    logs_assert(|lines: &[&str]| {
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line.contains("names no constrained_decoding_start label"))
+            .collect();
+        match warned.as_slice() {
+            [line] if line.contains("WARN") && line.contains("Worker grpc://worker-a:9000 ") => {
+                Ok(())
+            }
+            _ => Err(format!("one warning, for worker-a alone, not {warned:?}")),
+        }
+    });
+}
+
+/// Only a worker a gateway-shaped grammar reaches owes the warning: one on the
+/// gRPC pipeline, of a role that generates tokens, on a runtime whose request
+/// carries a constraint, whose label names no start a gateway reads.
+#[test]
+fn only_a_worker_a_grammar_reaches_owes_the_grammar_start_warning() {
+    let warned =
+        |mode: ConnectionMode, runtime: RuntimeType, role: WorkerType, labels: &[(&str, &str)]| {
+            unnamed_grammar_start_warning(
+                "grpc://worker:9000",
+                mode,
+                runtime,
+                role,
+                &labels_of(labels),
+            )
+            .is_some()
+        };
+    let (grpc, vllm, regular) = (ConnectionMode::Grpc, RuntimeType::Vllm, WorkerType::Regular);
+    let start = GrammarStart::LABEL;
+
+    assert!(warned(grpc, vllm, regular, &[]));
+    assert!(warned(grpc, vllm, WorkerType::Decode, &[]));
+    assert!(warned(ConnectionMode::Zmq, vllm, regular, &[]));
+    for runtime in [
+        RuntimeType::Sglang,
+        RuntimeType::Trtllm,
+        RuntimeType::TokenSpeed,
+    ] {
+        assert!(warned(grpc, runtime, regular, &[]), "{runtime}");
+    }
+    // A value a gateway does not read names no start either.
+    assert!(warned(grpc, vllm, regular, &[(start, "later")]));
+
+    assert!(!warned(grpc, vllm, regular, &[(start, "first_token")]));
+    assert!(!warned(grpc, vllm, regular, &[(start, "after_reasoning")]));
+    assert!(!warned(ConnectionMode::Http, vllm, regular, &[]));
+    assert!(!warned(grpc, vllm, WorkerType::Prefill, &[]));
+    assert!(!warned(grpc, vllm, WorkerType::Encode, &[]));
+    assert!(!warned(grpc, RuntimeType::Mlx, regular, &[]));
+}
+
 /// The failure of creation for a worker that reports these labels.
 async fn failure_of_a_worker_reporting(labels: &[(&str, &str)]) -> String {
     let mut data = local_data(
