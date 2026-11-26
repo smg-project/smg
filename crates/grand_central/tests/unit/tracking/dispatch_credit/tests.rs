@@ -15,7 +15,7 @@ use crate::{
         decision, decision_engine::DecisionEngine, framework, Candidate, Constraints, Engine,
         Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer, Scratch, Target, TieBand, WorkerId,
     },
-    stages::{pickers, scorers::take_lane, Lifecycle, StageRegistry},
+    stages::{pickers, scorers::tests::take_lane, Lifecycle, StageRegistry},
     tracking::{
         decision_guard::DecisionGuard, CreditedDispatches, DispatchCounts, DispatchCredit, Lease,
         Membership, Side,
