@@ -519,6 +519,13 @@ pub(crate) fn translate_request_sglang(
         }
         _ => (routed_dp_rank(req.data_parallel_rank, ranks)?, None),
     };
+    let sglang_proto::CachePartition {
+        cache_salt,
+        extra_key,
+    } = req
+        .cache_partition
+        .map(|partition| *partition)
+        .unwrap_or_default();
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
         input_text,
@@ -547,6 +554,10 @@ pub(crate) fn translate_request_sglang(
         routed_dp_rank,
         disagg_prefill_dp_rank,
         require_reasoning: req.require_reasoning,
+        // An empty string is unset. SGLang's tokenizer manager applies that
+        // rule, and a request on this wire does not pass through it.
+        extra_key: extra_key.filter(|value| !value.is_empty()),
+        cache_salt: cache_salt.filter(|value| !value.is_empty()),
         ..TokenizedGenerateReqInput::default()
     })
 }
@@ -1717,6 +1728,39 @@ mod tests {
             ),
             (None, None, None)
         );
+    }
+
+    /// The cache partition reaches the scheduler as its two separate fields. An
+    /// empty string is unset.
+    #[test]
+    fn sglang_translation_forwards_the_cache_partition() {
+        let forwarded = |cache_partition| {
+            let wire = translate(sglang_proto::GenerateRequest {
+                request_id: "r".into(),
+                tokenized: Some(sglang_proto::TokenizedInput {
+                    input_ids: vec![1, 2],
+                    original_text: String::new(),
+                }),
+                cache_partition,
+                ..Default::default()
+            })
+            .unwrap();
+            (wire.cache_salt, wire.extra_key)
+        };
+        assert_eq!(forwarded(None), (None, None));
+        for (sent, expected) in [
+            ((None, None), (None, None)),
+            ((Some(""), Some("")), (None, None)),
+            ((Some("salt"), None), (Some("salt"), None)),
+            ((Some(""), Some("key")), (None, Some("key"))),
+            ((Some("salt"), Some("key")), (Some("salt"), Some("key"))),
+        ] {
+            let (cache_salt, extra_key) = forwarded(Some(Box::new(sglang_proto::CachePartition {
+                cache_salt: sent.0.map(String::from),
+                extra_key: sent.1.map(String::from),
+            })));
+            assert_eq!((cache_salt.as_deref(), extra_key.as_deref()), expected);
+        }
     }
 
     /// The data-parallel pin is placed as the engine's own frontend places

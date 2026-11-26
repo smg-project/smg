@@ -858,6 +858,14 @@ mod tests {
     use super::*;
     use crate::channel::testing::refused_endpoint;
 
+    /// The future of each generate call holds a request. A field that needs
+    /// more room goes in a box (see `build.rs`).
+    #[test]
+    fn the_request_stays_in_the_512_byte_allocator_class() {
+        let bytes = size_of::<proto::GenerateRequest>();
+        assert!(bytes <= 512, "an SGLang request is {bytes} bytes");
+    }
+
     #[test]
     fn score_request_uses_unscaled_prefill_only_logprobs() {
         let request = SglangSchedulerClient::build_score_request(
