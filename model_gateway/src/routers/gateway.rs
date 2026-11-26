@@ -88,6 +88,9 @@ struct RouterFamily {
     /// The wire a PD or EPD family pairs its prefill and decode workers on;
     /// `None` for a regular family.
     wire: Option<PdWire>,
+    /// The encode pool of an EPD family: an image request needs a worker
+    /// there, a text request does not.
+    encode: Option<RoutingPool>,
     /// A family whose weight takes this one's place.
     shadowed_by: Option<RouterId>,
 }
@@ -104,31 +107,60 @@ const ROUTER_FAMILIES: [RouterFamily; 5] = [
             RoutingPool::GrpcDecode,
         ],
         wire: Some(PdWire::Grpc),
+        encode: Some(RoutingPool::GrpcEncode),
         shadowed_by: None,
     },
     RouterFamily {
         router: router_ids::GRPC_PD,
         pools: &[RoutingPool::GrpcPrefill, RoutingPool::GrpcDecode],
         wire: Some(PdWire::Grpc),
+        encode: None,
         shadowed_by: Some(router_ids::GRPC_EPD),
     },
     RouterFamily {
         router: router_ids::HTTP_PD,
         pools: &[RoutingPool::HttpPrefill, RoutingPool::HttpDecode],
         wire: Some(PdWire::Http),
+        encode: None,
         shadowed_by: None,
     },
     RouterFamily {
         router: router_ids::GRPC_REGULAR,
         pools: &[RoutingPool::GrpcPipelineRegular],
         wire: None,
+        encode: None,
         shadowed_by: None,
     },
     RouterFamily {
         router: router_ids::HTTP_REGULAR,
         pools: &[RoutingPool::HttpRegular],
         wire: None,
+        encode: None,
         shadowed_by: None,
+    },
+];
+
+/// One check of the family draw ([`Gateway::draw_family`]).
+struct DrawCheck {
+    /// Which workers can serve.
+    can_serve: fn(&dyn Worker) -> bool,
+    /// Whether an EPD family needs an encode worker that can serve.
+    needs_encode: bool,
+}
+
+/// The checks of the family draw, in the order it tries them.
+const DRAW_CHECKS: [DrawCheck; 3] = [
+    DrawCheck {
+        can_serve: routable_but_for_overload,
+        needs_encode: true,
+    },
+    DrawCheck {
+        can_serve: routable_but_for_overload,
+        needs_encode: false,
+    },
+    DrawCheck {
+        can_serve: routable_but_for_veto,
+        needs_encode: false,
     },
 ];
 
@@ -381,15 +413,20 @@ impl Gateway {
     /// serve, it refuses the request. So when more than one family has
     /// weight, a family weighs only its workers that can serve. A PD or EPD
     /// family gets weight only if a compatible prefill and decode pair can
-    /// serve. Its encode workers add weight, but it does not need them: a
-    /// text request needs no encode worker. The draw tries two checks, in
-    /// this order:
+    /// serve.
     ///
-    /// 1. ready, permitted by the circuit breaker, and not stalled;
-    /// 2. ready and permitted by the circuit breaker. A router uses a stalled
-    ///    worker when it has no other.
+    /// The draw does not see the request, so it tries three checks, in this
+    /// order. In the first two, a worker can serve if it is ready, permitted
+    /// by the circuit breaker, and not stalled.
     ///
-    /// If no family gets weight from either check, the registered weights
+    /// 1. An EPD family also needs an encode worker that can serve. So the
+    ///    family drawn can take every request.
+    /// 2. An EPD family needs no encode worker. It can take text requests
+    ///    only, because an image request needs an encode worker.
+    /// 3. A stalled worker can serve too. A router uses a stalled worker
+    ///    when it has no other.
+    ///
+    /// If no family gets weight from any check, the registered weights
     /// decide, and the router drawn refuses the request.
     ///
     /// Overload does not remove weight. If it did, all requests of a busy
@@ -411,11 +448,17 @@ impl Gateway {
             .as_ref()
             .map(|policies| policies.pd_pairing_mode())
             .unwrap_or_default();
-        let checks: [fn(&dyn Worker) -> bool; 2] =
-            [routable_but_for_overload, routable_but_for_veto];
-        for can_serve in checks {
+        for DrawCheck {
+            can_serve,
+            needs_encode,
+        } in DRAW_CHECKS
+        {
             let serves = |pool: RoutingPool, worker: &Arc<dyn Worker>| {
                 takes(pool, worker.as_ref()) && can_serve(worker.as_ref())
+            };
+            let pool_serves = |pool: RoutingPool| {
+                let mut workers = snapshot.pool(pool).iter();
+                workers.any(|worker| serves(pool, worker))
             };
             let pair_serves = |wire: PdWire| {
                 let pairs = snapshot.pd_pairs(wire, mode);
@@ -429,9 +472,13 @@ impl Gateway {
             let mut weights = [0usize; ROUTER_FAMILIES.len()];
             for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
                 // A family with no registered weight stays at zero, so the
-                // gRPC PD family stays behind the EPD family. A PD or EPD
-                // family needs a pair that can serve.
-                if registered[i] == 0 || family.wire.is_some_and(|wire| !pair_serves(wire)) {
+                // gRPC PD family stays behind the EPD family.
+                let can_take = registered[i] > 0
+                    && family.wire.is_none_or(&pair_serves)
+                    && family
+                        .encode
+                        .is_none_or(|pool| !needs_encode || pool_serves(pool));
+                if !can_take {
                     continue;
                 }
                 weights[i] = family
@@ -1357,6 +1404,7 @@ mod tests {
     use smg_worker::{
         health::circuit_breaker::CircuitBreakerConfig,
         identity::basic::{RuntimeType, WorkerType},
+        pd::pairing::PdPairingMode,
         runtime::StallReason,
     };
 
@@ -2821,7 +2869,16 @@ mod tests {
     /// A gateway with the five family routers, each named for its family,
     /// and one worker of model `m` for each entry.
     fn named_family_gateway(workers: &[(ConnectionMode, WorkerType, Serving)]) -> Arc<Gateway> {
-        let gateway = test_gateway(true);
+        named_families_over(Gateway::new(Arc::new(WorkerRegistry::new())), workers)
+    }
+
+    /// [`named_family_gateway`] over `gateway`, which can carry policies.
+    fn named_families_over(
+        mut gateway: Gateway,
+        workers: &[(ConnectionMode, WorkerType, Serving)],
+    ) -> Arc<Gateway> {
+        gateway.enable_igw = true;
+        let gateway = Arc::new(gateway);
         for (id, name) in [
             (router_ids::GRPC_EPD, "grpc_epd"),
             (router_ids::GRPC_PD, "grpc_pd"),
@@ -2987,25 +3044,53 @@ mod tests {
         );
     }
 
-    /// An EPD fleet keeps its share while its encode workers are down,
-    /// because a text request needs no encode worker. Its prefill and decode
-    /// workers give its weight. The gRPC PD family stays behind it.
+    /// An EPD fleet with no encode worker that can serve takes no image
+    /// request, so a family that can take every request goes first. Beside a
+    /// stalled worker, the EPD fleet takes the requests, because it can take
+    /// text. The gRPC PD family stays behind it.
     #[test]
-    fn an_epd_fleet_keeps_its_share_while_its_encode_workers_are_down() {
+    fn an_epd_fleet_without_an_encode_worker_yields_to_a_family_that_serves_all() {
         use Serving::{NotReady, Stalled, Yes};
         use WorkerType::{Decode, Encode, Prefill, Regular};
-        let encode = (GRPC, Encode, NotReady);
         let prefill = (GRPC, Prefill, Yes);
         let decode = (GRPC, Decode, Yes);
+        assert_shares(
+            &[(GRPC, Encode, Yes), prefill, decode, (HTTP, Regular, Yes)],
+            &[("grpc_epd", 0.75), ("http", 0.25)],
+        );
+        let encode = (GRPC, Encode, NotReady);
         assert_shares(&[encode, prefill, decode], &[("grpc_epd", 1.0)]);
         assert_shares(
             &[encode, prefill, decode, (HTTP, Regular, Yes)],
-            &[("grpc_epd", 2.0 / 3.0), ("http", 1.0 / 3.0)],
+            &[("http", 1.0)],
         );
         assert_shares(
             &[encode, prefill, decode, (HTTP, Regular, Stalled)],
             &[("grpc_epd", 1.0)],
         );
+    }
+
+    /// The draw pairs workers by the routers' pairing mode. Under `strict`,
+    /// workers that report no KV transport cannot pair, so a stalled HTTP
+    /// worker gets the requests.
+    #[test]
+    fn the_draw_pairs_workers_by_the_routers_pairing_mode() {
+        use WorkerType::{Decode, Prefill, Regular};
+        let workers = [
+            (HTTP, Regular, Serving::Stalled),
+            (GRPC, Prefill, Serving::Yes),
+            (GRPC, Decode, Serving::Yes),
+        ];
+        for (mode, expected) in [
+            (PdPairingMode::Lenient, "grpc_pd"),
+            (PdPairingMode::Strict, "http"),
+        ] {
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_pd_pairing_mode(mode);
+            let gateway =
+                Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
+            let gateway = named_families_over(gateway, &workers);
+            assert_drawn(&gateway, (mode, workers), &[(expected, 1.0)]);
+        }
     }
 
     /// A PD family gets weight only from a pair that can serve. On gRPC, an
