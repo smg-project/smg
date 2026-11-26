@@ -972,6 +972,81 @@ fn a_side_that_reads_no_affinity_keeps_its_own_rule() {
     assert_eq!(decodes.len(), 4, "{decodes:?}");
 }
 
+/// How many entries each of the calling thread's two columns holds, the
+/// prefills' first, as its last decision of a pair left them.
+fn column_lengths() -> [usize; 2] {
+    BUFFERS.with(|buffers| buffers.borrow().columns.each_ref().map(Vec::len))
+}
+
+/// A side whose phase reads no affinity keeps an empty column: its fill
+/// stops at one test. The side that reads holds an entry a worker of its
+/// list. The first three decisions run on one thread: each side's column
+/// goes from read to not read once, and what the decision before left in
+/// it is emptied. A pair that its two draws decide runs no fill, and
+/// leaves both columns empty behind a decision that filled both.
+#[test]
+fn a_side_that_reads_no_affinity_keeps_an_empty_column() {
+    for (prefill, decode, lengths) in [
+        ("cache_aware", "round_robin", [4, 0]),
+        ("round_robin", "cache_aware", [0, 4]),
+        ("cache_aware", "round_robin", [4, 0]),
+    ] {
+        let host = host_under(prefill, decode);
+        let sent = prompt(&host, 1_000);
+        host.picked(&decide_prompt(&host, &sent, 1, None));
+        assert_eq!(column_lengths(), lengths, "{prefill} and {decode}");
+    }
+    let filled = host_under("cache_aware", "cache_aware");
+    let sent = prompt(&filled, 1_000);
+    filled.picked(&decide_prompt(&filled, &sent, 1, None));
+    assert_eq!(column_lengths(), [4, 4], "both sides read");
+    let drawing = PolicySpec::pair_presets("power_of_two", "power_of_two");
+    let drawing = host_of(drawing.expect("the pair presets"), 8, 8);
+    assert!(drawing.decide(&OPEN, 5, None).pick().is_some());
+    assert_eq!(column_lengths(), [0, 0], "a pair its draws decide");
+}
+
+/// The decode asked again is handed no column of the prefills: the one
+/// its thread's decision before it filled is emptied, and the decodes'
+/// is filled anew.
+#[test]
+fn the_decode_asked_again_is_handed_no_column_of_the_prefills() {
+    let host = host_under("cache_aware", "cache_aware");
+    let sent = prompt(&host, 1_000);
+    let (prefill, _) = host.picked(&decide_prompt(&host, &sent, 1, None));
+    assert_eq!(column_lengths(), [4, 4]);
+    let held = prefill_alone(worker_id(host.prefills[prefill].as_ref()));
+    host.picked(&decide_prompt(&host, &sent, 2, Some(&held)));
+    assert_eq!(column_lengths(), [0, 4]);
+}
+
+/// A pair's two sides write one model's record, the prefill's side ahead
+/// of the decode's. Under a record held to one placement the prefill's
+/// write takes that placement, and the decode's write of the same block
+/// finds it taken and gives its worker none. So the prompt's next pair
+/// reads the prefills' column holding the prompt, and the decodes'
+/// holding none of it.
+#[test]
+fn a_pairs_prefill_is_recorded_ahead_of_its_decode() {
+    let mut document =
+        PolicySpec::pair_presets("cache_aware", "cache_aware").expect("the pair presets");
+    // Room for one placement: one block's tokens.
+    document.index.entry("*".into()).or_default().max_size = 16;
+    let host = host_of(document, 1, 1);
+    let tokens: Vec<u32> = (1_000..1_016).collect();
+    let spec = host.engine.spec();
+    let seeds = HashSeeds::PLAIN;
+    let sent = PromptHashes::under_document(&spec, Some(16), Some(&tokens), None, seeds);
+    host.picked(&decide_prompt(&host, &sent, 1, None));
+    // The prompt's next pair reads what each side's record holds of it.
+    host.picked(&decide_prompt(&host, &sent, 2, None));
+    let recorded = BUFFERS.with(|buffers| {
+        let columns = &buffers.borrow().columns;
+        columns.each_ref().map(|column| column[0].predicted_blocks)
+    });
+    assert_eq!(recorded, [1, 0]);
+}
+
 /// Asserts that under `host` a prompt's decode stays while its prefills
 /// take their turns, and that the decode asked again behind a held
 /// prefill is the prompt's too.
@@ -990,10 +1065,11 @@ fn the_decode_stays_and_the_prefills_turn(host: &Host) {
     assert_eq!(prefills.len(), 4, "{prefills:?}");
 }
 
-/// The mirror of the case above, where the decode alone reads: with
-/// `round_robin` on the prefills and `cache_aware` on the decodes, a
-/// prompt's decode stays and its prefills take their turns. The
-/// decode's pick is written and none for the prefill.
+/// The mirror of `a_side_that_reads_no_affinity_keeps_its_own_rule`,
+/// where the decode alone reads: with `round_robin` on the prefills and
+/// `cache_aware` on the decodes, a prompt's decode stays and its prefills
+/// take their turns. The decode's pick is written and none for the
+/// prefill.
 #[test]
 fn a_decode_that_reads_alone_keeps_its_prompts_decode() {
     the_decode_stays_and_the_prefills_turn(&host_under("round_robin", "cache_aware"));
@@ -1204,4 +1280,50 @@ fn each_sides_record_keeps_a_prompt_by_the_sides_own_word() {
             }
         }
     }
+}
+
+/// The decode asked again takes the decode side's word of the pair that
+/// holds it ahead of its side's write, which asks that word. A key's pin
+/// is followed under a rule that keeps what it places from the profile.
+/// The decode is then asked again behind that pair with no key: its own
+/// stages find the one decode again, the word of the pair stands, and
+/// the decode's record takes nothing of the prompt. So the prompt's next
+/// pair reads a decodes' column that holds none of it.
+#[test]
+fn the_decode_asked_again_writes_by_the_word_of_the_pair_that_holds_it() {
+    let document = kept_document("cache_aware", Assignment::Delegate, RulePlaced::Untold);
+    let host = host_of(document, 4, 1);
+    let classes = every(4, 1);
+    // One decision of the prompt `hashes`, under `key` where one is
+    // given: the pair's first, or the decode's again behind `held`.
+    let decide = |hashes: &PromptHashes, key: Option<u64>, held: Option<&Target>| {
+        let Asks(mut request, lists, _) = host.asks(&classes, false);
+        request.facts = RequestFacts {
+            seed: 1,
+            session_key: key.map_or(Identity::NONE, Identity::hashed),
+            ..facts()
+        };
+        hashes.write_to(&mut request.facts);
+        lists.decide(&host.engine, None, Instant::now(), &mut request, held)
+    };
+    let untold = |decision: &Decision| decision.pick().expect("a pick").decode_untold();
+    // The key is pinned, and its next request follows the pin: the rule
+    // placed that pair, and keeps it from the profile.
+    decide(&prompt(&host, 1_000), Some(500), None);
+    let sent = prompt(&host, 2_000);
+    let followed = decide(&sent, Some(500), None);
+    assert!(untold(&followed), "the rule placed the decode");
+    let held = first_target(&followed);
+    // With no key the decode asked again is placed by its own stages,
+    // and it names the decode of the pair that holds it.
+    let again = decide(&sent, None, Some(&held));
+    assert!(untold(&again), "the word of the pair that holds it");
+    // What the decodes' column holds of the prompt by the record, read
+    // by the prompt's next pair: nothing.
+    decide(&sent, None, None);
+    let recorded: Vec<u32> = BUFFERS.with(|buffers| {
+        let column = &buffers.borrow().columns[1];
+        column.iter().map(|held| held.predicted_blocks).collect()
+    });
+    assert_eq!(recorded, [0]);
 }

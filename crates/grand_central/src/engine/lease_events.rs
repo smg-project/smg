@@ -73,7 +73,7 @@ use crate::tracking::lease::{Lease, Said, Side};
 /// ([`Pair::decode_placing`](super::decision::Pair::decode_placing)). The
 /// askers are a pair's dispatch ([`pair`]), its two issues and a later
 /// decode's, and each side's write of where the prompt went
-/// (`in_process::pair`). A decode asked again states its own word of
+/// (`in_process::overlap`). A decode asked again states its own word of
 /// the decode side, and keeps the word of the pair it is held by where it
 /// names that pair's decode: the decision that put the request there
 /// stands. A gateway's sticky map places each role of a pair under that
