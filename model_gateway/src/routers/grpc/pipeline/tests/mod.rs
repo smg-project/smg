@@ -938,7 +938,11 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
         }],
     });
     let model_dir = unreadable_model_dir();
-    for (runtime, refused) in [(RuntimeType::Mlx, true), (RuntimeType::Sglang, false)] {
+    for (runtime, refused, prepared) in [
+        (RuntimeType::Mlx, true, false),
+        (RuntimeType::Sglang, false, false),
+        (RuntimeType::Sglang, false, true),
+    ] {
         let seen_ids = Arc::new(Mutex::new(Vec::new()));
         let port = spawn_stub(GatedScheduler {
             seen_input_ids: Arc::clone(&seen_ids),
@@ -954,8 +958,11 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
             None,
             Duration::from_secs(60),
         );
-        let pipeline = RequestPipeline::build(Endpoint::Messages, Mode::Regular, &deps)
+        let mut pipeline = RequestPipeline::build(Endpoint::Messages, Mode::Regular, &deps)
             .expect("messages pipeline");
+        if prepared {
+            pipeline.prepared_input = true;
+        }
         let components = components_with_multimodal(worker_registry, Some(model_dir.path())).await;
         let request: Arc<CreateMessageRequest> =
             Arc::new(serde_json::from_value(request.clone()).expect("messages request"));
@@ -992,6 +999,7 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
             // the config lookup the test's model directory cannot satisfy:
             // the deployment's fault, answered in the server's class.
             assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            let _ = prepared;
             assert_eq!(
                 body["error"]["code"], "multimodal_processing_failed",
                 "{body}"
@@ -1056,6 +1064,13 @@ fn completion_pipeline_with_policy(
 /// that just refused: one call there, one on the other engine, 200.
 #[tokio::test]
 async fn a_pinned_retry_moves_to_another_engine_after_an_unavailable_start() {
+    for prepared in [false, true] {
+        text_retry_with_optional_prepared_adapter(prepared).await;
+    }
+}
+
+/// An installed media adapter must not suppress ordinary text failover.
+async fn text_retry_with_optional_prepared_adapter(prepared: bool) {
     let seen_refusing = Arc::new(Mutex::new(Vec::new()));
     let seen_serving = Arc::new(Mutex::new(Vec::new()));
     let refusing_port = spawn_stub(GatedScheduler {
@@ -1075,8 +1090,11 @@ async fn a_pinned_retry_moves_to_another_engine_after_an_unavailable_start() {
     let worker_registry = Arc::new(WorkerRegistry::new());
     register_worker(&worker_registry, refusing_port, WorkerType::Regular);
     register_worker(&worker_registry, serving_port, WorkerType::Regular);
-    let pipeline =
+    let mut pipeline =
         completion_pipeline_with_policy(&worker_registry, PolicyConfig::ConsistentHashing);
+    if prepared {
+        pipeline.prepared_input = true;
+    }
     let components = components(worker_registry).await;
     let retry = fast_retry_config(3);
 

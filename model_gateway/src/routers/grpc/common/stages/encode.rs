@@ -81,6 +81,24 @@ impl PipelineStage for EncodeStage {
             return Ok(());
         }
 
+        // Under SGLang prepared-input EPD, media encoding is planned ahead of
+        // preparation and dispatched directly during request execution. If a
+        // prepared-input encoder is selected without the SGLang EPD adapter
+        // enabled (e.g., via dynamic registration without `--backend sglang`),
+        // refuse explicitly instead of falling through to Rendezvous.
+        if workers.encode_handoff() == Some(EncodeHandoff::PreparedInput) {
+            if matches!(
+                ctx.state.encode_outputs,
+                Some(EncodeOutputs::PreparedInput(_))
+            ) {
+                return Ok(());
+            }
+            return Err(error::bad_request(
+                "sglang_epd_not_enabled",
+                "SGLang prepared-input EPD requires --epd-disaggregation with --backend sglang",
+            ));
+        }
+
         // Under a push handoff the encoder takes the built prompt during
         // request execution; the stage names the encoder and the consumer
         // destination and refuses what the handoff cannot carry. There is no

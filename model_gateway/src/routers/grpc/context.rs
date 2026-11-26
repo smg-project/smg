@@ -616,6 +616,8 @@ pub(crate) struct AttemptStamp {
 /// Not `#[derive(Debug)]`: `EncodeDispatchPlan` transitively holds
 /// non-`Debug` raw proto payloads (`TokenSpeedMultimodalItem`).
 pub(crate) enum EncodeOutputs {
+    /// SGLang references and binding budget; E/P/D start together at execution.
+    PreparedInput(Box<super::sglang_epd::PreparedInput>),
     /// Per-item bootstrap rendezvous info for the prefill request, plus the
     /// dispatch plan that fans out to the encode workers beside the
     /// prefill/decode pair. Owns the encode jobs' SHM/RDMA Drop guards:

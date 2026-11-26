@@ -1159,9 +1159,10 @@ class RouterArgs:
                 " transfer protocol. lenient refuses only a known difference in runtime,"
                 " transport or KV layout (unknown components and engine versions pair"
                 " with anything); strict also refuses unknown components and version"
-                " differences; off compares nothing of it. On the gRPC wire two known"
-                " runtimes never pair, in any mode: its requests are in the runtime's"
-                " own message type"
+                " differences; off compares nothing of it, except prepared-input"
+                " (sglang_prepared_key) compatibility so managed and unmanaged workers"
+                " never mix. On the gRPC wire two known runtimes never pair, in any"
+                " mode: its requests are in the runtime's own message type"
             ),
         )
         routing_group.add_argument(

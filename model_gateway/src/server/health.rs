@@ -94,7 +94,10 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     routers::{
         common::snapshot::{WorkerRegistry, WorkerRegistryExt},
-        grpc::multimodal::{mm_settings, models_without_media_processing},
+        grpc::{
+            multimodal::{mm_settings, models_without_media_processing},
+            sglang_epd as prepared_input,
+        },
     },
 };
 
@@ -216,6 +219,11 @@ impl ModelReadiness {
             .find(|(role, _)| healthy_of(Some(*role)) == 0)
         {
             Some(*lacking)
+        } else if router_config.is_sglang_epd()
+            && has_encode_worker()
+            && !prepared_input::pipeline_ready(workers, router_config.pd_pairing_mode)
+        {
+            Some("no_compatible_epd_pipeline")
         } else if !router_config.disable_tokenizer_autoload
             && !workers
                 .iter()
@@ -431,7 +439,7 @@ impl ProbeState {
         // follows).
         let mut model_ids = worker_registry.get_models();
         model_ids.sort_unstable();
-        let models = model_ids
+        let models: Vec<_> = model_ids
             .into_iter()
             .filter(|model| model != UNKNOWN_MODEL_ID)
             .filter_map(|model| {
@@ -464,7 +472,8 @@ impl ProbeState {
         }
 
         self.readiness.store(Arc::new(ReadinessSnapshot {
-            workers_ready,
+            workers_ready: workers_ready
+                && (!router_config.is_sglang_epd() || models.iter().any(|m| m.ready)),
             tokenizers_ready,
             healthy_workers: healthy_workers.len(),
             total_workers: workers.len(),
@@ -1234,6 +1243,56 @@ mod tests {
         let snapshot = state.readiness();
         assert!(snapshot.workers_ready);
         assert!(!snapshot.tokenizers_ready);
+    }
+
+    #[tokio::test]
+    async fn prepared_epd_readiness_requires_compatible_pipeline() {
+        use openai_protocol::worker::RuntimeType;
+
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let mut router_config = config(RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        });
+        router_config.disable_tokenizer_autoload = true;
+        router_config.startup_worker_runtime_type = Some(RuntimeType::Sglang);
+        for (port, role, kv) in [
+            (9501, WorkerType::Encode, "mooncake"),
+            (9502, WorkerType::Prefill, "mooncake"),
+            (9503, WorkerType::Decode, "nixl"),
+        ] {
+            let mut cap = prepared_input::test_capability(role, 1);
+            cap.kv_backend = kv.into();
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .model(ModelCard::new("served-qwen"))
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::Sglang)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .status(WorkerStatus::Ready)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .label("sglang_prepared", serde_json::to_string(&cap).unwrap())
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let tokenizers = TokenizerRegistry::new();
+        state.recompute(&registry, &tokenizers, &router_config);
+        let snapshot = state.readiness();
+        assert!(!snapshot.workers_ready);
+        assert_eq!(
+            snapshot.models[0].reason,
+            Some("no_compatible_epd_pipeline")
+        );
     }
 
     /// Under worker-side media placement, a model whose workers report a

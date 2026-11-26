@@ -519,6 +519,7 @@ impl Bed {
             .map(|worker| Encoder {
                 runtime: runtime(worker).as_str(),
                 handoff: match PdProtocol::encode_handoff(runtime(worker)) {
+                    Some(EncodeHandoff::PreparedInput) => Some("prepared_input"),
                     Some(EncodeHandoff::Push) => Some("push"),
                     Some(EncodeHandoff::Rendezvous) => Some("rendezvous"),
                     None => None,
