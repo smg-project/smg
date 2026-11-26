@@ -901,8 +901,10 @@ struct WorkerArgs {
 
     // ==================== Multimodal ====================
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
-    /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
-    /// per-worker `WorkerSpec.multimodal_tensor_transport` overrides this.
+    /// /dev/shm), `auto` (shm only when the worker shares /dev/shm), or `rdma`
+    /// (the NIXL lane; needs the `mm-rdma` build and falls back to inline
+    /// where the lane is unavailable). A per-worker
+    /// `WorkerSpec.multimodal_tensor_transport` overrides this.
     #[arg(long, value_parser = parse_transport_mode, help_heading = "Multimodal")]
     multimodal_tensor_transport: Option<TransportMode>,
 
