@@ -3324,6 +3324,62 @@ fn a_later_registration_at_the_url_of_that_race_is_refused() {
     );
 }
 
+/// A lock another call laid for the id while a registration waited behind a
+/// removal is not the one the registration holds, so a later call on the id
+/// does not wait for the registration. Under it the registration lays no
+/// mapping for its URL: a removal by URL finds nothing to take while the
+/// worker is being entered, as it found nothing before.
+#[test]
+fn a_registration_under_another_lock_of_its_id_lays_no_mapping() {
+    let url = "http://w1:8080";
+    let at_the_url = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let registry = WorkerRegistry::new();
+    let first = registry
+        .register(at_the_url())
+        .expect("the first worker registers");
+    let second = at_the_url();
+    let of_another_call = Arc::new(parking_lot::Mutex::new(()));
+
+    let id = registry
+        .with_another_write_before_the_lock(
+            |registry| registry.register(Arc::clone(&second)),
+            |registry| {
+                assert!(registry.remove(&first).is_some(), "the first worker left");
+                registry
+                    .worker_mutation_locks
+                    .insert(first.clone(), Arc::clone(&of_another_call));
+            },
+        )
+        .expect("the second worker registers");
+
+    assert_eq!(id, first, "under the id it read");
+    let standing = registry
+        .worker_mutation_locks
+        .get(&id)
+        .map(|entry| Arc::clone(entry.value()))
+        .expect("the id has a lock");
+    assert!(
+        Arc::ptr_eq(&standing, &of_another_call),
+        "the lock another call laid stays"
+    );
+    assert_eq!(
+        registry.get_id_by_url(url),
+        None,
+        "no mapping is laid under a lock the registration does not hold"
+    );
+    assert!(
+        registry.remove_by_url(url).is_none(),
+        "a removal by URL finds nothing to take"
+    );
+}
+
 /// The lines a rendered scrape holds for the worker at `url`, sorted.
 fn series_of(rendered: &str, url: &str) -> Vec<String> {
     let label = format!("worker=\"{url}\"");

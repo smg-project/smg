@@ -2241,18 +2241,27 @@ impl<G: Generation> WorkerRegistry<G> {
         // The id was read before its lock was held. A removal that held the
         // lock in between took the URL's mapping and the lock's entry with
         // its worker, and a worker entered then would be one no read by URL
-        // finds, under a lock no later call takes: where either is gone it
-        // is laid again for this id. One another call laid meanwhile stays,
-        // and both windows stand as before: a lock laid for this id is not
-        // the one held here, so later calls on the id take another lock
-        // than this registration; a mapping of the URL to another id leaves
-        // this worker entered beside it.
-        if !self.worker_mutation_locks.contains_key(&worker_id) {
-            self.worker_mutation_locks
+        // finds, under a lock no later call takes: the lock's entry is laid
+        // again for this id where it is gone, and the mapping where the
+        // table's lock is the one held here. One another call laid meanwhile
+        // stays, and both windows stand as before: a lock laid for this id
+        // is not the one held here, so later calls on the id take another
+        // lock than this registration, and no mapping is laid under it: a
+        // call by URL finds no worker this registration is still entering;
+        // a mapping of the URL to another id leaves this worker entered
+        // beside it.
+        let standing = self
+            .worker_mutation_locks
+            .get(&worker_id)
+            .map(|entry| Arc::ptr_eq(entry.value(), &lock));
+        let holds_the_tables_lock = standing.unwrap_or_else(|| {
+            let laid = self
+                .worker_mutation_locks
                 .entry(worker_id.clone())
                 .or_insert_with(|| Arc::clone(&lock));
-        }
-        if !self.url_to_id.contains_key(worker.url()) {
+            Arc::ptr_eq(laid.value(), &lock)
+        });
+        if holds_the_tables_lock && !self.url_to_id.contains_key(worker.url()) {
             self.url_to_id
                 .entry(worker.url().to_string())
                 .or_insert_with(|| worker_id.clone());
