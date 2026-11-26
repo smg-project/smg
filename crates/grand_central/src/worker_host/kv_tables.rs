@@ -61,6 +61,7 @@ use super::kv_cursor::{BatchAdmission, RankCursor};
 use crate::{engine::view::WorkerId, store::workers::WorkerRow};
 
 #[cfg(test)]
+#[path = "../../tests/unit/worker_host/kv_tables/tests.rs"]
 mod tests;
 
 /// Workers one model's index holds at once: the chain index's own ceiling.

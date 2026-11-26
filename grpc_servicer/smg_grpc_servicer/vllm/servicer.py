@@ -6,6 +6,7 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 """
 
 import asyncio
+import inspect
 import itertools
 import json
 import os
@@ -246,6 +247,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         settle_logging()
         self.engine = async_llm
         self.start_time = start_time
+        # Whether the engine's generate() takes `reasoning_ended`, read once
+        # off its signature rather than a version: an engine whose generate()
+        # does not name the keyword is never handed it (see Generate).
+        generate = getattr(async_llm, "generate", None)
+        self._takes_reasoning_ended = (
+            generate is not None and "reasoning_ended" in inspect.signature(generate).parameters
+        )
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
@@ -567,6 +575,19 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 generate_kwargs["reasoning_parser_kwargs"] = {
                     "chat_template_kwargs": template_kwargs
                 }
+            # A grammar the Router led with the model's thought for a worker
+            # whose grammar starts at the first token starts there whatever
+            # reasoning parser the engine runs: `reasoning_ended=True` is the
+            # engine's own switch for the gate behind its parser being passed,
+            # as the Rust servicer sets it. A request that constrains nothing,
+            # or whose grammar the Router did not shape, says nothing of it,
+            # and the engine starts the grammar where it does.
+            if (
+                request.sampling_params.grammar_from_first_token
+                and request.sampling_params.WhichOneof("constraint")
+                and self._takes_reasoning_ended
+            ):
+                generate_kwargs["reasoning_ended"] = True
 
             # Extract logprobs configuration
             num_logprobs = sampling_params.logprobs

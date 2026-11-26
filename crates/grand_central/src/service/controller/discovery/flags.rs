@@ -555,4 +555,5 @@ pub(super) fn refuse(flag: &'static str, reason: impl Into<String>) -> ConfigErr
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/unit/service/controller/discovery/flags/tests.rs"]
 mod tests;

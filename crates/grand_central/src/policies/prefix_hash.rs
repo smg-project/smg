@@ -4,13 +4,15 @@
 //! The ring and its scorer (`ConsistentHash`) live in `consistent_hashing`:
 //! one scorer serves both policies, and it reads the prefix through this file.
 
+use std::fmt;
+
 use crate::{
     document::spec::{
         BoundedLoadParams, ConsistentHashParams, KeySourceSpec, ProfileSpec, ScoreStage,
         MANUAL_SESSION_HEADER,
     },
     engine::view::{fold_block, RequestFacts},
-    policies::{cache_aware::Gates, consistent_hashing::Head, standard_filters},
+    policies::{cache_aware::Gates, standard_filters},
 };
 
 /// How the `prefix_hash` policy is composed: its filters, its scorers and its
@@ -79,6 +81,38 @@ fn folded(facts: &RequestFacts<'_>, blocks: usize) -> u64 {
 /// cut, as the gateway's own policy counts them
 /// (`model_gateway/src/policies/prefix_hash.rs`, line 119 at 882be6f4f).
 const CHARS_PER_TOKEN: usize = 4;
+
+/// What a lender's ring is asked the place of under the prefix form of the
+/// ring ([`LentRing::head_position`]): a head of the request's prompt, or
+/// its routing value. A head is a part of the request's own ids or text:
+/// nothing is copied for it.
+///
+/// [`LentRing::head_position`]: crate::policies::consistent_hashing::LentRing::head_position
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[expect(clippy::exhaustive_enums, reason = "a caller answers every case")]
+pub enum Head<'a> {
+    /// The first token ids of a tokenized prompt. The bytes a lender's
+    /// recipe reads are each id's four bytes in the machine's order, one id
+    /// after the other: the gateway's own policy casts the ids in place
+    /// (`model_gateway/src/policies/prefix_hash.rs`, lines 145 and 178 at
+    /// 882be6f4f).
+    Tokens(&'a [u32]),
+    /// The leading text of a prompt that carries no token ids, cut on a
+    /// character's edge, and the whole text of a routing value, which
+    /// leads every prompt (the same file, lines 358 to 360). A recipe
+    /// reads its bytes.
+    Text(&'a str),
+}
+
+/// Sizes alone: a client's tokens and text reach no log line.
+impl fmt::Debug for Head<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tokens(ids) => write!(f, "Tokens({})", ids.len()),
+            Self::Text(text) => write!(f, "Text({})", text.len()),
+        }
+    }
+}
 
 /// How a prefix-form stage cuts a request into the heads it is placed by
 /// on a ring its caller lends
@@ -203,89 +237,5 @@ impl Prefix {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The heads `rule` states of a prompt, in the order it states them.
-    fn stated<'a>(
-        rule: HeadRule<'_>,
-        tokens: Option<&'a [u32]>,
-        text: Option<&'a str>,
-    ) -> Vec<Head<'a>> {
-        let mut heads = Vec::new();
-        rule.heads(tokens, text, |head| heads.push(head));
-        heads
-    }
-
-    /// A prompt is cut where the gateway's own policy cuts it
-    /// (`model_gateway/src/policies/prefix_hash.rs`, lines 143 to 205 at
-    /// 882be6f4f): a head at each boundary it reaches, the shallowest
-    /// first, where the last token of a boundary reaches it. A prompt that
-    /// reaches none has the one head of the rule's depth, and is its own
-    /// head where it is shorter. A text is measured at four characters a
-    /// token and cut on a character's edge, whatever bytes a character
-    /// takes. Token ids lead a text, an empty list of ids leaves the text,
-    /// and a prompt with nothing to read has no head.
-    #[test]
-    fn a_prompt_has_the_heads_the_gateways_own_policy_cuts() {
-        let rule = HeadRule {
-            depth: 128,
-            boundaries: &[64, 256],
-        };
-        let ids: Vec<u32> = (0..300).collect();
-        let tokens = |len: usize| Head::Tokens(&ids[..len]);
-        assert_eq!(stated(rule, Some(&ids), None), [tokens(64), tokens(256)]);
-        let at_the_last = stated(rule, Some(&ids[..256]), None);
-        assert_eq!(at_the_last, [tokens(64), tokens(256)]);
-        assert_eq!(stated(rule, Some(&ids[..255]), None), [tokens(64)]);
-        assert_eq!(stated(rule, Some(&ids[..63]), None), [tokens(63)]);
-        let deep = HeadRule {
-            depth: 128,
-            boundaries: &[256],
-        };
-        assert_eq!(stated(deep, Some(&ids[..200]), None), [tokens(128)]);
-
-        // A text: boundaries at eight and sixteen characters, a depth of
-        // twelve.
-        let rule = HeadRule {
-            depth: 3,
-            boundaries: &[2, 4],
-        };
-        let text = "abcdefghijklmnopq";
-        let cut = |len: usize| Head::Text(&text[..len]);
-        assert_eq!(stated(rule, None, Some(text)), [cut(8), cut(16)]);
-        assert_eq!(stated(rule, None, Some(&text[..16])), [cut(8), cut(16)]);
-        assert_eq!(stated(rule, None, Some(&text[..15])), [cut(8)]);
-        assert_eq!(stated(rule, None, Some(&text[..7])), [cut(7)]);
-        let unbounded = HeadRule {
-            depth: 3,
-            boundaries: &[],
-        };
-        assert_eq!(stated(unbounded, None, Some(text)), [cut(12)]);
-        // The rule's depth counts characters too: twelve of two bytes each.
-        let wide = "\u{e9}".repeat(14);
-        let twelve = [Head::Text(&wide[..24])];
-        assert_eq!(stated(unbounded, None, Some(&wide)), twelve);
-        // Boundaries a validated document never holds, out of order: the
-        // gateway's own cut reads on from where the text was read to
-        // (the same file, lines 185 to 205).
-        let unordered = HeadRule {
-            depth: 1,
-            boundaries: &[2, 1, 3],
-        };
-        let cuts = [cut(8), cut(8), cut(12)];
-        assert_eq!(stated(unordered, None, Some(&text[..16])), cuts);
-        // Nine characters of two bytes each: the head of eight holds
-        // sixteen bytes.
-        let wide = "\u{e9}".repeat(9);
-        assert_eq!(stated(rule, None, Some(&wide)), [Head::Text(&wide[..16])]);
-
-        assert_eq!(
-            stated(rule, Some(&ids[..5]), Some(text)),
-            [tokens(2), tokens(4)]
-        );
-        assert_eq!(stated(rule, Some(&[]), Some(&text[..7])), [cut(7)]);
-        assert!(stated(rule, Some(&[]), Some("")).is_empty());
-        assert!(stated(rule, None, None).is_empty());
-    }
-}
+#[path = "../../tests/unit/policies/prefix_hash/tests.rs"]
+mod tests;

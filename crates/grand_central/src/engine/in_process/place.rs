@@ -101,7 +101,7 @@ use crate::{
             TokenKey, WorkerLists,
         },
         demands::Demands,
-        framework::EncodeItems,
+        framework::{EncodeItems, PairSide},
         list_cell::LentList,
         prompt_hashes::{
             prompt_bytes_of, prompt_chars_of, prompt_tokens_of, HashSeeds, PromptHashes,
@@ -1400,6 +1400,20 @@ pub enum Unplaced {
         /// The seconds after which a retry may find room: a caller's
         /// retry hint.
         retry_after_secs: u16,
+        /// The side of a pair this refusal is for, by the one definition
+        /// at the decision's field
+        /// ([`Shed::side`](crate::engine::decision::Shed::side)): a
+        /// pair's caller answers for that role. A decision's own side
+        /// passes as it is. A pair shed under the worker it names
+        /// (`target-worker`) names the side that worker was missed on. A
+        /// first decision's shed that stands behind a rule names the side
+        /// of the list the gateway's own pair selection judges there.
+        /// `None` for a single request, for a pair refused before either
+        /// side was read, and for a refusal the call itself makes of no
+        /// one list: under the route's rule (`admits`), whose lists its
+        /// caller judges, under the budget, and for what the call does
+        /// not place.
+        side: Option<PairSide>,
     },
     /// The engine queued the request. A caller that holds no request
     /// answers as for overloaded workers.
@@ -1493,6 +1507,7 @@ const fn declined(stated: &'static str) -> Unplaced {
         reason: ShedReason::PolicyDeclined,
         emptied_by: stated,
         retry_after_secs: 1,
+        side: None,
     }
 }
 
@@ -1531,6 +1546,7 @@ pub(super) fn picked(decision: &Decision) -> Result<&Pick, Unplaced> {
             reason: shed.reason,
             emptied_by: shed.emptied_by,
             retry_after_secs: shed.retry_after_secs,
+            side: shed.side,
         }),
         Decision::Queue(_) => Err(Unplaced::Queued),
     }
@@ -1683,6 +1699,7 @@ fn hold_to_rule(
             reason: ShedReason::NoEndpoints,
             emptied_by: ADMITS,
             retry_after_secs: 1,
+            side: None,
         });
     }
     *held = Some(places);
@@ -1783,6 +1800,7 @@ impl Call {
                 reason: ShedReason::Deadline,
                 emptied_by: BUDGET,
                 retry_after_secs: 1,
+                side: None,
             }),
             left => Ok(left),
         }
@@ -2200,4 +2218,5 @@ impl InProcess {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/place/tests/mod.rs"]
 mod tests;

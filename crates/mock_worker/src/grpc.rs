@@ -146,7 +146,7 @@ pub async fn serve_with_listener_until(
         shutdown.await;
         let _ = stop.send(true);
     };
-    let overrides = for_port(addr.map(|a| a.port()).unwrap_or(0));
+    let overrides = overrides_at_start(&cfg, addr.map(|a| a.port()).unwrap_or(0));
     let wire = cfg.grpc_wire;
     let health = MockHealth {
         overrides: Arc::clone(&overrides),
@@ -408,7 +408,10 @@ impl MockScheduler {
 /// logprobs it wants (the alternatives per token; `None` for none), the token
 /// ids it asks a score for (a prefill-only scoring request's; empty on the
 /// wires without the field), the rank it is pinned to, and the KV
-/// rendezvous a disaggregated request carries ([`Rendezvous`]).
+/// rendezvous a disaggregated request carries ([`Rendezvous`]), and the
+/// placeholder spans of its media items ([`MediaSpan`]; none for a text
+/// request), built where the realistic engine's cache reads them: a
+/// prefill-role or scripted request never asks for them.
 pub(crate) struct GenerateInput {
     pub(crate) request_id: String,
     pub(crate) prompt_ids: Vec<u32>,
@@ -420,6 +423,46 @@ pub(crate) struct GenerateInput {
     pub(crate) score_ids: Vec<u32>,
     pub(crate) pin: Option<i32>,
     pub(crate) rendezvous: Rendezvous,
+    pub(crate) media: Box<dyn FnOnce() -> Vec<MediaSpan> + Send>,
+}
+
+/// One placeholder span of a media item as the realistic engine's cache keys
+/// it: where the item's tokens sit in the prompt, and the item's identity, a
+/// fold of the hash its wire carries ([`media_identity`]). The gateway
+/// writes one placeholder id under every image, so the ids alone read two
+/// requests with the same text and different images as one prompt, where an
+/// engine tells them apart by the item.
+pub(crate) struct MediaSpan {
+    pub(crate) identity: u64,
+    pub(crate) offset: u32,
+    pub(crate) length: u32,
+    /// The placeholder id the wire names for the item, if any: under the
+    /// span the tokens of that id alone are the item's, and a token of
+    /// another id (a marker around the item, the end of a row) stays as
+    /// sent.
+    pub(crate) slot: Option<u32>,
+}
+
+/// The identity a media item's hash gives its tokens: FNV-1a over the hash's
+/// bytes, the same for the same item on every request.
+pub(crate) fn media_identity(hash: &[u8]) -> u64 {
+    hash.iter().fold(0xcbf2_9ce4_8422_2325, |digest, byte| {
+        (digest ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The overrides of the worker on `port` as it starts: `--supports-vision`
+/// seeds the `supports_vision` entry of its info, which the admin API's info
+/// patch then reads, replaces and removes like an entry of its own.
+fn overrides_at_start(cfg: &Config, port: u16) -> Arc<WorkerOverrides> {
+    let overrides = for_port(port);
+    if let Some(vision) = cfg.supports_vision {
+        overrides.patch_info(&serde_json::Map::from_iter([(
+            "supports_vision".to_string(),
+            serde_json::Value::Bool(vision),
+        )]));
+    }
+    overrides
 }
 
 /// The KV rendezvous a disaggregated request carries, read from each
@@ -717,7 +760,7 @@ impl MockScheduler {
     /// for and this worker's load report counts it.
     pub(crate) async fn generate_frames(
         &self,
-        input: GenerateInput,
+        mut input: GenerateInput,
     ) -> Result<FrameStream, Status> {
         self.ops.record_request();
         self.check_rendezvous(&input.rendezvous)?;
@@ -846,19 +889,74 @@ impl MockScheduler {
             // gateway and the engine, as a backlog in transit would hold it;
             // the load record does not see it until it lands.
             engine.admit().await;
+            // The cache keys a media item's tokens by the item: the ids
+            // under each of its placeholder spans give way to one id of its
+            // identity (below 2^30), so the same item is the same prompt
+            // and another item parts the prompt at its first token; where
+            // the span names the item's placeholder id, a token of another
+            // id under it stays. The count stays; the script above and a
+            // capture read the ids as sent.
+            // The spans in the prompt's order: a token goes to the first
+            // span over it that takes its id. One sweep over the prompt
+            // finds it: the spans over a position wait in that order under
+            // their slot, and a span that has ended leaves the head of its
+            // row, so the work is the tokens and the spans, whatever the
+            // spans cover.
+            // An engine that writes the item's id under its tokens itself
+            // (SGLang, TokenSpeed) publishes those ids in its stored-block
+            // events, so there the keyed ids are the prompt. The vLLM engine
+            // keeps the ids as sent in its events and puts the item into
+            // the block's hash beside them, so on that wire the engine gets
+            // the keyed ids beside the prompt.
+            let mut media = (input.media)();
+            media.sort_by_key(|span| span.offset);
+            let mut key_ids = None;
+            if !media.is_empty() {
+                let ids = if self.cfg.grpc_wire == SchedulerWire::Vllm {
+                    key_ids.insert(input.prompt_ids.clone())
+                } else {
+                    &mut input.prompt_ids
+                };
+                let mut open = std::collections::BTreeMap::<Option<u32>, VecDeque<usize>>::new();
+                let mut next = 0;
+                for (at, id) in ids.iter_mut().enumerate() {
+                    while media
+                        .get(next)
+                        .is_some_and(|span| span.offset as usize <= at)
+                    {
+                        open.entry(media[next].slot).or_default().push_back(next);
+                        next += 1;
+                    }
+                    let mut first = |slot: Option<u32>| {
+                        let row = open.get_mut(&slot)?;
+                        while row.front().is_some_and(|&span| {
+                            let span = &media[span];
+                            (span.offset as usize).saturating_add(span.length as usize) <= at
+                        }) {
+                            row.pop_front();
+                        }
+                        row.front().copied()
+                    };
+                    let (any, own) = (first(None), first(Some(*id)));
+                    if let Some(span) = any.into_iter().chain(own).min() {
+                        *id = (media[span].identity % (1 << 30)) as u32;
+                    }
+                }
+            }
             let prompt_tokens = input.prompt_ids.len() as u64;
             for index in 0..choices {
                 let (to_engine, from_engine) = mpsc::unbounded_channel();
                 let (to_frames, frames) = mpsc::unbounded_channel();
                 rank.prefill_pending
                     .fetch_add(prompt_tokens, Ordering::Relaxed);
-                engine.submit(NewRequest {
+                let request = NewRequest {
                     request_id: input.request_id.clone(),
                     prompt_token_ids: input.prompt_ids.clone(),
                     max_new,
                     choice: index,
                     events: to_engine,
-                });
+                };
+                engine.submit_keyed(request, key_ids.clone());
                 relays.push(ChoiceRelay {
                     from_engine: Some(from_engine),
                     to_frames: Some(to_frames),
@@ -1234,7 +1332,7 @@ impl MockScheduler {
             capture: None,
             stopped,
             in_flight: WorkerInFlight::default(),
-            overrides: for_port(port),
+            overrides: overrides_at_start(&cfg, port),
             bootstrap_port: cfg.bootstrap_base_port,
             ops: AdminOps::register(&name),
             name,

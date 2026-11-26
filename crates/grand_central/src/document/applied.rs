@@ -305,13 +305,23 @@ impl AppliedSpec {
     /// hold, for each profile whose name and text did not change
     /// ([`Engine::keep_from`]). A profile's build reads three blocks of its
     /// spec: its own, the spec's `view` and its `signals`. So a new spec
-    /// that changes `view` or `signals` builds every profile anew. The
-    /// engine keeps nothing across two stage tables that may build another
-    /// stage under one name.
+    /// that changes `signals` builds every profile anew, and so does one
+    /// that changes `view`, with one exception.
+    ///
+    /// The exception is a view that differs in its header list alone
+    /// ([`ViewSpec::same_but_for_headers`]). No stage is built from that
+    /// list: a factory is handed none, and the validator's own stages read
+    /// four other values of the view. A stage that reads a request's header
+    /// reads it by a place its host wrote, under the list of the spec its
+    /// decision runs under. So a kept stage reads what one built anew
+    /// would.
+    ///
+    /// The engine keeps nothing across two stage tables that may build
+    /// another stage under one name.
     #[cfg(feature = "in-process")]
     pub(crate) fn keep_from(&mut self, standing: &Self) {
         let (new, old) = (&self.built_from, &standing.built_from);
-        if new.view != old.view || new.signals != old.signals {
+        if !new.view.same_but_for_headers(&old.view) || new.signals != old.signals {
             return;
         }
         let same = |name: &str| {

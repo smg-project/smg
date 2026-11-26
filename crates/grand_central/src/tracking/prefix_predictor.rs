@@ -1030,4 +1030,5 @@ impl PrefixPredictor {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/tracking/prefix_predictor/tests.rs"]
 mod tests;

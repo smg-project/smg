@@ -38,7 +38,7 @@ use tokio::time::sleep;
 
 use crate::{
     pair::{self, decode, prefill, sends, typed, PLAIN},
-    program::{encode_settings, settings, Answer, Asked, Plan},
+    program::{encode_settings, pair_settings, settings, Answer, Asked, Plan},
     served,
     single::{taken, Heard, Hears},
     started_as, under, under_encode, under_pairs, url, workers, MODEL,
@@ -118,7 +118,7 @@ fn an_item_goes_to_its_encoder_ahead_of_its_pair() {
 /// gateway asks the engine, a request with no item is placed on the engine's
 /// pair and on no encoder: its case
 /// `the_engine_places_an_encode_requests_pair_and_refuses_an_item_by_name`
-/// (`worker_selection.rs:5313-5442`).
+/// (`worker_selection.rs:5410-5539`).
 #[test]
 fn a_request_with_no_item_is_placed_as_its_pair() {
     for encoders in [2, 0] {
@@ -135,6 +135,88 @@ fn a_request_with_no_item_is_placed_as_its_pair() {
             "over {encoders} encoders"
         );
     }
+}
+
+/// A gateway of many routers mounts its three-sided router in every mode,
+/// so its settings plan an encode side under the regular mode and under a
+/// pair mode as well. An item then goes to its encoder ahead of its pair,
+/// as it does under the encode mode, and a request with no item is placed
+/// as its pair.
+///
+/// Where the plan of three sides has no document the settings say the
+/// pair's plan, as under the manual policy on a pair's two sides. The
+/// engine then names no worker for a request that carries an item, under
+/// the binding's name.
+///
+/// The classic gateway builds that router in every mode of many routers,
+/// its encode side under `consistent_hashing` where the mode names no
+/// encode policy (`model_gateway/src/routers/factory.rs:207-218`, `:246`,
+/// `:289-292`).
+#[test]
+fn many_routers_place_an_item_in_every_mode_that_plans_three_sides() {
+    let keys = [Identity::plain("item-a")];
+    let many_routers = |one_router: RoutingSettings| RoutingSettings {
+        enable_igw: true,
+        ..one_router
+    };
+    // The program routes to pairs behind encoders whatever mode the
+    // settings name, as such a gateway's three-sided router does.
+    let started = |said: &RoutingSettings, fleet: &[Arc<dyn Worker>]| {
+        let document = said.policy_document();
+        let document = document.expect("the settings have a document");
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        started_as(Plan::Encode, spec, fleet, served)
+    };
+    for one_router in [
+        settings(PolicySettings::RoundRobin),
+        pair_settings(PolicySettings::RoundRobin),
+    ] {
+        let mode = format!("{:?}", one_router.mode);
+        let fleet = fleet(1, 1, 1);
+        let (program, _loads, _task) = started(&many_routers(one_router), &fleet);
+        assert_eq!(
+            program.serve(&carrying(&keys)),
+            Answer {
+                sent: vec![encoder(0), prefill(0), decode(0)],
+                status: 200,
+                unplaced: None,
+            },
+            "{mode}"
+        );
+        assert_eq!(
+            program.serve(&PLAIN),
+            Answer {
+                sent: vec![prefill(0), decode(0)],
+                status: 200,
+                unplaced: None,
+            },
+            "{mode}"
+        );
+    }
+
+    let manual = || PolicySettings::of_label("manual");
+    let fallen = many_routers(RoutingSettings {
+        mode: ModeSettings::PrefillDecode {
+            prefill_policy: manual(),
+            decode_policy: manual(),
+        },
+        ..settings(PolicySettings::RoundRobin)
+    });
+    let fleet = fleet(1, 1, 1);
+    let (program, _loads, _task) = started(&fallen, &fleet);
+    let answer = program.serve(&carrying(&keys));
+    assert!(answer.sent.is_empty(), "{answer:?}");
+    assert!(
+        matches!(
+            answer.unplaced,
+            Some(Unplaced::Shed {
+                reason: ShedReason::PolicyDeclined,
+                emptied_by: "binding",
+                ..
+            })
+        ),
+        "{answer:?}"
+    );
 }
 
 /// An encoder that cannot be sent to takes no item: the item goes to another
@@ -173,6 +255,7 @@ fn an_encoder_that_cannot_be_sent_to_takes_no_item() {
             reason: ShedReason::NoEndpoints,
             emptied_by: "encoders",
             retry_after_secs: 1,
+            side: None,
         }),
     };
     assert_eq!(program.serve(&carrying(&keys)), refused());
@@ -191,11 +274,11 @@ fn an_encoder_that_cannot_be_sent_to_takes_no_item() {
 /// The classic router sends an item once a request: the first dispatch
 /// takes its encode outputs, and a replay gets none
 /// (`model_gateway/src/routers/grpc/common/stages/request_execution.rs:295-299`).
-/// Where its encoder answers ahead of the pair (`:882-883`), a dispatch
+/// Where its encoder answers ahead of the pair (`:966-967`), a dispatch
 /// that failed is marked as one that is not asked again (`:461-466`).
 /// Where its items launch beside the pair, a failed encode dispatch is
 /// answered a 502 that is final for the retry layer
-/// (`encode_dispatch_failure_response`, `:2593-2608`).
+/// (`encode_dispatch_failure_response`, `:2705-2720`).
 #[test]
 fn an_encoder_that_fails_is_the_requests_answer_and_no_side_is_sent() {
     let fleet = fleet(2, 2, 3);
@@ -265,9 +348,9 @@ fn an_encoder_that_fails_is_the_requests_answer_and_no_side_is_sent() {
 /// The classic router's retry selects the pair alone again, since the first
 /// dispatch launched the encode jobs (the doc of its re-selection,
 /// `worker_selection.rs:781-783`): a replay launches none
-/// (`model_gateway/src/routers/grpc/common/stages/request_execution.rs:929-932`).
+/// (`model_gateway/src/routers/grpc/common/stages/request_execution.rs:1013-1016`).
 /// It names the addresses of the prefill and of the decode as tried, and no
-/// encoder's (`model_gateway/src/routers/grpc/context.rs:1665-1669`, read at
+/// encoder's (`model_gateway/src/routers/grpc/context.rs:1717-1721`, read at
 /// `model_gateway/src/routers/grpc/pipeline.rs:849-861`).
 #[test]
 fn a_retry_behind_a_failed_side_states_no_item_and_sends_none() {
@@ -409,6 +492,7 @@ fn an_item_for_a_model_with_no_worker_is_refused_as_a_request_with_none_is() {
             reason: ShedReason::NoEndpoints,
             emptied_by: "none",
             retry_after_secs: 1,
+            side: None,
         }),
     };
     // No worker ever joined: the registry holds no generation of the model.

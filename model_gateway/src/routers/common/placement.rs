@@ -1081,7 +1081,7 @@ impl ByEngine {
     #[inline(never)]
     #[expect(
         clippy::too_many_arguments,
-        reason = "the pair placement's own arguments, and the decode's guard"
+        reason = "the pair placement's own arguments, the decode's guard and its claim"
     )]
     fn decode_again(
         &self,
@@ -1092,6 +1092,7 @@ impl ByEngine {
         wire: Option<WireConstraint>,
         inputs: PlacementInputs<'_>,
         ahead: WorkerLoadGuard,
+        claimed: bool,
     ) -> (Option<Placed>, WorkerLoadGuard) {
         let Some(engine) = policies.engine() else {
             return (None, ahead);
@@ -1116,6 +1117,7 @@ impl ByEngine {
             &pairs,
             wire,
             None,
+            claimed.then_some(&ahead),
             inputs,
             self.stated,
             |request| {
@@ -2596,13 +2598,48 @@ impl PairAdmission for PairGates<'_> {
     }
 }
 
+/// A pair's admission ([`PairGates`]) for a decode asked again by a request
+/// that holds a claim at its decode's gate, which its route made before the
+/// prefill was sent ([`decode_again`]): the decode `claimed` counts has a
+/// room whatever its gate reads, since the room that fills the gate is the
+/// request's own. Every other worker is read as the gates read it.
+struct ClaimedGates<'a> {
+    gates: &'a PairGates<'a>,
+    claimed: &'a WorkerLoadGuard,
+}
+
+impl fmt::Debug for ClaimedGates<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaimedGates")
+            .field("gates", self.gates)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PairAdmission for ClaimedGates<'_> {
+    fn has_capacity(&self, prefill: usize) -> bool {
+        self.gates.has_capacity(prefill)
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        self.gates
+            .decodes
+            .get(decode)
+            .is_some_and(|worker| self.claimed.counts(worker))
+            || self.gates.has_room(decode)
+    }
+}
+
 /// Grand Central's request for a pair over the two pools of `pairs`,
 /// handed to `ask`: each pool's list with its cell and the index's pair
 /// classes ([`PdPairIndex::lent`]), and this gateway's two admission reads
 /// ([`PairGates`]), on the hash ring the registry answers for the model now
 /// ([`ModelRing::read`]). One function for a pair's two decisions: the
 /// first ([`pair_by_engine`]), and the decode asked again behind its
-/// prefill ([`decode_again`]), which reads no prefill's capacity.
+/// prefill ([`decode_again`]), which reads no prefill's capacity and hands
+/// the guard of its first decode as `claimed` where the request holds a
+/// claim at that decode's gate: the engine then reads the gates with that
+/// claim ([`ClaimedGates`]).
 ///
 /// What `inputs` and `stated` state of the request is handed as the engine
 /// reads it ([`place_request`]), the route's own rule among it, which the
@@ -2633,6 +2670,7 @@ fn with_pair_request<R>(
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    claimed: Option<&WorkerLoadGuard>,
     inputs: PlacementInputs<'_>,
     stated: Stated,
     ask: impl FnOnce(&mut PlaceRequest<'_>) -> R,
@@ -2643,11 +2681,19 @@ fn with_pair_request<R>(
         decodes: decode.workers,
         capacity: prefill_capacity,
     };
+    let claimed = claimed.map(|claimed| ClaimedGates {
+        gates: &gates,
+        claimed,
+    });
+    let admission: &dyn PairAdmission = match &claimed {
+        Some(claimed) => claimed,
+        None => &gates,
+    };
     let lists = PairLists {
         prefill,
         decode,
         classes,
-        admission: &gates,
+        admission,
         // No place of a list is stated. A pinned request is held to its
         // wire by its demand, a side at a time, and the engine asks the
         // route's rule of a list itself.
@@ -2758,6 +2804,7 @@ fn pair_by_engine(
         pairs,
         wire,
         prefill_capacity,
+        None,
         inputs,
         stated,
         |request| {
@@ -2852,9 +2899,14 @@ fn pair_by_engine(
 /// stands now ([`PairsAgain`]): the route's own rule in `inputs` is asked of
 /// the decode the engine picks. What the request stated for the engine
 /// alone ([`Stated`]) is stated again as the decode's answer kept it, so a
-/// route states it once. The function answers the guard to keep, and
-/// the decode the request goes to now where that is another worker than
-/// `decode`'s:
+/// route states it once. `claimed` says whether the request holds a claim
+/// at `decode`'s admission gate, as it does on a route that claims a
+/// decode's room before it sends the prefill: the engine then reads that
+/// decode with a room whatever its gate reads, since the room that fills
+/// the gate is the request's own. A route that claims no room says `false`,
+/// and every gate is read as it stands. The function answers the guard to
+/// keep, and the decode the request goes to now where that is another
+/// worker than `decode`'s:
 ///
 /// - `(None, ahead)` wherever the first decision's decode stands: under the
 ///   classic policies, under a document that picked the decode with its
@@ -2883,7 +2935,7 @@ fn pair_by_engine(
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the pair placement's own arguments, the decode's answer and its guard"
+    reason = "the pair placement's own arguments, the decode's answer, its guard and its claim"
 )]
 pub(crate) fn decode_again(
     registry: &WorkerRegistry,
@@ -2894,10 +2946,13 @@ pub(crate) fn decode_again(
     inputs: PlacementInputs<'_>,
     decode: &Placed,
     ahead: WorkerLoadGuard,
+    claimed: bool,
 ) -> (Option<Placed>, WorkerLoadGuard) {
     match &decode.engine {
         None => (None, ahead),
-        Some(first) => first.decode_again(registry, policies, model_id, pairs, wire, inputs, ahead),
+        Some(first) => first.decode_again(
+            registry, policies, model_id, pairs, wire, inputs, ahead, claimed,
+        ),
     }
 }
 
@@ -10286,6 +10341,7 @@ pub(crate) mod tests {
             inputs,
             &pair.decode,
             ahead,
+            false,
         )
     }
 
@@ -10384,6 +10440,7 @@ pub(crate) mod tests {
             inputs,
             &pair.decode,
             sent,
+            false,
         );
         assert!(moved.is_none());
         assert!(guard.counts(pair.decode.worker()));
@@ -10521,6 +10578,7 @@ pub(crate) mod tests {
             inputs,
             &pair.decode,
             ahead,
+            false,
         );
         assert!(moved.is_none());
         assert!(guard.counts(pair.decode.worker()));

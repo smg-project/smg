@@ -32,7 +32,7 @@ use smg_grand_central::{
         AppliedSpec, Assignment, DecodePick, LoadMetricSetting, ModeSettings, PolicySettings,
         PolicySpec, RoutingSettings, ScoreSpec,
     },
-    engine::{ShedReason, Unplaced},
+    engine::{PairSide, ShedReason, Unplaced},
     stages::StageRegistry,
 };
 use smg_worker::{
@@ -55,6 +55,7 @@ pub(crate) const PLAIN: Asked<'static> = Asked {
     model: MODEL,
     headers: None,
     items: &[],
+    tokens: None,
 };
 
 /// The address of the prefill worker at `at`.
@@ -99,7 +100,7 @@ pub(crate) fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeM
 ///
 /// The classic router names both sides of a pair with their places: its
 /// case `a_pair_placement_names_both_sides_with_their_positions`
-/// (`model_gateway/src/routers/common/placement.rs:3489-3536`).
+/// (`model_gateway/src/routers/common/placement.rs:3598-3645`).
 #[test]
 fn a_pair_names_a_prefill_and_a_decode_and_each_side_takes_its_turn() {
     let fleet = fleet(2, 3);
@@ -129,7 +130,7 @@ fn a_pair_names_a_prefill_and_a_decode_and_each_side_takes_its_turn() {
 /// time, and goes back to a tried worker that is the only one open: its
 /// cases `a_pairs_retry_steps_aside_from_the_tried_engines_a_side_at_a_time`
 /// and `a_pairs_retry_goes_back_to_a_tried_worker_that_is_the_only_one_open`
-/// (`model_gateway/src/routers/common/placement.rs:3720-3768`, `:3774-3806`).
+/// (`model_gateway/src/routers/common/placement.rs:3829-3877`, `:3883-3915`).
 #[test]
 fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
     let fleet = fleet(2, 2);
@@ -192,12 +193,15 @@ fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
 /// decode can be sent to, the engine names no pair under the `healthy`
 /// filter's name, and the program answers a 503. So it does for a model
 /// that has prefills and no decode at all, where no filter emptied a list
-/// and the engine names none.
+/// and the engine names none. Each refusal names the decode side, which
+/// was left with nobody.
 ///
 /// The classic router answers a pair whose only decode is not ready as the
 /// decode role's unavailability: its case
 /// `a_pair_whose_only_decode_is_not_ready_is_the_decode_roles_unavailability`
-/// (`model_gateway/src/routers/common/placement.rs:4529-4541`).
+/// (`model_gateway/src/routers/common/placement.rs`). It answers a decode
+/// pool with no worker for the decode's role too (`pair_pass` in that
+/// file: its test of `decode_pool` for a role with no worker).
 #[test]
 fn a_side_that_cannot_be_sent_to_takes_no_request() {
     let fleet = fleet(2, 3);
@@ -224,6 +228,7 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "healthy",
         retry_after_secs: 1,
+        side: Some(PairSide::Decode),
     };
     assert_eq!(
         answer,
@@ -241,6 +246,7 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "none",
         retry_after_secs: 1,
+        side: Some(PairSide::Decode),
     };
     assert_eq!(
         answer,
@@ -263,7 +269,7 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
 ///
 /// The classic router's engine arm says each side by that side's guard: its
 /// case `the_engine_hears_each_side_of_a_placed_pair_by_that_sides_guard`
-/// (`model_gateway/src/routers/common/placement.rs:9514-9549`).
+/// (`model_gateway/src/routers/common/placement.rs:9718-9753`).
 #[tokio::test(start_paused = true)]
 async fn the_engine_hears_both_sides_of_a_pair() {
     for when in [DecodePick::WithPrefill, DecodePick::AfterPrefill] {
@@ -410,11 +416,11 @@ pub(crate) fn in_turn(
 /// The gateway asks so where the engine placed the pair: its cases
 /// `a_decode_asked_again_moves_the_request_and_its_guard_to_the_decode_the_engine_takes`
 /// and `a_decode_asked_again_that_takes_no_other_worker_leaves_the_first_standing`
-/// (`model_gateway/src/routers/common/placement.rs:10084-10110`, `:10119-10175`).
+/// (`model_gateway/src/routers/common/placement.rs:10288-10314`, `:10323-10379`).
 /// It makes no ask for a decode booked with its prefill either
-/// (`:1004-1010`): its case
+/// (`:1090-1096`): its case
 /// `a_decode_booked_with_its_prefill_answers_the_ask_as_the_first_decode_standing`
-/// (`:10325-10371`).
+/// (`:10529-10575`).
 /// A pair the classic policies picked is sent the decode its one selection
 /// named, and no decode is picked again (`DecodeBehindPrefill`,
 /// `model_gateway/src/routers/grpc/sequential_pd.rs:595-603`).
@@ -490,7 +496,7 @@ fn a_decode_asked_again_is_picked_as_the_decodes_stand_behind_the_prefills_answe
 /// decode would stand at the rule's bound and the request would move.
 ///
 /// The gateway states the same word behind the guard it makes ahead of the
-/// decode's send (`model_gateway/src/routers/common/placement.rs:1022-1026`,
+/// decode's send (`model_gateway/src/routers/common/placement.rs:1108-1112`,
 /// over `LoadGuards::behind_prefill`,
 /// `model_gateway/src/routers/grpc/context.rs:1116-1130`).
 #[test]
@@ -548,7 +554,7 @@ fn a_decode_asked_again_is_read_without_the_request_its_guard_counts_there() {
 ///
 /// The classic router names both sides of a pair in its one selection: its
 /// case `a_pair_placement_names_both_sides_with_their_positions`
-/// (`model_gateway/src/routers/common/placement.rs:3489-3536`).
+/// (`model_gateway/src/routers/common/placement.rs:3598-3645`).
 #[test]
 fn a_pair_in_turn_under_a_document_that_books_both_sides_takes_its_turns() {
     let fleet = fleet(2, 3);
@@ -623,7 +629,7 @@ fn a_prefill_that_answered_in_turn_holds_the_request_no_more() {
 /// attempt's selection, whichever side failed and whether or not its
 /// decode was sent: it reads the selection, and not what went out
 /// (`WorkerSelection::engines`,
-/// `model_gateway/src/routers/grpc/context.rs:1665-1669`, read at
+/// `model_gateway/src/routers/grpc/context.rs:1717-1721`, read at
 /// `model_gateway/src/routers/grpc/pipeline.rs:849-861`).
 #[test]
 fn a_prefill_that_fails_in_turn_sends_no_decode() {

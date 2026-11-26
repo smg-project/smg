@@ -1,80 +1,80 @@
 //! The program: what it holds, how it starts the engine, and the one way it
 //! serves a request.
 //!
-//! It holds what a program that routes requests holds already, in the
-//! worker crate's own types: the worker registry, with the program's value
-//! of each membership generation ([`Lists`]). That value keeps the members
-//! the registry published. At its first lending it cuts them into one list
-//! for each kind of worker the program routes to, each with an empty cell
-//! of its own ([`PublishedList`]): the single workers, the prefills and the
-//! decodes of a pair, and the encoders of an encode request.
+//! # What it holds
 //!
-//! The engine takes the registry and the load monitor's channel once, at
-//! its start ([`InProcess::start`]), and reads both in place: the program
-//! tells it nothing of a worker that joins or leaves. The program hands its
-//! lists by model beside the start ([`PublishedLists`]), and the engine's
-//! task fills the cells of a model's newest lists behind each membership
-//! change. Its sends are a function its builder gives ([`Program::start`]):
-//! handed the worker a request goes to, it answers the status that worker
-//! answered.
+//! It holds what a program that routes requests holds already, in the worker
+//! crate's own types. That is the worker registry, and the program's value of
+//! each membership generation ([`Lists`]).
 //!
-//! The document is the one its routing settings mean
-//! ([`RoutingSettings::policy_document`]): the program writes settings as a
-//! configuration file would, and no document. The settings' mode says the
-//! kinds of worker the program routes to as well ([`Plan`]): single workers
-//! ([`settings`]), pairs of a prefill worker and a decode worker
-//! ([`pair_settings`]), or such pairs behind encoders that take a request's
-//! items ([`encode_settings`]).
+//! That value keeps the members the registry published. At its first lending
+//! it cuts them into one list for each kind of worker the program routes to,
+//! each with an empty cell of its own ([`PublishedList`]). The kinds are the
+//! single workers, the prefills and the decodes of a pair, and the encoders of
+//! an encode request.
 //!
-//! The program keeps a hash ring of its own for each generation
-//! ([`Ring`]) and lends it with every request: where the document places a
-//! routing value by a ring, the value goes where the program's ring puts it.
+//! The program writes routing settings, as a configuration file would, and no
+//! document. Its document is the one the settings mean
+//! ([`RoutingSettings::policy_document`]). The settings' mode says which kinds
+//! of worker the program routes to ([`Plan`]):
 //!
-//! A route says one thing more of a pair, which no setting holds: whether it
-//! sends the decode at once or behind the prefill's answer
-//! ([`Program::in_turn`]). A route of the second kind asks the engine for
-//! its decode again, behind that answer, where the placement says that the
-//! decode still stands chosen. It stands chosen under a document that picks
-//! a pair's decode behind its prefill, and no setting holds that word: a
-//! host whose route asks again writes it into the document its settings
-//! mean (`plans.pd-pair.decode`).
+//! - single workers ([`settings`])
+//! - pairs of a prefill worker and a decode worker ([`pair_settings`])
+//! - such pairs behind encoders that take a request's items
+//!   ([`encode_settings`])
 //!
-//! Of the engine the program asks what [`Engine`] lists, and nothing else.
-//! It keeps no circuit breaker's count and chooses no rank inside a worker:
-//! both are a route's own, behind the engine's answer. It keeps no limit of
-//! its own on a pair's workers either ([`NoLimit`]).
+//! # How it starts the engine
 //!
-//! A retry stays on the wire of its first attempt's worker. The request a
-//! route keeps for a retry was built for one runtime and transport, so the
-//! program states the wire of each worker a retry can go to beside its
-//! list ([`wire`]), and a retry demands the one its first worker is on
-//! ([`Demands::runtime`]). A host whose retries are bound to no wire states
-//! no demand.
+//! The engine takes the registry and the load monitor's channel once, at its
+//! start ([`InProcess::start`]). It reads both in place, so the program tells
+//! it nothing of a worker that joins or leaves.
 //!
-//! A route has a rule of its own for a retry, by what it alone knows of the
-//! request and a worker: a worker that answered the request itself takes no
-//! further attempt of it ([`OWN_ANSWER`]). The program states that rule
-//! with each attempt behind such an answer ([`PlaceRequest::admits`]), and
-//! where the engine says that the rule left the request no worker, the
-//! worker's answer is the client's ([`Program::serve`]).
+//! The program hands its lists by model beside the start ([`PublishedLists`]).
+//! The engine's task fills the cells of a model's newest lists behind each
+//! membership change.
 //!
-//! An encode request here carries items and no more. Beyond its wire the
-//! program states no fact of a worker, so it serves no image, no other
-//! demand and no item handed as a reference.
+//! # What a request lends and states
+//!
+//! Of the engine the program asks what [`Engine`] lists, and nothing else: one
+//! call, which serves every request. With it the program lends and states:
+//!
+//! - the lists its plan names, each with its cell ([`Lists`])
+//! - its own hash ring of the generation ([`Ring`]): where the document places
+//!   a routing value by a ring, the value goes where this ring puts it
+//! - whether its route sends a pair's decode behind the prefill's answer,
+//!   which no setting holds ([`Program::in_turn`])
+//! - a retry's wire, so that a retry stays on the wire of its first worker
+//!   ([`wire`])
+//! - the route's own rule for a retry, by what it alone knows of the request
+//!   and a worker ([`OWN_ANSWER`]). A worker that answered the request itself
+//!   takes no further attempt of it.
+//! - the prompt's token ids, and its entry in the token tree the program lends
+//!   ([`Asked::tokens`], [`Trees`])
+//!
+//! # What it leaves out
+//!
+//! - It keeps no circuit breaker's count and chooses no rank inside a worker.
+//!   Both are a route's own, behind the engine's answer.
+//! - It keeps no limit of its own on a pair's workers ([`NoLimit`]).
+//! - An encode request carries items and no more. Beyond its wire the program
+//!   states no fact of a worker, so it serves no image, no other demand and no
+//!   item handed as a reference.
 
 use std::{
+    borrow::Cow,
     future::Future,
     sync::{Arc, OnceLock},
 };
 
 use http::HeaderMap;
+use kv_index::{ModelTrees, TenantId, TokenTree};
 use smg_grand_central::{
     document::{AppliedSpec, ModeSettings, PolicySettings, RoutingSettings},
     engine::{
-        Demands, EncodeClasses, EncodeItems, EncodeLists, EncodeMember, EncoderFacts, FixedFacts,
-        HeaderRead, Identity, InProcess, LentList, ModelLists, PairAdmission, PairLists,
-        PartnerClasses, PlaceRequest, PublishedList, Unplaced, WorkerData, WorkerId, WorkerLists,
-        WorkerRule,
+        CacheIndex, CacheIndexes, Demands, EncodeClasses, EncodeItems, EncodeLists, EncodeMember,
+        EncoderFacts, FixedFacts, HeaderRead, Identity, InProcess, LentList, ModelLists,
+        PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Prompt, PromptEntry,
+        PublishedList, TokenKey, Unplaced, WorkerData, WorkerId, WorkerLists, WorkerRule,
     },
     policies::consistent_hashing::LentRing,
     store::{EncodeHandoff, EncodeOffer},
@@ -155,9 +155,9 @@ impl Reply {
     }
 
     /// Whether the worker answered the request itself ([`OWN_ANSWER`]). It
-    /// reads what the worker answered and never the status the client
-    /// reads, so a send no worker answered is nobody's own answer, whatever
-    /// the program answers its client for it.
+    /// reads what the worker answered, never the status the client reads. So a
+    /// send no worker answered is nobody's own answer, whatever the client
+    /// reads for it.
     const fn own(self) -> bool {
         matches!(self, Self::Status(OWN_ANSWER))
     }
@@ -193,10 +193,15 @@ const RUNTIME: &str = "example";
 
 /// The number the program knows a worker's wire by: the runtime it runs and
 /// the transport it is dialed over, each by its place in the worker crate's
-/// own list. It is never zero, which states no wire. The numbering is the
-/// program's own: the engine compares two numbers and reads nothing else of
-/// one ([`DemandFacts::runtime`]), so each host numbers its wires as it
-/// likes.
+/// own list. It is never zero, which states no wire.
+///
+/// The numbering is the program's own. The engine compares two numbers and
+/// reads nothing else of one ([`DemandFacts::runtime`]), so each host numbers
+/// its wires as it likes.
+///
+/// A retry demands the wire of its first worker ([`Demands::runtime`]), since
+/// the request a route keeps for a retry was built for one runtime and
+/// transport. A host whose retries are bound to no wire states no demand.
 ///
 /// [`DemandFacts::runtime`]: smg_grand_central::engine::DemandFacts::runtime
 fn wire(worker: &dyn Worker) -> u32 {
@@ -237,9 +242,9 @@ pub fn pair_settings(policy: PolicySettings) -> RoutingSettings {
 }
 
 /// The routing settings of a gateway that routes to such pairs behind
-/// encoders, every side under `policy` but the encode side, which keeps the
-/// policy a configuration that names none gets, and sets nothing else
-/// ([`settings`]).
+/// encoders, and sets nothing else ([`settings`]). Every side is under
+/// `policy` but the encode side, which keeps the policy a configuration that
+/// names none gets.
 pub fn encode_settings(policy: PolicySettings) -> RoutingSettings {
     RoutingSettings {
         mode: ModeSettings::EncodePrefillDecode {
@@ -279,27 +284,34 @@ impl Plan {
     }
 }
 
-/// The program's value of one membership generation of a model: the
-/// members the registry published and, cut from them at the value's first
-/// lending, the list of each kind of worker with the cell the program keeps
-/// beside it ([`Cut`]). Of a worker the program states its wire beside its
-/// object ([`wire`]), and no other fact: of an encoder it states none.
+/// The program's value of one membership generation of a model. It holds the
+/// members the registry published. Cut from them at the value's first lending,
+/// it holds the list of each kind of worker, with the cell the program keeps
+/// beside it ([`Cut`]).
+///
+/// Of a worker the program states its wire beside its object ([`wire`]) and no
+/// other fact. Of an encoder it states none.
 #[derive(Debug)]
 pub struct Lists {
     members: Arc<[Arc<dyn Worker>]>,
     cut: OnceLock<Cut>,
 }
 
-/// A generation's members by the kind of worker each is: each kind's list
-/// in the registry's order with an empty cell beside it, the wire of each
-/// worker a retry can go to ([`facts_of`]), the pair classes of the
-/// prefills and the decodes, what the encode side reads of the encoders and
-/// of the prefills, and the generation's ring, made of every member's
-/// address. Which workers pair is the program's own word: here every
-/// prefill pairs with every decode. Which encoder hands an item to which
-/// prefill is derived by the crate's one rule ([`EncodeClasses::derive`])
-/// from what the program says each worker states: here a rendezvous under
-/// one runtime, so every encoder hands to every prefill.
+/// A generation's members by the kind of worker each is:
+///
+/// - each kind's list in the registry's order, with an empty cell beside it
+/// - the wire of each worker a retry can go to ([`facts_of`])
+/// - the pair classes of the prefills and the decodes
+/// - what the encode side reads of the encoders and of the prefills
+/// - the generation's ring, made of every member's address
+///
+/// Which workers pair is the program's own word: here every prefill pairs with
+/// every decode.
+///
+/// Which encoder hands an item to which prefill is derived by the crate's one
+/// rule ([`EncodeClasses::derive`]), from what the program says each worker
+/// states. Here that is a rendezvous under one runtime, so every encoder hands
+/// to every prefill.
 #[derive(Debug)]
 struct Cut {
     single: PublishedList,
@@ -334,11 +346,13 @@ impl Generation for Lists {
 }
 
 impl Lists {
-    /// The lists, cut at the first ask: each member is read once, for the
-    /// kind of worker it is and for the address the ring holds it by, and
-    /// each but an encoder for the wire it is on. Asks that meet there wait
-    /// for the one that cuts. The engine's task asks behind each membership
-    /// change, so a request cuts only where it comes ahead of the task.
+    /// The lists, cut at the first ask. Each member is read once: for the kind
+    /// of worker it is, for the address the ring holds it by, and for its wire
+    /// unless it is an encoder.
+    ///
+    /// Asks that meet there wait for the one that cuts. The engine's task asks
+    /// behind each membership change, so a request cuts only where it comes
+    /// ahead of the task.
     fn cut(&self) -> &Cut {
         self.cut.get_or_init(|| {
             let of = |kind: WorkerType| -> Arc<[Arc<dyn Worker>]> {
@@ -408,9 +422,9 @@ impl Lists {
     }
 
     /// An encode request's three lists lent: the pair's two as a pair lends
-    /// them, the encoders with their cell, and what the encode side reads
-    /// of the encoders and of the prefills, under no veto of the program's
-    /// own.
+    /// them, and the encoders with their cell. With them goes what the encode
+    /// side reads of the encoders and of the prefills. The program adds no
+    /// veto of its own.
     fn encode(&self) -> EncodeLists<'_> {
         let cut = self.cut();
         EncodeLists {
@@ -443,11 +457,12 @@ impl PairAdmission for NoLimit {
 }
 
 /// The program's lists by model, as it hands them to the engine beside its
-/// start: the generation the registry holds of a model now, each list of
-/// it that holds a worker lent as a request lends it. The engine's task
-/// asks them behind each membership word of the registry and fills a cell
-/// it finds empty, so a list's first request reads a filled cell where the
-/// task came first.
+/// start. For a model it answers the generation the registry holds now: each
+/// list of it that holds a worker, lent as a request lends it.
+///
+/// The engine's task asks them behind each membership word of the registry,
+/// and fills a cell it finds empty. So a list's first request reads a filled
+/// cell where the task came first.
 #[derive(Debug)]
 struct PublishedLists(Arc<WorkerRegistry<Lists>>);
 
@@ -464,6 +479,52 @@ impl ModelLists for PublishedLists {
             if !list.workers().is_empty() {
                 hand(list.lent());
             }
+        }
+    }
+}
+
+/// The program's token trees of the prompts it sent, one a model. It lends
+/// them to the engine at its start ([`WorkerData::cache_indexes`]).
+///
+/// A model's tree is made where the engine first asks for it, with the
+/// document's block as its page. The engine asks under a document that reads
+/// the prefixes sent to each worker, and under no other. It then decides a
+/// single request inside the tree's match, and the same descent writes the
+/// prompt for the worker the request goes to.
+///
+/// The engine calls the tree's match and nothing else. The bound and the
+/// workers that leave are the program's ([`Program::trim`],
+/// [`Program::leave`]).
+///
+/// A host that has such a tree lends that one, and makes none for the engine
+/// alone. This program has no other use of a tree: it keeps one, in the index
+/// crate's store, to show what a lent tree asks of its host.
+///
+/// The store is empty until the engine's first ask, so the program makes it
+/// always. A host whose trees cost it a task of its own makes them only where
+/// its document reads them. The document's needs say so
+/// (`Needs::sent_prefixes`), and a gateway asks them before it makes its
+/// trees.
+///
+/// The engine decides no request but a single one inside a lent tree, so the
+/// program lends its tree at no other phase. It keeps no index of its workers'
+/// cache events, since its workers read as publishing none. It keeps no tree
+/// of prompts held as text, since it holds every prompt as token ids.
+struct Trees(Arc<ModelTrees>);
+
+impl CacheIndexes for Trees {
+    fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+        None
+    }
+
+    fn block_size(&self, _: &str) -> Option<u32> {
+        None
+    }
+
+    fn token_tree(&self, model: &str, phase: Phase) -> Option<Arc<TokenTree>> {
+        match phase {
+            Phase::Single => Some(self.0.token_tree_or_new(model)),
+            Phase::Prefill | Phase::Decode | Phase::Encode => None,
         }
     }
 }
@@ -486,14 +547,19 @@ impl Engine {
     }
 }
 
-/// What one attempt of a request states beyond what its client asked: its
-/// number, the workers the request's failed attempts named, the wire the
-/// request stays on ([`wire`]), and the route's own rule for a worker
-/// ([`Program::serve`]). A pair's failed attempt names both its workers,
-/// its decode too where the prefill failed ahead of it and the decode was
-/// sent nothing. A first attempt states the default: the number `0`, no
-/// worker tried, `0` for no wire, and no rule. An attempt states no rule
-/// until a worker answered the request itself.
+/// What one attempt of a request states beyond what its client asked:
+///
+/// - its number
+/// - the workers the request's failed attempts named
+/// - the wire the request stays on ([`wire`])
+/// - the route's own rule for a worker ([`Program::serve`])
+///
+/// A pair's failed attempt names both its workers. It names its decode too
+/// where the prefill failed ahead of it and the decode was sent nothing.
+///
+/// A first attempt states the default: the number `0`, no worker tried, `0`
+/// for no wire, and no rule. An attempt states no rule until a worker answered
+/// the request itself.
 #[derive(Clone, Copy, Default)]
 pub struct Stated<'a> {
     number: u8,
@@ -502,8 +568,9 @@ pub struct Stated<'a> {
     admits: Option<WorkerRule<'a>>,
 }
 
-/// What a client's request states.
-#[derive(Clone, Copy, Debug)]
+/// What a client's request states. It prints nothing of itself: a client's
+/// tokens reach no log line.
+#[derive(Clone, Copy)]
 pub struct Asked<'a> {
     /// The model the request is for.
     pub model: &'a str,
@@ -513,20 +580,39 @@ pub struct Asked<'a> {
     /// each. Empty for a request with none. A program that routes to no
     /// encoder reads none.
     pub items: &'a [Identity<'a>],
+    /// The prompt's token ids, where the program tokenized it. `None` for a
+    /// request it read no prompt of: such a request states no prompt and
+    /// names no entry in the program's tree.
+    pub tokens: Option<&'a [u32]>,
 }
 
-/// One attempt of a request on its way: the placement, and the load guard
-/// of each worker the request goes to, a pair's decode as well as its
-/// prefill. A route keeps them to the end of the response, streamed or not.
+/// A request's entry in the program's token tree ([`Trees`]): its prompt's
+/// token ids as they are. The program's workers share one cache partition,
+/// so the entry holds no marker and the prompt is hashed under the plain
+/// seeds. A host that parts its workers' caches hands the ids behind the
+/// partition's marker, in whole pages, and states the partition's seeds
+/// with the prompt.
+impl PromptEntry for Asked<'_> {
+    fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
+        Some(TokenKey::of(Cow::Borrowed(self.tokens?), 0))
+    }
+}
+
+/// One attempt of a request on its way: the placement, and the load guard of
+/// each worker the request goes to. A pair's decode has a guard as its prefill
+/// has. A route keeps them to the end of the response, streamed or not.
+///
 /// A route that sends a pair in turn lets the prefill's guard go once the
-/// prefill answered ([`Self::prefill_ended`]): that worker holds the request
+/// prefill answered ([`Self::prefill_ended`]). That worker holds the request
 /// no more while the decode runs.
-/// A pair's decode is counted from the placement, whether it is sent at
-/// once or behind its prefill's answer: a gateway makes that guard behind
-/// its selection too. Where a second ask names another decode, the guard
-/// moves there ([`Self::follow_decode`]). No guard of an encoder stands
-/// here: an item is counted on its encoder while its own send runs
-/// ([`Program::serve`]).
+///
+/// A pair's decode is counted from the placement, whether it is sent at once
+/// or behind its prefill's answer. A gateway makes that guard behind its
+/// selection too. Where a second ask names another decode, the guard moves
+/// there ([`Self::follow_decode`]).
+///
+/// No guard of an encoder stands here. An item is counted on its encoder while
+/// its own send runs ([`Program::serve`]).
 pub struct InFlight {
     /// The placement, kept: it owns all it holds.
     pub placement: Placement<'static>,
@@ -635,24 +721,31 @@ pub struct Program {
     /// Whether the program's route sends a pair's decode behind its
     /// prefill's answer ([`Self::in_turn`]).
     in_turn: bool,
+    /// The program's token trees ([`Trees`]). The engine holds them too,
+    /// since its start.
+    trees: Arc<ModelTrees>,
 }
 
 impl Program {
-    /// The program's start: the engine's one call
-    /// ([`InProcess::start`]), made over the program's own data. The
-    /// engine is built from `spec` for the life of the process and takes
+    /// The program's start: the engine's one call ([`InProcess::start`]), made
+    /// over the program's own data.
+    ///
+    /// The engine is built from `spec` for the life of the process. It takes
     /// the program's registry, and its load monitor's channel where the
-    /// program has a monitor. This program keeps no index of cache events.
-    /// Beside the start it hands the engine its lists by model
-    /// ([`PublishedLists`]). `plan` is the kinds of worker the settings
-    /// behind `spec` route to ([`Plan::of`]).
+    /// program has a monitor. The program lends its token trees with them
+    /// ([`Trees`]), a tree's page the block of `spec`, and keeps no index of
+    /// cache events. Beside the start it hands the engine its lists by model
+    /// ([`PublishedLists`]).
+    ///
+    /// `plan` is the kinds of worker the settings behind `spec` route to
+    /// ([`Plan::of`]). `sends` are the program's sends.
     ///
     /// It answers the program with the engine's own task, which a program
     /// spawns on its runtime ahead of its first request. The task keeps the
-    /// newest load snapshot at hand, runs the engine's upkeep, and follows
-    /// the registry: it tells the document's stages a worker that joined or
-    /// left, and fills the cells of the model's lists that stand then.
-    /// `sends` are the program's sends.
+    /// newest load snapshot at hand and runs the engine's upkeep. It also
+    /// follows the registry: it tells the document's stages a worker that
+    /// joined or left, and fills the cells of the model's lists that stand
+    /// then.
     pub fn start(
         plan: Plan,
         spec: AppliedSpec,
@@ -661,10 +754,12 @@ impl Program {
     ) -> (Self, impl Future<Output = ()> + Send + 'static) {
         let registry = Arc::new(WorkerRegistry::new());
         let handed: Arc<WorkerRegistry<Lists>> = Arc::clone(&registry);
+        let trees = Arc::new(ModelTrees::new(spec.block_size() as usize));
+        let lent: Arc<dyn CacheIndexes> = Arc::new(Trees(Arc::clone(&trees)));
         let data = WorkerData {
             registry: handed,
             loads,
-            cache_indexes: None,
+            cache_indexes: Some(lent),
         };
         let (engine, task) = InProcess::start(spec, data);
         engine.set_lists(Arc::new(PublishedLists(Arc::clone(&registry))));
@@ -674,17 +769,22 @@ impl Program {
             plan,
             sends: Box::new(sends),
             in_turn: false,
+            trees,
         };
         (program, task)
     }
 
     /// The program with a route that sends a pair's decode behind its
-    /// prefill's answer, as a route with sequential dispatch does. Each
-    /// pair's request then says that its decode is asked again
-    /// ([`PlaceRequest::decode_again`]), and [`Self::serve`] asks it behind
-    /// the prefill's answer, where the decode still stands chosen. It is
-    /// the route's word and no setting: a program that sends both sides at
-    /// once never says it.
+    /// prefill's answer, as a route with sequential dispatch does. Each pair's
+    /// request then says that its decode is asked again
+    /// ([`PlaceRequest::decode_again`]). [`Self::serve`] asks it behind the
+    /// prefill's answer, where the decode still stands chosen.
+    ///
+    /// It is the route's word and no setting: a program that sends both sides
+    /// at once never says it. The decode stands chosen under a document that
+    /// picks a pair's decode behind its prefill, and no setting says that
+    /// either. A host whose route asks again writes it into the document its
+    /// settings mean (`plans.pd-pair.decode`).
     #[must_use]
     pub fn in_turn(mut self) -> Self {
         self.in_turn = true;
@@ -699,13 +799,43 @@ impl Program {
         self.registry.register(worker).is_some()
     }
 
-    /// The worker at `address` leaves. `false` where the registry holds
-    /// none there. The registry finds a worker by an address written
-    /// without its scheme too. The engine's task hears the removal with
-    /// the worker's own object, so the stages are told the worker under
-    /// the address it states.
+    /// The worker at `address` leaves. `false` where the registry holds none
+    /// there. The registry finds a worker by an address written without its
+    /// scheme too.
+    ///
+    /// The engine's task hears the removal with the worker's own object, so
+    /// the stages are told the worker under the address it states.
+    ///
+    /// The worker is taken out of the program's trees too, under that address:
+    /// the engine writes a prompt for a worker by it. A tree keeps what it
+    /// holds for a worker that is gone until its host takes it out. The size
+    /// pass alone would keep it for good.
+    ///
+    /// A worker that joins at the address again starts with no prompt, unless
+    /// a decision under way at the leave wrote one behind the purge, as in a
+    /// gateway.
     pub fn leave(&self, address: &str) -> bool {
-        self.registry.remove_by_url(address).is_some()
+        let Some(left) = self.registry.remove_by_url(address) else {
+            return false;
+        };
+        self.trees.remove_tenant(&TenantId::from(left.url()));
+        true
+    }
+
+    /// The program's size pass: each model's tree is held to `tokens`
+    /// tokens ([`ModelTrees::evict_token_trees`]). The bound is the host's,
+    /// as the purge of a worker that left is: the engine calls a tree's
+    /// match and nothing else. A program runs the pass on a timer of its
+    /// own, with its settings' number. This one spawns nothing, and its
+    /// builder calls the pass.
+    pub fn trim(&self, tokens: usize) {
+        self.trees.evict_token_trees(tokens, |_, _| {});
+    }
+
+    /// The program's token tree of `model`: `None` until the engine asked
+    /// for it, and so under a document that reads no sent prefix.
+    pub fn tree(&self, model: &str) -> Option<Arc<TokenTree>> {
+        self.trees.token_tree(model)
     }
 
     /// The model's generation as the registry holds it now.
@@ -713,25 +843,30 @@ impl Program {
         self.registry.model_generation(model)
     }
 
-    /// The request of one attempt, as each call for that attempt states it:
-    /// what the attempt states ([`Stated`]) of the request its client
-    /// asked, over `lists`, the model's generation as its caller holds it
-    /// at that call. The attempt's number is stated and not counted off the
-    /// tried workers: a failed attempt of a pair names two workers. A retry
-    /// states the wire it stays on as its demand ([`Demands::runtime`]),
-    /// and a first attempt demands nothing. An attempt behind a worker's
-    /// own answer states the route's rule ([`PlaceRequest::admits`]). The
-    /// request lends what the program's plan says: the single workers'
-    /// list, a pair's two, or an encode request's three. The items a
-    /// request carries are stated with those three lists, at its first
-    /// attempt alone: a retry states none and is placed as the pair. A
-    /// model that has no generation lends no list and states no item. The
-    /// generation's ring is lent with its lists ([`Lists::ring`]). A
-    /// program whose route sends a pair's decode behind its prefill's
-    /// answer says so here.
+    /// The request of one attempt, as each call for that attempt states it. It
+    /// states what the attempt states ([`Stated`]) of the request its client
+    /// asked, over `lists`: the model's generation as its caller holds it at
+    /// that call.
+    ///
+    /// - The attempt's number is stated, and not counted off the tried
+    ///   workers: a failed attempt of a pair names two workers.
+    /// - A retry states the wire it stays on as its demand
+    ///   ([`Demands::runtime`]). A first attempt demands nothing.
+    /// - An attempt behind a worker's own answer states the route's rule
+    ///   ([`PlaceRequest::admits`]).
+    /// - The request lends what the program's plan says: the single workers'
+    ///   list, a pair's two, or an encode request's three. A model that has no
+    ///   generation lends no list and states no item.
+    /// - The items a request carries are stated with those three lists, at its
+    ///   first attempt alone. A retry states none and is placed as the pair.
+    /// - The generation's ring is lent with its lists ([`Lists::ring`]).
+    /// - A program whose route sends a pair's decode behind its prefill's
+    ///   answer says so here.
+    /// - A request that holds its prompt's token ids states them and its entry
+    ///   in the program's tree, at each attempt alike ([`Asked::tokens`]).
     fn request<'a>(
         &self,
-        asked: &Asked<'a>,
+        asked: &'a Asked<'a>,
         lists: Option<&'a Lists>,
         stated: Stated<'a>,
     ) -> PlaceRequest<'a> {
@@ -764,7 +899,17 @@ impl Program {
             runtime: stated.wire,
             ..Demands::default()
         };
+        // The prompt as the program holds it: its token ids, and the
+        // request itself as its entry in the program's tree. The engine
+        // asks the entry where a decision reads that tree, and of no other
+        // request.
+        let mut prompt = Prompt::NONE;
+        if asked.tokens.is_some() {
+            prompt.tokens = asked.tokens;
+            prompt.entry = Some(asked);
+        }
         PlaceRequest {
+            prompt,
             headers,
             demands,
             encode: carries.then_some(items),
@@ -777,14 +922,16 @@ impl Program {
         }
     }
 
-    /// One attempt placed: the engine asked once over the generation that
+    /// One attempt placed. The engine is asked once, over the generation that
     /// stands, for the request of that attempt ([`Self::request`]), which
     /// states `stated`. A caller that keeps its own attempt states a first
-    /// attempt's ([`Stated::default`]). The answer is the placement kept
-    /// with the load guard of each worker the request goes to, under the
-    /// routing key the placement names: a pair's decode is counted from
-    /// here, sent at once or later. An item's encoder takes its guard at
-    /// the item's send, and no sooner ([`Self::serve`]).
+    /// attempt's ([`Stated::default`]).
+    ///
+    /// The answer is the placement, kept with the load guard of each worker
+    /// the request goes to, under the routing key the placement names. A
+    /// pair's decode is counted from here, sent at once or later. An item's
+    /// encoder takes its guard at the item's send, and no sooner
+    /// ([`Self::serve`]).
     ///
     /// # Errors
     ///
@@ -809,62 +956,76 @@ impl Program {
         (self.sends)(worker).into()
     }
 
-    /// Serves one client request: places an attempt, says it sent, sends
-    /// each side of it, says each side's end, and where the attempt was
-    /// answered a status a gateway asks again for ([`ASKED_AGAIN`]) places
-    /// the next attempt past the workers tried, up to [`ATTEMPTS`]
-    /// attempts. Both sides of a pair sent at once go out, whatever the
-    /// first answered: the attempt's status is its prefill's where that one
-    /// failed, and its decode's otherwise.
+    /// Serves one client request, in up to [`ATTEMPTS`] attempts. For each
+    /// attempt it places the attempt, says it sent, sends each side of it and
+    /// says each side's end. Where the attempt was answered a status a gateway
+    /// asks again for ([`ASKED_AGAIN`]), it places the next attempt past the
+    /// workers tried.
     ///
-    /// A retry stays on the wire of the worker the first attempt went to
-    /// ([`wire`]): each later attempt states that number as its demand. A
-    /// wire that holds one worker keeps it for the retry, and a wire that
-    /// holds none any more leaves the retry no endpoint.
-    ///
-    /// A worker that answered the request itself ([`OWN_ANSWER`]) takes no
-    /// further attempt of it. From then on each attempt states the route's
-    /// own rule ([`PlaceRequest::admits`]): it refuses the engines that
-    /// answered so, and reads the program's list of them alone. A send no
-    /// worker answered refuses nobody ([`UNANSWERED`]). A tried worker
-    /// steps aside while another is left, and a worker the rule refuses is
-    /// sent nothing. For a pair the rule is the plain one: the side whose
-    /// own answer it was is refused, and its partner is not. An attempt
-    /// reads one side's answer, the side that gave it its status: sent at
-    /// once, the first that failed in the order of the sends. Behind a
-    /// prefill that failed, a decode's answer is not its own word on the
-    /// request. A gateway's pair route may go further, and refuse the
-    /// partner where no pair is left without the worker that answered.
-    ///
-    /// Where the engine says that the rule left the request no worker, by
-    /// its shed under `admits` ([`Unplaced::Shed`]), the worker's own
-    /// answer is the client's, as it is: nobody is left to give another. A
-    /// shed for any other cause is answered [`NO_WORKER`], at a retry as at
-    /// a first attempt. A gateway that keeps such a rule may end the
-    /// request ahead of that call: this program asks the engine once more
-    /// and reads its word.
-    ///
-    /// An encode request's items go out once a request, with its first
-    /// attempt: each to the encoder the placement names for it, ahead of
-    /// the pair. That order is this program's own: a gateway whose workers
-    /// state a rendezvous launches the items beside the pair. An item is
-    /// counted on its encoder while its send runs, under no routing key,
-    /// as a gateway's encode stage counts it: the key is the pair's, and an
-    /// encoder that answered holds the request no more. Nothing is said of
-    /// an encoder, since no lease stands for one.
-    ///
-    /// An encoder's failure is the request's answer: neither side of the
-    /// pair is sent, the placement's drop gives the pair up, and no attempt
-    /// follows. A retry behind a failed side of the pair states no item and
-    /// sends none: it is placed as the pair alone, with the pair's two
-    /// workers as tried and no encoder, as a gateway's retry is.
-    ///
-    /// A route that sends a pair's decode behind its prefill's answer
-    /// ([`Self::in_turn`]) sends the pair in turn ([`Self::sent_in_turn`]):
-    /// a prefill that failed sends no decode.
+    /// Both sides of a pair sent at once go out, whatever the first answered.
+    /// The attempt's status is its prefill's where that one failed, and its
+    /// decode's otherwise. A route that sends a pair's decode behind its
+    /// prefill's answer ([`Self::in_turn`]) sends the pair in turn
+    /// ([`Self::sent_in_turn`]): a prefill that failed sends no decode.
     ///
     /// A route does more than this: it waits between two attempts, and a
     /// response can say that it is not to be asked again.
+    ///
+    /// # A retry's wire
+    ///
+    /// A retry stays on the wire of the worker the first attempt went to
+    /// ([`wire`]): each later attempt states that number as its demand. A wire
+    /// that holds one worker keeps it for the retry, and a wire that holds
+    /// none any more leaves the retry no endpoint.
+    ///
+    /// # The route's own rule
+    ///
+    /// A worker that answered the request itself ([`OWN_ANSWER`]) takes no
+    /// further attempt of it. From then on each attempt states the route's own
+    /// rule ([`PlaceRequest::admits`]). The rule refuses the engines that
+    /// answered so, and reads the program's list of them alone.
+    ///
+    /// - A send no worker answered refuses nobody ([`UNANSWERED`]).
+    /// - A tried worker steps aside while another is left. A worker the rule
+    ///   refuses is sent nothing.
+    /// - For a pair the rule is the plain one: the side whose own answer it
+    ///   was is refused, and its partner is not.
+    /// - An attempt reads one side's answer, the side that gave it its status.
+    ///   Sent at once, that is the first that failed in the order of the
+    ///   sends. Behind a prefill that failed, a decode's answer is not its own
+    ///   word on the request.
+    ///
+    /// A gateway's pair route may go further, and refuse the partner where no
+    /// pair is left without the worker that answered.
+    ///
+    /// Where the rule left the request no worker, the engine says so by its
+    /// shed under `admits` ([`Unplaced::Shed`]). The worker's own answer is
+    /// then the client's, as it is: nobody is left to give another. A shed for
+    /// any other cause is answered [`NO_WORKER`], at a retry as at a first
+    /// attempt.
+    ///
+    /// A gateway that keeps such a rule may end the request ahead of that
+    /// call. This program asks the engine once more and reads its word.
+    ///
+    /// # An encode request
+    ///
+    /// The items go out once a request, with its first attempt: each to the
+    /// encoder the placement names for it, ahead of the pair. That order is
+    /// this program's own. A gateway whose workers state a rendezvous launches
+    /// the items beside the pair.
+    ///
+    /// An item is counted on its encoder while its send runs, under no routing
+    /// key, as a gateway's encode stage counts it. The key is the pair's, and
+    /// an encoder that answered holds the request no more. Nothing is said of
+    /// an encoder, since no lease stands for one.
+    ///
+    /// An encoder's failure is the request's answer. Neither side of the pair
+    /// is sent, the placement's drop gives the pair up, and no attempt
+    /// follows.
+    ///
+    /// A retry behind a failed side of the pair states no item and sends none.
+    /// It is placed as the pair alone, with the pair's two workers as tried
+    /// and no encoder, as a gateway's retry is.
     pub fn serve(&self, asked: &Asked<'_>) -> Answer {
         let (mut tried, mut sent, mut attempts) = (Vec::new(), Vec::new(), 0u8);
         // The wire the request stays on, from its first attempt's worker.
@@ -965,38 +1126,44 @@ impl Program {
 
     /// A pair's attempt sent in turn, for the attempt that states `stated`:
     /// the prefill first, and behind its good answer the decode, which the
-    /// engine is asked for again. The answer is the side that gave the
-    /// attempt its status and what that side's send answered: the prefill
-    /// where it failed, else the decode.
+    /// engine is asked for again. The answer is the side that gave the attempt
+    /// its status, and what that side's send answered: the prefill where it
+    /// failed, else the decode.
     ///
     /// The order is the one the second ask stands on
-    /// ([`Placement::decode_again`]). The prefill's send is said and made.
-    /// Behind a good answer the program asks the placement whether its
-    /// decode still stands chosen ([`Placement::decode_chosen`]), as a
-    /// gateway does ahead of its second ask. Where it does, the request is
-    /// stated again, over the generation that stands then, and the decode
-    /// is asked ahead of the prefill's end. The decode's guard stands on
-    /// the first decode across that ask, so the request says so
-    /// (`PlaceRequest::counted_on_decode`): the engine then reads that
-    /// decode without this request. Where the ask takes a decode, the
-    /// prefill's end is said, the guard follows the decode, and the
-    /// decode's send is said behind it. Where it takes none, the first
-    /// decision's decode is sent under the guard it has, and its send is
-    /// said ahead of the prefill's end.
+    /// ([`Placement::decode_again`]):
     ///
-    /// A decode that does not stand chosen was booked with its prefill:
-    /// by a document that books both sides at once, or for a request the
-    /// engine books whole whatever its route says
-    /// ([`PlaceRequest::decode_again`]). The engine would refuse its second
-    /// ask with no decision made, so the program states no request again
-    /// and sends that decode, in the same order.
+    /// 1. The prefill's send is said and made.
+    /// 2. Behind a good answer the program asks the placement whether its
+    ///    decode still stands chosen ([`Placement::decode_chosen`]), as a
+    ///    gateway does ahead of its second ask.
+    /// 3. Where it does, the request is stated again, over the generation that
+    ///    stands then, and the decode is asked ahead of the prefill's end.
+    ///
+    /// The decode's guard stands on the first decode across the second ask, so
+    /// the request says so (`PlaceRequest::counted_on_decode`). The engine
+    /// then reads that decode without this request.
+    ///
+    /// That ask ends one of two ways:
+    ///
+    /// - Where it takes a decode, the prefill's end is said, the guard follows
+    ///   the decode, and the decode's send is said behind it.
+    /// - Where it takes none, the first decision's decode is sent under the
+    ///   guard it has, and its send is said ahead of the prefill's end.
+    ///
+    /// A decode that does not stand chosen was booked with its prefill. Either
+    /// the document books both sides at once, or the engine books the request
+    /// whole whatever its route says ([`PlaceRequest::decode_again`]). The
+    /// engine would refuse a second ask with no decision made. So the program
+    /// states no request again and sends that decode, in the same order.
     ///
     /// The engine hears the decode's dispatch where its send is said
-    /// ([`Placement::sent`]), and not where its guard was made. The
-    /// prefill's own guard goes where its end is said
-    /// ([`InFlight::prefill_ended`]). A prefill that failed sends no decode:
-    /// the decode's guard ends with the attempt, and a decode the engine
-    /// had booked is given up by the placement's drop.
+    /// ([`Placement::sent`]), and not where its guard was made. The prefill's
+    /// own guard goes where its end is said ([`InFlight::prefill_ended`]).
+    ///
+    /// A prefill that failed sends no decode. The decode's guard ends with the
+    /// attempt, and a decode the engine had booked is given up by the
+    /// placement's drop.
     fn sent_in_turn(
         &self,
         asked: &Asked<'_>,

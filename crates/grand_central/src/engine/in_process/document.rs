@@ -99,6 +99,13 @@ pub(in crate::engine) struct InForce {
     /// facts ([`super::signals::decide`]), and any other document pays one
     /// test of this word.
     pub(super) signals: bool,
+    /// Whether a stage of the document that keeps load reports keeps a
+    /// signal's column too ([`Engine::keepers_read_signals`]), read once,
+    /// here. Under such a document a report the task tells states its
+    /// named values ([`InProcess::tell_loads`]). Under any other none is
+    /// converted for a telling: a column held by a stage that keeps no
+    /// report is read at decisions alone.
+    pub(super) keepers_read_signals: bool,
     /// Whether a decision under the document reads the load snapshot the
     /// engine's task keeps at hand: a stage of it reads a load report
     /// ([`Needs::loads`](crate::document::spec::Needs::loads)) or a named
@@ -113,7 +120,9 @@ pub(in crate::engine) struct InForce {
     /// `explain.sample` is not zero
     /// ([`Engine::explain_sample`](crate::engine::Engine::explain_sample)).
     /// Read once, here. A whole decision tests it once
-    /// ([`super::sample::whole`]).
+    /// ([`super::sample::whole`]), and a single request's kept behind a
+    /// placement once more, for the best rows of its trace
+    /// ([`super::single::decide`]).
     pub(super) samples: bool,
     /// The decisions kept under the document, newest last
     /// ([`super::sample`]): one ring of them, behind one lock that a kept
@@ -147,6 +156,7 @@ impl InForce {
             leases_or_samples: hears.intersects(EventSet::LEASE) || samples,
             labels: labels::of(&spec),
             signals: needs.signal_cells,
+            keepers_read_signals: engine.keepers_read_signals(),
             reads_loads: needs.loads || needs.signal_cells,
             any_shadow,
             samples,
@@ -348,24 +358,34 @@ impl InProcess {
     /// and its record of sent prompts. The table takes the new document's
     /// two times. The stages of a profile whose name and text did not
     /// change stand too, with what they hold: the new document keeps their
-    /// objects. A profile's stages are built from its own block, the
-    /// document's `view` and its `signals`, so a new document that changes
-    /// `view` or `signals` builds every profile anew. A profile is built
-    /// anew too where one of its stages, built again, says otherwise of
-    /// itself than the standing one: another name, other words of a
-    /// request's life to hear, or anything else the engine reads of a
-    /// stage when it builds a profile. A factory of the host's own may
-    /// build such a stage. A count of sends stands where a profile that
-    /// reads it is kept, whichever of its other readers changed, left or
-    /// came: a profile built new beside it reads the same count. A count
-    /// none of whose readers is kept is built new and takes over a
-    /// standing count: which one is the count's own rule
+    /// objects.
+    ///
+    /// A profile's stages are built from its own block, the document's
+    /// `view` and its `signals`. So a new document that changes `view` or
+    /// `signals` builds every profile anew. One change of `view` keeps
+    /// them: another header list, where nothing else of the view changed.
+    /// No stage is built from that list. A stage that reads a header by a
+    /// place its host wrote is kept as it stands, and reads that place of
+    /// the new list.
+    ///
+    /// A profile is built anew too where one of its stages, built again,
+    /// says otherwise of itself than the standing one. That is another
+    /// name, other words of a request's life to hear, or anything else the
+    /// engine reads of a stage when it builds a profile. A factory of the
+    /// host's own may build such a stage.
+    ///
+    /// A count of sends stands where a profile that reads it is kept,
+    /// whichever of its other readers changed, left or came. A profile
+    /// built new beside it reads the same count. A count none of whose
+    /// readers is kept is built new and takes over a standing count: which
+    /// one is the count's own rule
     /// ([`Engine::succeed`](crate::engine::Engine::succeed)). Every other
-    /// stage starts empty, a registered one too. The keep stands between
-    /// two documents validated over the stock table, or over one table of
-    /// the host's own as it stood at both validations
-    /// ([`StageRegistry`](crate::stages::StageRegistry)): a host that
-    /// builds its table anew for each document keeps nothing.
+    /// stage starts empty, a registered one too.
+    ///
+    /// The keep stands between two documents validated over the stock
+    /// table, or over one table of the host's own as it stood at both
+    /// validations ([`StageRegistry`](crate::stages::StageRegistry)). A
+    /// host that builds its table anew for each document keeps nothing.
     ///
     /// What a caller may rely on when the call returns: the stages built
     /// new have heard every worker that stands in the registry the
@@ -530,4 +550,5 @@ impl InProcess {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/document/tests.rs"]
 mod tests;

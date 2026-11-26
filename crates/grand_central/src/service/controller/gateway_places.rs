@@ -189,4 +189,5 @@ impl GatewayPlaces {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/service/controller/gateway_places/tests.rs"]
 mod tests;

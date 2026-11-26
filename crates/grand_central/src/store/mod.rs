@@ -63,6 +63,7 @@ pub(crate) mod snapshot;
 pub(crate) mod workers;
 
 #[cfg(test)]
+#[path = "../../tests/unit/store/tests/mod.rs"]
 mod tests;
 
 pub use applied::EngineFaults;

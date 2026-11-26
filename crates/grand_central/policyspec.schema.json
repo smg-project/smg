@@ -163,7 +163,7 @@
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: on a text host its characters plus\n1024 for each node a worker stands on, tokens otherwise.\nThe crate's own store reads it for a pool whose profile\nreads sent prefixes: the model's record is bound to `max_size` over\nthe block size placements, never under one, one a block a worker\nwas sent. A lowered bound is met by sweeps at the record's next\nwrites, and a pool whose lanes are all heard writes none.",
+          "description": "The size bound of a tree index: on a text host its characters plus\n1024 for each node a worker stands on, tokens otherwise.\nThe crate's engine reads it for a pool whose profile reads sent\nprefixes: the model's record is bound to `max_size` over the block\nsize placements, never under one, one a block a worker was sent. A\nlowered bound is met by sweeps, at the record's next writes and at\nthe engine's upkeep.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
@@ -1578,7 +1578,7 @@
           "const": "pd-pair"
         },
         {
-          "description": "The encode profile once per encode item, then the pair; all three\nsides named.",
+          "description": "The pair, then the encode profile over the encoders of the chosen\nprefill's class, once per encode item or once for the items taken\nas one; all three sides named. A request with items that no encoder\nis open to is refused ahead of the pair.",
           "type": "string",
           "const": "epd"
         }
@@ -1864,7 +1864,7 @@
       "type": "object",
       "properties": {
         "sample": {
-          "description": "Keep every Nth pick or shed per decider under this generation. Zero\nturns sampling off and one keeps every pick and shed.",
+          "description": "Each decider of a controller, and each calling thread in a host's\nown process, keeps every Nth pick or shed it counts. The count\nstarts over under a new generation, and in a controller under a new\nlead. Zero keeps none. In a host's own process a request is counted\nonly where an id names it.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,

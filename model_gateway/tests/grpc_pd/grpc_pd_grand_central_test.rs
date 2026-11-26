@@ -464,6 +464,66 @@ async fn a_decode_asked_again_is_not_counted_against_itself() {
     assert_eq!(moved.count(), 0, "{said:?}");
 }
 
+/// A decode asked again behind its prefill has the room its request holds
+/// there, and no other decode gains one. Decode A runs one request at a
+/// time and decode B two (`max_running_requests`), under the stock decode
+/// side, which keeps the decodes with a free room (`has-room`). The route
+/// claims a request's room at its first decode ahead of the prefill, and
+/// asks the decode again while that room fills A's window.
+///
+/// With A ranked first and B free, a request stays A's: the room that
+/// fills A's window is its own. Then B is ranked first, while another
+/// request holds one of B's rooms and a batch of two waits at B's gate for
+/// both: B has no room for the request, though the route's one try at B's
+/// gate would take it, and the request stays A's.
+#[tokio::test]
+async fn a_decode_asked_again_has_the_room_its_request_holds() {
+    let (heard, preferred) = (Heard::default(), Preferred::default());
+    let prefill = Prefill {
+        heard: Arc::clone(&heard),
+        preferred: Arc::clone(&preferred),
+        then: None,
+    };
+    let prefill = serve_engine(prefill.into_server()).await;
+    let decode_a = serve_engine(Decode(Arc::clone(&heard), "decode A").into_server()).await;
+    let decode_b = serve_engine(Decode(Arc::clone(&heard), "decode B").into_server()).await;
+    let of_rooms = |port, rooms: &str| -> Arc<dyn Worker> {
+        let card = ModelCard::new(MODEL);
+        let decode = grpc_worker(port, WorkerType::Decode, RuntimeType::Vllm, card);
+        Arc::new(decode.label("max_running_requests", rooms).build())
+    };
+    let (decode_a, decode_b) = (of_rooms(decode_a, "1"), of_rooms(decode_b, "2"));
+    let (a, b) = (worker_id(decode_a.as_ref()), worker_id(decode_b.as_ref()));
+    let prefill = worker(prefill, WorkerType::Prefill);
+    let workers = vec![prefill, decode_a, Arc::clone(&decode_b)];
+
+    common::with_policy_stages(stages_hearing(&heard, &preferred), async {
+        let config = pair_config(DecodePick::AfterPrefill);
+        let router = build_grpc_router(config, MODEL, workers).await;
+        // The route moves a request only to a decode whose client the
+        // gateway holds, which it does from the first decision that names
+        // the decode: one request names B first.
+        prefer(&preferred, Some(b));
+        chat(router.as_ref(), &heard).await;
+        heard.lock().expect("the record").clear();
+
+        prefer(&preferred, Some(a));
+        for _ in 0..4 {
+            chat(router.as_ref(), &heard).await;
+        }
+
+        assert!(decode_b.try_admit_pd(1, 2), "one of B's two rooms");
+        let _waits = decode_b.pd_enqueue(2);
+        prefer(&preferred, Some(b));
+        chat(router.as_ref(), &heard).await;
+    })
+    .await;
+
+    let said = heard.lock().expect("the record").clone();
+    let moved = said.iter().filter(|word| *word == "decode B was asked");
+    assert_eq!(moved.count(), 0, "{said:?}");
+}
+
 /// A pair whose decode moved states the weight version of the decode that
 /// answered. Decode A and decode B carry a version each, and a chat
 /// answer's `system_fingerprint` is its worker's. The first request is

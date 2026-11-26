@@ -59,8 +59,8 @@ wasmtime = { workspace = true, optional = true }
 # runtime handle its election thread blocks on is the optional tokio declared
 # with the controller's dependencies below; this feature turns it on too.
 # Nothing of it is built without the feature.
-k8s-openapi = { version = "0.27.0", features = ["v1_33"], optional = true }
-kube = { version = "3.0.1", default-features = false, features = ["client", "rustls-tls", "ring"], optional = true }
+k8s-openapi = { version = "0.28.0", features = ["v1_33"], optional = true }
+kube = { version = "4.2.1", default-features = false, features = ["client", "rustls-tls", "ring"], optional = true }
 
 # The controller's engine client (the `controller` feature): the gRPC
 # connector each worker object dials through and the cache events' wire.

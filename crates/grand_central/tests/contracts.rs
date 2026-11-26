@@ -262,7 +262,8 @@ struct ProtoMirror {
     /// position, the in-process length of a fixed array, the trace the wire
     /// hoists into `Decision`, whether a report counts resident tokens, a
     /// fingerprint the host carries of a name the wire carries, the place
-    /// of a row's engine among the engines of its host's list.
+    /// of a row's engine among the engines of its host's list, the side of
+    /// a pair a refusal names.
     host_only: &'static [&'static str],
     /// Wire fields outside the record, in the wire's order: an event's key
     /// before it, controller facts, a wire-only input, the observability
@@ -475,7 +476,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Shed",
             record: shed_record(),
-            host_only: &["trace"],
+            host_only: &["side", "trace"],
             wire_only: &[],
             wire: &[
                 ("reason", Type::Enum),
@@ -1607,7 +1608,8 @@ fn the_named_worker_field_is_pinned() {
 
 /// What a registration states and its answer tells, by name and number: the
 /// prober's settings (one message for the registration and the row), the
-/// row's rank and engine, and the two thresholds a row is judged by.
+/// row's rank and engine, the two thresholds a row is judged by, and what a
+/// worker states for a request's hard demands (one message for the two).
 const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
     (
         "HealthPolicy",
@@ -1633,13 +1635,30 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("engine", 24, Type::String),
             ("health_policy", 25, Type::Message),
             ("maker", 27, Type::Message),
+            ("demand_facts", 28, Type::Message),
+        ],
+    ),
+    (
+        "DemandFacts",
+        &[
+            ("runtime", 1, Type::Uint32),
+            ("references", 2, Type::Bool),
+            ("host_pipeline", 3, Type::Bool),
+            ("window", 4, Type::Uint32),
+            ("decoding", 5, Type::Uint32),
         ],
     ),
     (
         "Maker",
         &[("provider", 1, Type::String), ("key", 2, Type::String)],
     ),
-    ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
+    (
+        "WorkerSpec",
+        &[
+            ("health_policy", 14, Type::Message),
+            ("demand_facts", 15, Type::Message),
+        ],
+    ),
 ];
 
 /// A membership change on the plugin wire, by name and number: a plugin
@@ -1691,9 +1710,12 @@ fn the_membership_fields_are_pinned() {
     for (message_name, expected) in MEMBERSHIP_FIELDS {
         let compiled = message(controller, message_name)
             .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
-        // The two small messages are pinned whole, the two rows by the
+        // The three small messages are pinned whole, the two rows by the
         // fields named here.
-        let whole = matches!(*message_name, "HealthPolicy" | "OverloadThresholds");
+        let whole = matches!(
+            *message_name,
+            "HealthPolicy" | "OverloadThresholds" | "DemandFacts"
+        );
         let found: Vec<(String, i32, Type)> = fields(compiled)
             .into_iter()
             .filter(|(name, _, _, _, _)| {

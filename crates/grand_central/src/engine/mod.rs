@@ -64,7 +64,7 @@ pub use in_process::encode::EncodeLists;
 #[cfg(feature = "in-process")]
 pub use in_process::membership::Members;
 #[cfg(feature = "in-process")]
-pub use in_process::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffinity, PrefixRead};
+pub use in_process::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffinity};
 #[cfg(feature = "in-process")]
 pub use in_process::pair::{prefills_full, PairAdmission, PairLists};
 #[cfg(feature = "in-process")]
@@ -90,6 +90,7 @@ pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,
     Constraints, Engines, FixedFacts, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
     ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts, Role, Session,
-    SessionCountedUnder, SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
+    SessionCountedUnder, SignalSource, TreeMatch, WireModes, WorkerId, ZoneCapacity,
+    TEXT_BYTES_PER_TOKEN,
 };
 pub use warm_up::{WarmUpRule, WarmUpState};

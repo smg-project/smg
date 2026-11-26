@@ -707,6 +707,7 @@ pub(crate) async fn execute_sequential_pd(
                 wire,
                 tried,
                 ledger,
+                claimed: held.claimed(),
             };
             let mut moved = None;
             held.map_decode(|ahead| {

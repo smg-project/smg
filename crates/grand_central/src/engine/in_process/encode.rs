@@ -43,14 +43,15 @@ use super::{
 use crate::engine::{
     decision::{shed, Decision, ShedReason, Target, WIRES},
     decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
-    demands::Demands,
-    framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
+    demands::{Demands, UnmetDemand},
+    framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools, PairSide},
     list_cell::LentList,
     records::{HeldCells, Live, PoolRecords},
     view::{Constraints, Phase, RequestFacts},
 };
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/encode/tests/mod.rs"]
 mod tests;
 
 /// What a request that states the later decode is declined under where its
@@ -157,7 +158,10 @@ impl EncodeLists<'_> {
     /// whose worker meets its part of the demand, among the places its
     /// host states for it, and a side left nobody sheds the request with
     /// no endpoint under the stage of the demand that took its last
-    /// worker, the prefills' first. The encoders' part is the pass's own
+    /// worker, the prefills' first. Where the pair's other list holds no
+    /// worker, the request is shed as its pair alone is: one side alone
+    /// is no pair, and the engine answers over no candidate, for the side
+    /// of the list with no worker. The encoders' part is the pass's own
     /// to keep, in its one test of an encoder: one that fails a part of
     /// it is no member of its class, and what the encoders lack is named
     /// in the pass's order, a demand's part with the request's own facts
@@ -279,11 +283,13 @@ impl EncodeLists<'_> {
     /// with no item takes no encoder: its pair's sides are held as a
     /// pair's own, and the encoders state no demand.
     ///
-    /// With them comes the stage of the demand that left a side of the
-    /// pair nobody, the prefills' first, where one did: that side's
-    /// constraints are then its host's own and decide nothing. Out of
-    /// line: its code stays off the path of a request that states no
-    /// demand.
+    /// With them comes the demand that left a side of the pair nobody,
+    /// the prefills' first, where one did, and that side. Each side's
+    /// constraints are then the request's own less its demand, with no
+    /// list's places or mask, as a pair's records are handed them: they
+    /// are read for a list of the pair that holds no worker alone.
+    /// Out of line: its code stays off the path of a request that states
+    /// no demand.
     #[inline(never)]
     fn meeting<'s>(
         &self,
@@ -291,7 +297,7 @@ impl EncodeLists<'_> {
         lists: (&PoolRecords, &PoolRecords),
         items: bool,
         kept: &'s mut [Vec<u32>; 2],
-    ) -> ([Constraints<'s>; 3], Option<&'static str>)
+    ) -> ([Constraints<'s>; 3], Option<(UnmetDemand, PairSide)>)
     where
         Self: 's,
     {
@@ -317,10 +323,7 @@ impl EncodeLists<'_> {
         let kept = [prefill_kept, decode_kept];
         match self.pair.sides_meeting(&spent, sides, lists, kept) {
             Ok([prefill_cx, decode_cx]) => ([prefill_cx, decode_cx, encode_cx], None),
-            Err(unmet) => {
-                let [prefill_cx, decode_cx] = self.pair.sides_of(&spent);
-                ([prefill_cx, decode_cx, encode_cx], Some(unmet.stage()))
-            }
+            Err(unmet) => ([spent, spent, encode_cx], Some(unmet)),
         }
     }
 
@@ -438,12 +441,22 @@ impl EncodeLists<'_> {
                 (met, unmet) = judged;
                 // A request with no item reads no encoder: a side its
                 // demand leaves nobody sheds it here, as its pair alone
-                // is shed. With items the pass says the side's stage,
-                // behind its answers for the encoders.
-                if let Some(stage) = unmet.filter(|_| !carries) {
+                // is shed, and the shed names that side. One list alone is
+                // no pair, whatever the demand left of the other: the
+                // answer is then its pair's own over no candidate, under
+                // the constraints its judge hands for such a side. With
+                // items the pass says either, behind its answers for the
+                // encoders.
+                if let Some((demand, side)) = unmet.filter(|_| !carries) {
                     placed.clear();
-                    let (seed, generation) = (facts.seed, pool.generation);
-                    return shed(ShedReason::NoEndpoints, stage, seed, generation);
+                    if prefills.is_empty() || decodes.is_empty() {
+                        let (engine, scratch) = (spec.engine(), &mut buffers.scratch);
+                        let (prefills, own) = (!prefills.is_empty(), &met[0]);
+                        return engine
+                            .decide_over_an_empty_list(facts, &pool, prefills, own, scratch);
+                    }
+                    let (stage, seed, generation) = (demand.stage(), facts.seed, pool.generation);
+                    return shed(ShedReason::NoEndpoints, stage, seed, generation).of_side(side);
                 }
                 met.each_ref()
             } else {

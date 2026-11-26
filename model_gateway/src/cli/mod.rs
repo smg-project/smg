@@ -1615,9 +1615,11 @@ struct ModelArgs {
 
     // ==================== Parsers ====================
     /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
-    /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
+    /// symphony, a worker's labels decide for its model, else this flag and
+    /// --tool-call-parser, before Symphony's registry, for every model; a
+    /// name here alone that a table answers to leaves a model the registry
+    /// knows to the registry and reads only the models it does not know: a
+    /// Symphony table's name here (and in
     /// --tool-call-parser, or there alone) reads them with that table, and
     /// so does a legacy parser's name whose format a table reads (the
     /// table's aliases); `hf` reads each with the table its tokenizer's
@@ -1627,9 +1629,9 @@ struct ModelArgs {
     reasoning_parser: Option<String>,
 
     /// Parser for tool-call interactions (e.g., json, qwen). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
-    /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
+    /// symphony, a worker's labels decide for its model, else this flag, for
+    /// every model, before Symphony's registry, which reads a model it knows
+    /// only where the flags select nothing: a Symphony table's name here (and in
     /// --reasoning-parser, or here alone) reads them with that table, and
     /// so does a legacy parser's name whose format a table reads (the
     /// table's aliases); `hf` reads each with the table its tokenizer's
@@ -1640,9 +1642,10 @@ struct ModelArgs {
 
     /// Which parser reads a chat completion's reasoning and tool calls:
     /// Symphony (the default) or the per-model parsers (legacy). With
-    /// Symphony, a model's worker labels decide, else Symphony's registry
-    /// for a model it knows, else --tool-call-parser and
-    /// --reasoning-parser: a Symphony table's name reads with that table,
+    /// Symphony, a model's worker labels decide, else --tool-call-parser and
+    /// --reasoning-parser, else Symphony's registry for a model it knows (a
+    /// reasoning name alone that a table answers to comes after the
+    /// registry): a Symphony table's name reads with that table,
     /// and so does a legacy parser's name whose format a table reads (qwen
     /// for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so
     /// existing flags keep a working parser); any other legacy parser's

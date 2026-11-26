@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -12,6 +13,12 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+
+
+def _python_loader_environment():
+    # Keep an explicitly configured interpreter's shared-library loader path.
+    # Do not copy the caller's credentials or unrelated environment.
+    return {name: os.environ[name] for name in ("LD_LIBRARY_PATH",) if name in os.environ}
 
 
 @pytest.mark.parametrize(
@@ -144,6 +151,7 @@ def test_go_amd_marker_uses_a_fresh_uuid_for_each_invocation(tmp_path):
             env={
                 "PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin",
                 "GITHUB_ENV": str(output),
+                **_python_loader_environment(),
             },
             capture_output=True,
             text=True,
@@ -171,6 +179,7 @@ def test_go_amd_caller_marker_survives_real_process_title_only_with_preservation
     environment = {
         "PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin",
         "GITHUB_ENV": str(output),
+        **_python_loader_environment(),
     }
     if "SPT_NOENV" in job["env"]:
         environment["SPT_NOENV"] = job["env"]["SPT_NOENV"]
