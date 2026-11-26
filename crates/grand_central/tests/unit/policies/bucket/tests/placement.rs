@@ -1,6 +1,6 @@
-//! Where a prefill request goes. Its size's range names the owner, and
-//! the balance rule spills past an owner booked too far ahead. The
-//! preset and a host that makes no lifecycle call stand here too.
+//! Where a prefill request goes: to its size's owner, or to the least
+//! booked survivor where the most booked stands too far ahead of it.
+//! The preset and a host that makes no lifecycle call stand here too.
 
 use super::*;
 
