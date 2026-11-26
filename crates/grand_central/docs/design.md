@@ -274,14 +274,21 @@ The mode and the gateway decide what the document binds:
 
 A gateway of many routers serves pairs and single workers, however it reaches them, so its
 document binds both. It also mounts its three-sided router in every mode, and a model with an
-encode pool goes to it, so the first binding plans an encode side beside the pair's two. Where
+encode pool goes to it. So the first binding plans an encode side beside the pair's two. Where
 that plan of three sides has no document, the settings say what they said before it, and an
-encode request meets no binding with an encode side. One setting does so until it has a
-document under the `epd` plan. Under the sticky override, for a policy the override places, the
-gateway is refused by the setting's name as it was. A document of three sides the controller's
-check refuses is not taken either, and the pair binding stands. The manual policy on a pair's
-two sides runs under the `epd` plan: its sessions rule places the pair, and an item goes to its
-encoder by its content.
+encode request meets no binding with an encode side.
+
+The sticky override is among the settings that do so, until it has a document under the `epd`
+plan. So is a value the document holds once for every side, as a cache block size, where a pair
+mode's main policy names another than the pair's sides. Under the sticky override, for a policy
+the override places, the gateway is refused by the setting's name as it was. A document of
+three sides the controller's check refuses is not taken either, and the pair binding stands.
+
+The manual policy on a pair's two sides runs under the `epd` plan: its sessions rule places the
+pair, and an item goes to its encoder by its side's policy. Beside a main policy the sticky
+override places, the override leaves the manual pair its own document alone, as it did: that
+document binds no policy the override places. The override's header list then holds the routing
+key header, or the settings are refused by that setting's name, as they were.
 
 In a gateway of one router the second binding of a prefill-decode mode is
 there for one request, the token count. Over HTTP the gateway still places it as a single request,
@@ -1689,7 +1696,7 @@ single's, so a controller refuses a document whose rule states `untold` under `p
 field's name.
 
 Under the `epd` plan a rule runs on the pair's two sides the same way and places no item. An item
-goes to its encoder by its content, and the encode phase takes none of the rule's needs. A host
+is placed by its side's policy, and the encode phase takes none of the rule's needs. A host
 that decides in its own process names each side's count of the key's requests for an encode
 request as for a pair. A controller refuses every rule under `epd` by the plan's name, with a cap
 or with none. The rule is not in that build at all, and an encode frame's rows name no count of a
