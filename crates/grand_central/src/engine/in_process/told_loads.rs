@@ -59,21 +59,23 @@
 //! object that stands for several ranks is told as its one record: the
 //! ranks' sum, under the rank its registration states.
 //!
-//! **Its named values.** Under a document a stage of which keeps a signal's
-//! column, the report is told with the values it states under the
-//! document's names ([`ReportSignals`]), as a list's cells state them
-//! ([`stated_signals`]): one conversion, the signal's own unit, a value in
-//! range, and each value's own sample instant on the engine's decision
-//! clock. A name the report does not state reads none. A report that is
-//! not the whole of its worker object states no named value, as a list's
-//! cells hold none of it: one that lists fewer ranks than it counts, and
-//! one of several rows that does not list as many as the object stands
-//! for.
+//! **Its named values.** The report is told with the values it states
+//! under the document's names ([`ReportSignals`]) where a stage that keeps
+//! reports keeps a signal's column too. They are stated as a list's cells
+//! state them ([`stated_signals`]), by one conversion. A stated value is
+//! under the signal's own unit and in range, with its own sample instant
+//! on the engine's decision clock. A name the report does not state reads
+//! none. A report that is not the whole of its worker object states no
+//! named value, as a list's cells hold none of it: one that lists fewer
+//! ranks than it counts, and one of several rows that does not list as
+//! many as the object stands for.
 //! No age is tested here: a telling has no request's clock. Under any other
-//! document a report states none, and nothing is converted for it. The
-//! values stand in one row the task keeps, written again at each report:
-//! they are lent for the stage's call, and a stage copies out what it
-//! keeps.
+//! document a report states none, and nothing is converted for it. A
+//! column held by a stage that keeps no report is read at decisions alone.
+//! A stage that keeps reports reads none there by a column its own build
+//! did not resolve. The values stand in one row the task keeps, written
+//! again at each report: they are lent for the stage's call, and a stage
+//! copies out what it keeps.
 //!
 //! **What can be passed over.** The host's channel keeps one snapshot, and a
 //! snapshot keeps one report a worker. So of two reports of one worker the
@@ -108,7 +110,11 @@
 //! a snapshot is at hand for decisions behind its telling: the registry's
 //! ready words, one look-up for each joined worker, one conversion of each
 //! new report, its named values where a stage reads them, and the stages'
-//! own work at each. A telling allocates nothing.
+//! own work at each. The values' row is the task's and keeps its room. It
+//! takes room at the first report, and again only under a document that
+//! declares more signals. Behind that, the values of a report of one rank
+//! cost no allocation. Those of a report of several ranks cost one list of
+//! the document's columns.
 
 use smg_worker::load::state::LoadSnapshot;
 
@@ -128,10 +134,12 @@ use crate::{
 };
 
 impl InProcess {
-    /// Tells the stages that keep load reports what is new in `newest`, the
-    /// snapshot the task is about to keep at hand: for each worker the
-    /// follow told them as joined, its report where the sample instant is
-    /// not the one told last.
+    /// Tells the stages that keep load reports what is new in `newest`. For
+    /// each worker the follow told them as joined, that is its report
+    /// where the sample instant is not the one told last. `newest` is the
+    /// snapshot the task is about to keep at hand. At one call it is the
+    /// one at hand already. An upkeep tells that one where the upkeep
+    /// before it owed a whole read of the registry and did not make it.
     ///
     /// An engine with no such stage returns at once. Else the registry's
     /// ready words are heard first ([`Self::follow_so_far`]), and nothing
@@ -170,10 +178,11 @@ impl InProcess {
     /// as a stage is told it, where its sample instant is not the one told
     /// last of the worker: one look-up, and one conversion of a report that
     /// is new. The instant counts as told from here on. Its named values
-    /// are written into `cells` where a stage of the document keeps a
-    /// signal's column, and nothing is converted for them elsewhere. A
-    /// conversion that panics is held and counted
-    /// ([`Self::upkeep_faults`]), and its report is told to no stage.
+    /// are written into `cells` where a stage that keeps reports keeps a
+    /// signal's column too ([`InForce::keepers_read_signals`]), and nothing
+    /// is converted for them elsewhere. A conversion that panics is held
+    /// and counted ([`Self::upkeep_faults`]), and its report is told to no
+    /// stage.
     fn new_report<'c>(
         &self,
         document: &InForce,
@@ -189,7 +198,7 @@ impl InProcess {
         self.held(move || {
             let clock = &self.clock;
             let (row, sampled_at_micros) = stated_report(report, sampled_at, worker.role, clock);
-            let signals = if document.signals {
+            let signals = if document.keepers_read_signals {
                 let columns = document.spec.signal_columns();
                 stated_signals(report, sampled_at, worker.ranks, columns, clock, cells)
             } else {

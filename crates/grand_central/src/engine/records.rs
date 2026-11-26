@@ -479,8 +479,8 @@ pub(super) fn stated_report(
 }
 
 /// A report's named values as a record states them, written into the row
-/// of `cells` at `position`, and whether a named value is read of the
-/// report at all. They are made by the crate's one conversion
+/// of `cells` at `position`, and whether the report is the whole of its
+/// worker object. They are made by the crate's one conversion
 /// ([`signal_values`]) under `columns`, the document's, and written where
 /// a decision may read them ([`SignalCells::write`]): under the signal's
 /// own unit and in range, each sample instant on `clock`. A report that

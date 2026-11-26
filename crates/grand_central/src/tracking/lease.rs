@@ -419,12 +419,13 @@ pub enum Signal<'a> {
         /// sample instant on the clock of `sampled_at_micros`. They are
         /// lent for the call that tells the word
         /// ([`Lifecycle::on_signal`](crate::stages::Lifecycle::on_signal)).
-        /// In-process only: no wire carries them, and a plugin is told
-        /// the row alone. None ([`ReportSignals::NONE`]) from a host that
-        /// states none, as the policy store does. The in-process engine
-        /// states them under a document a stage of which keeps a signal's
-        /// column, as its lists' cells state them, and none of a report
-        /// that is not the whole of its worker object.
+        /// In-process only: no plugin's wire carries them, and a plugin is
+        /// told the row alone. None ([`ReportSignals::NONE`]) from a host
+        /// that states none, as the policy store does. The in-process
+        /// engine states them under a document in which a stage that keeps
+        /// reports keeps a signal's column, as its lists' cells state them.
+        /// It states none of a report that is not the whole of its worker
+        /// object.
         signals: ReportSignals<'a>,
     },
     #[non_exhaustive]

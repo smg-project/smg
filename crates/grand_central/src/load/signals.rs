@@ -21,8 +21,9 @@
 //! decision holds.
 //!
 //! A stage that keeps a number of each load report is told a report's
-//! named values with the report ([`ReportSignals`]), and reads one by the
-//! column it holds ([`SignalColumn::told`]): the same index, and no age.
+//! named values with the report, where its host states them
+//! ([`ReportSignals`]). It reads one by the column it holds
+//! ([`SignalColumn::told`]): the same index, and no age.
 
 #![expect(
     clippy::exhaustive_structs,
@@ -234,9 +235,10 @@ pub struct ReportSignals<'a>(&'a [SignalCell]);
 
 impl<'a> ReportSignals<'a> {
     /// No named value: every column reads none. A report states it under
-    /// a document none of whose stages keeps a signal's column, and so
-    /// does a report that is not the whole of its worker object. A host
-    /// that states no named value tells every report with it.
+    /// a document in which no stage that keeps reports keeps a signal's
+    /// column. So does a report that is not the whole of its worker
+    /// object. A host that states no named value tells every report with
+    /// it.
     pub const NONE: Self = Self(&[]);
 
     /// The values in `cells`: one cell a signal the document declares, in
@@ -566,7 +568,7 @@ mod tests {
     }
 
     /// A told report's value is read by its column, with its own sample
-    /// instant and at any age: the third signal ends a millisecond old at
+    /// instant and at any age. The third signal ends past a millisecond at
     /// a decision, whose read of the same cells passes the value over. A
     /// cell with no value reads none. So does a column past the report's
     /// cells, as every column is under a report that states no value.
@@ -590,6 +592,8 @@ mod tests {
         assert_eq!(column(2).among(&cells, 0), Some(-0.5));
         let ages = [column(0), column(2)].map(|column| column.max_age_micros());
         assert_eq!(ages, [None, Some(1_000)], "as the document declares");
+        let longer = SignalColumn::new("held", "tokens", 0, Some(2_500));
+        assert_eq!(longer.max_age_micros(), Some(2_500_000), "each its own");
         assert_eq!(told(3, stated), None, "past the report's cells");
         assert_eq!(told(u16::MAX, stated), None);
         for at in 0..3 {

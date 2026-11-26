@@ -116,7 +116,8 @@ pub trait Lifecycle: Send + Sync {
     /// A signal about one worker: a load row, a health change or a
     /// gateway's veto. A load row lends its report's named values for
     /// this call alone ([`Signal::Load`]): a stage copies out what it
-    /// keeps, and a cell is `Copy`. The word does not outlive the call.
+    /// keeps, and a cell is `Copy`. The values it was lent end with the
+    /// call.
     fn on_signal(&self, _signal: &Signal<'_>) {}
 
     /// Whether the stage keeps a number of each rank's report, which a host

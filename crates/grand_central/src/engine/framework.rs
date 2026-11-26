@@ -9325,6 +9325,27 @@ impl Engine {
         }
     }
 
+    /// Whether a stage that keeps the reports ([`Lifecycle::keeps_loads`])
+    /// keeps a signal's column too ([`Needs::signal_cells`]). Such a stage
+    /// reads a told report's named values by its column. A host states the
+    /// values of a report it tells under this word: every stage that keeps
+    /// reports is told them, or none is. It converts none under an engine
+    /// that answers no. It asks once, where it makes its value of the
+    /// document.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn keepers_read_signals(&self) -> bool {
+        self.keepers.iter().any(|keeper| match *keeper {
+            Keeper::Scorer { profile, stage } => {
+                let scorer = &self.profiles[usize::from(profile)].scorers[usize::from(stage)];
+                scorer.scorer.needs().signal_cells
+            }
+            Keeper::Picker { profile } => {
+                let picker = &self.profiles[usize::from(profile)].picker;
+                picker.needs().signal_cells
+            }
+        })
+    }
+
     /// The stages' part of a change of membership
     /// ([`Lifecycle::on_membership`]): the tallies of sends and each
     /// profile's scorers and its picker hear it, and the session table does

@@ -99,6 +99,13 @@ pub(in crate::engine) struct InForce {
     /// facts ([`super::signals::decide`]), and any other document pays one
     /// test of this word.
     pub(super) signals: bool,
+    /// Whether a stage of the document that keeps load reports keeps a
+    /// signal's column too ([`Engine::keepers_read_signals`]), read once,
+    /// here. Under such a document a report the task tells states its
+    /// named values ([`InProcess::tell_loads`]). Under any other none is
+    /// converted for a telling: a column held by a stage that keeps no
+    /// report is read at decisions alone.
+    pub(super) keepers_read_signals: bool,
     /// Whether a decision under the document reads the load snapshot the
     /// engine's task keeps at hand: a stage of it reads a load report
     /// ([`Needs::loads`](crate::document::spec::Needs::loads)) or a named
@@ -149,6 +156,7 @@ impl InForce {
             leases_or_samples: hears.intersects(EventSet::LEASE) || samples,
             labels: labels::of(&spec),
             signals: needs.signal_cells,
+            keepers_read_signals: engine.keepers_read_signals(),
             reads_loads: needs.loads || needs.signal_cells,
             any_shadow,
             samples,
