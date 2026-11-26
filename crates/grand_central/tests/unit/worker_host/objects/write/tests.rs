@@ -265,7 +265,12 @@ fn a_row_in_place_keeps_the_tables_status_and_a_next_life_takes_its_rows() {
         ..row
     });
     let now = Instant::now();
-    let (change, next) = facts(2, "gold").laid_over(standing.as_ref(), Registrant::Control, now);
+    let (change, next) = WorkerRow::laid_over(
+        facts(2, "gold"),
+        standing.as_ref(),
+        Registrant::Control,
+        now,
+    );
     assert_eq!(next.status, WorkerStatus::Pending, "as the holder read it");
     assert!(store.follow_objects(change, Some(next), Some(2)));
     assert_eq!(status(A), Some(WorkerStatus::Pending));
@@ -308,7 +313,7 @@ fn a_row_with_no_object_is_laid_where_its_registration_is_refused() {
     let replica = Replica::new();
     let (store, objects) = (&replica.store, &replica.objects);
     let now = Instant::now();
-    let (change, row) = facts(1, "gold").laid_over(None, Registrant::Control, now);
+    let (change, row) = WorkerRow::laid_over(facts(1, "gold"), None, Registrant::Control, now);
     assert!(store.follow_objects(change, Some(row.clone()), None));
     let id = change.id();
     let patch = WorkerPatch {
@@ -347,7 +352,7 @@ fn a_write_over_a_row_another_writer_moved_is_refused_and_reads_it() {
     /// A registration of `next` decided over the row `read`.
     fn lay(replica: &Replica, next: WorkerFacts, read: &WorkerRow) -> Option<MembershipChange> {
         let now = Instant::now();
-        let (change, row) = next.laid_over(Some(read), Registrant::Control, now);
+        let (change, row) = WorkerRow::laid_over(next, Some(read), Registrant::Control, now);
         let seen = Some(read.revision);
         replica
             .objects
@@ -471,7 +476,7 @@ fn a_refused_write_reads_the_row_under_its_own_key_alone() {
     };
     let now = Instant::now();
     for key in [A, B, C] {
-        let (change, row) = keyed(key).laid_over(None, Registrant::Control, now);
+        let (change, row) = WorkerRow::laid_over(keyed(key), None, Registrant::Control, now);
         assert!(store.follow_objects(change, Some(row), None));
     }
     assert_eq!(replica.upsert(facts(1, "iron")), None, "refused once");
