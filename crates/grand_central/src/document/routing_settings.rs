@@ -3688,6 +3688,17 @@ mod tests {
         assert_eq!(index_of(&document, "m"), of_label);
         assert_eq!(index_of(&document, "n"), index_of(&own, "n"));
 
+        // A pair's side at a size of its own writes a `*` of another value.
+        // The label's entry stands beside it, and each model reads its own.
+        let sized = indexed(Some(cache_aware(0.3, 64, 1.5, 60, 1024)), None);
+        let own = sized.policy_document().expect("the settings' document");
+        let star = own.index.get("*").cloned().expect("a `*` of the settings");
+        assert_ne!(star, of_label, "the pair's side names another");
+        let document = with_labels(&sized, &[("m", "cache_aware")]).expect("beside a `*`");
+        assert_eq!(document.index.get("*"), Some(&star));
+        assert_eq!(document.index.get("m"), Some(&of_label));
+        assert_eq!(index_of(&document, "n"), star);
+
         let same = indexed(as_a_label(), None);
         let own = same.policy_document().expect("the settings' document");
         assert_eq!(
@@ -3981,10 +3992,9 @@ mod tests {
     /// settings that set nothing, `manual` alone changes the view, by its
     /// header. `cache_aware` alone writes the index block: its model's own
     /// entry, at the size and sweep a label builds it with. No label writes
-    /// a signal. Under
-    /// the sticky override beside a main policy of the hash ring, whose
-    /// binding lists no header, a label the override places adds the
-    /// override's headers to the view.
+    /// a signal. Under the sticky override beside a main policy of the hash
+    /// ring, whose binding lists no header, a label the override places adds
+    /// the override's headers to the view.
     #[test]
     fn a_label_changes_the_view_for_its_headers_alone() {
         let mut changed = Vec::new();
