@@ -1014,5 +1014,5 @@ impl Following<'_> {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/service/controller/generations/tests.rs"]
+#[path = "../../../tests/unit/service/controller/generations/tests/mod.rs"]
 pub(crate) mod tests;
