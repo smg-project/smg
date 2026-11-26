@@ -267,11 +267,20 @@ The mode and the gateway decide what the document binds:
 | one router | prefill-decode, over HTTP | two profiles under one pair binding, over the prefill and decode phases; behind it, the main policy's profile, bound to every other request |
 | one router | prefill-decode, over gRPC or ZMQ | the pair binding alone |
 | one router | encode-prefill-decode | three profiles under one binding of the `epd` plan, and no single request |
-| many routers | single workers, or prefill-decode | the pair binding and, behind it, the main policy's profile for every other request; under `manual` with single workers, its one profile alone |
+| many routers | single workers, or prefill-decode | three profiles under one binding of the `epd` plan, over the encode, prefill and decode phases, the encode side under `consistent_hashing`; behind it, the main policy's profile for every other request; under `manual` with single workers, its one profile alone |
 | many routers | encode-prefill-decode | three profiles under one binding of the `epd` plan, over the encode, prefill and decode phases; behind it, the main policy's profile, bound to every other request |
 
 A gateway of many routers serves pairs and single workers, however it reaches them, so its
-document binds both. In a gateway of one router the second binding of a prefill-decode mode is
+document binds both. It also mounts its three-sided router in every mode, and a model with an
+encode pool goes to it, so the first binding plans an encode side beside the pair's two. Where
+that plan of three sides has no document, the settings say what they said before it, and an
+encode request meets no binding with an encode side. Two settings do so until each has a
+document under the `epd` plan. Under the manual policy on a pair's two sides the pair binding
+stands as it did. Under the sticky override, for a policy the override places, the gateway is
+refused by the setting's name as it was. A document of three sides the controller's check
+refuses is not taken either, and the pair binding stands.
+
+In a gateway of one router the second binding of a prefill-decode mode is
 there for one request, the token count. Over HTTP the gateway still places it as a single request,
 on one prefill worker, and classic places it by the model's policy, which is the main policy
 unless a worker's label names another (below). Over gRPC or ZMQ the mode counts

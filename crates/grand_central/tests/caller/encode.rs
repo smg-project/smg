@@ -38,7 +38,7 @@ use tokio::time::sleep;
 
 use crate::{
     pair::{self, decode, prefill, sends, typed, PLAIN},
-    program::{encode_settings, settings, Answer, Asked, Plan},
+    program::{encode_settings, pair_settings, settings, Answer, Asked, Plan},
     served,
     single::{taken, Heard, Hears},
     started_as, under, under_encode, under_pairs, url, workers, MODEL,
@@ -135,6 +135,88 @@ fn a_request_with_no_item_is_placed_as_its_pair() {
             "over {encoders} encoders"
         );
     }
+}
+
+/// A gateway of many routers mounts its three-sided router in every mode,
+/// so its settings plan an encode side under the regular mode and under a
+/// pair mode as well. An item then goes to its encoder ahead of its pair,
+/// as it does under the encode mode, and a request with no item is placed
+/// as its pair.
+///
+/// Where the plan of three sides has no document the settings say the
+/// pair's plan, as under the manual policy on a pair's two sides. The
+/// engine then names no worker for a request that carries an item, under
+/// the binding's name.
+///
+/// The classic gateway builds that router in every mode of many routers,
+/// its encode side under `consistent_hashing` where the mode names no
+/// encode policy (`model_gateway/src/routers/factory.rs:207-218`, `:246`,
+/// `:289-292`).
+#[test]
+fn many_routers_place_an_item_in_every_mode_that_plans_three_sides() {
+    let keys = [Identity::plain("item-a")];
+    let many_routers = |one_router: RoutingSettings| RoutingSettings {
+        enable_igw: true,
+        ..one_router
+    };
+    // The program routes to pairs behind encoders whatever mode the
+    // settings name, as such a gateway's three-sided router does.
+    let started = |said: &RoutingSettings, fleet: &[Arc<dyn Worker>]| {
+        let document = said.policy_document();
+        let document = document.expect("the settings have a document");
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        started_as(Plan::Encode, spec, fleet, served)
+    };
+    for one_router in [
+        settings(PolicySettings::RoundRobin),
+        pair_settings(PolicySettings::RoundRobin),
+    ] {
+        let mode = format!("{:?}", one_router.mode);
+        let fleet = fleet(1, 1, 1);
+        let (program, _loads, _task) = started(&many_routers(one_router), &fleet);
+        assert_eq!(
+            program.serve(&carrying(&keys)),
+            Answer {
+                sent: vec![encoder(0), prefill(0), decode(0)],
+                status: 200,
+                unplaced: None,
+            },
+            "{mode}"
+        );
+        assert_eq!(
+            program.serve(&PLAIN),
+            Answer {
+                sent: vec![prefill(0), decode(0)],
+                status: 200,
+                unplaced: None,
+            },
+            "{mode}"
+        );
+    }
+
+    let manual = || PolicySettings::of_label("manual");
+    let fallen = many_routers(RoutingSettings {
+        mode: ModeSettings::PrefillDecode {
+            prefill_policy: manual(),
+            decode_policy: manual(),
+        },
+        ..settings(PolicySettings::RoundRobin)
+    });
+    let fleet = fleet(1, 1, 1);
+    let (program, _loads, _task) = started(&fallen, &fleet);
+    let answer = program.serve(&carrying(&keys));
+    assert!(answer.sent.is_empty(), "{answer:?}");
+    assert!(
+        matches!(
+            answer.unplaced,
+            Some(Unplaced::Shed {
+                reason: ShedReason::PolicyDeclined,
+                emptied_by: "binding",
+                ..
+            })
+        ),
+        "{answer:?}"
+    );
 }
 
 /// An encoder that cannot be sent to takes no item: the item goes to another
