@@ -11,6 +11,11 @@
 //! where the record is declared, by the crate's lint, by an example in its
 //! own doc where a literal of it must fail to build, or by review alone
 //! where its module still expects the lint.
+//!
+//! The records a policy document states have a file of their own,
+//! `growing_types_cases/document.rs`. A document alone states ten of them:
+//! their cases read one from a document's text, the one road a crate
+//! outside this one has to it.
 
 #![deny(unreachable_patterns)]
 
@@ -36,6 +41,9 @@ use smg_grand_central::{
     store::{pairing::PairingDescriptor, EncodeHandoff, EncodeOffer, Position},
     tracking::{EventKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
 };
+
+#[path = "growing_types_cases/document.rs"]
+mod document;
 
 /// What a match outside the crate answers for a case the crate adds later.
 const ANOTHER: &str = "another";

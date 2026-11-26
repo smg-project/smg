@@ -774,11 +774,10 @@ mod tests {
 
     /// A binding's `overload` block that says `enabled` and `shed`.
     fn block(enabled: bool, shed: bool) -> OverloadSpec {
-        OverloadSpec {
-            enabled,
-            shed_when_all_vetoed: shed,
-            ..OverloadSpec::default()
-        }
+        let mut overload = OverloadSpec::default();
+        overload.enabled = enabled;
+        overload.shed_when_all_vetoed = shed;
+        overload
     }
 
     /// The stock document with one binding for each of `blocks`, under that

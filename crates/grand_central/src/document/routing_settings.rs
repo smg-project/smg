@@ -2,11 +2,6 @@
 //! the types it is made of, and why some settings have no document
 //! ([`RoutingSettingsError`]).
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 mod translation;
 
 use std::collections::BTreeMap;
@@ -150,7 +145,15 @@ use crate::{
 /// which need not be that key, so the pin is refused beside one. The copy
 /// of the cache boundaries at the top of the configuration decides nothing
 /// either: each policy reads its own.
+///
+/// The record is closed: a gateway names every setting, so a setting that
+/// joins stops its build until the gateway states it. Left out by silence, it
+/// would decide by this crate's default with no word.
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "closed by its doc: a gateway names every setting, and a new one must stop its build"
+)]
 pub struct RoutingSettings {
     /// The kinds of worker the gateway routes to, with each side's own policy.
     pub mode: ModeSettings,
@@ -270,7 +273,14 @@ pub enum ConnectionModeSetting {
 }
 
 /// The settings of the sticky override this module reads.
+///
+/// The record is closed, as the settings that hold it are: a gateway names
+/// each of its fields, and one that joins stops its build.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "closed by its doc: a gateway names every setting, and a new one must stop its build"
+)]
 pub struct RoutingKeyOverrideSettings {
     /// A request that carries a sticky key is placed by the sticky sessions'
     /// rule, whatever the policy.

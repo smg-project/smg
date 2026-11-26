@@ -14,11 +14,23 @@
 //! by name as not in this build, so a document written against the published
 //! schema validates the day its stage lands. [`PolicySpec::schema`] is that
 //! schema; the field documentation of this module is its descriptions.
-
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
+//!
+//! A Rust caller outside this crate writes no literal of a record of this
+//! module: the records gain fields, and a pattern of one ends with `..`. No
+//! record's own doc says so, because that doc is the record's description in
+//! the published schema. How such a caller comes to nineteen of them:
+//!
+//! - Ten are stated by a document alone: [`ResidentWorkParams`],
+//!   [`LeastCostParams`], [`BestParams`], [`BestWithTemperatureParams`],
+//!   [`HasRoomParams`], [`Bounds`], [`HeaderMatch`], [`SessionsSpec`],
+//!   [`CanarySpec`] and [`SignalSpec`]. Code outside this crate reads one
+//!   from a document's text and builds none. A start comes the day a caller
+//!   needs one.
+//! - Seven start from their `Default`, and the caller assigns what it states
+//!   otherwise: [`IndexSpec`], [`BucketParams`], [`CostMargin`], [`Match`],
+//!   [`OverloadSpec`], [`KeySourceSpec`] and [`BindingSpec`].
+//! - Two start from a call that takes the one field a document must write:
+//!   [`ProfileSpec::of`] and [`RoutingKeySpec::of`].
 
 use std::{
     borrow::Cow,
@@ -573,6 +585,7 @@ pub enum IndexKind {
 /// [`PolicySpec::index_for`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct IndexSpec {
     pub kind: IndexKind,
     /// How long a hash-index placement stays routable, in seconds.
@@ -900,6 +913,7 @@ impl Default for WarmupSliceParams {
 /// more than a factor of two since the last cut or the listing changed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BucketParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -1003,6 +1017,7 @@ impl Default for ConsistentHashParams {
 /// and a price in tokens for every request it holds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ResidentWorkParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -1022,6 +1037,7 @@ const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
 /// in the document's units. Lower cost scores higher.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct LeastCostParams {
     /// The scorer's weight in the profile's combined score.
     #[serde(default = "one")]
@@ -1122,6 +1138,7 @@ impl From<Unreported> for UnreportedEntry {
 /// The sum of the absolute and relative margins. Both default to zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct CostMargin {
     /// In cost units.
     #[schemars(extend("minimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
@@ -1197,6 +1214,7 @@ impl JsonSchema for AbsoluteOrParts {
 /// The `best` picker's parameters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BestParams {
     /// How many rows the picker draws where the host names the request's
     /// holders and the pool's warming rows: a pool of more than twice this
@@ -1209,6 +1227,7 @@ pub struct BestParams {
 /// The `best-with-temperature` picker's parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BestWithTemperatureParams {
     /// The softmax temperature over the combined scores; at or above zero,
     /// 0 picks the best.
@@ -1350,6 +1369,7 @@ impl FilterStage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[serde(expecting = "a rule with `used` and `capacity`, or the bare name `has-room`")]
+#[non_exhaustive]
 pub struct HasRoomParams {
     /// What a worker holds: field names and their coefficients, summed. At
     /// least one is required. A name written `signal.<name>` reads a signal
@@ -2110,6 +2130,7 @@ impl JsonSchema for PickSpec {
 /// picker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ProfileSpec {
     /// The hard filters, in order: each a name, or the name of a filter the
     /// catalog adds mapped to its parameters. Which workers the hard
@@ -2149,10 +2170,32 @@ pub struct ProfileSpec {
     pub sent_report_delay_ms: Option<u32>,
 }
 
+impl ProfileSpec {
+    /// A profile of `pick` alone: what a document that writes its picker and
+    /// nothing else gives. It takes the one field a document must write.
+    /// The filters and the scorers start empty and the two limits of a send
+    /// unset, each as the field's own read leaves it where a document
+    /// leaves it out. It checks nothing: a document's validation does. Code
+    /// outside this crate starts here and assigns what it states otherwise:
+    /// the record gains fields, so no literal of it builds there, and a
+    /// pattern of it ends with `..`.
+    #[must_use]
+    pub const fn of(pick: PickSpec) -> Self {
+        Self {
+            filter: Vec::new(),
+            score: Vec::new(),
+            pick,
+            sent_ttl_ms: None,
+            sent_report_delay_ms: None,
+        }
+    }
+}
+
 /// A closed range with one or both bounds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(rename = "Bounds_for_{T}")]
+#[non_exhaustive]
 pub struct Bounds<T> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<T>,
@@ -2164,6 +2207,7 @@ pub struct Bounds<T> {
 /// values.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct HeaderMatch {
     /// The header's name, lowercase, listed in `view.headers`.
     pub name: String,
@@ -2175,6 +2219,7 @@ pub struct HeaderMatch {
 /// What a binding matches on. Bindings are ordered; the first match wins.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct Match {
     /// The model id after aliasing: an exact id, `prefix*`, `*suffix` or
     /// `*`.
@@ -2242,6 +2287,7 @@ pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 /// does.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct OverloadSpec {
     /// Whether the host's thresholds veto at all (a worker's own block still
     /// does).
@@ -2392,6 +2438,7 @@ pub enum RulePlaced {
 /// key was first placed on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SessionsSpec {
     /// The header whose value is the session key; listed in `view.headers`.
     /// Left out where the binding names its key's sources under
@@ -2470,6 +2517,7 @@ fn default_inflight_cap() -> u16 {
 /// enters a view, so the list is not held to `view.headers`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct RoutingKeySpec {
     /// The sources, read in order: one to eight, each named once, with up
     /// to four client sources and one target source beside them.
@@ -2482,9 +2530,27 @@ pub struct RoutingKeySpec {
     pub strip_lineage: bool,
 }
 
+impl RoutingKeySpec {
+    /// A routing key read from `sources` alone: what a document that writes
+    /// its sources and nothing else gives. It takes the one field a document
+    /// must write. `strip_lineage` starts false, as the field's own read
+    /// leaves it where a document leaves it out. It checks nothing: a
+    /// document's validation does. Code outside this crate starts here and
+    /// assigns what it states otherwise: the record gains fields, so no
+    /// literal of it builds there, and a pattern of it ends with `..`.
+    #[must_use]
+    pub const fn of(sources: Vec<KeySourceSpec>) -> Self {
+        Self {
+            sources,
+            strip_lineage: false,
+        }
+    }
+}
+
 /// One source of a routing key: exactly one of `header` and `rid`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct KeySourceSpec {
     /// A request header, lowercase. A credential header is refused, as on
     /// `view.headers`; `cookie` is not. A key from a header `view.headers`
@@ -2545,6 +2611,7 @@ pub struct KeySourceSpec {
 /// `tenants` and `header` chooses the share.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CanarySpec {
     /// The profile deciding the canary's share.
     pub profile: String,
@@ -2672,6 +2739,7 @@ impl<'de> Deserialize<'de> for ShadowSpec {
 /// and the rules around the decision.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
 pub struct BindingSpec {
     #[serde(rename = "match")]
     pub matcher: Match,
@@ -2740,6 +2808,7 @@ pub struct ExplainSpec {
 /// document's stages read beside the rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SignalSpec {
     /// The unit a source states for its value to be taken: 1 to 31 ASCII
     /// characters with no space. It is compared byte for byte with the

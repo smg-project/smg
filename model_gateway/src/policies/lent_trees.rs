@@ -529,11 +529,10 @@ mod tests {
     /// An `index` entry of `max_size` tokens trimmed every `sweep_s`
     /// seconds.
     fn entry(max_size: u64, sweep_s: u32) -> IndexSpec {
-        IndexSpec {
-            max_size,
-            sweep_s,
-            ..IndexSpec::default()
-        }
+        let mut index = IndexSpec::default();
+        index.max_size = max_size;
+        index.sweep_s = sweep_s;
+        index
     }
 
     /// Whether each of `model`'s two trees holds a prompt for `workers` and
