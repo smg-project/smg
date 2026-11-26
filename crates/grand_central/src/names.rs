@@ -12,8 +12,10 @@ use std::{
 /// same name reuses the allocation.
 pub(crate) fn intern(name: &str) -> &'static str {
     static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    // The cases' count of calls stays here, since only this function sees
+    // every call: a case reads it to show that a placement asks for no name.
     #[cfg(test)]
-    ASKED.with(|asked| asked.set(asked.get() + 1));
+    tests::ASKED.with(|asked| asked.set(asked.get() + 1));
     let names = NAMES.get_or_init(|| Mutex::new(HashSet::new()));
     let mut guard = names
         .lock()
@@ -27,13 +29,5 @@ pub(crate) fn intern(name: &str) -> &'static str {
 }
 
 #[cfg(test)]
-thread_local! {
-    /// How many names this thread asked [`intern`] for: a case reads it
-    /// around a call to show that the call takes no name from the table,
-    /// and so not the table's lock.
-    pub(crate) static ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
 #[path = "../tests/unit/names/tests.rs"]
-mod tests;
+pub(crate) mod tests;

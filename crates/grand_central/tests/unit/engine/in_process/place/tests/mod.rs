@@ -1216,7 +1216,9 @@ fn a_placement_names_the_profile_that_picked_by_its_label() {
 /// engine made at its start. A place's placement, and a whole decision's.
 #[test]
 fn placing_a_request_asks_the_table_of_names_for_nothing() {
-    let asked = || crate::names::ASKED.with(Cell::get);
+    use crate::names::tests::ASKED;
+
+    let asked = || ASKED.with(Cell::get);
     for name in ["round_robin", "power_of_two"] {
         let engine = hosted(preset(name));
         let list = pool(4);
