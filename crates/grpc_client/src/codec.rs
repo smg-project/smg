@@ -12,14 +12,18 @@
 //! length for its prefix, the packed field's length for its prefix, then the
 //! varints a byte at a time), about nine instructions per id per walk. Here
 //! the request id, the prompt text and the ids are taken out of the owned
-//! request. The ids get one length walk and one tight pass into a per-thread
+//! request. One walk of the ids tells whether any is wider than three bytes
+//! (none is in a vocabulary under 2^21): if none is, each id is one
+//! four-byte write, else the list gets one length walk and one tight pass.
+//! Either way the bytes go into a per-thread
 //! scratch. The writer puts the request id and the prompt's text and ids in
 //! prost's field order into a buffer reserved to the frame's length (one
 //! walk of the few other fields gives it), the text copied once, straight
 //! from the request; prost writes the prompt message's other fields (none
 //! on most wires) and then the request's behind them, straight into the
 //! buffer. The frame is byte for byte prost's. The scratch holds the packed
-//! ids alone and keeps the size of the largest prompt it packed, up to a
+//! ids alone and keeps the room of the largest prompt it packed (three bytes
+//! an id and one, where none was wider than three), up to a
 //! cap; neither the text nor any other field (a structured-output
 //! constraint may be many kilobytes) passes through it. A
 //! request with media never reaches the writer: its one entry refuses it by
@@ -177,8 +181,9 @@ impl ReserveBuf for BytesMut {
 }
 
 thread_local! {
-    /// The one-pass writer's scratch: the ids' varint bytes, kept per thread at
-    /// the size of the largest prompt it packed, up to [`SCRATCH_CAP`]. Nothing
+    /// The one-pass writer's scratch: the ids' varint bytes, kept per thread
+    /// with the room of the largest prompt it packed (three bytes an id and
+    /// one, where none was wider than three), up to [`SCRATCH_CAP`]. Nothing
     /// else of a request enters it: the writer copies the prompt text from the
     /// request into the frame, and prost writes every other field there.
     static PACKED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -206,8 +211,32 @@ fn string_field_len(tag: u32, value: &str) -> usize {
     }
 }
 
-/// The ids' packed bytes: one walk for the length, one pass for the bytes.
+/// The ids' packed bytes. No id of a vocabulary under 2^21 is wider than
+/// three bytes: each is then one four-byte write with no branch on its
+/// width, into three bytes an id and one to spare, cut to what was written.
+/// A list with a wider id takes one walk for the length and one pass for the
+/// bytes.
 fn pack_ids(ids: &[u32], packed: &mut Vec<u8>) {
+    if ids.iter().fold(0, |all, &id| all | id) < 1 << 21 {
+        let room = ids.len() * 3 + 1;
+        packed.clear();
+        packed.resize(room, 0);
+        let mut out = packed.as_mut_slice();
+        for &id in ids {
+            let width = 1 + usize::from(id >= 1 << 7) + usize::from(id >= 1 << 14);
+            // Seven bits a byte: the bits past the first seven move up by
+            // one, then those past the first fifteen.
+            let spread = id + (id & !0x7f);
+            let spread = spread + (spread & !0x7fff);
+            // The continuation bits by width.
+            let word = spread | [0, 0, 0x80, 0x8080][width];
+            out[..4].copy_from_slice(&word.to_le_bytes());
+            out = &mut std::mem::take(&mut out)[width..];
+        }
+        let spare = out.len();
+        packed.truncate(room - spare);
+        return;
+    }
     let len: usize = ids
         .iter()
         .map(|&id| encoded_len_varint(u64::from(id)))
@@ -266,7 +295,8 @@ fn put_ids(tag: u32, packed: &[u8], buf: &mut impl BufMut) {
 /// remainder behind them, straight into the buffer. Inside the prompt
 /// message the text and the ids come in tag order, then the message's other
 /// fields, which prost writes in place as well. The bytes are prost's own;
-/// the ids cost one length walk and one write instead of three walks and a
+/// the ids cost one walk and one pass of writes (one walk more where an id
+/// is wider than three bytes) instead of three walks and a
 /// byte at a time; the text and every other field are each copied once, into
 /// the frame. The scratch keeps its size for the next request, up to
 /// [`SCRATCH_CAP`].
@@ -817,6 +847,57 @@ mod tests {
         assert_eq!(decoded.len(), frames);
     }
 
+    /// The cost of packing a prompt's ids, for the Numbers table: `PACK_LOOPS`
+    /// calls (100 by default) of [`pack_ids`] on `PACK_IDS` ids (3,500) of
+    /// the widths `PACK_MIX` names: `two` or `three` bytes an id, `four` or
+    /// five, `text` (3 ids in 100 of one byte, 68 of two, 29 of three, in a
+    /// drawn order) or `wide` (the text mix with one id in 100 of four or
+    /// five bytes); run with `--ignored` under a counter, at two loop counts.
+    #[test]
+    #[ignore = "a cost, not a check"]
+    fn cost_per_packed_id() {
+        let number = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(default)
+        };
+        let mix = std::env::var("PACK_MIX").unwrap_or_else(|_| "text".to_string());
+        assert!(
+            ["two", "three", "four", "text", "wide"].contains(&mix.as_str()),
+            "PACK_MIX names no mix: {mix}"
+        );
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut draw = |low: u32, high: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            low + (state >> 33) as u32 % (high - low)
+        };
+        let ids: Vec<u32> = (0..number("PACK_IDS", 3_500))
+            .map(|_| match (mix.as_str(), draw(0, 100)) {
+                ("two", _) => draw(1 << 7, 1 << 14),
+                ("three", _) => draw(1 << 14, 150_000),
+                ("four", _) | ("wide", 99) => draw(1 << 21, u32::MAX),
+                (_, 0..=2) => draw(0, 1 << 7),
+                (_, 3..=70) => draw(1 << 7, 1 << 14),
+                _ => draw(1 << 14, 150_000),
+            })
+            .collect();
+        let loops = number("PACK_LOOPS", 100);
+        let mut packed = Vec::new();
+        let mut bytes = 0;
+        for _ in 0..loops {
+            pack_ids(std::hint::black_box(&ids), &mut packed);
+            bytes += std::hint::black_box(&packed).len();
+        }
+        let len: usize = ids
+            .iter()
+            .map(|&id| encoded_len_varint(u64::from(id)))
+            .sum();
+        assert_eq!(bytes, len * loops);
+    }
+
     /// What tonic puts on the wire for one message through `codec`: the data
     /// frames of the client request body it builds, in order.
     fn wire_bytes<C, T>(codec: C, message: T) -> Vec<u8>
@@ -1143,6 +1224,19 @@ mod tests {
         });
     }
 
+    /// Every id that takes the four-byte write, on one wire.
+    #[test]
+    fn every_id_under_two_to_the_21_frames_as_prosts_bytes() {
+        frames_as_prost_does(tokenspeed_proto::GenerateRequest {
+            request_id: "r".to_string(),
+            tokenized: Some(tokenspeed_proto::TokenizedInput {
+                input_ids: (0..1 << 21).rev().collect(),
+                original_text: "two words".to_string(),
+            }),
+            ..Default::default()
+        });
+    }
+
     /// The ids' varints across every byte width, and an empty id list, frame
     /// as prost's bytes on every wire that carries a prompt, behind a request
     /// id and a prompt text on each.
@@ -1160,7 +1254,13 @@ mod tests {
             2_097_152,
             u32::MAX,
         ];
-        for ids in [widths, Vec::new()] {
+        // Without its two wide ids the list takes the four-byte writes.
+        let narrow = widths[..8].to_vec();
+        // The widest id that takes them, alone: its write ends on the
+        // scratch's spare byte. The next id up, alone, takes the walks.
+        let widest_narrow = vec![2_097_151];
+        let narrowest_wide = vec![2_097_152];
+        for ids in [widest_narrow, widths, narrow, narrowest_wide, Vec::new()] {
             frames_as_prost_does(tokenspeed_proto::GenerateRequest {
                 request_id: "r".to_string(),
                 tokenized: Some(tokenspeed_proto::TokenizedInput {
@@ -1422,8 +1522,8 @@ mod tests {
     /// A text-only prompt beyond the scratch cap frames as prost's bytes
     /// through the one-pass writer, and the thread does not keep it: the
     /// outsized ids are released after the write, and the next request, a few
-    /// ids behind a text beyond the cap, leaves the scratch at the size of its
-    /// ids, because the text never enters it.
+    /// ids behind a text beyond the cap, leaves the scratch at the room of its
+    /// ids (three bytes an id and one), because the text never enters it.
     #[test]
     fn a_prompt_beyond_the_scratch_cap_frames_as_prosts_bytes_and_is_not_kept() {
         std::thread::spawn(|| {
@@ -1446,8 +1546,8 @@ mod tests {
             });
             let ids = scratch_capacity();
             assert!(
-                (1..4096).contains(&ids),
-                "the text never enters the scratch, which holds the ids alone: {ids}"
+                (1..=3 * 77 + 1).contains(&ids),
+                "the text never enters the scratch, which holds the ids' room alone: {ids}"
             );
         })
         .join()
