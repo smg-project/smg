@@ -70,7 +70,7 @@ use crate::{
         WorkerFacts, WorkerStatus,
     },
     tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, DISPATCH_TTL},
-    worker_host::{stand, Members, Objects},
+    worker_host::{tests::stand, Members, Objects},
 };
 
 mod encode;

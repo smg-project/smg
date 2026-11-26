@@ -33,7 +33,8 @@ mod tests {
         },
         store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus, WorkersStore},
         worker_host::{
-            HolderDoor, KvFeed, KvTables, Members, MembershipWriter as _, Objects, Precondition,
+            tests::HolderDoor, KvFeed, KvTables, Members, MembershipWriter as _, Objects,
+            Precondition,
         },
     };
 

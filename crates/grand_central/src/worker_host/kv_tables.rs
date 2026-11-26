@@ -670,13 +670,6 @@ impl KvTables {
         self.resyncs[slot(reason)].load(Ordering::Relaxed)
     }
 
-    /// How many rows hold a lane, for the cases: the rows that ask for
-    /// events less these are the rows an index had no place for.
-    #[cfg(test)]
-    pub(super) fn lanes(&self) -> usize {
-        self.table.lock().lanes.len()
-    }
-
     /// Blocks the index holds for the row of `id` at `rank`; `0` for a row
     /// that holds no lane there.
     pub fn indexed_blocks(&self, id: WorkerId, rank: u16) -> usize {
@@ -687,61 +680,5 @@ impl KvTables {
         lane.held
             .as_ref()
             .map_or(0, |held| held.index.chain.worker_block_count(held.worker))
-    }
-
-    /// Whether the row of `id` holds a lane at `rank`, for the cases.
-    #[cfg(test)]
-    pub(crate) fn holds_lane(&self, id: WorkerId, rank: u16) -> bool {
-        self.lane(id, Some(rank)).is_some()
-    }
-
-    /// The rows holding a prefix of the request's blocks in `model`'s
-    /// index, each with the leading blocks it holds, by id: every holder
-    /// listed, for the cases.
-    #[cfg(test)]
-    pub(crate) fn overlaps(&self, model: &str, hashes: &[u64]) -> Vec<(WorkerId, u32)> {
-        let (index, rows) = {
-            let table = self.table.lock();
-            let Some(ModelIndex { index, .. }) = table.indexes.get(model) else {
-                return Vec::new();
-            };
-            let rows: FxHashMap<u32, WorkerId> = table
-                .lanes
-                .iter()
-                .filter(|(_, entry)| &*entry.model == model)
-                .filter_map(|(id, entry)| Some((entry.lane.lock().held.as_ref()?.worker, *id)))
-                .collect();
-            (Arc::clone(index), rows)
-        };
-        let mut held = Vec::new();
-        index.chain.score_into(
-            hashes,
-            |hash| *hash,
-            false,
-            |worker, blocks| {
-                if let Some(id) = rows.get(&worker) {
-                    held.push((*id, blocks));
-                }
-            },
-        );
-        held.sort_unstable();
-        held
-    }
-
-    /// How many models hold an index.
-    #[cfg(test)]
-    pub(super) fn indexes(&self) -> usize {
-        self.table.lock().indexes.len()
-    }
-
-    /// Blocks `model`'s index holds across its workers (a block two hold
-    /// counts twice).
-    #[cfg(test)]
-    pub(super) fn held_blocks(&self, model: &str) -> usize {
-        let table = self.table.lock();
-        table
-            .indexes
-            .get(model)
-            .map_or(0, |held| held.index.chain.current_size())
     }
 }

@@ -62,13 +62,6 @@ mod standby;
 mod status;
 mod write;
 
-#[cfg(test)]
-pub(crate) use status::tests::stand;
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use tests::stored_chain;
-#[cfg(test)]
-pub(crate) use write::tests::lay_standing;
-
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1364,4 +1357,4 @@ impl Objects<Members> {
 
 #[cfg(test)]
 #[path = "../../tests/unit/worker_host/objects/tests.rs"]
-mod tests;
+pub(super) mod tests;

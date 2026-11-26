@@ -28,7 +28,7 @@ use crate::{
     },
     stages::registry,
     store::{WorkerFacts, WorkerStatus, WorkersStore},
-    worker_host::lay_standing,
+    worker_host::tests::lay_standing,
 };
 
 impl Lag {

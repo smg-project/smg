@@ -41,7 +41,7 @@ use crate::{
         Journal, LeasesStore, MembershipChange, MemoryStore, Position, Registrant, StoreCheckpoint,
         WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
-    worker_host::{stand, Members, Objects},
+    worker_host::{tests::stand, Members, Objects},
 };
 
 impl Feed {

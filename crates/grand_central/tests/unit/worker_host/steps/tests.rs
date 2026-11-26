@@ -35,7 +35,7 @@ use crate::{
     worker_host::{
         facts,
         membership_writer::tests::{HolderDoor, StoreDoor},
-        objects::lay_standing,
+        objects::tests::lay_standing,
         Credentials, Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter,
         Objects, Over, Precondition, Remover, RowRevision,
     },

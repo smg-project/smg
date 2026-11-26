@@ -2186,8 +2186,8 @@ mod decided {
         },
         store::{Registrant, WorkerFacts, WorkerStatus, WorkersStore},
         worker_host::{
-            facts, objects::lay_standing, pairing_descriptor, Members, MembershipWriteOutcome,
-            MembershipWriter, Objects, OpenAdmission, Precondition,
+            facts, objects::tests::lay_standing, pairing_descriptor, Members,
+            MembershipWriteOutcome, MembershipWriter, Objects, OpenAdmission, Precondition,
         },
     };
 

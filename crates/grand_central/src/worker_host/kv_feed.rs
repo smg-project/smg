@@ -95,13 +95,6 @@ impl<G: Generation> KvFeed<G> {
         let _ = self.loads.set(Arc::downgrade(monitor));
     }
 
-    /// The collector, for the stock controller's cases of the follow:
-    /// shared, so a case reads it behind the serve that takes the follow.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn collector(&self) -> &Arc<KvEventCollector<KvHost<G>>> {
-        &self.collector
-    }
-
     /// Follow the registry until `stop` reads true, then end every stream.
     ///
     /// A removal runs on a task of its own, so one that is slow holds no
@@ -259,3 +252,7 @@ const fn phase_of(role: Role) -> Phase {
         Role::Encode => Phase::Encode,
     }
 }
+
+#[cfg(all(test, feature = "controller"))]
+#[path = "../../tests/unit/worker_host/kv_feed/tests.rs"]
+mod tests;

@@ -13,13 +13,22 @@ use smg_worker::{
 use super::*;
 use crate::{
     store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkersStore},
-    worker_host::{objects::lay_standing, Members},
+    worker_host::{objects::tests::lay_standing, Members},
 };
 
 const MODEL: &str = "m";
 const URL: &str = "http://a:8000";
 const RANK: u16 = 1;
 const BLOCK_SIZE: u32 = 32;
+
+impl KvAdapter {
+    /// An adapter that writes `tables`, every batch to its stream's row. It
+    /// has no holder to state its rows: the cases that build one state
+    /// theirs to the tables themselves.
+    fn new(tables: Arc<KvTables>) -> Self {
+        Self::over(tables, None)
+    }
+}
 
 /// A store's rows, the tables beside them and an adapter with no
 /// holder: the cases state a row to the tables themselves

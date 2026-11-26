@@ -148,12 +148,6 @@ pub use loads::load_monitor;
 pub use members::Members;
 #[cfg(feature = "in-process")]
 pub use members::{EncodeColumns, OpenAdmission};
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use membership_writer::tests::{
-    check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-    check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, HolderDoor, Rows,
-    StoreDoor,
-};
 #[cfg(feature = "controller")]
 pub(crate) use membership_writer::{
     awaits_connect, drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
@@ -164,8 +158,6 @@ pub use membership_writer::{
 #[cfg(feature = "controller")]
 pub(crate) use object::dial_address;
 pub use object::object;
-#[cfg(all(test, feature = "controller"))]
-pub(crate) use objects::{lay_standing, stand};
 pub use objects::{Objects, RowRevision};
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,
@@ -173,3 +165,7 @@ pub use steps::{
     RemoveWorkersFromStore, WriteWorkersToStore, DISCOVERY, DRAIN_WORKERS_IN_STORE_STEP,
     REMOVE_WORKERS_FROM_STORE_STEP, WRITE_WORKERS_TO_STORE_STEP,
 };
+
+#[cfg(all(test, feature = "controller"))]
+#[path = "../tests/unit/worker_host/tests.rs"]
+pub(crate) mod tests;
