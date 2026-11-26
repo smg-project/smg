@@ -259,6 +259,9 @@ impl WorkerFacts {
     /// What a row is charged beside its numbers where its worker states a
     /// fact for a request's hard demands: the wire's block at its widest.
     pub const DEMAND_FACTS: usize = 22;
+    /// What a row is charged beside its numbers where its worker takes
+    /// images: the wire's bit.
+    pub const VISION: usize = 3;
     /// What a text is charged beside its own bytes.
     pub const FRAME: usize = 5;
     /// The most a row weighs.
@@ -275,6 +278,9 @@ impl WorkerFacts {
         }
         if self.demand_facts != crate::engine::DemandFacts::default() {
             bytes += Self::DEMAND_FACTS;
+        }
+        if self.vision {
+            bytes += Self::VISION;
         }
         if let Some(zone) = &self.zone {
             bytes += text(zone);

@@ -191,8 +191,7 @@ pub enum Error {
     /// A hard demand of a host's request is refused under this kind too,
     /// where its controller would not hold it
     /// ([`DecisionGuard::asked`](crate::tracking::decision_guard::DecisionGuard::asked)).
-    /// The handle names `constraints.demands`, or
-    /// `constraints.demands.vision` for that part. The link names `demands`.
+    /// The handle names `constraints.demands`. The link names `demands`.
     #[error("an ask's {0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
     /// A link's report queue was full: its session took no report for as

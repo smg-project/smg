@@ -625,6 +625,8 @@ async fn the_store_holds_the_rows_the_door_answered() {
                 window: 32_768,
                 decoding: 3,
             }),
+            // It states that its worker takes images too.
+            vision: Some(true),
             ..unchecked("http://127.0.0.1:9/b")
         };
         let block = stating.demand_facts;
@@ -677,6 +679,10 @@ async fn the_store_holds_the_rows_the_door_answered() {
         };
         assert_eq!(held(&rows[0]), (0, (false, false), 0, 0));
         assert_eq!(held(&rows[1]), (7, (true, false), 32_768, 3));
+        // So does whether the worker takes images. A registration that
+        // states none is told as taking none.
+        assert_eq!(told.each_ref().map(|told| told.vision), [false, true]);
+        assert_eq!([rows[0].facts.vision, rows[1].facts.vision], [false, true]);
 
         // A registration that states two ranks is answered a row a rank.
         let ranked = proto::WorkerSpec {

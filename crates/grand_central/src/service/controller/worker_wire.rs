@@ -222,6 +222,7 @@ fn numbers(
         dp_rank: u32::from(facts.dp_rank),
         health_policy: Some(health_policy(facts.health)),
         demand_facts: stated_demand_facts(facts.demand_facts),
+        vision: facts.vision,
         ..Default::default()
     }
 }
@@ -433,10 +434,10 @@ fn maker_weight(maker: &Registrant) -> usize {
 /// standby builds its rows from the log, so it would hold the row without
 /// the fact, and a promoted one would decide by other facts than its leader
 /// did. The row on the wire carries a pairing's port alone and no encode
-/// offer, vision bit, priority or drain window, and it reads an empty zone
-/// and a zero admission window, block size or port as none. The facts are
-/// written as the log writes them and read back as a standby reads them, so
-/// a fact the wire gains is taken here with no second list.
+/// offer, priority or drain window, and it reads an empty zone and a zero
+/// admission window, block size or port as none. The facts are written as
+/// the log writes them and read back as a standby reads them, so a fact the
+/// wire gains is taken here with no second list.
 #[cfg_attr(
     not(any(test, feature = "discovery")),
     expect(dead_code, reason = "the host's door asks it of each registration")
@@ -448,7 +449,6 @@ pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {
     let lost = [
         ("row.pairing", back.pairing != facts.pairing),
         ("row.encode", back.encode != facts.encode),
-        ("row.vision", back.vision != facts.vision),
         ("row.priority", back.priority != facts.priority),
         ("row.zone", back.zone != facts.zone),
         ("row.max_running", back.max_running != facts.max_running),
@@ -736,6 +736,7 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
             .map(|block| demand_facts(block, "row.demand_facts.decoding"))
             .transpose()?
             .unwrap_or_default(),
+        vision: told.vision,
         ..WorkerFacts::default()
     };
     let maker = match &told.maker {
@@ -1064,6 +1065,11 @@ fn over(
     if let Some(block) = &spec.demand_facts {
         facts.demand_facts = demand_facts(block, "spec.demand_facts.decoding")?;
     }
+    // Whether the worker takes images is the registration's where it states
+    // it: one that states none keeps the row's.
+    if let Some(vision) = spec.vision {
+        facts.vision = vision;
+    }
     // The health policy of record is the registration's, whole: one that
     // states none is checked under the defaults.
     let default = HealthPolicy::default();
@@ -1130,7 +1136,6 @@ fn bootstrap_port(pairing: &proto::PairingDescriptor) -> Result<Option<u16>, Ref
         kv_layout,
         ec_producer,
         ec_consumer,
-        vision,
         encode_handoff,
         ec_connector,
         encode_references,
@@ -1143,7 +1148,6 @@ fn bootstrap_port(pairing: &proto::PairingDescriptor) -> Result<Option<u16>, Ref
         (!kv_layout.is_empty(), "spec.pairing.kv_layout"),
         (*ec_producer, "spec.pairing.ec_producer"),
         (*ec_consumer, "spec.pairing.ec_consumer"),
-        (*vision, "spec.pairing.vision"),
         (*encode_handoff != 0, "spec.pairing.encode_handoff"),
         (!ec_connector.is_empty(), "spec.pairing.ec_connector"),
         (*encode_references, "spec.pairing.encode_references"),

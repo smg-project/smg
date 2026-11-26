@@ -1818,8 +1818,9 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let port = leader.replication.port();
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     // A ready worker the load monitor polls, at an address nobody answers.
-    // It states what a worker states for a request's hard demands: the
-    // log's row tells that too, so the standby holds the row whole.
+    // It states what a worker states for a request's hard demands, and it
+    // takes images: the log's row tells both, so the standby holds the row
+    // whole.
     let mut stated = DemandFacts::default();
     stated.runtime = 7;
     stated.references = true;
@@ -1829,6 +1830,7 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let polled = WorkerFacts {
         wire_modes: WireModes::GRPC,
         demand_facts: stated,
+        vision: true,
         ..facts("grpc://127.0.0.1:1", 1, 0)
     };
     let written = leader

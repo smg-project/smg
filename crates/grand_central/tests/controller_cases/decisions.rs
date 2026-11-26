@@ -457,7 +457,9 @@ async fn demanded(
 /// 2 and is welcomed on 1. A demand its frame states is read all the same.
 /// Every pick of a demand names workers that meet it and no other. A
 /// demand no worker meets is shed with no endpoint, under that demand's
-/// own stage.
+/// own stage. So is a demand for vision, until one more single worker's
+/// registration states that it takes images: that worker is then its every
+/// pick.
 ///
 /// A prefill frame states its demand too, and its list is held as a
 /// prefill is: to a runtime, and to no way to decide a constraint. A frame
@@ -614,6 +616,7 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
             match added.event {
                 Some(Event::Registered(row)) => {
                     assert_eq!(row.demand_facts, block, "the answer tells the block");
+                    assert!(!row.vision, "no registration here says it takes images");
                     ids.push(row.id);
                 }
                 other => panic!("a registration's answer: {other:?}"),
@@ -770,6 +773,50 @@ async fn a_frame_that_states_a_demand_is_held_to_the_workers_whose_registrations
             let answer = demanded(&requests, &mut answers, asked, of, Some(demands)).await;
             assert_eq!(answer, Ok(Err(stage.to_owned())), "{what}");
         }
+
+        // One more single worker's registration states that it takes images.
+        // Its answer tells the bit, and a frame that demands vision is then
+        // answered that worker and no other. The case's five workers stand
+        // at d0 to d4.
+        let request = RegisterWorkerRequest {
+            spec: Some(WorkerSpec {
+                url: "http://d5.fleet:8000".to_owned(),
+                wire: WireMode::Grpc as i32,
+                role: proto::Role::Single as i32,
+                models: vec![MODEL.to_owned()],
+                health_policy: Some(proto::HealthPolicy {
+                    disabled: true,
+                    ..Default::default()
+                }),
+                vision: Some(true),
+                ..WorkerSpec::default()
+            }),
+            mode: Mode::Add as i32,
+            wait_ready: false,
+        };
+        let added = operator
+            .register_worker(stating(Some("operator-d"), request))
+            .await
+            .expect("the add is taken")
+            .into_inner();
+        let Some(Event::Registered(seeing)) = added.event else {
+            panic!("a registration's answer: {:?}", added.event);
+        };
+        assert!(seeing.vision, "the answer tells the bit");
+        let vision = Demands {
+            vision: true,
+            ..none
+        };
+        // The registration is acknowledged, so the first frame behind it
+        // reads the fleet it left.
+        let mut named = BTreeSet::new();
+        for _ in 0..ASKS {
+            asked += 1;
+            let of = (MODEL, proto::Phase::Single);
+            let answer = demanded(&requests, &mut answers, asked, of, Some(vision)).await;
+            named.extend(answer.expect("an answer").expect("a pick"));
+        }
+        assert_eq!(named, BTreeSet::from([seeing.id]), "vision");
 
         // An encode request's frame holds no demand yet: a frame of the
         // encode phase that states a demand is out of range by the field,
