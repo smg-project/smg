@@ -3373,9 +3373,8 @@ Five things follow, and they are the first work of section 16.
    A gateway runs that ring for some requests, among them a shadow profile whose live profile
    reads the ring too, by another word: such a shadow is lent no ring (`Engine::unlent`). A
    single binding's shadow beside a live profile that reads no ring is lent it, and stated its
-   own place. So is a pair side's shadow where neither live side reads a ring, but for the
-   decode's shadow that cuts a request by another head rule than the prefill's shadow: that one
-   places on a ring of its own.
+   own place. So is a pair side's shadow where neither live side reads a ring: two that cut a
+   request by two head rules are each stated the places of their own heads.
 
    Classic's key recipe and its ring lookup are functions that classic and the lender both call
    (`PrefixHashPolicy::ring_key` and `HashRing::walk_from` in `model_gateway/src/policies/`), and
