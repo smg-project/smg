@@ -6,6 +6,7 @@ mod generate_body;
 mod glm53;
 mod model_label;
 mod outcome;
+mod pair_outcome;
 mod pretokenized;
 mod rate_limit_reserve;
 mod refusal_lines;
@@ -148,6 +149,12 @@ struct GatedScheduler {
     /// The call of this place, counted from zero, is refused as
     /// `fail_first` refuses the first: UNAVAILABLE, and no stream.
     fail_call: Option<usize>,
+    /// Every call is refused as `fail_always` refuses it, behind this wait:
+    /// a refusal that lands behind the answer of a call sent beside it.
+    fail_after: Option<Duration>,
+    /// Every call waits where it arrived until the flag is set, then
+    /// answers: a call whose answer the test times itself.
+    call_gate: Option<Arc<AtomicBool>>,
     started: Arc<AtomicUsize>,
     fail_constraint: bool,
     fail_engine_report: bool,
@@ -295,6 +302,15 @@ impl TokenSpeedScheduler for GatedScheduler {
                     .unwrap_or_default(),
             );
         let place = self.started.fetch_add(1, Ordering::SeqCst);
+        if let Some(wait) = self.fail_after {
+            tokio::time::sleep(wait).await;
+            return Err(Status::unavailable("release-test induced late failure"));
+        }
+        if let Some(gate) = &self.call_gate {
+            while !gate.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
         if self.fail_always
             || self.fail_call == Some(place)
             || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0)

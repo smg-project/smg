@@ -52,7 +52,7 @@ use crate::{
         common::{prefill_admission::PrefillLoadGuard, sse::SseSender, sse_rechunk},
         grpc::{
             common::{
-                response_collection::drain_prefill,
+                response_collection::{drain_prefill, StreamedAnswer},
                 response_formatting::{
                     chat_usage, effective_weight_version, known_spec_drafted,
                     CompletionTokenTracker, TokenCounts,
@@ -808,10 +808,15 @@ impl StreamingProcessor {
         // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
         // logprobs, but the Prefill reservation must end with this phase, and
         // the client's prompt-side usage is the prefill side's.
-        let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-                .await
-                .map_err(utils::StreamFailure::prefill)?;
+        let prefill_cached_tokens = drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            true,
+            StreamedAnswer,
+            |_| {},
+        )
+        .await
+        .map_err(utils::StreamFailure::prefill)?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
@@ -1246,17 +1251,22 @@ impl StreamingProcessor {
         } else {
             None
         };
-        let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, true, |complete| {
+        let prefill_cached_tokens = drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            true,
+            StreamedAnswer,
+            |complete| {
                 if ctx.return_logprob && input_token_logprobs.is_none() {
                     input_token_logprobs = complete
                         .input_logprobs()
                         .as_ref()
                         .map(utils::convert_generate_input_logprobs);
                 }
-            })
-            .await
-            .map_err(utils::StreamFailure::prefill)?;
+            },
+        )
+        .await
+        .map_err(utils::StreamFailure::prefill)?;
         // The client's prompt-side usage is the prefill side's.
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
@@ -2850,10 +2860,15 @@ impl StreamingProcessor {
     ) -> Result<(), utils::StreamFailure> {
         // Consume prefill stream (Messages API does not expose prompt logprobs);
         // the client's prompt-side usage is the prefill side's.
-        let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-                .await
-                .map_err(utils::StreamFailure::prefill)?;
+        let prefill_cached_tokens = drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            true,
+            StreamedAnswer,
+            |_| {},
+        )
+        .await
+        .map_err(utils::StreamFailure::prefill)?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
@@ -3299,10 +3314,15 @@ impl StreamingProcessor {
         first_frame: Option<&AtomicBool>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         // The client's prompt-side usage is the prefill side's.
-        let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-                .await
-                .map_err(utils::StreamFailure::prefill)?;
+        let prefill_cached_tokens = drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            true,
+            StreamedAnswer,
+            |_| {},
+        )
+        .await
+        .map_err(utils::StreamFailure::prefill)?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self

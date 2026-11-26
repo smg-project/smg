@@ -38,9 +38,10 @@ use crate::{
             common::stages::{
                 request_execution::{
                     decode_silence_response, dispatch_prefill_within,
-                    first_prefill_response_within, is_prefill_silence, pd_start_failure_response,
-                    prefill_silence_response, retire_pd_side, PdSides, PrefillBound, PrefillWait,
-                    Retirement, SideDispatch, StreamResult,
+                    first_prefill_response_within, is_prefill_silence, owe_decode_end,
+                    pd_start_failure_response, prefill_silence_response, retire_pd_side,
+                    tell_prefill_failure, PdSides, PrefillBound, PrefillWait, Retirement,
+                    SideDispatch, StreamResult,
                 },
                 MovedDecode, RequestAgain, WorkerSelectionStage,
             },
@@ -270,6 +271,8 @@ async fn first_decode_response_within(
 /// The attempt's answer for a decode side that failed to start or fell
 /// silent on the sequential path: the breaker sample, the worker-error
 /// counter (the silence verdict counted itself) and the client response.
+/// The answer bears the end the decode owes Grand Central, as the breaker
+/// sampled it: the plan holds the decode's guard and tells it.
 fn sequential_decode_failure(
     e: &tonic::Status,
     workers: &WorkerSelection,
@@ -279,6 +282,17 @@ fn sequential_decode_failure(
     if let Some(status) = e.breaker_status() {
         workers.record_outcome_decode(ledger, status);
     }
+    let mut response = sequential_decode_answer(e, workers, connection);
+    owe_decode_end(&mut response, workers, || e.end_status());
+    response
+}
+
+/// The client response of [`sequential_decode_failure`], with its counter.
+fn sequential_decode_answer(
+    e: &tonic::Status,
+    workers: &WorkerSelection,
+    connection: &'static str,
+) -> Response {
     if is_decode_side_silence(e) {
         if let Some(decode) = workers.decode_worker() {
             return decode_silence_response(e, decode);
@@ -835,7 +849,10 @@ pub(crate) async fn sequential_prefill_side(
         sides.prompt_tokens,
     )
     .await
-    .map_err(|e| sequential_prefill_failure(&e, workers, sides.ledger, sides.prefill_label))?;
+    .map_err(|e| {
+        tell_prefill_failure(&prefill_guard, &e);
+        sequential_prefill_failure(&e, workers, sides.ledger, sides.prefill_label)
+    })?;
     // The prompt has been pending prefill on its worker since the dispatch,
     // until the first response, which teaches the worker's rate; the stream
     // takes the booking over.
@@ -863,6 +880,7 @@ pub(crate) async fn sequential_prefill_side(
     {
         // Dropping the stream aborts the side's room: nothing was handed off.
         drop(prefill_stream);
+        tell_prefill_failure(&prefill_guard, &e);
         return Err(sequential_prefill_failure(
             &e,
             workers,
@@ -902,6 +920,7 @@ pub(crate) async fn sequential_prefill_side(
                     .filter(|_| sides.streaming || !is_the_engines_own_report(&e))
                 {
                     workers.record_outcome_prefill(sides.ledger, status);
+                    tell_prefill_failure(&prefill_guard, &e);
                 }
                 UpstreamClass::account_dispatch_failure(
                     metrics_labels::WORKER_PREFILL,
@@ -918,7 +937,9 @@ pub(crate) async fn sequential_prefill_side(
         }
     }
     prefill_stream.mark_completed();
-    // Prefill is drained: its admission slot is free while decode runs.
+    // Prefill is drained: it is told its good answer through its load, and
+    // its admission slot is free while decode runs.
+    prefill_guard.end().report(200, || true);
     drop(prefill_guard);
     workers.record_outcome_prefill(sides.ledger, 200);
     // The prefill phase ends at the drain; recorded by the executor only once

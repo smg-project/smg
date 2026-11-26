@@ -222,10 +222,10 @@ impl PrefillLoadGuard {
     /// through it where it records the prefill's status, and keeps no
     /// handle past this load: the prefill's end waits for none.
     ///
-    /// A replica that shares the reservation asks the same side, so a
-    /// later report writes over an earlier one. A replica that is a guard
-    /// of its own keeps no side, and a load whose guard is gone holds
-    /// none: each answers the empty handle.
+    /// A replica asks the same side. It shares the reservation, or it is a
+    /// guard of its own that keeps the first one's handle
+    /// ([`Self::replicate`]). A later report writes over an earlier one. A load
+    /// whose guard is gone holds no side and answers the empty handle.
     #[inline]
     pub(crate) fn end(&self) -> RequestEnd {
         match self {
@@ -241,13 +241,21 @@ impl PrefillLoadGuard {
     ///
     /// This is explicit instead of `Clone` because the unbounded variant
     /// increments externally visible worker load.
+    #[inline]
     pub(crate) fn replicate(&self) -> Self {
         match self {
             Self::Admission { _reservation } => Self::Admission {
                 _reservation: Arc::clone(_reservation),
             },
-            Self::Unbounded { _guard } => Self::Unbounded {
+            // A guard that keeps nothing is replicated as it stands: a load
+            // the classic policies placed pays the one test of that word.
+            Self::Unbounded { _guard } if _guard.kept().is_none() => Self::Unbounded {
                 _guard: _guard.replicate(),
+            },
+            // The replica keeps the handle of the guard it is made of: a
+            // child that holds it tells the request's one prefill side.
+            Self::Unbounded { _guard } => Self::Unbounded {
+                _guard: RequestEnd::kept_by_replica_of(_guard),
             },
         }
     }
@@ -744,7 +752,10 @@ mod tests {
                 pair_index::PdPairIndex,
                 placement::{
                     select_pair,
-                    tests::{hearing_pairs_on, keyed_pairs_on, one_pair, pairs_of, MODEL},
+                    tests::{
+                        hearing_pair_sides_on, hearing_pairs_on, keyed_pairs_on, one_pair,
+                        pairs_of, MODEL,
+                    },
                     PairFailure, PlacedPair, PlacementInputs, Stated,
                 },
                 snapshot::WorkerRegistry,
@@ -1588,5 +1599,92 @@ mod tests {
 
         drop(held);
         assert!(acquire().await.is_ok(), "a released prefill takes the next");
+    }
+
+    /// Each child of a fan-out or a batch holds a replica of its request's
+    /// one prefill load, and every replica asks the one prefill side. It
+    /// may share the admission's reservation or be a guard of its own, and
+    /// it may be made of a replica. The last report stands: a child's
+    /// failure stands against the good answer a sibling told ahead of it,
+    /// and a sibling that never answered tells nothing. The side ends once,
+    /// behind the last child's load.
+    #[tokio::test]
+    async fn every_replica_of_a_prefills_load_tells_the_one_side() {
+        const NEVER_SENT: &str = "released Decode Abandoned";
+        let orders = [(false, true), (false, false), (true, true), (true, false)];
+        for (admitted, good_first) in orders {
+            let order = format!("admission {admitted}, a good answer first {good_first}");
+            let registry = one_pair();
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let heard = hearing_pair_sides_on(&policies);
+            let ends = || {
+                let heard = heard.lock().expect("the stage heard");
+                let ends = heard
+                    .iter()
+                    .filter(|word| word.starts_with("completed") || word.starts_with("released"));
+                let mut ends: Vec<String> = ends.cloned().collect();
+                ends.sort();
+                ends
+            };
+            let admission = admitted.then(|| PrefillAdmission::new(1, 0, Duration::from_secs(1)));
+            let inputs = PlacementInputs::default();
+            let ((prefill, decode), ahead) =
+                acquired(&registry, &policies, admission.as_ref(), inputs).await;
+            drop(decode);
+
+            // The loads are made as a fan-out makes its children's.
+            let mut loads = ahead.sent().replicate_to(2);
+            let load = loads.pop().expect("the load itself");
+            let mut replicas = loads.pop().expect("its replica").replicate_to(2);
+            let replica = replicas.pop().expect("the replica itself");
+            let of_a_replica = replicas.pop().expect("a replica of the replica");
+            // A reservation is counted once, a guard of its own each time.
+            let counted = if admitted { 1 } else { 3 };
+            assert_eq!(prefill.load(), counted, "{order}");
+            if good_first {
+                load.end().report(200, || true);
+            }
+            of_a_replica.end().report(503, || true);
+            drop(load);
+            drop(of_a_replica);
+            assert_eq!(
+                ends(),
+                [NEVER_SENT],
+                "no end while a replica stands: {order}"
+            );
+
+            drop(replica);
+            assert_eq!(
+                ends(),
+                ["completed Prefill ServerError 503", NEVER_SENT],
+                "{order}"
+            );
+            assert_eq!(prefill.load(), 0, "{order}");
+        }
+    }
+
+    /// A replica of a load the classic policies placed keeps nothing, as the
+    /// load it is made of. Nothing is allocated for it, and the handle asked of
+    /// either is empty. A replica's handle lies in the slot a worker guard
+    /// keeps its maker's value in, so the load's type is no wider for it.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_classic_replica_keeps_nothing_and_the_load_is_no_wider() {
+        let prefill = worker("grpc://p:1");
+        let load = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
+        };
+        let mut loads = load.replicate_to(2);
+        let load = loads.pop().expect("the load itself");
+        let replica = loads.pop().expect("its replica");
+        assert!(load.end().is_empty() && replica.end().is_empty());
+        let PrefillLoadGuard::Unbounded { _guard: guard } = &replica else {
+            panic!("a guard of its own");
+        };
+        assert!(guard.kept().is_none());
+        assert_eq!(prefill.load(), 2);
+
+        assert_eq!(size_of::<WorkerLoadGuard>(), 56);
+        assert_eq!(size_of::<PrefillLoadGuard>(), 56);
     }
 }
