@@ -227,15 +227,13 @@ class RustPreprocessorBridge:
         )
         pixels, grids, counts, items_per_req, second_per_grids, all_keys = [], [], [], [], [], []
         has_second_per_grid = None
-        total_bytes = 0
         all_keys_valid = True
         for request in requests:
             raw = _extract_artifact(request)
             if not isinstance(raw, bytes) or not raw:
                 raise ValueError("managed encoder is missing its immutable Rust artifact")
-            total_bytes += len(raw)
-            if total_bytes > self.max_artifact_bytes:
-                raise ValueError("managed native batch exceeds artifact budget")
+            if len(raw) > self.max_artifact_bytes:
+                raise ValueError("managed native request exceeds artifact budget")
             artifact = sg.GenerateRequest.FromString(raw)
             if not artifact.HasField("mm_inputs"):
                 raise ValueError("managed Rust artifact has no pixels")
@@ -964,6 +962,13 @@ async def serve_native(config, backend):
         except asyncio.TimeoutError:  # noqa: UP041 - Python 3.10
             for task in list(tasks):
                 task.cancel()
+            if tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True), timeout=0.5
+                    )
+                except asyncio.TimeoutError:  # noqa: UP041 - Python 3.10
+                    pass
         finally:
             if runner is not None:
                 try:

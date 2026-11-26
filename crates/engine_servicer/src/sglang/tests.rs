@@ -5543,14 +5543,28 @@ async fn prepared_read_metadata_drops_malformed_frames_without_failing_runtime()
 }
 
 #[test]
-fn prepared_definitely_unsubmitted_matches_client_closed() {
+fn prepared_definitely_unsubmitted_matches_pre_enqueue_errors() {
     use std::sync::Arc;
 
-    let mut closed = tonic::Status::unavailable("closed");
-    closed.set_source(Arc::new(engine_zmq_client::Error::ClientClosed {
-        message: "writer ended".to_string(),
-    }));
-    assert!(native::definitely_unsubmitted(&closed));
+    for source in [
+        engine_zmq_client::Error::ClientClosed {
+            message: "writer ended".to_string(),
+        },
+        engine_zmq_client::Error::DuplicateRequestId {
+            request_id: "dup-rid".to_string(),
+        },
+        engine_zmq_client::Error::InvalidDataParallelRank {
+            rank: 4,
+            num_engines: 2,
+        },
+    ] {
+        let mut status = tonic::Status::unavailable("pre-enqueue");
+        status.set_source(Arc::new(source));
+        assert!(native::definitely_unsubmitted(&status));
+    }
+    assert!(native::definitely_unsubmitted(
+        &tonic::Status::already_exists("dup")
+    ));
     assert!(!native::definitely_unsubmitted(
         &tonic::Status::unavailable("unknown")
     ));

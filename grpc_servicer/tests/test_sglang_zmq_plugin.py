@@ -541,12 +541,13 @@ def test_split_work_and_control_reqs_preserves_dp_scoped_aborts_on_normal_pd(mon
         def __init__(self):
             pass
 
-    # MsgpackRecvSocket (normal SMG ZMQ PD worker): move AbortReq & EncoderDispatchErrorReq to work_reqs.
+    # MsgpackRecvSocket (normal SMG ZMQ PD worker): move AbortReq & EncoderDispatchErrorReq to
+    # work_reqs while preserving original receive order (e.g. stale abort before a retry ADD).
     msgpack_receiver = SimpleNamespace(recv_from_tokenizer=FakeMsgpackRecv())
     work_reqs, control_reqs = zmq_plugin.split_work_and_control_reqs(
-        original, msgpack_receiver, [work_item, abort_dp1, flush_ctrl, dispatch_err]
+        original, msgpack_receiver, [abort_dp1, work_item, flush_ctrl, dispatch_err]
     )
-    assert work_reqs == [work_item, abort_dp1, dispatch_err]
+    assert work_reqs == [abort_dp1, work_item, dispatch_err]
     assert control_reqs == [flush_ctrl]
 
     # Non-Msgpack receiver (native SGLang without SMG ZMQ): untouched.

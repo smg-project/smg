@@ -162,7 +162,8 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let mut server_args = struct_from_json(&model.server_args_json);
     if let Some(config) = &state.managed_config {
-        let capability = config.capabilities();
+        let managed_ready = state.prepared.get().is_some_and(|runtime| runtime.ready());
+        let capability = config.capabilities(managed_ready);
         for (key, value) in [
             (
                 "sglang_prepared",

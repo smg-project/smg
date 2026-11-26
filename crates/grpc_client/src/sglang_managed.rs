@@ -171,6 +171,7 @@ pub fn validate_manifest(
         return Err(Status::invalid_argument("incomplete managed media layout"));
     }
     let mut last_end = None;
+    let mut cursor = 0usize;
     let mut has_image = false;
     let mut has_video = false;
     for (occurrence, item) in manifest.images.iter().enumerate() {
@@ -212,8 +213,27 @@ pub fn validate_manifest(
             if start > end || end >= count || last_end.is_some_and(|prev| start <= prev) {
                 return Err(Status::invalid_argument("invalid managed media offset"));
             }
+            if manifest.padded_ids[cursor..start]
+                .iter()
+                .zip(&manifest.unpadded_ids[cursor..start])
+                .any(|(&padded, &unpadded)| padded != i64::from(unpadded))
+            {
+                return Err(Status::invalid_argument(
+                    "managed padded_ids diverged from unpadded_ids outside media spans",
+                ));
+            }
+            cursor = end + 1;
             last_end = Some(end);
         }
+    }
+    if manifest.padded_ids[cursor..count]
+        .iter()
+        .zip(&manifest.unpadded_ids[cursor..count])
+        .any(|(&padded, &unpadded)| padded != i64::from(unpadded))
+    {
+        return Err(Status::invalid_argument(
+            "managed padded_ids diverged from unpadded_ids outside media spans",
+        ));
     }
     if (has_image && manifest.image_token_id == 0)
         || (has_video && manifest.video_token_id == 0 && manifest.image_token_id == 0)
@@ -380,5 +400,15 @@ mod tests {
         many.mrope_positions = None;
         many.mrope_delta = None;
         validate_manifest(&many, &binding, Limits::default()).unwrap();
+
+        // Reject padded_ids mutating text tokens outside image/video offset spans.
+        let mut mutated_prefix = sample_manifest(&binding);
+        mutated_prefix.padded_ids[0] = 999_999;
+        assert!(validate_manifest(&mutated_prefix, &binding, Limits::default()).is_err());
+
+        let mut mutated_suffix = sample_manifest(&binding);
+        let last_idx = mutated_suffix.padded_ids.len() - 1;
+        mutated_suffix.padded_ids[last_idx] = 999_999;
+        assert!(validate_manifest(&mutated_suffix, &binding, Limits::default()).is_err());
     }
 }
