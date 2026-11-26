@@ -41,7 +41,10 @@ use crate::{
 /// issue and dispatch it did not hear: a stage matches an end by the
 /// lease's id ([`Lease::id`]), and moves no count by an end it cannot
 /// match. It is so in a gateway's own process and behind a controller,
-/// which keeps the rule's word on the lease it files.
+/// which keeps the rule's word on the lease it files. A side of a pair
+/// the rule placed alone is kept from its stages in the same way, each
+/// side by its own decision, in a gateway's own process: a controller
+/// takes `told` alone under `pd-pair`.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. Its host filed the
     /// lease as it issued it, in process as behind a served controller:
@@ -113,7 +116,8 @@ pub trait Lifecycle: Send + Sync {
     /// A signal about one worker: a load row, a health change or a
     /// gateway's veto. A load row lends its report's named values for
     /// this call alone ([`Signal::Load`]): a stage copies out what it
-    /// keeps, and a cell is `Copy`. The word does not outlive the call.
+    /// keeps, and a cell is `Copy`. The values it was lent end with the
+    /// call.
     fn on_signal(&self, _signal: &Signal<'_>) {}
 
     /// Whether the stage keeps a number of each rank's report, which a host

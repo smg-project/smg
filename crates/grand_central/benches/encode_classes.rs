@@ -97,10 +97,7 @@ fn fleet(fleet: &str, n: usize) -> Vec<WorkerFacts> {
 fn members(fleet: &[WorkerFacts], role: Role) -> Vec<EncodeMember<'_>> {
     let of_role = fleet.iter().filter(|facts| facts.role == role);
     of_role
-        .map(|facts| EncodeMember {
-            runtime: &facts.engine_kind,
-            offer: &facts.encode,
-        })
+        .map(|facts| EncodeMember::of(&facts.engine_kind, &facts.encode))
         .collect()
 }
 

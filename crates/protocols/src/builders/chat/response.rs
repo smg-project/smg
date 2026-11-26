@@ -117,6 +117,7 @@ impl ChatCompletionResponseBuilder {
             usage: self.usage,
             system_fingerprint: self.system_fingerprint,
             service_tier: self.service_tier,
+            prompt_text: None,
         }
     }
 }

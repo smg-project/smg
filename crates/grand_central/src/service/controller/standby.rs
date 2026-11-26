@@ -1028,6 +1028,7 @@ mod tests {
         },
         stages::registry,
         store::{WorkerFacts, WorkerStatus, WorkersStore},
+        worker_host::lay_standing,
     };
 
     type Replica = (Arc<MemoryStore>, Arc<Log>);
@@ -1276,7 +1277,7 @@ mod tests {
         leader.upsert(side("http://da:8000", Role::Decode, "green"));
         follow(&follower, &led, Instant::now());
         let leading = WorkerObjects::new(Arc::clone(&leader)).holder();
-        leading.follow(&*leader);
+        lay_standing(&leading, &leader);
         for mode in [Pairing::Lenient, Pairing::Strict] {
             let behind = pair_classes(&follower.objects, mode);
             assert_eq!(behind, pair_classes(&leading, mode), "{mode:?}");
@@ -1315,9 +1316,9 @@ mod tests {
             panic!("a free lease is taken at the first tick");
         };
         // The cases write the leader's rows through its store's own
-        // entries: the holder its cut is taken from follows the store.
+        // entries: the holder its cut is taken from lays what stands.
         let cut_from = holder(store);
-        cut_from.follow(&**store);
+        lay_standing(&cut_from, store);
         let cut = Replication::new(
             Arc::clone(store),
             Arc::clone(log),
@@ -2061,11 +2062,15 @@ mod tests {
         let elector = Elector::alone(OWN, ElectionSettings::default())
             .expect("the default settings are in order");
         let (standing, stood) = watch::channel(ElectionObservation::default());
-        let journal = journaled(&LeasePlace::File("shared".into()), 1);
+        // One place for the log and for the document door: a standby's
+        // lease is one another replica can take.
+        let place = LeasePlace::File("shared".into());
+        let journal = journaled(&place, 1);
         let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
         let catalog = Arc::new(crate::stages::StageRegistry::builtin());
         let journal = followed(journal);
-        let shared = Shared::new(id, address, &elector, unserved(stood), journal, catalog, 1)
+        let source = (catalog, &place);
+        let shared = Shared::new(id, address, &elector, unserved(stood), journal, source, 1)
             .expect("the deciders start");
         let mut standby = Standby::new(Arc::new(shared), bed.addr.port());
         // The bound a replica runs with: three of its leader's heartbeats,
@@ -3227,10 +3232,11 @@ mod tests {
         let objects = Arc::new(objects);
         let catalog = Arc::new(registry::StageRegistry::builtin());
         let (store, log) = (Arc::clone(&standby.0), Arc::clone(&standby.1));
-        let following = Generations::stating(Arc::clone(&store), catalog, Arc::clone(&objects));
         // Under a shared lease, and it has not led: its door writes no row.
         let elector = election();
-        following.under(elector.fence());
+        let fence = Some(elector.fence());
+        let following =
+            Generations::stating(Arc::clone(&store), catalog, Arc::clone(&objects), fence);
         let follower = Follower::new(store, log, Arc::clone(&objects)).through(Arc::new(following));
         let object = |url: &str| objects.registry().get_by_url(url).expect("an object");
         let at = Instant::now();

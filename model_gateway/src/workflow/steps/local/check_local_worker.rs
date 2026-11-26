@@ -280,16 +280,17 @@ fn symphony_table_of(
     table_label_read(&ModelNames { labels, flags }, &card.id)
 }
 
-/// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
-/// labels select no reader (none, or a reasoning name alone that no table answers to or that gives
-/// way), whatever the
-/// gateway's `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::names::reads`). When
-/// they name another reader, the registration of the model's first worker says so: `Some(message)`
-/// while no worker of the model is registered, naming the model, both readers and the one used;
-/// `None` for the model's later workers, a worker whose labels select a reader, a model the
-/// registry does not know, flags that select nothing or the registry's own table, and the legacy
-/// parser choice. Workers of one model registering at the same moment may each say it, as the
-/// override check above may: the registry gains the worker a step later.
+/// Under `--parser symphony`, the gateway's flags read a model ahead of the registry for every
+/// worker whose labels select no reader (none, or a reasoning name alone that no table answers to
+/// or that gives way), except a `--reasoning-parser` alone that selects a table
+/// (`regular::symphony::names::flags_read_first`): the registry's table reads a model it knows then
+/// (`regular::symphony::names::reads`). When that name selects another table than the registry's,
+/// the registration of the model's first worker says so: `Some(message)` while no worker of the
+/// model is registered, naming the model, both tables and the one used; `None` for the model's
+/// later workers, a worker whose labels select a reader, a model the registry does not know, flags
+/// that read first, select nothing or name the registry's own table, and the legacy parser
+/// choice. Workers of one model registering at the same moment may each say it, as the override
+/// check above may: the registry gains the worker a step later.
 fn registry_reads_over_the_flags(
     card: &ModelCard,
     worker_url: &str,
@@ -304,17 +305,15 @@ fn registry_reads_over_the_flags(
         return None;
     }
     let (table, named) = set_aside_by_the_registry(flags, &card.id)?;
-    let spell =
-        |name: Option<&str>| name.map_or_else(|| "unset".to_string(), |name| format!("'{name}'"));
     Some(format!(
         "the registry's table '{}' reads model '{}' for worker {}, whose labels select \
-         no reader; the gateway's --tool-call-parser {} / --reasoning-parser {} name {named}, which \
-         reads only the models the registry does not know",
+         no reader; the gateway's --reasoning-parser '{}', set alone, names {named}, which \
+         reads only the models the registry does not know (a --tool-call-parser beside it puts \
+         the flags before the registry)",
         table.name(),
         card.id,
         Endpoint::redacted_str(worker_url),
-        spell(flags.tool.as_deref()),
-        spell(flags.reasoning.as_deref()),
+        flags.reasoning.as_deref().unwrap_or_default(),
     ))
 }
 
@@ -617,16 +616,17 @@ mod tests {
 
     /// Under `--parser symphony`, the registration of a model's first worker whose labels select
     /// no reader (none, or a reasoning name no table answers to) says that the registry's table
-    /// reads the model, not what the gateway's flags name, naming both; the model's next worker,
-    /// a worker whose labels select a reader, a model the registry does not know, flags that name
-    /// the registry's own table or nothing, and the legacy parser choice, say nothing.
+    /// reads the model, not the table a `--reasoning-parser` set alone names, naming both; the
+    /// model's next worker, a worker whose labels select a reader, a model the registry does not
+    /// know, flags that read first (a tool-call name), flags that name the registry's own table or
+    /// nothing, and the legacy parser choice, say nothing.
     #[test]
     fn the_registrys_table_over_the_flags_is_said_once_per_model_at_registration() {
         let flags = Names {
-            tool: Some("mistral_v13".to_string()),
-            reasoning: None,
+            tool: None,
+            reasoning: Some("qwen3".to_string()),
         };
-        let known = ModelCard::new("Qwen/Qwen3-8B");
+        let known = ModelCard::new("stepfun-ai/Step-3.5-Flash");
         let registry = WorkerRegistry::new();
         let said =
             |card: &ModelCard, url: &str, parser, flags: &Names, registry: &WorkerRegistry| {
@@ -644,9 +644,10 @@ mod tests {
         )
         .expect("the model's first worker says so");
         assert!(
-            first.contains("'Qwen/Qwen3-8B'")
-                && first.contains("'qwen3'")
-                && first.contains("the table 'mistral_v13'")
+            first.contains("'stepfun-ai/Step-3.5-Flash'")
+                && first.contains("'qwen3_tagged'")
+                && first.contains("--reasoning-parser 'qwen3', set alone")
+                && first.contains("the table 'qwen3'")
                 && first.contains("***@a:1")
                 && !first.contains("secret"),
             "{first}"
@@ -695,17 +696,50 @@ mod tests {
             None,
             "a model the registry does not know"
         );
-        let own = Names {
-            tool: Some("qwen".to_string()),
-            reasoning: None,
-        };
         assert_eq!(
-            said(&known, "grpc://a:1", ParserChoice::Symphony, &own, &fresh),
+            said(
+                &ModelCard::new("Qwen/Qwen3-8B"),
+                "grpc://a:1",
+                ParserChoice::Symphony,
+                &flags,
+                &fresh
+            ),
             None,
             "the registry's own table"
         );
+        // A tool-call name puts the flags before the registry: nothing is set aside.
+        let tool_named = Names {
+            tool: Some("mistral_v13".to_string()),
+            reasoning: None,
+        };
+        assert_eq!(
+            said(
+                &known,
+                "grpc://a:1",
+                ParserChoice::Symphony,
+                &tool_named,
+                &fresh
+            ),
+            None,
+            "flags that read first"
+        );
+        // ... and the table the registration publishes is the flags', not the registry's; for a
+        // reasoning name alone, the registry's.
+        assert_eq!(
+            symphony_table_of(
+                &known,
+                ParserChoice::Symphony,
+                ConnectionMode::Grpc,
+                &tool_named
+            ),
+            Some("mistral_v13")
+        );
+        assert_eq!(
+            symphony_table_of(&known, ParserChoice::Symphony, ConnectionMode::Grpc, &flags),
+            Some("qwen3")
+        );
         // A label that selects nothing (a reasoning name no table answers to) falls through to
-        // the registry as no label does, so the worker says it too.
+        // the flags and the registry as no label does, so the worker says it too.
         let mut idle_label = known.clone();
         idle_label.reasoning_parser = Some("deepseek_r1".to_string());
         assert!(
@@ -717,7 +751,8 @@ mod tests {
                 &fresh
             )
             .is_some_and(|message| {
-                message.contains("'qwen3'") && message.contains("whose labels select no reader")
+                message.contains("'qwen3_tagged'")
+                    && message.contains("whose labels select no reader")
             }),
             "a label that selects nothing"
         );

@@ -53,9 +53,9 @@
 //!   reservations, leases), the one-process
 //!   [`store::MemoryStore`] behind them and the contract tests over it. KV
 //!   events are the worker host's: they feed the index its tables hold for
-//!   each model (`worker_host::KvTables`), which no decision reads yet. A
-//!   gateway in the embedded mode implements the same traits over its own
-//!   structures.
+//!   each model (`worker_host::KvTables`), which a controller lends its
+//!   engine. A gateway in the embedded mode implements the same traits over
+//!   its own structures.
 //! - 10, the election ([`service::elector`]): one [`service::elector::Elector`] over a
 //!   [`service::elector::LeaseBackend`] (the lease file and the in-process record
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
@@ -109,9 +109,9 @@
 //!   (`worker_host`): one object of the worker crate for every row of the
 //!   membership store, in a registry the host hands in, built, replaced and
 //!   dropped as the rows come, change and go. A controller built with it
-//!   follows its own store, on a leader and on a standby alike, and hands
-//!   each object a gRPC connector: an object connects to its engine at its
-//!   first use.
+//!   writes each row through their holder, on a leader and on a standby
+//!   alike. It hands each object a gRPC connector: an object connects to
+//!   its engine at its first use.
 //! - Behind the `in-process` feature, the engine in a gateway's own process
 //!   (`engine::InProcess`): it gives the gateway's own placement its pick
 //!   over the gateway's worker objects, read in place. It keeps no worker

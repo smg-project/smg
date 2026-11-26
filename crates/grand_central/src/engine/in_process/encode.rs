@@ -35,8 +35,8 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::{
     pair::{
-        issued, not_decided, record_sides, side_columns, stamp, tried_engines, Buffers, PairLists,
-        BUFFERS,
+        issued, not_decided, record_sides, said_apart, side_columns, stamp, tried_engines, Buffers,
+        PairLists, BUFFERS,
     },
     signals, single, InProcess, Loaded, PoolMembers,
 };
@@ -408,12 +408,23 @@ impl EncodeLists<'_> {
         let mut decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, prefill_records) = (prefill.workers(), prefill.records(spec, clock));
+            let (decode_workers, decode_records) = (decode.workers(), decode.records(spec, clock));
+            let (encode_workers, records) = (encoders.workers(), encoders.records(spec, clock));
+            // The rows are filled with no read of a worker object where
+            // the three lists are wholly available and the host states no
+            // veto beside any.
+            let live = live.rested_where(spec.engine(), |word| {
+                pair.prefill_stalled.is_empty()
+                    && pair.decode_stalled.is_empty()
+                    && self.encoders_stalled.is_empty()
+                    && prefill_records.stands(workers, word)
+                    && decode_records.stands(decode_workers, word)
+                    && records.stands(encode_workers, word)
+            });
             let (prefills, pool) = prefill_records.write(workers, &live, prefills);
-            let (workers, decode_records) = (decode.workers(), decode.records(spec, clock));
-            let (decodes, _) = decode_records.write(workers, &live, decodes);
+            let (decodes, _) = decode_records.write(decode_workers, &live, decodes);
             stamp(prefills, decodes, pair.classes, pair.admission);
-            let (workers, records) = (encoders.workers(), encoders.records(spec, clock));
-            let (rows, _) = records.write(workers, &live, &mut buffers.encoders);
+            let (rows, _) = records.write(encode_workers, &live, &mut buffers.encoders);
             // A hard demand the request states is judged here for the
             // pair's two sides, and the engine's pass is handed the places
             // that meet it. The encoders' part is the pass's to keep. A
@@ -511,8 +522,14 @@ impl EncodeLists<'_> {
         let decision = BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
             Ok(mut buffers) => decide(&mut buffers),
             // A stage asked for a decision from inside its own, on this
-            // thread: that decision takes buffers of its own.
-            Err(_) => decide(&mut Buffers::default()),
+            // thread: that decision takes buffers of its own, and its word
+            // of a shed is kept for its call ([`said_apart`]).
+            Err(_) => {
+                let mut own = Buffers::default();
+                let decision = decide(&mut own);
+                said_apart(&own.scratch);
+                decision
+            }
         });
         // The thread's list goes back for its next retry.
         if let Some(tried) = tried {
@@ -574,12 +591,14 @@ impl InProcess {
         self.under(&document)
             .decide_encode_at(maker, items, placed, clock)
     }
+}
 
+impl Loaded<'_, '_> {
     /// [`Self::decide_encode_at`] with nothing its host hears of later: no
     /// lease is issued, no id is taken and no stage is told. For a host
     /// that files a pick's lease itself, as [`Self::decide_without_lease`]
-    /// is for a single request and for a pair. The wires' test stands in
-    /// it.
+    /// is for a single request and for a pair, under the document this
+    /// value holds. The wires' test stands in it.
     ///
     /// # Errors
     ///
@@ -592,25 +611,21 @@ impl InProcess {
         )
     )]
     pub(crate) fn decide_encode_without_lease(
-        &self,
+        self,
         maker: &impl RequestMaker,
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
         now: Instant,
     ) -> Result<Decision, DecisionRefused> {
-        let document = self.in_force();
-        let own = self.under(&document);
-        own.over_three(maker, placed, |lists, request, loads, placed| {
+        self.over_three(maker, placed, |lists, request, loads, placed| {
             let sends_to = |target: &_| maker.sends_to(target);
             let encoder = |place| maker.sends_to_encoder(place);
             decide(
-                own, lists, request, items, loads, placed, now, sends_to, encoder,
+                self, lists, request, items, loads, placed, now, sends_to, encoder,
             )
         })
     }
-}
 
-impl Loaded<'_, '_> {
     /// [`InProcess::decide_encode_at`] under the document this value
     /// holds: for a caller that reads that document further behind the
     /// decision, as the call that places a request does.

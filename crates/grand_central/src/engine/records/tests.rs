@@ -219,6 +219,77 @@ fn a_record_states_what_its_worker_object_says_at_the_decision() {
     assert_eq!(written[2].in_flight, 1);
 }
 
+/// Under a document no stage of which reads a count, a list whose every
+/// worker publishes available is written with no read of a worker object.
+/// A veto on one worker is read by the next decision of every list that
+/// holds the worker, which reads every object again, and the lists stand
+/// again once the veto is gone.
+#[test]
+fn a_wholly_available_list_is_written_with_no_read_of_a_worker_object() {
+    let spec = applied("round_robin");
+    let clock = DecisionClock::new();
+    let workers = fleet(4);
+    // Two lists hold the last three workers: a veto on one reaches both.
+    let lists = [&workers[..], &workers[1..]];
+    let pools = lists.map(|list| PoolRecords::new(list, &spec, &clock));
+    // What the object alone knows: a row written with no read of it
+    // carries no count.
+    workers[2].increment_load();
+    let mut rows = Vec::new();
+    let mut read = |at: usize| {
+        let live = Live::at(spec.engine(), &clock, Instant::now(), None, None)
+            .rested_where(spec.engine(), |word| pools[at].stands(lists[at], word));
+        let (written, _) = pools[at].write(lists[at], &live, &mut rows);
+        let routable = written.iter().filter(|row| row.health.routable());
+        let in_flight = written.iter().map(|row| row.in_flight);
+        (routable.count(), in_flight.sum::<u32>())
+    };
+    assert_eq!([read(0), read(1)], [(4, 0), (3, 0)], "no object is read");
+    assert!(workers[3].set_overloaded(true));
+    assert_eq!([read(0), read(1)], [(3, 1), (2, 1)], "every object is read");
+    assert!(workers[3].set_overloaded(false));
+    assert_eq!([read(0), read(1)], [(4, 0), (3, 0)], "both lists stand");
+    // The word moved and another decision holds the list's claim: this one
+    // asks no worker, waits for nothing and reads every object.
+    assert!(workers[0].set_overloaded(true));
+    assert!(workers[0].set_overloaded(false));
+    let claim = pools[0].asking.lock();
+    assert_eq!(read(0), (4, 1));
+    drop(claim);
+    assert_eq!(read(0), (4, 0));
+    // A worker that publishes no state answers as a worker type of a host's
+    // own does: its list never stands, and every object of it is read.
+    let unpublished = <BasicWorkerBuilder>::new(url(4))
+        .health_config(no_health_check())
+        .build();
+    let mixed: [Arc<dyn Worker>; 2] = [Arc::clone(&workers[2]), Arc::new(unpublished)];
+    let pool = PoolRecords::new(&mixed, &spec, &clock);
+    for _ in 0..2 {
+        let live = Live::at(spec.engine(), &clock, Instant::now(), None, None)
+            .rested_where(spec.engine(), |word| pool.stands(&mixed, word));
+        let (written, _) = pool.write(&mixed, &live, &mut rows);
+        assert_eq!(written[0].in_flight, 1);
+    }
+    // A document a stage of which reads the count reads every object, and
+    // so does one whose sessions rule places a new key on the worker with
+    // the fewest requests: the rule scores the rows beside every profile.
+    let mut keyed = PolicySpec::preset("manual").expect("a built-in preset");
+    for profile in keyed.profiles.values_mut() {
+        profile.pick = PickSpec::from("round-robin");
+    }
+    for binding in &mut keyed.bindings {
+        let rule = binding.sessions.as_mut().expect("the preset's rule");
+        rule.assignment = Assignment::MinLoad;
+    }
+    for spec in [applied("least_load"), applied_of(keyed)] {
+        let pool = PoolRecords::new(&workers, &spec, &clock);
+        let live = Live::at(spec.engine(), &clock, Instant::now(), None, None)
+            .rested_where(spec.engine(), |word| pool.stands(&workers, word));
+        let (written, _) = pool.write(&workers, &live, &mut rows);
+        assert_eq!(written[2].in_flight, 1);
+    }
+}
+
 #[test]
 fn a_record_carries_its_workers_report_dated_on_the_decisions_clock() {
     let spec = applied("least_load");
@@ -1429,7 +1500,7 @@ fn what_was_written_behind_a_write_never_shows_in_the_next() {
     for live in [
         &live, &live, &counting, &counting, &keyed[0], &keyed[1], &live,
     ] {
-        let (written, _) = pool.write_over::<true>(&workers, live, &mut rows, &mut stands);
+        let (written, _) = pool.write_over::<true, false>(&workers, live, &mut rows, &mut stands);
         let texts: Vec<_> = written.iter().map(text).collect();
         assert_eq!(texts, fresh(&pool, &workers, live));
         for row in written {
@@ -1504,7 +1575,7 @@ fn rows_stand_for_their_own_list_and_snapshot_alone() {
         at += Duration::from_micros(1);
         let live = Live::at(spec.engine(), &clock, at, loads, None);
         let (written, _) =
-            pools[list].write_over::<true>(lists[list], &live, &mut rows, &mut stands);
+            pools[list].write_over::<true, false>(lists[list], &live, &mut rows, &mut stands);
         let stood = mem::replace(&mut written[0].zone, 0) == 9;
         let texts: Vec<_> = written.iter().map(text).collect();
         assert_eq!(texts, fresh(&pools[list], lists[list], &live));
@@ -1543,7 +1614,7 @@ fn a_decision_asked_inside_a_decision_leaves_its_rows_alone() {
     let live = Live::at(spec.engine(), &clock, Instant::now(), Some(&loads), None);
     with_buffers(|buffers| {
         let Buffers { whole, stands, .. } = buffers;
-        let (written, _) = pools[0].write_over::<true>(&outer, &live, whole, stands);
+        let (written, _) = pools[0].write_over::<true, false>(&outer, &live, whole, stands);
         let before: Vec<_> = written.iter().map(text).collect();
         let named = *stands;
         // A stage that asks a decision of its own on this thread, over

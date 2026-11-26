@@ -119,6 +119,12 @@ pub struct Config {
     /// a few megabytes; tonic's own default (4 MiB) refuses that, while the
     /// engine servicers run without a limit, so none is the default.
     pub grpc_max_message_bytes: usize,
+    /// Whether the gRPC wires serve the subscription to KV-cache events
+    /// (`--grpc-kv-events`). With false it is refused as by an engine
+    /// without the call, so a gateway hears no KV event from this process
+    /// over gRPC, while the engines keep their prefix cache and the load
+    /// records alone stay served. The ZMQ publishers are not touched.
+    pub grpc_kv_events: bool,
     /// vLLM-wire ZMQ KV-event publishers (realistic engines only): the first
     /// PUB port; worker `i` publishes on `base + 2i` and answers replay on
     /// `base + 2i + 1`. Off when `None`.
@@ -138,6 +144,11 @@ pub struct Config {
     /// batches), `false` (the default) a wire that carries token batches
     /// only, whose silence the gateway judges against its prefill bound.
     pub step_reports: bool,
+    /// What the gRPC workers' model info says of vision input from their
+    /// start (`--supports-vision`): the `supports_vision` entry of the info
+    /// the admin API patches, seeded. Unset, each wire answers as it does
+    /// with no entry.
+    pub supports_vision: Option<bool>,
     /// The role of a process's HTTP workers alone, or of its gRPC workers
     /// and ZMQ ranks together, in a disaggregated fleet
     /// (`--worker-type`): a prefill worker answers every request with the
@@ -402,6 +413,7 @@ impl Default for Config {
             drain_timeout: Duration::from_secs(5),
             context_length: 32768,
             grpc_max_message_bytes: usize::MAX,
+            grpc_kv_events: true,
             kv_events_zmq_base_port: None,
             kv_events_replay: true,
             kv_events_topic: String::new(),
@@ -409,6 +421,7 @@ impl Default for Config {
             kv_events_wire: Wire::Vllm,
             loads_like: LoadsLike::Mock,
             step_reports: false,
+            supports_vision: None,
             role: None,
             bootstrap_base_port: None,
             pairing_protocol: None,
@@ -546,6 +559,9 @@ impl Config {
                 "--grpc-max-message-bytes" => {
                     cfg.grpc_max_message_bytes = parse(value(&mut args, &flag)?, &flag)?;
                 }
+                "--grpc-kv-events" => {
+                    cfg.grpc_kv_events = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--kv-events-zmq-base-port" => {
                     cfg.kv_events_zmq_base_port = Some(parse(value(&mut args, &flag)?, &flag)?);
                 }
@@ -563,6 +579,9 @@ impl Config {
                 }
                 "--loads-like" => cfg.loads_like = value(&mut args, &flag)?.parse()?,
                 "--step-reports" => cfg.step_reports = parse(value(&mut args, &flag)?, &flag)?,
+                "--supports-vision" => {
+                    cfg.supports_vision = Some(parse(value(&mut args, &flag)?, &flag)?);
+                }
                 "--block-size" => {
                     cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?;
                     block_size_given = true;
@@ -1145,6 +1164,9 @@ pub fn usage() -> String {
                                 the gateway detects the runtime from it (--capture: tokenspeed only)\n\
        --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
                                 (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
+       --grpc-kv-events <bool>  serve the gRPC subscription to KV-cache events (default true);\n\
+                                false refuses it as an engine without the call does, while the\n\
+                                engines keep their prefix cache and the load records stay served\n\
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
        --zmq-count <n>          number of ZMQ mock EngineCore ranks (default 0)\n\
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\
@@ -1231,6 +1253,11 @@ pub fn usage() -> String {
                                 vLLM's stats-only step batches do) instead of token batches only\n\
                                 (default false): decides which bound the gateway judges the\n\
                                 engine's silence against\n\
+       --supports-vision <bool> what the gRPC workers' model info says of vision input from\n\
+                                their start (default: no entry, so an encode worker on the vLLM\n\
+                                wire says true and every other worker false); the gateway\n\
+                                refuses an image request to vLLM-wire workers that all say\n\
+                                false; the admin API's info patch sets the same entry later\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)\n\
        --worker-type <prefill|decode|encode>  the role of the HTTP workers alone, or of the gRPC\n\

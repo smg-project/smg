@@ -85,8 +85,9 @@ struct Keeping {
     /// that holder where the line is built ([`Objects::credentials`]). So
     /// the write and the build read one keeper.
     credentials: Arc<Credentials>,
-    /// The store that holder follows. Where the keeper's answer says so,
-    /// the write has the holder lay the address's objects again from it.
+    /// The store the write's door writes. Where the keeper's answer says
+    /// so, the write has the holder lay the address's objects again, and
+    /// a lay hands each row's count to this store. No row is read from it.
     store: Arc<dyn WorkersStore>,
 }
 
@@ -149,9 +150,15 @@ pub fn registration_into_store<H: WorkflowHost>(
 /// ([`Objects::with_credentials`]), and the holder builds the row's object
 /// with it.
 ///
-/// `store` is the store the holder follows: where the keeper's answer says
-/// so, the write has the holder lay the address's objects again from it. A
-/// holder is built with no store, since each of its reads is handed one.
+/// `door` writes through the holder's write calls ([`Objects::upsert`],
+/// [`Objects::patch`], [`Objects::remove`]), so a row's object stands when
+/// the door answers: the line follows no store. A row written around the
+/// holder has no object when its registration is answered, and the keeper
+/// forgets it there.
+///
+/// `store` is the store that door writes: where the keeper's answer says
+/// so, the write has the holder lay the address's objects again, and a lay
+/// hands each row's count to it. No row is read from it.
 ///
 /// The write runs in the holder's turn, from its keep to that lay-again. A
 /// registration that states another credential alone moves no row, and the
@@ -211,8 +218,9 @@ fn registration_line<H: WorkflowHost>(
 }
 
 /// Build a removal that selects workers, marks their rows draining, waits
-/// for them to settle and removes their rows. The holder drops the objects
-/// when it follows the store. The drain is the door's write. A door with
+/// for them to settle and removes their rows. A door that writes through
+/// the holder drops each object with its row.
+/// The drain is the door's write. A door with
 /// a holder marks the worker object draining and tells its row, so a
 /// decision that reads the object's status picks it no more. Where a door
 /// marks the row alone, the held object's status does not move.
@@ -779,9 +787,11 @@ mod tests {
             WorkersStore,
         },
         worker_host::{
-            facts, membership_writer::tests::StoreDoor, Members, MembershipWriteOutcome,
-            MembershipWriteRefused, MembershipWriter, Objects, Over, Precondition, Remover,
-            RowRevision,
+            facts,
+            membership_writer::tests::{HolderDoor, StoreDoor},
+            objects::lay_standing,
+            Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects,
+            Over, Precondition, Remover, RowRevision,
         },
     };
 
@@ -851,7 +861,7 @@ mod tests {
             let registry = Arc::new(WorkerRegistry::new());
             let objects = Arc::new(Objects::new(Arc::clone(&registry)));
             let store = Arc::new(MemoryStore::default());
-            let door = Arc::new(StoreDoor::new(Arc::clone(&store)));
+            let door = Arc::new(HolderDoor::new(Arc::clone(&store), Arc::clone(&objects)));
             let host = Arc::new(Host {
                 registry,
                 settings: RegistrationSettings {
@@ -932,13 +942,26 @@ mod tests {
             maker: &Registrant,
             worker: &dyn Worker,
         ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
-            let answer = self
-                .door
+            self.door
                 .found(maker, Precondition::Any, worker.url(), &|old| {
                     facts(worker, old)
-                })?;
-            self.objects.follow(&*self.store);
-            Ok(answer)
+                })
+        }
+
+        /// A row that stands ahead of a case's job: written through the
+        /// holder, as a control call's.
+        fn laid(&self, facts: WorkerFacts) {
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write");
+        }
+
+        /// The fixture of a host whose door writes the store alone. The
+        /// registry holds a row's object only where a case lays it. For
+        /// the cases of a door's answer under an object that lags its row.
+        fn around() -> Self {
+            let mut fixture = Self::new();
+            fixture.door = Arc::new(StoreDoor::new(Arc::clone(&fixture.store)));
+            fixture
         }
 
         fn write(&self) -> WriteWorkersToStore<Members> {
@@ -949,13 +972,17 @@ mod tests {
             }
         }
 
-        /// The fixture with a keeper that its holder reads.
+        /// The fixture with a keeper that its holder reads, and a door that
+        /// writes through that holder: the line that keeps follows no
+        /// store, so a row's object stands when its door answers.
         fn keeping() -> (Self, Arc<Credentials>) {
             let mut fixture = Self::new();
             let credentials = Arc::new(Credentials::new());
             let registry = Arc::clone(&fixture.host.registry);
             fixture.objects =
                 Arc::new(Objects::new(registry).with_credentials(Arc::clone(&credentials)));
+            let (store, objects) = (Arc::clone(&fixture.store), Arc::clone(&fixture.objects));
+            fixture.door = Arc::new(HolderDoor::new(store, objects));
             (fixture, credentials)
         }
 
@@ -1007,10 +1034,8 @@ mod tests {
         Arc::new(<BasicWorkerBuilder>::from_spec(spec).build())
     }
 
-    /// The credential the row's object at `url` holds, once the holder has
-    /// followed the store.
+    /// The credential the row's object at `url` holds.
     fn held_key(f: &Fixture, url: &str) -> Option<String> {
-        f.objects.follow(&*f.store);
         let object = f.host.registry.get_by_url(url).expect("the row's object");
         object.api_key().cloned()
     }
@@ -1046,7 +1071,6 @@ mod tests {
         // the ranks, whatever address the job's configuration names.
         cx.data.config.url = "worker:8000".to_owned();
         f.write().execute(&mut cx).await.expect("written");
-        f.objects.follow(&*f.store);
 
         let mut held = find_workers_by_url(&f.host.registry, URL);
         held.sort_by_key(|worker| worker.dp_rank());
@@ -1083,7 +1107,6 @@ mod tests {
         let row = f.store.by_key(URL).expect("the worker's one row");
         assert_eq!((row.facts.dp_rank, row.facts.dp_size), (0, 4));
         assert_eq!(f.store.all_rows().1.len(), 1);
-        f.objects.follow(&*f.store);
         let held = f
             .host
             .registry
@@ -1176,7 +1199,10 @@ mod tests {
             };
             assert_eq!(row.facts, expected);
             assert_eq!(row.maker, maker);
-            assert!(f.host.registry.get_by_url(url).is_none());
+            assert!(
+                f.host.registry.get_by_url(url).is_some(),
+                "laid by the write"
+            );
         }
         assert_eq!(f.store.epoch(), 2);
         assert_eq!(cx.data.workers.expect("the written URLs").worker_urls, urls);
@@ -1285,13 +1311,14 @@ mod tests {
     /// The door answers that the row left, under an object the holder has
     /// not dropped yet: the worker stays the job's at either step.
     #[tokio::test]
-    async fn a_removal_keeps_a_worker_whose_row_left_before_the_holder_followed() {
-        let f = Fixture::new();
+    async fn a_removal_keeps_a_worker_whose_row_left_under_its_object() {
+        let f = Fixture::around();
         let built = worker(URL, "model");
         let maker = Registrant::Control;
         let by = Remover::Registrant(&maker);
         for at_the_drain in [true, false] {
             f.seed(&maker, built.as_ref()).expect("registered");
+            lay_standing(&f.objects, &f.store);
             let live = f.host.registry.get_by_url(URL).expect("the held worker");
             let id = f.host.registry.get_id_by_url(URL).expect("its id");
             let seen = f.objects.standing_of(&id, &live).expect("its row");
@@ -1309,7 +1336,6 @@ mod tests {
                 assert!(removal.data.removed_workers.is_empty());
             }
             assert_eq!(removal.data.worker_urls, [URL]);
-            f.objects.follow(&*f.store);
         }
     }
 
@@ -1319,7 +1345,7 @@ mod tests {
         let workers = ranked_workers(2);
         let available = workers[0].url().to_owned();
         let occupied = workers[1].url().to_owned();
-        f.store.upsert(facts(workers[1].as_ref(), None));
+        f.laid(facts(workers[1].as_ref(), None));
         let before = f.store.by_key(&occupied);
         let mut cx = f.registration(WorkerJobAsker::Discovery, workers);
         let write = f.write();
@@ -1585,12 +1611,10 @@ mod tests {
     }
 
     /// A door another writer moved the row under: it writes the row another
-    /// way, has the holder follow, and then refuses. So the holder builds
-    /// the row's object while the registration is in flight.
+    /// way and then refuses. So the holder builds the row's object while
+    /// the registration is in flight.
     struct MovedUnder {
         door: Arc<dyn MembershipWriter>,
-        objects: Arc<Objects<Members>>,
-        store: Arc<MemoryStore>,
     }
 
     impl MembershipWriter for MovedUnder {
@@ -1619,7 +1643,6 @@ mod tests {
                         moved
                     })?;
             }
-            self.objects.follow(&*self.store);
             Err(MembershipWriteRefused::Moved)
         }
 
@@ -1668,8 +1691,6 @@ mod tests {
         let write = WriteWorkersToStore {
             door: Arc::new(MovedUnder {
                 door: Arc::clone(&f.door),
-                objects: Arc::clone(&f.objects),
-                store: Arc::clone(&f.store),
             }),
             ..f.write_keeping(&credentials)
         };
@@ -1834,7 +1855,7 @@ mod tests {
         // is not written.
         let f = Fixture::new();
         let ranks = ranked_workers(2);
-        f.store.upsert(WorkerFacts {
+        f.laid(WorkerFacts {
             labels: [("tier".to_owned(), "gold".to_owned())].into(),
             ..facts(ranks[1].as_ref(), None)
         });
@@ -1852,7 +1873,7 @@ mod tests {
         // tried again, and it lays the first rank.
         let f = Fixture::new();
         let ranks = ranked_workers(2);
-        f.store.upsert(facts(ranks[1].as_ref(), None));
+        f.laid(facts(ranks[1].as_ref(), None));
         let mut cx = f.registration(WorkerJobAsker::Api, ranks);
         cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
         f.write()
@@ -1938,7 +1959,6 @@ mod tests {
             row.facts.labels.get("tier").map(String::as_str),
             Some("silver")
         );
-        f.objects.follow(&*f.store);
         assert_eq!(f.host.registry.get_id_by_url(URL), Some(id.clone()));
 
         // The worker drains: its removal wins, and the replacement is told.
@@ -1978,7 +1998,6 @@ mod tests {
             ..Overload::default()
         };
         let standing = || {
-            f.objects.follow(&*f.store);
             let id = f.host.registry.get_id_by_url(URL).expect("the worker's id");
             let live = f.host.registry.get(&id).expect("the worker");
             (id, live)
@@ -2052,7 +2071,6 @@ mod tests {
         f.door
             .gone(Remover::Registrant(&Registrant::Control), URL, seen)
             .expect("removed");
-        f.objects.follow(&*f.store);
         assert!(matches!(held(&f.host.registry, &second, URL), Held::Gone));
     }
 
@@ -2092,7 +2110,6 @@ mod tests {
             .build();
         let mut cx = f.registration(WorkerJobAsker::Api, vec![Arc::new(built)]);
         f.write().execute(&mut cx).await.expect("registered");
-        f.objects.follow(&*f.store);
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let workflow =
             removal_from_store::<Host>(Arc::clone(&f.door), Arc::clone(&f.objects), SCOPE);
@@ -2128,9 +2145,10 @@ mod tests {
             assert!(Arc::ptr_eq(&workers[0], &live));
         }
         assert!(f.store.by_key(URL).is_none());
-        assert!(f.host.registry.get_by_url(URL).is_some());
-        f.objects.follow(&*f.store);
-        assert!(f.host.registry.get_by_url(URL).is_none());
+        assert!(
+            f.host.registry.get_by_url(URL).is_none(),
+            "gone with its row"
+        );
     }
 
     #[tokio::test]
@@ -2279,10 +2297,11 @@ mod tests {
     /// the job at either step.
     #[tokio::test]
     async fn a_removal_leaves_a_row_that_moved_and_drops_its_worker_from_the_job() {
-        let f = Fixture::new();
+        let f = Fixture::around();
         let built = worker(URL, "model");
         f.seed(&Registrant::Control, built.as_ref())
             .expect("registered");
+        lay_standing(&f.objects, &f.store);
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         f.door
             .found(&Registrant::Control, Precondition::Any, URL, &|old| {
@@ -2374,7 +2393,6 @@ mod tests {
                 }
             })
             .expect("registered again");
-        f.objects.follow(&*f.store);
         let replacement = f
             .host
             .registry

@@ -326,22 +326,14 @@ impl Replication {
         term: u64,
         now: Instant,
     ) -> Result<Option<(Parts, Arc<StoreCheckpoint>)>, Status> {
-        let parts = {
-            let mut holds = self.cuts.holds.lock();
-            holds.retain(|hold| hold.keeps(now));
-            if holds.len() >= RESTORES {
-                // Refused as its cut would be, where the term is not served.
-                return self.serves(term).map(|()| None);
-            }
-            let hold = Arc::new(Hold::default());
-            holds.push(Arc::clone(&hold));
-            Parts::held(hold)
+        let Some(room) = self.cuts.reserve(now) else {
+            // Refused as its cut would be, where the term is not served.
+            return self.serves(term).map(|()| None);
         };
-        // A cut that is refused gives the room back: the parts end their
-        // hold where they are dropped.
+        // A cut that is refused gives the room back: the reservation
+        // leaves its room where it is dropped.
         let cut = self.cut(term)?;
-        parts.hold.fill(Arc::clone(&cut), now);
-        Ok(Some((parts, cut)))
+        Ok(Some((room.fill(Arc::clone(&cut), now), cut)))
     }
 
     /// The restores' clock: a pass a beat until `stop`, on no stream's
@@ -363,13 +355,13 @@ impl Replication {
     #[cfg(test)]
     pub(super) fn stalled_since(&self, at: Instant) {
         let cut = self.cuts.at_head(&self.objects, &self.store, &self.log);
-        self.cuts.holds.lock().push(Arc::new(Hold::of(cut, at)));
+        self.cuts.stalled(cut, at);
     }
 
     /// How many restores this leader holds: a served case's own.
     #[cfg(test)]
     pub(super) fn held(&self) -> usize {
-        self.cuts.holds.lock().len()
+        self.cuts.held()
     }
 }
 
@@ -449,6 +441,15 @@ impl Hold {
         *self.0.lock() = Held::Gone;
     }
 
+    /// Gives the room back where no cut was made for it. A hold that got
+    /// its cut is its stream's by then, and stands.
+    fn leave(&self) {
+        let mut held = self.0.lock();
+        if matches!(*held, Held::Room) {
+            *held = Held::Gone;
+        }
+    }
+
     /// Lets the cut go where its stream took no part for [`STALLED`] at
     /// `now`, and says whether the leader still keeps the hold.
     fn keeps(&self, now: Instant) -> bool {
@@ -469,6 +470,34 @@ impl Kept {
         self.holds.lock().retain(|hold| hold.keeps(now));
     }
 
+    /// Room for one more restore at `now`, counted and taken in one hold
+    /// of the lock. The holds that ended leave first, and the ones whose
+    /// streams took no part for [`STALLED`]. `None` where [`RESTORES`]
+    /// stand still.
+    fn reserve(&self, now: Instant) -> Option<Reservation> {
+        let mut holds = self.holds.lock();
+        holds.retain(|hold| hold.keeps(now));
+        if holds.len() >= RESTORES {
+            return None;
+        }
+        let hold = Arc::new(Hold::default());
+        holds.push(Arc::clone(&hold));
+        Some(Reservation(hold))
+    }
+
+    /// A hold of `cut` as a stream that took no part since `at` leaves
+    /// it, with no room counted: a case's own.
+    #[cfg(test)]
+    fn stalled(&self, cut: Arc<StoreCheckpoint>, at: Instant) {
+        self.holds.lock().push(Arc::new(Hold::of(cut, at)));
+    }
+
+    /// How many holds stand: a case's own.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.holds.lock().len()
+    }
+
     fn at_head(
         &self,
         objects: &Objects<Members>,
@@ -483,6 +512,26 @@ impl Kept {
         let cut = Arc::new(objects.checkpoint(store));
         *kept = Arc::downgrade(&cut);
         cut
+    }
+}
+
+/// Room among a leader's restores, from its count ([`Kept::reserve`]) until
+/// the restore's cut fills it. Dropped unfilled, it gives the room back: a
+/// cut that is refused holds no place among the restores.
+#[derive(Debug)]
+struct Reservation(Arc<Hold>);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
+
+impl Reservation {
+    /// The parts of `cut` from `now`, in the room reserved: none sent yet.
+    fn fill(self, cut: Arc<StoreCheckpoint>, now: Instant) -> Parts {
+        self.0.fill(cut, now);
+        Parts::held(Arc::clone(&self.0))
     }
 }
 
@@ -1054,7 +1103,8 @@ mod tests {
         },
         stages::registry,
         store::{
-            LeasesStore, MembershipChange, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
+            LeasesStore, MembershipChange, Registrant, WorkerFacts, WorkerRow, WorkerStatus,
+            WorkersStore,
         },
     };
 
@@ -1068,6 +1118,9 @@ mod tests {
     struct Leader {
         elector: Elector,
         store: Arc<MemoryStore>,
+        /// The holder of the leader's worker objects: the cases write its
+        /// rows through it, and its cuts are taken from it.
+        objects: Arc<Objects<Members>>,
         log: Arc<Log>,
         term: u64,
         at: Instant,
@@ -1090,6 +1143,7 @@ mod tests {
             };
             Self {
                 elector,
+                objects: holder(&store),
                 store,
                 log: feed.log,
                 term,
@@ -1104,14 +1158,16 @@ mod tests {
             leader
         }
 
-        /// A holder of the leader's worker objects, for a cut. The cases
-        /// write their rows through the store's own entries, which take no
-        /// turn of a holder: this one follows the store once, as the host
-        /// of such a store has it follow.
+        /// The holder of the leader's worker objects, for a cut.
         fn objects(&self) -> Arc<Objects<Members>> {
-            let objects = holder(&self.store);
-            objects.follow(&*self.store);
-            objects
+            Arc::clone(&self.objects)
+        }
+
+        /// `facts` written through the leader's holder, as its registration
+        /// call writes a row: the row's id.
+        fn registers(&self, facts: WorkerFacts) -> WorkerId {
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write").id()
         }
 
         fn replication(&self) -> Replication {
@@ -1143,17 +1199,14 @@ mod tests {
         /// One worker and `more` watched writes behind it: generations by
         /// their numbers alone, each one small entry of the log.
         fn writes(&self, more: u32) -> WorkerId {
-            let id = self
-                .store
-                .upsert(WorkerFacts {
-                    key: "http://a:8000".to_owned(),
-                    engine: "http://a:8000".to_owned(),
-                    incarnation: 1,
-                    models: vec!["m".to_owned()],
-                    dp_size: 1,
-                    ..WorkerFacts::default()
-                })
-                .id();
+            let id = self.registers(WorkerFacts {
+                key: "http://a:8000".to_owned(),
+                engine: "http://a:8000".to_owned(),
+                incarnation: 1,
+                models: vec!["m".to_owned()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            });
             for generation in 1..=more {
                 Journal::generation(&*self.log, None, u64::from(generation));
             }
@@ -1173,7 +1226,7 @@ mod tests {
                     dp_size: 1,
                     ..WorkerFacts::default()
                 };
-                let _id = self.store.upsert(facts).id();
+                let _id = self.registers(facts);
             }
         }
     }
@@ -1470,7 +1523,7 @@ mod tests {
         // that holds three labels at a value's bound: an event carries the
         // row it replaced beside the row it wrote.
         for incarnation in 1..=257 {
-            leader.store.upsert(WorkerFacts {
+            leader.registers(WorkerFacts {
                 key: "http://a:8000".to_owned(),
                 engine: "http://a:8000".to_owned(),
                 incarnation,
@@ -1791,7 +1844,7 @@ mod tests {
                     .into(),
                 ..WorkerFacts::default()
             };
-            let _id = leader.store.upsert(facts).id();
+            let _id = leader.registers(facts);
         }
         let cut = leader.replication().cut(leader.term).expect("a cut");
         let sent = parts(Arc::clone(&cut), leader.at);

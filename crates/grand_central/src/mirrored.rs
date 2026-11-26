@@ -223,6 +223,7 @@ pub fn request_facts() -> &'static [&'static str] {
             client_key,
             ring,
             ring_positions,
+            decode_ring_positions,
             session_key_from_rid,
         }
     )
@@ -389,7 +390,8 @@ pub fn pair() -> &'static [&'static str] {
             decode_position,
             decode_id,
             decode_dp_rank,
-            decode_verdict
+            decode_verdict,
+            decode_placing
         }
     )
 }

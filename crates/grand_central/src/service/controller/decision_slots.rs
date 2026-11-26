@@ -1133,10 +1133,6 @@ impl Deciding {
         // The load reports the decision reads: the monitor's newest, taken
         // once a frame.
         let loads = self.loads.newest();
-        // No task follows the store under a case's deciders: each decision
-        // lays the worker objects of the rows written since the last.
-        #[cfg(test)]
-        objects.follow(&**store);
         // One load of the world for the decision and for its lease: the
         // engine that decides is the one whose stages the store tells of
         // the lease.
@@ -1556,9 +1552,10 @@ const fn busy_of(refused: DecodeRefused) -> Reason {
 /// Takes back the issue of a decode call whose answer does not leave: the
 /// side stands as the call found it and its booking is freed
 /// ([`MemoryStore::unissue_decode`]), then the engine that heard the issue
-/// is told the side's release, once: the engine of the lease's generation
-/// ([`issuing`]), where it still stands. A side that moved since was ended
-/// or issued anew by another hand, and nothing is told of it here.
+/// is told the side's release, once: the engine of the lease's generation,
+/// or what a later one kept of its stages ([`issuing`]). A side that moved
+/// since was ended or issued anew by another hand, and nothing is told of
+/// it here.
 fn take_back(
     store: &MemoryStore,
     world: &StoreSnapshot,
@@ -1568,7 +1565,7 @@ fn take_back(
     reason: ReleaseReason,
 ) {
     if store.unissue_decode(gateway, lease.id, issue) {
-        if let Some(engine) = issuing(world.spec(), lease) {
+        if let Some(engine) = issuing(world, lease) {
             engine.on_released(lease, reason);
         }
     }
@@ -1658,8 +1655,8 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
-            DecodeIssue, DecodeMark, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore,
-            WorkerFacts, WorkerStatus, WorkersStore,
+            DecodeIssue, DecodeMark, GatewayId, HealthSink, LeaseState, LeasesStore,
+            MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore,
         },
         tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
         worker_host::{stand, Members, Objects},
@@ -1751,9 +1748,7 @@ pub(crate) mod tests {
     }
 
     /// The holder of a case's worker objects over `store`, built as the
-    /// controller builds its own. No task follows the store under a case:
-    /// a decider lays the objects of the rows written since its last
-    /// decision.
+    /// controller builds its own. A case writes its rows through it.
     pub(crate) fn holder(store: &Arc<MemoryStore>) -> Arc<Objects<Members>> {
         WorkerObjects::new(Arc::clone(store)).holder()
     }
@@ -1836,21 +1831,46 @@ pub(crate) mod tests {
             .expect("the catalog holds the stage")
     }
 
+    /// The row of `facts`, written through the holder of `store`'s worker
+    /// objects: the row's id. A new row, and a key's next life, is made
+    /// ready by its connect signal. A row written again where it stood
+    /// keeps the status its object stands in.
+    pub(crate) fn written_ready(
+        store: &MemoryStore,
+        objects: &Objects<Members>,
+        facts: WorkerFacts,
+    ) -> WorkerId {
+        let written = objects.upsert(store, facts, Registrant::Control);
+        let written = written.expect("the store takes the write");
+        let id = written.id();
+        store.publish_now();
+        if matches!(
+            written,
+            MembershipChange::Registered { .. } | MembershipChange::Replaced { .. }
+        ) {
+            let row = objects.record(id).expect("the record the write laid");
+            objects.connect_row(store, id, row.revision);
+        }
+        id
+    }
+
     /// The member `name`, serving `model` in `role` and stating `wires`,
     /// ready: written again where it stood, with its status as it was.
     pub(crate) fn ready(
         store: &MemoryStore,
+        objects: &Objects<Members>,
         name: &str,
         model: &str,
         role: Role,
         wires: WireModes,
     ) -> WorkerId {
-        serving(store, name, &[model], role, wires)
+        serving(store, objects, name, &[model], role, wires)
     }
 
     /// [`ready`] for a member that serves each of `models`.
     fn serving(
         store: &MemoryStore,
+        objects: &Objects<Members>,
         name: &str,
         models: &[&str],
         role: Role,
@@ -1868,22 +1888,18 @@ pub(crate) mod tests {
             max_running: Some(4),
             ..WorkerFacts::default()
         };
-        let id = store.upsert(facts).id();
-        store.publish_now();
-        let row = WorkersStore::get(store, id).expect("the row");
-        if row.status != WorkerStatus::Ready {
-            store
-                .set_status(id, WorkerStatus::Ready, row.revision)
-                .expect("the row stands");
-        }
-        id
+        written_ready(store, objects, facts)
     }
 
     /// Three ready members serving [`MODEL`] in the single role, and one in
     /// each other role beside the phase that role serves. None states a
     /// wire.
-    pub(crate) fn fleet(store: &MemoryStore) -> (Vec<WorkerId>, [(proto::Phase, WorkerId); 3]) {
-        let member = |name: &str, role: Role| ready(store, name, MODEL, role, WireModes::NONE);
+    pub(crate) fn fleet(
+        store: &MemoryStore,
+        objects: &Objects<Members>,
+    ) -> (Vec<WorkerId>, [(proto::Phase, WorkerId); 3]) {
+        let member =
+            |name: &str, role: Role| ready(store, objects, name, MODEL, role, WireModes::NONE);
         let singles = ["w0", "w1", "w2"].map(|name| member(name, Role::Single));
         let sides = [
             (proto::Phase::Prefill, member("p0", Role::Prefill)),
@@ -1904,7 +1920,8 @@ pub(crate) mod tests {
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
         let store = Arc::new(MemoryStore::new().with_decision_slots(deciders));
-        let (workers, _sides) = fleet(&store);
+        let objects = holder(&store);
+        let (workers, _sides) = fleet(&store, &objects);
         if let Some(spec) = spec {
             store.apply(spec).expect("above the unbound start");
         }
@@ -1934,7 +1951,7 @@ pub(crate) mod tests {
         let (loads, published) = watch::channel(Arc::new(LoadSnapshot::default()));
         let reads = Reads {
             store: Arc::clone(&store),
-            objects: holder(&store),
+            objects,
             loads: published,
             fence: elector.fence(),
             standing: stood,
@@ -2058,7 +2075,7 @@ pub(crate) mod tests {
     }
 
     /// The worker the in-process front names first for `frame`, over the
-    /// list `objects` lends as it stands. No follow is made here: the
+    /// list `objects` lends as it stands: the
     /// answer reads what the holder held when it was asked. `None` where
     /// the front names no worker.
     pub(crate) fn lent_pick(
@@ -2132,7 +2149,6 @@ pub(crate) mod tests {
             let wire = frame.facts.as_ref().expect("the case's frame has facts");
             let left = Duration::from_micros(u64::from(wire.budget_micros));
             let objects = &self.reads.objects;
-            objects.follow(&*self.store);
             let decision = self.store.deciding(|world| {
                 let front = world.front();
                 let mut lists = wire::Lists::default();
@@ -2503,11 +2519,12 @@ pub(crate) mod tests {
             let at = bed.script.taken;
             let (near, far, aside) = (bed.workers[0], bed.workers[1], bed.workers[2]);
             // Two workers take requests: the third is set not ready.
-            let row = WorkersStore::get(&*bed.store, aside).expect("the row");
-            let set = bed
-                .store
-                .set_status(aside, WorkerStatus::NotReady, row.revision);
-            set.expect("the row stands");
+            stand(
+                &bed.reads.objects,
+                &bed.store,
+                aside,
+                WorkerStatus::NotReady,
+            );
             // One request on each of the two, held by a lease on file that
             // no decision of the policy's filed.
             for (id, target) in [(1, near), (2, far)] {
@@ -2667,7 +2684,8 @@ pub(crate) mod tests {
         for name in spec::PRESETS {
             let mut bed = bed(Some(preset(name, 1)), true, (1, 8), []);
             let beside = Arc::new(MemoryStore::new().with_decision_slots(1));
-            fleet(&beside);
+            let objects = holder(&beside);
+            fleet(&beside, &objects);
             let applied = beside.apply(preset(name, 1));
             applied.expect("above the unbound start");
             // Three more workers on each side, which state their wires: a
@@ -2679,16 +2697,15 @@ pub(crate) mod tests {
                 ("b0", both),
             ];
             let mut dialed = Vec::new();
-            for store in [&bed.store, &beside] {
-                let more =
-                    stating.map(|(worker, wires)| ready(store, worker, MODEL, Role::Single, wires));
+            for (store, objects) in [(&bed.store, &bed.reads.objects), (&beside, &objects)] {
+                let more = stating.map(|(worker, wires)| {
+                    ready(store, objects, worker, MODEL, Role::Single, wires)
+                });
                 dialed = more[1..].to_vec();
             }
             let vetoed = bed.workers[1];
             let until = bed.script.taken + Duration::from_secs(60);
             bed.store.gateway_veto(VETOING, vetoed, Some(until));
-            let objects = holder(&beside);
-            objects.follow(&*beside);
             let at = bed.script.taken;
             for id in 1..=30u8 {
                 let (gateway, wires) = match id % 3 {
@@ -2813,6 +2830,54 @@ pub(crate) mod tests {
         (bed, sent, row.facts)
     }
 
+    /// The record of sent prefixes stands across an apply: the store keeps
+    /// one engine for its life, and the record is that engine's. A request
+    /// whose prefix was sent under the generation before lands where the
+    /// prefix was sent.
+    #[tokio::test]
+    async fn a_request_lands_where_its_prefix_was_sent_under_the_generation_before() {
+        let (mut bed, sent, _) = sent_one_prefix().await;
+        let next = preset("cache_aware", 2);
+        bed.store.apply(next).expect("a later generation");
+        assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
+        // Each lease on file books its worker: load alone would send the
+        // next request to another.
+        for (id, seed) in (2..=4).zip(101..) {
+            let returned = picked(&bed.ask(hashed(id, seed)).await);
+            assert_eq!(returned, sent, "request {id}");
+        }
+    }
+
+    /// The store tells its one engine each word of its membership, under
+    /// whichever generation stands. A worker that leaves behind an apply
+    /// leaves the record of the prefixes it was sent under the generation
+    /// before, and registered again under its id it is named for none of
+    /// them.
+    #[tokio::test]
+    async fn a_worker_that_left_behind_an_apply_is_named_for_no_prefix_it_held_before() {
+        let (bed, sent, facts) = sent_one_prefix().await;
+        let next = preset("cache_aware", 2);
+        bed.store.apply(next).expect("a later generation");
+        assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
+        let row = WorkersStore::get(&*bed.store, sent).expect("the row");
+        bed.store.remove(sent, row.revision).expect("removed");
+        assert_eq!(
+            sent_prefixes(&bed),
+            Some(Vec::new()),
+            "the record forgot it"
+        );
+        assert_eq!(bed.store.upsert(facts).id(), sent, "its id again");
+        assert_eq!(sent_prefixes(&bed), Some(Vec::new()));
+    }
+
+    /// `facts` written through the bed's holder, as a registration call
+    /// writes a row: the row's id.
+    fn rewritten(bed: &Bed, facts: WorkerFacts) -> WorkerId {
+        let (store, objects) = (&bed.store, &bed.reads.objects);
+        let written = objects.upsert(store, facts, Registrant::Control);
+        written.expect("the store takes the write").id()
+    }
+
     /// A served engine's records of sent prefixes hear the store's word of
     /// a replacement. A key registered again under a new incarnation is a
     /// new id, and the records keep no place for the id that went.
@@ -2823,7 +2888,7 @@ pub(crate) mod tests {
             incarnation: facts.incarnation + 1,
             ..facts
         };
-        let replaced = bed.store.upsert(next).id();
+        let replaced = rewritten(&bed, next);
         assert_ne!(replaced, sent, "a new incarnation is a new id");
         assert_eq!(sent_prefixes(&bed), Some(Vec::new()));
     }
@@ -2845,14 +2910,14 @@ pub(crate) mod tests {
             ..facts.clone()
         };
         for kept in [relabelled, resized] {
-            assert_eq!(bed.store.upsert(kept).id(), sent);
+            assert_eq!(rewritten(&bed, kept), sent);
             assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
         }
         let elsewhere = WorkerFacts {
             models: vec!["model-b".to_owned()],
             ..facts
         };
-        assert_eq!(bed.store.upsert(elsewhere).id(), sent, "the id stands");
+        assert_eq!(rewritten(&bed, elsewhere), sent, "the id stands");
         assert_eq!(sent_prefixes(&bed), Some(Vec::new()));
     }
 
@@ -2915,10 +2980,11 @@ pub(crate) mod tests {
         let pinned = picked(&bed.ask(keyed(1, 1_001)).await);
         assert_eq!(absent(&bed), 0, "every worker stands");
         let row = WorkersStore::get(&*bed.store, pinned).expect("the row");
-        let removed = WorkersStore::remove(&*bed.store, pinned, row.revision);
+        let objects = &bed.reads.objects;
+        let removed = objects.remove(&bed.store, pinned, row.revision);
         assert!(removed.is_some(), "the store took the worker out");
         assert_eq!(absent(&bed), 1, "the worker its key is pinned on left");
-        assert_eq!(bed.store.upsert(row.facts).id(), pinned, "its id again");
+        assert_eq!(rewritten(&bed, row.facts), pinned, "its id again");
         assert_eq!(absent(&bed), 0, "back under its id");
     }
 
@@ -4591,7 +4657,14 @@ pub(crate) mod tests {
         let models = a_model_each(&bed.deciders, 2);
         let served: Vec<&str> = models.iter().map(String::as_str).collect();
         for name in ["s0", "s1", "s2"] {
-            serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
+            serving(
+                &bed.store,
+                &bed.reads.objects,
+                name,
+                &served,
+                Role::Single,
+                WireModes::NONE,
+            );
         }
         let hand = Hand::new(GATEWAY);
         let answer = bed.ask(frame_for(&models[0], 1, 1)).await;
@@ -4693,7 +4766,14 @@ pub(crate) mod tests {
         let models = a_model_each(&bed.deciders, deciders);
         let served: Vec<&str> = models.iter().map(String::as_str).collect();
         for name in ["s0", "s1", "s2"] {
-            serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
+            serving(
+                &bed.store,
+                &bed.reads.objects,
+                name,
+                &served,
+                Role::Single,
+                WireModes::NONE,
+            );
         }
         let hand = Hand::new(GATEWAY);
         for model in &models {
@@ -4814,7 +4894,14 @@ pub(crate) mod tests {
         let models = a_model_each(&bed.deciders, 2);
         let served: Vec<&str> = models.iter().map(String::as_str).collect();
         for name in ["s0", "s1", "s2"] {
-            serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
+            serving(
+                &bed.store,
+                &bed.reads.objects,
+                name,
+                &served,
+                Role::Single,
+                WireModes::NONE,
+            );
         }
         let hand = Hand::new(GATEWAY);
         let pause = |long: Duration| {
@@ -4876,8 +4963,9 @@ pub(crate) mod tests {
     }
 
     /// An abandoned lease is told to the engine whose generation issued it
-    /// and to no later one: a later generation's stages never saw the
-    /// issue. The lease is ended all the same.
+    /// and to no stage a later one built new: such a stage never saw the
+    /// issue. Each generation here is validated over a stage table of its
+    /// own, so the later one keeps none. The lease is ended all the same.
     #[tokio::test]
     async fn a_later_generations_engine_is_not_told_of_a_lease_it_did_not_issue() {
         let told = Arc::new(Mutex::new(Vec::new()));
@@ -5002,14 +5090,11 @@ pub(crate) mod tests {
             max_running: Some(4),
             ..WorkerFacts::default()
         };
-        let late = bed.store.upsert(facts).id();
+        let late = rewritten(&bed, facts);
         let row = WorkersStore::get(&*bed.store, late).expect("the row");
-        if row.status != WorkerStatus::Ready {
-            let moved = bed
-                .store
-                .set_status(late, WorkerStatus::Ready, row.revision);
-            moved.expect("the row stands");
-        }
+        bed.reads
+            .objects
+            .connect_row(&bed.store, late, row.revision);
         let listed = bed.store.snapshot().booked_of(late);
         assert_eq!(listed, None, "no world lists the worker yet");
         for request in 1..=2u8 {
@@ -5705,6 +5790,7 @@ pub(crate) mod tests {
         // of it stands in the registry's lists.
         serving(
             &bed.store,
+            &bed.reads.objects,
             "s9",
             &["model-of-singles"],
             Role::Single,
@@ -5928,7 +6014,14 @@ pub(crate) mod tests {
     fn later_bed_of(deciders: usize) -> (Bed, Arc<Mutex<SideCalls>>, WorkerId) {
         let told = Arc::new(Mutex::new(Vec::new()));
         let bed = bed(Some(later_spec(1, &told)), true, (deciders, 8), []);
-        ready(&bed.store, "d1", MODEL, Role::Decode, WireModes::NONE);
+        ready(
+            &bed.store,
+            &bed.reads.objects,
+            "d1",
+            MODEL,
+            Role::Decode,
+            WireModes::NONE,
+        );
         let prefill = side_of(&bed, Role::Prefill);
         (bed, told, prefill)
     }
@@ -5956,12 +6049,30 @@ pub(crate) mod tests {
         told: &Arc<Mutex<SideCalls>>,
         edit: impl FnOnce(&mut PolicySpec),
     ) -> AppliedSpec {
+        hearing_sides(&mut catalog, told);
+        later_spec_over(&catalog, generation, edit)
+    }
+
+    /// Adds to `catalog` the stage of [`later_bed`]'s decode side, which
+    /// keeps what its engine tells it in `told`.
+    fn hearing_sides(catalog: &mut StageRegistry, told: &Arc<Mutex<SideCalls>>) {
         let kept = Arc::clone(told);
         catalog
             .scorer("heard-sides", move || {
                 Box::new(HeardSides(Arc::clone(&kept)))
             })
             .expect("a free name");
+    }
+
+    /// The document of [`later_bed`] as `generation`, validated over
+    /// `catalog`, which holds its decode side's stage ([`hearing_sides`]).
+    /// Two documents validated over one catalog are a controller's: the
+    /// later one keeps the stages of a profile both state alike.
+    fn later_spec_over(
+        catalog: &StageRegistry,
+        generation: u64,
+        edit: impl FnOnce(&mut PolicySpec),
+    ) -> AppliedSpec {
         let mut document: PolicySpec = serde_json::from_str(
             r#"{
               "apiVersion": "smg.policy/v1",
@@ -5981,7 +6092,7 @@ pub(crate) mod tests {
         document.generation = generation;
         edit(&mut document);
         let digest = document.digest().expect("the document digests");
-        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+        AppliedSpec::validate_digested(&document, digest, catalog, &[])
             .expect("the catalog holds the stage")
     }
 
@@ -6196,14 +6307,11 @@ pub(crate) mod tests {
             max_running: Some(4),
             ..WorkerFacts::default()
         };
-        let late = bed.store.upsert(facts).id();
+        let late = rewritten(&bed, facts);
         let row = WorkersStore::get(&*bed.store, late).expect("the row");
-        if row.status != WorkerStatus::Ready {
-            let moved = bed
-                .store
-                .set_status(late, WorkerStatus::Ready, row.revision);
-            moved.expect("the row stands");
-        }
+        bed.reads
+            .objects
+            .connect_row(&bed.store, late, row.revision);
         let listed = bed.store.snapshot().booked_of(late);
         assert_eq!(listed, None, "no world lists the worker yet");
         file(&bed.store, 1, other, bed.script.taken);
@@ -6272,7 +6380,14 @@ pub(crate) mod tests {
             profile.filter.push("ends".into());
         });
         let mut bed = bed(Some(spec), true, (1, 8), []);
-        ready(&bed.store, "d1", MODEL, Role::Decode, WireModes::NONE);
+        ready(
+            &bed.store,
+            &bed.reads.objects,
+            "d1",
+            MODEL,
+            Role::Decode,
+            WireModes::NONE,
+        );
         let prefill = side_of(&bed, Role::Prefill);
         let (id, [chosen, other], _) = held(&mut bed).await;
         *armed.lock() = Some((Arc::downgrade(&bed.store), LeaseId(id)));
@@ -6603,7 +6718,6 @@ pub(crate) mod tests {
         let lease = request.decode_of().expect("a decode call's frame");
         let Reads { store, objects, .. } = &bed.reads;
         let loads = Arc::new(LoadSnapshot::default());
-        objects.follow(&**store);
         let decided = store.deciding(|world| {
             let theirs = (&mut frames, &loads, &part);
             decode_call(store, world, objects, &taken, lease, theirs, &mut caught)
@@ -6835,6 +6949,46 @@ pub(crate) mod tests {
         assert_eq!(booked(&bed, [prefill, chosen, other]), [2, 1, 0]);
         assert_eq!(*reloaded.lock(), []);
         assert_eq!(told.lock().len(), before);
+    }
+
+    /// A call's issue behind a reload that states the decode side's
+    /// profile as it stood is told to that profile's stage, which the
+    /// reload kept, and so is its take-back: the stage stood when the lease
+    /// was issued. Both documents are validated over one catalog, as a
+    /// controller validates its documents.
+    #[tokio::test]
+    async fn a_decode_issued_and_taken_back_behind_a_reload_is_told_to_the_stage_it_kept() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut catalog = StageRegistry::builtin();
+        hearing_sides(&mut catalog, &told);
+        let first = later_spec_over(&catalog, 1, |_| {});
+        let mut bed = bed(Some(first), true, (1, 8), []);
+        ready(
+            &bed.store,
+            &bed.reads.objects,
+            "d1",
+            MODEL,
+            Role::Decode,
+            WireModes::NONE,
+        );
+        let prefill = side_of(&bed, Role::Prefill);
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let store = Arc::clone(&bed.store);
+        let before = told.lock().len();
+        let applied = store.apply(later_spec_over(&catalog, 2, |_| {}));
+        applied.expect("a later generation");
+        let steps = [Step::At(Duration::ZERO), Step::At(FENCED)];
+        bed.script.steps.lock().extend(steps);
+        let answer = bed.ask(call(1, id)).await;
+        assert_eq!(busy(&answer), Reason::NotLeader);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, chosen));
+        assert_eq!(booked(&bed, [prefill, chosen, other]), [2, 1, 0]);
+        // The side's issue on the decode the call picked, then its release.
+        let heard = told.lock()[before..].to_vec();
+        let [(Side::Decode, issued, None), (Side::Decode, released, Some(_))] = heard[..] else {
+            panic!("the stage kept heard {heard:?}");
+        };
+        assert_eq!((issued, released), (other, other));
     }
 
     /// A replica that does not lead says so for a request it has no
@@ -7144,7 +7298,14 @@ pub(crate) mod tests {
         const SPOKEN: &str = "model-http";
         let mut bed = leading([]);
         let store = Arc::clone(&bed.store);
-        let first = ready(&store, "h0", SPOKEN, Role::Single, WireModes::HTTP);
+        let first = ready(
+            &store,
+            &bed.reads.objects,
+            "h0",
+            SPOKEN,
+            Role::Single,
+            WireModes::HTTP,
+        );
         let answer = bed.ask(frame_for(SPOKEN, 100, 100)).await;
         assert_eq!(targets(&answer), [first], "no constraints");
         // The wires a gateway states, its hint, and the stage its decision
@@ -7178,8 +7339,22 @@ pub(crate) mod tests {
         // The wires took the member in four decisions: under a hint of 0
         // they had none to take.
         assert_eq!(bed.counts.undialed(), 4);
-        ready(&store, "g0", SPOKEN, Role::Single, WireModes::GRPC);
-        let second = ready(&store, "h1", SPOKEN, Role::Single, WireModes::HTTP);
+        ready(
+            &store,
+            &bed.reads.objects,
+            "g0",
+            SPOKEN,
+            Role::Single,
+            WireModes::GRPC,
+        );
+        let second = ready(
+            &store,
+            &bed.reads.objects,
+            "h1",
+            SPOKEN,
+            Role::Single,
+            WireModes::HTTP,
+        );
         for seed in 0..32_u8 {
             let frame = frame_for(SPOKEN, 40 + seed, u64::from(seed));
             let mut frame = constrained(frame, 0b001, None);
@@ -7211,7 +7386,7 @@ pub(crate) mod tests {
             ("w1", WireModes::GRPC),
             ("w2", both),
         ]
-        .map(|(name, wires)| ready(&store, name, MODEL, Role::Single, wires));
+        .map(|(name, wires)| ready(&store, &bed.reads.objects, name, MODEL, Role::Single, wires));
         let mut dialed = [grpc, either];
         dialed.sort_unstable();
         let mut named = BTreeSet::new();
@@ -7247,6 +7422,7 @@ pub(crate) mod tests {
         for row in 0..16 {
             ready(
                 &store,
+                &bed.reads.objects,
                 &format!("h{row}"),
                 TWO,
                 Role::Single,
@@ -7254,6 +7430,7 @@ pub(crate) mod tests {
             );
             ready(
                 &store,
+                &bed.reads.objects,
                 &format!("g{row}"),
                 TWO,
                 Role::Single,
@@ -7261,6 +7438,7 @@ pub(crate) mod tests {
             );
             ready(
                 &store,
+                &bed.reads.objects,
                 &format!("o{row}"),
                 ONE,
                 Role::Single,
@@ -7352,6 +7530,7 @@ pub(crate) mod tests {
                 .expect("a model on each decider");
             ready(
                 &store,
+                &bed.reads.objects,
                 &format!("m{decider}"),
                 &model,
                 Role::Single,
@@ -7424,11 +7603,11 @@ pub(crate) mod tests {
     }
 
     /// A keyed session keeps its worker across an apply of a new
-    /// generation. The new document's engine is to take the session table
-    /// of the engine before it (`Engine::share_sessions`): a decision of a
-    /// dispatched key is made on its pin under either generation.
+    /// generation. The store's engine keeps one session table for its
+    /// life, and each generation's stages read it
+    /// (`AppliedSpec::share_sessions`): a decision of a dispatched key is
+    /// made on its pin under either generation.
     #[tokio::test]
-    #[ignore = "a new document's engine starts with no session pin yet"]
     async fn a_keyed_session_keeps_its_worker_across_an_apply() {
         use crate::{
             engine::sticky_sessions::SessionVerdict,
@@ -7479,7 +7658,7 @@ pub(crate) mod tests {
             assert_eq!(picked(&answer), worker);
             assert_eq!(verdict(&bed, &answer), SessionVerdict::Pinned);
         }
-        // A new generation: its engine is to hold the pins of the one before.
+        // A new generation: the pins of the one before stand.
         let held = pins(&bed, first[0].2);
         assert!(held.is_some());
         bed.store

@@ -2,6 +2,8 @@
 
 mod decode_again;
 mod named;
+mod ring_words;
+pub(super) mod rows;
 mod ruled;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};

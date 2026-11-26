@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -17,7 +17,7 @@ use std::{
 use axum::{
     body::{Body, Bytes},
     extract::{RawQuery, State},
-    http::header,
+    http::{header, StatusCode},
     response::Response,
     routing::any,
     Router,
@@ -27,18 +27,17 @@ use k8s_openapi::{
     api::core::v1::{Pod, PodCondition, PodStatus},
     apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
 };
-use rustls::crypto::ring;
 use smg::{
     app_context::AppContext,
-    mesh::discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
+    mesh::discovery::{start_mesh_discovery_on, MeshDiscoveryConfig},
     routers::grpc::backend_client::BasicWorkerBuilder,
 };
 use smg_service_discovery::{
-    start_service_discovery_with_client, DiscoveryHost, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
+    start_service_discovery_on, DiscoveryHost, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
     DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
 };
 use smg_worker::test_support::RefusedAddress;
-use tokio::sync::broadcast;
+use tokio::{sync::broadcast, task::JoinHandle};
 
 use super::{start_mock_engine, test_context_with_drain};
 use crate::common;
@@ -50,10 +49,15 @@ struct FakeState {
     pods: Arc<Mutex<BTreeMap<String, Pod>>>,
     resource_version: Arc<AtomicU64>,
     watch_tx: Arc<Mutex<broadcast::Sender<String>>>,
+    /// Whether the next LIST is refused.
+    refuse_next_list: Arc<AtomicBool>,
+    /// LIST calls answered, a refused one too.
+    lists: Arc<AtomicU64>,
 }
 
-/// Minimal pods endpoint: LIST returns the current pod set, WATCH streams
-/// scripted line-delimited events; a 410 ERROR event forces a re-LIST.
+/// Minimal pods endpoint: LIST returns the current pod set, or refuses as
+/// scripted; WATCH streams scripted line-delimited events; a 410 ERROR event
+/// forces a re-LIST.
 struct FakeK8s {
     state: FakeState,
     base_url: String,
@@ -66,6 +70,8 @@ impl FakeK8s {
             pods: Arc::new(Mutex::new(BTreeMap::new())),
             resource_version: Arc::new(AtomicU64::new(1)),
             watch_tx: Arc::new(Mutex::new(broadcast::channel(64).0)),
+            refuse_next_list: Arc::default(),
+            lists: Arc::default(),
         };
         let app = Router::new()
             .route("/api/v1/pods", any(pods_handler))
@@ -81,10 +87,33 @@ impl FakeK8s {
         }
     }
 
-    fn client(&self) -> kube::Client {
-        let _ = ring::default_provider().install_default();
-        let config = kube::Config::new(self.base_url.parse().unwrap());
-        kube::Client::try_from(config).unwrap()
+    /// The client configuration that names this API server, as a served
+    /// gateway infers the one of its cluster.
+    fn config(&self) -> kube::Config {
+        kube::Config::new(self.base_url.parse().unwrap())
+    }
+
+    /// Worker discovery on this API server, started as a served gateway
+    /// starts it on the configuration it infers.
+    fn start_workers(
+        &self,
+        config: ServiceDiscoveryConfig,
+        host: Arc<dyn DiscoveryHost>,
+    ) -> JoinHandle<()> {
+        start_service_discovery_on(self.config(), config, host).unwrap()
+    }
+
+    /// Refuse the next LIST with 503 and a `Retry-After` of an hour.
+    fn refuse_the_next_list(&self) {
+        self.state.refuse_next_list.store(true, Ordering::SeqCst);
+    }
+
+    /// The LIST calls answered so far, and whether a refusal is still owed.
+    fn lists_and_refusal_owed(&self) -> (u64, bool) {
+        (
+            self.state.lists.load(Ordering::SeqCst),
+            self.state.refuse_next_list.load(Ordering::SeqCst),
+        )
     }
 
     fn apply_pod(&self, pod: Pod) {
@@ -187,6 +216,24 @@ async fn pods_handler(State(state): State<FakeState>, RawQuery(query): RawQuery)
             .body(Body::from_stream(stream))
             .unwrap()
     } else {
+        state.lists.fetch_add(1, Ordering::SeqCst);
+        if state.refuse_next_list.swap(false, Ordering::SeqCst) {
+            let status = serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "metadata": {},
+                "status": "Failure",
+                "message": "the server is currently unable to handle the request",
+                "reason": "ServiceUnavailable",
+                "code": 503,
+            });
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::RETRY_AFTER, "3600")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(status.to_string()))
+                .unwrap();
+        }
         let items: Vec<Pod> = state.pods.lock().unwrap().values().cloned().collect();
         let list = serde_json::json!({
             "kind": "PodList",
@@ -243,6 +290,26 @@ fn discovery_config() -> ServiceDiscoveryConfig {
     }
 }
 
+/// The Ready router Pod `r-0`, which names its mesh port 7100.
+fn router_pod() -> Pod {
+    let mut router = worker_pod("r-0", "uid-r-0", "1", true);
+    router.metadata.labels = Some([("role".to_string(), "router".to_string())].into());
+    router.metadata.annotations = Some(
+        [("sglang.ai/mesh-port".to_string(), "7100".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    router
+}
+
+/// Router discovery by the label of [`router_pod`].
+fn router_discovery_config() -> MeshDiscoveryConfig {
+    MeshDiscoveryConfig {
+        router_selector: [("role".to_string(), "router".to_string())].into(),
+        ..Default::default()
+    }
+}
+
 async fn test_context() -> Arc<AppContext> {
     test_context_with_drain(0).await
 }
@@ -289,8 +356,7 @@ async fn multi_port_pod_registers_and_removes_all_workers() {
         true,
     ));
 
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -332,8 +398,7 @@ async fn terminating_pod_drains_before_final_deletion() {
     let (_engine, port) = start_mock_engine().await;
 
     fake.apply_pod(worker_pod("term-0", "uid-term-0", &port.to_string(), true));
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -387,8 +452,7 @@ async fn zombie_worker_removed_and_manual_worker_kept() {
     app_context.worker_registry.register(zombie).unwrap();
     app_context.worker_registry.register(manual).unwrap();
 
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -418,8 +482,7 @@ async fn watch_interruption_relists_and_converges() {
     let (_engine, port) = start_mock_engine().await;
 
     fake.apply_pod(worker_pod("re-0", "uid-re-0", &port.to_string(), true));
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -461,8 +524,7 @@ async fn drain_window_is_honored_despite_reconcile_passes() {
         &port.to_string(),
         true,
     ));
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -603,8 +665,7 @@ async fn failed_registration_retries_until_engine_appears() {
     let port = reserved.port();
 
     fake.apply_pod(worker_pod("late-0", "uid-late-0", &port.to_string(), true));
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -646,8 +707,7 @@ async fn pod_added_after_start_registers_only_once_ready() {
 
     // Discovery starts against an empty cluster; everything below arrives
     // through watch events, not the initial LIST.
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -680,8 +740,7 @@ async fn ready_pod_becoming_unready_removes_all_workers_and_recovers() {
     let ports = format!("{port_a},{port_b}");
 
     fake.apply_pod(worker_pod("ready-flip-0", "uid-ready-flip-0", &ports, true));
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -759,8 +818,7 @@ async fn same_url_pod_replacement_reregisters_with_new_uid() {
         ("smg.ai/kv-engine-id".to_string(), "engine-gen1".to_string()),
     ]);
     fake.apply_pod(first);
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -851,8 +909,7 @@ async fn kv_annotation_edit_on_a_live_pod_updates_its_worker_in_place() {
     let nixl = || vec![Some("NixlConnector".to_string())];
 
     fake.apply_pod(pod("MooncakeConnector"));
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -905,8 +962,7 @@ async fn annotation_port_change_reconciles_worker_set() {
         &format!("{port_a},{port_b}"),
         true,
     ));
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -957,8 +1013,7 @@ async fn severed_watch_reconnects_and_converges_without_relist() {
     let (_engine, port) = start_mock_engine().await;
 
     fake.apply_pod(worker_pod("re2-0", "uid-re2-0", &port.to_string(), true));
-    let handle = start_service_discovery_with_client(
-        fake.client(),
+    let handle = fake.start_workers(
         discovery_config(),
         Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
@@ -995,23 +1050,16 @@ async fn mesh_router_discovery_runs_without_worker_discovery() {
 
     // Mesh router discovery runs on its own lifecycle: no worker discovery
     // is started here, and none of these router pods may become workers.
-    let config = MeshDiscoveryConfig {
-        router_selector: [("role".to_string(), "router".to_string())].into(),
-        ..Default::default()
-    };
     let cluster_state: smg_mesh::ClusterState = Arc::default();
+    fake.apply_pod(router_pod());
 
-    let mut router = worker_pod("r-0", "uid-r-0", "1", true);
-    router.metadata.labels = Some([("role".to_string(), "router".to_string())].into());
-    router.metadata.annotations = Some(
-        [("sglang.ai/mesh-port".to_string(), "7100".to_string())]
-            .into_iter()
-            .collect(),
-    );
-    fake.apply_pod(router.clone());
-
-    let handle =
-        start_mesh_discovery_with_client(fake.client(), config, cluster_state.clone(), 7000);
+    let handle = start_mesh_discovery_on(
+        fake.config(),
+        router_discovery_config(),
+        cluster_state.clone(),
+        7000,
+    )
+    .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -1052,6 +1100,80 @@ async fn mesh_router_discovery_runs_without_worker_discovery() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    handle.abort();
+}
+
+/// A watch's client sends a call once: the client library's own retry, on by
+/// default since its 4.0 release, is off. A LIST the API server refuses with
+/// 503 comes back to the watcher, whose own backoff sends the next one within
+/// seconds. A client that sent the call again by itself would first wait out
+/// the hour the answer's `Retry-After` names, and the worker would not show.
+#[tokio::test]
+async fn a_worker_watch_lists_again_by_its_own_backoff_after_a_refusal() {
+    let fake = FakeK8s::start().await;
+    let app_context = test_context().await;
+    let (_engine, port) = start_mock_engine().await;
+    fake.apply_pod(worker_pod(
+        "refused-0",
+        "uid-refused-0",
+        &port.to_string(),
+        true,
+    ));
+    fake.refuse_the_next_list();
+
+    let handle = fake.start_workers(
+        discovery_config(),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
+    );
+
+    wait_for(
+        &app_context,
+        "the worker of the LIST that follows the refused one",
+        Duration::from_secs(15),
+        |urls| has_url(urls, port),
+    )
+    .await;
+    assert_eq!(
+        fake.lists_and_refusal_owed(),
+        (2, false),
+        "one refused LIST, then the watcher's own"
+    );
+
+    handle.abort();
+}
+
+/// The router watch runs on the same client: its refused LIST is followed by
+/// the watcher's own too.
+#[tokio::test]
+async fn a_router_watch_lists_again_by_its_own_backoff_after_a_refusal() {
+    let fake = FakeK8s::start().await;
+    let cluster_state: smg_mesh::ClusterState = Arc::default();
+    fake.apply_pod(router_pod());
+    fake.refuse_the_next_list();
+
+    let handle = start_mesh_discovery_on(
+        fake.config(),
+        router_discovery_config(),
+        cluster_state.clone(),
+        7000,
+    )
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while cluster_state.read().get("r-0").is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no LIST followed the refused one; answered, and a refusal still owed: {:?}",
+            fake.lists_and_refusal_owed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        fake.lists_and_refusal_owed(),
+        (2, false),
+        "one refused LIST, then the watcher's own"
+    );
 
     handle.abort();
 }

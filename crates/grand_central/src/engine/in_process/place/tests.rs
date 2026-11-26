@@ -35,6 +35,7 @@ use crate::{
         decision::{Queue, Shed, Target, Targets, Trace},
         decision_engine::{Decided, DecisionEngine},
         framework::{Filter, Picker, Place, PoolWord, Scorer, TieBand, DRAW_FROM},
+        in_process::single::tests::ruled_ahead,
         list_cell::PublishedList,
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
@@ -1046,6 +1047,81 @@ fn a_plain_request_is_placed_on_the_worker_at_its_place() {
     }
 }
 
+/// A picker that places the worker at place 0 of its list by itself, takes
+/// no word of a lease, and marks that worker not ready behind the read that
+/// found it eligible.
+#[derive(Debug)]
+struct Turns(Arc<dyn Worker>);
+
+impl Lifecycle for Turns {}
+
+impl Picker for Turns {
+    fn name(&self) -> &'static str {
+        "turns"
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
+    fn picks_alone(&self) -> bool {
+        true
+    }
+
+    fn pick_alone(&self, _: &PoolWord<'_>, keep: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
+        let kept = keep(0);
+        if kept {
+            self.0.set_status(WorkerStatus::NotReady);
+        }
+        kept.then_some(0)
+    }
+
+    fn pick(
+        &self,
+        _: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut Targets,
+    ) {
+        push_drawn(candidates, kept, out);
+    }
+}
+
+/// Under a document whose session table alone takes a word on a lease, the
+/// worker at a plain request's place is read a second time, as a noted
+/// pick's target is at its walk: where its picker turned it, the pick is
+/// noted, and the call's next decision places the request on a worker that
+/// is ready.
+#[test]
+fn a_place_under_a_table_that_alone_takes_a_word_is_read_ready_a_second_time() {
+    let list = pool(2);
+    let first = Arc::clone(&list[0]);
+    let mut stages = StageRegistry::builtin();
+    let added = stages.picker("turns", move || Box::new(Turns(Arc::clone(&first))));
+    added.expect("a free name");
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    let profile = document.profiles.get_mut("random");
+    profile.expect("the preset's profile").pick = "turns".into();
+    let spec = AppliedSpec::validate_in(&ruled_ahead(document), &stages, &[]);
+    let engine = hosted(InProcess::new(spec.expect("the stages hold the picker")));
+    let hears = engine.in_force().hears.intersects(EventSet::LEASE);
+    let beside = engine.in_force().hears_beside_table;
+    assert!(
+        hears && !beside.intersects(EventSet::LEASE),
+        "the session table alone takes a word"
+    );
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()));
+    let placement = engine.place(&request).expect("a placement");
+    assert!(!ready(list[0].as_ref()), "the pick turned its worker");
+    assert!(
+        Arc::ptr_eq(&placement.worker, &list[1]),
+        "the worker that is ready"
+    );
+}
+
 /// A room rule that names the request's output limit reserves room for the
 /// answer its caller states through the one call: a worker whose requests
 /// in flight leave no room for the answer is passed over while another
@@ -1218,6 +1294,70 @@ fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
     let plain = hosted(preset("round_robin"));
     let placed = plain.place(&request).expect("a placement");
     assert_eq!(placed.overlap, Overlap::NONE);
+}
+
+/// A decision kept behind a placement, which hands out no trace, reads no
+/// best row for it where no stage of the document takes its issue and the
+/// document keeps no sample: the debug text of the placement names none,
+/// under a profile that draws first and beside a shadow profile too. A
+/// caller that is handed a decision reads them, right behind such a
+/// placement too, and so do a stage that takes the issue and the record of
+/// a document that keeps a sample.
+#[test]
+fn a_trace_names_its_best_rows_for_whoever_can_read_them() {
+    // The smallest pool a profile that draws first draws over.
+    let list = pool(DRAW_FROM);
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest {
+        explain_id: Some("host-1"),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    // The debug text of a placement prints the decision its lease keeps.
+    // Each preset here takes a word of a lease: `least_load` and
+    // `power_of_two` the dispatch alone, `bucket` the issue too.
+    let kept =
+        |engine: &'static InProcess| format!("{:?}", engine.place(&request).expect("a placement"));
+    // The best rows of a decision its caller is handed.
+    let handed = |engine: &'static InProcess| {
+        let handed = engine.decide_at(&Made::new(engine, &request, &[]), Instant::now);
+        let handed = handed
+            .ok()
+            .and_then(Decided::whole)
+            .expect("a whole decision");
+        handed.0.decision.pick().expect("a pick").trace.top_len
+    };
+    let scores = hosted(preset("least_load"));
+    assert!(kept(scores).contains("top_len: 0"), "nobody reads them");
+    assert_eq!(handed(scores), 3, "a caller reads them");
+    let draws = hosted(preset("power_of_two"));
+    assert!(kept(draws).contains("top_len: 0"), "nor behind a draw");
+    // Beside a shadow profile the front of the two decisions states that
+    // nobody reads them, for that placement alone.
+    let mut document = PolicySpec::preset("least_load").expect("a built-in preset");
+    let twin = document.profiles.values().next().cloned();
+    document
+        .profiles
+        .insert("twin".into(), twin.expect("the preset's profile"));
+    document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    document.generation = 1;
+    let shadowed = hosted(engine_of(&document));
+    assert!(kept(shadowed).contains("top_len: 0"), "nor beside a shadow");
+    assert_eq!(handed(shadowed), 3, "a caller reads them behind it");
+    let books = hosted(preset("bucket"));
+    assert!(kept(books).contains("top_len: 3"), "a stage is handed them");
+    // A document that keeps a sample keeps a placement's decision as it
+    // stands: the record names them.
+    let mut document = PolicySpec::preset("least_load").expect("a built-in preset");
+    document.generation = 1;
+    document.explain.sample = 1;
+    let sampled = hosted(engine_of(&document));
+    assert!(
+        kept(sampled).contains("top_len: 3"),
+        "a sample is kept of them"
+    );
+    let record = sampled.explained(b"host-1").expect("the decision is kept");
+    let pick = record.decision.pick().expect("a pick");
+    assert_eq!(pick.trace.top_len, 3, "the record names them");
 }
 
 /// A program that asks `place` states no worker id of its own: a placement
@@ -3171,9 +3311,10 @@ fn a_lender_that_declines_a_head_is_asked_nothing_more() {
 /// ([`RequestFacts::ring`]). The prefix form is lent it by the same rule,
 /// and states the lender's place of the routing value as a head. A side
 /// that reads no ring holds nothing back. A pair with no ring stage is
-/// lent none, and neither is a pair of two ring forms or of two depths,
-/// whose one list of places would be one side's alone: the caller's ring
-/// is asked nothing.
+/// lent none: the caller's ring is asked nothing. A pair of two ring forms
+/// or of two depths has no one list of places, and the engine's two
+/// questions answer nothing for it: each of its sides is stated its own
+/// (`pair::ring_words`).
 #[test]
 fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     let list = pool(2);
@@ -3209,16 +3350,6 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     assert_eq!(stated(pair(prefixed, plain), &ring), lent);
     let none = (false, Vec::new());
     assert_eq!(stated(pair(plain, plain), &Unasked), none);
-    assert_eq!(stated(pair(prefixed, ringed), &Unasked), none);
-    assert_eq!(stated(pair(ringed, prefixed), &Unasked), none);
-    let mut two_depths = pair(prefixed, prefixed);
-    let decode = two_depths.profiles.get_mut("decode").expect("the side");
-    decode.score[0] = ScoreStage::ConsistentHash(ConsistentHashParams {
-        prefix_tokens: Some(128),
-        ..ConsistentHashParams::default()
-    })
-    .into();
-    assert_eq!(stated(two_depths, &Unasked), none);
     // The engine's own word, phase by phase: a pair asked at its prefill
     // is answered for both its profiles, and a decode asked alone for its
     // own.
@@ -3231,6 +3362,7 @@ fn a_pairs_request_is_lent_the_ring_a_side_of_it_places_by() {
     assert_eq!(depths(pair(prefixed, plain)), [Some(256), None]);
     assert_eq!(depths(pair(plain, prefixed)), [Some(256), Some(256)]);
     assert_eq!(depths(pair(prefixed, ringed)), [None, None]);
+    assert_eq!(depths(pair(ringed, prefixed)), [None, Some(256)]);
 }
 
 /// An `epd` binding pairs its prefill and its decode as a `pd-pair`

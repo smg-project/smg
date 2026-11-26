@@ -39,8 +39,8 @@ pub(crate) mod view;
 pub(crate) mod warm_up;
 
 pub use decision::{
-    Decision, LiftedVeto, Overlap, OverlapSource, Pair, Pick, PlacedBy, Queue, ShadowKind, Shed,
-    ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+    Decision, DecodePlacing, LiftedVeto, Overlap, OverlapSource, Pair, Pick, PlacedBy, Queue,
+    ShadowKind, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use decision_engine::{
     AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
@@ -64,11 +64,11 @@ pub use in_process::encode::EncodeLists;
 #[cfg(feature = "in-process")]
 pub use in_process::membership::Members;
 #[cfg(feature = "in-process")]
-pub use in_process::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffinity, PrefixRead};
+pub use in_process::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffinity};
 #[cfg(feature = "in-process")]
 pub use in_process::pair::{prefills_full, PairAdmission, PairLists};
 #[cfg(feature = "in-process")]
-pub use in_process::place::{HeaderRead, PlaceRequest, Prompt, TokenEntry, Unplaced, WorkerRule};
+pub use in_process::place::{HeaderRead, PlaceRequest, Prompt, PromptEntry, Unplaced, WorkerRule};
 #[cfg(feature = "in-process")]
 pub use in_process::start::WorkerData;
 #[cfg(feature = "in-process")]

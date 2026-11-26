@@ -7,7 +7,7 @@ use std::{
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use smg_grand_central::{
-    document::{AppliedSpec, PolicySpec},
+    document::{AppliedSpec, DecodePick, PolicySpec, ShadowSpec},
     engine::{Candidate, Decision, Members, RequestFacts, Scorer, TieBand, POLICY_FAULTS_HELP},
     stages::{Lifecycle, StageRegistry},
     tracking::{EventSet, Lease},
@@ -22,16 +22,20 @@ use tokio::sync::broadcast::Receiver;
 
 use super::{
     test_support::{
-        assert_metric, fault_kinds, render_with_recorder, shadow_kinds, shadowing_spec,
+        assert_metric, fault_kinds, render_with_recorder, shadow_kinds, shadowing_spec, side_kinds,
         sorted_series,
     },
     *,
 };
 use crate::{
-    config::types::PolicyConfig,
+    config::types::{PolicyConfig, RouterConfig},
     policies::PolicyRegistry,
     routers::common::{
-        placement::{select_single, PlacementInputs, Stated},
+        placement::{
+            decode_again, select_pair, select_single,
+            tests::{engine_on, one_pair, pairs_of, MODEL},
+            PlacementInputs, Stated,
+        },
         snapshot::{RoutingPool, WorkerRegistry},
     },
 };
@@ -166,6 +170,89 @@ fn the_engines_shadow_counts_are_published_from_zero_and_added_by_their_growth()
         second.place(2);
         assert_eq!(scraped(&second), agreed(7));
         assert_eq!(scraped(&second), agreed(7));
+    });
+}
+
+/// A pair binding's shadows on a scrape, by side. The policy document
+/// names a shadow for each side of its pair's binding and picks the decode
+/// behind its prefill, and the gateway's own loader takes it. From the
+/// first scrape the binding has a zero series of each kind beside its
+/// prefill side, beside its decode side and beside its decode decided
+/// again, and none beside a single request. A pair placed adds one
+/// decision beside each side, and its decode asked again adds one under
+/// `decode-again`. Each shadow is its live profile's twin over the one
+/// worker of its side, so it agrees.
+///
+/// Classic picks a pair's decode once, with its prefill
+/// (`model_gateway/src/routers/common/placement.rs:3071`, on main
+/// `9bfcf9bd2`). It asks no decode again and runs no second policy beside
+/// a side, so the series is the engine's own.
+#[test]
+fn a_pair_bindings_shadow_counts_are_published_by_side() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        init_metrics();
+        let pairs = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = pairs.expect("the presets of a pair");
+        document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+        let sides = ["prefill", "decode"].map(|side| {
+            let twin = document.profiles[side].clone();
+            let next = format!("{side}-next");
+            document.profiles.insert(next.clone(), twin);
+            (side.to_owned(), next)
+        });
+        document.bindings[0].shadow = Some(ShadowSpec::Sides(sides.into()));
+        let config = RouterConfig::default();
+        let spec = config.hosted_policy(&document, &StageRegistry::builtin());
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        engine_on(&policies, spec.expect("the gateway loads a pair's shadows"));
+        let engine = policies.engine().expect("the engine that was set");
+
+        let published = ShadowsPublished::default();
+        // The binding's series beside a single request, beside each side
+        // and beside the decode decided again.
+        let scraped = || {
+            record_policy_shadow_activity(engine, &published);
+            let rendered = handle.render();
+            ["single", "prefill", "decode", "decode-again"]
+                .map(|side| side_kinds(&rendered, 0, side))
+        };
+        let agreed = |count| [Some(count), Some(0), Some(0), Some(0)];
+        assert_eq!(scraped(), [[None; 4], agreed(0), agreed(0), agreed(0)]);
+
+        let pairs = || pairs_of(&registry, &policies);
+        let pair = select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs(),
+            None,
+            None,
+            PlacementInputs::default(),
+            Stated::nothing,
+        );
+        let pair = pair.expect("the engine places the pair");
+        assert_eq!(scraped(), [[None; 4], agreed(1), agreed(1), agreed(0)]);
+
+        // The prefill is sent and its guard let go, and the decode is asked
+        // again behind it, as a route that sends the sides in turn asks.
+        drop(pair.prefill.guard(None));
+        let ahead = pair.decode.ahead(None);
+        let (moved, guard) = decode_again(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs,
+            None,
+            PlacementInputs::default(),
+            &pair.decode,
+            ahead,
+        );
+        assert!(moved.is_none(), "the one decode stands");
+        assert_eq!(scraped(), [[None; 4], agreed(1), agreed(1), agreed(1)]);
+        drop(pair.decode.sent(guard));
     });
 }
 

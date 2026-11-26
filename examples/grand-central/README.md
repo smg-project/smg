@@ -4,7 +4,7 @@ A controller of your own: the stock controller with one scorer added
 in Rust. The command line, the listeners, the election, the store and the
 policy documents are the crate's (`crates/grand_central`). The scorer is
 this package's. This page is the guide: write a stage, register it, run.
-The crate's [README](../../crates/grand_central/README.md) explains the policy document.
+The crate's [policy spec page](../../crates/grand_central/docs/policy-spec.md) explains the policy document.
 
 Write a stage in code when a routing rule cannot be written as a policy
 document over the built-in stages and you want it compiled into the
@@ -113,7 +113,7 @@ profiles:
 `Pack` takes a weight from the document and nothing else:
 `- pack: { weight: 2 }`. A bare name weighs one. A scorer with settings of
 its own registers with `scorer_with` and reads them from the document as
-typed parameters: the crate's README shows one. The command line is the
+typed parameters: the crate's [reference](../../crates/grand_central/REFERENCE.md#register-a-rust-stage) shows one. The command line is the
 crate's, and it refuses a flag it does not know.
 
 The stock `not-overloaded` filter is where `pack` stops filling a worker. It

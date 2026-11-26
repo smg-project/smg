@@ -23,8 +23,8 @@ pub enum Event {
         /// The membership epoch the write made.
         epoch: u64,
         change: MembershipChange,
-        /// The row the change is about, as the write left it in the table;
-        /// `None` for a removal.
+        /// The row the change is about, as the write leaves it; `None` for
+        /// a removal.
         row: Option<Arc<WorkerRow>>,
         /// The row the write took out of the table: a removal's row, a
         /// replacement's old incarnation.

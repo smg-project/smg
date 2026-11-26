@@ -68,6 +68,7 @@ fn picked() -> Pick {
                 decode_id,
                 decode_dp_rank,
                 decode_verdict,
+                ..Pair::default()
             }),
         });
     }

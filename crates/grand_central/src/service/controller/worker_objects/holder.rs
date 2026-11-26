@@ -11,8 +11,9 @@ use smg_worker::{
 #[cfg(test)]
 use crate::service::controller::Config;
 use crate::{
+    engine::CacheIndexes,
     store::MemoryStore,
-    worker_host::{KvTables, Members, Objects},
+    worker_host::{EventIndexes, KvTables, Members, Objects},
 };
 
 /// The replica's worker objects: their holder and the store their rows
@@ -96,6 +97,13 @@ impl WorkerObjects {
     /// The replica's KV tables: the ones the holder was handed at its build.
     pub(crate) fn kv_tables(&self) -> Arc<KvTables> {
         Arc::clone(&self.tables)
+    }
+
+    /// The indexes of cache events the replica's engine reads: its KV
+    /// tables' own, a worker found by its address among the worker objects.
+    /// The store is lent them once, at the controller's build.
+    pub(crate) fn cache_indexes(&self) -> Arc<dyn CacheIndexes> {
+        Arc::new(EventIndexes::new(Arc::clone(&self.tables), &self.objects))
     }
 
     /// The holder shared with readers of the replica's worker objects.
@@ -221,11 +229,10 @@ pub(crate) mod tests {
     }
 
     /// Two moves in a row end with the table at the object's newest
-    /// status. The follow reads the first move's event between the second
-    /// move and its telling, and leaves the object alone: the replica's
-    /// holder copies no status of its store's tail back onto an object.
-    /// With that copy the second move is lost: the object goes back to the
-    /// first status, and its tell finds nothing to tell.
+    /// status. The second move stands on the object until its tell: the
+    /// replica's holder copies no status of its store's table back onto
+    /// an object. With such a copy the second move is lost: the object
+    /// goes back to the first status, and its tell finds nothing to tell.
     #[test]
     fn two_moves_in_a_row_end_with_the_table_at_the_objects_newest_status() {
         let (store, workers) = replica();
@@ -264,9 +271,8 @@ pub(crate) mod tests {
         assert_eq!(statuses(), ready);
         // The second move stands on the object, and its tell has not run.
         let second = probe(false);
-        holder.follow(&*store);
         let trails = (Some(WorkerStatus::Ready), ObjectStatus::NotReady);
-        assert_eq!(statuses(), trails, "the follow left the object alone");
+        assert_eq!(statuses(), trails, "the table trails until the tell");
         let told = HealthWrite::Moved {
             from: WorkerStatus::Ready,
             to: WorkerStatus::NotReady,

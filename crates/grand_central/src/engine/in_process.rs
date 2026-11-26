@@ -133,11 +133,10 @@ fn next_applied() -> u64 {
 /// ([`InProcess::unheard`]) and a step's of the engine's own task
 /// ([`InProcess::upkeep_faults`]).
 ///
-/// An engine counts into counts of its own. A host that builds an engine
-/// for each of its documents hands every one the same counts
-/// ([`InProcess::with_origin`]): a count then outlasts the document it
-/// rose under, and an engine a decision still holds past its document
-/// counts where the host reads.
+/// An engine counts into counts of its own, for its life: a count
+/// outlasts the document it rose under, and a decision still running
+/// under a document that was replaced counts where the engine's host
+/// reads.
 #[derive(Debug, Default)]
 pub(crate) struct HeldFaults {
     decisions: AtomicU64,
@@ -210,9 +209,8 @@ pub struct InProcess {
     /// and changes of membership panicked in a stage that heard them
     /// ([`Self::unheard`]). Its task's steps: a run of the upkeep, a step
     /// of the registry's follow, or a telling of load reports
-    /// ([`Self::upkeep_faults`]). The engine's own, or its host's where the
-    /// host handed them ([`Self::with_origin`]).
-    held: Arc<HeldFaults>,
+    /// ([`Self::upkeep_faults`]). The engine's own, for its life.
+    held: HeldFaults,
     /// The last lease id handed out. A pair's lease writes it, and a thread
     /// once for a run of its single requests' ids (`single::lease_id`):
     /// one atomic step, on cache lines of its own.
@@ -343,8 +341,9 @@ impl PoolMembers {
 
     /// What a decision whose stages read affinity keeps of the list: each
     /// worker's number in its model's index of cache events and the list's
-    /// warming rows, as a ruling read again at most once a second
-    /// ([`PoolAffinity`]). A caller that asks a whole decision of its own
+    /// warming rows, as a ruling read again once a second, and once the
+    /// index handed a number on to another worker ([`PoolAffinity`]). A
+    /// caller that asks a whole decision of its own
     /// over the list's records hands it to [`overlap::decide`], as a single
     /// request's decision here does.
     #[must_use]
@@ -408,7 +407,7 @@ impl InProcess {
             telling: Mutex::new(()),
             epochs: AtomicU64::new(0),
             clock: DecisionClock::new(),
-            held: Arc::default(),
+            held: HeldFaults::default(),
             leases: OwnWord(AtomicU64::new(0)),
             sessions,
             affinity: Affinity::default(),
@@ -418,25 +417,25 @@ impl InProcess {
         }
     }
 
-    /// [`Self::new`] on the clock of a host that reads one of its own and
-    /// builds an engine for each of its documents: the engine's clock
-    /// starts at `origin`, the host's. An instant then reads alike under
-    /// every document and on the host's clock, so what one document's
-    /// stages stamped and the next takes over, a profile's count of sends
-    /// ([`Engine::succeed`](crate::engine::framework::Engine::succeed)),
-    /// is read on the clock it was written on.
-    ///
-    /// The engine counts the panics it holds into `held`, the host's: every
-    /// engine the host builds counts there, and the three readers of each
-    /// ([`DecisionEngine::faults`], [`Self::unheard`],
-    /// [`Self::upkeep_faults`]) answer the counts of them all.
+    /// [`Self::new`] on the clock of a host that reads one of its own, as
+    /// a store does: the engine's clock starts at `origin`, the host's. An
+    /// instant then reads alike on the engine's clock and on the host's,
+    /// so a lease the host dates is read by a stage on the clock it was
+    /// written on.
     #[must_use]
-    pub(crate) fn with_origin(spec: AppliedSpec, origin: Instant, held: Arc<HeldFaults>) -> Self {
+    pub(crate) fn with_origin(spec: AppliedSpec, origin: Instant) -> Self {
         Self {
             clock: DecisionClock::from_origin(origin),
-            held,
             ..Self::new(spec)
         }
+    }
+
+    /// The three counts of the panics the engine held, as one read answers
+    /// them ([`HeldFaults::read`]): the decisions', the words' and the
+    /// task's steps'. A store reads them of its one engine.
+    #[must_use]
+    pub(crate) fn held_faults(&self) -> [u64; 3] {
+        self.held.read()
     }
 
     /// What the engine keeps for its affinity stages: the gateway hands its
@@ -562,6 +561,23 @@ impl InProcess {
         let _held = self.telling.lock();
         self.hears(self.document.load().spec.engine(), word, |engine| {
             self.word_caught(|| engine.on_membership(word));
+        });
+    }
+
+    /// [`Self::on_membership`] for what the document in force built new:
+    /// the stages and the counts of sends made under its own generation,
+    /// and its session table ([`Engine::hearing`]). A store says the list
+    /// of its members through this at the document's apply: what the
+    /// document kept of the standing one heard each member as it came, and
+    /// is told nothing again. The word passes the same locks and the same
+    /// catch: a stage that panics at the list is held and counted.
+    pub(crate) fn on_membership_built_new(&self, word: &Membership<'_>) {
+        let _held = self.telling.lock();
+        let document = self.document.load();
+        let own = document.spec.generation();
+        let new = document.spec.engine().hearing(|made| made == own);
+        self.hears(&new, word, |new| {
+            self.word_caught(|| new.on_membership(word));
         });
     }
 
@@ -913,7 +929,7 @@ impl Loaded<'_, '_> {
     }
 }
 
-impl InProcess {
+impl Loaded<'_, '_> {
     /// One request's decision and nothing its host hears of later: no lease
     /// is issued, no id is taken and no stage is told. For a host that
     /// files a pick's lease itself and tells the stages of the issue under
@@ -922,8 +938,14 @@ impl InProcess {
     /// of the document's engine), as a controller's service does in its
     /// store.
     ///
+    /// The decision runs under the document this value holds, at each of
+    /// its steps. Such a host hands the document of the state its request
+    /// read ([`SpecHandle::under`]), so the decision, the lease it files
+    /// and the stages it tells are one document's, whatever document is
+    /// put in force meanwhile.
+    ///
     /// The request is made once and decided whole, at `now`, as
-    /// [`Self::decide_at`] decides a request that is not plain
+    /// [`InProcess::decide_at`] decides a request that is not plain
     /// ([`RequestMaker::plain`]): a request that stands alone
     /// ([`Loaded::stands_alone`]) over its host's one list, a pair at
     /// its prefill over its host's two lists ([`pair::decide`], the test
@@ -958,12 +980,11 @@ impl InProcess {
         expect(dead_code, reason = "a controller's deciding thread calls it")
     )]
     pub(crate) fn decide_without_lease(
-        &self,
+        self,
         maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<(super::decision::Decision, Option<Shadowed>), DecisionRefused> {
-        let document = self.in_force();
-        let own = self.under(&document);
+        let own = self;
         self.caught(|| {
             let mut request = own.made(maker);
             let mut said = None;
@@ -1028,13 +1049,12 @@ impl InProcess {
         expect(dead_code, reason = "a controller's deciding thread calls it")
     )]
     pub(crate) fn decide_decode_without_lease(
-        &self,
+        self,
         maker: &impl RequestMaker,
         held: &super::decision::Target,
         now: Instant,
     ) -> Result<super::decision::Decision, DecisionRefused> {
-        let document = self.in_force();
-        let own = self.under(&document);
+        let own = self;
         self.caught(|| {
             let mut request = own.made(maker);
             Ok(match maker.workers() {
@@ -1176,14 +1196,29 @@ impl Loaded<'_, '_> {
                     // No stage takes a word of the request and the
                     // document keeps no sample: the place is the whole
                     // answer.
-                    if !self.document.leases_or_samples {
+                    let document = self.document;
+                    if !document.leases_or_samples {
                         return Ok(Some(pick));
                     }
                     // A document that keeps a sample and takes no word: the
                     // place is the whole answer all the same, counted
                     // toward the thread's next sample behind the pick.
-                    if !self.document.hears.intersects(EventSet::LEASE) {
+                    if !document.hears.intersects(EventSet::LEASE) {
                         sample::place(self, maker, pick, members, clock);
+                        return Ok(Some(pick));
+                    }
+                    // The session table alone takes a word, and it has none
+                    // for the pick, made under a binding that states no
+                    // rule: the place is the whole answer where its worker
+                    // reads ready a second time, as a noted pick's target
+                    // is read at its walk. A worker that turned not ready
+                    // behind the pick is noted.
+                    if !document.hears_beside_table.intersects(EventSet::LEASE)
+                        && single::still_ready(pick, members)
+                    {
+                        if document.samples {
+                            sample::place(self, maker, pick, members, clock);
+                        }
                         return Ok(Some(pick));
                     }
                     picked = Some((pick, members, plain));

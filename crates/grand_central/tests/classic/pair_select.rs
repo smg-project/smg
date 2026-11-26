@@ -116,7 +116,7 @@ impl Worker {
 /// then the decode's, or no pair.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Answer {
+pub(super) enum Answer {
     Pair([usize; 2]),
     None { why: String },
 }
@@ -125,7 +125,7 @@ enum Answer {
 /// pair took a drawn row's one request.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Outcome {
+pub(super) enum Outcome {
     Sequence(Vec<Answer>),
     Counts {
         draws: u32,
@@ -342,7 +342,7 @@ fn pairing(row: &Row) -> Pairing {
 /// Why the gateway answers no pair, read from a shed: an overload shed,
 /// the prefill admission's bound, a role with no worker at all, and
 /// `unavailable` for every other.
-fn why(reason: ShedReason, stage: &str) -> &'static str {
+pub(super) fn why(reason: ShedReason, stage: &str) -> &'static str {
     match (reason, stage) {
         (ShedReason::Saturated, _) => "overloaded",
         (_, "has-capacity") => "at_capacity",
@@ -354,7 +354,7 @@ fn why(reason: ShedReason, stage: &str) -> &'static str {
 /// What this crate answers one request of a row: the pair, or why none and
 /// the stage its shed names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Here {
+pub(super) enum Here {
     Pair([usize; 2]),
     None(&'static str, &'static str),
 }
@@ -424,7 +424,7 @@ fn run(row: &Row, engine: &Engine, draw: u64, classes: &Classes<'_>) -> Result<V
 /// What this crate answers a row: each request's answer in order, or how
 /// often each answer was given to a drawn row's one request.
 #[derive(Debug)]
-enum Replayed {
+pub(super) enum Replayed {
     Sequence(Vec<Here>),
     Counts(Vec<(Here, u32)>),
 }
@@ -475,8 +475,10 @@ fn same(recorded: &Answer, here: &Here) -> bool {
 }
 
 /// What separates this crate's answers from the recorded ones: a sequence
-/// answer for answer, a drawn row pair for pair and share for share.
-fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
+/// answer for answer, a drawn row pair for pair and share for share. Each
+/// side's shares are of its own draws: the sheet's `draws` counts the
+/// recording's, and a replay's are the sum of its counts.
+pub(super) fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
     match (recorded, here) {
         (Outcome::Sequence(recorded), Replayed::Sequence(here)) if recorded.len() == here.len() => {
             (recorded.iter().zip(here).enumerate())
@@ -487,6 +489,10 @@ fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
                 .collect()
         }
         (Outcome::Counts { draws, pairs }, Replayed::Counts(here)) => {
+            // A sheet may record a row over more draws than its replay
+            // makes. The bound is then the one of two samples of the
+            // replay's size.
+            let made: u32 = here.iter().map(|&(_, count)| count).sum();
             let listed = |answer: &Here| {
                 pairs
                     .iter()
@@ -495,7 +501,7 @@ fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
             let mut found: Vec<String> = (here.iter())
                 .filter(|(answer, _)| !listed(answer))
                 .map(|(answer, count)| {
-                    format!("{count} of {draws} draws replayed {answer:?}, which no draw recorded")
+                    format!("{count} of {made} draws replayed {answer:?}, which no draw recorded")
                 })
                 .collect();
             let count_of = |prefill, decode| {
@@ -507,9 +513,9 @@ fn differences(recorded: &Outcome, here: &Replayed) -> Vec<String> {
                 .iter()
                 .map(|&(prefill, decode, count)| (count, count_of(prefill, decode)))
                 .unzip();
-            if !same_shares(&shares(&ours, *draws), &shares(&recorded, *draws), *draws) {
+            if !same_shares(&shares(&ours, made), &shares(&recorded, *draws), made) {
                 found.push(format!(
-                    "recorded {pairs:?} of {draws} draws, replayed those pairs {ours:?} times"
+                    "recorded {pairs:?} of {draws} draws, replayed those pairs {ours:?} of {made}"
                 ));
             }
             found

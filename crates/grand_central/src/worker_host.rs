@@ -4,8 +4,9 @@
 //! The store is the truth of who the workers are. What reads a worker's
 //! signals (its loads, its cache events, its health) is the worker crate's
 //! and works over that crate's object and registry. This module is the
-//! projection between the two. [`Objects`] follows the store's membership
-//! and writes the registry: a row arrives and its object is built, a row's
+//! projection between the two. Every writer of a row writes through
+//! [`Objects`], which writes the registry:
+//! a row arrives and its object is built, a row's
 //! facts change and its object is replaced under the same id, a row goes and
 //! its object is dropped. A leader and a standby run the same path over the
 //! same rows.
@@ -82,6 +83,12 @@
 //! above rank 0 of a data-parallel worker gets no feed yet ([`SkipReason`]).
 //! The module `kv` names the decode's limits.
 //!
+//! The stock controller lends its engine the tables' indexes through the
+//! engine's own traits: the index the streams write, with no second copy
+//! (the module `kv_read`). A worker's number there is its row's place in
+//! its model's index, found from the worker's address through the registry
+//! and the holder's record beside the object.
+//!
 //! # The door
 //!
 //! The host hands out a [`MembershipWriter`] door. The crate holds one: the
@@ -101,7 +108,7 @@
 //! # What the module does not hold
 //!
 //! It builds no registry and no engine. The host builds the registry and
-//! hands it in, and calls [`Objects::follow`] where the store moved.
+//! hands it in, and writes its rows through [`Objects`].
 //! [`KvFeed::run`], its follow of the cache events, is a future the host
 //! drives. The collector under it starts a task for each worker it streams
 //! and ends them at the stop. It names nothing of the controller.
@@ -112,6 +119,8 @@ mod health;
 mod kv;
 mod kv_cursor;
 mod kv_feed;
+#[cfg(feature = "controller")]
+mod kv_read;
 mod kv_tables;
 mod lead;
 mod loads;
@@ -131,6 +140,8 @@ pub use found::{facts, pairing_descriptor};
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
+#[cfg(feature = "controller")]
+pub(crate) use kv_read::EventIndexes;
 pub use kv_tables::KvTables;
 pub use lead::{Lead, SoleLead};
 pub use loads::load_monitor;
@@ -140,7 +151,8 @@ pub use members::{EncodeColumns, OpenAdmission};
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use membership_writer::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-    check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows, StoreDoor,
+    check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, HolderDoor, Rows,
+    StoreDoor,
 };
 #[cfg(feature = "controller")]
 pub(crate) use membership_writer::{
@@ -153,7 +165,7 @@ pub use membership_writer::{
 pub(crate) use object::dial_address;
 pub use object::object;
 #[cfg(all(test, feature = "controller"))]
-pub(crate) use objects::stand;
+pub(crate) use objects::{lay_standing, stand};
 pub use objects::{Objects, RowRevision};
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,

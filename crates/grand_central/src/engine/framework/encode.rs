@@ -46,8 +46,8 @@
 
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
-    run_profile, shed, Buffers, ClassBits, Engine, PairPools, Plan, Profile, Scratch, Set,
-    AFFINITY_COLUMN,
+    run_profile, shed, Buffers, ClassBits, Engine, PairPools, PairTable, Plan, Profile, Scratch,
+    Set, ShedOver, AFFINITY_COLUMN,
 };
 use crate::{
     engine::{
@@ -222,9 +222,6 @@ impl EncodeItems<'_> {
 pub struct EncodePlaced {
     encoders: Vec<Target>,
     one: bool,
-    /// Whether the decision shed the request as saturated over its
-    /// encoders ([`Self::shed_over_encoders`]).
-    shed_over_encoders: bool,
 }
 
 impl EncodePlaced {
@@ -248,29 +245,10 @@ impl EncodePlaced {
         self.one
     }
 
-    /// Whether the decision shed the request as saturated over its
-    /// encoders: the overload veto left none of the encoders that take the
-    /// request, and the pair was not decided. No other answer says so, a
-    /// shed made over one of the pair's own lists neither. The engine's
-    /// one placement call reads it: a route's rule is asked of no encoder,
-    /// so such a shed stands and no rule is asked behind it.
-    #[cfg_attr(
-        not(feature = "in-process"),
-        expect(
-            dead_code,
-            reason = "the one reader is the engine over worker lists, built under `in-process`"
-        )
-    )]
-    pub(crate) fn shed_over_encoders(&self) -> bool {
-        self.shed_over_encoders
-    }
-
-    /// Empties the list and keeps its room, and takes back what the last
-    /// decision said of its shed.
+    /// Empties the list and keeps its room.
     pub(crate) fn clear(&mut self) {
         self.encoders.clear();
         self.one = false;
-        self.shed_over_encoders = false;
     }
 
     /// The room for the encoders an answer read from a link names, with
@@ -448,16 +426,9 @@ pub(super) struct EncodeScratch {
     /// the encode pool ([`EncodeScratch::hold_opened`]), and read there
     /// alone.
     reached: Vec<u32>,
-    /// The decode classes with a registered decode: one bit a class, no
-    /// wider than the fleet.
-    decodes_of: ClassBits,
-    /// The decode classes with a registered decode that takes images.
-    vision_of: ClassBits,
-    /// Under no table, the classes of the decodes whose number the bits do
-    /// not hold, ascending.
-    far: Vec<u32>,
-    /// The same of the decodes that take images.
-    far_vision: Vec<u32>,
+    /// The decode classes with a registered decode, and those whose decode
+    /// takes images.
+    decode_classes: DecodeClasses,
     /// The prefills the encode side admits, when it does not admit all.
     prefills: Admitted,
     /// The decodes it admits, when it does not admit all.
@@ -496,6 +467,75 @@ impl EncodeScratch {
                 self.far_open.push(class);
             }
         }
+    }
+}
+
+/// The decode classes of the decodes one decision reads: the classes with a
+/// registered decode, and those whose decode takes images. It is filled from
+/// the decodes' rows under the pair table ([`Self::fill`]) and read by a
+/// class's number ([`Self::holds`], [`Self::holds_vision`]).
+///
+/// The classes stand in sets of bits no wider than the fleet. Under a table
+/// the width is the table's own, as the pair entry keeps it, and a number
+/// above it is no class of the table. Under none a class pairs by its
+/// number, whatever the number: one bit a number up to the count of the
+/// decodes, and a list for the numbers above it, which a dense numbering
+/// never names.
+#[derive(Debug, Default)]
+struct DecodeClasses {
+    /// The classes with a registered decode: one bit a class.
+    registered: ClassBits,
+    /// The classes with a registered decode that takes images.
+    vision: ClassBits,
+    /// Under no table, the classes of the decodes whose number the bits do
+    /// not hold, ascending.
+    far: Vec<u32>,
+    /// The same of the decodes that take images.
+    far_vision: Vec<u32>,
+}
+
+impl DecodeClasses {
+    /// Fills the index from `decodes`, the decodes a decision reads of a
+    /// fleet of `fleet` decodes, under `table`, and answers it filled. A
+    /// decode of no class enters none. One row's insertion records the
+    /// class and whether its decode takes images. A number the bits do not
+    /// hold is kept in the lists under no table, and is no class under one.
+    /// Both lists are sorted before the index is read.
+    #[inline(always)]
+    fn fill(&mut self, decodes: &[Candidate], fleet: usize, table: &PairTable<'_>) -> &Self {
+        let tabled = !table.is_empty();
+        let width = if tabled { table.width() } else { fleet + 1 };
+        self.registered.reset(width);
+        self.vision.reset(width);
+        self.far.clear();
+        self.far_vision.clear();
+        for row in decodes.iter().filter(|row| row.pair_class != 0) {
+            if self.registered.insert(row.pair_class) {
+                if row.vision {
+                    self.vision.insert(row.pair_class);
+                }
+            } else if !tabled {
+                self.far.push(row.pair_class);
+                if row.vision {
+                    self.far_vision.push(row.pair_class);
+                }
+            }
+        }
+        self.far.sort_unstable();
+        self.far_vision.sort_unstable();
+        self
+    }
+
+    /// Whether a registered decode is of `class`.
+    #[inline(always)]
+    fn holds(&self, class: u32) -> bool {
+        holds(&self.registered, &self.far, class)
+    }
+
+    /// Whether a registered decode that takes images is of `class`.
+    #[inline(always)]
+    fn holds_vision(&self, class: u32) -> bool {
+        holds(&self.vision, &self.far_vision, class)
     }
 }
 
@@ -891,6 +931,9 @@ impl Engine {
         placed: &mut EncodePlaced,
     ) -> Decision {
         placed.clear();
+        // The word of the list a shed is made over is this decision's: one
+        // an earlier decision left goes here ([`Scratch::shed_over`]).
+        scratch.shed_over = None;
         // The encode side's buffers leave the scratch for the decision: the
         // pair entry takes the scratch whole while they hold its pools.
         let mut side = scratch.encode.take().unwrap_or_default();
@@ -899,11 +942,8 @@ impl Engine {
             placed,
         );
         scratch.encode = Some(side);
-        // A decision that is no pick names no encoder. What the pass said
-        // of its shed stays for the decision's caller.
         if decision.pick().is_none() {
-            placed.encoders.clear();
-            placed.one = false;
+            placed.clear();
         }
         decision
     }
@@ -1020,9 +1060,11 @@ impl Engine {
             // value's, or its prompt's heads': no item is placed by them.
             // A key's run is stated the key's own place, on the ring lent
             // for the items, where that run is made below. The passes
-            // over the encoders ahead of it read no ring.
+            // over the encoders ahead of it read no ring. The decode
+            // side's own places are that side's alone.
             ring: None,
             ring_positions: &[],
+            decode_ring_positions: None,
             // The word says how the request's own key came. An item's key
             // is its content's, whatever handed the request's: it leads
             // the item under every form of the ring.
@@ -1113,7 +1155,7 @@ impl Engine {
                 if let Some(stage) = saturated {
                     // The pair is not decided, and the decision says so to
                     // its caller.
-                    placed.shed_over_encoders = true;
+                    scratch.shed_over = Some(ShedOver::Encoders);
                     return turned_away(ShedReason::Saturated, stage, bare);
                 }
                 return gap(encode_gap(&encode, &wanted, any_member));
@@ -1132,12 +1174,8 @@ impl Engine {
         // one whose decode takes images. The request with no item that asks
         // none of them left by the early answer.
         //
-        // The decodes' classes stand in sets of bits no wider than the
-        // fleet. Under a table the width is the table's own, as the pair
-        // entry keeps it, and a number above it is no class of the table.
-        // Under none a class pairs by its number, whatever the number: one
-        // bit a number up to the count of the decodes, and a list for the
-        // numbers above it, which a dense numbering never names.
+        // The decodes' classes are read from an index of this decision's
+        // decodes ([`DecodeClasses`]).
         let class_of = |at: usize| encode.prefill_classes.get(at).copied().unwrap_or(0);
         let (mut any_pair, mut any_served, mut any_vision) = (false, false, false);
         // A request with items whose decode is not held to the ones that
@@ -1156,39 +1194,15 @@ impl Engine {
             Some(true) => (&[], &[]),
             _ => (pools.decodes, pools.prefills),
         };
-        let tabled = !pools.table.is_empty();
-        let width = if tabled {
-            pools.table.width()
-        } else {
-            pools.decodes.len() + 1
-        };
-        side.decodes_of.reset(width);
-        side.vision_of.reset(width);
-        side.far.clear();
-        side.far_vision.clear();
-        for row in decodes.iter().filter(|row| row.pair_class != 0) {
-            if side.decodes_of.insert(row.pair_class) {
-                if row.vision {
-                    side.vision_of.insert(row.pair_class);
-                }
-            } else if !tabled {
-                side.far.push(row.pair_class);
-                if row.vision {
-                    side.far_vision.push(row.pair_class);
-                }
-            }
-        }
-        side.far.sort_unstable();
-        side.far_vision.sort_unstable();
+        let decode_classes = side
+            .decode_classes
+            .fill(decodes, pools.decodes.len(), &pools.table);
         // The three answers only rise: the pass ends at the prefill
         // that gives the last of them the request reads. The third is read
         // for a request whose decode is held to the ones that take images.
         for (at, row) in prefills.iter().enumerate() {
             let listed = pools.table.of(&row.pair_class);
-            if listed
-                .iter()
-                .any(|&class| holds(&side.decodes_of, &side.far, class))
-            {
+            if listed.iter().any(|&class| decode_classes.holds(class)) {
                 any_pair = true;
                 if !needs || holds(&side.member, &side.far_member, class_of(at)) {
                     any_served = true;
@@ -1197,7 +1211,7 @@ impl Engine {
                     }
                     if listed
                         .iter()
-                        .any(|&class| holds(&side.vision_of, &side.far_vision, class))
+                        .any(|&class| decode_classes.holds_vision(class))
                     {
                         any_vision = true;
                         break;
@@ -1301,6 +1315,19 @@ impl Engine {
         // twice.
         let mut pair = self.decide_pair(facts, pool, admitted, cx, decode_cx, scratch);
         let Decision::Pick(pick) = &mut pair else {
+            // The pair's decision judged the rows it was handed. Where
+            // either list is a part of the one the request's caller lent,
+            // its word goes, whichever list it names. A word of the
+            // list that was cut was counted over the part. A word of the
+            // prefills counts the prefills that pair with a decode the
+            // decision was handed, and a cut of the decodes changes which
+            // those are. A word of the decodes behind a cut of the
+            // prefills alone was counted over the whole decode list, and
+            // goes too: the call's routine holds the rule's prefills to
+            // no part.
+            if !every_prefill || !every_decode {
+                scratch.shed_over = None;
+            }
             return pair;
         };
         if !every_prefill || !every_decode {

@@ -663,7 +663,6 @@ mod tests {
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
         let (store, feed) = journaled_at(&LeasePlace::Process, 0, deciders);
-        let (workers, _sides) = fleet(&store);
         store
             .apply(preset("random", 1))
             .expect("above the unbound start");
@@ -713,10 +712,12 @@ mod tests {
             &elector,
             (looks, stopped, role, lag),
             (Arc::clone(&store), feed, Arc::clone(&objects), loads),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             deciders,
         )
         .expect("the deciders start");
+        // The fleet is written through the holder, as a registration's is.
+        let (workers, _sides) = fleet(&store, &objects);
         let reads = Reads {
             objects,
             loads: frame_loads::silent(),
@@ -2078,7 +2079,8 @@ mod tests {
         let store = &bed.shared.store;
         let later = encode_plan_in(&StageRegistry::builtin(), 2, ["random"; 3]);
         store.apply(later).expect("a later generation");
-        let member = |name: &str, role| member_of(store, ENCODED, name, role, PUSHING);
+        let objects = &bed.shared.objects;
+        let member = |name: &str, role| member_of(store, objects, ENCODED, name, role, PUSHING);
         let p = member("ep0", Role::Prefill);
         let d = member("ed0", Role::Decode);
         let e = member("ee0", Role::Encode);

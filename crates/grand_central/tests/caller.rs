@@ -14,12 +14,20 @@
 //! What the program asks of the engine stands in one place, the methods of
 //! its `Engine`. Each method beside `place` is a call the host contract
 //! still owes a program, and leaves that list with the change that pays it.
+//! A pair's decode asked again is asked of the placement `place` answered,
+//! where that placement says its decode still stands chosen.
 //!
-//! One module a plan holds the plan's cases. A single request
-//! (`caller/single.rs`) and a pair of a prefill worker and a decode worker
-//! (`caller/pair.rs`) are served so far. The example's own stage
+//! One module a plan holds the plan's cases: a single request
+//! (`caller/single.rs`), a pair of a prefill worker and a decode worker
+//! (`caller/pair.rs`), and an encode request, whose items go to encoders
+//! ahead of its pair (`caller/encode.rs`). The example's own stage
 //! (`examples/in_process/engine_load.rs`) is taken in beside the program,
-//! and its cases decide over records made by hand (`caller/stage.rs`).
+//! and its cases decide over records made by hand (`caller/stage.rs`). The
+//! program's own ring (`examples/in_process/ring.rs`) is taken in too: its
+//! cases read the ring a generation holds (`caller/lent_ring.rs`). The wire
+//! a retry stays on has its cases beside them (`caller/demand.rs`), and so
+//! has the route's own rule for a retry (`caller/rule.rs`). The token tree
+//! the program lends has its cases too (`caller/tree.rs`).
 //!
 //! [`InProcess::place`]: smg_grand_central::engine::InProcess::place
 
@@ -27,20 +35,32 @@
 
 use std::{future::Future, sync::Arc};
 
-use program::{pair_settings, settings, Plan, Program};
+use program::{encode_settings, pair_settings, settings, Plan, Program};
 use smg_grand_central::document::{AppliedSpec, PolicySettings, RoutingSettings};
 use smg_worker::{identity::basic::Worker, load::state::TestFeed, test_support::ready_worker};
 
+#[path = "caller/demand.rs"]
+mod demand;
+#[path = "caller/encode.rs"]
+mod encode;
 #[path = "../examples/in_process/engine_load.rs"]
 mod engine_load;
+#[path = "caller/lent_ring.rs"]
+mod lent_ring;
 #[path = "caller/pair.rs"]
 mod pair;
 #[path = "../examples/in_process/program.rs"]
 mod program;
+#[path = "../examples/in_process/ring.rs"]
+mod ring;
+#[path = "caller/rule.rs"]
+mod rule;
 #[path = "caller/single.rs"]
 mod single;
 #[path = "caller/stage.rs"]
 mod stage;
+#[path = "caller/tree.rs"]
+mod tree;
 
 /// The model every case serves.
 const MODEL: &str = "model-a";
@@ -125,4 +145,14 @@ fn under_pairs(
     sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
 ) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
     under_settings(&pair_settings(policy), fleet, sends)
+}
+
+/// The program under the document a gateway means that routes to pairs
+/// behind encoders, the pair's two sides under `policy`.
+fn under_encode(
+    policy: PolicySettings,
+    fleet: &[Arc<dyn Worker>],
+    sends: impl Fn(&dyn Worker) -> u16 + Send + Sync + 'static,
+) -> (Program, TestFeed, impl Future<Output = ()> + Send + 'static) {
+    under_settings(&encode_settings(policy), fleet, sends)
 }

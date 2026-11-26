@@ -180,10 +180,11 @@ use crate::{
 };
 
 /// What tells the engine of a frame applied to a lease on file: the world
-/// the frame is told under, the lease as it stood before the frame, both
-/// its parts, what the frame said, and the decider whose file the lease is
-/// on, where the store's host named its deciders. It holds what its host
-/// gave it: a served controller's holds the replica's worker objects.
+/// the frame's run loaded ([`OneLoad`]), the lease as it stood before the
+/// frame, both its parts, what the frame said, and the decider whose file
+/// the lease is on, where the store's host named its deciders. It holds
+/// what its host gave it: a served controller's holds the replica's worker
+/// objects.
 type Teller =
     Arc<dyn Fn(&MemoryStore, &StoreSnapshot, &Sides, Said, Option<DecisionSlot>) + Send + Sync>;
 
@@ -191,13 +192,13 @@ type Teller =
 /// world, loaded at the run's first word and held to its last. A run is
 /// one loop's words: the frames an apply finds in the ring, the leases an
 /// issue ends, the leases a sweep ends in a file. So a run that tells
-/// nothing loads no world, and one that tells many loads one: each word
-/// of a run is told under the generation that stood at the run's first.
-/// Each run builds its own where it tells, so one hold of a turn may load
-/// twice: the leases an issue ends may be told under a later world than
-/// the frames its apply found. Where a generation starts between the two,
-/// the engine that issued those leases does not hear their ends. That is
-/// a limit of this form, not its aim: one load for both runs undoes it.
+/// nothing loads no world, and one that tells many loads one. Each run
+/// builds its own where it tells, so one hold of a turn may load twice.
+/// The load is the world a teller is handed, and it does not say who
+/// hears a word: a served controller's teller tells each word by the
+/// generation that stands at that word, and loads the standing world
+/// itself where a generation started behind the run's load
+/// (`lease_words::told`).
 /// None is passed in by a caller: that cost every take a holder's
 /// building and its drop, whatever the take found.
 #[derive(Default)]
@@ -1160,7 +1161,21 @@ impl MemoryStore {
     /// is of the sides the record held as the frame found it. A dispatch
     /// at an index a chosen side's pick holds no target at moves nothing
     /// and is handed on all the same.
+    ///
+    /// A side a decode call issued stands in the place of the chosen side
+    /// the pair's first decision filed. A release that ends the issued
+    /// side ends that chosen side too, and the engine hears it as the
+    /// release of a decode still chosen that is named alone: the session
+    /// table does, under the verdict the first decision stated, and no
+    /// stage.
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
+        // Read ahead of the door's change, for a release that can end the
+        // decode: one that names it, or no side.
+        #[cfg(feature = "controller")]
+        let first = match said {
+            Said::Released(None | Some(lease::Side::Decode), _) => leases.replaced_decode(&key),
+            _ => None,
+        };
         let found = match said {
             Said::Dispatched(dispatch, when) => leases
                 .dispatched(self.slots(), &key, dispatch, when)
@@ -1170,6 +1185,15 @@ impl MemoryStore {
         };
         if let Some(found) = found {
             self.tell(at, one.world(self), &found, said);
+            #[cfg(feature = "controller")]
+            if let (Some(first), Said::Released(_, reason)) = (first, said) {
+                let chosen = Sides {
+                    decode: Some(first),
+                    ..found
+                };
+                let alone = Said::Released(Some(lease::Side::Decode), reason);
+                self.tell(at, one.world(self), &chosen, alone);
+            }
         }
     }
 }

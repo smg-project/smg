@@ -58,6 +58,12 @@ pub struct Pair {
     /// decode. The pick's own verdict ([`Pick::session_verdict`]) is the
     /// prefill side's. It is one byte the pair had spare.
     pub decode_verdict: DecodeVerdict,
+    /// Who placed the decode side, and whether a sessions rule that placed
+    /// it alone keeps it from the profile: the word of the decision that
+    /// made the pick's decodes, which every pair of the pick states. The
+    /// pick's own word ([`Pick::placed_by`]) is the prefill side's. It is
+    /// the last byte the pair had spare.
+    pub decode_placing: DecodePlacing,
 }
 
 impl Target {
@@ -87,7 +93,8 @@ impl Target {
 
 impl Pair {
     /// The decode side that names `decode`: its position in the decodes,
-    /// its id and its rank, with no verdict on a session key.
+    /// its id and its rank, with no verdict on a session key and the
+    /// stages as its placer.
     #[must_use]
     pub fn of(decode: &Candidate) -> Self {
         Self {
@@ -95,6 +102,7 @@ impl Pair {
             decode_id: decode.id,
             decode_dp_rank: decode.dp_rank,
             decode_verdict: DecodeVerdict::NONE,
+            decode_placing: DecodePlacing::STAGES,
         }
     }
 }
@@ -108,7 +116,9 @@ pub struct Targets {
     len: u8,
     /// Who placed the pick ([`Pick::placed_by`]) and, of a rule's pick,
     /// whether the rule keeps it from the profile (`Pick::untold`), in
-    /// the byte the count and the overlap left spare between them.
+    /// the byte the count and the overlap left spare between them. A
+    /// pair's list states its prefill side's here, and its decode side's
+    /// in its pairs ([`Pair::decode_placing`]).
     placing: Placing,
     /// What the rows the decision was given say the first target holds
     /// ([`Pick::overlap`]), in the bytes the count left spare.
@@ -176,13 +186,49 @@ impl Targets {
     /// States that the binding's sessions rule placed the pick, with no
     /// stage of the profile asked ([`PlacedBy::Rule`]), and whether that
     /// rule keeps what it places from the profile (`kept`, the rule's own
-    /// word). Both are the decision's: a list led anew, emptied or turned
-    /// into a pair's keeps them.
+    /// word). Both are the decision's: a list led anew or emptied keeps
+    /// them, and a list turned into a pair's hands them to its pairs
+    /// ([`Self::pair_under`]).
     pub(crate) fn by_rule(&mut self, kept: RulePlaced) {
         self.placing = match kept {
             RulePlaced::Told => Placing::Rule,
             RulePlaced::Untold => Placing::RuleUntold,
         };
+    }
+
+    /// The list's word of who placed it: a single's, or the prefill side's
+    /// of a pair.
+    pub(crate) const fn placing(&self) -> Placing {
+        self.placing
+    }
+
+    /// Takes the word of `held`, a pair's list, for the prefill side: a
+    /// decode asked again decides no prefill, and its pick keeps the word
+    /// the pair's first decision stated of that side. The word is on no
+    /// lease, so the pick alone carries it to the side's later words.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) fn placed_as(&mut self, held: &Self) {
+        self.placing = held.placing;
+    }
+
+    /// Takes the decode side's word of `held`, the pair a decode asked
+    /// again is held by, where the list names that pair's decode first.
+    /// The decision that put the request on that decode stands: the call
+    /// found the decode again, by the claim that decision made for the key
+    /// or by its own stages, and placed nothing. A list that names another
+    /// decode first placed the side anew, and keeps its own word.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) fn decode_placed_as(&mut self, held: &Pair) {
+        let named = |pair: Pair| (pair.decode_id, pair.decode_dp_rank);
+        let first = self.first().and_then(|first| first.pair);
+        if first.map(named) != Some(named(*held)) {
+            return;
+        }
+        for target in &mut self.items[..usize::from(self.len)] {
+            if let Some(pair) = &mut target.pair {
+                pair.decode_placing = held.decode_placing;
+            }
+        }
     }
 
     /// Append a target; a list already full keeps what it has.
@@ -196,14 +242,21 @@ impl Targets {
     /// Turns a decode side's targets into a pair's where they stand: each
     /// names `prefill` with the decode it held, in the order they had. The
     /// first pair states `decode`, the decode side's own session verdict,
-    /// and no pair behind it states one. What the decode side's list
-    /// stated of its first target goes ([`Pick::overlap`]): the engine
-    /// over worker lists states what a pair's prefill holds behind this
-    /// turn. The entries past the count are not rewritten, as
-    /// [`Self::clear`] leaves them. No accessor goes past the count.
-    pub(crate) fn pair_under(&mut self, prefill: &Target, decode: SessionVerdict) {
+    /// and no pair behind it states one. Every pair states the list's own
+    /// word of who placed it, which is the decode side's: one decision
+    /// made them all. The list then states `placed`, the prefill side's
+    /// word, as a pair's pick states the prefill side's verdict. So each
+    /// side of a pair keeps the word of its own decision: a sessions rule
+    /// may place one side alone and leave the other to its stages. What
+    /// the decode side's list stated of its first target goes
+    /// ([`Pick::overlap`]): the engine over worker lists states what a
+    /// pair's prefill holds behind this turn. The entries past the count
+    /// are not rewritten, as [`Self::clear`] leaves them. No accessor goes
+    /// past the count.
+    pub(crate) fn pair_under(&mut self, prefill: &Target, decode: SessionVerdict, placed: Placing) {
         // Taken by the first pair: the pairs behind it read none.
         let mut verdict = DecodeVerdict::of(decode);
+        let placing = DecodePlacing(self.placing as u8);
         for target in &mut self.items[..usize::from(self.len)] {
             *target = Target {
                 position: prefill.position,
@@ -214,9 +267,11 @@ impl Targets {
                     decode_id: target.id,
                     decode_dp_rank: target.dp_rank,
                     decode_verdict: std::mem::take(&mut verdict),
+                    decode_placing: placing,
                 }),
             };
         }
+        self.placing = placed;
         self.overlap = Overlap::NONE;
     }
 
@@ -387,6 +442,10 @@ pub struct Trace {
     /// sums runs past the trace's last row, the rows listed can differ
     /// too: each is a row of that tie.
     pub top: [(WorkerId, f32); TRACE_TOP],
+    /// How many rows of `top` are set, which can be none where the picker
+    /// compared workers: the decision the placing call keeps for a single
+    /// request reads no best row of its scores where no stage of the
+    /// document takes its issue and the document keeps no sample.
     pub top_len: u8,
     pub seed: u64,
     pub generation: u64,
@@ -603,7 +662,10 @@ impl Overlap {
 /// stores no prompt for it, as a gateway's sticky map keeps a request it
 /// places from the gateway's policy. Under `told`, the default, the stages
 /// hear both and where the prompt went is kept as behind any pick. The
-/// session table hears the dispatch under either.
+/// session table hears the dispatch under either. Each side of a pair is
+/// placed by a decision of its own and states its own word: the pick the
+/// prefill side's, and its pairs the decode side's
+/// ([`Pair::decode_placing`]).
 ///
 /// Who placed a pick does not cross the crate's frame: no wire message
 /// carries it, since the record is written where the decision is made.
@@ -629,11 +691,50 @@ pub enum PlacedBy {
 /// from the profile ([`RulePlaced::Untold`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
-enum Placing {
+pub(crate) enum Placing {
     #[default]
     Stages,
     Rule,
     RuleUntold,
+}
+
+/// What a pair keeps of its decode side's placing, in the last byte the
+/// pair had spare ([`Pair::decode_placing`]): who placed that side, and
+/// whether a sessions rule that placed it alone keeps it from the profile.
+/// The decode side of a pair is decided on its own, so the rule may place
+/// it alone beside a prefill its stages placed, and the other way round.
+///
+/// It is a byte with a name for each word, and no enum: every value of
+/// the byte is a word's or reads as the stages', so the byte tells nothing
+/// of whether a target names a pair, and a pick is laid out as it was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodePlacing(u8);
+
+impl DecodePlacing {
+    /// The profile's stages placed the side ([`PlacedBy::Stages`]).
+    pub const STAGES: Self = Self(Placing::Stages as u8);
+    /// The binding's sessions rule placed the side alone
+    /// ([`PlacedBy::Rule`]), and the profile is told of it.
+    pub const RULE: Self = Self(Placing::Rule as u8);
+    /// The rule placed the side alone and keeps it from the profile
+    /// ([`RulePlaced::Untold`]).
+    pub const RULE_UNTOLD: Self = Self(Placing::RuleUntold as u8);
+
+    /// Who placed the side ([`PlacedBy`]).
+    #[must_use]
+    pub const fn placed_by(self) -> PlacedBy {
+        match self {
+            Self::RULE | Self::RULE_UNTOLD => PlacedBy::Rule,
+            _ => PlacedBy::Stages,
+        }
+    }
+
+    /// Whether the side is kept from the profile, as `Pick::untold` says
+    /// it of a single.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) const fn untold(self) -> bool {
+        self.0 == Self::RULE_UNTOLD.0
+    }
 }
 
 /// A pick: ordered targets, the trace, and what a sessions rule did with
@@ -662,7 +763,13 @@ impl Pick {
     }
 
     /// Who placed the pick ([`PlacedBy`]): the profile's stages, unless the
-    /// binding's sessions rule placed it alone.
+    /// binding's sessions rule placed it alone. A pair's pick says it of
+    /// its prefill side, and its pairs of its decode side
+    /// ([`DecodePlacing::placed_by`]). The pick of a decode asked again
+    /// says the first decision's word of the prefill side to its guard and
+    /// its host. The stages that hear that decode's issue are handed the
+    /// pick ahead of that word: they read the decode side's word there,
+    /// and none of the prefill side.
     pub const fn placed_by(&self) -> PlacedBy {
         match self.targets.placing {
             Placing::Stages => PlacedBy::Stages,
@@ -675,10 +782,23 @@ impl Pick {
     /// the profile's own ([`RulePlaced::Untold`]). It has one reader
     /// (`lease_events::stages_hear`): the words of a lease and what is kept
     /// of where a prompt went both ask it, and so does a controller where
-    /// it files a pick's lease.
+    /// it files a pick's lease. A pair's pick says it of its prefill side
+    /// ([`Self::decode_untold`] of the other).
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) const fn untold(&self) -> bool {
         matches!(self.targets.placing, Placing::RuleUntold)
+    }
+
+    /// [`Self::untold`] of a pair's decode side: the word the pick's pairs
+    /// state ([`Pair::decode_placing`]), read off the first. A pick whose
+    /// first target names no pair has one side, and that side's word.
+    #[cfg(any(test, feature = "in-process"))]
+    #[inline]
+    pub(crate) fn decode_untold(&self) -> bool {
+        match self.targets.first().and_then(|first| first.pair) {
+            Some(pair) => pair.decode_placing.untold(),
+            None => self.untold(),
+        }
     }
 }
 
@@ -900,6 +1020,7 @@ mod tests {
             decode_id: WorkerId(9),
             decode_dp_rank: 1,
             decode_verdict: DecodeVerdict::NONE,
+            decode_placing: DecodePlacing::STAGES,
         };
         assert_eq!(Pair::of(&decode), side);
         let pair = Target {
@@ -910,7 +1031,7 @@ mod tests {
 
         let mut targets = Targets::new();
         targets.push(Target::of(&decode));
-        targets.pair_under(&Target::of(&prefill), SessionVerdict::None);
+        targets.pair_under(&Target::of(&prefill), SessionVerdict::None, Placing::Stages);
         assert_eq!(targets.first(), Some(&pair));
     }
 
@@ -1126,7 +1247,8 @@ mod tests {
     /// one a list's count and overlap left spare between them, with the
     /// rule's own word of a pick it placed. A pick no rule placed reads the
     /// stages, and is not kept from them. Both words are the decision's: a
-    /// list led anew, turned into a pair's or emptied keeps them.
+    /// list led anew or emptied keeps them, and a list turned into a
+    /// pair's hands them to its pairs (the next case).
     #[test]
     fn the_word_of_who_placed_a_pick_costs_the_pick_no_byte() {
         assert_eq!(size_of::<Placing>(), 1);
@@ -1152,8 +1274,6 @@ mod tests {
             assert_ne!(pick, by_stages);
             pick.targets.lead(target(1));
             assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
-            pick.targets.pair_under(&target(2), SessionVerdict::None);
-            assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
             pick.targets.clear();
             assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
         }
@@ -1162,6 +1282,133 @@ mod tests {
         told.targets.by_rule(RulePlaced::Told);
         kept.targets.by_rule(RulePlaced::Untold);
         assert_ne!(told, kept);
+    }
+
+    /// Each side of a pair states its own word of who placed it, and the
+    /// word costs the pair no byte: the decode side's sits in the last
+    /// byte the pair had spare, beside that side's verdict, and the
+    /// prefill side's in the list's own. A pair, a target and a pick are
+    /// the size they were. A list turned into a pair's hands its own word,
+    /// the decode side's, to each of its pairs, and states the prefill
+    /// side's. Each of the three words reads back on each side, whatever
+    /// the other side states: a sessions rule may place one side of a pair
+    /// alone and leave the other to its stages. A pair no decision spoke
+    /// of reads the stages. A decode asked again keeps the word a held
+    /// list states of the prefill side. Of the decode side it keeps the
+    /// word of the pair it is held by where it names that pair's decode
+    /// first, by its worker and its rank, and its own where it names
+    /// another. A gateway's sticky map places each role of a pair under
+    /// that role's own key
+    /// (`model_gateway/src/policies/registry.rs:762-769`), so one role's
+    /// request may follow its pin where the other's is its policy's. It
+    /// selects a request's decode once
+    /// (`model_gateway/src/routers/common/placement.rs:3088`): the policy
+    /// that placed it hears of it, however often the decode is asked for.
+    #[test]
+    fn each_side_of_a_pair_states_its_own_word_of_who_placed_it() {
+        assert_eq!(size_of::<DecodePlacing>(), 1);
+        assert_eq!((size_of::<Pair>(), size_of::<Target>()), (16, 40));
+        assert_eq!(size_of::<Pick>(), 256);
+        assert_eq!(Pair::default().decode_placing, DecodePlacing::STAGES);
+        let target = |position: u32| Target {
+            position,
+            id: WorkerId(u64::from(position) + 1),
+            dp_rank: 0,
+            pair: None,
+        };
+        // A side's word as its list states it and as a pair does, with
+        // who placed the side and whether it is kept from the profile.
+        let words = [
+            (
+                Placing::Stages,
+                DecodePlacing::STAGES,
+                (PlacedBy::Stages, false),
+            ),
+            (Placing::Rule, DecodePlacing::RULE, (PlacedBy::Rule, false)),
+            (
+                Placing::RuleUntold,
+                DecodePlacing::RULE_UNTOLD,
+                (PlacedBy::Rule, true),
+            ),
+        ];
+        for (prefill, _, prefill_word) in words {
+            for (decode, in_pair, decode_word) in words {
+                // The decode side's own list, as its decision made it.
+                let mut pick = Pick::default();
+                pick.targets.push(target(0));
+                pick.targets.push(target(1));
+                match decode {
+                    Placing::Stages => {}
+                    Placing::Rule => pick.targets.by_rule(RulePlaced::Told),
+                    Placing::RuleUntold => pick.targets.by_rule(RulePlaced::Untold),
+                }
+                pick.targets
+                    .pair_under(&target(2), SessionVerdict::None, prefill);
+                let pairs: Vec<Pair> = pick.targets.iter().filter_map(|t| t.pair).collect();
+                assert_eq!(pairs.len(), 2);
+                assert!(pairs.iter().all(|pair| pair.decode_placing == in_pair));
+                let stated = (in_pair.placed_by(), in_pair.untold());
+                assert_eq!(stated, decode_word, "the decode side's");
+                assert_eq!(pick.decode_untold(), decode_word.1);
+                let own = (pick.placed_by(), pick.untold());
+                assert_eq!(own, prefill_word, "the prefill side's");
+                // A decode asked again: its own word, and the held list's
+                // of the prefill side.
+                let mut again = Pick::default();
+                again.targets.push(target(3));
+                again.targets.by_rule(RulePlaced::Untold);
+                again
+                    .targets
+                    .pair_under(&target(2), SessionVerdict::None, Placing::Stages);
+                assert_eq!(again.placed_by(), PlacedBy::Stages);
+                again.targets.placed_as(&pick.targets);
+                assert_eq!((again.placed_by(), again.untold()), prefill_word);
+                assert!(again.decode_untold(), "its own side's word stands");
+                // Held by a pair of another decode, or of another rank of
+                // its decode, the call placed the side anew.
+                let own = again;
+                for held in [pairs[0], pairs[1]] {
+                    again.targets.decode_placed_as(&held);
+                    let other_rank = Pair {
+                        decode_id: WorkerId(4),
+                        decode_dp_rank: 1,
+                        ..held
+                    };
+                    again.targets.decode_placed_as(&other_rank);
+                    assert_eq!(again, own);
+                }
+                // Held by a pair of the decode it names first, it keeps
+                // that pair's word on every pair, and the prefill side's.
+                let mut found = Pick::default();
+                found.targets.push(target(3));
+                found.targets.push(target(4));
+                found.targets.by_rule(RulePlaced::Untold);
+                found
+                    .targets
+                    .pair_under(&target(2), SessionVerdict::None, prefill);
+                let held = Pair {
+                    decode_id: WorkerId(4),
+                    ..pairs[1]
+                };
+                found.targets.decode_placed_as(&held);
+                let kept: Vec<Pair> = found.targets.iter().filter_map(|t| t.pair).collect();
+                assert!(kept.iter().all(|pair| pair.decode_placing == in_pair));
+                assert_eq!(found.decode_untold(), decode_word.1);
+                assert_eq!((found.placed_by(), found.untold()), prefill_word);
+            }
+        }
+        // A pick that names no pair has one side, and that side's word.
+        let mut single = Pick::default();
+        single.targets.push(target(0));
+        assert!(!single.decode_untold());
+        single.targets.by_rule(RulePlaced::Untold);
+        assert!(single.untold() && single.decode_untold());
+        // Every other value of the byte reads as the stages'.
+        let other = DecodePlacing(9);
+        assert_eq!(
+            (other.placed_by(), other.untold()),
+            (PlacedBy::Stages, false)
+        );
     }
 
     /// The decode side's verdict costs a pair no byte: it sits in one the
@@ -1346,6 +1593,7 @@ mod tests {
                     decode_dp_rank: decode(position).dp_rank,
                     decode_verdict: [DecodeVerdict::CLAIMED, DecodeVerdict::NONE]
                         [position as usize],
+                    decode_placing: DecodePlacing::STAGES,
                 }),
                 ..prefill
             });
@@ -1356,7 +1604,11 @@ mod tests {
             source: OverlapSource::Index,
             margin_held: false,
         });
-        turned.pair_under(&prefill, SessionVerdict::Claimed(decode(0).id));
+        turned.pair_under(
+            &prefill,
+            SessionVerdict::Claimed(decode(0).id),
+            Placing::Stages,
+        );
         assert_eq!(turned, pushed);
         // The first pair reads its side's whole verdict back with its decode.
         let first = turned.as_slice()[0].pair.expect("a pair");
@@ -1379,13 +1631,13 @@ mod tests {
         ] {
             let mut list = Targets::new();
             list.push(decode(0));
-            list.pair_under(&prefill, verdict);
+            list.pair_under(&prefill, verdict, Placing::Stages);
             let pair = list.as_slice()[0].pair.expect("a pair");
             assert_eq!(pair.decode_verdict.on(pair.decode_id), verdict);
         }
         // An empty list stays empty.
         let mut none = Targets::new();
-        none.pair_under(&prefill, SessionVerdict::None);
+        none.pair_under(&prefill, SessionVerdict::None, Placing::Stages);
         assert_eq!(none, Targets::new());
     }
 

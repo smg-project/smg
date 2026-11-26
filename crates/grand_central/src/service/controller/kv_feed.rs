@@ -28,11 +28,12 @@ mod tests {
         document::{AppliedSpec, PolicySpec},
         engine::view::{WireModes, WorkerId as RowId},
         service::controller::{
-            config::tests::valid, readiness::State, worker_objects::WorkerObjects, Controller,
+            config::tests::valid, decision_slots::tests as bed, readiness::State,
+            worker_objects::WorkerObjects, Controller,
         },
         store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus, WorkersStore},
         worker_host::{
-            KvFeed, KvTables, Members, MembershipWriter as _, Objects, Precondition, StoreDoor,
+            HolderDoor, KvFeed, KvTables, Members, MembershipWriter as _, Objects, Precondition,
         },
     };
 
@@ -97,18 +98,16 @@ mod tests {
         }
 
         fn lay(&self, facts: WorkerFacts) -> RowId {
-            let row = self.store.upsert(facts).id();
-            self.objects.follow(&*self.store);
-            row
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write").id()
         }
 
         fn remove(&self, row: RowId) -> bool {
             let Some(standing) = self.store.get(row) else {
                 return false;
             };
-            let removed = self.store.remove(row, standing.revision).is_some();
-            self.objects.follow(&*self.store);
-            removed
+            let (store, objects) = (&self.store, &self.objects);
+            objects.remove(store, row, standing.revision).is_some()
         }
 
         /// The feed gets its first turn before the case writes any more rows.
@@ -233,13 +232,12 @@ mod tests {
         f.store
             .apply(AppliedSpec::validate(&spec).expect("the preset validates"))
             .expect("the first generation");
-        let door = StoreDoor::new(Arc::clone(&f.store));
+        let door = HolderDoor::new(Arc::clone(&f.store), Arc::clone(&f.objects));
         f.check(async {
             door.found(&Registrant::Control, Precondition::Absent, FIRST, &|_| {
                 facts(FIRST, WireModes::GRPC, false)
             })
             .expect("registered");
-            f.objects.follow(&*f.store);
             f.new_slot(FIRST, None).await;
         })
         .await
@@ -514,6 +512,27 @@ mod tests {
         };
         let (stop_mock, mock_stopped) = oneshot::channel();
         let mut tasks = JoinSet::new();
+        // A second engine of the model, which is sent no prompt: it stores
+        // no block.
+        let idle_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("the second mock worker's listener binds");
+        let idle_addr = idle_listener
+            .local_addr()
+            .expect("the second mock worker's address");
+        let idle_url = format!("grpc://{idle_addr}");
+        let idle_row = WorkerFacts {
+            engine_kind: row.engine_kind.clone(),
+            ..facts(&idle_url, WireModes::GRPC, true)
+        };
+        let (stop_idle, idle_stopped) = oneshot::channel();
+        tasks.spawn(grpc::serve_with_listener_until(
+            Arc::new(mock.clone()),
+            idle_listener,
+            async {
+                let _ = idle_stopped.await;
+            },
+        ));
         tasks.spawn(grpc::serve_with_listener_until(
             Arc::new(mock),
             listener,
@@ -539,27 +558,27 @@ mod tests {
             let _ = stopped.await;
         }));
         let case = async {
-            let written = objects.upsert(&store, row, Registrant::Control);
-            let id = written.expect("the store took the registration").id();
-            let revision = store.get(id).expect("the row").revision;
-            objects.connect_row(&store, id, revision);
+            let ready = |facts: WorkerFacts| {
+                let written = objects.upsert(&store, facts, Registrant::Control);
+                let id = written.expect("the store took the registration").id();
+                let revision = store.get(id).expect("the row").revision;
+                objects.connect_row(&store, id, revision);
+                id
+            };
+            let (id, idle) = (ready(row), ready(idle_row));
             store.publish_now();
 
+            let dialed = |url: &str| {
+                let worker = objects.registry().get_by_url(url);
+                worker.is_some_and(|w| w.engine_connection_if_initialized().is_some())
+            };
             timeout(WAIT, async {
-                loop {
-                    if objects
-                        .registry()
-                        .get_by_url(&url)
-                        .and_then(|w| w.engine_connection_if_initialized())
-                        .is_some()
-                    {
-                        break;
-                    }
+                while !(dialed(&url) && dialed(&idle_url)) {
                     sleep(POLL).await;
                 }
             })
             .await
-            .expect("the feed dials through the worker object's connector");
+            .expect("the feed dials through each worker object's connector");
 
             let hashes = [compute_content_hash(&tokens).0];
             // The workers the model's index holds a leading block of the
@@ -602,6 +621,27 @@ mod tests {
             // holder made and the block its feed wrote there.
             assert_eq!(tables.indexed_blocks(id, 0), 1);
             assert!(tables.cursor(id, 0).is_some());
+            // The controller's engine reads the index. The engine that
+            // stored the block has a request in flight and the other none,
+            // so load alone names the other: a prompt nobody stored goes
+            // there. The request whose block was stored is named the engine
+            // that stored it, whatever its seed. No prompt went through the
+            // controller, so its record of sent prefixes names neither.
+            assert_eq!(tables.indexed_blocks(idle, 0), 0);
+            let stored_by = objects.registry().get_by_url(&url);
+            stored_by.expect("the worker's object").increment_load();
+            let named = |hashes: &[u64], seed: u64| {
+                let mut frame = bed::frame_for(MODEL, 1, seed);
+                let facts = frame.facts.as_mut().expect("the frame's facts");
+                facts.block_hashes = hashes.to_vec();
+                facts.prompt_tokens = block_size;
+                bed::lent_pick(&store, &objects, frame)
+            };
+            for seed in 1..=16 {
+                let unheard = [!hashes[0]];
+                assert_eq!(named(&unheard, seed), Some(idle), "seed {seed}");
+                assert_eq!(named(&hashes, seed), Some(id), "seed {seed}");
+            }
             stop.send(()).expect("the controller is still serving");
         };
         let (result, ()) = timeout(Duration::from_secs(15), async { tokio::join!(serve, case) })
@@ -611,11 +651,16 @@ mod tests {
         stop_mock
             .send(())
             .expect("the mock worker is still serving");
-        timeout(WAIT, tasks.join_next())
-            .await
-            .expect("the mock worker stops")
-            .expect("the mock worker's task")
-            .expect("the mock worker stops cleanly");
+        stop_idle
+            .send(())
+            .expect("the second mock worker is still serving");
+        for _ in 0..2 {
+            timeout(WAIT, tasks.join_next())
+                .await
+                .expect("a mock worker stops")
+                .expect("a mock worker's task")
+                .expect("a mock worker stops cleanly");
+        }
     }
 
     /// The serve hands its feed the sink of the load records its streams

@@ -30,7 +30,9 @@
 //! rule for such a list has loads to steer by. `--refused limit` puts every
 //! prefill of a pair's cell at its host's admission limit, and `--refused
 //! partners` takes its every decode out of service: each decision is then
-//! refused, and a turn refused that way counts. `--shadow twin` names a
+//! refused, and a turn refused that way counts. `--refused overload` puts
+//! its every decode over its thresholds under a binding that sheds such a
+//! list: each request is then shed as saturated. `--shadow twin` names a
 //! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,
@@ -85,6 +87,8 @@ mod conversations;
 mod counting_alloc;
 #[path = "in_process/encode.rs"]
 mod encode;
+#[path = "in_process/indexed.rs"]
+mod indexed;
 #[path = "in_process/pair.rs"]
 mod pair;
 #[path = "in_process/place.rs"]
@@ -117,8 +121,8 @@ use parking_lot::{Condvar, Mutex};
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec, RulePlaced, ShadowSpec},
     engine::{
-        Constraints, Decided, FixedFacts, Identity, InProcess, Phase, Plain, PublishedList,
-        Request, RequestFacts, RequestMaker, TokenEntry, TokenKey, WorkerId, WorkerLists,
+        Constraints, Decided, FixedFacts, Identity, InProcess, Phase, Plain, PromptEntry,
+        PublishedList, Request, RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
     },
     policies::{
         consistent_hashing::{Head, LentRing},
@@ -160,6 +164,11 @@ pub static MALLOC_CONF: &[u8; 100] =
 
 const MODEL: &str = "bench-model";
 
+/// The address of the list's worker at `at`.
+fn address(at: usize) -> String {
+    format!("http://worker-{at:04}:8000")
+}
+
 /// Decisions a caller makes untimed first: the buffers a thread keeps.
 const CALLER_WARM: u64 = 256;
 
@@ -191,6 +200,9 @@ struct Cell {
     /// The request of one turn of the cell's callers by the turn's seed. It
     /// is plain for every seed or for none: the bench asks it once a cell.
     request: fn(u64) -> Request<'static>,
+    /// What the cell stores behind its engine for a run's callers, ahead of
+    /// the list's first request.
+    stores: fn(&Run, &InProcess),
     /// The words the cell adds at the end of its result line.
     words: fn() -> String,
 }
@@ -198,8 +210,8 @@ struct Cell {
 impl Cell {
     /// A cell of plain requests that makes nothing behind its engine, whose
     /// callers ask the run's `decide`, which takes every run, which writes
-    /// nothing into its reports and whose line gains no word. An entry names
-    /// itself and its document.
+    /// nothing into its reports, which stores nothing for a run's callers
+    /// and whose line gains no word. An entry names itself and its document.
     const PLAIN: Self = Self {
         behind: |_| (),
         caller: None,
@@ -208,6 +220,7 @@ impl Cell {
         name: "",
         reports: |_| (),
         request: plain,
+        stores: |_, _| (),
         words: String::new,
     };
 
@@ -235,6 +248,16 @@ const CELLS: &[Cell] = &[
         words: conversations::words,
         ..Cell::PLAIN
     },
+    Cell {
+        name: "cache_aware_held",
+        document: || preset("cache_aware"),
+        behind: indexed::holds,
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        stores: conversations::held,
+        words: conversations::words,
+        ..Cell::PLAIN
+    },
     // The cache-aware preset over one prompt at every turn, under a host
     // that lends no tree. Asked by the one call (`--entry place`), a turn
     // is named its worker by the engine's record of sent prefixes. Under
@@ -243,6 +266,15 @@ const CELLS: &[Cell] = &[
     Cell {
         name: "cache_aware_one_prompt",
         document: || preset("cache_aware"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "cache_aware_indexed",
+        document: || preset("cache_aware"),
+        behind: indexed::keeps,
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        words: conversations::words,
         ..Cell::PLAIN
     },
     Cell {
@@ -360,6 +392,16 @@ const CELLS: &[Cell] = &[
         request: on_runtime,
         ..Cell::PLAIN
     },
+    // The cache-aware preset on both sides of a pair: each side is handed
+    // its own list's column. Asked by the one call (`--entry place`), a
+    // turn's prompt is hashed, each side's column is filled from the
+    // engine's record of sent prefixes, and its pick is written there.
+    Cell {
+        name: "pair_cache_aware",
+        document: || pair::of("cache_aware"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "pair_least_load",
         document: || pair::of("least_load"),
@@ -376,6 +418,15 @@ const CELLS: &[Cell] = &[
         name: "pair_round_robin_later",
         document: || pair::of("round_robin"),
         request: pair::later,
+        ..Cell::PLAIN
+    },
+    // A pair under the document of three sides, its encode side under the
+    // plain ring: what a pair pays for a side it does not use, counted
+    // against `pair_round_robin`, the same two sides under the pair plan.
+    Cell {
+        name: "pair_round_robin_three_sided",
+        document: encode::ringed,
+        request: pair::request,
         ..Cell::PLAIN
     },
     Cell {
@@ -944,17 +995,21 @@ fn warm_stack() {
 fn main() {
     let run = run();
     // A pair's cell hands two lists and an encode request's three: such a
-    // run is its file's.
-    if pair::runs(&run) || encode::runs(&run) {
+    // run is its file's. A pair's cell alone runs refused.
+    if pair::runs(&run) {
         return;
     }
     let open = run.refused == pair::Refused::No;
     assert!(open, "a pair's cell alone runs refused");
+    if encode::runs(&run) {
+        return;
+    }
     let Cell {
         behind,
         document,
         fits,
         request,
+        stores,
         ..
     } = run.cell;
     fits(&run);
@@ -965,7 +1020,7 @@ fn main() {
         "--cold-kb: this cell's callers time their own turns"
     );
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
-        .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
+        .map(|at| ready_worker(&address(at), MODEL))
         .collect();
     lend(&workers);
     if run.overloaded {
@@ -997,6 +1052,7 @@ fn main() {
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(spec)));
     behind(engine);
+    stores(&run, engine);
     assert!(matches!(run.engines, 1 | 2), "one engine or two");
     // A cell whose callers make turns of their own times those turns
     // itself, and they ask one engine.

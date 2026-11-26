@@ -80,6 +80,7 @@ use rustc_hash::FxHashMap;
 use smg_worker::{
     identity::basic::Worker,
     load::state::LoadSnapshot,
+    runtime::published_word,
     worker::{WorkerLoadResponse, WorkerSpec, WorkerStatus},
 };
 
@@ -157,8 +158,8 @@ impl DecisionClock {
     }
 
     /// The clock whose origin is `origin`: for a host that reads a clock of
-    /// its own and builds an engine for each of its documents, so one
-    /// instant reads alike on the host's clock and on every engine's.
+    /// its own, as a store does, so one instant reads alike on the host's
+    /// clock and on its engine's.
     #[must_use]
     #[cfg_attr(
         not(feature = "in-process"),
@@ -210,9 +211,15 @@ pub struct Live<'a> {
     /// Whether a stage of the document reads a worker's count of session
     /// keys with a request in flight.
     sessions: bool,
+    /// Whether nobody reads the best rows of the decision's trace
+    /// ([`Self::unread`]).
+    unread: bool,
     /// The list's own word, where the decision is over one list
     /// ([`Self::turning`]).
     word: Option<&'a AtomicU64>,
+    /// Whether the decision's records are written at rest
+    /// ([`Self::rested_where`]): no worker object is read to fill one.
+    rest: bool,
 }
 
 impl<'a> Live<'a> {
@@ -245,7 +252,32 @@ impl<'a> Live<'a> {
             loads,
             counted_key: session_key.filter(|_| needs.session_in_flight),
             sessions: needs.active_sessions,
+            unread: false,
             word: None,
+            rest: false,
+        }
+    }
+
+    /// These reads with every record of the decision written at rest: the
+    /// row is copied with its health clear, and no worker object is read
+    /// to fill it.
+    /// Only under a document no stage of which reads a count a worker
+    /// object alone holds ([`Engine::rows_stand`]), and only where `stand`
+    /// says, of the process's word of published states
+    /// ([`published_word`]), that every list of the decision stands under
+    /// it ([`PoolRecords::stands`]) and that its host states no veto beside
+    /// the rows. The word is read here, ahead of every question a list asks
+    /// its workers under it and of every record the decision writes.
+    ///
+    /// Every list, because the engine's rule for an emptied pool picks by
+    /// the count in flight, also of rows that carry no veto: it steers
+    /// only where a row of the decision carries a veto or its host masks
+    /// one, and then every record is read as it always was.
+    #[must_use]
+    pub(crate) fn rested_where(self, engine: &Engine, stand: impl FnOnce(u64) -> bool) -> Self {
+        Self {
+            rest: engine.rows_stand() && stand(published_word()),
+            ..self
         }
     }
 
@@ -261,6 +293,18 @@ impl<'a> Live<'a> {
             word: Some(word),
             ..self
         }
+    }
+
+    /// These reads for a decision nobody reads the best rows of, where
+    /// `unread`: one kept behind a placement, which hands out no trace,
+    /// under a document none of whose stages takes its issue and that
+    /// keeps no sample. The front that runs the decision states the word
+    /// to the engine's scratch ([`Scratch::unread`]), which the borrow of
+    /// the thread's buffers hands it cleared, and no pass over the
+    /// decision's scores runs for the best rows of its trace.
+    #[must_use]
+    pub(crate) fn unread(self, unread: bool) -> Self {
+        Self { unread, ..self }
     }
 
     /// These reads with the request's key counted under `session_key`: for
@@ -309,9 +353,33 @@ impl<'a> Live<'a> {
     /// beside the breaker's, as a veto that holds is written: no rule
     /// lifts it.
     ///
-    /// Read at every decision and kept nowhere.
+    /// Read at every decision and kept nowhere. The one decision that
+    /// fills its rows with no read of an object is a pair's or an encode
+    /// request's whose every list is wholly available
+    /// ([`Self::rested_where`]): its rows are written ready with no other
+    /// bit, as the object would say, and their counts stay at rest, which
+    /// no stage of its document reads.
     #[inline]
     fn object(&self, worker: &dyn Worker, row: &mut Candidate) {
+        if self.rest {
+            self.object_as::<true>(worker, row);
+        } else {
+            self.object_as::<false>(worker, row);
+        }
+    }
+
+    /// [`Self::object`] where the caller has asked whether the decision's
+    /// records are written at rest, `REST`: a write of a whole list asks
+    /// once, and its loop over the rows is compiled without the question.
+    #[inline(always)]
+    fn object_as<const REST: bool>(&self, worker: &dyn Worker, row: &mut Candidate) {
+        if REST {
+            row.health = Health {
+                healthy: true,
+                ..Health::default()
+            };
+            return;
+        }
         let state = worker.routing_state();
         let held = !state.can_execute;
         row.health = Health {
@@ -411,8 +479,8 @@ pub(super) fn stated_report(
 }
 
 /// A report's named values as a record states them, written into the row
-/// of `cells` at `position`, and whether a named value is read of the
-/// report at all. They are made by the crate's one conversion
+/// of `cells` at `position`, and whether the report is the whole of its
+/// worker object. They are made by the crate's one conversion
 /// ([`signal_values`]) under `columns`, the document's, and written where
 /// a decision may read them ([`SignalCells::write`]): under the signal's
 /// own unit and in range, each sample instant on `clock`. A report that
@@ -476,8 +544,8 @@ pub(super) fn stated_signals<'c>(
 /// The rows are of one snapshot and one list, and are read by a decision
 /// that holds that snapshot and that list and by no other
 /// ([`Self::is_of`]). They are replaced whole, never changed, and they die
-/// with their list. Nothing a worker object says is in them: that is read
-/// at every decision ([`Live::object`]), and so is the report's age
+/// with their list. Nothing a worker object says is in them: that is a
+/// decision's to write ([`Live::object`]), and so is the report's age
 /// ([`Live::age`]).
 #[derive(Debug)]
 struct Reported {
@@ -526,7 +594,9 @@ type Held = Guard<Option<Arc<Reported>>>;
 /// It holds the half of each worker's record that no request changes, the
 /// pool's engines and the pool's number. It holds no worker object and no
 /// value a worker object says: a worker's health and its count of requests
-/// in flight are read on the object at each decision ([`Live`]). A
+/// in flight are read on the object at each decision ([`Live`]), but by a
+/// pair's or an encode request's decision that the list's one kept answer
+/// serves: that every worker of it has published that it is available. A
 /// worker's load report is read from the load snapshot the decision holds:
 /// converted once for the list, by the first decision that writes every
 /// record under that snapshot or by the draw that pays the last of the
@@ -589,6 +659,15 @@ pub struct PoolRecords {
     conversions: AtomicU64,
     /// The number the list's fixed rows are known by ([`serial`]).
     serial: NonZeroU64,
+    /// The process's word of published routing states the list's workers
+    /// were last asked under, shifted left by one, and in the low bit
+    /// whether every one of them said available ([`Self::stands`]). Zero
+    /// before the first question: the word starts at one. A word of two
+    /// to the 63rd or more equals no kept value: every decision asks.
+    standing: AtomicU64,
+    /// The claim to ask the list's workers ([`Self::ask`]): taken by one
+    /// compare and exchange and never waited for, as the conversion's is.
+    asking: Mutex<()>,
 }
 
 impl PoolRecords {
@@ -710,7 +789,60 @@ impl PoolRecords {
             converting: Mutex::new(LookUps::default()),
             conversions: AtomicU64::new(0),
             serial: serial(),
+            standing: AtomicU64::new(0),
+            asking: Mutex::new(()),
         }
+    }
+
+    /// Whether every worker of the list, `workers`, says that its published
+    /// routing state is available ([`Worker::published_available`]), as
+    /// asked under `word`, a value of the process's word of published
+    /// states the caller read before this call ([`published_word`]).
+    ///
+    /// The list keeps the last answer with the word it was asked under,
+    /// and a decision that reads the same word takes it by one load: no
+    /// published state has moved since. The first decision under another
+    /// word takes the list's claim, asks every worker once and leaves the
+    /// answer. The claim is never waited for: a decision that finds it
+    /// taken is answered no, and reads its workers' objects as it always
+    /// did. So is every decision over a list with a worker whose published
+    /// state is not available, or that publishes none.
+    #[inline]
+    pub(crate) fn stands(&self, workers: &[Arc<dyn Worker>], word: u64) -> bool {
+        let standing = self.standing.load(Ordering::Acquire);
+        if standing >> 1 == word {
+            return standing & 1 == 1;
+        }
+        self.ask(workers, word)
+    }
+
+    /// [`Self::stands`] by the list's kept answer alone: no worker is
+    /// asked, and a list last asked under another word answers no. For
+    /// the decision that writes one record of the list, a decode's asked
+    /// again: a question a worker would cost it more than the one read
+    /// of its held prefill's object.
+    #[inline]
+    pub(crate) fn stood(&self, word: u64) -> bool {
+        let standing = self.standing.load(Ordering::Acquire);
+        standing >> 1 == word && standing & 1 == 1
+    }
+
+    /// Asks every worker of the list whether its published state is
+    /// available, under the list's claim, and leaves the answer with
+    /// `word` ([`Self::stands`]). The word was read before the workers are
+    /// asked, so an answer left under it is never newer than it says: a
+    /// state that moves behind a worker's answer moves the process's word
+    /// past it.
+    #[cold]
+    #[inline(never)]
+    fn ask(&self, workers: &[Arc<dyn Worker>], word: u64) -> bool {
+        let Some(_claim) = self.asking.try_lock() else {
+            return false;
+        };
+        let available = workers.iter().all(|worker| worker.published_available());
+        self.standing
+            .store(word << 1 | u64::from(available), Ordering::Release);
+        available
     }
 
     /// How many workers the list holds.
@@ -922,7 +1054,10 @@ impl PoolRecords {
     ///
     /// Read on the worker object at this call and kept nowhere ([`Live`]):
     /// a worker's status, its circuit breaker, its overload and liveness
-    /// vetoes and its count of requests in flight.
+    /// vetoes and its count of requests in flight. A pair's or an encode
+    /// request's decision whose every list is wholly available, under a
+    /// document no stage of which reads a count, reads none of them: its
+    /// records are written ready.
     ///
     /// A worker's load report with its sample's instant is the one the
     /// decision's snapshot holds, and never another snapshot's. Where the
@@ -948,6 +1083,7 @@ impl PoolRecords {
     ///
     /// The facts borrow the records and what `live` borrows, the list's own
     /// word among it. The rows borrow their buffer alone.
+    #[inline]
     pub fn write<'a, 'f>(
         &'f self,
         workers: &[Arc<dyn Worker>],
@@ -955,7 +1091,12 @@ impl PoolRecords {
         rows: &'a mut Vec<Candidate>,
     ) -> (&'a mut [Candidate], PoolFacts<'f>) {
         // A caller's own buffer: no rows stand in it.
-        self.write_over::<false>(workers, live, rows, &mut Standing::default())
+        let stands = &mut Standing::default();
+        if live.rest {
+            self.write_over::<false, true>(workers, live, rows, stands)
+        } else {
+            self.write_over::<false, false>(workers, live, rows, stands)
+        }
     }
 
     /// [`Self::write`] into `rows`, where `stands` says which rows they
@@ -972,13 +1113,23 @@ impl PoolRecords {
     /// `KEEPS` is whether the buffer keeps its rows between writes. One
     /// that does not is never asked what stands in it: its write is
     /// compiled as the whole one alone.
-    fn write_over<'a, 'f, const KEEPS: bool>(
+    ///
+    /// `REST` is whether the decision's records are written at rest
+    /// ([`Live::rested_where`]): asked once a list, so neither form's loop
+    /// over the rows asks it of a row. Only into a buffer that keeps no
+    /// rows: a row written at rest takes its counts from the copy, and
+    /// rows that stand carry the counts of the decision before.
+    fn write_over<'a, 'f, const KEEPS: bool, const REST: bool>(
         &'f self,
         workers: &[Arc<dyn Worker>],
         live: &Live<'f>,
         rows: &'a mut Vec<Candidate>,
         stands: &mut Standing,
     ) -> (&'a mut [Candidate], PoolFacts<'f>) {
+        debug_assert!(
+            !(KEEPS && REST),
+            "rows that stand are never written at rest"
+        );
         debug_assert_eq!(
             workers.len(),
             self.fixed.len(),
@@ -1007,7 +1158,7 @@ impl PoolRecords {
                         let of = of(reported.serial);
                         if KEEPS && *stands == of && rows.len() == workers.len() {
                             for (row, worker) in rows.iter_mut().zip(workers) {
-                                live.object(worker.as_ref(), row);
+                                live.object_as::<REST>(worker.as_ref(), row);
                                 live.age(row);
                             }
                         } else {
@@ -1016,7 +1167,7 @@ impl PoolRecords {
                             rows.extend(reported.rows.iter().zip(workers).map(
                                 |(reported, worker)| {
                                     let mut row = *reported;
-                                    live.object(worker.as_ref(), &mut row);
+                                    live.object_as::<REST>(worker.as_ref(), &mut row);
                                     live.age(&mut row);
                                     row
                                 },
@@ -1046,14 +1197,14 @@ impl PoolRecords {
                 let of = of(self.serial);
                 if KEEPS && *stands == of && rows.len() == workers.len() {
                     for (row, worker) in rows.iter_mut().zip(workers) {
-                        live.object(worker.as_ref(), row);
+                        live.object_as::<REST>(worker.as_ref(), row);
                     }
                 } else {
                     *stands = of;
                     rows.clear();
                     rows.extend(self.fixed.iter().zip(workers).map(|(fixed, worker)| {
                         let mut row = *fixed;
-                        live.object(worker.as_ref(), &mut row);
+                        live.object_as::<REST>(worker.as_ref(), &mut row);
                         row
                     }));
                 }
@@ -1583,6 +1734,9 @@ pub fn decide(
     facts.now_micros = live.now_micros;
     let facts = &*facts;
     let decide = |buffers: &mut Buffers| {
+        if live.unread {
+            buffers.scratch.unread(true);
+        }
         let Buffers {
             rows,
             whole,
@@ -1622,7 +1776,7 @@ pub fn decide(
         }) {
             return decision;
         }
-        let (rows, pool_facts) = pool.write_over::<true>(workers, live, whole, stands);
+        let (rows, pool_facts) = pool.write_over::<true, false>(workers, live, whole, stands);
         let written;
         let cx = if cx.stalled.is_empty() {
             cx
@@ -1638,6 +1792,12 @@ pub fn decide(
 /// Runs one decision over the calling thread's own buffers: the one borrow
 /// of them, for a decision without a shadow ([`decide`]) and for one
 /// followed by its binding's shadow profile ([`with_shadow::decide`]).
+///
+/// The scratch is handed out with its word on the best rows of a trace
+/// cleared ([`Live::unread`]): the word of the thread's last decision
+/// never stands for this one, and a decision that states none reads them.
+/// A live decision and the shadow profile decided behind it on this
+/// borrow share the word: the front states it once, for both.
 #[inline]
 fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
     // The key's own call hands out the pointer alone: what a decision
@@ -1648,6 +1808,7 @@ fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
         // thread: that decision takes buffers of its own.
         return decide(&mut Buffers::default());
     };
+    buffers.scratch.unread(false);
     decide(&mut buffers)
 }
 

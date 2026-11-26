@@ -205,13 +205,14 @@ fn counted(
     }
 }
 
-/// A place's step toward a sample, under a document that keeps one and
-/// takes no word on a lease. The place stands as the request's whole
-/// answer. Where it is the calling thread's next sample ([`nth`]), it is
-/// kept as the decision that names the worker at the place alone
-/// ([`AlonePick::decision`]), by the id and the rank a noted pick names
-/// that worker by ([`super::single::noted`]), and `clock` is read for that
-/// record alone. The request's id is asked of `maker` ahead of the count.
+/// A place's step toward a sample, under a document that keeps one and no
+/// stage or count of sends of which takes a word on a lease. The place
+/// stands as the request's whole answer. Where it is the calling thread's
+/// next sample ([`nth`]), it is kept as the decision that names the worker
+/// at the place alone ([`AlonePick::decision`]), by the id and the rank a
+/// noted pick names that worker by ([`super::single::noted`]), and `clock`
+/// is read for that record alone. The request's id is asked of `maker`
+/// ahead of the count.
 ///
 /// Out of line: no decision of a document that keeps no sample runs it.
 #[cold]

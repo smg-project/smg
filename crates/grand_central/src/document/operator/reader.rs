@@ -749,6 +749,53 @@ mod tests {
         );
     }
 
+    /// A binding's six blocks are optional, and the key of one with nothing
+    /// under it reads as the key left out: in YAML, where the key stands
+    /// bare or under `~`, and as a JSON null. The schema file states each
+    /// of the six as its block or a null. So an emptied `sessions:` keeps
+    /// no session, and no read says so.
+    #[test]
+    fn a_bindings_block_with_nothing_under_it_reads_as_the_key_left_out() {
+        const BLOCKS: [&str; 6] = [
+            "overload",
+            "routing_key",
+            "sessions",
+            "shadow",
+            "canary",
+            "admission",
+        ];
+        // One document, its binding with `more` among its keys, in each form.
+        let yaml = |more: &str| {
+            format!(
+                "apiVersion: smg.policy/v1\nprofiles:\n  default: {{pick: random}}\n\
+                 bindings:\n- match: {{model: m}}\n  profile: default\n{more}"
+            )
+        };
+        let json = |more: &str| {
+            format!(
+                "{{\"apiVersion\":\"smg.policy/v1\",\"profiles\":{{\"default\":{{\"pick\":\"random\"}}}},\
+                 \"bindings\":[{{\"match\":{{\"model\":\"m\"}},\"profile\":\"default\"{more}}}]}}"
+            )
+        };
+        // What a document reads as, once its check passed.
+        let checked = |format: Format, document: String| {
+            let read = format
+                .read(document.as_bytes())
+                .unwrap_or_else(|refused| panic!("{document}: {refused}"));
+            assert!(read.validate().is_ok(), "{document}");
+            read
+        };
+        let left_out = checked(Format::Yaml, yaml(""));
+        assert_eq!(checked(Format::Json, json("")), left_out);
+        for block in BLOCKS {
+            for bare in [format!("  {block}:\n"), format!("  {block}: ~\n")] {
+                assert_eq!(checked(Format::Yaml, yaml(&bare)), left_out, "{block}");
+            }
+            let null = format!(",\"{block}\":null");
+            assert_eq!(checked(Format::Json, json(&null)), left_out, "{block}");
+        }
+    }
+
     /// A whole number past 64 bits reads as a fraction where one stands, as
     /// the JSON form reads it: both forms read one document. Where a whole
     /// number stands, both forms refuse it by its type, in the same words.

@@ -774,7 +774,7 @@ impl HarmonyStreamingProcessor {
                 endpoint: metrics_labels::ENDPOINT_RESPONSES,
                 tail_tokens: decode.tail_tokens,
             });
-            drop(decode_stream);
+            decode_stream.abort_past_stop();
         } else {
             decode_stream.mark_completed();
         }
@@ -1739,7 +1739,7 @@ impl ChatDecode {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             tail_tokens: self.tail_tokens,
         });
-        drop(decode_stream);
+        decode_stream.abort_past_stop();
     }
 
     /// The stream's first engine output, for the TTFT; in PD mode the PD first-token pair is

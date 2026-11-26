@@ -367,6 +367,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "signal_cells",
                 "ring",
                 "ring_positions",
+                "decode_ring_positions",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -462,7 +463,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Pair",
             record: pair_record(),
-            host_only: &["decode_position", "decode_verdict"],
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
             wire_only: &[],
             wire: &[
                 ("decode_id", Type::Fixed64),
@@ -628,6 +629,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "client_key",
                 "ring",
                 "ring_positions",
+                "decode_ring_positions",
                 "session_key_from_rid",
             ],
             before: &[],
@@ -663,7 +665,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
-            host_only: &["decode_position", "decode_verdict"],
+            host_only: &["decode_position", "decode_verdict", "decode_placing"],
             before: &[],
             beside: &[],
         },
@@ -1605,7 +1607,8 @@ fn the_named_worker_field_is_pinned() {
 
 /// What a registration states and its answer tells, by name and number: the
 /// prober's settings (one message for the registration and the row), the
-/// row's rank and engine, and the two thresholds a row is judged by.
+/// row's rank and engine, the two thresholds a row is judged by, and what a
+/// worker states for a request's hard demands (one message for the two).
 const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
     (
         "HealthPolicy",
@@ -1631,13 +1634,30 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("engine", 24, Type::String),
             ("health_policy", 25, Type::Message),
             ("maker", 27, Type::Message),
+            ("demand_facts", 28, Type::Message),
+        ],
+    ),
+    (
+        "DemandFacts",
+        &[
+            ("runtime", 1, Type::Uint32),
+            ("references", 2, Type::Bool),
+            ("host_pipeline", 3, Type::Bool),
+            ("window", 4, Type::Uint32),
+            ("decoding", 5, Type::Uint32),
         ],
     ),
     (
         "Maker",
         &[("provider", 1, Type::String), ("key", 2, Type::String)],
     ),
-    ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
+    (
+        "WorkerSpec",
+        &[
+            ("health_policy", 14, Type::Message),
+            ("demand_facts", 15, Type::Message),
+        ],
+    ),
 ];
 
 /// A membership change on the plugin wire, by name and number: a plugin
@@ -1689,9 +1709,12 @@ fn the_membership_fields_are_pinned() {
     for (message_name, expected) in MEMBERSHIP_FIELDS {
         let compiled = message(controller, message_name)
             .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
-        // The two small messages are pinned whole, the two rows by the
+        // The three small messages are pinned whole, the two rows by the
         // fields named here.
-        let whole = matches!(*message_name, "HealthPolicy" | "OverloadThresholds");
+        let whole = matches!(
+            *message_name,
+            "HealthPolicy" | "OverloadThresholds" | "DemandFacts"
+        );
         let found: Vec<(String, i32, Type)> = fields(compiled)
             .into_iter()
             .filter(|(name, _, _, _, _)| {
@@ -1760,6 +1783,39 @@ fn the_principals_scopes_keep_the_ingestion_scopes_number_and_name_reserved() {
         .collect();
     assert_eq!(reserved, [2], "the reserved number");
     assert_eq!(scopes.reserved_name, strings(&["SCOPE_INGESTION"]));
+}
+
+/// A pair's class left the pairing descriptor, and a snapshot's pair rows
+/// left with their message: no writer filled either. The two numbers and
+/// names stay reserved, so a later field takes neither, and no message
+/// takes the name of the one that left.
+#[test]
+fn the_pair_class_and_the_pair_rows_keep_their_numbers_and_names_reserved() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, number, name) in [
+        ("PairingDescriptor", 8, "pair_class"),
+        ("Snapshot", 9, "pairs"),
+    ] {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let reserved: Vec<i32> = compiled
+            .reserved_range
+            .iter()
+            .flat_map(|range| range.start()..range.end())
+            .collect();
+        assert_eq!(reserved, [number], "{message_name}: the reserved number");
+        assert_eq!(
+            compiled.reserved_name,
+            strings(&[name]),
+            "{message_name}: the reserved name"
+        );
+    }
+    assert!(
+        message(controller, "PairRow").is_none(),
+        "no message takes the name of the pair row that left"
+    );
 }
 
 /// The packed request block's layout as the world's comment states it: an

@@ -551,9 +551,11 @@ impl InProcess {
         // The upkeep before this one owed a whole read and did not make it:
         // the load reports wait for this answer. A read the host fails
         // again writes no record of a worker it read, as the host is asked
-        // of every worker ahead of the first write: the telling behind it
-        // tells the workers the subscription told as joined since the
-        // snapshot at hand, and no other.
+        // of every worker ahead of the first write. So the telling behind
+        // it tells the workers whose record a word of the subscription
+        // wrote since the snapshot at hand, and no other. That is a worker
+        // that joined, and one the follow held whose record a registration
+        // or a replacement wrote again.
         let again = follow.late;
         follow.late = follow.unread;
         // The program handed its lists since the follow last owed every

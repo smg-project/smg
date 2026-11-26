@@ -95,6 +95,9 @@ pub(crate) struct ChatChunkFrame {
 }
 
 impl ChatChunkFrame {
+    /// The head's end: the key every chunk's choices follow.
+    const CHOICES: &'static [u8] = b",\"choices\":[";
+
     pub(crate) fn new(
         request_id: &str,
         model: &str,
@@ -112,7 +115,7 @@ impl ChatChunkFrame {
             head.extend_from_slice(b",\"system_fingerprint\":");
             push_json(&mut head, system_fingerprint);
         }
-        head.extend_from_slice(b",\"choices\":[");
+        head.extend_from_slice(Self::CHOICES);
         Self { head }
     }
 
@@ -127,6 +130,27 @@ impl ChatChunkFrame {
     ) {
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
+        let serialized = serde_json::to_writer(FrameSink(buffer), choice);
+        Self::close_chunk(buffer, start, serialized, usage, emit_usage_null);
+    }
+
+    /// [`Self::write_chunk`] for the chunk that carries the rendered prompt:
+    /// `prompt_text` is the key ahead of `choices`, where the struct has it,
+    /// so the head goes in up to that key, then the prompt, then the chunk
+    /// as every other is written.
+    pub(super) fn write_chunk_with_prompt<C: Serialize>(
+        &self,
+        buffer: &mut BytesMut,
+        prompt_text: &str,
+        choice: &C,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head[..self.head.len() - Self::CHOICES.len()]);
+        buffer.extend_from_slice(b",\"prompt_text\":");
+        push_json(FrameSink(buffer), prompt_text);
+        buffer.extend_from_slice(Self::CHOICES);
         let serialized = serde_json::to_writer(FrameSink(buffer), choice);
         Self::close_chunk(buffer, start, serialized, usage, emit_usage_null);
     }

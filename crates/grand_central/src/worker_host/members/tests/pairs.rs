@@ -19,7 +19,7 @@ use crate::{
         Constraints, Decision, InProcess, PairAdmission, PairLists, Phase, Request, RequestFacts,
         Role, WireModes, WorkerId,
     },
-    store::{pairing::PairingDescriptor, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{pairing::PairingDescriptor, Registrant, WorkerFacts, WorkersStore},
     worker_host::OpenAdmission,
 };
 
@@ -28,11 +28,12 @@ const PREFILL_2: &str = "http://prefill-2:8000";
 const DECODE_1: &str = "http://decode-1:8000";
 const DECODE_2: &str = "http://decode-2:8000";
 
-/// Write the row `facts` state and have the holder follow: the row's id.
+/// Write the row `facts` state through the holder: the row's id.
 pub(super) fn state(replica: &Replica, facts: WorkerFacts) -> WorkerId {
-    let row = replica.store.upsert(facts).id();
-    replica.objects.follow(&replica.store);
-    row
+    let written = replica
+        .objects
+        .upsert(&replica.store, facts, Registrant::Control);
+    written.expect("the store takes the write").id()
 }
 
 /// What the row of a pair's worker at `url` states: its side, and the KV
@@ -335,14 +336,17 @@ fn the_lent_lists_and_the_holders_classes_pick_the_one_pair_of_one_fleet() {
             max_running: Some(4_096),
             ..pair_side(url, role, transport)
         };
-        let id = replica.store.upsert(facts).id();
+        let written = replica
+            .objects
+            .upsert(&replica.store, facts, Registrant::Control);
+        let id = written.expect("the store takes the write").id();
         replica.store.publish_now();
         let row = replica.store.by_key(url).expect("a row");
-        let ready = WorkerStatus::Ready;
-        assert!(replica.store.set_status(id, ready, row.revision).is_some());
+        replica
+            .objects
+            .connect_row(&replica.store, id, row.revision);
         id
     });
-    replica.objects.follow(&replica.store);
     let the_pair = Some((rows[1], rows[3]));
     let document = PolicySpec::pair_presets("least_load", "least_load").expect("the stock presets");
     let applied = || AppliedSpec::validate(&document).expect("the stock document");

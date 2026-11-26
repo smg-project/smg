@@ -35,7 +35,7 @@ provider-openai = ["smg-external-router/openai", "smg-test-harness/provider-open
 provider-anthropic = ["smg-external-router/anthropic"]
 provider-gemini = ["smg-external-router/gemini"]
 providers = ["provider-openai", "provider-anthropic", "provider-gemini"]
-# Client-injection seam for this crate's own K8s discovery integration tests
+# Client-configuration seam for this crate's own K8s discovery integration tests
 # (auto-enabled by the self dev-dependency below, never in production builds).
 # It turns on the worker crate's test support, which the gateway's re-exports.
 # And the Grand Central crate's: the reference index's cases read its lookup over
@@ -138,8 +138,8 @@ opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", features = ["trace", "grpc-tonic"] }
 tracing-opentelemetry = "0.33"
-kube = { version = "3.0.1", features = ["runtime", "derive"] }
-k8s-openapi = { version = "0.27.0", features = ["v1_33"] }
+kube = { version = "4.2.1", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.28.0", features = ["v1_33"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 metrics-util = { version = "0.20.4", default-features = false, features = ["registry"] }

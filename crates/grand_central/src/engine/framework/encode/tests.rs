@@ -185,6 +185,24 @@ impl Bed {
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
     ) -> (Decision, EncodePlaced) {
+        self.decide_asked_in(engine, facts, pool, &mut Scratch::new())
+    }
+
+    /// The encode entry's answer over the bed's pools, made with `scratch`:
+    /// the scratch keeps the decision's word of the list it shed over.
+    fn decide_in(&self, engine: &Engine, scratch: &mut Scratch) -> Decision {
+        let (facts, pool) = self.asked();
+        self.decide_asked_in(engine, &facts, &pool, scratch).0
+    }
+
+    /// [`Self::decide_asked`], made with `scratch`.
+    fn decide_asked_in(
+        &self,
+        engine: &Engine,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        scratch: &mut Scratch,
+    ) -> (Decision, EncodePlaced) {
         fn cells(of: &[SignalCell]) -> Option<SignalCells> {
             (!of.is_empty()).then(|| SignalCells::new(of.to_vec(), 1))
         }
@@ -227,7 +245,7 @@ impl Bed {
             &cx,
             &cx,
             &encode_cx,
-            &mut Scratch::new(),
+            scratch,
             &mut placed,
         );
         (decision, placed)
@@ -673,6 +691,78 @@ fn overloaded(row: Candidate) -> Candidate {
         },
         ..row
     }
+}
+
+/// An encode decision says, in the scratch it is made with, the list it
+/// sheds its request over as saturated: the encoders where the overload
+/// veto left none of them open, and else the list its pair's decision
+/// says, where that decision was handed the pair's two lists whole. Where
+/// the pass handed it a part of either list, the decision says no list,
+/// of the list that was cut or of the other: the pair's decision judged
+/// the part. Each decision takes back the word of the one before where it
+/// begins, so an answer that is no such shed leaves none.
+#[test]
+fn an_encode_decision_says_the_list_it_sheds_over() {
+    let mut shedding = engine();
+    shedding.shed_when_all_vetoed(0);
+    let saturated = (ShedReason::Saturated, "not-overloaded");
+    let mut scratch = Scratch::new();
+    // The one encoder is over its thresholds.
+    let mut bed = Bed::new();
+    bed.encoders[0] = overloaded(bed.encoders[0]);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), Some(ShedOver::Encoders));
+    // No encoder is ready: a missing endpoint, which says no list.
+    bed.encoders[0] = unready(bed.encoders[0]);
+    let missing = (ShedReason::NoEndpoints, "encoders");
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), missing);
+    assert_eq!(scratch.shed_over(), None, "behind a missing endpoint");
+    // The one prefill is over its thresholds: the pair's decision is
+    // handed both lists whole, and says the prefills.
+    let mut bed = Bed::new();
+    bed.prefills[0] = overloaded(bed.prefills[0]);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), Some(ShedOver::Prefills));
+    // A second prefill under its thresholds hands to no encoder, so the
+    // pair's decision is handed the first alone: its word of the prefills
+    // says nothing of the list the caller lent, and goes.
+    bed.prefills.push(row(1, Role::Prefill, 1, 0));
+    bed.prefill_classes.push(2);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), None, "a part of the prefills");
+    // A pick says no list either.
+    bed.prefills[0] = row(0, Role::Prefill, 1, 0);
+    let decision = bed.decide_in(&shedding, &mut scratch);
+    assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+    assert_eq!(scratch.shed_over(), None, "behind a pick");
+    // The one decode is over its thresholds behind whole lists: the
+    // pair's decision says the decodes.
+    let mut bed = Bed::new();
+    bed.decodes[0] = overloaded(bed.decodes[0]);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), Some(ShedOver::Decodes));
+    // Behind a part of the prefills that word goes too: the decision made
+    // its shed for the prefills it was handed.
+    bed.prefills.push(row(1, Role::Prefill, 1, 0));
+    bed.prefill_classes.push(2);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), None, "the prefills cut, the decodes");
+    // The request's decode must take images, and a second decode under
+    // its thresholds takes none: a part of the decodes, behind a shed over
+    // the decodes and behind one over the prefills.
+    let mut bed = Bed::new();
+    bed.decode_images = true;
+    bed.decodes[0] = overloaded(bed.decodes[0]);
+    bed.decodes.push(Candidate {
+        vision: false,
+        ..row(1, Role::Decode, 1, 0)
+    });
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), None, "the decodes cut, the decodes");
+    bed.decodes[0] = row(0, Role::Decode, 1, 0);
+    bed.prefills[0] = overloaded(bed.prefills[0]);
+    assert_eq!(shed_of(&bed.decide_in(&shedding, &mut scratch)), saturated);
+    assert_eq!(scratch.shed_over(), None, "the decodes cut, the prefills");
 }
 
 /// Under a binding that sheds a pool the overload veto empties, encoders
@@ -1805,7 +1895,8 @@ fn decided_widths(bed: &Bed, table: PairTable<'_>) -> (Decision, [usize; 4]) {
         .encode
         .as_deref()
         .expect("the entry leaves its side in the scratch");
-    let sets = [&side.open, &side.member, &side.decodes_of, &side.vision_of];
+    let held = &side.decode_classes;
+    let sets = [&side.open, &side.member, &held.registered, &held.vision];
     (decision, sets.map(|set| set.words.len()))
 }
 
@@ -1877,6 +1968,63 @@ fn an_encode_class_above_the_rows_handed_is_a_class_still() {
         panic!("a pick, not {decision:?}");
     };
     assert_eq!(targets.first().map(|target| target.position), Some(1));
+}
+
+/// The index of `decodes`, of a fleet of as many, under `table`.
+fn index_of(decodes: &[Candidate], table: PairTable<'_>) -> DecodeClasses {
+    let mut classes = DecodeClasses::default();
+    classes.fill(decodes, decodes.len(), &table);
+    classes
+}
+
+#[test]
+fn a_far_decode_class_is_found_whatever_the_order_of_its_rows() {
+    // Under no table the numbers above the bits stand in two lists, and
+    // each is found whatever the order of its rows: four far classes, the
+    // largest first, and the third takes no images.
+    let far = |at: u32, below: u32| row(at, Role::Decode, u32::MAX - below, 0);
+    let mut decodes = vec![far(0, 0), far(1, 1), far(2, 5), far(3, 9)];
+    decodes[2].vision = false;
+    // A decode of no class stands beside them.
+    decodes.push(row(4, Role::Decode, 0, 0));
+    let classes = index_of(&decodes, PairTable::default());
+    for below in [0, 1, 5, 9] {
+        let class = u32::MAX - below;
+        assert!(classes.holds(class), "{below} below the largest");
+        let vision = classes.holds_vision(class);
+        assert_eq!(vision, below != 5, "{below} below the largest");
+    }
+    // A far number no decode names is no class, and neither is the number
+    // of the decode outside any pairing.
+    for class in [u32::MAX - 2, 0] {
+        assert!(!classes.holds(class), "class {class}");
+        assert!(!classes.holds_vision(class), "class {class}");
+    }
+}
+
+#[test]
+fn a_tables_decode_classes_stand_in_the_tables_own_width() {
+    // Under a table the sets are the table's width, whatever the count of
+    // the decodes: one decode of the last of a table's seventy classes.
+    let listed: Vec<u32> = (1..=70).collect();
+    let ends = [70];
+    let decodes = [row(0, Role::Decode, 70, 0)];
+    let classes = index_of(&decodes, PairTable::new(&ends, &listed));
+    assert!(classes.holds(70));
+    assert!(classes.holds_vision(70));
+    let sets = [&classes.registered, &classes.vision];
+    assert_eq!(sets.map(|set| set.words.len()), [2, 2]);
+    // A number above the table's count is no class of it, and no list
+    // keeps it.
+    let (ends, listed) = ([1], [1]);
+    let decodes = [
+        row(0, Role::Decode, 1, 0),
+        row(1, Role::Decode, u32::MAX, 0),
+    ];
+    let classes = index_of(&decodes, PairTable::new(&ends, &listed));
+    assert!(classes.holds(1));
+    assert!(!classes.holds(u32::MAX));
+    assert!(!classes.holds_vision(u32::MAX));
 }
 
 #[test]

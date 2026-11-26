@@ -12,9 +12,22 @@ use std::{
 use kv_index::TokenTree;
 
 use super::*;
-use crate::engine::{
-    decision_engine::{TextKey, TokenKey},
-    in_process::single::tests::{lending, lending_text, lent, Also},
+use crate::{
+    document::spec::{RulePlaced, WarmupSliceParams},
+    engine::{
+        decision::{Overlap, OverlapSource},
+        decision_engine::{TextKey, TokenKey},
+        in_process::single::tests::{default_under_sessions, lending, lending_text, lent, Also},
+    },
+};
+
+/// What a pick states of a worker the record of sent prefixes holds a
+/// prompt of 100 blocks whole for.
+const WHOLE: Overlap = Overlap {
+    blocks: 100,
+    of: 100,
+    source: OverlapSource::Predictor,
+    ..Overlap::NONE
 };
 
 /// A caller's entry for its prompt: the prompt's token ids under no cache
@@ -33,7 +46,7 @@ impl<'a> Entry<'a> {
     }
 }
 
-impl TokenEntry for Entry<'_> {
+impl PromptEntry for Entry<'_> {
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
         self.asked.set(self.asked.get() + 1);
         Some(TokenKey {
@@ -51,7 +64,7 @@ struct Words<'a> {
     asked: Cell<u32>,
 }
 
-impl TokenEntry for Words<'_> {
+impl PromptEntry for Words<'_> {
     fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
         None
     }
@@ -550,4 +563,89 @@ fn a_prompt_is_hashed_where_a_lookup_reads_its_hashes() {
     asked.expect("a placement");
     assert!(entry.asked.get() > 0, "that ask read the tree");
     assert!(inside.whole.get().is_none(), "and hashed no block");
+}
+
+/// A prompt made with no block hashed is hashed where a column is filled
+/// too. A second warm-up stage that rules by another window leaves the
+/// profile no row to be named: its decision reads the affinity column
+/// whole, and the fill reads the prompt's hashes. The list is hashed for
+/// it there and the record of sent prefixes takes the whole prompt for the
+/// worker picked: sent again, the prompt goes back to that worker, which
+/// holds every block of it.
+#[test]
+fn a_prompt_is_hashed_where_a_column_is_filled() {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let profile = document.profiles.get_mut("cache_aware");
+    profile.expect("the preset's profile").score.push(
+        ScoreStage::WarmupSlice(WarmupSliceParams {
+            weight: 1.0,
+            secs: Some(7),
+            ..WarmupSliceParams::default()
+        })
+        .into(),
+    );
+    let applied = AppliedSpec::validate(&document).expect("the document validates");
+    let cap = applied.engine().affinity_rows_cap(MODEL, Phase::Single);
+    assert_eq!(cap, 0, "the profile reads the column whole");
+    let engine = hosted(InProcess::new(applied));
+    let members = PublishedList::new(pool(8));
+    let tokens: Vec<u32> = (0..1_600).collect();
+    let entry = Entry::of(&tokens);
+    let request = stating(&members, &entry, None);
+    let mut call = Call::default();
+    {
+        let made = Made::asked(engine.loaded(), &request, &call);
+        let facts = made.make(engine.standing_spec()).facts;
+        assert!(facts.block_hashes.is_empty(), "no block is hashed there");
+    }
+    let asked = single(engine.loaded(), &request, Some(members.lent()), &mut call);
+    let first = asked.expect("a placement").id();
+    let hashed = matches!(call.whole.get(), Some(Some(_)));
+    assert!(hashed, "the column's fill hashed them");
+    let again = engine.place(&request).expect("a placement");
+    assert_eq!((again.id(), again.overlap), (first, WHOLE));
+}
+
+/// A prompt made with no block hashed is hashed behind a pin's answer too.
+/// Under the `manual` preset's sessions rule, with a new key's placement
+/// delegated to the profile's stages, a key's second request goes where
+/// the key is pinned, and the rule tells the profile's stages of it: the
+/// lookup hands the prompt to the record of sent prefixes behind that
+/// answer, and the list is hashed for the write. The same prompt under no
+/// key then goes to the pin's worker by the record alone, which holds
+/// every block of it.
+#[test]
+fn a_prompt_is_hashed_where_a_pins_answer_is_recorded() {
+    let engine = hosted(InProcess::new(default_under_sessions(RulePlaced::Told)));
+    let members = PublishedList::new(pool(8));
+    let keyed = [(MANUAL_SESSION_HEADER, "talk-7")];
+    let (opening, fresh): (Vec<u32>, Vec<u32>) =
+        ((0..1_600).collect(), (100_000..101_600).collect());
+    let (opening, fresh) = (Entry::of(&opening), Entry::of(&fresh));
+    // The key's first request: the profile's stages place it and pin it.
+    let first = PlaceRequest {
+        headers: &keyed,
+        ..stating(&members, &opening, None)
+    };
+    let pin = engine.place(&first).expect("a placement").id();
+    // A prompt nobody was sent, under the pinned key: the pin answers.
+    let second = PlaceRequest {
+        headers: &keyed,
+        ..stating(&members, &fresh, None)
+    };
+    let mut call = Call::default();
+    {
+        let made = Made::asked(engine.loaded(), &second, &call);
+        let facts = made.make(engine.standing_spec()).facts;
+        assert!(facts.block_hashes.is_empty(), "no block is hashed there");
+    }
+    let asked = single(engine.loaded(), &second, Some(members.lent()), &mut call);
+    assert_eq!(asked.expect("a placement").id(), pin, "the pin's worker");
+    let hashed = matches!(call.whole.get(), Some(Some(_)));
+    assert!(hashed, "the record's write hashed them");
+    // The same prompt under no key: the record alone names its holder.
+    let unkeyed = stating(&members, &fresh, None);
+    let again = engine.place(&unkeyed).expect("a placement");
+    assert_eq!((again.id(), again.overlap), (pin, WHOLE));
 }

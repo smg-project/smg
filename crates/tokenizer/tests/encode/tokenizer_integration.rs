@@ -360,6 +360,22 @@ fn test_special_tokens() {
     println!("Special tokens: {special_tokens:?}");
 }
 
+/// The file's BPE section says `byte_fallback`, so on the sentencepiece path
+/// the load builds no model and its listing answers in the model's place:
+/// `max_token_id` still counts the whole vocabulary (the three added tokens
+/// are below its last id), not just the empty model's added tokens.
+#[test]
+fn max_token_id_counts_the_vocabulary_of_an_unbuilt_model() {
+    use llm_tokenizer::traits::Tokenizer as TokenizerTrait;
+
+    let (_dir, tokenizer_path) = tokenizer_file();
+    let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
+        .expect("Failed to load tokenizer");
+    // `<unk>`, `<s>`, `</s>`, the 256 byte tokens, `▁`, 26 letters, 12 merges.
+    assert_eq!(TokenizerTrait::vocab_size(&tokenizer), 298);
+    assert_eq!(TokenizerTrait::max_token_id(&tokenizer), Some(297));
+}
+
 #[test]
 fn test_thread_safety() {
     use std::thread;

@@ -506,6 +506,31 @@ async fn a_native_read_that_fails_counts_its_reason_once_an_engine() {
     );
 }
 
+/// A native read that fails behind its headers says nothing about its
+/// route, whether the route ever answered or not: the next fetch asks it
+/// again. The engine answers whole once, to a fetch over a memo of its own.
+/// Two fetches over a new memo then each meet half a body and a closed
+/// connection, and each is the transport's.
+#[tokio::test]
+async fn a_native_read_that_fails_leaves_a_route_that_never_answered() {
+    let counts = PollCounts::default();
+    let (cutting, _) = spawn_cutting(Cut::Closes).await;
+    fetch_engine(&counts, two_ranks(&cutting)).await;
+    fetch_twice(&counts, &cutting).await;
+    assert_eq!(
+        counts.totals(),
+        PollTotals {
+            scrapes: 1,
+            scrape_failures: FailureTotals {
+                transport: 2,
+                ..FailureTotals::default()
+            },
+            ..PollTotals::default()
+        },
+        "the second fetch asks the route again: no fetch finds it absent"
+    );
+}
+
 /// A native body that stalls behind its headers is a deadline: the
 /// request's timeout ends the body's read. The engine answers whole once,
 /// then sends half a body and no more. The clock stops once the half is

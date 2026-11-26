@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicU64;
 
 use crate::{
     engine::{
-        decision::{Pair, Target},
+        decision::{DecodePlacing, Pair, Target},
         sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{
             AffinityFacts, AffinityRows, Candidate, Engines, HashKind, Header, Health, Identity,
@@ -77,10 +77,11 @@ wit! {
     // A session crosses as its value.
     Session => "u64",
     // Host-only: a lease's session verdict and a pair's decode side's never
-    // reach a guest, and a request's model crosses as its name, never as
-    // the host's fingerprint.
+    // reach a guest, nor does who placed that side, and a request's model
+    // crosses as its name, never as the host's fingerprint.
     SessionVerdict => "host-only",
     DecodeVerdict => "host-only",
+    DecodePlacing => "host-only",
     ModelFingerprint => "host-only",
     // Host-only: a guest reads the request's affinity column as five fields
     // of each candidate.
@@ -100,6 +101,9 @@ wit! {
     // Host-only: the ring a caller lends names its workers by address,
     // and a guest is shown rows.
     Option<&dyn LentRing> => "host-only",
+    // Host-only: a pair's decode side's own places on that ring stay
+    // with the ring, in process.
+    Option<&[u64]> => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that
@@ -215,12 +219,12 @@ pub(crate) fn all() -> Vec<Probe> {
             budget_micros, headers, media, seed, block_size, prompt_chars, prompt_bytes, now_micros,
             session_counted, affinity, named,
             model_fingerprint, signal_cells, client_key, ring, ring_positions,
-            session_key_from_rid,
+            decode_ring_positions, session_key_from_rid,
         } host [
             prompt_chars, prompt_bytes, now_micros,
             session_counted,
             affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions,
-            session_key_from_rid
+            decode_ring_positions, session_key_from_rid
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
@@ -237,8 +241,8 @@ pub(crate) fn all() -> Vec<Probe> {
             session_verdict, issued_micros, tokens, chars, bytes,
         } host [booked, session_verdict, issued_micros, chars, bytes], &lease),
         probe!("pair", before [], Pair {
-            decode_position, decode_id, decode_dp_rank, decode_verdict,
-        } host [decode_position, decode_verdict], &pair),
+            decode_position, decode_id, decode_dp_rank, decode_verdict, decode_placing,
+        } host [decode_position, decode_verdict, decode_placing], &pair),
         probe!("target", before [], Target { position, id, dp_rank, pair } host [position], &target),
         probe!("completed", before ["lease": "lease"], Outcome {
             side, served, status, class, ttft_micros, tokens_in, tokens_out, duration_micros,

@@ -52,7 +52,7 @@ use super::{
     config::Scope,
     decide::{self, Streams},
     decision_slots::{self, DecisionSlots, Reads},
-    election::{self, split_identity, ElectionObservation, Running},
+    election::{self, split_identity, ElectionObservation, LeasePlace, Running},
     floor::Floors,
     gateways::Gateways,
     generations::{
@@ -64,12 +64,12 @@ use super::{
     replication::{Batches, Replication},
     session, snapshot,
     standby::Lag,
-    watch_workers::{self, Feed, Source, Watchers, Watching},
+    watch_workers::{self, Feed, Readers, Source, Watching},
     wire, PROTOCOL_VERSION,
 };
 use crate::{
     document::{
-        operator::{DryRun, EnforceOutcome, EnforceRefused, NeedsRow, SerialTurn},
+        operator::{DryRun, EnforceOutcome, EnforceRefused, NeedsRow},
         spec::Digest,
     },
     engine::{explain::DecisionRecord, framework::Engine},
@@ -196,8 +196,11 @@ pub(crate) struct Shared {
     /// clone has seen no word, and marks its own seen where it hears from
     /// its start on.
     pub(crate) role: watch::Receiver<Option<u64>>,
-    /// Who watches this replica: the bounds of a watch's open.
-    pub(crate) watchers: Arc<Watchers>,
+    /// Who reads the rows of that feed and can share its kept cut: the
+    /// watches, within the bounds of a watch's open, and the operators'
+    /// snapshots in their turn, one taken at a time off the runtime's
+    /// workers.
+    pub(crate) readers: Arc<Readers>,
     /// A gateway's term floor above this replica's term, on its way to the
     /// election.
     pub(crate) floors: Floors,
@@ -206,9 +209,6 @@ pub(crate) struct Shared {
     /// under, the first of the three counts of design 5.4: the bind makes
     /// it once, where the configuration is known.
     pub(crate) lag: Arc<Lag>,
-    /// The turn of the operators' snapshots: one is taken at a time, off
-    /// the runtime's workers.
-    pub(crate) snapshots: SerialTurn,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -229,7 +229,10 @@ impl Shared {
     /// it can, so the other builders do not change. The identity and the
     /// fence are `elector`'s, so no instance answers under an identity
     /// another fence guards. A spec document names the stages `catalog`
-    /// holds. `deciders` is how many threads decide. The store comes with
+    /// holds, and its door is built under that fence where `place`, the
+    /// lease's, is one another replica can take
+    /// ([`Generations::stating`]): no later step puts it there.
+    /// `deciders` is how many threads decide. The store comes with
     /// the feed of the log it journals to, the one value one place builds
     /// ([`journaled`](super::replication::journaled)), and with the holder
     /// of the replica's worker objects, whose rows stand in that store: the
@@ -258,7 +261,7 @@ impl Shared {
             Arc<Objects<Members>>,
             LoadReceiver,
         ),
-        catalog: Arc<StageRegistry>,
+        (catalog, place): (Arc<StageRegistry>, &LeasePlace),
         deciders: usize,
     ) -> io::Result<Self> {
         let gateways = Arc::new(Gateways::new(
@@ -289,11 +292,14 @@ impl Shared {
             },
         )?;
         // The door states each generation's overload switch on the worker
-        // objects the deciding threads read.
+        // objects the deciding threads read. Under a lease another replica
+        // can take it stands under this replica's fence from its first
+        // instant.
         let generations = Arc::new(Generations::stating(
             Arc::clone(&store),
             catalog,
             Arc::clone(&objects),
+            place.is_shared().then(|| elector.fence()),
         ));
         Ok(Self {
             controller_id,
@@ -325,11 +331,16 @@ impl Shared {
             deciders,
             streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
             stop,
+            // The feed's readers are built over it: as many principals
+            // watch as may be present, and the snapshots wait their turn.
+            readers: Arc::new(Readers::of(
+                feed.clone(),
+                session::PRESENT_MAX,
+                snapshot::SNAPSHOTS_WAITING,
+            )),
             feed,
             role,
-            watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
-            snapshots: SerialTurn::new(snapshot::SNAPSHOTS_WAITING),
         })
     }
 
@@ -845,8 +856,8 @@ impl GrandCentral for Service {
             role,
             term,
         };
-        let watchers = &self.shared.watchers;
-        let watching = watch_workers::open(source, watchers, by, start, asked.models.clone())?;
+        let readers = &self.shared.readers;
+        let watching = watch_workers::open(source, readers, by, start, asked.models.clone())?;
         Ok(Response::new(watching))
     }
 
@@ -890,7 +901,7 @@ impl GrandCentral for Service {
     /// field refused by its name, the spec slice of a controller with no
     /// spec source among them, and a refused request takes no turn. One
     /// snapshot is taken at a time, off the runtime's workers
-    /// ([`SerialTurn`]), and its rows come by one of the roads of
+    /// ([`snapshot::in_turn`]), and its rows come by one of the roads of
     /// [`snapshot::read`]. The lead is read again behind that wait: the
     /// answer is told while this replica still leads the term the call was
     /// admitted under. A standby is restored on its `Replicate` stream,
@@ -909,24 +920,14 @@ impl GrandCentral for Service {
                 &asked,
                 term,
                 &shared.controller_id,
-                || {
-                    snapshot::read(
-                        &asked,
-                        &shared.snapshots,
-                        &shared.feed,
-                        &shared.watchers,
-                        (&shared.objects, &shared.store),
-                    )
-                },
+                || snapshot::read(&asked, &shared.readers, (&shared.objects, &shared.store)),
                 &shared.generations,
                 Instant::now(),
             )
         };
-        // The last call out lets the feed's kept cut go where no watch is
-        // open to share it.
-        let last = Arc::clone(&self.shared);
-        let out = move || last.watchers.unshared(&last.feed);
-        let taken = snapshot::in_turn(&self.shared.snapshots, take, out).await??;
+        // The feed's readers let its kept cut go at the last call out, where
+        // no watch is open to share it.
+        let taken = snapshot::in_turn(&self.shared.readers, take).await??;
         if self.watched(Instant::now())? != term {
             return Err(Status::unavailable(TAKE_OVER));
         }
@@ -1252,7 +1253,7 @@ mod tests {
                 &elector,
                 bed::unserved(stood),
                 bed::followed(journaled_at(&LeasePlace::Process, 0, 2)),
-                Arc::new(catalog),
+                (Arc::new(catalog), &LeasePlace::Process),
                 2,
             )
             .expect("the deciders start"),
@@ -1309,7 +1310,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             state,
-            catalog,
+            (catalog, &LeasePlace::Process),
             1,
         );
     }
@@ -1341,7 +1342,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             (Arc::clone(&store), feed, Arc::clone(&objects), loads),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1417,7 +1418,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             bed::followed((Arc::clone(&store), feed)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1431,7 +1432,7 @@ mod tests {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        bed::fleet(&store);
+        bed::fleet(&store, &shared.objects);
         let applied = store.apply(bed::preset("random", 1));
         applied.expect("above the unbound start");
         store.spend_ids(u32::MAX - TERM_MARK + 4);
@@ -1504,7 +1505,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             bed::followed((store, feed)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1546,14 +1547,18 @@ mod tests {
             &elector,
             bed::unserved(stood),
             bed::followed((store, feed)),
-            Arc::new(StageRegistry::builtin()),
+            // The door stands under the fence, as under a lease another
+            // replica can take: its start passes the document.
+            (
+                Arc::new(StageRegistry::builtin()),
+                &LeasePlace::File("shared".into()),
+            ),
             1,
         )
         .expect("the decider starts");
-        shared.generations.under(Arc::clone(&shared.fence));
         shared
             .generations
-            .defer(LEAST_LOAD.into(), Format::Yaml)
+            .start_with(LEAST_LOAD.into(), Format::Yaml)
             .expect("a valid document");
         assert_eq!(shared.store.snapshot().spec().generation(), 0);
 
@@ -1612,7 +1617,7 @@ mod tests {
             &elector,
             bed::unserved(stood),
             bed::followed((Arc::clone(&store), feed)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -1641,7 +1646,7 @@ mod tests {
             );
             standby = Some((fence, running));
         }
-        bed::fleet(&store);
+        bed::fleet(&store, &shared.objects);
         let applied = store.apply(bed::preset("random", 1));
         applied.expect("above the unbound start");
         store.spend_ids(u32::MAX - TERM_MARK + 4);
@@ -1740,7 +1745,7 @@ mod tests {
                 &elector,
                 bed::unserved(stood),
                 bed::followed((Arc::clone(&store), feed)),
-                Arc::new(StageRegistry::builtin()),
+                (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
                 2,
             )
             .expect("the deciders start"),
@@ -2102,7 +2107,7 @@ mod tests {
             &elector,
             (stood, stop, role, lag),
             bed::followed(journaled_from(&LeasePlace::Process, 0)),
-            Arc::new(StageRegistry::builtin()),
+            (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
             1,
         )
         .expect("the decider starts");
@@ -2374,7 +2379,7 @@ mod tests {
                     &elector,
                     bed::unserved(stood),
                     bed::followed((store, feed)),
-                    Arc::new(StageRegistry::builtin()),
+                    (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
                     2,
                 )
                 .expect("the deciders start"),
@@ -2713,7 +2718,7 @@ mod tests {
     #[tokio::test]
     async fn explain_echoes_the_key_and_decision_and_names_only_the_standing_generation() {
         let (_elector, _standing, control) = electing(true);
-        let _ = bed::fleet(&control.shared.store);
+        let _ = bed::fleet(&control.shared.store, &control.shared.objects);
         explain_spec(&control, "z-first", 1);
 
         for (model, id) in [(bed::MODEL, 1), ("empty", 2)] {
@@ -2794,7 +2799,7 @@ mod tests {
     #[tokio::test]
     async fn explain_names_only_the_plan_for_a_shed_ahead_of_the_first_profile() {
         let (_elector, _standing, control) = electing(true);
-        let _ = bed::fleet(&control.shared.store);
+        let _ = bed::fleet(&control.shared.store, &control.shared.objects);
         explain_spec(&control, "a-first", 1);
 
         let mut frame = bed::frame(1, 1);
@@ -3107,6 +3112,41 @@ mod tests {
         assert_eq!(issue.field_path, FIELD);
         assert_eq!(issue.message, format!("{FIELD} = 0 is not above zero"));
         assert_eq!(control.shared.generations.standing(), standing);
+    }
+
+    /// The write call refuses a document whose bindings differ on the
+    /// overload switch, at a dry run and at an enforce alike: one issue by
+    /// the field of the first binding that differs, in the refusal's words,
+    /// and the standing generation stays. Bindings that agree are taken.
+    #[tokio::test]
+    async fn the_write_call_names_the_binding_that_differs_on_the_overload_switch() {
+        const FIELD: &str = "bindings[1].overload.enabled";
+        const OFF: &str = "    overload:\n      enabled: false\n";
+        let (_dir, _elector, _standing, control) = stored(true);
+        let write = |mode: proto::ApplyMode, second: &str| {
+            let head = "apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\nbindings:\n";
+            let first = format!("  - match:\n      model: chat/*\n    profile: p\n{OFF}");
+            let document = format!("{head}{first}  - profile: p\n{second}");
+            control.apply_policy_spec(apply(mode, document, "yaml", ""))
+        };
+        let agreed = write(proto::ApplyMode::Enforce, OFF).await;
+        let agreed = agreed.expect("an answer").into_inner();
+        assert!(agreed.accepted, "{agreed:?}");
+        assert_eq!(agreed.generation, 1);
+        for mode in [proto::ApplyMode::DryRun, proto::ApplyMode::Enforce] {
+            let refused = write(mode, "").await.expect("an answer").into_inner();
+            assert!(!refused.accepted && !refused.read_only, "{refused:?}");
+            assert_eq!(refused.generation, 1, "the standing generation stays");
+            let [issue] = refused.issues.as_slice() else {
+                panic!("one issue: {refused:?}")
+            };
+            assert_eq!(issue.field_path, FIELD);
+            assert_eq!(
+                issue.message,
+                format!("{FIELD} = true is not the false bindings[0] says, by its block or the block's default: a controller builds its workers with one default set of overload thresholds, so the bindings of its document say one word")
+            );
+        }
+        assert_eq!(control.shared.generations.generation(), 1);
     }
 
     /// The spec's source is a file, which no call writes: an enforce and a
@@ -3916,7 +3956,7 @@ mod tests {
         use proto::snapshot_request::Slice;
 
         let (_elector, _standing, control) = electing(true);
-        let places = control.shared.snapshots.fill();
+        let places = control.shared.readers.snapshots().fill();
         assert_eq!(places.len(), super::snapshot::SNAPSHOTS_WAITING + 1);
         let past = control
             .get_snapshot(snapshot(&[Slice::Workers]))
@@ -3954,11 +3994,11 @@ mod tests {
             .await
             .expect("a place is free again");
         assert_eq!(rows.into_inner().term, 1);
-        assert_eq!(control.shared.snapshots.let_in(), 0);
+        assert_eq!(control.shared.readers.snapshots().let_in(), 0);
 
         // A replica that does not lead refuses by its lead, places or none.
         let (_elector, _standing, follower) = electing(false);
-        let _places = follower.shared.snapshots.fill();
+        let _places = follower.shared.readers.snapshots().fill();
         let refused = follower
             .get_snapshot(snapshot(&[Slice::Workers]))
             .await
@@ -3994,7 +4034,12 @@ mod tests {
 
         // Another call is let in beside it: the cut stays for that one, the
         // next call shares it, and the last call out lets it go.
-        let beside = control.shared.snapshots.place().expect("a place is free");
+        let beside = control
+            .shared
+            .readers
+            .snapshots()
+            .place()
+            .expect("a place is free");
         assert_eq!(told().await, 0);
         let cut = feed.kept().expect("a call is let in to share the cut");
         assert_eq!(told().await, 0);
@@ -4060,7 +4105,9 @@ mod tests {
     /// takes no cut of every row: it reads the rows it may tell. One that
     /// states neither would copy every row anyway, so it takes the feed's
     /// cut, which a call let in while it runs shares. Beside another call
-    /// each takes the cut the two share, once.
+    /// each takes the cut the two share, once: the first of them takes it,
+    /// whatever it states. So does a call beside an open watch, where no cut
+    /// stands at the log's head: the watch can share it.
     #[tokio::test]
     async fn a_lone_snapshot_takes_a_cut_only_where_it_tells_every_row() {
         use proto::snapshot_request::Slice;
@@ -4112,12 +4159,33 @@ mod tests {
         assert_eq!((answer.workers.len(), answer.truncated), (3, false));
         assert_eq!(feed.cuts(), 1, "a lone call for its models took the cut");
 
-        // Another call is let in beside it: one cut, and both calls share it.
-        let beside = control.shared.snapshots.place().expect("a place is free");
+        // Another call is let in beside it: the call for one row takes the
+        // cut the two share, and the call behind it shares that one.
+        let beside = control
+            .shared
+            .readers
+            .snapshots()
+            .place()
+            .expect("a place is free");
         assert_eq!(told(1).await, (1, true));
+        assert_eq!(feed.cuts(), 2, "a call beside another takes their cut");
         assert_eq!(told(0).await, (4, false));
         assert_eq!(feed.cuts(), 2, "one copy for the calls let in");
         drop(beside);
+
+        // A watch is open, and no cut stands at the log's head: the call
+        // for one row takes the cut the watch can share, and keeps it.
+        assert_eq!(told(0).await, (4, false));
+        assert!(feed.kept().is_none(), "the last call out let the cut go");
+        let gateways = Service::new(vec![Scope::Gateway], Arc::clone(&control.shared));
+        let watching = gateways
+            .watch_workers(from("gateway-a", proto::WatchWorkersRequest::default()))
+            .await
+            .expect("opened");
+        assert_eq!(told(1).await, (1, true));
+        assert_eq!(feed.cuts(), 3, "a call beside an open watch takes its cut");
+        assert!(feed.kept().is_some(), "kept for the watch");
+        drop(watching);
     }
 
     /// A snapshot that waited its turn through a later take of the lease is
@@ -4129,7 +4197,7 @@ mod tests {
 
         let (_elector, _standing, control) = electing(true);
         let control = Arc::new(control);
-        let held = control.shared.snapshots.hold().await;
+        let held = control.shared.readers.snapshots().hold().await;
         let mut calls = JoinSet::new();
         calls.spawn({
             let control = Arc::clone(&control);
@@ -4137,7 +4205,7 @@ mod tests {
         });
         // The call is let in and waits behind the held turn.
         let began = Instant::now();
-        while control.shared.snapshots.let_in() < 1 {
+        while control.shared.readers.snapshots().let_in() < 1 {
             assert!(
                 began.elapsed() < Duration::from_secs(20),
                 "the call took no place"
@@ -4170,14 +4238,14 @@ mod tests {
 
         let (mut elector, _standing, control) = electing(true);
         let control = Arc::new(control);
-        let held = control.shared.snapshots.hold().await;
+        let held = control.shared.readers.snapshots().hold().await;
         let mut calls = JoinSet::new();
         calls.spawn({
             let control = Arc::clone(&control);
             async move { control.get_snapshot(snapshot(&[Slice::Workers])).await }
         });
         let began = Instant::now();
-        while control.shared.snapshots.let_in() < 1 {
+        while control.shared.readers.snapshots().let_in() < 1 {
             assert!(
                 began.elapsed() < Duration::from_secs(20),
                 "the call took no place"

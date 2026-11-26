@@ -20,7 +20,7 @@ use crate::{
         Constraints, InProcess, LentList, Request, RequestFacts, RequestMaker, WorkerId,
         WorkerLists,
     },
-    store::{MemoryStore, WorkerFacts, WorkersStore},
+    store::{MemoryStore, Registrant, WorkerFacts, WorkersStore},
     worker_host::Objects,
 };
 
@@ -32,7 +32,7 @@ const DECODE: &str = "http://decode-0:8000";
 const ENCODE: &str = "http://encode-0:8000";
 const STRAY: &str = "http://stray-0:8000";
 
-/// A holder with the store it follows.
+/// A holder with the store it writes.
 struct Replica {
     store: MemoryStore,
     objects: Objects<Members>,
@@ -46,8 +46,8 @@ impl Replica {
         }
     }
 
-    /// Write the row at `url`, of `role` and with its image bit, and have
-    /// the holder follow: the row's id.
+    /// Write the row at `url`, of `role` and with its image bit, through
+    /// the holder: the row's id.
     fn write(&self, url: &str, role: Role, vision: bool) -> WorkerId {
         let facts = WorkerFacts {
             key: url.to_string(),
@@ -59,16 +59,15 @@ impl Replica {
             vision,
             ..WorkerFacts::default()
         };
-        let row = self.store.upsert(facts).id();
-        self.objects.follow(&self.store);
-        row
+        let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+        written.expect("the store takes the write").id()
     }
 
-    /// Remove the row at `url` and have the holder follow.
+    /// Remove the row at `url` through the holder.
     fn remove(&self, url: &str) {
         let row = self.store.by_key(url).expect("a row");
-        assert!(self.store.remove(row.id, row.revision).is_some());
-        self.objects.follow(&self.store);
+        let removed = self.objects.remove(&self.store, row.id, row.revision);
+        assert!(removed.is_some());
     }
 
     /// A worker another writer registers: the holder lays no row for it.
@@ -173,7 +172,6 @@ fn a_decision_over_a_lent_list_names_its_targets_by_their_rows_ids() {
             .objects
             .connect_row(&replica.store, row.id, row.revision);
     }
-    replica.objects.follow(&replica.store);
     let generation = replica.generation();
     let list = replica.objects.lent(&generation, Role::Single);
     let facts = list.facts.expect("the holder lends facts");

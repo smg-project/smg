@@ -20,7 +20,7 @@ use smg_grand_central::{
 
 use crate::{
     engine_load::{decided_by_engine_load, stages},
-    program::{settings, Asked},
+    program::{settings, Asked, Stated},
     served, started, workers, MODEL,
 };
 
@@ -165,6 +165,8 @@ fn the_programs_scorer_places_a_request_past_the_workers_under_way() {
     const PLAIN: Asked<'static> = Asked {
         model: MODEL,
         headers: None,
+        items: &[],
+        tokens: None,
     };
     let document = settings(PolicySettings::RoundRobin).policy_document();
     let mut document = document.expect("the settings have a document");
@@ -174,8 +176,9 @@ fn the_programs_scorer_places_a_request_past_the_workers_under_way() {
     let spec = spec.expect("the catalog holds the scorer");
     let (program, _loads, _task) = started(spec, &workers(3), served);
 
-    let first = program.place(&PLAIN, &[]).expect("a placement");
-    let second = program.place(&PLAIN, &[]).expect("a placement");
+    let placed = || program.place(&PLAIN, Stated::default());
+    let first = placed().expect("a placement");
+    let second = placed().expect("a placement");
     let under_way = [first.placement.worker.url(), second.placement.worker.url()];
     assert_ne!(under_way[0], under_way[1], "the second went past the first");
     for turn in 0..8 {

@@ -6,15 +6,18 @@
 //! the one entry a host asks for a request ([`InProcess::decide_at`]). A
 //! pair's decision is leased: its guard is told both dispatches and each
 //! side's end. A request that states the later decode has it decided again
-//! behind the prefill's dispatch (`pair_round_robin_later`).
+//! behind the prefill's dispatch (`pair_round_robin_later`). The cell
+//! `pair_round_robin_three_sided` places the same pair under a document of
+//! three sides, whose encode side places nothing of a pair.
 //!
 //! `--entry place` asks the one call a host makes for a request instead
 //! ([`InProcess::place`]): the model, the two lists and a prompt of the
 //! plain request's size, with both dispatches and each side's end said of
 //! the placement. Such a request states no later decode, and its run
-//! refuses no pair. `--entry place_ruled` and `--entry place_held` state a
-//! route's rule with it (the bench's `ruled` file). `--entry place_named`
-//! asks the one call with a pair that names its worker ([`NAMED`]).
+//! refuses no pair but by `--refused overload`. `--entry place_ruled` and
+//! `--entry place_held` state a route's rule with it (the bench's `ruled`
+//! file). `--entry place_named` asks the one call with a pair that names
+//! its worker ([`NAMED`]).
 //!
 //! Every worker has a load report, and a prefill states its rate as its
 //! measured input rate too: the one drain a prefill's record reads. Under
@@ -26,7 +29,10 @@
 //! `--refused` states what refuses every pair ([`Refused`]): the engine
 //! then names the refusal of each request, and a turn counts where it was
 //! refused the way the run states. A cell that leaves that path counts no
-//! turn. The result's `conversions=` counts the two lists together.
+//! turn. `--refused overload` puts every decode over its thresholds under
+//! a binding that sheds a list wholly over them: each request is shed as
+//! saturated, by the engine's entry and by the one call alike. The
+//! result's `conversions=` counts the two lists together.
 
 use std::{
     cell::OnceCell,
@@ -41,8 +47,9 @@ use std::{
 use smg_grand_central::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        prefills_full, Decided, InProcess, PairAdmission, PairLists, PartnerClasses, Phase,
-        PlaceRequest, Plain, Prompt, PublishedList, Request, RequestMaker, WorkerLists,
+        prefills_full, Decided, Decision, InProcess, PairAdmission, PairLists, PartnerClasses,
+        Phase, PlaceRequest, Plain, Prompt, PublishedList, Request, RequestMaker, ShedReason,
+        Unplaced, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -155,6 +162,10 @@ pub(super) enum Refused {
     /// The decode side: no decode is ready, and no prefill has a partner
     /// to go to.
     Partners,
+    /// The overload veto, under a binding that sheds a list wholly over its
+    /// thresholds: every decode is over them, and each request is shed as
+    /// saturated.
+    Overload,
 }
 
 impl Refused {
@@ -163,6 +174,7 @@ impl Refused {
         match name {
             "limit" => Self::Limit,
             "partners" => Self::Partners,
+            "overload" => Self::Overload,
             other => panic!("nothing refuses a pair by {other}"),
         }
     }
@@ -254,6 +266,15 @@ impl Decodes {
             request.headers = &NUMBER;
         }
         let mut answer = host.engine.place(&request);
+        if self.refused == Refused::Overload {
+            // A run whose every decode is over its thresholds counts the
+            // turns shed as saturated.
+            let shed = |unplaced: &Unplaced| {
+                let saturated = ShedReason::Saturated;
+                matches!(unplaced, Unplaced::Shed { reason, .. } if *reason == saturated)
+            };
+            return answer.as_ref().err().is_some_and(shed).then_some(0);
+        }
         let placement = answer.as_mut().ok()?;
         if placement.owes_events() {
             encode::said(placement);
@@ -279,12 +300,20 @@ impl Decodes {
             return None;
         };
         // A run that refuses every pair counts the turns refused the way it
-        // states: by full prefills under the limit, by any other shed where
-        // the decode side refuses.
+        // states: by full prefills under the limit, by a shed as saturated
+        // under the overload veto, by any other shed where the decode side
+        // refuses.
         if self.refused != Refused::No {
-            let full = prefills_full(&decided.decision);
-            let stated = full == (self.refused == Refused::Limit);
-            return (decided.decision.pick().is_none() && stated).then_some(0);
+            let decision = &decided.decision;
+            let full = prefills_full(decision);
+            let saturated =
+                matches!(decision, Decision::Shed(shed) if shed.reason == ShedReason::Saturated);
+            let stated = match self.refused {
+                Refused::Limit => full,
+                Refused::Overload => saturated && !full,
+                Refused::Partners | Refused::No => !full,
+            };
+            return (decision.pick().is_none() && stated).then_some(0);
         }
         let target = *decided.decision.pick()?.targets.first()?;
         let decode = target.pair?.decode_id;
@@ -363,7 +392,18 @@ pub(super) fn runs(run: &Run) -> bool {
             worker.set_status(WorkerStatus::NotReady);
         }
     }
-    let document = document();
+    let mut document = document();
+    if run.refused == Refused::Overload {
+        for worker in decodes.iter() {
+            worker.set_overloaded(true);
+        }
+        // Each binding sheds a list wholly over its thresholds.
+        for binding in &mut document.bindings {
+            let mut overload = binding.overload.take().unwrap_or_default();
+            overload.shed_when_all_vetoed = true;
+            binding.overload = Some(overload);
+        }
+    }
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(spec)));
     behind(engine);
@@ -408,7 +448,8 @@ pub(super) fn runs(run: &Run) -> bool {
     let converted = || host.conversions() + engine.conversions(decode_side.list.lent());
     // The one call a host makes for a request, where the run asks it.
     if place::asked_with_lists(run, true) {
-        assert!(run.refused == Refused::No, "the one call's pair is open");
+        let open = matches!(run.refused, Refused::No | Refused::Overload);
+        assert!(open, "the one call's pair is open, or shed as saturated");
         let rule = ruled::stated(run);
         let named = run.entry == NAMED;
         NAMES.store(named, Ordering::Relaxed);
