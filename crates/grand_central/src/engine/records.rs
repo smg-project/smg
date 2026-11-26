@@ -184,6 +184,14 @@ impl DecisionClock {
     fn membership_epoch(&self) -> u64 {
         self.pools.load(Ordering::Relaxed)
     }
+
+    /// One more pool on this clock: counts it and answers its number, the
+    /// membership epoch from then on. The first pool is number one: an
+    /// epoch of zero says no membership.
+    #[inline]
+    fn next_pool(&self) -> u64 {
+        self.pools.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 impl Default for DecisionClock {
@@ -775,9 +783,7 @@ impl PoolRecords {
             places.clear();
         }
         let (engine_rows, engine_ends) = engines_of(workers, &mut fixed);
-        // The first pool is number one: an epoch of zero says no
-        // membership.
-        let number = clock.pools.fetch_add(1, Ordering::Relaxed) + 1;
+        let number = clock.next_pool();
         Self {
             regular: fixed.iter().all(|row| row.role == Role::Single),
             fixed,
