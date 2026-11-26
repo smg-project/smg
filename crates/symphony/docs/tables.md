@@ -388,10 +388,13 @@ What this table says beyond the DSML one:
   then the separator the template writes before `<tool_call>`, optional, then the block; the
   block without the separator, which the grammar forced until now, stays valid. With the thought
   left open by the prompt, free text that may close it comes first instead (`docs/grammar.md`).
-  A JSON answer's tag (`response_format`) is led the same way. The thought-closed shape serves
-  both the adaptive default and `thinking_mode: disabled` (the generation prompt then ends with
-  `</mm:think>`): the thought, or a second close, is admitted in both, and an answer that writes
-  one with thinking off reads back as content, as the legacy parser's tag has it.
+  A JSON answer's tag (`response_format`) is led the same way. That shape serves the adaptive
+  default, whose generation prompt has no marker. Under `thinking_mode: disabled` the
+  generation prompt ends with `</mm:think>`: the template closed the thought in the model's
+  place (`Format::thought_closed`), and a forced or required call is written at once, the block
+  alone, with no thought and no second close before it. The `auto` tag and a JSON answer's tag
+  admit the thought, or a second close, in both, and an answer that writes one with thinking
+  off reads back as content, as the legacy parser's tag has it.
 - **Two states for the calls, as for DSML:** `calls` is the template's wrapping (a newline after
   `<tool_call>` and after `</invoke>`), `invoke` one call's arguments, read by the XML assembler
   (`tagged::xml`); a second invoke before the first closed ends the first,
