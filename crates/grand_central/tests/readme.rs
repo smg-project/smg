@@ -36,8 +36,8 @@
 //! - every link of the three pages to a path of the checkout resolves, and
 //!   a link that names a heading names one its page holds;
 //! - each command the README shows names what the checkout holds: this
-//!   package, features and an example of its manifest, a test of the
-//!   library's source, and flags the standalone binary's command line
+//!   package, features and an example of its manifest, a unit test of the
+//!   library, and flags the standalone binary's command line
 //!   declares.
 
 use std::{
@@ -1083,8 +1083,8 @@ fn held_under(folder: &Path, text: &str) -> bool {
 }
 
 /// What a command names that the checkout does not hold. A cargo command
-/// names this package, features and an example of its manifest, and a test
-/// of the library's source. A command of the standalone binary names flags
+/// names this package, features and an example of its manifest, and a unit
+/// test of the library. A command of the standalone binary names flags
 /// its command line declares. A command of another kind is a fault too: the
 /// case reads it once it is taught to.
 fn command_faults(command: &str) -> Vec<String> {
@@ -1136,10 +1136,10 @@ fn command_faults(command: &str) -> Vec<String> {
         };
         if let Some(name) = name {
             // The library's unit tests stand under `tests/unit`.
-            let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/unit");
-            if !held_under(&source, &format!("fn {name}(")) {
+            let unit_tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/unit");
+            if !held_under(&unit_tests, &format!("fn {name}(")) {
                 faults.push(format!(
-                    "`{command}`: the library's source holds no test {name}"
+                    "`{command}`: the library's unit tests hold no test {name}"
                 ));
             }
         }
