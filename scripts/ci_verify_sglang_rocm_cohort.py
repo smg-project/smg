@@ -77,9 +77,30 @@ def installed_cache_source(name):
     return str(path.parent.parent / (match[1] + ".py")) if match else None
 
 
+def uninstall_record_rows(record):
+    """Use only path spellings whose full-text and pip line-based CSV parsing agree."""
+    text = record.read_text()
+    try:
+        rows = list(csv.reader(io.StringIO(text), strict=True))
+        pip_rows = list(csv.reader(text.splitlines()))
+    except csv.Error as error:
+        raise RuntimeError("Malformed uninstall RECORD") from error
+    require(all(len(row) == 3 for row in rows), "Malformed uninstall RECORD")
+    require(
+        all(
+            not any(ord(ch) < 32 or 127 <= ord(ch) <= 159 or ch in "\u2028\u2029" for ch in row[0])
+            for row in rows
+        )
+        and all(len(row) == 3 for row in pip_rows)
+        and [row[0] for row in rows] == [row[0] for row in pip_rows],
+        "Unsafe uninstall RECORD parser disagreement or control character",
+    )
+    return rows
+
+
 def verify_record(root, folder, consoles=()):
     record = folder / "RECORD"
-    rows = list(csv.reader(io.StringIO(record.read_text())))
+    rows = uninstall_record_rows(record)
     require(all(len(row) == 3 for row in rows), "Malformed installed RECORD")
     names = {row[0] for row in rows}
     require(len(names) == len(rows), "Duplicate installed RECORD path")
@@ -163,6 +184,17 @@ def verify_extension_payload(root, folder, names):
     require(isinstance(archive, dict), "Malformed extension archive_info")
     hashes = archive.get("hashes")
     require(isinstance(hashes, dict), "Malformed extension archive hashes")
+    if "hash" in archive:
+        legacy = archive["hash"]
+        require(isinstance(legacy, str), "Malformed legacy archive hash")
+        algorithm, separator, value = legacy.partition("=")
+        require(
+            separator == "="
+            and re.fullmatch(r"[a-zA-Z0-9_]+", algorithm) is not None
+            and re.fullmatch(r"[a-fA-F0-9]+", value) is not None
+            and hashes.get(algorithm) == value,
+            "Conflicting legacy archive hash",
+        )
     require(
         direct.get("url") == SDIST_URL
         and hashes.get("sha256") == SDIST_SHA
@@ -377,7 +409,7 @@ def validate_uninstall_record(root, folder, package, consoles=()):
     require(not folder.is_symlink() and folder.is_dir(), "Unsafe native distribution location")
     record = folder / "RECORD"
     require(not record.is_symlink() and record.is_file(), "Unsafe or absent uninstall RECORD")
-    rows = list(csv.reader(io.StringIO(record.read_text())))
+    rows = uninstall_record_rows(record)
     require(all(len(row) == 3 for row in rows), "Malformed uninstall RECORD")
     names = [row[0] for row in rows]
     require(len(names) == len(set(names)), "Duplicate uninstall RECORD path")
@@ -392,48 +424,96 @@ def validate_uninstall_record(root, folder, package, consoles=()):
             "Unsafe linked native package payload",
         )
     for name in names:
-        relative = Path(name)
-        path = root / name
-        if name in consoles:
-            expected = Path("/opt/venv/bin") / relative.name
-            require(
-                path.resolve() == expected and not expected.parent.is_symlink(),
-                "Unsafe uninstall console path",
-            )
-        else:
-            require(
-                not relative.is_absolute()
-                and ".." not in relative.parts
-                and bool(relative.parts)
-                and str(relative) == name
-                and (
-                    relative.parts[0] in (package, folder.name)
-                    or (
-                        package == "torch_c_dlpack_ext"
-                        and (
-                            name == "build_backend.py"
-                            or (
-                                installed_cache_source(name) == "build_backend.py"
-                                and "build_backend.py" in names
-                            )
+        validate_uninstall_target(root, folder, package, name, names, consoles)
+    return names
+
+
+def validate_uninstall_target(root, folder, package, name, names, consoles=()):
+    relative = Path(name)
+    path = root / name
+    if name in consoles:
+        expected = Path("/opt/venv/bin") / relative.name
+        require(
+            path.resolve() == expected and not expected.parent.is_symlink(),
+            "Unsafe uninstall console path",
+        )
+    else:
+        require(
+            not relative.is_absolute()
+            and ".." not in relative.parts
+            and bool(relative.parts)
+            and str(relative) == name
+            and (
+                relative.parts[0] in (package, folder.name)
+                or (
+                    package == "torch_c_dlpack_ext"
+                    and (
+                        name == "build_backend.py"
+                        or (
+                            installed_cache_source(name) == "build_backend.py"
+                            and "build_backend.py" in names
                         )
                     )
                 )
-                and path.resolve().is_relative_to(root),
-                "Unsafe uninstall RECORD path: " + name,
             )
-            require(
-                not any(
-                    parent.is_symlink()
-                    for parent in path.parents
-                    if parent != root and parent.is_relative_to(root)
-                ),
-                "Unsafe linked uninstall parent",
-            )
-        require(
-            not path.is_symlink() and (not path.exists() or path.is_file()),
-            "Unsafe uninstall RECORD file: " + name,
+            and path.resolve().is_relative_to(root),
+            "Unsafe uninstall RECORD path: " + name,
         )
+        require(
+            not any(
+                parent.is_symlink()
+                for parent in path.parents
+                if parent != root and parent.is_relative_to(root)
+            ),
+            "Unsafe linked uninstall parent",
+        )
+    require(
+        not path.is_symlink() and (not path.exists() or path.is_file()),
+        "Unsafe uninstall RECORD file: " + name,
+    )
+
+
+def validate_effective_uninstall_targets(root, folder, package, consoles=()):
+    """Conservatively qualify pip's generated deletion paths before a selected repair."""
+    names = validate_uninstall_record(root, folder, package, consoles)
+    for name in names:
+        source = root / name
+        if not str(source).endswith(".py"):
+            continue
+        # pip enumerates these even when the recorded source no longer exists.
+        targets = [source.parent / (source.name[:-3] + suffix) for suffix in (".pyc", ".pyo")]
+        if source.exists() and os.path.splitext(source)[1] == ".py":
+            targets.append(Path(importlib.util.cache_from_source(str(source))))
+        for target in targets:
+            try:
+                relative = str(target.relative_to(root))
+            except ValueError as error:
+                raise RuntimeError(
+                    "Unsafe derived uninstall target outside package root"
+                ) from error
+            # Legacy root backend caches have no qualified ownership. Absence is
+            # harmless, but their parent/link boundary must still be checked.
+            absent_backend_legacy = (
+                package == "torch_c_dlpack_ext"
+                and name == "build_backend.py"
+                and relative in {"build_backend.pyc", "build_backend.pyo"}
+                and not os.path.lexists(target)
+            )
+            if absent_backend_legacy:
+                require(
+                    not any(parent.is_symlink() for parent in target.parents if parent != root),
+                    "Unsafe linked derived uninstall parent",
+                )
+                continue
+            if (
+                package == "torch_c_dlpack_ext"
+                and installed_cache_source(relative) == "build_backend.py"
+            ):
+                require(
+                    not os.path.lexists(target) or relative in names,
+                    "Unsafe unrecorded shared backend cache",
+                )
+            validate_uninstall_target(root, folder, package, relative, names, consoles)
 
 
 def validate_repair_script_metadata(folder):
@@ -523,10 +603,11 @@ def native_repair_packages():
             isinstance(observed, str) and re.fullmatch(r"[A-Za-z0-9_.+!-]+", observed),
             "Unsafe native distribution version",
         )
-        folder = root / (name.replace("-", "_") + "-" + observed + ".dist-info")
+        folder = Path(dist._path)
         require(
             Path(dist.locate_file("")).resolve() == root
-            and Path(dist._path).resolve() == folder
+            and folder.parent.resolve() == root
+            and folder.resolve() == root / folder.name
             and not folder.is_symlink(),
             "Unsafe native distribution location",
         )
@@ -564,6 +645,7 @@ def native_repair_packages():
         if needs_repair:
             # Fatal admission is not inside the repairable-integrity try/catch.
             # Check all pip metadata deletion inputs before append or any output.
+            validate_effective_uninstall_targets(root, folder, package, consoles)
             validate_repair_script_metadata(folder)
             repair.append(name)
     return repair

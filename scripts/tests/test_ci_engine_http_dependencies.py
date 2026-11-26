@@ -1908,6 +1908,11 @@ def test_real_pip_backend_cache_and_directory_identity_are_safe(tmp_path, monkey
     import importlib.metadata
     import zipfile
 
+    try:
+        pip_dist = importlib.metadata.distribution("pip")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("pip is not installed in the test interpreter")
+
     evidence = tmp_path / "real-pip-artifacts"
     evidence.mkdir()
     venv = tmp_path / "fresh-pip-venv"
@@ -1944,7 +1949,6 @@ def test_real_pip_backend_cache_and_directory_identity_are_safe(tmp_path, monkey
     )
     # Reuse immutable pip tooling, not another environment's SDKs. -B prevents
     # implicit bytecode writes there; pip's explicit default --compile remains on.
-    pip_dist = importlib.metadata.distribution("pip")
     pip_source = Path(importlib.util.find_spec("pip").origin).resolve().parent
     (site / "pip").symlink_to(pip_source, target_is_directory=True)
     (site / Path(pip_dist._path).name).symlink_to(
@@ -2021,6 +2025,57 @@ def test_real_pip_backend_cache_and_directory_identity_are_safe(tmp_path, monkey
     with pytest.raises(RuntimeError, match="Unsafe native distribution identity"):
         verifier.find_native_distributions(distributions, "tilelang")
     assert sentinel.read_bytes() == b"do not remove; no uninstall will run"
+    # Build actual pip deletion plans only. Every mutation/removal API is guarded.
+    plan_script = """
+import json, sys
+from pip._internal.metadata import get_environment
+from pip._internal.req.req_uninstall import UninstallPathSet, StashedUninstallPathSet
+
+def forbidden(*args, **kwargs):
+    raise AssertionError('readonly plan must never remove/stash files')
+UninstallPathSet.remove = forbidden
+StashedUninstallPathSet.stash = forbidden
+dist = get_environment([sys.argv[1]]).get_distribution(sys.argv[2])
+assert dist is not None
+plan = UninstallPathSet.from_dist(dist)
+print(json.dumps(sorted(plan._paths)))
+"""
+
+    def plan(name, label):
+        return json.loads(run(label, [py, "-I", "-B", "-c", plan_script, str(site), name]))
+
+    # An absent literal multiline path bypassed the old safety admission, while
+    # pip's splitlines() parsing instead targeted this owned venv interpreter.
+    import io
+
+    alias_record = io.StringIO(newline="")
+    writer = csv.writer(alias_record)
+    writer.writerow([alias.name + "/RECORD", "", ""])
+    writer.writerow(["tilelang/" + "\n../" * 4 + "bin/python3", "", ""])
+    (alias / "METADATA").write_text("Metadata-Version: 2.1\nName: tilelang\nVersion: 0.1.15\n")
+    (alias / "RECORD").write_text(alias_record.getvalue())
+    interpreter = venv / "bin/python3"
+    interpreter_before = interpreter.read_bytes()
+    parser_plan = plan("tilelang", "readonly-parser-plan")
+    assert str(interpreter) in parser_plan
+    with pytest.raises(RuntimeError, match="parser disagreement|control character"):
+        verifier.validate_uninstall_record(site, alias, "tilelang")
+    assert interpreter.read_bytes() == interpreter_before
+
+    # Source absence does not stop pip enumerating adjacent legacy bytecode.
+    source_body = (site / "build_backend.py").read_bytes()
+    (site / "build_backend.py").unlink()
+    legacy = site / "build_backend.pyc"
+    legacy.mkdir()
+    protected = legacy / "owned-foreign-sentinel"
+    protected.write_bytes(b"never remove; plan only")
+    derived_plan = plan("smg-cohort-cache-fixture", "readonly-missing-source-legacy-plan")
+    assert str(legacy) in derived_plan
+    with pytest.raises(RuntimeError, match="Unsafe"):
+        verifier.validate_effective_uninstall_targets(site, folder, "torch_c_dlpack_ext")
+    assert protected.read_bytes() == b"never remove; plan only"
+    (site / "build_backend.py").write_bytes(source_body)
+    assert sentinel.read_bytes() == b"do not remove; no uninstall will run"
     (evidence / "receipt.json").write_text(
         json.dumps(
             {
@@ -2034,8 +2089,160 @@ def test_real_pip_backend_cache_and_directory_identity_are_safe(tmp_path, monkey
                 "Source_policy_rejected_alias": True,
                 "dangerous_RECORD_rejected_sentinel_unchanged": True,
                 "real_uninstall_calls": 0,
+                "readonly_parser_plan_contains_owned_interpreter": str(interpreter) in parser_plan,
+                "readonly_missing_source_plan_contains_legacy_directory": str(legacy)
+                in derived_plan,
+                "all_owned_sentinels_unchanged": True,
                 "testwheel_not_Torch_TVM_or_official_SDK": True,
             },
             indent=2,
         )
     )
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r", "\t", "\v", "\x85", "\u2028"])
+def test_repair_rejects_record_path_parser_controls_before_pip(tmp_path, monkeypatch, separator):
+    import csv
+
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    folder = root / "tilelang-0.1.15.dist-info"
+    with (folder / "RECORD").open("a", newline="") as stream:
+        csv.writer(stream).writerow(["tilelang/" + separator + "../foreign.py", "", ""])
+    with pytest.raises(RuntimeError, match="Unsafe uninstall RECORD"):
+        verifier.native_repair_packages()
+    assert native == [] and pip == []
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "legacy-dir",
+        "legacy-file",
+        "source-missing",
+        "unrecorded-cache",
+        "root-cache-link",
+        "runtime-prefix",
+        "missing-target-linked-parent",
+    ],
+)
+def test_selected_repair_qualifies_all_effective_bytecode_targets(tmp_path, monkeypatch, target):
+    import csv
+
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    folder = root / "torch_c_dlpack_ext-0.1.5.dist-info"
+    verifier.ANCHORS["build_backend.py"] = "0" * 64
+    sentinel = tmp_path / "foreign"
+    sentinel.mkdir()
+    (sentinel / "keep").write_bytes(b"not a repair target")
+    if target in {"legacy-dir", "legacy-file", "source-missing"}:
+        legacy = root / "build_backend.pyc"
+        if target == "legacy-file":
+            legacy.write_bytes(b"foreign root bytecode")
+        else:
+            legacy.mkdir()
+            (legacy / "keep").write_bytes(b"foreign directory")
+        if target == "source-missing":
+            (root / "build_backend.py").unlink()
+    elif target in {"unrecorded-cache", "root-cache-link", "missing-target-linked-parent"}:
+        rows = list(csv.reader((folder / "RECORD").read_text().splitlines()))
+        rows = [r for r in rows if not r[0].startswith("__pycache__/")]
+        with (folder / "RECORD").open("w", newline="") as stream:
+            csv.writer(stream).writerows(rows)
+        if target != "unrecorded-cache":
+            cache = root / "__pycache__"
+            for leaf in cache.iterdir():
+                leaf.unlink()
+            cache.rmdir()
+            cache.symlink_to(sentinel, target_is_directory=True)
+            if target == "root-cache-link":
+                (sentinel / f"build_backend.{sys.implementation.cache_tag}.pyc").write_bytes(
+                    b"other"
+                )
+    else:
+        prefix = root / "foreign-cache-prefix"
+        monkeypatch.setattr(sys, "pycache_prefix", str(prefix))
+        predicted = Path(importlib.util.cache_from_source(str(root / "build_backend.py")))
+        predicted.parent.mkdir(parents=True)
+        predicted.write_bytes(b"not an owned native cache")
+    with pytest.raises(RuntimeError, match="Unsafe"):
+        verifier.native_repair_packages()
+    assert native == [] and pip == []
+    assert (sentinel / "keep").read_bytes() == b"not a repair target"
+
+
+def test_owned_package_unrecorded_generated_cache_remains_repairable(tmp_path, monkeypatch):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    source = root / "tilelang/__init__.py"
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    cache.parent.mkdir()
+    cache.write_bytes(b"unrecorded generated package bytecode, never imported")
+    verifier.ANCHORS["tilelang/__init__.py"] = "0" * 64
+    assert verifier.native_repair_packages() == ["tilelang"]
+    assert native == [] and pip == []
+
+
+def test_selected_dist_directory_not_header_selects_uninstall_record(tmp_path, monkeypatch):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    version = verifier.md.version
+    monkeypatch.setattr(
+        verifier.md, "version", lambda n: "0.1.14" if n == "tilelang" else version(n)
+    )
+    folder = root / "tilelang-0.1.15.dist-info"
+    (folder / "METADATA").write_text("Metadata-Version: 2.1\nName: tilelang\nVersion: 0.1.14\n")
+    _rewrite_fixture_record(root, folder)
+    assert verifier.native_repair_packages() == ["tilelang"]
+    with (folder / "RECORD").open("a") as stream:
+        stream.write("../../../bin/python3,,\n")
+    with pytest.raises(RuntimeError, match="Unsafe"):
+        verifier.native_repair_packages()
+    assert native == [] and pip == []
+
+
+@pytest.mark.parametrize(
+    "legacy,repair",
+    [(None, False), ("matching", False), ("sha256=bad", True), ({}, True), ("broken", True)],
+)
+def test_shared_archive_check_rejects_conflicting_legacy_digest(
+    tmp_path, monkeypatch, legacy, repair
+):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    folder = root / "torch_c_dlpack_ext-0.1.5.dist-info"
+    direct = json.loads((folder / "direct_url.json").read_text())
+    if legacy is not None:
+        direct["archive_info"]["hash"] = (
+            "sha256=" + verifier.SDIST_SHA if legacy == "matching" else legacy
+        )
+    (folder / "direct_url.json").write_text(json.dumps(direct))
+    _rewrite_fixture_record(root, folder)
+    assert verifier.native_repair_packages() == (["torch-c-dlpack-ext"] if repair else [])
+    if repair:
+        with pytest.raises(RuntimeError):
+            verifier.verify({})
+    assert native == [] and pip == []
+
+
+def test_optional_real_pip_probe_skips_missing_tool_without_a_child(tmp_path, monkeypatch):
+    import importlib.metadata
+
+    def absent(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "distribution", absent)
+    with pytest.raises(pytest.skip.Exception, match="pip is not installed"):
+        test_real_pip_backend_cache_and_directory_identity_are_safe(tmp_path, monkeypatch)
+    assert not (tmp_path / "real-pip-artifacts").exists()
+
+
+def test_hidden_dot_py_source_has_pip_legacy_deletion_targets(tmp_path, monkeypatch):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    folder = root / "tilelang-0.1.15.dist-info"
+    (root / "tilelang/.py").write_text("# owned malformed source fixture, never imported\n")
+    with (folder / "RECORD").open("a") as stream:
+        stream.write("tilelang/.py,,\n")
+    target = root / "tilelang/.pyc"
+    target.mkdir()
+    (target / "keep").write_bytes(b"not a bytecode file")
+    with pytest.raises(RuntimeError, match="Unsafe"):
+        verifier.native_repair_packages()
+    assert (target / "keep").read_bytes() == b"not a bytecode file"
+    assert native == [] and pip == []
