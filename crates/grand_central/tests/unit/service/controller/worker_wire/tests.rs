@@ -115,7 +115,7 @@ fn full() -> WorkerRow {
         demand_facts: DemandFacts {
             runtime: 7,
             references: true,
-            host_pipeline: true,
+            host_pipeline: false,
             window: 32_768,
             decoding: 3,
         },
@@ -191,7 +191,7 @@ fn the_wires_row_tells_every_fact_of_the_stores_row() {
         demand_facts: Some(proto::DemandFacts {
             runtime: 7,
             references: true,
-            host_pipeline: true,
+            host_pipeline: false,
             window: 32_768,
             decoding: 3,
         }),
