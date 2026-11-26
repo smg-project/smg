@@ -150,10 +150,10 @@ fn keyed(key: &str) -> HeaderMap {
     headers
 }
 
-/// A document of three sides whose binding keeps a sessions rule: the
-/// encode side places an item on the plain ring, and the rule pins a key
-/// by its header and hands the key on where `cap` of its requests run on
-/// the pinned worker. Each side of the pair takes its workers in turn, or,
+/// A document of three sides whose binding keeps a sessions rule. The
+/// encode side places an item on the plain ring. The rule pins a key by
+/// its header, and hands the key on where `cap` of its requests run on the
+/// pinned worker. Each side of the pair takes its workers in turn, or,
 /// with `fewest`, the worker that holds the fewest requests. The rule is
 /// the stock `manual` preset's, and the view lists the key's header.
 fn pinned(cap: u16, fewest: bool) -> AppliedSpec {
@@ -179,17 +179,17 @@ fn pinned(cap: u16, fewest: bool) -> AppliedSpec {
     AppliedSpec::validate(&document).expect("the document validates")
 }
 
-/// Under a sessions rule the pair of an encode request is its key's: the
+/// Under a sessions rule the pair of an encode request is its key's. The
 /// key's requests keep the prefill and the decode its first request took,
-/// with an item and with none, while each side of the pair would else take
-/// its workers in turn. A request with no key takes those turns.
+/// with an item and with none. Each side of the pair would else take its
+/// workers in turn, and a request with no key takes those turns.
 ///
 /// The classic gateway's sticky map pins a key within its model and its
-/// role, prefill or decode, and its three-sided selection places the pair
-/// through that same call, with items and without
-/// (`model_gateway/src/policies/registry.rs:783`, `:801-806`,
-/// `model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2532`).
-/// The lines are main's at `9b72a221d`.
+/// role, prefill or decode: the `namespaced` key of `select_sticky`
+/// (`model_gateway/src/policies/registry.rs`). Its three-sided selection
+/// places the pair through that same call, with items and without:
+/// `placed_encode_prefill_decode_workers`
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`).
 #[test]
 fn a_key_keeps_its_pair_with_an_item_and_with_none() {
     let fleet = fleet(3, 3, 2);
@@ -216,15 +216,17 @@ fn a_key_keeps_its_pair_with_an_item_and_with_none() {
     assert!(turns.len() > 1, "a request with no key takes its turn");
 }
 
-/// Under a cap of two the third request of a key leaves the pinned worker:
-/// with two of the key's requests running on its prefill, the key's next
-/// request takes another prefill, and its decode, which runs none, stays.
-/// Each side takes the worker that holds the fewest requests, so the
-/// request handed on never lands on the pinned prefill again.
+/// Under a cap of two the third request of a key leaves the pinned worker.
+/// With two of the key's requests running on its prefill, the key's next
+/// request takes another prefill. Its decode, which runs none, stays. Each
+/// side takes the worker that holds the fewest requests, so the request
+/// handed on never lands on the pinned prefill again.
 ///
 /// The classic gateway's sticky map hands a key on where two of its
-/// requests run on the pinned worker, counted under the key's own text
-/// (`model_gateway/src/policies/registry.rs:394`, `:810`).
+/// requests run on the pinned worker, counted under the key's own text.
+/// The cap is `STICKY_INFLIGHT_CAP`, and `select_sticky` tests
+/// `routing_key_inflight` against it
+/// (`model_gateway/src/policies/registry.rs`).
 #[test]
 fn the_third_request_of_a_key_leaves_its_pinned_prefill_under_a_cap_of_two() {
     const KEY: &str = "session-7";
@@ -251,14 +253,14 @@ fn the_third_request_of_a_key_leaves_its_pinned_prefill_under_a_cap_of_two() {
     assert_eq!(third.sent[2], first.sent[2], "the key's decode");
 }
 
-/// An item goes by its content whatever the request's key: one content
+/// An item goes by its content whatever the request's key. One content
 /// keeps one encoder under each key and under none, and the contents of
 /// one key spread over the encoders.
 ///
 /// The classic gateway asks the encode policy for an item under the hash
-/// of its content alone, and its sticky map never sees an item
-/// (`assign_encode_workers`, `worker_selection.rs:2780-2796`, `:2823-2829`).
-/// The lines are main's at `9b72a221d`.
+/// of its content alone, and its sticky map never sees an item:
+/// `assign_encode_workers` and `encode_routing_headers`
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`).
 #[test]
 fn an_item_goes_by_its_content_whatever_the_requests_key() {
     let fleet = fleet(2, 2, 3);
@@ -375,8 +377,12 @@ fn many_routers_place_an_item_in_every_mode_that_plans_three_sides() {
 /// The classic router keeps the encoders that are available: the
 /// `available_encode` list of `placed_encode_prefill_decode_workers`
 /// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`). With
-/// none of them left it answers a request that needs one as unavailable, ahead
-/// of its pair: the test of `available_encode.is_empty()` there.
+/// none of them left it answers a request that needs one ahead of its pair:
+/// the test of `available_encode.is_empty()` there. The answer is unavailable
+/// where a registered encoder could serve the request, or where the model
+/// has none: this case's two fleets. Where the registered encoders lack the
+/// vision, the connector's producer role or the media the request asks, the
+/// router refuses under that lack's own name.
 #[test]
 fn an_encoder_that_cannot_be_sent_to_takes_no_item() {
     let fleet = fleet(1, 1, 3);
