@@ -212,6 +212,94 @@ fn a_conversation_of_text_placed_by_the_one_call_goes_back_to_its_worker() {
     }
 }
 
+/// A request of text follows the worker its string tree holds the text for
+/// by the tree's own share: the chars the tree matched over the text's
+/// chars, with nothing rounded to a window. The worker a text was first
+/// sent to is loaded from then on and every other stays free, so a request
+/// that does not follow it goes to another.
+///
+/// - A text under one window goes back to its worker, and its placement
+///   states the match: forty chars of forty.
+/// - A text whose match ends inside its second window follows where the
+///   share is just over the threshold: a hundred chars of 333.
+/// - It does not where the share is just under: a hundred chars of 334.
+/// - A match of one whole window is not followed at 64 chars of 214: a
+///   share under the threshold, which a size rounded down to four bytes
+///   would put over it.
+///
+/// The classic policy divides the chars its tree matched by the text's and
+/// follows a holder where the share is over `cache_threshold`
+/// (`select_worker_with_text` in
+/// `model_gateway/src/policies/cache_aware.rs`), every tenant of the match
+/// a candidate whatever its blocks (`select_matched_candidate` there).
+#[test]
+fn a_text_follows_its_holder_by_the_string_trees_share() {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let (engine, _tree) = lending_text(spec);
+    let engine = hosted(engine);
+    let list = pool(8);
+    let members = PublishedList::new(Arc::clone(&list));
+    let sent = |text: &str| {
+        let entry = Words {
+            text,
+            asked: Cell::new(0),
+        };
+        let request = PlaceRequest {
+            prompt: Prompt {
+                text: Some(text),
+                entry: Some(&entry),
+                ..Prompt::NONE
+            },
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let placement = engine.place(&request).expect("a placement");
+        (placement.id(), placement.overlap)
+    };
+    // The worker a text is first sent to, loaded from then on.
+    let first = |text: &str| {
+        let (holder, _) = sent(text);
+        let at = list
+            .iter()
+            .position(|worker| worker_id(&**worker) == holder);
+        list[at.expect("a worker of the list")].increment_load();
+        holder
+    };
+    let held = |blocks: u16, of: u16| Overlap {
+        blocks,
+        of,
+        source: OverlapSource::Tree,
+        ..Overlap::NONE
+    };
+
+    let short = "a".repeat(40);
+    let holder = first(&short);
+    for turn in 0..16 {
+        assert_eq!(sent(&short), (holder, held(40, 40)), "turn {turn}");
+    }
+
+    let stored = "b".repeat(100);
+    let holder = first(&stored);
+    let over = format!("{stored}{}", "o".repeat(233));
+    assert_eq!(sent(&over), (holder, held(100, 333)));
+    let under = format!("{stored}{}", "u".repeat(234));
+    let (other, stated) = sent(&under);
+    assert_ne!(other, holder, "a hundred of 334 is under the threshold");
+    let miss = Overlap {
+        of: stated.of,
+        ..Overlap::NONE
+    };
+    assert_eq!(stated, miss, "a miss of the request's blocks");
+    assert_ne!(stated.of, 0);
+
+    let stored = "d".repeat(64);
+    let holder = first(&stored);
+    let sliver = format!("{stored}{}", "s".repeat(150));
+    let (other, _) = sent(&sliver);
+    assert_ne!(other, holder, "64 of 214 is under the threshold");
+}
+
 /// The entry is asked where a decision of the call reads the lent tree, and
 /// nowhere else: never by a place one pick decides, never by a whole
 /// decision whose profile reads no record of sent prefixes, and never

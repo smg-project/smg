@@ -533,6 +533,7 @@ fn a_holder_named_outside_the_places_is_not_handed() {
                 warming: &[],
                 thin: false,
                 mean_in_flight: None,
+                tree: None,
             }),
             ..facts(seed)
         };

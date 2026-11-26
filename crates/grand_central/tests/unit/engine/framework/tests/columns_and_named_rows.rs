@@ -196,6 +196,7 @@ fn rows_named_out_of_order_past_the_pool_or_beside_a_column_stop_a_debug_build()
                     warming,
                     thin: false,
                     mean_in_flight: None,
+                    tree: None,
                 }),
                 ..RequestFacts::default()
             };
