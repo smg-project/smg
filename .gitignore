@@ -164,3 +164,6 @@ clients/java/target/
 clients/java/build.sbt
 clients/java/gradle.properties
 openapitools.json
+
+# Pinned upstream source used by the offline tau2 hook tests
+.tau2-upstream/

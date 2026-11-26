@@ -131,3 +131,108 @@ Brought up end-to-end on one node, **`Qwen/Qwen3.6-27B` at TP=1 per arm** (on a 
 The arms **agree on 7/10 tasks** and diverge on 3 (SMG loses tasks 5 & 6, wins task 8 → net −1). The split is *mixed*, consistent with multi-turn trajectory divergence — small frontend differences (e.g. the `reasoning_content` delta above) amplified across turns via the LLM user-sim — rather than a systematic parser defect. **n=10 / k=1 is not conclusive**; a real parity verdict needs the nightly's larger, k=2 run (ideally several). This mixed-trajectory signal is exactly what single-turn BFCL AST matching cannot surface — the reason τ²-bench is worth running.
 
 **Throughput & cost** (these set the nightly knobs): 20 dialogues (retail 10 tasks × 2 arms, 1 trial) took **19.5 min** wall at tau2's default concurrency (~85 s/dialogue) and **$0.17** of `gpt-5.2` user-sim spend (~$0.009/dialogue). At default concurrency the full 3-domain × k=2 nightly would take ~18 h, so the workflow sets **`--max-concurrency 16`** to keep it within the 360-min ceiling. Scale trials/domains for tighter confidence intervals.
+
+## Paid request admission foundation (F)
+
+This foundation supplies `budget.py`, explicit isolated `guarded_cli.py`, and
+the opt-in legacy hook with its startup tests. The existing `run_ab.py` and
+nightly remain at the main baseline in this source cut; their guarded A/B
+consumer integration is a separate dependent C change. Do not treat this
+foundation alone as paid nightly admission or use its old driver for paid work.
+The isolated entry runs under the pinned Python 3.12 SDK contract before any
+provider transport; only synthetic CPU evidence is inherited here.
+
+The supported paid scope is the existing plain-text `llm_agent` /
+`user_simulator`, base split, retail/airline/telecom. Both `gpt-5.2` user turns and
+the required `gpt-4.1-2025-04-14` natural-language evaluator are charged. Retail
+has 112/114 base tasks requiring that evaluator; its quality checks are retained.
+Only the exact declared local agent model and loopback endpoint are uncharged.
+Voice, knowledge/embeddings, optional reviews, other providers, streaming,
+asynchronous SDK requests and unknown paid callsites refuse without sending.
+This is a boundary for the pinned text pipeline, not a general egress sandbox or
+support claim for all τ² modes. CUDA launch/cleanup and AMD qualification remain
+separate; this change does not add a paid or AMD execution authorization.
+
+Before invoking the isolated entry, supply these reviewed values using its
+`--policy`, `--contexts`, `--contexts-sha256`, `--ledger` and `--scope` flags.
+The dependent C change owns the driver environment and `--budget-*` flags.
+No real prices, provider limits or spending approval are supplied here:
+
+- `TAU2_BUDGET_POLICY`: JSON containing `scope_id`, integer `cap_nusd`, `calls`,
+  `calls_per_arm`, and `models` with exactly `openai/gpt-5.2` and
+  `openai/gpt-4.1-2025-04-14`. Each model has explicit decimal-string
+  `input_per_million` / `output_per_million`, positive integer `input_limit` /
+  `output_limit`, and `service_tier: "default"`. `cap_nusd` is billionths of USD.
+- `TAU2_BUDGET_CONTEXTS`: a separately verified provider-contract JSON with
+  `schema_version: 1` and `models` keyed by those two model names without the
+  `openai/` prefix. Each entry has the complete provider `context_tokens` bound,
+  the official `source_url`, and the explicitly reviewed resolved
+  `response_models` IDs covered by the same pricing/context contract.
+- `TAU2_BUDGET_CONTEXTS_SHA256`: the independently reviewed SHA256 of the exact
+  context file bytes. A URL plus an invented number is not provider evidence.
+  The tool does not discover/attest provider limits: real values must be verified
+  outside the policy before execution. No real bound is supplied here; fixtures
+  use synthetic contracts only. An estimate of the last message's tokens or the
+  policy's `input_limit` itself is not a complete input bound.
+- `TAU2_BUDGET_LEDGER`: one absolute SQLite file shared by both arms, every domain
+  and both sequential score processes. The explicit guarded `--initialize` entry creates it once using an exclusive
+  new file before either arm; live scoring, guarded children and saved-score
+  acceptance open an existing file only. Do not rerun initialization after loss of a live ledger; restore its state or
+  obtain a new scope/approval. An old or missing/incompatible ledger is not reset or silently recreated at acceptance.
+- `TAU2_BUDGET_SCOPE`: the exact approved comparison scope matching the policy.
+  In CI it is `<run_id>:<run_attempt>:<matrix.name>`. Approval is either for
+  that exact job or an explicit standing per-job allowance resolved by the guard;
+  C owns the nightly configuration and run-identity wiring.
+  This is a per-comparison-job cap, not an aggregate monthly/multi-host billing
+  controller. Matrix and repeated-run exposure must be explicitly approved.
+
+Every actual paid HTTP send reserves the entire independently verified provider
+context bound plus `max_completion_tokens` at that model's rates, under one
+atomic global USD/call/per-arm cap. This deliberately over-reserves accepted
+input, including full system/history/tool schemas and framing, instead of using
+an optimistic token estimate. The final wire must have one non-streaming
+completion, explicit `service_tier=default`, the protected output cap (including
+reasoning tokens), and only the supported text/function-tool fields. The
+returned model and actual tier must match the reviewed contract. A missing or
+unknown tier/model/usage, a transport error, an over-bound count, or a refused
+request retains its reservation and halts further admission; no successful call
+refunds its worst-case reservation. Requested standard pricing is never treated
+as known actual spend after an unknown-tier response. The guarantee depends on
+the approved provider contract; an unknown outcome is incomplete, not a billing
+success claim.
+
+Task/transport retries cannot get an unreserved send. Task retries are disabled,
+known SDK retry options are forced to zero, and the final transport boundary
+still covers the SDK's own retries and LiteLLM's parameter/role reformat retries.
+Requests already reserved/in flight may finish when another fails; their exposure
+is already included in the cap. Each row records actual model/role/arm/domain/
+invocation/task/trial, status and known token usage, with no key/prompt.
+
+CPU tests execute the pinned UserSimulator, NL evaluator, task wrapper and
+LiteLLM/OpenAI request chain through fake HTTP transports with socket connections
+forbidden and fixed offline keys. Synthetic two-model prices/bounds validate
+mechanisms, not actual pricing, quality, spend, GPU cleanup or continuous CI.
+
+The earlier `costmap_shim/sitecustomize.py` startup hook remains a separate,
+explicit `SMG_TAU2_BUDGET_GUARD=1` opt-in for legacy callers. Its unconfigured
+synchronous authorizer still refuses requests; it is not the paid authorizer for
+the explicit isolated entry. The baseline main driver is not retrofitted in F.
+
+The legacy hook remains unconfigured unless an external caller provides its
+verified authorizer. Its explicit opt-in compatibility is retained, not retired
+from absence of a repository caller. The pre-existing zero-price registration
+function is unchanged. The explicit isolated guard owns its own SDK boundary.
+
+The source check resolves the actual imported `tau2` package, including the
+checkout used by `uv sync` editable installations, and verifies the same pinned
+request-path hashes in either installation mode. Distribution versions and SDK
+source fingerprints remain mandatory; an editable install does not waive them.
+
+Initialize an approved scope exactly once with the isolated guard's
+`--initialize` entry; never recreate a missing live ledger. A guarded invocation
+requires the existing policy, context SHA, scope and ledger identity. The
+foundation descriptor/completion protocol is consumed by C without a copied
+implementation. Unknown request outcomes keep their reservation. If both
+persistent ordering paths are unavailable, cross-process stop is NOT_ATTESTED;
+paid admission remains on hold pending owner reconciliation. This cut supplies
+no prices, provider contracts, approval, GPU use or new service.
