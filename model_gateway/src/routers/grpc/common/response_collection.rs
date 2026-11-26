@@ -16,6 +16,7 @@ use crate::{
             attempt_ledger::mark_pending_charge,
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
+            retry::mark_non_retryable,
         },
         error,
         grpc::{
@@ -27,7 +28,7 @@ use crate::{
             utils::{
                 account_pd_side_failure, dead_rendezvous_of, mark_error_reason,
                 stream_failure::UpstreamClass,
-                tonic_ext::{is_the_engines_own_report, TonicStatusExt},
+                tonic_ext::{is_receive_bound_refusal, is_the_engines_own_report, TonicStatusExt},
                 DeadRendezvous,
             },
         },
@@ -241,6 +242,11 @@ fn stream_failed(
         (None, Some(side)) if !is_request_timeout(status) => {
             let mut response =
                 side.answer(SidePhase::Stream, status.http_status(), status.message());
+            // An answer above the receive bound is as large from any
+            // worker: final, as `to_http_error` makes it for a single one.
+            if is_receive_bound_refusal(status) {
+                mark_non_retryable(&mut response);
+            }
             mark_error_reason(&mut response, status.error_reason());
             response
         }
@@ -749,6 +755,33 @@ mod tests {
             logs_contain("127.0.0.1:30000"),
             "the line still names the prefill side by host and port"
         );
+    }
+
+    /// A stream a worker's message above the receive bound ended, a single
+    /// worker's or a side's: a 502 under the code each failure has, and
+    /// never replayed, since another worker's answer would be as large.
+    #[test]
+    fn a_stream_the_receive_bound_ended_is_an_upstream_fault_and_final() {
+        let code = |response: &Response| {
+            let header = response.headers().get(error::HEADER_X_SMG_ERROR_CODE);
+            header.and_then(|v| v.to_str().ok()).map(str::to_owned)
+        };
+        let refused = tonic::Status::out_of_range(
+            "Error, decoded message length too large: found 9886731 bytes, the limit is: 4194304 bytes",
+        );
+        let single = stream_failed(None, "worker", &refused, None);
+        assert_eq!(single.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(code(&single).as_deref(), Some("worker_stream_failed"));
+        assert!(!is_retryable_response(&single));
+        for side in [PdSide::Prefill, PdSide::Decode] {
+            let response = stream_failed(Some(side), side.name(), &refused, None);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                code(&response).as_deref(),
+                Some(side.code(SidePhase::Stream))
+            );
+            assert!(!is_retryable_response(&response));
+        }
     }
 
     /// A side's stream the request timeout cut is answered as on every other
