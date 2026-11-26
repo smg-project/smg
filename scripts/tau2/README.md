@@ -28,27 +28,43 @@ Two arms expose an identical OpenAI `/v1` endpoint. The same `tau2` CLI is point
 ```bash
 # 0) one-time: install tau2-bench (uv required); and ninja in the vLLM env (see Gotchas)
 git clone https://github.com/sierra-research/tau2-bench ~/tau/tau2-bench
-cd ~/tau/tau2-bench && uv sync
+(cd ~/tau/tau2-bench && git checkout --quiet 5bfa7e37b36656b37dc6d022156be6563c1007f3 \
+  && uv sync --frozen --python 3.12 \
+  && uv pip install --python .venv/bin/python websockets==15.0.1 pydub==0.25.1 httpx==0.28.1)
+export TAU2_PYTHON="$HOME/tau/tau2-bench/.venv/bin/python"
+# Run the remaining commands from the SMG repository root.
 ~/vllm-env/bin/pip install ninja          # then ensure ~/vllm-env/bin is on PATH
+
+# Before either arm, export the reviewed TAU2_BUDGET_* inputs listed below.
+# GPU/host admission and paid approval are separate; this example grants neither.
+"$TAU2_PYTHON" -I scripts/tau2/guarded_cli.py \
+    --policy "$TAU2_BUDGET_POLICY" --contexts "$TAU2_BUDGET_CONTEXTS" \
+    --contexts-sha256 "$TAU2_BUDGET_CONTEXTS_SHA256" \
+    --ledger "$TAU2_BUDGET_LEDGER" --scope "$TAU2_BUDGET_SCOPE" --initialize
+# Initialization creates this approved scope once; never reset/recreate its ledger.
+"$TAU2_PYTHON" scripts/tau2/run_ab.py \
+    --prepare-expected-tasks "$HOME/tau2_expected_tasks.json" \
+    --data-dir "$HOME/tau/tau2-bench/data" --domains retail,airline,telecom \
+    --num-tasks 0 --num-trials 2 --seed 300
 
 # 1) bring up both arms (here: Qwen3.8-27B, TP=2, one arm per GPU pair)
 export TAU2_MODEL=Qwen/Qwen3.8-27B VLLM_BIN=~/vllm-env/bin/vllm \
        VLLM_PYTHON=~/vllm-env/bin/python SMG_LAUNCH="$HOME/smg/target/ci/smg launch" \
        TAU2_TP=2 TAU2_MAX_MODEL_LEN=16384 PATH=~/vllm-env/bin:$PATH
-A_URL=$(TAU2_GPU=0,1 TAU2_VLLM_TOOL_PARSER=qwen3_xml TAU2_VLLM_REASONING_PARSER=qwen3 bash launch_arms.sh a)
-B_URL=$(TAU2_GPU=2,3 TAU2_SMG_TOOL_PARSER=qwen_xml   TAU2_SMG_REASONING_PARSER=qwen3  bash launch_arms.sh b)
+A_URL=$(TAU2_GPU=0,1 TAU2_VLLM_TOOL_PARSER=qwen3_xml TAU2_VLLM_REASONING_PARSER=qwen3 bash scripts/tau2/launch_arms.sh a)
+B_URL=$(TAU2_GPU=2,3 TAU2_SMG_TOOL_PARSER=qwen_xml   TAU2_SMG_REASONING_PARSER=qwen3  bash scripts/tau2/launch_arms.sh b)
 
 # 2) set your OpenAI key so the user-sim (gpt-5.2) can reach the API
 export OPENAI_API_KEY=sk-...
 
-# 3) run the A/B (run_ab.py is stdlib-only — any python3; give its full path or
-#    run from the smg repo root as shown)
-python scripts/tau2/run_ab.py \
+# 3) run the A/B through the qualified Python3.12 environment
+"$TAU2_PYTHON" scripts/tau2/run_ab.py \
     --baseline  "vllm=$A_URL" \
     --candidate "smg=$B_URL" \
     --agent-model Qwen/Qwen3.8-27B \
     --user-llm gpt-5.2 \
-    --tau2 ~/tau/tau2-bench/.venv/bin/tau2 \
+    --tau2 ~/tau/tau2-bench/.venv/bin/tau2 --tau2-python "$TAU2_PYTHON" \
+    --expected-tasks "$HOME/tau2_expected_tasks.json" --seed 300 \
     --data-dir ~/tau/tau2-bench/data \
     --domains retail,airline,telecom \
     --num-trials 2 \
@@ -56,12 +72,12 @@ python scripts/tau2/run_ab.py \
     --out ~/tau2_ab.md --json-out ~/tau2_ab.json
 
 # 4) teardown
-bash launch_arms.sh stop
+bash scripts/tau2/launch_arms.sh stop
 ```
 
 Key env knobs for `launch_arms.sh`: `TAU2_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `TAU2_TP` (tensor-parallel size — match the GPU count), `TAU2_MAX_MODEL_LEN`, `TAU2_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, `TAU2_VLLM_EXTRA` for extra vLLM flags, and `TAU2_ARM_A_PORT` / `TAU2_ARM_B_GRPC_PORT` / `TAU2_ARM_B_GW_PORT` / `TAU2_ARM_B_METRICS_PORT` to pin ports (default: OS-assigned free ports, so concurrent arms/jobs on one host don't collide).
 
-`run_ab.py` exits non-zero if the candidate's overall pass^k drops more than `--tolerance` (default 2pp) below the baseline. Use `--max-concurrency N` to run N tau2 simulations per arm in parallel (the lever that keeps large runs within a time budget).
+`run_ab.py` exits 1 if the candidate's pass^k on the common valid domains drops more than `--tolerance` (default 2pp) below the baseline. Independent overall means are diagnostics only; no common valid domain, budget/provenance/seed failures and infrastructure errors exit 2. Use `--max-concurrency N` to run N tau2 simulations per arm in parallel (the lever that keeps large runs within a time budget).
 
 ## Agent-vs-user routing (no config file)
 
@@ -73,12 +89,12 @@ Key env knobs for `launch_arms.sh`: `TAU2_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`
 --user-llm gpt-5.2
 ```
 
-The user-simulator (`gpt-5.2`) is reached via the standard OpenAI API using `OPENAI_API_KEY`. The agent is routed to whichever arm is under test. `run_ab.py` constructs and passes these arguments automatically — you only need to supply `--agent-model`, `--user-llm`, and `--baseline`/`--candidate`.
+The user-simulator (`gpt-5.2`) is reached via the standard OpenAI API using `OPENAI_API_KEY`. The agent is routed to whichever arm is under test. `run_ab.py` constructs these routing arguments; live scoring also requires the qualified interpreter, approved policy/context/shared ledger, and expected-task/trial/seed inputs shown above.
 
 Results land at:
 
 ```
-<DATA_DIR>/simulations/ab_<arm_name>_<domain>/results.json
+<DATA_DIR>/simulations/ab_<invocation_id>/results.json
 ```
 
 where `<DATA_DIR>` is the path you pass to the **required** `--data-dir` flag (typically `tau2-bench/data`); tau2 reads and writes results under it (override tau2's own location with `TAU2_DATA_DIR` if it differs).
@@ -118,6 +134,9 @@ dominated by model-load time, serialized by a host lock, so a PR run is not fast
 
 ## Validation status — ran end-to-end ✅
 
+These earlier experiment results predate the guarded entry below; they do not
+establish current guarded CPU, paid-request or quality acceptance.
+
 Brought up end-to-end on one node, **`Qwen/Qwen3.6-27B` at TP=1 per arm** (on a high-memory GPU: the 27B model's ~54 GB of BF16 weights fit on one card; the Quick start and the weekly matrix run a 27B at TP=2), user-sim **`gpt-5.2`** at temp 0. Stack: vLLM 0.24.0 (CUDA 13.0), smg 1.7.0, tau2-bench 1.0.0.
 
 **FC confirmed on both arms** — identical `get_weather(city="Paris")` tool call, `finish_reason=tool_calls`. One frontend delta observed: the pure-vLLM arm returned empty `reasoning_content` while the SMG arm populated it (a reasoning-parse/template difference; the tool call itself is identical).
@@ -132,15 +151,18 @@ The arms **agree on 7/10 tasks** and diverge on 3 (SMG loses tasks 5 & 6, wins t
 
 **Throughput & cost** (these set the nightly knobs): 20 dialogues (retail 10 tasks × 2 arms, 1 trial) took **19.5 min** wall at tau2's default concurrency (~85 s/dialogue) and **$0.17** of `gpt-5.2` user-sim spend (~$0.009/dialogue). At default concurrency the full 3-domain × k=2 nightly would take ~18 h, so the workflow sets **`--max-concurrency 16`** to keep it within the 360-min ceiling. Scale trials/domains for tighter confidence intervals.
 
-## Paid request admission foundation (F)
+## Paid request budget entry
 
-This foundation supplies `budget.py`, explicit isolated `guarded_cli.py`, and
-the opt-in legacy hook with its startup tests. The existing `run_ab.py` and
-nightly remain at the main baseline in this source cut; their guarded A/B
-consumer integration is a separate dependent C change. Do not treat this
-foundation alone as paid nightly admission or use its old driver for paid work.
-The isolated entry runs under the pinned Python 3.12 SDK contract before any
-provider transport; only synthetic CPU evidence is inherited here.
+`run_ab.py` now launches each domain with the pinned τ² venv interpreter and
+`-I scripts/tau2/guarded_cli.py`, then calls the real `tau2.cli:main`. The guard
+requires Python3.12 and checks the installed τ² source at `5bfa7e37b36656b37dc6d022156be6563c1007f3`,
+LiteLLM 1.81.11, OpenAI 2.20.0 and HTTPX 0.28.1, including the critical request
+source hashes. The nightly uses that source's frozen lock and pins its extra
+import dependencies. An unqualified source/version refuses before simulation.
+The guard stays installed for the child process lifetime, including exceptions
+and thread shutdown. Paid clients are closed and removed from the allowlist in
+each synchronous call’s finally; live pools are bounded by inflight calls.
+Redirects are disabled for both paid and local SDK requests; best-effort `sitecustomize` is not an admission mechanism.
 
 The supported paid scope is the existing plain-text `llm_agent` /
 `user_simulator`, base split, retail/airline/telecom. Both `gpt-5.2` user turns and
@@ -153,10 +175,20 @@ This is a boundary for the pinned text pipeline, not a general egress sandbox or
 support claim for all τ² modes. CUDA launch/cleanup and AMD qualification remain
 separate; this change does not add a paid or AMD execution authorization.
 
-Before invoking the isolated entry, supply these reviewed values using its
-`--policy`, `--contexts`, `--contexts-sha256`, `--ledger` and `--scope` flags.
-The dependent C change owns the driver environment and `--budget-*` flags.
-No real prices, provider limits or spending approval are supplied here:
+Before live scoring with `run_ab.py`, supply these reviewed environment values
+or their corresponding `--budget-*` arguments. The standalone `guarded_cli.py`
+entry uses `--policy`, `--contexts`, `--contexts-sha256`, `--ledger` and `--scope`.
+No real prices, provider limits or spending approval are supplied here.
+The value definitions below use the standalone flag names; the driver accepts
+these corresponding arguments or environment variables:
+
+| `guarded_cli.py` | `run_ab.py` | Driver environment |
+| --- | --- | --- |
+| `--policy` | `--budget-policy` | `TAU2_BUDGET_POLICY` |
+| `--contexts` | `--budget-contexts` | `TAU2_BUDGET_CONTEXTS` |
+| `--contexts-sha256` | `--budget-contexts-sha256` | `TAU2_BUDGET_CONTEXTS_SHA256` |
+| `--ledger` | `--budget-ledger` | `TAU2_BUDGET_LEDGER` |
+| `--scope` | `--budget-scope` | `TAU2_BUDGET_SCOPE` |
 
 - `--policy`: JSON containing `scope_id`, integer `cap_nusd`, `calls`,
   `calls_per_arm`, and `models` with exactly `openai/gpt-5.2` and
@@ -181,10 +213,17 @@ No real prices, provider limits or spending approval are supplied here:
   obtain a new scope/approval. An old or missing/incompatible ledger is not reset or silently recreated at acceptance.
 - `--scope`: the exact approved comparison scope matching the policy.
   In CI it is `<run_id>:<run_attempt>:<matrix.name>`. Approval is either for
-  that exact job or an explicit standing per-job allowance resolved by the guard;
-  C owns the nightly configuration and run-identity wiring.
+  that exact job or an explicit standing per-job allowance described below.
   This is a per-comparison-job cap, not an aggregate monthly/multi-host billing
   controller. Matrix and repeated-run exposure must be explicitly approved.
+
+The nightly reads the policy/context JSON and context SHA from the corresponding
+`TAU2_BUDGET_POLICY_JSON`, `TAU2_PROVIDER_CONTEXTS_JSON` and
+`TAU2_PROVIDER_CONTEXTS_SHA256` repository configuration. Missing configuration
+fails before model staging/arm launch. No variables are changed by this source
+proposal. The policy files/ledger live in one scope-hash directory (preventing shared-temp
+collisions) and are included with the existing result artifact;
+providers' credentials and prompts are not ledger fields.
 
 Every actual paid HTTP send reserves the entire independently verified provider
 context bound plus `max_completion_tokens` at that model's rates, under one
@@ -206,7 +245,12 @@ known SDK retry options are forced to zero, and the final transport boundary
 still covers the SDK's own retries and LiteLLM's parameter/role reformat retries.
 Requests already reserved/in flight may finish when another fails; their exposure
 is already included in the cap. Each row records actual model/role/arm/domain/
-invocation/task/trial, status and known token usage, with no key/prompt.
+invocation/task/trial, status and known token usage, with no key/prompt. A domain
+checks only its own pending/unknown requests when it ends; the final gate checks
+global pending/unknown/halted after both arms join. Sequential saved-score diffs
+reopen the same policy/scope/ledger and recheck current state, so an earlier clean
+summary cannot hide a later halt or deletion. Legacy score files without budget
+provenance remain readable but cannot pass the normal budgeted CLI gate.
 
 Within the guarded process, a failure publishes local STOP_PENDING before
 settlement or halt I/O. The final reservation commit and that stop publication
@@ -223,26 +267,196 @@ LiteLLM/OpenAI request chain through fake HTTP transports with socket connection
 forbidden and fixed offline keys. Synthetic two-model prices/bounds validate
 mechanisms, not actual pricing, quality, spend, GPU cleanup or continuous CI.
 
+For continuous schedules, an operator can instead explicitly approve a **standing
+per-comparison-job allowance**. Replace the exact `scope_id` with this `approval`
+object while retaining the same explicit caps, two-model prices and independently
+reviewed context contract:
+
+```json
+{"mode":"standing", "budget_unit":"per_comparison_job",
+ "workflow_ref":"ORG/REPO/.github/workflows/nightly-tau2.yml@refs/heads/main",
+ "allowed_events":["schedule"], "matrix_names":["EXPLICIT_MODEL_NAME"],
+ "not_before":"2026-11-09T00:00:00Z", "expires_at":"2026-11-10T00:00:00Z"}
+```
+
+These illustrative values are not approval. The workflow's trusted run ID,
+attempt, workflow/ref, event and matrix name must match the approved template and
+UTC start window before any directory/ledger initialization. It materializes a
+concrete `run:attempt:matrix` policy, then uses the same exclusive initializer and
+dual-arm ledger. One standing configuration can cover multiple explicitly listed
+matrix jobs and natural scheduled runs: **each comparison job gets the stated
+allowance**, so total exposure is the allowance multiplied by admitted jobs and
+recurrences. This is not a monthly or multi-host aggregate cap. Exact-job approval
+remains available and cannot be mixed with standing mode. Neither mode recreates
+a missing ledger during scoring or saved-result acceptance. No actual standing
+approval, repository variable change or paid execution is part of this proposal.
+
+
 The earlier `costmap_shim/sitecustomize.py` startup hook remains a separate,
 explicit `SMG_TAU2_BUDGET_GUARD=1` opt-in for legacy callers. Its unconfigured
 synchronous authorizer still refuses requests; it is not the paid authorizer for
-the explicit isolated entry. The baseline main driver is not retrofitted in F.
-
-The legacy hook remains unconfigured unless an external caller provides its
-verified authorizer. Its explicit opt-in compatibility is retained, not retired
-from absence of a repository caller. The pre-existing zero-price registration
-function is unchanged. The explicit isolated guard owns its own SDK boundary.
+this guarded workflow. `run_ab.py` launches `guarded_cli.py` with Python `-I`,
+which ignores the inherited `PYTHONPATH` shim. The explicit guard owns the actual
+SDK/send boundary, so the legacy hook cannot add another reservation or reject
+an otherwise approved guarded call. Both legacy startup/hook tests and the new
+pinned-SDK/result suites run in the same CPU workflow; this compatibility does
+not grant a policy, spending cap or execution permission.
 
 The source check resolves the actual imported `tau2` package, including the
 checkout used by `uv sync` editable installations, and verifies the same pinned
 request-path hashes in either installation mode. Distribution versions and SDK
 source fingerprints remain mandatory; an editable install does not waive them.
 
-Initialize an approved scope exactly once with the isolated guard's
-`--initialize` entry; never recreate a missing live ledger. A guarded invocation
-requires the existing policy, context SHA, scope and ledger identity. The
-foundation descriptor/completion protocol is consumed by C without a copied
-implementation. Unknown request outcomes keep their reservation. If both
-persistent ordering paths are unavailable, cross-process stop is NOT_ATTESTED;
-paid admission remains on hold pending owner reconciliation. This cut supplies
-no prices, provider contracts, approval, GPU use or new service.
+A timeout or HTTP error from the exact uncharged loopback agent does not by
+itself halt the shared paid ledger. With the pinned zero-retry runner, an ordinary
+exception can instead produce an `infrastructure_error` simulation with
+`reward_info: null`. Upstream excludes these placeholders from its metrics; they
+are **unscored**, not synthetic zero-reward trials. This driver reports their
+original task/trial/seed identities and safe error types, preserves the raw result
+hash and any scored-case diagnostics, and marks the invocation
+`infrastructure_error_results`. The full comparison remains incomplete (exit 2),
+even with `--allow-incomplete`: no obligation is discarded and no smaller
+pass^k denominator or complete-domain mean is substituted. Genuine reported zero
+rewards remain valid. Unknown nulls, contradictory infrastructure rows with a
+reward, and malformed schemas remain invalid results rather than being scored.
+
+Unknown clients, redirects outside the fixed request contract, and paid request
+failures still halt the ledger. Nonzero process exits and mandatory paid-ledger
+halt/pending/unknown checks remain independent gates; a result placeholder never
+waives them. No retry, model, task selection, trial, seed or arm contract changes.
+
+## Result evidence and validity
+
+Result uploads stage the current summary, JSON comparison, expected-task manifest,
+transcripts and available budget files under one workspace directory. This avoids
+the container runner's partial translation of a multi-line upload path and retains
+available diagnostics after a failed run; unrelated caches are not included.
+
+Existing task manifests/seed300, trial coverage, same-policy paid ledger across
+both arms/domains, request guards and final hard budget gate remain mandatory.
+Public provider facts have been collected separately; execution still needs
+approved call/USD/output/scope bounds and paid/GPU authorization. No provider
+call, GPU test or quality score is authorized by this source feature. A source
+review, command fixture or passing CPU workflow is not sustained CI acceptance.
+
+The guarded CLI consumes the complete reviewed long-option command. Short
+aliases, abbreviated options, duplicate flags and unclaimed values cannot
+replace the approved domain or text workflow. SQLite connection, transaction and
+cleanup failures remain fatal paid-guard errors; secondary cleanup failures do
+not replace the original failure.
+
+If malformed rows accompany valid infrastructure placeholders, the invocation
+remains invalid, retains sanitized row-index diagnostics and all valid unscored
+identities, and still exits 2 even with `--allow-incomplete`. It cannot contribute
+a partial quality score. Pure malformed-result diagnostics retain the existing
+`--allow-incomplete` behavior; paid-ledger and process gates remain independent.
+
+Live and saved comparisons also retain each task/trial's actual seed. The pinned
+SDK seeds its RNG with the configured seed and draws one integer per trial; the
+configured seed itself is not the trial seed. Every task must match that exact
+trial mapping and the requested manifest seed. Missing or mismatched seed
+identities are fatal (exit 2), including sequential `--diff` with
+`--allow-incomplete`; legacy score files cannot invent missing seed provenance.
+
+
+Guarded sequential `--score-arm` writes the invocation outcome into its score file.
+Hard budget, process and provenance failures return 2 immediately so the sequential
+parent cannot start the paired arm; quality-only diagnostics may return 0 for the
+subsequent `--diff` decision. Saved comparisons reject malformed domain score
+shapes and return 2 for unscored infrastructure, guarded-child failures, absent
+invocation provenance or missing expected-task manifests, including with
+`--allow-incomplete`. This flag waives quality-only incompleteness; it cannot waive
+safety or result-identity failures.
+
+
+The quality gate uses the unweighted pass^k mean over the **same scored domains**
+on both arms. JSON `quality_gate` records that domain set, both matched means,
+the delta and its comparability status. The original `overall` means remain
+independent per-arm diagnostics and do not decide regression. A quality-only
+missing domain therefore cannot create a false regression or hide one on the
+shared scored domains. With no common scored domain, comparison is explicitly
+not comparable and exits 2, including with `--allow-incomplete`. A partial pair
+with common scored domains can still return 0 or regression 1 under that flag;
+all requested domains, missing-result diagnostics and invocation evidence remain
+in the report. Budget, provenance, infrastructure, seed and child-process failures
+still take precedence with exit 2; this does not score unexecuted obligations.
+Saved comparisons retain the invocation UUID, configured seed, result SHA256,
+and original invocation result file as well as the task/trial manifest. The original
+`results.json` must remain accessible at its recorded `results_path`. Each completed
+arm/domain/UUID/digest must also match the independent shared-ledger completion;
+reusing one invocation for two comparison arms is rejected.
+
+Budget exhaustion commits its halt while holding the reservation transaction;
+already-reserved calls may settle but no new reservation can pass. A fail-stop
+sidecar `<ledger>.fail-stop` latches a guard halt independently of SQLite, so a
+recovered sibling cannot resume admission after an unknown paid response even
+when the database could not save its halt. It is never reset within a run and
+must be retained with the original ledger, not deleted to resume a failed scope.
+Initialization publishes a privately initialized ledger without replacing any
+existing path; a failed initialization leaves the final ledger path available
+for an explicitly authorized retry.
+
+The ledger protocol-v2 admission fence orders reservation commits and halt
+publication across processes. A reservation committed before halt is already
+admitted and may settle; one ordered after halt cannot dispatch. The sidecar and
+SQLite halt are attempted independently. New readers/writers reject protocol-v1
+ledger configuration rather than mixing admission contracts; do not migrate or
+resume an unknown paid scope. Keep the ledger, fail-stop sidecar and its admission
+lock together for the scope lifetime. A killed invocation halts sibling admission
+only for its own pending/unknown paid requests or an unverifiable own audit.
+
+
+A child that exits nonzero is audited using its own invocation identity, just as
+for an invocation timeout. Pending or unknown own work (including an unavailable
+audit) attempts a shared stop; a clean own audit leaves healthy siblings alone.
+A ledger refusal during completion is a hard paid-budget error, not a waivable
+malformed-results diagnostic.
+
+If the admission lock cannot be entered, halt attempts an independent SQLite
+writer transaction before publishing the marker. This preserves ordering with
+already admitted reservations. If neither ordering fence is obtainable, halt
+raises and cannot attest a persisted cross-process stop; do not resume paid work
+from that failed scope without reconciling its retained evidence. Failure while
+closing the marker is still reported, and does not skip the database stop attempt.
+Evidence staging attempts each available copy, including the fail-stop marker,
+before returning a failure for any unsuccessful copy.
+
+
+An unconfirmed shared halt also quarantines that ledger/scope's subsequent
+launch admissions in the current driver process, across domains and both arms.
+Already admitted children are not revoked by this latch. It is not evidence of
+persistent cross-process shutdown when both ordering/storage paths are unavailable;
+that paid-admission boundary remains unconfirmed until owner reconciliation.
+Post-child budget descriptor/audit IO errors are hard failures even when quality
+diagnostics are allowed. Upload staging records lexical stop-marker presence
+(including dangling links) as an empty regular marker, without reading its target
+or contents; inability to record the marker fails staging.
+
+
+### Consumer handoff and explicit outcomes
+
+Every admitted arm/domain must retain a terminal invocation identity. Unlaunched
+domains remain unscored and the comparison remains incomplete. A missing record,
+an unavailable budget, or a safety failure is not an incomplete-quality waiver. The same outcome predicates guard saved comparisons and `--score-arm`:
+that command saves truthful evidence, then exits 2 on safety/provenance failure
+so the strict sequential parent stops before starting the other arm. Explicit
+quality-only failures may return 0 for handoff and are gated in the final diff.
+A scope enters STOP_PENDING_LOCAL under the admission lock before halt IO; IO
+runs outside that lock. Already admitted work is not revoked. All stopping states
+block new local admissions and require owner reconciliation. Memory cannot prove
+cross-process persistent stop if both existing stores are unavailable; paid
+resumption remains on hold in that case. Staging pairs the resolved database
+basename with its empty lexical marker, rather than a caller's symlink alias.
+
+Saved-score comparison validates any supplied caller budget arguments against
+both saved descriptors before opening their shared ledger for the final audit.
+A mismatched or partial caller policy/context/scope/ledger is incomplete (exit 2);
+when no caller budget inputs are supplied, the existing offline saved-comparison
+contract is retained. Neither path initializes a ledger.
+
+A hard domain outcome stops new domain launches in both owned arms. A sibling
+already admitted before that stop may finish and settle its paid work while the
+shared ledger remains healthy; independent paid-budget failures still fail
+closed. The domain stop does not erase reservations or claim that in-flight
+work was cancelled. Partial quality diagnostics alone do not trigger this
+admission stop.
