@@ -341,6 +341,7 @@ def reap_strict(
     max_scans = max(2, math.ceil((grace + 20.0) / POLL_SECS) + 2)
     handles: dict[int, tuple[OwnedProcess, int]] = {}
     seen: dict[int, int] = {}
+    unbound: dict[int, OwnedProcess] = {}
     sent: set[tuple[int, int, int]] = set()
     term_sent_at: dict[tuple[int, int], float] = {}
     clean = False
@@ -394,11 +395,27 @@ def reap_strict(
         protected = _strict_ancestors(proc_root, me)
         quiet = 0
         for _ in range(max_scans):
+            if clock() >= deadline:
+                raise TimeoutError("strict cleanup deadline before observation pass")
             if _strict_ancestors(proc_root, me) != protected:
                 raise ValueError("cleanup process ancestor chain changed")
             census_before, before_complete = _strict_census(proc_root, report_unresolved)
             observed: list[OwnedProcess] = []
             unresolved_observation = False
+            # A previously verified owner still owes a lifecycle resolution even
+            # if a later environment read is marker-negative or unreadable.
+            for pid, process in list(unbound.items()):
+                try:
+                    current = _strict_stat(proc_root, pid)
+                    if current is not None and current[2] != process.starttime:
+                        # A different birth positively retires the old identity;
+                        # seen still prevents retargeting this numeric PID.
+                        del unbound[pid]
+                    elif (current is None or current[0] == "Z") and group_exited(pid):
+                        del unbound[pid]
+                except (OSError, ValueError) as error:
+                    report_unresolved(pid, error)
+                    unresolved_observation = True
             for pid in sorted(census_before):
                 if pid in protected or pid <= 1:
                     continue
@@ -423,13 +440,19 @@ def reap_strict(
                     continue
                 seen[process.pid] = process.starttime
                 if process.pid not in handles:
+                    unbound.setdefault(process.pid, process)
                     if clock() >= deadline:
                         raise TimeoutError("strict cleanup deadline before pidfd acquisition")
                     try:
                         fd = opener(process.pid, 0)
                     except ProcessLookupError:
                         continue
+                    except OSError as error:
+                        report_unresolved(process.pid, error)
+                        unresolved_observation = True
+                        continue
                     handles[process.pid] = (process, fd)
+                    del unbound[process.pid]  # The bound fd now carries this obligation.
                     # The pidfd and the post-open proc observation must bind the
                     # same identity. No signal is sent if the numeric PID changed.
                     if still_owned(process) is False:
@@ -462,30 +485,38 @@ def reap_strict(
                     except ProcessLookupError:
                         retire(pid)
                         break
+                    except PermissionError as error:
+                        report_unresolved(pid, error)
+                        unresolved_observation = True
+                        break
                     sent.add(key)
                     if sig == signal.SIGTERM:
                         term_sent_at[identity] = clock()
                     log(f"strict signal {sig} pid {pid} uid {owner_uid} birth {process.starttime}")
-            if clock() > deadline:
+            if clock() >= deadline:
                 raise TimeoutError("strict cleanup observation deadline reached")
             census_after, after_complete = _strict_census(proc_root, report_unresolved)
-            if clock() > deadline:
+            if clock() >= deadline:
                 raise TimeoutError("strict cleanup final census exceeded deadline")
             stable = before_complete and after_complete and census_before == census_after
             quiet = (
                 quiet + 1
-                if stable and not unresolved_observation and not observed and not handles
+                if stable
+                and not unresolved_observation
+                and not observed
+                and not handles
+                and not unbound
                 else 0
             )
             if quiet == 2:
+                if clock() >= deadline:
+                    raise TimeoutError("strict cleanup deadline before clean acceptance")
                 clean = True
                 break
             remaining = deadline - clock()
             if remaining <= 0:
                 break
             sleep(min(POLL_SECS, remaining))
-        if not clean:
-            log(f"::error::strict cleanup unresolved/surviving owned pids: {sorted(handles)}")
     except (OSError, ValueError, TimeoutError) as error:
         log(f"::error::strict cleanup incomplete: {type(error).__name__}: {error}")
     finally:
@@ -495,6 +526,10 @@ def reap_strict(
             except OSError as error:
                 clean = False
                 log(f"::error::cannot close strict pidfd: {type(error).__name__}")
+        if not clean:
+            bound = [(p.pid, p.uid, p.starttime) for p, _ in handles.values()]
+            pending = [(p.pid, p.uid, p.starttime) for p in unbound.values()]
+            log(f"::error::strict cleanup unresolved identities bound={bound} unbound={pending}")
     if clean:
         log("strict owned-process observations are empty; physical resource release is separate")
     return clean

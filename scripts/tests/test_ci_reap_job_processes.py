@@ -950,8 +950,28 @@ def test_strict_unreadable_census_keeps_cleaning_verified_peers(mod, strict_tree
 def test_strict_real_retitled_process_retains_marker_only_with_spt_noenv(
     mod, tmp_path, preserve_environment
 ):
-    pytest.importorskip("setproctitle")
-    import select
+    if (
+        sys.platform != "linux"
+        or not Path("/proc/self/stat").is_file()
+        or not callable(getattr(os, "pidfd_open", None))
+        or not callable(getattr(signal, "pidfd_send_signal", None))
+    ):
+        pytest.skip("real retitling cleanup requires Linux procfs and pidfd APIs")
+    try:
+        probe_fd = os.pidfd_open(os.getpid(), 0)
+    except OSError as error:
+        pytest.skip(f"pidfd unavailable for real retitling cleanup: {error}")
+    else:
+        os.close(probe_fd)
+    probe = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", "import setproctitle"],
+        env=os.environ.copy(),
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    if probe.returncode:
+        pytest.skip(f"isolated child cannot import setproctitle: {probe.stderr[:500]!r}")
 
     marker = f"spt-{os.getpid()}-{time.monotonic_ns()}"
     env = {**os.environ, "E2E_JOB_MARKER": marker}
@@ -982,7 +1002,11 @@ def test_strict_real_retitled_process_retains_marker_only_with_spt_noenv(
         view.mkdir()
         for pid in {1, child.pid, *mod._strict_ancestors("/proc", os.getpid())}:
             (view / str(pid)).symlink_to(f"/proc/{pid}", target_is_directory=True)
-        assert mod.reap_strict(marker, grace=0.1, proc_root=str(view)) is preserve_environment
+        options = {} if preserve_environment else {"sleep": lambda _: None}
+        assert (
+            mod.reap_strict(marker, grace=0.1, proc_root=str(view), **options)
+            is preserve_environment
+        )
         if preserve_environment:
             assert child.wait(timeout=5) == -signal.SIGTERM
         else:
@@ -991,3 +1015,374 @@ def test_strict_real_retitled_process_retains_marker_only_with_spt_noenv(
         if child.poll() is None:
             child.kill()
         child.wait(timeout=5)
+        child.stdout.close()
+        child.stderr.close()
+
+
+@pytest.mark.parametrize("denied_pid", [99, 102])
+@pytest.mark.parametrize("error_number", [13, 24])
+def test_strict_pidfd_bind_error_keeps_verified_peers(mod, strict_tree, denied_pid, error_number):
+    runtime = _Pidfds(strict_tree)
+    _strict_process(strict_tree, denied_pid, birth=2000 + denied_pid)
+    attempts, lines, timed = [], [], []
+
+    def opener(pid, flags):
+        if pid == denied_pid:
+            attempts.append(pid)
+            raise OSError(error_number, "fixture binding denied")
+        return runtime.open(pid, flags)
+
+    def on_signal(pid, sig):
+        timed.append((pid, sig, runtime.now))
+        if pid == 100 or sig == signal.SIGKILL:
+            runtime.remove(pid)
+
+    runtime.on_signal = on_signal
+    assert not runtime.run(mod, pidfd_open=opener, log=lines.append)
+    assert len(attempts) > 1  # Unbound identities retry under the same fixed deadline.
+    assert all(pid != denied_pid for pid, _ in runtime.sent)
+    assert (100, signal.SIGTERM) in runtime.sent
+    assert any(pid == 101 and sig == signal.SIGKILL and t >= 0.4 for pid, sig, t in timed)
+    assert sum(f"unresolved pid {denied_pid}:" in line for line in lines) == 1
+    assert runtime.closed == set(runtime.opened)
+    assert runtime.now <= 20.4 + 1e-9
+
+
+@pytest.mark.parametrize("denied_signal", [signal.SIGTERM, signal.SIGKILL])
+def test_strict_signal_denial_retains_handle_and_keeps_verified_peers(
+    mod, strict_tree, denied_signal
+):
+    runtime = _Pidfds(strict_tree)
+    attempts, timed, lines = [], [], []
+
+    def sender(fd, sig, info, flags):
+        pid = runtime.opened[fd]
+        if pid == 100 and sig == denied_signal:
+            attempts.append((fd, sig))
+            raise PermissionError(1, "fixture signal denied")
+        runtime.send(fd, sig, info, flags)
+
+    def on_signal(pid, sig):
+        timed.append((pid, sig, runtime.now))
+        if pid == 101 and sig == signal.SIGKILL:
+            runtime.remove(pid)
+
+    runtime.on_signal = on_signal
+    assert not runtime.run(mod, pidfd_send_signal=sender, log=lines.append)
+    assert len(attempts) > 1  # Denied attempts must not be recorded as sent.
+    assert len({fd for fd, _ in attempts}) == 1  # Keep the bound identity's handle.
+    assert (100, denied_signal) not in runtime.sent
+    if denied_signal == signal.SIGTERM:
+        assert (100, signal.SIGKILL) not in runtime.sent  # No fictitious TERM grace.
+    assert any(pid == 101 and sig == signal.SIGKILL and t >= 0.4 for pid, sig, t in timed)
+    assert sum("unresolved pid 100:" in line for line in lines) == 1
+    assert runtime.closed == set(runtime.opened)
+    assert runtime.now <= 20.4 + 1e-9
+
+
+def test_strict_deadline_top_blocks_a_new_observation_pass(mod, strict_tree, monkeypatch):
+    runtime = _Pidfds(strict_tree)
+    runtime.remove(100)
+    runtime.remove(101)
+    original = mod._strict_census
+    observations = []
+
+    def census(*args):
+        observations.append(runtime.now)
+        return original(*args)
+
+    def sleep(_):
+        runtime.now = 20.4
+
+    monkeypatch.setattr(mod, "_strict_census", census)
+    assert not runtime.run(mod, sleep=sleep)
+    assert observations == [0.0, 0.0]
+    assert runtime.sent == [] and runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("deadline_census", [3, 4])
+def test_strict_exact_deadline_observation_cannot_certify_clean(
+    mod, strict_tree, monkeypatch, deadline_census
+):
+    runtime = _Pidfds(strict_tree)
+    runtime.remove(100)
+    runtime.remove(101)
+    original = mod._strict_census
+    calls = []
+
+    def census(*args):
+        found = original(*args)
+        calls.append(runtime.now)
+        if len(calls) == deadline_census:
+            runtime.now = 20.4
+        return found
+
+    monkeypatch.setattr(mod, "_strict_census", census)
+    assert not runtime.run(mod)
+    assert len(calls) == deadline_census
+    assert runtime.sent == [] and runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("helper_exit", [0, 23])
+def test_amd_cleanup_log_output_survives_actual_helper_failure(tmp_path, helper_exit):
+    workflow = SCRIPT.parents[1] / ".github/workflows/e2e-gpu-job.yml"
+    text = workflow.read_text()
+    start = text.index("      - name: Snapshot logs when AMD cleanup is the first failure\n")
+    end = text.index("      - name: ", start + 1)
+    step = text[start:end]
+    header = "        run: |\n"
+    assert step.count(header) == 1
+    script = "\n".join(line[10:] for line in step.split(header, 1)[1].splitlines()) + "\n"
+    assert "always() && inputs.gpu_vendor == 'amd'" in step
+    upload = text[end : text.index("      # The prebuilt", end)]
+    assert "if: always() && inputs.gpu_vendor == 'amd'" in upload
+    assert "steps.amd_cleanup_logs.outputs.artifact != ''" in upload
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "ci_dump_worker_logs.sh").write_text(
+        f'mkdir -p "$1"\nprintf "readable fixture log\\n" > "$1/worker.log"\nexit {helper_exit}\n'
+    )
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    # The actual workflow's only Python call creates its UUID. Helpers stay owned fakes.
+    python = binary / "python3"
+    python.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I -B "$@"\n')
+    python.chmod(0o700)
+    output = tmp_path / "github-output"
+    child = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{binary}:/usr/bin:/bin", "GITHUB_OUTPUT": str(output)},
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert child.returncode == helper_exit, child.stderr
+    value = output.read_text().strip()
+    assert value.startswith("artifact=e2e-amd-cleanup-")
+    assert len(value.removeprefix("artifact=e2e-amd-cleanup-")) == 32
+    assert (tmp_path / "e2e-logs/worker.log").read_text() == "readable fixture log\n"
+
+
+def test_strict_clean_acceptance_rechecks_exact_deadline(mod, strict_tree, monkeypatch):
+    runtime = _Pidfds(strict_tree)
+    runtime.remove(100)
+    runtime.remove(101)
+    original = mod._strict_census
+    observations, final_reads = [], []
+
+    def census(*args):
+        found = original(*args)
+        observations.append(True)
+        return found
+
+    def clock():
+        if len(observations) == 4:
+            final_reads.append(True)
+            return 20.3 if len(final_reads) == 1 else 20.4
+        return runtime.now
+
+    monkeypatch.setattr(mod, "_strict_census", census)
+    assert not runtime.run(mod, clock=clock)
+    assert len(observations) == 4 and len(final_reads) == 2
+    assert runtime.sent == [] and runtime.closed == set(runtime.opened)
+
+
+def test_known_unbound_identity_cannot_disappear_when_marker_is_lost(mod, strict_tree, tmp_path):
+    runtime = _Pidfds(strict_tree)
+    attempts = []
+
+    def opener(pid, flags):
+        if pid == 100:
+            attempts.append(pid)
+            (strict_tree / "100/environ").write_bytes(b"HOME=/owned-worker\0")
+            raise OSError(24, "fixture first pidfd bind exhausted")
+        return runtime.open(pid, flags)
+
+    clean = runtime.run(mod, pidfd_open=opener)
+    (tmp_path / "known-unbound-witness.json").write_text(
+        __import__("json").dumps(
+            {
+                "clean": clean,
+                "known_pid_alive": (strict_tree / "100/stat").is_file(),
+                "marker_negative": (strict_tree / "100/environ").read_bytes()
+                == b"HOME=/owned-worker\0",
+                "sent": runtime.sent,
+                "open_attempts": attempts,
+                "clock": runtime.now,
+                "all_fds_closed": runtime.closed == set(runtime.opened),
+            },
+            indent=2,
+        )
+    )
+    assert not clean
+    assert (strict_tree / "100/stat").is_file()
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("change", ["permission", "malformed-stat", "uid-change"])
+def test_known_unbound_ambiguity_never_retires_a_live_birth(mod, strict_tree, monkeypatch, change):
+    runtime = _Pidfds(strict_tree)
+    failed = []
+    original_open = open
+
+    def opener(pid, flags):
+        if pid == 100:
+            failed.append(pid)
+            if change == "uid-change":
+                other = STRICT_UID + 1
+                (strict_tree / "100/status").write_text(
+                    f"Uid:\t{other}\t{other}\t{other}\t{other}\n"
+                )
+            elif change == "malformed-stat":
+                (strict_tree / "100/stat").write_text("unreadable identity\n")
+            raise OSError(24, "fixture bind exhausted")
+        return runtime.open(pid, flags)
+
+    def read(path, *args, **kwargs):
+        if (
+            change == "permission"
+            and failed
+            and os.fspath(path) == str(strict_tree / "100/environ")
+        ):
+            raise PermissionError(13, "fixture ownership read denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", read)
+    assert not runtime.run(mod, pidfd_open=opener)
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("retirement", ["exit", "foreign-new-birth"])
+def test_known_unbound_positive_retirement_does_not_poison_quiet(mod, strict_tree, retirement):
+    runtime = _Pidfds(strict_tree)
+    failed = []
+
+    def opener(pid, flags):
+        if pid == 100 and not failed:
+            failed.append(pid)
+            (strict_tree / "100/environ").write_bytes(b"HOME=/owned-worker\0")
+            raise OSError(24, "fixture initial bind exhausted")
+        return runtime.open(pid, flags)
+
+    def retire():
+        if retirement == "exit":
+            runtime.remove(100)
+        else:
+            _strict_process(strict_tree, 100, marker=MARKER + "-foreign", birth=9999)
+
+    runtime.on_sleep = retire
+    assert runtime.run(mod, pidfd_open=opener)
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert runtime.now < 1.0
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_known_unbound_retry_only_binds_current_verified_owner(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    attempts = []
+
+    def opener(pid, flags):
+        if pid == 100:
+            attempts.append(pid)
+            if len(attempts) == 1:
+                raise OSError(24, "fixture transient bind exhaustion")
+        return runtime.open(pid, flags)
+
+    assert runtime.run(mod, pidfd_open=opener)
+    assert len(attempts) == 2
+    assert (100, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_known_unbound_reused_owned_pid_is_never_retargeted(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    failed = []
+
+    def opener(pid, flags):
+        if pid == 100:
+            failed.append(pid)
+            (strict_tree / "100/environ").write_bytes(b"HOME=/owned-worker\0")
+            raise OSError(24, "fixture initial bind exhausted")
+        return runtime.open(pid, flags)
+
+    runtime.on_sleep = lambda: _strict_process(strict_tree, 100, birth=9999)
+    assert not runtime.run(mod, pidfd_open=opener)
+    assert len(failed) == 1 and all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("stop", ["deadline", "ancestor-error"])
+def test_known_unbound_failure_reports_identity_after_every_stop(mod, strict_tree, stop):
+    runtime = _Pidfds(strict_tree)
+    lines = []
+
+    def opener(pid, flags):
+        if pid == 100:
+            (strict_tree / "100/environ").write_bytes(b"HOME=/owned-worker\0")
+            raise OSError(24, "fixture bind exhausted")
+        return runtime.open(pid, flags)
+
+    if stop == "ancestor-error":
+        runtime.on_sleep = lambda: (strict_tree / "60/stat").write_text("unresolved ancestor\n")
+    assert not runtime.run(mod, pidfd_open=opener, log=lines.append)
+    assert any("unbound=[(100," in line and "1100)" in line for line in lines)
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_known_unbound_real_child_exit_can_be_positively_retired(mod, tmp_path):
+    if (
+        sys.platform != "linux"
+        or not Path("/proc/self/stat").is_file()
+        or not callable(getattr(os, "pidfd_open", None))
+    ):
+        pytest.skip("real known-owner retirement requires Linux pidfd")
+    marker = f"unbound-exit-{os.getpid()}-{time.monotonic_ns()}"
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-B", "-c", "import time;print('READY',flush=True);time.sleep(60)"],
+        env={**os.environ, "E2E_JOB_MARKER": marker},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert select.select([child.stdout], [], [], 5)[0]
+        assert child.stdout.readline() == "READY\n"
+        view = tmp_path / "owned-proc"
+        view.mkdir()
+        for pid in {1, child.pid, *mod._strict_ancestors("/proc", os.getpid())}:
+            (view / str(pid)).symlink_to(f"/proc/{pid}", target_is_directory=True)
+        denied = []
+
+        def opener(pid, flags):
+            if pid == child.pid and not denied:
+                denied.append(pid)
+                child.terminate()  # Only this test's Popen-owned child.
+                assert child.wait(timeout=5) == -signal.SIGTERM
+                (view / str(child.pid)).unlink()
+                raise OSError(24, "fixture first bind denied before positive exit")
+            return os.pidfd_open(pid, flags)
+
+        def forbidden_signal(*args):
+            pytest.fail("exited child must never receive a pidfd signal")
+
+        assert mod.reap_strict(
+            marker,
+            proc_root=str(view),
+            grace=0.1,
+            pidfd_open=opener,
+            pidfd_send_signal=forbidden_signal,
+        )
+        assert denied == [child.pid] and child.returncode == -signal.SIGTERM
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        child.stdout.close()
+        child.stderr.close()
