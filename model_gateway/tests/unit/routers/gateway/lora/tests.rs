@@ -339,24 +339,24 @@ fn an_adapter_request_goes_to_the_family_that_can_serve_it() {
 
     for draw in 0..100 {
         let router = gateway
-            .select_router_for_adapter("base", Some("adapter"), Media::Absent)
+            .select_router_for_adapter("base", Some("adapter"), EpdDemand::Pair)
             .expect("the pair serves the adapter");
         assert_eq!(router.router_type(), "grpc_pd", "draw {draw}");
     }
 }
 
-/// The adapter draw sees the request's media. The EPD family's encode
-/// worker is down, so an adapter request with media goes to the regular
+/// The adapter draw sees the request's media. It counts only SGLang
+/// workers, and SGLang has no encode role, so the EPD router cannot use the
+/// ready encode worker. An adapter request with media goes to the regular
 /// family, and the EPD family still takes text.
 #[test]
-fn an_adapter_request_with_media_needs_an_encode_worker_that_can_serve() {
-    use WorkerStatus::{NotReady, Ready};
+fn an_adapter_request_with_media_needs_an_encode_worker_the_epd_router_can_use() {
     let registry = Arc::new(WorkerRegistry::new());
-    for (port, role, status) in [
-        (9650, WorkerType::Regular, Ready),
-        (9651, WorkerType::Encode, NotReady),
-        (9652, WorkerType::Prefill, Ready),
-        (9653, WorkerType::Decode, Ready),
+    for (port, role) in [
+        (9650, WorkerType::Regular),
+        (9651, WorkerType::Encode),
+        (9652, WorkerType::Prefill),
+        (9653, WorkerType::Decode),
     ] {
         registry
             .register(Arc::new(
@@ -365,7 +365,7 @@ fn an_adapter_request_with_media_needs_an_encode_worker_that_can_serve() {
                     .worker_type(role)
                     .connection_mode(ConnectionMode::Grpc)
                     .runtime_type(RuntimeType::Sglang)
-                    .status(status)
+                    .status(WorkerStatus::Ready)
                     .build(),
             ))
             .unwrap();
@@ -375,16 +375,16 @@ fn an_adapter_request_with_media_needs_an_encode_worker_that_can_serve() {
     gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(Capture("grpc")));
     gateway.register_router(router_ids::GRPC_EPD, Arc::new(Capture("grpc_epd")));
 
-    let draw = |media| {
+    let draw = |epd| {
         gateway
-            .select_router_for_adapter("base", Some("adapter"), media)
+            .select_router_for_adapter("base", Some("adapter"), epd)
             .expect("a family serves the adapter")
             .router_type()
     };
     for draw_index in 0..100 {
-        assert_eq!(draw(Media::Present), "grpc", "draw {draw_index}");
+        assert_eq!(draw(EpdDemand::PairAndEncoder), "grpc", "draw {draw_index}");
     }
-    let text: Vec<_> = (0..100).map(|_| draw(Media::Absent)).collect();
+    let text: Vec<_> = (0..100).map(|_| draw(EpdDemand::Pair)).collect();
     assert!(
         text.contains(&"grpc_epd"),
         "the EPD family took no text: {text:?}"

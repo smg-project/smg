@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker};
 
-use super::{route_error, router_ids, Gateway, Media, RouterTrait};
+use super::{route_error, router_ids, EpdDemand, Gateway, RouterTrait};
 use crate::routers::common::snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt};
 
 fn sglang_grpc(worker: &dyn Worker) -> bool {
@@ -64,12 +64,12 @@ impl Gateway {
         &self,
         model: &str,
         adapter: Option<&str>,
-        media: Media,
+        epd: EpdDemand,
     ) -> Option<Arc<dyn RouterTrait>> {
         if adapter.is_some() && has_sglang_grpc(&self.worker_registry, model) {
-            self.select_lora_router(model, media)
+            self.select_lora_router(model, epd)
         } else {
-            self.select_router_for_media(Some(model), media)
+            self.select_router_for_demand(Some(model), epd)
         }
     }
 
@@ -78,7 +78,7 @@ impl Gateway {
     pub(super) fn select_lora_router(
         &self,
         model: &str,
-        media: Media,
+        epd: EpdDemand,
     ) -> Option<Arc<dyn RouterTrait>> {
         if !self.enable_igw {
             let default = self.default_router.load();
@@ -104,16 +104,14 @@ impl Gateway {
                 .count()
         };
         let registered = self.family_weights(size);
-        self.draw_family(&snapshot, &registered, media, |_, worker| {
-            sglang_grpc(worker)
-        })
-        .or_else(|| {
-            self.incomplete_disaggregated_router(
-                size(RoutingPool::GrpcEncode),
-                size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
-                0,
-            )
-        })
+        self.draw_family(&snapshot, &registered, epd, |_, worker| sglang_grpc(worker))
+            .or_else(|| {
+                self.incomplete_disaggregated_router(
+                    size(RoutingPool::GrpcEncode),
+                    size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
+                    0,
+                )
+            })
     }
 }
 

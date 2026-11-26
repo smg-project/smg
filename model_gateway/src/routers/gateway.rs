@@ -66,6 +66,7 @@ use crate::{
         error as route_error,
         factory::{router_ids, RouterId},
         grpc::{
+            common::stages::encodes_for,
             multimodal::{media_plan_chat, media_plan_messages},
             regular::stages::decisions::supports_worker as supports_decisions_worker,
         },
@@ -143,38 +144,44 @@ const ROUTER_FAMILIES: [RouterFamily; 5] = [
     },
 ];
 
-/// Whether a request carries a media item: an image, audio or video. An EPD
-/// router sends each media item to an encode worker.
+/// What an EPD family needs to take a request. The EPD router serves only
+/// the chat, generate, completion and Messages routes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Media {
-    /// No media item: an EPD family needs only a prefill and decode pair.
-    Absent,
-    /// A media item: an EPD family also needs an encode worker.
-    Present,
+enum EpdDemand {
+    /// The EPD router refuses the route, for example responses: the family
+    /// takes no request.
+    Refused,
+    /// A request with no media item: a prefill and decode pair.
+    Pair,
+    /// A request with a media item (an image, audio or video): a pair, and
+    /// an encode worker for it. The EPD router sends each media item to an
+    /// encode worker.
+    PairAndEncoder,
 }
 
-impl Media {
-    /// The media of a chat request, as the gRPC chat pipeline reads it.
+impl EpdDemand {
+    /// The demand of a chat request, whose media is read as the gRPC chat
+    /// pipeline reads it.
     fn of_chat(request: &ChatCompletionRequest) -> Self {
-        Self::when(!media_plan_chat(&request.messages).is_empty())
+        Self::with_media(!media_plan_chat(&request.messages).is_empty())
     }
 
-    /// The media of a Messages request, as the gRPC Messages pipeline reads
-    /// it.
+    /// The demand of a Messages request, whose media is read as the gRPC
+    /// Messages pipeline reads it.
     fn of_messages(request: &CreateMessageRequest) -> Self {
-        Self::when(!media_plan_messages(&request.messages).is_empty())
+        Self::with_media(!media_plan_messages(&request.messages).is_empty())
     }
 
-    /// The media of a generate request.
+    /// The demand of a generate request.
     fn of_generate(request: &GenerateRequest) -> Self {
-        Self::when(request.carries_media())
+        Self::with_media(request.carries_media())
     }
 
-    fn when(carried: bool) -> Self {
+    fn with_media(carried: bool) -> Self {
         if carried {
-            Self::Present
+            Self::PairAndEncoder
         } else {
-            Self::Absent
+            Self::Pair
         }
     }
 }
@@ -422,15 +429,19 @@ impl Gateway {
 
     /// Draws the router for one request. `registered` holds each family's
     /// weight from its registered workers, in [`ROUTER_FAMILIES`] order.
-    /// `media` tells if the request carries a media item, and `takes` tells
-    /// which workers of a pool can take the request.
+    /// `epd` tells what an EPD family needs to take the request, and `takes`
+    /// tells which workers of a pool can take it.
     ///
     /// A router selects only from its own pools. If no worker there can
     /// serve, it refuses the request. So when more than one family has
     /// weight, a family weighs only its workers that can serve. A PD or EPD
     /// family gets weight only if a compatible prefill and decode pair can
-    /// serve. For a request with media, an EPD family also needs an encode
-    /// worker that can serve.
+    /// serve. An EPD family gets no weight on a route its router refuses.
+    ///
+    /// For a request with media, each worker of that pair also needs an
+    /// encode worker that the EPD router can use: one that is available
+    /// ([`Worker::is_available`]) and can encode for it ([`encodes_for`]).
+    /// The EPD router does not use a stalled or overloaded encode worker.
     ///
     /// A worker can serve if it is ready, permitted by the circuit breaker,
     /// and not stalled. If no family gets weight, a stalled worker can serve
@@ -447,45 +458,66 @@ impl Gateway {
         &self,
         snapshot: &ModelWorkerSnapshot,
         registered: &[usize; ROUTER_FAMILIES.len()],
-        media: Media,
+        epd: EpdDemand,
         takes: impl Fn(RoutingPool, &dyn Worker) -> bool,
     ) -> Option<Arc<dyn RouterTrait>> {
+        // An EPD family takes no request on a route its router refuses.
+        let mut registered = *registered;
+        if epd == EpdDemand::Refused {
+            for (weight, family) in registered.iter_mut().zip(&ROUTER_FAMILIES) {
+                if family.encode.is_some() {
+                    *weight = 0;
+                }
+            }
+        }
         if registered.iter().filter(|weight| **weight > 0).count() <= 1 {
-            return self.pick_router_by_weights(registered);
+            return self.pick_router_by_weights(&registered);
         }
         let mode = self
             .policies
             .as_ref()
             .map(|policies| policies.pd_pairing_mode())
             .unwrap_or_default();
+        // Whether `pool` holds an encode worker that the EPD router can use
+        // for `worker`. The EPD router has no fallback to a stalled encode
+        // worker, so this does not change with the check.
+        let has_encoder = |pool: RoutingPool, worker: &dyn Worker| {
+            snapshot.pool(pool).iter().any(|encoder| {
+                encoder.is_available()
+                    && takes(pool, encoder.as_ref())
+                    && encodes_for(encoder.as_ref(), worker)
+            })
+        };
         let checks: [fn(&dyn Worker) -> bool; 2] =
             [routable_but_for_overload, routable_but_for_veto];
         for can_serve in checks {
             let serves = |pool: RoutingPool, worker: &Arc<dyn Worker>| {
                 takes(pool, worker.as_ref()) && can_serve(worker.as_ref())
             };
-            let pool_serves = |pool: RoutingPool| {
-                let mut workers = snapshot.pool(pool).iter();
-                workers.any(|worker| serves(pool, worker))
-            };
-            let pair_serves = |wire: PdWire| {
+            // A pair serves if both of its workers can serve and, when
+            // `encode` is given, each has an encode worker in that pool.
+            let pair_serves = |wire: PdWire, encode: Option<RoutingPool>| {
+                let side_serves = |pool: RoutingPool, worker: &Arc<dyn Worker>| {
+                    serves(pool, worker)
+                        && encode.is_none_or(|encode| has_encoder(encode, worker.as_ref()))
+                };
                 let pairs = snapshot.pd_pairs(wire, mode);
                 let (prefill_pool, decode_pool) = wire.pools();
                 let mut prefills = pairs.prefill.iter().zip(&pairs.partners);
                 prefills.any(|(prefill, decodes)| {
-                    serves(prefill_pool, prefill)
-                        && decodes.iter().any(|decode| serves(decode_pool, decode))
+                    side_serves(prefill_pool, prefill)
+                        && decodes
+                            .iter()
+                            .any(|decode| side_serves(decode_pool, decode))
                 })
             };
             let mut weights = [0usize; ROUTER_FAMILIES.len()];
             for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
+                let encode = family.encode.filter(|_| epd == EpdDemand::PairAndEncoder);
                 // A family with no registered weight stays at zero, so the
                 // gRPC PD family stays behind the EPD family.
-                let can_take = registered[i] > 0
-                    && family.wire.is_none_or(&pair_serves)
-                    && family
-                        .encode
-                        .is_none_or(|pool| media == Media::Absent || pool_serves(pool));
+                let can_take =
+                    registered[i] > 0 && family.wire.is_none_or(|wire| pair_serves(wire, encode));
                 if !can_take {
                     continue;
                 }
@@ -502,7 +534,7 @@ impl Gateway {
                 return Some(router);
             }
         }
-        self.pick_router_by_weights(registered)
+        self.pick_router_by_weights(&registered)
     }
 
     /// One router drawn with probability proportional to its family's
@@ -565,7 +597,7 @@ impl Gateway {
     fn select_router_for_model(
         &self,
         model_id: Option<&str>,
-        media: Media,
+        epd: EpdDemand,
     ) -> Option<Arc<dyn RouterTrait>> {
         let snapshot = self
             .worker_registry
@@ -577,7 +609,7 @@ impl Gateway {
         }
         let size = |pool: RoutingPool| snapshot.pool(pool).len();
         let registered = self.family_weights(size);
-        self.draw_family(&snapshot, &registered, media, |_, _| true)
+        self.draw_family(&snapshot, &registered, epd, |_, _| true)
             .or_else(|| {
                 self.incomplete_disaggregated_router(
                     size(RoutingPool::GrpcEncode),
@@ -708,24 +740,22 @@ impl Gateway {
         self.enable_igw && (model_id.trim().is_empty() || model_id == UNKNOWN_MODEL_ID)
     }
 
-    /// The router that serves `model_id` for a request with no media item,
-    /// or the default router when the fleet gives no answer.
+    /// The router that serves `model_id` on a route that the EPD router
+    /// refuses, or the default router when the fleet gives no answer.
     pub fn select_router_for_request(
         &self,
         model_id: Option<&str>,
     ) -> Option<Arc<dyn RouterTrait>> {
-        self.select_router_for_media(model_id, Media::Absent)
+        self.select_router_for_demand(model_id, EpdDemand::Refused)
     }
 
-    /// [`Self::select_router_for_request`] for a request that carries
-    /// `media`. Only the chat, generate and Messages routes can send media to
-    /// an EPD router. The other routes draw with [`Media::Absent`]: a
-    /// completion request has no media, and the EPD router refuses the
-    /// routes that can carry media, such as responses.
-    fn select_router_for_media(
+    /// [`Self::select_router_for_request`] for a request that needs `epd`
+    /// of an EPD family. The chat, generate, completion and Messages routes
+    /// use it, because the EPD router serves them.
+    fn select_router_for_demand(
         &self,
         model_id: Option<&str>,
-        media: Media,
+        epd: EpdDemand,
     ) -> Option<Arc<dyn RouterTrait>> {
         // In single-router mode (enable_igw=false), always use the default router
         if !self.enable_igw {
@@ -739,7 +769,7 @@ impl Gateway {
             }
         }
 
-        self.select_router_for_model(model_id, media).or_else(|| {
+        self.select_router_for_model(model_id, epd).or_else(|| {
             if let Some(model) = model_id {
                 if self.external_router_missing(model) {
                     warn!(
@@ -799,7 +829,7 @@ impl Gateway {
         if self.enable_igw && request.max_tokens == 0 {
             self.select_router_for_empty_message(model_id)
         } else {
-            self.select_router_for_media(Some(model_id), Media::of_messages(request))
+            self.select_router_for_demand(Some(model_id), EpdDemand::of_messages(request))
         }
     }
 
@@ -949,7 +979,7 @@ impl RouterTrait for Gateway {
         let router = self.select_router_for_adapter(
             model_id,
             body.lora_path.as_deref().or(body.lora_id.as_deref()),
-            Media::of_generate(&body),
+            EpdDemand::of_generate(&body),
         );
         match router {
             Some(router) => {
@@ -980,11 +1010,11 @@ impl RouterTrait for Gateway {
             Err(response) => return response,
         };
         let model_id = lora_model.as_deref().unwrap_or(model_id);
-        let media = Media::of_chat(&body);
+        let epd = EpdDemand::of_chat(&body);
         let router = if lora_model.is_some() {
-            self.select_lora_router(model_id, media)
+            self.select_lora_router(model_id, epd)
         } else {
-            self.select_router_for_adapter(model_id, body.lora_path.as_deref(), media)
+            self.select_router_for_adapter(model_id, body.lora_path.as_deref(), epd)
         };
         match router {
             Some(router) => {
@@ -1014,9 +1044,9 @@ impl RouterTrait for Gateway {
         let model_id = lora_model.as_deref().unwrap_or(model_id);
         // A completion request carries no media.
         let router = if lora_model.is_some() {
-            self.select_lora_router(model_id, Media::Absent)
+            self.select_lora_router(model_id, EpdDemand::Pair)
         } else {
-            self.select_router_for_adapter(model_id, body.lora_path.as_deref(), Media::Absent)
+            self.select_router_for_adapter(model_id, body.lora_path.as_deref(), EpdDemand::Pair)
         };
         match router {
             Some(router) => {
@@ -1225,7 +1255,7 @@ impl RouterTrait for Gateway {
                     "Decisions requires a regular HTTP or SGLang gRPC worker for this model",
                 );
             }
-            self.draw_family(&snapshot, &[0, 0, 0, grpc, http], Media::Absent, takes)
+            self.draw_family(&snapshot, &[0, 0, 0, grpc, http], EpdDemand::Refused, takes)
         } else {
             self.select_router_for_request(Some(model_id))
         };
@@ -2157,6 +2187,16 @@ mod tests {
             (StatusCode::OK, self.0).into_response()
         }
 
+        async fn route_responses(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: ResponsesRequest,
+            _model_id: &str,
+        ) -> Response {
+            (StatusCode::OK, self.0).into_response()
+        }
+
         fn router_type(&self) -> &'static str {
             self.0
         }
@@ -2787,7 +2827,7 @@ mod tests {
 
         for _ in 0..100 {
             let router = manager
-                .select_router_for_request(Some("model-x"))
+                .select_router_for_demand(Some("model-x"), EpdDemand::Pair)
                 .expect("expected EPD router");
 
             assert_eq!(router.router_type(), "epd");
@@ -2907,7 +2947,9 @@ mod tests {
     }
 
     /// A gateway with the five family routers, each named for its family,
-    /// and one worker of model `m` for each entry.
+    /// and one worker of model `m` for each entry. Each worker runs
+    /// TokenSpeed, whose EPD form has an encode role, so an encode worker can
+    /// encode for the prefill and decode workers.
     fn named_family_gateway(workers: &[(ConnectionMode, WorkerType, Serving)]) -> Arc<Gateway> {
         named_families_over(Gateway::new(Arc::new(WorkerRegistry::new())), workers)
     }
@@ -2936,7 +2978,18 @@ mod tests {
                     WorkerStatus::Ready
                 }
             };
-            register_worker_in(&gateway, &url, *mode, *role, status);
+            gateway
+                .worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(&url)
+                        .connection_mode(*mode)
+                        .worker_type(*role)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .model(ModelCard::new("m"))
+                        .status(status)
+                        .build(),
+                ))
+                .unwrap();
             let worker = gateway.worker_registry.get_by_url(&url).unwrap();
             match serving {
                 Serving::Yes | Serving::NotReady => {}
@@ -2963,15 +3016,16 @@ mod tests {
         expected: &[(&'static str, f64)],
     ) {
         let gateway = named_family_gateway(workers);
-        assert_drawn(&gateway, Media::Absent, workers, expected);
+        assert_drawn(&gateway, EpdDemand::Pair, workers, expected);
     }
 
-    /// Draws a router for a request to model `m` with `media` many times.
-    /// Asserts that only the `expected` families are drawn, each within 5
-    /// points of its share. `fleet` names the workers in the failure message.
+    /// Draws a router for a request to model `m` that needs `epd` many
+    /// times. Asserts that only the `expected` families are drawn, each
+    /// within 5 points of its share. `fleet` names the workers in the failure
+    /// message.
     fn assert_drawn(
         gateway: &Gateway,
-        media: Media,
+        epd: EpdDemand,
         fleet: impl Debug,
         expected: &[(&'static str, f64)],
     ) {
@@ -2980,7 +3034,7 @@ mod tests {
         let mut drawn = BTreeMap::<_, f64>::new();
         for _ in 0..DRAWS {
             let router = gateway
-                .select_router_for_media(Some("m"), media)
+                .select_router_for_demand(Some("m"), epd)
                 .expect("a family serves the model");
             *drawn.entry(router.router_type()).or_default() += 1.0 / f64::from(DRAWS);
         }
@@ -2992,7 +3046,7 @@ mod tests {
             });
         assert!(
             within,
-            "{media:?}, {fleet:?}: drew {drawn:?}, expected {expected:?}"
+            "{epd:?}, {fleet:?}: drew {drawn:?}, expected {expected:?}"
         );
     }
 
@@ -3094,10 +3148,11 @@ mod tests {
         );
     }
 
-    /// An EPD family takes a request with media only if an encode worker can
-    /// serve it. A text request needs no encode worker, so while the encode
-    /// worker is down the EPD family still takes text. The gRPC PD family
-    /// stays behind the EPD family.
+    /// An EPD family takes a request with media only if the EPD router can
+    /// use an encode worker. It uses no encode worker that is down, stalled
+    /// or overloaded. A text request needs no encode worker, so while the
+    /// encode worker is down the EPD family still takes text. The gRPC PD
+    /// family stays behind the EPD family.
     #[test]
     fn an_epd_family_takes_media_only_if_an_encode_worker_can_serve() {
         use Serving::{NotReady, Overloaded, Stalled, Yes};
@@ -3114,7 +3169,7 @@ mod tests {
             (
                 vec![up, prefill, decode, (HTTP, Regular, Yes)],
                 registered.clone(),
-                registered,
+                registered.clone(),
             ),
             (
                 vec![down, prefill, decode, (HTTP, Regular, Yes)],
@@ -3133,6 +3188,29 @@ mod tests {
                 epd.clone(),
                 http.clone(),
             ),
+            // The second check counts a stalled worker, but not a stalled
+            // encode worker.
+            (
+                vec![
+                    (GRPC, Encode, Stalled),
+                    prefill,
+                    decode,
+                    (HTTP, Regular, Stalled),
+                ],
+                epd.clone(),
+                http.clone(),
+            ),
+            // An overloaded encode worker keeps its weight for text.
+            (
+                vec![
+                    (GRPC, Encode, Overloaded),
+                    prefill,
+                    decode,
+                    (HTTP, Regular, Yes),
+                ],
+                registered.clone(),
+                http.clone(),
+            ),
             (
                 vec![
                     down,
@@ -3148,17 +3226,77 @@ mod tests {
             (vec![down, prefill, decode], epd.clone(), epd),
         ] {
             let gateway = named_family_gateway(&fleet);
-            assert_drawn(&gateway, Media::Absent, &fleet, &text);
-            assert_drawn(&gateway, Media::Present, &fleet, &media);
+            assert_drawn(&gateway, EpdDemand::Pair, &fleet, &text);
+            assert_drawn(&gateway, EpdDemand::PairAndEncoder, &fleet, &media);
+        }
+    }
+
+    /// The EPD router uses an encode worker only for a pair of the same
+    /// runtime. While the TokenSpeed pair is down, the ready TokenSpeed
+    /// encode worker cannot encode for the vLLM pair, so a request with
+    /// media goes to the stalled HTTP worker. Text still goes to the vLLM
+    /// pair.
+    #[test]
+    fn an_epd_family_takes_media_only_if_an_encode_worker_suits_a_pair_that_can_serve() {
+        use RuntimeType::{TokenSpeed, Vllm};
+        use WorkerStatus::{NotReady, Ready};
+        for (serving, media) in [(TokenSpeed, "grpc_epd"), (Vllm, "http")] {
+            let gateway = named_family_gateway(&[(HTTP, WorkerType::Regular, Serving::Stalled)]);
+            for (runtime, encode) in [(TokenSpeed, Ready), (Vllm, NotReady)] {
+                let pair = if runtime == serving { Ready } else { NotReady };
+                for (role, status) in [
+                    (WorkerType::Encode, encode),
+                    (WorkerType::Prefill, pair),
+                    (WorkerType::Decode, pair),
+                ] {
+                    gateway
+                        .worker_registry
+                        .register(Arc::new(
+                            BasicWorkerBuilder::new(format!("grpc://{runtime:?}-{role:?}:8000"))
+                                .connection_mode(GRPC)
+                                .worker_type(role)
+                                .runtime_type(runtime)
+                                .model(ModelCard::new("m"))
+                                .status(status)
+                                .build(),
+                        ))
+                        .unwrap();
+                }
+            }
+            let fleet = format!("ready TokenSpeed encode worker, {serving:?} pair can serve");
+            assert_drawn(&gateway, EpdDemand::Pair, &fleet, &[("grpc_epd", 1.0)]);
+            assert_drawn(&gateway, EpdDemand::PairAndEncoder, &fleet, &[(media, 1.0)]);
+        }
+    }
+
+    /// An EPD family takes no request on a route its router refuses, such as
+    /// responses. Alone, it takes every request, and its router refuses
+    /// them, as before.
+    #[test]
+    fn an_epd_family_takes_no_route_its_router_refuses() {
+        use Serving::{NotReady, Stalled, Yes};
+        use WorkerType::{Decode, Encode, Prefill, Regular};
+        let (prefill, decode) = ((GRPC, Prefill, Yes), (GRPC, Decode, Yes));
+        for (encode, other, expected) in [
+            (Yes, Some((GRPC, Regular, Yes)), "grpc"),
+            (NotReady, Some((GRPC, Regular, Yes)), "grpc"),
+            (NotReady, Some((HTTP, Regular, Stalled)), "http"),
+            (Yes, None, "grpc_epd"),
+        ] {
+            let mut fleet = vec![(GRPC, Encode, encode), prefill, decode];
+            fleet.extend(other);
+            let gateway = named_family_gateway(&fleet);
+            assert_drawn(&gateway, EpdDemand::Refused, &fleet, &[(expected, 1.0)]);
         }
     }
 
     /// The chat, generate and Messages routes tell the draw if the request
     /// carries media. A completion request is text. The encode worker is
     /// down and the HTTP worker is stalled, so a request with media goes to
-    /// HTTP and a text request goes to the EPD family.
+    /// HTTP and a text request goes to the EPD family. A responses request
+    /// goes to HTTP, because the EPD router refuses it.
     #[tokio::test]
-    async fn a_route_draws_by_the_media_of_its_request() {
+    async fn a_route_draws_by_what_its_request_needs() {
         use serde_json::json;
         use Serving::{NotReady, Stalled, Yes};
         use WorkerType::{Decode, Encode, Prefill, Regular};
@@ -3216,7 +3354,13 @@ mod tests {
                             .await,
                     ));
                 }
-                for (route, response) in answers {
+                let responses = body(json!({"model": "m", "input": "hi"}));
+                let responses = gateway.route_responses(None, &tenant, responses, "m").await;
+                for (route, response, expected) in answers
+                    .into_iter()
+                    .map(|(route, response)| (route, response, expected))
+                    .chain([("responses", responses, "http")])
+                {
                     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                         .await
                         .unwrap();
@@ -3245,7 +3389,12 @@ mod tests {
             let gateway =
                 Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
             let gateway = named_families_over(gateway, &workers);
-            assert_drawn(&gateway, Media::Absent, (mode, workers), &[(expected, 1.0)]);
+            assert_drawn(
+                &gateway,
+                EpdDemand::Pair,
+                (mode, workers),
+                &[(expected, 1.0)],
+            );
         }
     }
 
@@ -3276,7 +3425,7 @@ mod tests {
             }
             assert_drawn(
                 &gateway,
-                Media::Absent,
+                EpdDemand::Pair,
                 format!("stalled HTTP, SGLang prefill, {decode:?} decode"),
                 &[(expected, 1.0)],
             );

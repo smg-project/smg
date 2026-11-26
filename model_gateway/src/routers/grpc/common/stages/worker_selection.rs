@@ -2634,13 +2634,8 @@ impl WorkerSelectionStage {
         }
         // References go to E only; P consumes EC and D consumes KV. Diagnose
         // permanent constraints against membership, not transient health.
-        let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
-            let runtime = worker.metadata().spec.runtime_type;
-            encoder.metadata().spec.runtime_type == runtime
-                && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::Push)
-                    || worker.worker_type() != &WorkerType::Prefill
-                    || ec_pair(encoder.as_ref(), worker))
-        };
+        let compatible =
+            |encoder: &Arc<dyn Worker>, worker: &dyn Worker| encodes_for(encoder.as_ref(), worker);
         let registered_ec = |worker: &dyn Worker| {
             !needs_encode
                 || registered_encode
@@ -2778,6 +2773,23 @@ fn ec_role(worker: &dyn Worker, role: &str) -> bool {
         && labels
             .get("ec_connector")
             .is_some_and(|value| !value.is_empty())
+}
+
+/// Whether `encoder` can encode media for `worker`, a prefill or decode
+/// worker. Both have the same runtime, and that runtime has an encode role.
+/// Under a push handoff, a prefill worker also takes the encoder's EC
+/// transfer. The EPD selection uses this rule, and so does the gateway's
+/// family draw.
+pub(crate) fn encodes_for(encoder: &dyn Worker, worker: &dyn Worker) -> bool {
+    let runtime = worker.metadata().spec.runtime_type;
+    encoder.metadata().spec.runtime_type == runtime
+        && match PdProtocol::encode_handoff(runtime) {
+            Some(EncodeHandoff::Push) => {
+                worker.worker_type() != &WorkerType::Prefill || ec_pair(encoder, worker)
+            }
+            Some(EncodeHandoff::Rendezvous) => true,
+            None => false,
+        }
 }
 
 /// EC producers and consumers must speak the same transfer protocol.
