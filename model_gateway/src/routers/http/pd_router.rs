@@ -1428,9 +1428,9 @@ impl PDRouter {
     /// the healthy prefill worker beside it. On the early-commit path the
     /// drain records the prefill's once its body is known: the attempt's
     /// status is the decode's there, and recording it on the prefill would
-    /// reset the failures the drain counts. A streamed decode head's success
-    /// was recorded before its relay task was spawned
-    /// (`create_streaming_response`), so it is not recorded again. A failure
+    /// reset the failures the drain counts. A streamed decode head's sample
+    /// is its relay's to take, at the head or at the stream's end
+    /// (`create_streaming_response`), so it is not recorded here. A failure
     /// goes through the request's `ledger`, which charges a worker once a
     /// request however many of its attempts failed there.
     fn record_attempt_outcomes(
@@ -1580,8 +1580,9 @@ impl PDRouter {
     }
 
     /// The decode side's response head, once the prefill side is done with:
-    /// the side's outcome recorded (a streamed head's success is the relay's
-    /// to record, before it spawns its task, see `create_streaming_response`;
+    /// the side's outcome recorded (a streamed head's sample is the relay's
+    /// to take, at the head or at the stream's end, see
+    /// `create_streaming_response`;
     /// a non-streamed success is recorded after its body is read), an error
     /// status answered, the PD TTFT taken from the dispatch to this head (the
     /// prefill wait is part of what the client experiences), and the body
@@ -8627,8 +8628,8 @@ mod tests {
         worker
     }
 
-    /// The successful head of a decode stream is recorded on the decode
-    /// worker before the relay task is spawned, so a body the worker cuts
+    /// On a breaker that is not closed, a decode stream's successful head is
+    /// recorded before the relay task is spawned, so a body the worker cuts
     /// right behind the head is sampled after the head's success and stands.
     /// Read on a current-thread runtime, where the relay cannot run before
     /// the body is polled: the half-open breaker is closed by the head as
