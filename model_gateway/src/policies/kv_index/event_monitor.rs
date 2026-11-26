@@ -340,15 +340,18 @@ impl KvEventMonitor {
 /// gateway's own process: a model's index and its block size, each read
 /// where the engine reads a list of workers, never once a request.
 impl CacheIndexes for KvEventMonitor {
-    /// The model's index, and none while it holds no block, as the trait
-    /// asks of a host ([`CacheIndexes::index`]): from the enrolment of the
-    /// model's first worker to its first event, and again once its last
-    /// holder left. The engine then decides the request in the token tree
-    /// the gateway lends it, as the classic policy does in its own
-    /// (`CacheAwarePolicy::event_index_for`).
+    /// The model's index, whenever the model has one: while it holds no
+    /// block too, from the enrolment of the model's first worker to its
+    /// first event, and again once its last holder left. The index says
+    /// itself whether it holds a block ([`CacheIndex::holds_a_block`]),
+    /// and the engine reads one that holds none as no index: it decides
+    /// the request in the token tree the gateway lends it, as the classic
+    /// policy does in its own (`CacheAwarePolicy::event_index_for`). The
+    /// engine asks that word at each decision, so a model's first event
+    /// and its last holder's leaving decide its next request.
     fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>> {
         let index = self.get_indexer(normalize_model_key(model))?;
-        (!index.is_empty()).then_some(index as Arc<dyn CacheIndex>)
+        Some(index as Arc<dyn CacheIndex>)
     }
 
     fn block_size(&self, model: &str) -> Option<u32> {
@@ -851,24 +854,26 @@ mod tests {
         assert_eq!(read.block_size("nonexistent"), None);
     }
 
-    /// The engine is answered no index while the model's index holds no
-    /// block, as its trait asks of a host: from the enrolment of the
-    /// model's first worker to its first event, and again once the last
-    /// holder left with its blocks. Its request is then decided by the
-    /// token tree the gateway lends. The block size is answered whatever
-    /// the index holds.
+    /// The engine is lent the model's index whenever the model has one,
+    /// and the index says itself that it holds no block: from the
+    /// enrolment of the model's first worker to its first event, and again
+    /// once the last holder left with its blocks. The engine reads such an
+    /// index as none, and its request is then decided by the token tree
+    /// the gateway lends. An index lent before the first event says the
+    /// event's block. The block size is answered whatever the index holds.
     ///
     /// The classic policy reads an index that holds no block as no index
     /// too (`model_gateway/src/policies/cache_aware.rs:1800`,
     /// `event_index_for`).
     #[test]
-    fn the_engine_is_answered_no_index_while_it_holds_no_block() {
+    fn the_engine_is_lent_an_index_that_says_whether_it_holds_a_block() {
         let monitor = KvEventMonitor::new();
         let index = Arc::new(KvIndex::chain());
         monitor.set_index("llama", Arc::clone(&index));
         monitor.set_block_size("llama", 4);
         let read: &dyn CacheIndexes = &monitor;
-        assert!(read.index("llama").is_none(), "no event yet");
+        let empty = read.index("llama").expect("the model's index");
+        assert!(!empty.holds_a_block(), "no event yet");
         assert_eq!(read.block_size("llama"), Some(4));
 
         let worker = index.intern_worker("grpc://w1:9000").unwrap();
@@ -885,9 +890,10 @@ mod tests {
             std::ptr::addr_eq(Arc::as_ptr(&lent), Arc::as_ptr(&index)),
             "the monitor's own index"
         );
+        assert!(lent.holds_a_block() && empty.holds_a_block());
 
         index.remove_worker(worker, held);
-        assert!(read.index("llama").is_none(), "the last holder left");
+        assert!(!lent.holds_a_block(), "the last holder left");
         assert_eq!(read.block_size("llama"), Some(4));
     }
 

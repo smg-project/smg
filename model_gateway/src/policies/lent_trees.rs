@@ -906,8 +906,8 @@ mod tests {
     }
 
     /// The object answers a model's index and its block size as the
-    /// cache-event monitor behind it does: no index while the model's holds
-    /// no block, and the monitor's own once it holds one.
+    /// cache-event monitor behind it does: the monitor's own index, which
+    /// says it holds no block until an event stores one.
     #[test]
     fn the_monitors_index_and_block_size_are_read_through_the_one_object() {
         let monitor = Arc::new(KvEventMonitor::new());
@@ -917,7 +917,8 @@ mod tests {
         let trees = Arc::new(owner(document(1_000, 0)));
         let caches = EngineCaches::of(Some(monitor), Some(trees)).expect("both");
         assert_eq!(caches.block_size(MODEL), Some(4));
-        assert!(caches.index(MODEL).is_none(), "no block yet");
+        let empty = caches.index(MODEL).expect("the model's index");
+        assert!(!empty.holds_a_block(), "no block yet");
         let worker = index.intern_worker("grpc://w1:9000").expect("a number");
         let block = StoredBlock {
             seq_hash: SequenceHash(1),

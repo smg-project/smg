@@ -188,9 +188,12 @@ fn a_stored_chain_is_named_under_its_workers_number_within_the_cap() {
     assert_eq!(deepest(&*index, &request, both, 1), [(first, 3)]);
 }
 
-/// An index that holds no block is none to the engine, as where a
-/// gateway lends its own
-/// (`model_gateway/src/policies/kv_index/event_monitor.rs:349-352`). In
+/// An index that holds no block is lent and says so itself: the engine
+/// reads it as none, as where a gateway lends its own
+/// (`KvEventMonitor::index`,
+/// `model_gateway/src/policies/kv_index/event_monitor.rs`). The word is
+/// the chain's own at each ask, so the lending made while the index was
+/// empty says its first block. In
 /// an index that holds a block, a row whose lane heard no batch has its
 /// number and no block: its place is made where the holder states it,
 /// as a gateway's index numbers a worker where its stream's task opens
@@ -199,19 +202,29 @@ fn a_stored_chain_is_named_under_its_workers_number_within_the_cap() {
 /// On a pair's side the engine reads a numbered worker with no block
 /// as the record's of sent prefixes, and a single request of token ids
 /// names it by nothing: its own cases hold both
-/// (`a_sides_column_holds_a_text_sent_to_a_worker_the_index_holds_blocks_for`,
-/// `the_index_decides_a_single_request_of_token_ids_alone`).
+/// (`an_empty_index_write_keeps_the_predicted_worker_named`,
+/// `a_list_under_an_index_that_holds_a_block_reads_no_record`).
 #[test]
 fn a_row_with_a_place_and_no_batch_has_its_number_and_no_block() {
     let bed = Bed::new();
     let (a, b) = (bed.row(A, MODEL), bed.row(B, MODEL));
-    assert!(bed.indexes.index(MODEL).is_none(), "no block yet");
+    let empty = bed.index();
+    assert!(!empty.holds_a_block(), "no block yet");
     bed.stores(a, &[1]);
+    assert!(
+        empty.holds_a_block(),
+        "the same lending says the first block"
+    );
     let index = bed.index();
     let quiet = index.worker_number(B).expect("its place stands");
     assert_eq!(index.worker_blocks(quiet), 0);
     assert_eq!(bed.tables.cursor(b, 0), None, "no batch ran through it");
     assert_eq!(deepest(&*index, &[1], 1 << quiet, 8), []);
+    // The one holder leaves: the model keeps its index, by the quiet
+    // row's lane, and both lendings say it holds no block.
+    bed.leaves(a);
+    assert!(!index.holds_a_block(), "its last block left");
+    assert!(!empty.holds_a_block());
 }
 
 /// A number is free for the next row once its row leaves, and the next

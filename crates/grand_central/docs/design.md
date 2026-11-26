@@ -782,9 +782,17 @@ request goes to.
     its pick is written there for the worker it goes to, whatever the index holds for that
     worker.
 
-  The host hands the engine no index while its index holds no block (`CacheIndexes::index`), so
-  an index the engine was handed holds one. The engine asks with the list's table, once a
-  second.
+  The engine reads an index that holds no block as no index. The gateway hands the engine a
+  model's index whenever the model has one, and the index says whether it holds a block
+  (`CacheIndex::holds_a_block`). A decision asks that word where it takes its list's table, and
+  a word that moved reads the table again. So a model's first block, and its last block's
+  leaving, decide the next request, as classic asks its index before every request.
+
+  While one decision reads the table again, the others decide by the table that stands. So the
+  old word decides for the length of one read. A host of its own may hand no index while its
+  index holds no block (`CacheIndexes::index`) and keep the word's default. The engine then
+  learns of a first block, and of a last block's leaving, with the list's next table, up to a
+  second later.
 - **[planned]** The hash table leaves the single decision. Until then it names a single request
   that no lent tree decides and the index does not name alone.
 - **[built]** A prefill-decode pair decided over worker lists reads the host's index of cache
@@ -1274,7 +1282,8 @@ The engine waits on no lock of its own, but for these. Under a document that kee
 decisions (decision 7), a decision that is kept takes the one lock of the sample's ring for its
 push. A decision that finds a list no lookup table for cache affinity (5.2) reads one, and a table
 stands for a second, or until the index of cache events hands a worker's number on to another
-worker, before one decision reads it anew. Such a read takes the lock of the engine's
+worker or its word of holding a block moves, before one decision reads it anew. Such a read takes
+the lock of the engine's
 map of the records of sent prefixes, once at most. A stage that keeps state takes its own short
 lock (one shard of the session table or the record of sent prefixes, among them). A decision that
 meets the one build of a list's value, or of a part of it, waits for it (5.2).
@@ -2450,8 +2459,8 @@ request ──> route (HTTP or gRPC, any family)
   For a request of more than 65,535 tokens or characters a pick states both numbers halved
   together, until the request's fits sixteen bits. The share they state is then within one part in
   32,768 of the match's. The stage's own test divides the match's numbers, which are not halved. So
-  the series can count such a request in the next bucket, where the match's share lies that close
-  to a bucket's edge.
+  the series can count such a request in a neighbouring bucket, above or below, where the match's
+  share lies that close to a bucket's edge.
 
   Where the engine places no worker for a request, the gateway names the client's answer itself,
   by classic's own judgement of the pool. The engine's word for the refusal goes to a log line
