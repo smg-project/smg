@@ -909,9 +909,9 @@ stage.
 
 A count of sends stands where a profile that reads it is kept. A profile built new beside it reads
 the same count, and a send is counted once. A count none of whose readers is kept is built new, and
-takes over the sends of a standing one (`Engine::succeed`). Profiles whose stages read a count under
-the same `sent_ttl_ms` and `sent_report_delay_ms` read one count. A document that states neither,
-as the one built from the routing settings does, puts them all under one.
+takes over the sends the standing counts hold (`Engine::succeed`). Profiles whose stages read a
+count under the same `sent_ttl_ms` and `sent_report_delay_ms` read one count. A document that states
+neither, as the one built from the routing settings does, puts them all under one.
 
 A word of a lease issued under an earlier document is told by one rule, in a gateway's own process
 and on a controller: the stages kept since the lease's document hear it, every count of sends in

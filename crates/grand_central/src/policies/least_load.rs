@@ -67,7 +67,7 @@ impl LeastLoad {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
-                Arc::new(DispatchCredit::new("", SentSettings::default())),
+                Arc::new(DispatchCredit::new(SentSettings::default())),
             )
         }
     }

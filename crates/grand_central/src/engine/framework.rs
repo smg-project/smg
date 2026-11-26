@@ -3849,10 +3849,9 @@ pub struct Engine {
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
     /// One tally for each two send settings a profile's stages read
-    /// under: a later engine finds one by its settings, then by the name
-    /// of the profile that made it, then takes one that is left
-    /// ([`Engine::succeed`]). A tally kept from an earlier engine bears
-    /// the name of the profile that made it there.
+    /// under: a later engine's tally under the same two shares its
+    /// entries, and one under two that no tally here has takes a copy of
+    /// the sends that stand ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
     /// Beside each profile, the place in `sent_credits` of the tally its
     /// stages read, where one asked for it at the build.
@@ -5496,58 +5495,59 @@ impl Engine {
         self.generation
     }
 
-    /// Takes over what the standing engine's counts of sends hold: each
+    /// Takes over what the standing engine's counts of sends hold. A
     /// count takes the rows' entries of the standing count under the same
-    /// two settings, whichever profile made that one. Where no standing
-    /// count has its settings, it takes the count that a profile of its
-    /// maker's name made, unless another count of this engine took that
-    /// one: two counts on one standing count would hold every send twice.
-    /// It then takes the first standing count that none took: the engine
-    /// records a send in every count, so any one of them carries the
-    /// sends. A count starts empty where none is left. The two engines share
-    /// those entries from here on: a decision still running under the
-    /// standing engine reads the sends a later one counts, and each count
-    /// reads them under its own time limit and report delay.
+    /// two settings, whichever profiles read that one, and the two
+    /// engines share those entries from here on: a decision still running
+    /// under the standing engine reads the sends a later one counts. A
+    /// count under two settings that no standing count has shares none: a
+    /// standing count has let go what its own settings ended. It takes a
+    /// copy of the sends that stand, of each rank those of the standing
+    /// count that holds the most there, each at its instant and its size,
+    /// and its own reads let go what its own settings end. The engine
+    /// records a send in every count and a count lets go a prefix by
+    /// time, so the fullest holds what the others hold, but for a send
+    /// that an earlier copy missed. A count starts empty where no count
+    /// stands.
     ///
-    /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) calls it
-    /// before it shows the new engine. A host with a store of its own
+    /// Three limits stand for a count that takes a copy. A send every
+    /// standing count has let go is gone for it too, though its own
+    /// settings would count it still. It shares no entry with the
+    /// standing engine: a decision still running there reads none of the
+    /// sends the later engine counts in it. And a send told to the
+    /// standing engine behind the copy's read of its rank is in no copy.
+    /// A thread that read the standing engine ahead of the swap may tell
+    /// it one: neither
+    /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) nor the
+    /// apply of an engine in its host's process holds a lock that a word
+    /// of a lease takes. The standing counts' rows of a rank are read one
+    /// after another, so a send told between two of those reads is in the
+    /// copy only where the longest read holds it. A count lacks a send
+    /// its copy missed for that send's life: where that count holds the
+    /// most at a later call, the copy made there lacks the send too,
+    /// though another standing count holds it.
+    ///
+    /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) has it
+    /// called under its workers lock and its load lock, where the
+    /// generation is put in place of the standing one and before the
+    /// store shows it: a copy takes as long as the sends it copies, and a
+    /// taker of either lock waits for it. A host with a store of its own
     /// calls it where it swaps engines, before this engine takes a
     /// decision or a dispatch: what this engine's counts held until then
-    /// is let go. A rank the standing count first hears of behind this
-    /// call is entered in the standing count alone.
+    /// is let go. A rank a standing count first hears of behind this call
+    /// is entered in the standing count alone. A copy reads every
+    /// standing count's row of a rank and takes the longest read. It
+    /// holds one standing row's locks at a time, for the read of its
+    /// sends: a send to that row and a release from it wait meanwhile.
     pub fn succeed(&self, standing: &Engine) {
         let prior = &standing.sent_credits;
-        // The standing count of each count. One rule at a time over every
-        // count that has none yet: by the settings, by the maker's name,
-        // then the first left. So no count's match by an earlier rule is
-        // taken by another count's later one.
-        let mut taken: Vec<Option<usize>> = vec![None; self.sent_credits.len()];
-        let mut free = vec![true; prior.len()];
-        // The third rule's place among the standing counts: it only moves on.
-        let mut left = 0..prior.len();
-        for rule in 0..3 {
-            for (at, credit) in self.sent_credits.iter().enumerate() {
-                if taken[at].is_some() {
-                    continue;
-                }
-                taken[at] = match rule {
-                    0 => prior
-                        .iter()
-                        .position(|count| count.settings == credit.settings),
-                    1 => (0..prior.len()).find(|&standing| {
-                        free[standing] && prior[standing].profile == credit.profile
-                    }),
-                    _ => left.find(|&standing| free[standing]),
-                };
-                if let Some(standing) = taken[at] {
-                    free[standing] = false;
-                }
-            }
-        }
-        for (credit, at) in self.sent_credits.iter().zip(taken) {
-            // A count this engine kept is the standing one itself.
-            if let Some(at) = at.filter(|&at| !Arc::ptr_eq(credit, &prior[at])) {
-                credit.succeed(&prior[at]);
+        for credit in &self.sent_credits {
+            let under = |count: &&Arc<DispatchCredit>| count.settings == credit.settings;
+            match prior.iter().find(under) {
+                // A count this engine kept is the standing one itself.
+                Some(stood) if Arc::ptr_eq(credit, stood) => {}
+                Some(stood) => credit.succeed(stood),
+                None => credit.copy_fullest(prior),
             }
         }
     }
@@ -5569,9 +5569,9 @@ impl Engine {
     /// made follows that one ([`DispatchCredit::follow`]), so a reader
     /// built new and a reader kept read one set of entries and a rank
     /// first heard behind this call stands once. A count none of whose
-    /// readers is kept is this engine's own, and takes a standing count
-    /// over ([`Self::succeed`]). A profile kept keeps the generation its
-    /// object was made under ([`Engine::hearing`]).
+    /// readers is kept is this engine's own, and takes over what the
+    /// standing counts hold ([`Self::succeed`]). A profile kept keeps the
+    /// generation its object was made under ([`Engine::hearing`]).
     ///
     /// Nothing is kept across two stage tables that may build another
     /// stage under one name: the stock table's number, or one table of a
