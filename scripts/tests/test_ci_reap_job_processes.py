@@ -1186,3 +1186,203 @@ def test_strict_clean_acceptance_rechecks_exact_deadline(mod, strict_tree, monke
     assert not runtime.run(mod, clock=clock)
     assert len(observations) == 4 and len(final_reads) == 2
     assert runtime.sent == [] and runtime.closed == set(runtime.opened)
+
+
+def test_known_unbound_identity_cannot_disappear_when_marker_is_lost(mod, strict_tree, tmp_path):
+    runtime = _Pidfds(strict_tree)
+    attempts = []
+
+    def opener(pid, flags):
+        if pid == 100:
+            attempts.append(pid)
+            (strict_tree / "100/environ").write_bytes(b"HOME=/owned-worker\0")
+            raise OSError(24, "fixture first pidfd bind exhausted")
+        return runtime.open(pid, flags)
+
+    clean = runtime.run(mod, pidfd_open=opener)
+    (tmp_path / "known-unbound-witness.json").write_text(
+        __import__("json").dumps(
+            {
+                "clean": clean,
+                "known_pid_alive": (strict_tree / "100/stat").is_file(),
+                "marker_negative": (strict_tree / "100/environ").read_bytes()
+                == b"HOME=/owned-worker\0",
+                "sent": runtime.sent,
+                "open_attempts": attempts,
+                "clock": runtime.now,
+                "all_fds_closed": runtime.closed == set(runtime.opened),
+            },
+            indent=2,
+        )
+    )
+    assert not clean
+    assert (strict_tree / "100/stat").is_file()
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("change", ["permission", "malformed-stat", "uid-change"])
+def test_known_unbound_ambiguity_never_retires_a_live_birth(mod, strict_tree, monkeypatch, change):
+    runtime = _Pidfds(strict_tree)
+    failed = []
+    original_open = open
+
+    def opener(pid, flags):
+        if pid == 100:
+            failed.append(pid)
+            if change == "uid-change":
+                other = STRICT_UID + 1
+                (strict_tree / "100/status").write_text(
+                    f"Uid:\t{other}\t{other}\t{other}\t{other}\n"
+                )
+            elif change == "malformed-stat":
+                (strict_tree / "100/stat").write_text("unreadable identity\n")
+            raise OSError(24, "fixture bind exhausted")
+        return runtime.open(pid, flags)
+
+    def read(path, *args, **kwargs):
+        if (
+            change == "permission"
+            and failed
+            and os.fspath(path) == str(strict_tree / "100/environ")
+        ):
+            raise PermissionError(13, "fixture ownership read denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", read)
+    assert not runtime.run(mod, pidfd_open=opener)
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("retirement", ["exit", "foreign-new-birth"])
+def test_known_unbound_positive_retirement_does_not_poison_quiet(mod, strict_tree, retirement):
+    runtime = _Pidfds(strict_tree)
+    failed = []
+
+    def opener(pid, flags):
+        if pid == 100 and not failed:
+            failed.append(pid)
+            (strict_tree / "100/environ").write_bytes(b"HOME=/owned-worker\0")
+            raise OSError(24, "fixture initial bind exhausted")
+        return runtime.open(pid, flags)
+
+    def retire():
+        if retirement == "exit":
+            runtime.remove(100)
+        else:
+            _strict_process(strict_tree, 100, marker=MARKER + "-foreign", birth=9999)
+
+    runtime.on_sleep = retire
+    assert runtime.run(mod, pidfd_open=opener)
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert runtime.now < 1.0
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_known_unbound_retry_only_binds_current_verified_owner(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    attempts = []
+
+    def opener(pid, flags):
+        if pid == 100:
+            attempts.append(pid)
+            if len(attempts) == 1:
+                raise OSError(24, "fixture transient bind exhaustion")
+        return runtime.open(pid, flags)
+
+    assert runtime.run(mod, pidfd_open=opener)
+    assert len(attempts) == 2
+    assert (100, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_known_unbound_reused_owned_pid_is_never_retargeted(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    failed = []
+
+    def opener(pid, flags):
+        if pid == 100:
+            failed.append(pid)
+            (strict_tree / "100/environ").write_bytes(b"HOME=/owned-worker\0")
+            raise OSError(24, "fixture initial bind exhausted")
+        return runtime.open(pid, flags)
+
+    runtime.on_sleep = lambda: _strict_process(strict_tree, 100, birth=9999)
+    assert not runtime.run(mod, pidfd_open=opener)
+    assert len(failed) == 1 and all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("stop", ["deadline", "ancestor-error"])
+def test_known_unbound_failure_reports_identity_after_every_stop(mod, strict_tree, stop):
+    runtime = _Pidfds(strict_tree)
+    lines = []
+
+    def opener(pid, flags):
+        if pid == 100:
+            (strict_tree / "100/environ").write_bytes(b"HOME=/owned-worker\0")
+            raise OSError(24, "fixture bind exhausted")
+        return runtime.open(pid, flags)
+
+    if stop == "ancestor-error":
+        runtime.on_sleep = lambda: (strict_tree / "60/stat").write_text("unresolved ancestor\n")
+    assert not runtime.run(mod, pidfd_open=opener, log=lines.append)
+    assert any("unbound=[(100," in line and "1100)" in line for line in lines)
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_known_unbound_real_child_exit_can_be_positively_retired(mod, tmp_path):
+    if (
+        sys.platform != "linux"
+        or not Path("/proc/self/stat").is_file()
+        or not callable(getattr(os, "pidfd_open", None))
+    ):
+        pytest.skip("real known-owner retirement requires Linux pidfd")
+    marker = f"unbound-exit-{os.getpid()}-{time.monotonic_ns()}"
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-B", "-c", "import time;print('READY',flush=True);time.sleep(60)"],
+        env={**os.environ, "E2E_JOB_MARKER": marker},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert select.select([child.stdout], [], [], 5)[0]
+        assert child.stdout.readline() == "READY\n"
+        view = tmp_path / "owned-proc"
+        view.mkdir()
+        for pid in {1, child.pid, *mod._strict_ancestors("/proc", os.getpid())}:
+            (view / str(pid)).symlink_to(f"/proc/{pid}", target_is_directory=True)
+        denied = []
+
+        def opener(pid, flags):
+            if pid == child.pid and not denied:
+                denied.append(pid)
+                child.terminate()  # Only this test's Popen-owned child.
+                assert child.wait(timeout=5) == -signal.SIGTERM
+                (view / str(child.pid)).unlink()
+                raise OSError(24, "fixture first bind denied before positive exit")
+            return os.pidfd_open(pid, flags)
+
+        def forbidden_signal(*args):
+            pytest.fail("exited child must never receive a pidfd signal")
+
+        assert mod.reap_strict(
+            marker,
+            proc_root=str(view),
+            grace=0.1,
+            pidfd_open=opener,
+            pidfd_send_signal=forbidden_signal,
+        )
+        assert denied == [child.pid] and child.returncode == -signal.SIGTERM
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        child.stdout.close()
+        child.stderr.close()
