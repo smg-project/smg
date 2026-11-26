@@ -402,7 +402,7 @@ fn wait_for(what: &str, fences: [&Fence; 2], met: impl Fn() -> bool) {
 }
 
 /// Polls until `met`, bounded.
-fn until(what: &str, mut met: impl FnMut() -> bool) {
+pub(in crate::service::controller) fn until(what: &str, mut met: impl FnMut() -> bool) {
     let started = Instant::now();
     while !met() {
         assert!(
@@ -414,7 +414,7 @@ fn until(what: &str, mut met: impl FnMut() -> bool) {
 }
 
 /// Waits, bounded, for an election thread to signal that it is gone.
-fn ended(running: Running) {
+pub(in crate::service::controller) fn ended(running: Running) {
     let mut end = running.end.expect("the end was not seen yet");
     let started = Instant::now();
     while end.try_recv().is_err() {
@@ -848,57 +848,233 @@ fn a_fallen_term_logs_one_line_a_streak_and_one_more_when_it_falls_again() {
     assert_eq!(fell, 2, "{text}");
 }
 
-#[test]
-fn a_take_that_starts_no_term_in_the_log_is_one_warning_at_the_take() {
-    let lines = Logged(Arc::new(Mutex::new(Vec::new())));
-    // A second subscriber stays registered beside each loop's own, as in
-    // the cases above.
-    let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-    // Two candidates, each over a lease and a store of its own: the
-    // second's log followed term 5 before its take of term 1.
-    for (name, followed) in [("a@127.0.0.1:1", false), ("b@127.0.0.1:2", true)] {
-        let settings = ElectionSettings {
-            duration: Duration::from_millis(600),
-            renew_period: Duration::from_millis(20),
-            renew_deadline: Duration::from_millis(400),
-        };
-        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
-        if followed {
-            feed.log
-                .restart(Position { seq: 9, term: 5 })
-                .expect("a place the log takes");
-        }
-        let candidate = Elector::new(Box::new(MemoryLease::new()), name, settings)
-            .expect("the settings are in order");
-        let (standing, stood) = watch::channel(ElectionObservation::default());
-        let writer = lines.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let (stop, stopped) = mpsc::channel();
-        let taking = Arc::clone(&store);
-        let looping = thread::spawn(move || {
-            tracing::subscriber::with_default(subscriber, || {
-                run(candidate, &taking, &standing, &stopped);
-            });
-        });
-        until("the take", || stood.borrow().holder == name);
-        stop.send(Word::Stop).expect("the loop runs");
-        until("the loop's end after its stop", || looping.is_finished());
-        looping.join().expect("the loop ends");
-        assert_eq!(store.term(), 1);
-        assert_eq!(store.followed(), followed.then_some(5), "{name}");
+/// A lease that reads, at each release's write, whom the standing names
+/// and the term the released record states.
+struct SeesStanding {
+    lease: MemoryLease,
+    stood: watch::Receiver<ElectionObservation>,
+    releases: Arc<Mutex<Vec<(String, u64)>>>,
+}
+
+impl LeaseBackend for SeesStanding {
+    fn read(&mut self) -> Result<Option<LeaseRecord>, ElectError> {
+        self.lease.read()
     }
-    let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
-    let count = |name: &str, what: &str| {
-        text.lines()
-            .filter(|line| line.contains(name) && line.contains(what))
-            .count()
+
+    fn write(
+        &mut self,
+        expected: Option<&LeaseRecord>,
+        record: &LeaseRecord,
+    ) -> Result<ConditionalWriteOutcome, ElectError> {
+        if record.holder.is_empty() {
+            let named = self.stood.borrow().holder.clone();
+            self.releases.lock().push((named, record.term));
+        }
+        self.lease.write(expected, record)
+    }
+
+    fn place(&self) -> String {
+        self.lease.place()
+    }
+}
+
+/// A store whose log followed `term` before any take.
+fn followed(term: u64) -> Arc<MemoryStore> {
+    let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+    feed.log
+        .restart(Position { seq: 9, term })
+        .expect("a place the log takes");
+    store
+}
+
+/// A take of term 1 over a store whose log followed `followed`, a term at
+/// or above it: another replica led that term, and the take starts none in
+/// the log. The loop leaves the lease in the take's own step, ahead of the
+/// standing, and the release states the higher of the two terms. The next
+/// take is `next`, above the followed term, and the log leads it. One
+/// warning says the take, and the leave's line says the term `said`.
+fn a_take_under_a_followed_term_is_left(followed_term: u64, said: Option<u64>, next: u64) {
+    let name = "b@127.0.0.1:2";
+    let store = followed(followed_term);
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let releases = Arc::new(Mutex::new(Vec::new()));
+    let lease = SeesStanding {
+        lease: MemoryLease::new(),
+        stood: stood.clone(),
+        releases: Arc::clone(&releases),
     };
-    assert_eq!(count("a@127.0.0.1:1", "started no term"), 0, "{text}");
-    assert_eq!(count("b@127.0.0.1:2", "started no term"), 1, "{text}");
-    assert_eq!(count("b@127.0.0.1:2", "followed=5"), 1, "{text}");
+    let candidate =
+        Elector::new(Box::new(lease), name, brisk()).expect("the settings are in order");
+    let looping = looping_over(candidate, Arc::clone(&store), standing);
+    // No standing names the take of term 1: the first one that names this
+    // replica is the next take's, one lease duration after the leave.
+    until("the take above the followed term", || {
+        stood.borrow().holder == name
+    });
+    assert_eq!(stood.borrow().term, next);
+    assert_eq!(store.term(), next);
+    assert_eq!(store.followed(), None);
+    // One release so far, the leave's: under the followed term, written
+    // while the standing named nobody.
+    assert_eq!(*releases.lock(), [(String::new(), followed_term)]);
+    until("the line of the lead", || looping.said(": leading"));
+    let (warned, text) = looping.stopped_with("started no term");
+    assert_eq!(warned, 1, "{text}");
+    let count = |what: &str| text.lines().filter(|line| line.contains(what)).count();
+    assert_eq!(count(&format!("followed={followed_term}")), 1, "{text}");
+    // One leave, and its line names the term said or none.
+    let mut left = text.lines().filter(|line| line.contains("stepped down"));
+    let line = left.next().expect("the leave's line");
+    assert_eq!(left.next(), None, "{text}");
+    match said {
+        Some(term) => assert!(line.contains(&format!("above={term}")), "{text}"),
+        None => assert!(!line.contains("above="), "{text}"),
+    }
+    // The take that was left says no lead and no wait for one: the next
+    // take leads, once.
+    assert_eq!(count(": leading"), 1, "{text}");
+    assert_eq!(count("no holder to wait for"), 0, "{text}");
+}
+
+#[test]
+fn a_take_under_a_term_its_log_followed_is_left_for_a_take_above_that_term() {
+    a_take_under_a_followed_term_is_left(5, Some(5), 6);
+}
+
+#[test]
+fn a_take_at_the_term_its_log_followed_is_left_with_no_term_said() {
+    a_take_under_a_followed_term_is_left(1, None, 2);
+}
+
+/// No other candidate can take a lease the elector made itself. So the
+/// step behind a take that started no term in the log follows at once, a
+/// renew period of a minute ahead of the clock's next step, and takes
+/// above the term the log followed.
+#[test]
+fn a_replica_alone_takes_again_at_once_above_the_term_its_log_followed() {
+    let name = "a@127.0.0.1:1";
+    let store = followed(5);
+    let elector = Elector::alone(name, unhurried()).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    let looping = looping_over(elector, Arc::clone(&store), standing);
+    until("the retake above the followed term", || {
+        store.term() == 6 && stood.borrow().holder == name
+    });
+    assert_eq!(stood.borrow().term, 6);
+    assert_eq!(store.followed(), None);
+    until("the line of the lead", || looping.said(": leading"));
+    let (said, text) = looping.stopped_with("alone over its lease, takes it again at once");
+    assert_eq!(said, 1, "{text}");
+    assert_eq!(text.matches("started no term").count(), 1, "{text}");
+    assert_eq!(text.matches(": leading").count(), 1, "{text}");
+}
+
+/// A take over a store whose log followed the last term: the next take
+/// would stand above that term, and none is left. The election refuses the
+/// followed term by the elector's rule, as a word of that term is refused.
+/// The replica keeps the lease as it stands: the standing names it, its
+/// log leads no term, and a second warning says so. No release is written
+/// before the stop's. `released` is the term the lease was released under
+/// before the take: the take is the term above it, and term 1 over no
+/// record.
+fn a_take_under_the_last_term_keeps_its_lease(released: Option<u64>) {
+    let name = "b@127.0.0.1:2";
+    let last = TERM_CEILING - 1;
+    let store = followed(last);
+    let mut held = MemoryLease::new();
+    if let Some(term) = released {
+        let released = LeaseRecord {
+            term,
+            ..LeaseRecord::default()
+        };
+        assert_eq!(
+            held.write(None, &released).expect("a write"),
+            ConditionalWriteOutcome::Done
+        );
+    }
+    let taken = released.map_or(1, |term| term + 1);
+    let (standing, mut stood) = watch::channel(ElectionObservation::default());
+    let releases = Arc::new(Mutex::new(Vec::new()));
+    let lease = SeesStanding {
+        lease: held,
+        stood: stood.clone(),
+        releases: Arc::clone(&releases),
+    };
+    let candidate =
+        Elector::new(Box::new(lease), name, brisk()).expect("the settings are in order");
+    let looping = looping_over(candidate, Arc::clone(&store), standing);
+    until("the take", || stood.borrow().holder == name);
+    looks(&mut stood, 3);
+    assert_eq!(
+        *stood.borrow(),
+        ElectionObservation {
+            holder: name.to_owned(),
+            term: taken,
+            looked: true,
+        }
+    );
+    assert_eq!(store.term(), taken);
+    assert_eq!(store.followed(), Some(last));
+    assert!(releases.lock().is_empty());
+    until("the line of the lead", || looping.said(": leading"));
+    let (said, text) = looping.stopped_with("the election refused the term the log followed");
+    assert_eq!(said, 1, "{text}");
+    assert_eq!(text.matches("started no term").count(), 1, "{text}");
+    assert_eq!(text.matches("stepped down").count(), 0, "{text}");
+    assert_eq!(text.matches(": leading").count(), 1, "{text}");
+}
+
+/// A followed term above the take's that leaves the election none to take
+/// keeps the replica on its lease.
+#[test]
+fn a_followed_term_that_leaves_none_to_take_keeps_the_replica_on_its_lease() {
+    a_take_under_the_last_term_keeps_its_lease(None);
+}
+
+/// A take at the last term, the very term its log followed, keeps the
+/// replica on its lease too. The elector is said no term at the take's
+/// own, so the loop asks the elector's rule itself: a lease left there
+/// could be taken by no replica again.
+#[test]
+fn a_take_at_the_last_term_its_log_followed_keeps_the_replica_on_its_lease() {
+    a_take_under_the_last_term_keeps_its_lease(Some(TERM_CEILING - 2));
+}
+
+/// A take above the term its log followed starts its term in the log: the
+/// loop leaves nothing, and says nothing of the log. The lease was released
+/// under term 7 before the take, so the take is term 8.
+#[test]
+fn a_take_above_the_term_its_log_followed_leaves_nothing() {
+    let name = "b@127.0.0.1:2";
+    let store = followed(5);
+    let mut held = MemoryLease::new();
+    let released = LeaseRecord {
+        term: 7,
+        ..LeaseRecord::default()
+    };
+    assert_eq!(
+        held.write(None, &released).expect("a write"),
+        ConditionalWriteOutcome::Done
+    );
+    let (standing, mut stood) = watch::channel(ElectionObservation::default());
+    let releases = Arc::new(Mutex::new(Vec::new()));
+    let lease = SeesStanding {
+        lease: held,
+        stood: stood.clone(),
+        releases: Arc::clone(&releases),
+    };
+    let candidate =
+        Elector::new(Box::new(lease), name, brisk()).expect("the settings are in order");
+    let looping = looping_over(candidate, Arc::clone(&store), standing);
+    until("the take", || stood.borrow().holder == name);
+    looks(&mut stood, 3);
+    assert_eq!(stood.borrow().term, 8);
+    assert_eq!(store.term(), 8);
+    assert_eq!(store.followed(), None);
+    assert!(releases.lock().is_empty());
+    let (said, text) = looping.stopped_with("started no term");
+    assert_eq!(said, 0, "{text}");
+    assert_eq!(text.matches("stepped down").count(), 0, "{text}");
 }
 
 /// A lease whose every write takes `takes` to store while `slow` is set,
@@ -1111,6 +1287,15 @@ struct Looping {
 }
 
 fn looping(elector: Elector, standing: watch::Sender<ElectionObservation>) -> Looping {
+    looping_over(elector, Arc::new(MemoryStore::new()), standing)
+}
+
+/// The same over `store`: the loop tells it each take's term.
+fn looping_over(
+    elector: Elector,
+    store: Arc<MemoryStore>,
+    standing: watch::Sender<ElectionObservation>,
+) -> Looping {
     let lines = Logged(Arc::new(Mutex::new(Vec::new())));
     let writer = lines.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -1121,7 +1306,7 @@ fn looping(elector: Elector, standing: watch::Sender<ElectionObservation>) -> Lo
     let (stop, stopped) = mpsc::channel();
     let thread = thread::spawn(move || {
         tracing::subscriber::with_default(subscriber, || {
-            run(elector, &MemoryStore::new(), &standing, &stopped);
+            run(elector, &store, &standing, &stopped);
         });
     });
     Looping {
