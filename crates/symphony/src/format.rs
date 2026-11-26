@@ -1676,21 +1676,25 @@ impl Format {
     /// Whether `prompt` closed the thought itself and wrote what the template writes after the
     /// close (a request with thinking switched off: Qwen3's `<think>\n\n</think>\n\n`), so the
     /// structural tags owe none of it before their first text
-    /// ([`Options::thought_closed`](crate::grammar::Options::thought_closed)). `false` for a table
-    /// whose layout has no thought, a prompt that leaves the thought open or to the model, and
-    /// one that ends with the bare close (GLM 4.6's `<think></think>`, whose newline the tag still
-    /// writes).
+    /// ([`Options::thought_closed`](crate::grammar::Options::thought_closed)). Where the template
+    /// leaves the thought to the model and writes nothing after the close, the table saying so
+    /// with a row on the thought's opener and a row on its close from the turn's own state
+    /// (MiniMax M3), a prompt that ends with that close has closed the thought in the model's
+    /// place, and a call the request forces is written at once. `false` for a prompt that leaves
+    /// the thought open or to the model, for any other table whose layout writes nothing after
+    /// the close, and for a prompt that ends with the bare close where the layout writes text
+    /// after it (GLM 4.6's `<think></think>`, whose newline the tag still writes).
     pub fn thought_closed(&self, prompt: &str) -> bool {
-        let Some(thought) = self.layout().and_then(|layout| layout.thought.as_ref()) else {
-            return false;
-        };
-        let Some(close) = thought.close.as_deref() else {
-            return false;
-        };
-        !thought.after.is_empty()
-            && prompt
-                .strip_suffix(&*thought.after)
-                .is_some_and(|before| before.ends_with(close))
+        match self.layout().and_then(|layout| layout.thought.as_ref()) {
+            Some(thought) if !thought.after.is_empty() => {
+                thought.close.as_deref().is_some_and(|close| {
+                    prompt
+                        .strip_suffix(&*thought.after)
+                        .is_some_and(|before| before.ends_with(close))
+                })
+            }
+            _ => self.ends_with_the_close_left_to_the_model(prompt),
+        }
     }
 
     /// The format's name.

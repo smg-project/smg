@@ -1467,6 +1467,158 @@ mod tests {
         }
     }
 
+    /// The same rule where the template leaves the thought to the model and writes nothing after
+    /// its close (MiniMax M3's table): a prompt that ends with that close is past the thought
+    /// whatever the thinking switch says. A request whose switch says the model thinks is
+    /// prepared as the same prompt is with the switch off, wherever the model's workers start a
+    /// grammar: the forced call's constraint and where it starts, the decision request building
+    /// reads, and the reader are the same. The reader hears the prompt alone and stands past the
+    /// thought: an output that begins with text is content, and a second close before the text
+    /// is the thought's marker and none of the text. Before, the switch decided and the request
+    /// was prepared as inside an open thought. A chat request and a Messages request are walked,
+    /// each on one worker under each label and under none and on two workers that start a
+    /// grammar at different places.
+    #[test]
+    fn a_prompt_that_ends_with_the_models_own_close_overrules_the_thinking_switch() {
+        const CLOSED: &str = "]~b]user\nhi[e~[\n]~b]ai\n</mm:think>";
+        /// The gateway's components over the workers of one cell.
+        type Pool = fn() -> Arc<SharedComponents>;
+        let tokenizer = hiding(&["<mm:think>", "</mm:think>"]);
+        let chat = forced(true);
+        let messages: Arc<CreateMessageRequest> = Arc::new(
+            serde_json::from_value(json!({
+                "model": SERVED, "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
+                "tool_choice": {"type": "tool", "name": "lookup"},
+            }))
+            .expect("a Messages request"),
+        );
+        // The forced call of a chat request and of a Messages request, each with its tools.
+        let roads: [(&str, Asks<'_>, Arc<[Tool]>); 2] = [
+            (
+                "chat",
+                Asks::Chat(&chat),
+                chat.tools.clone().unwrap_or_default(),
+            ),
+            (
+                "messages",
+                Asks::for_messages(&messages, false),
+                messages.chat_tools().into(),
+            ),
+        ];
+        // One worker under each label and under none, and two workers that start a grammar at
+        // different places, the model's workers together starting at either.
+        let pools: [(&str, Pool); 4] = [
+            ("at the first token", || {
+                pool("minimax_m3", Some("first_token"))
+            }),
+            ("after the thought", || {
+                pool("minimax_m3", Some("after_reasoning"))
+            }),
+            ("where no label says", || pool("minimax_m3", None)),
+            ("at either place", || {
+                let components = pool("minimax_m3", Some("first_token"));
+                let joining = BasicWorkerBuilder::new("grpc://engine-2:50051")
+                    .model(ModelCard::new(SERVED).with_reasoning_parser("minimax_m3"))
+                    .worker_type(WorkerType::Regular)
+                    .label(WorkerGrammarStart::LABEL, "after_reasoning");
+                components
+                    .worker_registry
+                    .register(Arc::new(joining.build()));
+                components
+            }),
+        ];
+        let cells = roads
+            .iter()
+            .flat_map(|road| pools.iter().map(move |pool| (road, pool)));
+        let mut turned = Vec::new();
+        for ((road, asks, tools), (workers, components)) in cells {
+            let prepared_under = |switch: bool| {
+                let mut ctx = match asks {
+                    Asks::Chat(_) => RequestContext::for_chat(
+                        Arc::clone(&chat),
+                        None,
+                        SERVED.into(),
+                        components(),
+                    ),
+                    Asks::Messages { .. } => RequestContext::for_messages_carrying_its_tools(
+                        Arc::clone(&messages),
+                        None,
+                        SERVED.into(),
+                        components(),
+                    ),
+                };
+                ctx.state.parser = Some(ParserChoice::Symphony);
+                ctx.state.tokenizer = Some(Arc::clone(&tokenizer));
+                let prepared = prepare(&ctx, *asks, tools, CLOSED, switch, &tokenizer, "test")
+                    .map_err(|response| response.status())
+                    .expect("nothing refused");
+                ctx.state.parser_names = Some(prepared.names);
+                ctx.state.prompt_thought = Some(prepared.prompt_thought);
+                let decision = reasoning_decision(&ctx, SERVED, CLOSED, |_| switch);
+                let decided = decide(&mut ctx, *asks, tools, CLOSED, prepared.constraint, |_| {
+                    panic!("a forced call: no auto tag")
+                })
+                .map_err(|response| response.status())
+                .expect("nothing refused");
+                let assignment = decided.assignment.expect("the table reads the response");
+                assert_eq!(assignment.table(), "minimax_m3");
+                // The reasoning and the content the reader takes from `output`.
+                let read = |output: &str| {
+                    let mut delta = symphony::Delta::default();
+                    let mut events = ::symphony::Events::new();
+                    let mut reader =
+                        symphony::Reader::new(&assignment, Arc::clone(tools), &mut events)
+                            .expect("a reader");
+                    reader
+                        .tail(output.to_string(), &mut delta, &mut events)
+                        .expect("read");
+                    let who = symphony::telemetry::Who {
+                        request_id: "test",
+                        model: SERVED,
+                        choice: 0,
+                    };
+                    reader
+                        .end(::symphony::EngineFinish::Stop, who, &mut events)
+                        .expect("ended");
+                    let mut reasoning = String::new();
+                    let mut content = String::new();
+                    for event in events.as_slice() {
+                        match event {
+                            ::symphony::Event::Reasoning(text) => reasoning.push_str(&text.text),
+                            ::symphony::Event::Content(text) => content.push_str(&text.text),
+                            _ => {}
+                        }
+                    }
+                    (reasoning, content)
+                };
+                (
+                    decided.tool_constraints,
+                    decided.first_token,
+                    decision,
+                    read("Paris."),
+                    read("</mm:think>Paris."),
+                )
+            };
+            let off = prepared_under(false);
+            for read in [&off.3, &off.4] {
+                assert_eq!(
+                    read,
+                    &(String::new(), "Paris.".to_string()),
+                    "{road}, workers that start {workers}"
+                );
+            }
+            let on = prepared_under(true);
+            if on != off {
+                turned.push(format!(
+                    "{road}, workers that start {workers}\n  the switch off: {off:?}\n  the switch on: {on:?}"
+                ));
+            }
+        }
+        assert!(turned.is_empty(), "{}", turned.join("\n"));
+    }
+
     /// The assignment of a forced call under the schema starts the reader where the model's
     /// workers start a grammar together: in the call, with nothing of the prompt replayed, on
     /// workers that start at the first token, where the schema holds the output before the model

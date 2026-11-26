@@ -2253,6 +2253,250 @@ mod tests {
         ));
     }
 
+    /// The four places the workers of a model may start a grammar at.
+    const STARTS: [symphony::GrammarStart; 4] = [
+        symphony::GrammarStart::Unknown,
+        symphony::GrammarStart::Either,
+        symphony::GrammarStart::AfterReasoning,
+        symphony::GrammarStart::FirstToken,
+    ];
+
+    /// The generation prompt of a table whose template leaves the thought to the model (MiniMax
+    /// M3's) with no marker, and the one that ends with the thought's close: the template closed
+    /// the thought in the model's place, as it does with thinking switched off.
+    const TURN_WITH_NO_MARKER: &str = "]~b]user\nhi[e~[\n]~b]ai\n";
+    const TURN_THAT_CLOSED_THE_THOUGHT: &str = "]~b]user\nhi[e~[\n]~b]ai\n</mm:think>";
+
+    /// What a request (`ask`, over the `lookup` tool unless it asks for a JSON answer) takes on
+    /// `prompt` from the table that reads `MiniMaxAI/MiniMax-M3`, for workers that start the
+    /// grammar at `start`, the request's thinking switch saying `switch`: the table's replay of
+    /// the prompt decides with it as preparation does (`PromptThought::or_switch`).
+    fn found_where_the_thought_is_the_models(
+        ask: &Value,
+        prompt: &str,
+        switch: bool,
+        start: symphony::GrammarStart,
+    ) -> Result<Option<ToolConstraint>, SymphonyError> {
+        let model = "MiniMaxAI/MiniMax-M3";
+        let mut body = ask.clone();
+        body["model"] = json!(model);
+        let request = request(body);
+        let thought = reasoning_open(
+            ParserChoice::Symphony,
+            &names(None, None),
+            model,
+            &templates(),
+            prompt,
+        )
+        .expect("a table reads");
+        let (open, closed) = (thought.or_switch(|| switch), thought.closed);
+        let tools = if ask["response_format"].is_null() {
+            tools()
+        } else {
+            Vec::new()
+        };
+        if ask["tool_choice"] == "auto" {
+            auto_constraint(
+                ParserChoice::Symphony,
+                &names(None, None),
+                Asks::Chat(&request),
+                &tools,
+                open,
+                closed,
+                start,
+                TagVocabulary::Current,
+                &templates(),
+            )
+        } else {
+            super::constraint(
+                ParserChoice::Symphony,
+                &names(None, None),
+                Asks::Chat(&request),
+                &tools,
+                open,
+                closed,
+                start,
+                TagVocabulary::Current,
+                &templates(),
+            )
+            .and_then(|prepared| prepared.for_start(start, TagVocabulary::Current))
+        }
+    }
+
+    /// The structural tag [`found_where_the_thought_is_the_models`] finds.
+    fn tag_where_the_thought_is_the_models(
+        ask: &Value,
+        prompt: &str,
+        switch: bool,
+        start: symphony::GrammarStart,
+    ) -> Value {
+        tag_of(found_where_the_thought_is_the_models(
+            ask, prompt, switch, start,
+        ))
+    }
+
+    /// A forced call by name and by `required`, the `auto` choice, and a JSON answer by
+    /// `json_object` and by `json_schema`: every ask that takes a tag from the table.
+    fn asks_that_take_a_tag() -> [Value; 5] {
+        [
+            json!({"tool_choice": {"type": "function", "function": {"name": "lookup"}}}),
+            json!({"tool_choice": "required"}),
+            json!({"tool_choice": "auto"}),
+            json!({"response_format": {"type": "json_object"}}),
+            json!({"response_format": {"type": "json_schema", "json_schema": {
+                "name": "city",
+                "schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }}}),
+        ]
+    }
+
+    /// A prompt that ends with the thought's close, of a table whose template leaves the thought
+    /// to the model, is past the thought whatever the request's thinking switch says, and a
+    /// forced call, named or required, takes the block alone wherever the workers start the
+    /// grammar: no thought and no second close stand before it. A tag that offered the thought
+    /// again could hold the model there until its tokens ran out.
+    #[test]
+    fn a_forced_call_takes_the_block_alone_on_a_prompt_that_closed_the_thought() {
+        let thought = reasoning_open(
+            ParserChoice::Symphony,
+            &names(None, None),
+            "MiniMaxAI/MiniMax-M3",
+            &templates(),
+            TURN_THAT_CLOSED_THE_THOUGHT,
+        )
+        .expect("a table reads");
+        assert!(thought.closed && !thought.open && !thought.alone);
+        assert!(!thought.or_switch(|| true));
+        assert!(!thought.or_switch(|| false));
+        let named = json!({"tool_choice": {"type": "function", "function": {"name": "lookup"}}});
+        let required = json!({"tool_choice": "required"});
+        for start in STARTS {
+            for ask in [&named, &required] {
+                let unmarked =
+                    tag_where_the_thought_is_the_models(ask, TURN_WITH_NO_MARKER, false, start);
+                assert_eq!(
+                    unmarked["format"]["elements"][0]["type"], "optional",
+                    "{start:?}: {unmarked}"
+                );
+                for switch in [false, true] {
+                    let closed = tag_where_the_thought_is_the_models(
+                        ask,
+                        TURN_THAT_CLOSED_THE_THOUGHT,
+                        switch,
+                        start,
+                    );
+                    assert_eq!(
+                        closed["format"], unmarked["format"]["elements"][1],
+                        "{start:?}, switch {switch}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bound of the rule above, which holds before it too. A prompt with no marker hears the
+    /// request's thinking switch and admits the thought the model may write before a forced
+    /// call. For a request that switched thinking off, a JSON answer's tag (`json_object` and
+    /// `json_schema`) and the `auto` tag are the same on a prompt that closed the thought as on
+    /// one with no marker, wherever the workers start the grammar: only the forced call reads
+    /// the closed thought.
+    #[test]
+    fn a_json_answer_and_the_auto_tag_keep_their_thought_on_a_prompt_that_closed_it() {
+        let unmarked = reasoning_open(
+            ParserChoice::Symphony,
+            &names(None, None),
+            "MiniMaxAI/MiniMax-M3",
+            &templates(),
+            TURN_WITH_NO_MARKER,
+        )
+        .expect("a table reads");
+        assert!(!unmarked.closed && !unmarked.open && !unmarked.alone);
+        assert!(unmarked.or_switch(|| true));
+        assert!(!unmarked.or_switch(|| false));
+        let the_models_thought = json!({
+            "type": "optional",
+            "content": {"type": "or", "elements": [
+                {
+                    "type": "tag",
+                    "begin": "<mm:think>",
+                    "content": {"type": "any_text", "excludes": [
+                        "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>",
+                        "<invoke name=\"", "</invoke>", "]<]minimax[>["
+                    ]},
+                    "end": "</mm:think>"
+                },
+                {"type": "const_string", "value": "</mm:think>"}
+            ]}
+        });
+        let asks = asks_that_take_a_tag();
+        for start in STARTS {
+            for ask in &asks {
+                let unmarked =
+                    tag_where_the_thought_is_the_models(ask, TURN_WITH_NO_MARKER, false, start);
+                assert_eq!(
+                    unmarked["format"]["elements"][0], the_models_thought,
+                    "{start:?}: {ask}"
+                );
+                if ask["tool_choice"].is_null() || ask["tool_choice"] == "auto" {
+                    assert_eq!(
+                        tag_where_the_thought_is_the_models(
+                            ask,
+                            TURN_THAT_CLOSED_THE_THOUGHT,
+                            false,
+                            start
+                        ),
+                        unmarked,
+                        "{start:?}: {ask}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The corner of the two rules above: the request's thinking switch says the model thinks
+    /// while the prompt ends with the thought's close (a template closes the thought for a
+    /// request whose word the switch does not hear). The prompt decides, as it does for every
+    /// table whose template writes text after the close: a forced call, the `auto` tag and a
+    /// JSON answer take what the same prompt takes with the switch off, wherever the workers
+    /// start the grammar. Before, the switch decided and each was built as inside an open
+    /// thought.
+    #[test]
+    fn a_prompt_that_closed_the_thought_takes_the_tags_of_the_switch_off_under_any_switch() {
+        let asks = asks_that_take_a_tag();
+        let mut turned = Vec::new();
+        for start in STARTS {
+            for ask in &asks {
+                let [off, on] = [false, true].map(|switch| {
+                    match found_where_the_thought_is_the_models(
+                        ask,
+                        TURN_THAT_CLOSED_THE_THOUGHT,
+                        switch,
+                        start,
+                    ) {
+                        Ok(Some(ToolConstraint::StructuralTag(tag))) => tag,
+                        other => format!("{other:?}"),
+                    }
+                });
+                if on != off {
+                    turned.push(format!(
+                        "{start:?}: {ask}\n  the switch off: {off}\n  the switch on: {on}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            turned.is_empty(),
+            "{} of {} differ:\n{}",
+            turned.len(),
+            STARTS.len() * asks.len(),
+            turned.join("\n")
+        );
+    }
+
     #[test]
     fn the_legacy_choice_assigns_nothing_and_asks_for_no_constraint() {
         assert!(assign(
