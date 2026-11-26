@@ -186,7 +186,7 @@ fn plain_spec_answers_keep_each_wire_field() {
 
 use crate::{
     document::{
-        operator::{needs_rows, test_support::LEAST_LOAD},
+        operator::test_support::{needs_rows, LEAST_LOAD},
         spec::PolicySpec,
     },
     engine::{Candidate, Filter},
