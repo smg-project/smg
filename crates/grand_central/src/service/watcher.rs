@@ -18,7 +18,8 @@
 //! applier writes its own. The holder builds the object of the row an
 //! event tells, hands the store the event, and puts the object in the
 //! registry where the store took it. A snapshot's last page is the
-//! store's write and the read of its rows in one turn of the holder. So
+//! store's write and the lay of the snapshot's rows in one turn of the
+//! holder. So
 //! the object of each row stands when the event that told it returns, and
 //! the host follows nothing behind the watch.
 //!
