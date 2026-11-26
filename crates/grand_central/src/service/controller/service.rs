@@ -1170,5 +1170,5 @@ impl GrandCentral for Service {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/service/controller/service/tests.rs"]
+#[path = "../../../tests/unit/service/controller/service/tests/mod.rs"]
 mod tests;
