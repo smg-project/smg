@@ -1595,8 +1595,9 @@ holds that side while the prefill is dispatched, as its booking stands in a gate
 process.
 
 The side has a whole deadline from the file's first pass behind the prefill's end. A side that
-still waits is released between one and two deadlines behind that end, to the sweep's tick. A
-side a decode call issued keeps the call's own deadline.
+still waits is released at the first pass past that deadline. A sweep passes over a file whose
+decider works, so neither pass has a latest time. A side a decode call issued keeps the call's
+own deadline.
 
 The engine stores nothing about a lease. The host keeps what it was handed and hands it back
 with each event (`DecisionEngine::say`). The crate has a guard for that, `DecisionGuard`
@@ -1614,13 +1615,21 @@ dispatch on another worker a release takes back no claim.
 The session table knows a claim by its worker and by the instant its lease was issued under
 (`Lease::issued_micros`, the decision's `now_micros`). An event of a lease takes back the claim
 that carries the same instant. A later decision's claim on the same worker is dated later, so a
-refusal told late leaves it, and the session's next request follows it. The crate's guard and a
-controller tell a pair's every event under its first decision's lease, so a decode call there
-dates its claim by that lease.
+refusal told late leaves it: the session's pins stay as that decision wrote them. The crate's
+guard and a controller tell each dispatch and release of a pair under its first decision's lease,
+so a decode call there dates its claim by that lease.
 
-A lease that states no instant reaches a claim by its worker alone. A host that builds a lease by
-hand dates it by the `now_micros` of the decision its verdict comes from, or states none. For the
-side a decode call issues, that decision is the decode call.
+The table keeps the low 32 bits of the instant. Two claims of one key on one worker that are
+dated alike read as one: at one microsecond, or 2^32 microseconds apart.
+
+A decode call that panics behind its claim dates nothing. Its claim keeps the call's instant, and
+no event of the pair's lease reaches it. It ends at a dispatch on its worker or with the key's
+idle time.
+
+A lease that states no instant reaches a claim by its worker alone, and a stage that dates a
+dispatch by the lease reads it from 0. A host that builds a lease by hand dates it by the
+`now_micros` of the decision its verdict comes from. For the side a decode call issues, that
+decision is the decode call.
 
 What an event does:
 
