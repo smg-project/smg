@@ -1231,6 +1231,30 @@ impl SessionCountedUnder {
             }
         }
     }
+
+    /// [`Self::name`] for each side of a pair: the prefill side's name,
+    /// then the decode side's, each under the side's own session and
+    /// written into its own buffer of `buffers`. One text names both sides
+    /// where the key's own text is the name, and a session's number is
+    /// each side's own.
+    ///
+    /// Out of line: a pair's decision and an encode request's ask it under
+    /// a document one of whose stages reads the count, and each keeps the
+    /// one call off the path of every other document.
+    #[cfg(feature = "in-process")]
+    #[inline(never)]
+    pub(crate) fn sides<'a: 'b, 'b>(
+        self,
+        facts: &RequestFacts<'a>,
+        buffers: &'b mut [[u8; Session::TEXT_LEN]; 2],
+    ) -> [Option<&'b str>; 2] {
+        let [prefill, decode] = buffers;
+        let side = |phase| RequestFacts { phase, ..*facts };
+        [
+            self.name(&side(Phase::Prefill), prefill),
+            self.name(&side(Phase::Decode), decode),
+        ]
+    }
 }
 
 /// One request as a decision sees it. Borrowed from the host for the

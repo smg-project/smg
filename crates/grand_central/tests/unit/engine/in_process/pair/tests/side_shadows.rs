@@ -15,9 +15,13 @@ use crate::{
     document::spec::{Assignment, ShadowSpec},
     engine::{
         decision::LiftedVeto,
-        in_process::with_shadow::tests::{Heard, Rule, Takes},
+        in_process::{
+            place::{Made, PlaceRequest},
+            with_shadow::tests::{Heard, Rule, Takes},
+        },
         shadow::{ShadowSide, SHADOW_FLOOR},
     },
+    policies::consistent_hashing::{Head, LentRing},
 };
 
 /// The names of a case's pickers on a pair's two sides: the live one's,
@@ -998,6 +1002,115 @@ fn a_sides_shadow_apart_from_either_live_side_is_lent_no_ring() {
         let shadows: BTreeSet<Option<WorkerId>> = taken.iter().map(|taken| taken.1).collect();
         assert_eq!(shadows.len(), 1, "{side:?} reads no place: {taken:?}");
     }
+}
+
+/// The model's ring ([`model_ring`]) as a lender that answers the place it
+/// is set at, for every key's text and for every head: a case moves its
+/// request along the ring while the request's key stands.
+#[derive(Debug)]
+struct SetAt {
+    ring: InOrder,
+    at: AtomicU64,
+}
+
+impl LentRing for SetAt {
+    fn position(&self, _: &str) -> u64 {
+        self.at.load(Ordering::Relaxed)
+    }
+
+    fn head_position(&self, _: Head<'_>) -> Option<u64> {
+        Some(self.at.load(Ordering::Relaxed))
+    }
+
+    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+        self.ring.walk(position, take);
+    }
+}
+
+/// [`taken_on_ring`] for the request the one call makes of what its caller
+/// states ([`Made`]): one routing value in a header, and the model's ring
+/// lent ([`SetAt`]). The places a side reads are then those the call's own
+/// statement holds, and no case's. What the decode side's shadow took at
+/// each of six places the lender answers, beside the row the live prefill
+/// took there.
+fn taken_by_the_call(host: &Host) -> Vec<(usize, Option<WorkerId>)> {
+    let ring = SetAt {
+        ring: model_ring(),
+        at: AtomicU64::new(0),
+    };
+    let classes = every(host.prefills.len(), host.decodes.len() as u32);
+    let Asks(_, lists, _) = host.asks(&classes, false);
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let stated = PlaceRequest {
+        headers: &headers,
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists))
+    };
+    let own = host.engine.loaded();
+    let sides = (own.members_of(lists.prefill), own.members_of(lists.decode));
+    let taken = |place: u64| {
+        ring.at.store(place, Ordering::Relaxed);
+        // Made anew at each place: a making keeps what the lender answered.
+        let made = Made::new(&host.engine, &stated, &[]);
+        let mut request = made.make(host.engine.standing_spec());
+        let (mut said, now): (SidesSaid, _) = ([None; 2], Instant::now());
+        let (counted, room) = (SessionCountedUnder::default, Some(&mut said));
+        let decision = lists.decide_sides(
+            own,
+            sides,
+            None,
+            now,
+            &mut request,
+            None,
+            |_| true,
+            counted,
+            room,
+        );
+        let shadow = said[PairSide::Decode.index()].expect("the decode's shadow");
+        assert_ne!(shadow.kind, ShadowKind::Skipped, "the shadow ran");
+        (host.picked(&decision).0, shadow.first)
+    };
+    (0..6).map(taken).collect()
+}
+
+/// What the two cases of the call's one list hold. Under `live` ahead of
+/// a decode side that reads no ring, the live prefill follows the place
+/// the lender answers. A decode shadow under `next`, which reads a ring by
+/// another word than `live` does, takes one decode whatever that place.
+fn the_calls_one_list_holds_a_decode_shadow_to_both_sides(live: &str, next: &str) {
+    let host = stock([live, "least_load"], [None, Some(next)], (3, 3));
+    let taken = taken_by_the_call(&host);
+    let lives: BTreeSet<usize> = taken.iter().map(|taken| taken.0).collect();
+    assert!(
+        lives.len() > 1,
+        "the live prefill follows the place: {taken:?}"
+    );
+    let shadows: BTreeSet<Option<WorkerId>> = taken.iter().map(|taken| taken.1).collect();
+    assert_eq!(shadows.len(), 1, "the shadow reads no place: {taken:?}");
+}
+
+/// The one call states a pair's one place for both of its sides, and no
+/// place of the decode side's own ([`RequestFacts::decode_ring_positions`]):
+/// a side's shadow is then held to the rule against both live sides, as
+/// under the facts the case above states itself. Under the plain ring ahead
+/// of a decode side that reads no ring, the call states where the routing
+/// value's own text stands. A decode shadow of the prefix form is apart
+/// from the live prefill: it is lent no ring. Stated that place as its
+/// side's own, it would be held against its own live side alone, which
+/// reads no ring, and would follow the place as a head's.
+#[test]
+fn the_call_states_a_keys_one_place_for_both_sides_of_a_pair() {
+    the_calls_one_list_holds_a_decode_shadow_to_both_sides("consistent_hashing", "prefix_hash");
+}
+
+/// The twin under the prefix form ahead of a decode side that reads no
+/// ring: the call states where the routing value stands as the request's
+/// one head, once for both sides. A decode shadow of the plain ring is
+/// apart from the live prefill: it is lent no ring. Stated that list as
+/// its side's own, it would follow the place as its key's.
+#[test]
+fn the_call_states_a_requests_heads_once_for_both_sides_of_a_pair() {
+    the_calls_one_list_holds_a_decode_shadow_to_both_sides("prefix_hash", "consistent_hashing");
 }
 
 /// The decode's shadow beside a decode decided again is lent the request's

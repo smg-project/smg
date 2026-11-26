@@ -4451,13 +4451,19 @@ const _: () = {
     }
 };
 
-/// What a binding's sessions rule reads beyond its profile's stages: the
-/// key under the view's headers, and the per-key counts its assignment and
-/// cap compare; the validator's summary, per binding.
-fn session_needs(binding: &Binding) -> Needs {
+/// What a binding's sessions rule reads for a decision of `phase` beyond
+/// its profile's stages: the key under the view's headers, and the per-key
+/// counts its assignment and cap compare; the validator's summary, per
+/// binding. Nothing for the encode side of the `epd` plan: there a rule
+/// places the pair's two sides and no item, which goes by its content. A
+/// single binding's rule places a request of every phase it covers, an
+/// encode request among them.
+fn session_needs(binding: &Binding, phase: Phase) -> Needs {
+    let item = phase == Phase::Encode && matches!(binding.plan, Plan::Epd { .. });
     binding
         .sessions
         .as_ref()
+        .filter(|_| !item)
         .map_or_else(Needs::default, |rule| Needs {
             headers: true,
             active_sessions: rule.assignment == Assignment::MinGroup,
@@ -5274,7 +5280,7 @@ impl Engine {
                     phase_needs[slot(phase)] = phase_needs[slot(phase)]
                         .or(own)
                         .or(shadow)
-                        .or(session_needs(binding));
+                        .or(session_needs(binding, phase));
                 }
                 if binding.model == "*" {
                     break;
@@ -5816,7 +5822,7 @@ impl Engine {
                 (
                     self.profile_needs[usize::from(index)]
                         .or(self.shadow_needs(&entry.binding, phase))
-                        .or(session_needs(&entry.binding)),
+                        .or(session_needs(&entry.binding, phase)),
                     self.marks[usize::from(index)],
                 )
             })
@@ -6144,7 +6150,7 @@ impl Engine {
                 if let Some(own) = own(phase).filter(|_| covers(phase)) {
                     needs = own
                         .or(self.shadow_needs(binding, phase))
-                        .or(session_needs(binding));
+                        .or(session_needs(binding, phase));
                 }
                 // The decode side of every pair this binding's prefill
                 // lookup starts, and the encode side of an `epd` pair, each
