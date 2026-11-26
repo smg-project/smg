@@ -27,10 +27,11 @@ A gate is a test gate only where it cannot hold without `test`: the plain
 A package in mid-move says so by a file `tests/unit/MOVING.md`. There the first
 rule is not asked: a test module that has not moved yet may stand under `src`,
 as a body, as a `mod` line with no path attribute or with one that names a file
-under `src`, or inside an inline module, and a case may stand there too. Every
-other rule binds: a pointer that names a file outside `src` names the rule's
-place, and every file under `tests/unit` is named. The last change of the move
-deletes the file.
+under `src`, and a case may stand there too. Inside an inline module it may
+stand as a body or as a `mod` line with no path attribute. Every other rule
+binds: a pointer that names a file outside `src` names the rule's place, and
+every file under `tests/unit` is named. The last change of the move deletes the
+file: where nothing under `src` waits to move, the file itself is a fault.
 
 Usage: check_unit_test_layout.py [ROOT]. ROOT is the repository's folder, by
 default the one that holds this script's folder. Each fault is one line on
@@ -368,7 +369,8 @@ def check_package(package, label, moving=False):
             if body:
                 bodies.append((at, closing(source.code, source.code.index("{", at))))
             if chain:
-                if not moving:
+                # In mid-move it waits for its lift only where it stands under src by itself.
+                if not moving or (not body and path_of(attributes) is not None):
                     faults.append(
                         f"{place}: a test module inside the inline module `{chain[-1]}`: that "
                         "module becomes a file of its own, and the pointer stands at that file's "
@@ -461,8 +463,16 @@ def check(root):
     faults = []
     for package in packages(root):
         if (package / UNIT).is_dir() and (package / "src").is_dir():
+            label = package.relative_to(root).as_posix()
             moving = (package / UNIT / MOVING).is_file()
-            faults += check_package(package, package.relative_to(root).as_posix(), moving)
+            found = check_package(package, label, moving)
+            # Mid-move only takes faults away: where it takes none, nothing waits to move.
+            if moving and found == check_package(package, label):
+                found.append(
+                    f"{label}/{UNIT}/{MOVING}: nothing under src waits to move, "
+                    "so the move is done: this file goes"
+                )
+            faults += found
     return faults
 
 

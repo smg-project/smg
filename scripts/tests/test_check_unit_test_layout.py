@@ -105,6 +105,7 @@ def test_a_package_in_mid_move_may_hold_what_has_not_moved_yet(tmp_path):
 
 def test_a_package_in_mid_move_is_held_to_every_other_rule(tmp_path):
     files = {**VIEW, "tests/unit/MOVING.md": "The unit tests of this package are moving.\n"}
+    files["src/lib.rs"] = "mod view;\n#[test]\nfn waits() {}\n"
     files["src/view.rs"] = "pub fn width() -> usize {\n    4\n}\n\n" + pointer(
         "../tests/unit/view/cases.rs"
     )
@@ -114,6 +115,27 @@ def test_a_package_in_mid_move_is_held_to_every_other_rule(tmp_path):
         'the rule\'s path is "../tests/unit/view/tests.rs"',
         f"tests/unit/view/cases.rs: {UNNAMED}",
         f"tests/unit/view/tests.rs: {UNNAMED}",
+    ]
+
+
+def test_a_package_in_mid_move_holds_a_pointer_inside_an_inline_module_to_its_cure(tmp_path):
+    files = {**VIEW, "tests/unit/MOVING.md": "The unit tests of this package are moving.\n"}
+    files["src/lib.rs"] = (
+        "mod view;\nmod wide {\n    #[cfg(test)]\n"
+        '    #[path = "../../tests/private/cases.rs"]\n    mod tests;\n}\n'
+        "#[test]\nfn waits() {}\n"
+    )
+    files["tests/private/cases.rs"] = "#[test]\nfn holds() {}\n"
+    assert faults(tmp_path, files) == [
+        "src/lib.rs:3: a test module inside the inline module `wide`: that module becomes a file "
+        "of its own, and the pointer stands at that file's first level",
+    ]
+
+
+def test_a_package_whose_move_is_done_holds_no_mark_of_mid_move(tmp_path):
+    files = {**VIEW, "tests/unit/MOVING.md": "The unit tests of this package are moving.\n"}
+    assert faults(tmp_path, files) == [
+        "tests/unit/MOVING.md: nothing under src waits to move, so the move is done: this file goes",
     ]
 
 
