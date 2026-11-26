@@ -338,10 +338,11 @@ pub struct PolicyRegistry {
     /// every request.
     engine: Arc<OnceLock<&'static InProcess>>,
 
-    /// The trees Grand Central is lent, where its start asked
-    /// for them ([`Self::lend_trees`]). A worker the registry lost is
-    /// taken out of them by their own task
-    /// ([`LentTrees::follow_removals`]).
+    /// The trees Grand Central is lent, in their cell: filled where a
+    /// document put in force first reads sent prefixes, at the start
+    /// ([`Self::lend_trees`]) or behind a worker's label
+    /// ([`LentTrees::under`]). A worker the registry lost is taken out of
+    /// them by their own task ([`LentTrees::follow_removals`]).
     lent_trees: Arc<OnceLock<Arc<LentTrees>>>,
 
     /// Shared sticky selector for the routing-key override. `Some` when the
@@ -962,13 +963,15 @@ impl PolicyRegistry {
 
     /// Hands the registry the maker of every later spec of this process,
     /// once, with the engine at the start
-    /// ([`Respec`](super::labels::Respec)): a worker's `policy` label is
+    /// ([`Respec`](super::labels::Respec)). A worker's `policy` label is
     /// built into a spec by it. A registry that was handed none applies no
     /// label. `workers` is the registry of the worker lists the engine is
     /// lent: they are published again behind each spec a label puts in
-    /// force.
+    /// force. The maker is handed with the cell of the lent trees, which
+    /// follow each of those specs.
     pub(crate) fn set_respec(&self, respec: super::labels::Respec, workers: Arc<WorkerRegistry>) {
-        self.labels.set_respec(respec, workers);
+        self.labels
+            .set_respec(respec, workers, Arc::clone(&self.lent_trees));
     }
 
     /// Whether the spec in force places `model_id`'s single requests by the
@@ -1007,35 +1010,31 @@ impl PolicyRegistry {
 
     /// The trees Grand Central is lent, made at the first call
     /// under the numbers of `document`, the document the engine runs, whose
-    /// block size is `page` tokens ([`LentTrees::of_document`]), and kept
-    /// here. The engine's start calls it, and only where its document reads
-    /// the prefixes sent to each worker: with the engine on no classic
-    /// policy is made that would keep such trees.
-    ///
-    /// The trees are made with the task that takes a worker `workers` lost
-    /// out of them ([`LentTrees::follow_removals`]), on the runtime the
-    /// call is made on. The start runs on one, the engine's own task needs
-    /// it. Where none is entered no task is started, nothing takes a worker
-    /// out of the trees, and a debug line says so.
+    /// block size is `page` tokens ([`LentTrees::lend`]). They are kept
+    /// here in their cell. The engine's start calls it, and only where its
+    /// document reads the prefixes sent to each worker. With the engine on
+    /// no classic policy is made that would keep such trees. Where the
+    /// start's document reads none, the first document a worker's label
+    /// puts in force that reads them fills the same cell
+    /// ([`LentTrees::under`]).
     pub(crate) fn lend_trees(
         &self,
         document: &PolicySpec,
         page: u32,
         workers: &WorkerRegistry,
     ) -> Arc<LentTrees> {
-        let made = || {
-            let trees = Arc::new(LentTrees::of_document(document.clone(), page));
-            match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => trees.follow_removals(workers, &runtime),
-                Err(_) => debug!("No runtime is entered: no task takes a worker that leaves out of the lent trees"),
-            }
-            trees
-        };
-        Arc::clone(self.lent_trees.get_or_init(made))
+        LentTrees::lend(&self.lent_trees, document, page, workers)
     }
 
-    /// The trees Grand Central is lent, where its start asked
-    /// for them: for a case that reads what the start made.
+    /// The cell of the lent trees, for the object the engine reads its
+    /// host's caches through. Trees lent behind a worker's label are read
+    /// through the cell the start handed.
+    pub(crate) fn lent_cell(&self) -> Arc<OnceLock<Arc<LentTrees>>> {
+        Arc::clone(&self.lent_trees)
+    }
+
+    /// The trees Grand Central is lent, where a document put in force
+    /// asked for them: for a case that reads what was made.
     #[cfg(test)]
     pub(crate) fn lent_trees(&self) -> Option<Arc<LentTrees>> {
         self.lent_trees.get().cloned()

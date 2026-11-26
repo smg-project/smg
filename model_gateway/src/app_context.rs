@@ -1107,27 +1107,39 @@ impl AppContextBuilder {
             .as_ref()
             .ok_or_else(|| unset("kv_event_monitor"))?;
         let events = Some(cache_events);
+        let later = respec.is_some();
         let data = WorkerData {
             registry: Arc::clone(registry) as Arc<dyn Members>,
             loads: Some(monitor.subscribe()),
-            cache_indexes: Self::engine_caches(&document, &spec, events, policies, registry),
+            cache_indexes: Self::engine_caches(&document, &spec, events, policies, registry, later),
         };
         Self::start_engine(spec, data, policies, registry, respec)?;
         Ok(self)
     }
 
-    /// The maker of every later spec of this process: the spec the routing
-    /// settings mean with a model's own policy for each worker's `policy`
-    /// label, checked as the start checks its own
-    /// (`RouterConfig::hosted_policy_with_labels`). It owns a copy of the
-    /// settings and `stages`, the table the start was handed, or the stock
-    /// one where it was handed none. The registry is handed it with the
-    /// engine and puts each spec it makes in force on that engine.
+    /// The maker of every later spec of this process. A spec it makes is
+    /// the one the routing settings mean with a model's own policy for each
+    /// worker's `policy` label. It is checked as the start checks its own
+    /// (`RouterConfig::hosted_policy_with_labels`). The maker owns a copy of
+    /// the settings and `stages`, the table the start was handed, or the
+    /// stock one where it was handed none.
+    ///
+    /// The registry is handed it with the engine and puts each spec it makes
+    /// in force on that engine. It hands the spec's document with the
+    /// checked spec: the trees the engine is lent are sized by that
+    /// document.
     fn respec(config: &RouterConfig, stages: Option<StageRegistry>) -> crate::policies::Respec {
         let config = config.clone();
         let stages = stages.unwrap_or_else(StageRegistry::builtin);
         Box::new(move |labels, generation| {
-            config.hosted_policy_with_labels(labels, generation, &stages)
+            let spec = config.hosted_policy_with_labels(labels, generation, &stages)?;
+            // The document the spec was checked from, built once more: the
+            // builder is a pure function of the settings and the labels.
+            let mut document = config
+                .policy_document_with_labels(labels)
+                .map_err(|refused| refused.to_string())?;
+            document.generation = generation;
+            Ok((document, spec))
         })
     }
 
@@ -1138,25 +1150,35 @@ impl AppContextBuilder {
     /// With the engine on no classic policy object is built, so no policy
     /// keeps the trees of the prompts this process sent. The start asks the
     /// registry for them in a policy's place
-    /// ([`PolicyRegistry::lend_trees`]), and only where `spec`, the
-    /// checked form of `document`, reads the prefixes sent to each worker:
-    /// the document's own word, whatever the settings name the policy. The
-    /// trees take the document's numbers too: its block size, and each
+    /// ([`PolicyRegistry::lend_trees`]). It asks only where `spec`, the
+    /// checked form of `document`, reads the prefixes sent to each worker.
+    /// That is the document's own word, whatever the settings name the
+    /// policy.
+    ///
+    /// The trees take the document's numbers too: its block size, and each
     /// model's `index` entry. They follow `workers`, the registry the engine
-    /// is handed: a worker it lost is taken out of them. `None` where the
-    /// process keeps neither a monitor nor trees.
+    /// is handed: a worker it lost is taken out of them.
+    ///
+    /// The object reads the trees through their cell, which a later spec
+    /// can fill. Where the start's spec reads no sent prefix, the first
+    /// spec a worker's `policy` label puts in force that reads them lends
+    /// the trees. A classic registry builds that model's trees at its
+    /// registration. So the engine is handed the object wherever the
+    /// registry holds a maker of later specs (`later`). `None` where the
+    /// process keeps neither a monitor nor trees and no later spec can
+    /// bring them.
     fn engine_caches(
         document: &PolicySpec,
         spec: &AppliedSpec,
         events: Option<&Arc<KvEventMonitor>>,
         policies: &PolicyRegistry,
         workers: &WorkerRegistry,
+        later: bool,
     ) -> Option<Arc<dyn CacheIndexes>> {
-        let trees = spec
-            .needs()
-            .sent_prefixes
-            .then(|| policies.lend_trees(document, spec.block_size(), workers));
-        let caches = EngineCaches::of(events.cloned(), trees)?;
+        if spec.needs().sent_prefixes {
+            policies.lend_trees(document, spec.block_size(), workers);
+        }
+        let caches = EngineCaches::of(events.cloned(), policies.lent_cell(), later)?;
         Some(Arc::new(caches) as Arc<dyn CacheIndexes>)
     }
 
@@ -1221,12 +1243,15 @@ impl AppContextBuilder {
         monitor: &WorkerMonitor,
     ) -> Result<(), String> {
         if let Some((document, spec)) = Self::policy_in_force(config, stages)? {
+            let respec = stages.is_none().then(|| Self::respec(config, None));
+            let later = respec.is_some();
             let data = WorkerData {
                 registry: Arc::clone(registry) as Arc<dyn Members>,
                 loads: Some(monitor.subscribe()),
-                cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
+                cache_indexes: Self::engine_caches(
+                    &document, &spec, None, policies, registry, later,
+                ),
             };
-            let respec = stages.is_none().then(|| Self::respec(config, None));
             Self::start_engine(spec, data, policies, registry, respec)?;
         }
         Ok(())
@@ -1253,7 +1278,9 @@ impl AppContextBuilder {
             let data = WorkerData {
                 registry: Arc::clone(registry) as Arc<dyn Members>,
                 loads,
-                cache_indexes: Self::engine_caches(&document, &spec, None, policies, registry),
+                cache_indexes: Self::engine_caches(
+                    &document, &spec, None, policies, registry, true,
+                ),
             };
             let respec = Some(Self::respec(config, None));
             Self::start_engine(spec, data, policies, registry, respec)?;

@@ -380,11 +380,17 @@ The registry's list of no workers, which a request for a model no worker serves 
 and is not published again. The gateway lends it with a cell of the request's own, so no value is
 kept beside it: the value made for such a request falls with the request.
 
-The token trees the engine is lent are made at the start alone, where the start's document reads
-sent prefixes. So a model that a later label makes `cache_aware` is placed by the engine's own
-record of sent prefixes, where classic builds that model's trees at its registration. That
-difference from classic stands open: trees made where a label's document first reads sent
-prefixes would end it.
+The trees the engine is lent, a token tree and a string tree for each model, have one owner. It
+is made where a document put in force first reads sent prefixes: at the start, or behind a
+worker's label. Where the start's document read them already, the owner stands, and a model that
+a later label makes `cache_aware` is handed its trees by it. Where that label's document is the
+first to read them, the owner is made there.
+
+Either way the model is decided inside its lent trees, as classic builds that model's trees at
+its registration. The engine reads them where it next builds the model's table. The gateway takes
+the size and the sweep interval of a model's trees from the model's `index` entry of the document
+in force when the tree is first asked. It lends a tree for a single request's model alone: a
+pair's sides are lent none.
 
 A document put in force keeps the stages of a profile that did not change, under the rules of
 section 5.1. Its name and its own block stand in both documents, and the document's `signals` and
@@ -2559,6 +2565,10 @@ request ──> route (HTTP or gRPC, any family)
   its trees are held to and how often. The longest cadence, a `sweep_s` of 4294967295, starts no
   pass: the trees under it are held to no size.
 
+  Where the start's document reads no sent prefixes, the first document a worker's label puts in
+  force that reads them makes the trees. Wherever they are made, the trees take the numbers of
+  the document in force: a label's document sizes its model's trees.
+
   The start makes the Grand Central crate's one start call as the last step of the context's build. The document is checked first against the table of stages the gateway's host hands the start, or the stock table where it hands none, and a refused document ends the start before the gateway listens. The engine's task follows the registry's events and tells the document's stages a worker that joined and a worker that was removed. With the engine on, the gateway builds its policy registry with no classic policy object: a stand-in that places nothing stands in its default and encode slots, and a worker's registration and a router's build add no policy.
 
 - **Each request.** Three of the four functions ask the engine. They fill `PlaceRequest` from the inputs
@@ -3513,7 +3523,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `canary`, `override: allowed`, `admission` | **[planned]** | in the schema; a document that writes one is refused, and the error names the field |
 | `shadow`, `explain.sample` | **[partly]** | the engine runs a single request's shadow, but not one that reads affinity rows of its own; it runs a pair's shadows by side at the pair's first decision, and the decode side's at a decode decided again, in a host's own process; a gateway takes a document that names them, and no served controller asks them, and `explain.sample` is kept by the served controller and, for a single request and a pair's first decision, by the engine in a gateway's process, where the gateway answers a record at `GET /policy/explain/{request_id}` (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
-| A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, the gateway hands it its labels and puts the document in force, and a document put in force keeps the stages of a profile that did not change; open: a profile for each labelled model, and token trees made where a label's document first reads sent prefixes |
+| A worker's `policy` label names its model's policy | **[partly]** | section 3.3: built: the builder of the settings' document takes a label and binds its model, the gateway hands it its labels and puts the document in force, a document put in force keeps the stages of a profile that did not change, and the trees the engine is lent are made where a label's document first reads sent prefixes; open: a profile for each labelled model |
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`InProcess`) | **[partly]** | refuses a subset hint, and a request that states protocols where a worker of its list is dialed over one it does not state; of the recorded lines only the three hard-demand sheets, `sticky_rank`, `encode_pair`, `pair_named` and 23 lines of `pair_sticky` (132), and 31 lines of `prefix_hash`, replay through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |

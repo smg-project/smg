@@ -29,6 +29,13 @@
 //! an empty cell, so no list keeps a value for each label that came and
 //! went.
 //!
+//! Ahead of each spec put in force the trees the engine is lent are put
+//! under its document ([`LentTrees::under`]). A label whose spec is the
+//! first to read the prefixes sent to each worker gets the trees made
+//! there. A classic registry builds that model's trees at its
+//! registration. A model's trees are sized by its `index` entry of the
+//! spec in force.
+//!
 //! [`RouterConfig::policy_document_with_labels`]: crate::config::RouterConfig::policy_document_with_labels
 
 use std::{
@@ -38,23 +45,38 @@ use std::{
 
 use parking_lot::Mutex;
 use smg_grand_central::{
-    document::{AppliedSpec, PRESETS},
+    document::{AppliedSpec, PolicySpec, PRESETS},
     engine::{InProcess, Phase},
 };
 use tracing::{debug, info, warn};
 
+use super::lent_trees::LentTrees;
 use crate::routers::common::snapshot::WorkerRegistry;
 
-/// Makes the checked spec this gateway runs with a set of labels: the spec
-/// the routing settings mean with a model's own policy for each label (a
-/// model's exact id to the name of a policy's preset), numbered as the
-/// second argument says and checked over the table of stages the start was
-/// handed. A refusal is answered in its own words, and no spec.
+/// Makes the checked spec this gateway runs with a set of labels. The
+/// labels map a model's exact id to the name of a policy's preset. The
+/// spec is the one the routing settings mean with a model's own policy
+/// for each label. It is numbered as the second argument says and checked
+/// over the table of stages the start was handed.
+///
+/// The spec's document is answered with its checked form: the lent trees
+/// are sized by it. A refusal is answered in its own words, and no spec.
 ///
 /// The start makes it, since the start holds the settings and that table,
 /// and hands it to the registry with the engine.
-pub(crate) type Respec =
-    Box<dyn Fn(&BTreeMap<String, String>, u64) -> Result<AppliedSpec, String> + Send + Sync>;
+pub(crate) type Respec = Box<
+    dyn Fn(&BTreeMap<String, String>, u64) -> Result<(PolicySpec, AppliedSpec), String>
+        + Send
+        + Sync,
+>;
+
+/// What a spec is made and put in force with: the maker, the registry of
+/// the lent worker lists, and the cell of the lent trees.
+struct Maker {
+    respec: Respec,
+    workers: Arc<WorkerRegistry>,
+    trees: Arc<OnceLock<Arc<LentTrees>>>,
+}
 
 /// What the deciding registration of a model said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,17 +104,28 @@ struct Decided {
 #[derive(Default)]
 pub(crate) struct Labels {
     decided: Mutex<BTreeMap<String, Decided>>,
-    /// The maker of the specs, and the registry of the worker lists the
+    /// The maker of the specs, with the worker lists and the trees the
     /// engine is lent.
-    respec: OnceLock<(Respec, Arc<WorkerRegistry>)>,
+    maker: OnceLock<Maker>,
 }
 
 impl Labels {
     /// Hands the maker of every later spec, once: the start hands it with
-    /// the engine, and with `workers`, the registry of the worker lists the
-    /// engine is lent. A second one is not taken.
-    pub(crate) fn set_respec(&self, respec: Respec, workers: Arc<WorkerRegistry>) {
-        if self.respec.set((respec, workers)).is_err() {
+    /// the engine. `workers` is the registry of the worker lists the engine
+    /// is lent, and `trees` the cell of the trees it is lent. A second one
+    /// is not taken.
+    pub(crate) fn set_respec(
+        &self,
+        respec: Respec,
+        workers: Arc<WorkerRegistry>,
+        trees: Arc<OnceLock<Arc<LentTrees>>>,
+    ) {
+        let maker = Maker {
+            respec,
+            workers,
+            trees,
+        };
+        if self.maker.set(maker).is_err() {
             warn!("a maker of policy specs is already set: the second one is not taken");
         }
     }
@@ -188,13 +221,28 @@ impl Labels {
     /// standing one says is not put in force: a label that binds nothing
     /// there costs no stage its state. Behind a spec put in force the worker
     /// lists are published again.
+    ///
+    /// Ahead of the apply the lent trees are put under the spec's document.
+    /// The table a request builds behind the apply then asks trees that
+    /// stand, sized by that spec. A refused apply puts them back under the
+    /// document they followed.
+    ///
+    /// A table built between the two asks trees sized by that document
+    /// ahead of its force, and behind a refused apply it keeps them until
+    /// its next build. Only a model whose `index` entry differs between
+    /// the two documents sees it.
     fn put_in_force(
         &self,
         engine: &InProcess,
         decided: &BTreeMap<String, Decided>,
         added: Option<(&str, &'static str)>,
     ) -> (bool, bool) {
-        let Some((respec, workers)) = self.respec.get() else {
+        let Some(Maker {
+            respec,
+            workers,
+            trees,
+        }) = self.maker.get()
+        else {
             debug!("No maker of policy specs is set: a worker's policy label is not applied");
             return (false, false);
         };
@@ -208,8 +256,8 @@ impl Labels {
         }
         let standing = engine.spec();
         let next = standing.generation().saturating_add(1);
-        let spec = match respec(&labels, next) {
-            Ok(spec) => spec,
+        let (document, spec) = match respec(&labels, next) {
+            Ok(made) => made,
             Err(refused) => {
                 match added {
                     Some((model, preset)) => {
@@ -230,6 +278,8 @@ impl Labels {
         if spec.digest() == standing.digest() {
             return (true, false);
         }
+        let reads = spec.needs().sent_prefixes;
+        let followed = LentTrees::under(trees, document, reads, spec.block_size(), workers);
         match engine.apply(spec) {
             Ok(()) => {
                 // Each list that stands holds a value of the spec before in
@@ -243,6 +293,9 @@ impl Labels {
                 (true, true)
             }
             Err(stale) => {
+                if let (Some(document), Some(owner)) = (followed, trees.get()) {
+                    owner.follow(document);
+                }
                 warn!("A policy spec built for a worker's policy label is not applied: {stale}");
                 (false, false)
             }
