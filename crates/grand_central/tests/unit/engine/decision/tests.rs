@@ -81,6 +81,7 @@ fn shadow_kind_compares_the_outcome_and_first_target() {
         emptied_by: "healthy",
         retry_after_secs: 0,
         wait_allowed: false,
+        side: None,
         trace: Trace::default(),
     });
     let queue = |ticket| {
@@ -108,6 +109,7 @@ fn shadow_kind_compares_the_outcome_and_first_target() {
                 emptied_by: "not-overloaded",
                 retry_after_secs: 3,
                 wait_allowed: false,
+                side: None,
                 trace: Trace::default(),
             }),
             ShadowKind::Agreed,
@@ -157,6 +159,28 @@ fn the_mark_of_a_lifted_veto_costs_the_trace_no_byte() {
     assert_eq!(size_of::<LiftedVeto>(), 1);
     assert_eq!(size_of::<Trace>(), 72);
     assert_eq!(Trace::default().lifted, LiftedVeto::None);
+}
+
+/// The side of a pair costs the refusal no byte, and so the decision
+/// none: it stands in a byte the refusal had spare. A side is put on a
+/// refusal alone: a pick and a queue ticket pass as they are.
+#[test]
+fn the_side_of_a_pair_costs_the_refusal_no_byte() {
+    assert_eq!(size_of::<Option<PairSide>>(), 1);
+    assert_eq!(size_of::<Shed>(), 96);
+    assert_eq!(size_of::<Decision>(), 256);
+    let refused = Decision::Shed(Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "healthy",
+        retry_after_secs: 0,
+        wait_allowed: false,
+        side: None,
+        trace: Trace::default(),
+    });
+    let named = refused.of_side(PairSide::Decode);
+    assert!(matches!(named, Decision::Shed(shed) if shed.side == Some(PairSide::Decode)));
+    let pick = Decision::Pick(Pick::default());
+    assert_eq!(pick.of_side(PairSide::Prefill), pick);
 }
 
 /// The overlap costs the pick no byte: it shares the eight bytes the
@@ -459,6 +483,7 @@ fn every_outcome_carries_its_trace_and_only_a_pick_has_targets() {
         emptied_by: "healthy",
         retry_after_secs: 1,
         wait_allowed: false,
+        side: None,
         trace,
     });
     let queue = Decision::Queue(Queue {

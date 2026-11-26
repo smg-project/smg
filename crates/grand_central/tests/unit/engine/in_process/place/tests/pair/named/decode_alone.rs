@@ -31,7 +31,7 @@ fn asked(
                 pairs.insert(placed);
             }
             Err(unplaced) => {
-                assert_eq!(unplaced, MISSED, "names {number}");
+                assert_eq!(unplaced, missed_on(PairSide::Decode), "names {number}");
                 missed += 1;
             }
         }
@@ -342,7 +342,7 @@ fn a_decode_named_alone_that_cannot_take_the_request_after_all_is_never_replaced
         worker.set_overloaded(true);
     };
     let steering = ring_decode();
-    assert_eq!(racing(steering, leaves), Err(MISSED));
+    assert_eq!(racing(steering, leaves), Err(missed_on(PairSide::Decode)));
     assert_eq!(
         racing(steering, overloads),
         Ok(0),
@@ -357,7 +357,10 @@ fn a_decode_named_alone_that_cannot_take_the_request_after_all_is_never_replaced
         ..OverloadSpec::default()
     });
     let shedding = hosted(engine_of(&document));
-    assert_eq!(racing(shedding, overloads), Err(MISSED));
+    assert_eq!(
+        racing(shedding, overloads),
+        Err(missed_on(PairSide::Decode))
+    );
 
     // The rule takes every worker while it is counted: two decodes, and
     // the first prefill, which opens the pair. Behind that it refuses the
@@ -437,7 +440,11 @@ fn a_decode_named_alone_takes_no_number_behind_a_mask_or_a_demand() {
     };
     assert_eq!(decode_of("0"), Ok(1), "the first decode on the wire");
     assert_eq!(decode_of("1"), Ok(2));
-    assert_eq!(decode_of("2"), Err(MISSED), "two decodes meet the demand");
+    assert_eq!(
+        decode_of("2"),
+        Err(missed_on(PairSide::Decode)),
+        "two decodes meet the demand"
+    );
 
     // Where neither decode on the wire can be sent to, no decode is
     // counted, though the first decode is ready: the header is not read,
@@ -517,10 +524,15 @@ fn a_prefill_with_no_counted_partner_opens_no_pair() {
     let pair = lists.under(&classes, &Open);
     let unnamed = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     let nobody = placed(engine, &lists, &unnamed);
+    // The decode side: the prefill that can be sent to has no partner
+    // left. The classic router refuses for the decode's role where an
+    // available prefill has no open partner (`P:2943-2952`, on main
+    // `d43c7b2a9`).
     let saturated = Err(Unplaced::Shed {
         reason: ShedReason::Saturated,
         emptied_by: "not-overloaded",
         retry_after_secs: 1,
+        side: Some(PairSide::Decode),
     });
     assert_eq!(nobody, saturated, "a request that names nobody");
     for number in ["0", "1", "one"] {
@@ -621,10 +633,14 @@ fn under_a_binding_that_sheds_a_prefill_over_its_thresholds_opens_no_pair() {
     let pair = lists.under(&classes, &Open);
     let unnamed = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
     let nobody = placed(shedding, &lists, &unnamed);
+    // The decode side, as above: with its shedding on the classic router
+    // lifts no veto, so the first prefill is its one available prefill and
+    // has no open partner (`P:2943-2952`, on main `d43c7b2a9`).
     let saturated = Err(Unplaced::Shed {
         reason: ShedReason::Saturated,
         emptied_by: "not-overloaded",
         retry_after_secs: 1,
+        side: Some(PairSide::Decode),
     });
     assert_eq!(nobody, saturated, "a request that names nobody");
     for number in ["0", "1", "one"] {

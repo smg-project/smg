@@ -13,6 +13,7 @@ use crate::service::proto;
 use crate::{
     document::spec::RulePlaced,
     engine::{
+        framework::PairSide,
         sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{Candidate, WorkerId},
     },
@@ -812,6 +813,28 @@ pub struct Shed {
     pub retry_after_secs: u16,
     /// The binding's scale-from-zero budget lets the host hold the request.
     pub wait_allowed: bool,
+    /// The side of a pair this refusal is for: a host answers for that
+    /// role, as the gateway's own pair selection names a role in every
+    /// refusal. A decision fills it by its own list, the one its stages
+    /// left with nobody. The prefill side where no prefill passed its own
+    /// stages, where the prefill's own run declined, and where the
+    /// prefills stand at their admission limit. The decode side where the
+    /// prefills that passed had no decode to pair with, and where the
+    /// decode's run refused. A decode decided again names the decode
+    /// side, and the prefill side where the held prefill left its list.
+    /// Two refusals name the side of the list that selection judges
+    /// instead. A pair whose named worker's number reaches nobody
+    /// (`target-worker`) names the side it reaches nobody on, the
+    /// prefills' first. A call's shed that stands behind a route's rule
+    /// names the prefill side where none of the rule's prefills can take
+    /// the request, whichever list the decision said. An encode request
+    /// names the side of its pair that a hard demand left nobody, as its
+    /// pair alone does. `None` for a single decision, for a pair refused
+    /// before either side was read, for an encode request's other
+    /// refusals of its own pass (for its encoders, for the pairs they
+    /// serve, for a list's places), and for a refusal that came over a
+    /// link: the protocol's message has no field for it.
+    pub side: Option<PairSide>,
     pub trace: Trace,
 }
 
@@ -852,6 +875,17 @@ impl Decision {
             Self::Shed(shed) => &shed.trace,
             Self::Queue(queue) => &queue.trace,
         }
+    }
+
+    /// This decision, its refusal naming the side of a pair that was left
+    /// with nobody ([`Shed::side`]). A pick and a queue ticket pass as they
+    /// are.
+    #[must_use]
+    pub(crate) fn of_side(mut self, side: PairSide) -> Self {
+        if let Self::Shed(shed) = &mut self {
+            shed.side = Some(side);
+        }
+        self
     }
 }
 
@@ -981,6 +1015,7 @@ pub(crate) fn shed(
         emptied_by,
         retry_after_secs: 1,
         wait_allowed: false,
+        side: None,
         trace: Trace {
             seed,
             generation,

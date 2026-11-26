@@ -181,6 +181,7 @@ fn a_wire_with_no_worker_left_leaves_the_retry_no_endpoint() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "wires",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(answer.sent.len(), 1, "{answer:?}");
     assert_eq!(answer.status, NO_WORKER);

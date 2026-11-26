@@ -542,6 +542,7 @@ fn a_shed_keeps_its_reason_and_pacing_and_a_queue_keeps_its_ticket() {
         emptied_by: "not-overloaded",
         retry_after_secs: 3,
         wait_allowed: true,
+        side: None,
         trace: trace(Survivors::counted(0)),
     };
     for reason in [
@@ -594,6 +595,7 @@ fn a_shed_made_ahead_of_every_profile_names_none_over_a_link() {
         emptied_by: "not-overloaded",
         retry_after_secs: 3,
         wait_allowed: true,
+        side: None,
         trace: Trace {
             profile: 0,
             ..trace(Survivors::counted(0))
@@ -751,6 +753,7 @@ fn an_answers_encoders_are_read_in_the_keys_order() {
         emptied_by: "controller",
         retry_after_secs: 0,
         wait_allowed: false,
+        side: None,
         trace: trace(Survivors::counted(0)),
     });
     placed(Some(&one), &shed, &items, &mut room).expect("a shed places nothing");

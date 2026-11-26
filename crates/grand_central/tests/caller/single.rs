@@ -245,6 +245,7 @@ fn a_worker_that_cannot_be_sent_to_takes_no_request() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "healthy",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(
         answer,

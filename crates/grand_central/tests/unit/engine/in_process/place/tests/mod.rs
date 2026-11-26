@@ -945,24 +945,30 @@ fn a_worker_is_ready_by_its_status_and_its_breaker() {
 }
 
 /// A whole decision's pick is handed on. A shed hands on its reason, the
-/// stage that left nobody and its retry hint, and a queue ticket is answered
-/// as queued.
+/// stage that left nobody, its retry hint and the side of a pair it names,
+/// and a queue ticket is answered as queued. The side costs the answer no
+/// byte: it stands in one the shed's answer had spare.
 #[test]
 fn a_decision_that_placed_nothing_says_why() {
     assert!(picked(&Decision::Pick(Pick::default())).is_ok());
-    let shed = Shed {
-        reason: ShedReason::Saturated,
-        emptied_by: "has-capacity",
-        retry_after_secs: 7,
-        wait_allowed: false,
-        trace: Trace::default(),
-    };
-    let said = Unplaced::Shed {
-        reason: ShedReason::Saturated,
-        emptied_by: "has-capacity",
-        retry_after_secs: 7,
-    };
-    assert_eq!(picked(&Decision::Shed(shed)).err(), Some(said));
+    for side in [None, Some(PairSide::Prefill), Some(PairSide::Decode)] {
+        let shed = Shed {
+            reason: ShedReason::Saturated,
+            emptied_by: "has-capacity",
+            retry_after_secs: 7,
+            wait_allowed: false,
+            side,
+            trace: Trace::default(),
+        };
+        let said = Unplaced::Shed {
+            reason: ShedReason::Saturated,
+            emptied_by: "has-capacity",
+            retry_after_secs: 7,
+            side,
+        };
+        assert_eq!(picked(&Decision::Shed(shed)).err(), Some(said));
+    }
+    assert_eq!(size_of::<Unplaced>(), 24);
     let queue = Queue {
         ticket: 1,
         max_wait_micros: 0,
@@ -1860,6 +1866,7 @@ fn a_rule_that_takes_no_worker_is_shed_under_its_name() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "admits",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(engine.place(&request).err(), Some(shed));
     let calls: Vec<_> = (0..4).chain(0..6).map(id).collect();
@@ -1893,6 +1900,7 @@ fn a_rule_that_takes_no_worker_is_shed_where_no_pick_is_ready() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "admits",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(engine.place(&request).err(), Some(shed));
     let calls: Vec<_> = (0..6).map(id).collect();
@@ -2090,6 +2098,7 @@ fn a_later_decision_is_given_what_the_call_has_left_of_the_budget() {
         reason: ShedReason::Deadline,
         emptied_by: "budget",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(engine.place(&short).err(), Some(shed));
     let first = worker_id(list[0].as_ref());
@@ -2268,6 +2277,7 @@ fn a_request_with_no_worker_is_answered_why() {
             reason,
             emptied_by,
             retry_after_secs: 1,
+            side: None,
         })
     };
     let none = PlaceRequest::of(MODEL, WorkerLists::None);
@@ -2693,6 +2703,7 @@ fn a_shadow_alone_walks_the_lent_ring() {
             reason: ShedReason::NoEndpoints,
             emptied_by,
             retry_after_secs: 1,
+            side: None,
         })
     };
     assert_eq!(engine.place(&unserved).err(), refused("vision"));

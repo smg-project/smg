@@ -32,7 +32,7 @@ use smg_grand_central::{
         AppliedSpec, Assignment, DecodePick, LoadMetricSetting, ModeSettings, PolicySettings,
         PolicySpec, RoutingSettings, ScoreSpec,
     },
-    engine::{ShedReason, Unplaced},
+    engine::{PairSide, ShedReason, Unplaced},
     stages::StageRegistry,
 };
 use smg_worker::{
@@ -193,12 +193,15 @@ fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
 /// decode can be sent to, the engine names no pair under the `healthy`
 /// filter's name, and the program answers a 503. So it does for a model
 /// that has prefills and no decode at all, where no filter emptied a list
-/// and the engine names none.
+/// and the engine names none. Each refusal names the decode side, which
+/// was left with nobody.
 ///
 /// The classic router answers a pair whose only decode is not ready as the
 /// decode role's unavailability: its case
 /// `a_pair_whose_only_decode_is_not_ready_is_the_decode_roles_unavailability`
-/// (`model_gateway/src/routers/common/placement.rs:4638-4650`).
+/// (`model_gateway/src/routers/common/placement.rs`). It answers a decode
+/// pool with no worker for the decode's role too (`pair_pass` in that
+/// file: its test of `decode_pool` for a role with no worker).
 #[test]
 fn a_side_that_cannot_be_sent_to_takes_no_request() {
     let fleet = fleet(2, 3);
@@ -225,6 +228,7 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "healthy",
         retry_after_secs: 1,
+        side: Some(PairSide::Decode),
     };
     assert_eq!(
         answer,
@@ -242,6 +246,7 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "none",
         retry_after_secs: 1,
+        side: Some(PairSide::Decode),
     };
     assert_eq!(
         answer,

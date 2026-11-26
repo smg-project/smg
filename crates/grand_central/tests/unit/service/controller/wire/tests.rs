@@ -937,6 +937,7 @@ fn a_shed_names_its_reason_and_its_stage_and_a_ticket_its_wait() {
             emptied_by: "healthy",
             retry_after_secs: 7,
             wait_allowed: true,
+            side: None,
             trace: traced(),
         });
         let (outcome, trace, leases) = carried(decided(Vec::new(), 1, &shed, None, None));

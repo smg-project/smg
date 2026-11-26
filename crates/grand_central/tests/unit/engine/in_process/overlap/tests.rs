@@ -352,6 +352,7 @@ fn shed() -> Decision {
         emptied_by: "a case",
         retry_after_secs: 0,
         wait_allowed: false,
+        side: None,
         trace: Trace::default(),
     })
 }

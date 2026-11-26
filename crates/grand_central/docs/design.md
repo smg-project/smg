@@ -1211,6 +1211,7 @@ pub struct Shed {           // the request is refused
     pub emptied_by: &'static str, // the filter or picker that left no worker
     pub retry_after_secs: u16,
     pub wait_allowed: bool,       // the host may hold the request (scale from zero)
+    pub side: Option<PairSide>,   // the side of a pair that was left with no worker
     pub trace: Trace,
 }
 pub enum ShedReason {
@@ -1236,6 +1237,23 @@ pub struct Trace {
 ```
 
 `Queue` (the request waits) is defined; no built-in stage issues one **[planned]**.
+
+A pair's refusal names the side it is for (`Shed::side`), and a host answers for that role, as
+the gateway's own pair selection names a role in every refusal. A decision fills the side by its
+own list, the one its stages left with no worker. It is the prefill side where no prefill passed
+its own stages, where the prefill's picker declined, and where the prefills stand at their
+admission limit. It is the decode side where the prefills that passed had no decode to pair with,
+and where the decode's own run refused. Two refusals name the side of the list that selection
+judges instead (section 8.2). A pair whose named worker's number reaches nobody names the side it
+reaches nobody on, the prefills' first. A call's shed that stands behind a route's rule names the
+prefill side where none of the rule's prefills can take the request, whichever list the decision
+said. On one recorded line the decision's own list is not the one that selection judges (section
+13.1, point 4). No side is named for a single decision, for a pair refused before either side
+was read (no binding takes it, or it states what a pair's decision does not honour), and for an
+answer that came over a link: the protocol's `Shed` has no field for it. An encode request names
+the side of its pair that a hard demand left nobody, as its pair alone does. Its own pass names
+no side in its other refusals: for its encoders, for the pairs they serve, and for a list's
+places.
 
 The HTTP status codes belong to the host. The engine only says why.
 
@@ -1955,7 +1973,7 @@ pub struct Placement<'a> {               // built, see part 3
 }
 
 pub enum Unplaced {
-    Shed { reason: ShedReason, emptied_by: &'static str, retry_after_secs: u16 },
+    Shed { reason: ShedReason, emptied_by: &'static str, retry_after_secs: u16, side: Option<PairSide> },
     Queued,
     PrefillsFull, // the host's admission holds back every prefill of a pair that has an open partner: the host waits for room
     NoWorkers,
@@ -1994,6 +2012,10 @@ decision said a list. There the shed is the answer where one of the rule's prefi
 request and the decision shed over the decodes, and where none can, one of them is ready and every
 ready one is over its thresholds. A prefill that pairs with no decode is no prefill of the rule's
 there: a rule that takes only such prefills is answered as one that takes none.
+
+A shed that stands names the side of the list the gateway's own selection judges there. That is
+the decision's own side, but the prefill side where none of the rule's prefills can take the
+request, whichever list the decision said.
 
 A decision that sheds a pair as saturated says the list it shed over where the gateway's own
 selection would read that list as wholly over its thresholds too. Of the prefills at the request's
@@ -2120,7 +2142,8 @@ A named prefill at the admission
 limit is waited for (`Unplaced::PrefillsFull`), as classic waits for it. A named decode with no
 free room is taken, because the `has-room` filter is soft (classic,
 `retain_decodes_with_a_room`). A retry is handed the pair again. A number that reaches no worker
-on a side sheds the pair under `target-worker`, as classic refuses it.
+on a side sheds the pair under `target-worker` and names that side, as classic refuses for the
+role whose policy found no target.
 
 Where no decode can be
 sent to, a decode over its thresholds alone counts as a partner, and the decode goes by load, as
@@ -3087,7 +3110,7 @@ On main: 21 sheets, 537 lines.
 | recorded, replayed by nothing (`constraint_decider`) | 1 | 5 |
 | recorded, and refused by the routing settings by name (`pair_sticky`: a pair with one side under `consistent_hashing`) | | 2 |
 | replayed through the engine (`InProcess`) | **7**, and 31 lines of `prefix_hash` | **163** |
-| replayed lines held to an answer of the crate's own, not classic's | | 7 |
+| replayed lines held to an answer of the crate's own, not classic's | | 8 |
 
 A replay of all seventeen decision sheets through `InProcess` over worker objects is in work and not on main yet: on main the three hard-demand sheets (`retry_wire`, `media_refs`, `context_window`; 26 lines), `sticky_rank` (8 lines), `encode_pair` (52 lines), `pair_named` (23 lines), 23 lines of `pair_sticky` and 31 lines of `prefix_hash` replay through it. Measured
 with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that recorded a decision
@@ -3128,9 +3151,18 @@ Five things follow, and they are the first work of section 16.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,
    `least_load` and `consistent_hashing`. Their only recorded lines are over pools in trouble.
    New recorders are decision 2.
-4. **Two limits on "as classic recorded".** A pair's refusal names no side in the engine's
-   answer, so the pair sheet's refusals are compared by their reason alone, where classic names
-   the side. A change of stage 1 makes a pair's refusal name its side. The 12 ring lines of
+4. **Two limits on "as classic recorded".** A pair's refusal names its side in the engine's
+   answer (`Shed::side`). The four pair sheets' refusals are compared by their reason and by
+   their role, where classic names the role.
+
+   They hold 54 recorded refusals on 27 lines, and 52
+   of them agree on the role. One line's two refusals do not, and the replay holds it apart by
+   name. On that line every prefill is over its thresholds under a policy that weighs load itself,
+   and every decode is down. Classic judges the prefill pool as it stood before its lift and
+   refuses for the prefill's role, and the pair's decision names the decode side. That line ends
+   when the pair's decision judges one list for its refusal, as classic's selection does.
+
+   The 12 ring lines of
    `all_vetoed` name their workers by the key's order on the engine's own ring: they prove the
    walk past a vetoed worker, not that a key lands on classic's worker (decision 3). With a ring
    its caller lends, the 12 answer as recorded over hand-built candidates
@@ -3265,7 +3297,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | placed on the ring the host lends (decision 3): through `place` the plain ring at the place the engine reads with the request's keys, and `prefix_hash` at the places the host's ring answers for the request's heads, where it answers for a head; that both are classic's is proven at stage 3; a host that lends none is placed on the crate's ring, which may be another worker than classic's |
 | `manual` and sticky sessions on that engine | **[partly]** | the sheets of `manual` and of the sticky override's single requests (`sticky_override`) replay through the decision function, not through the engine; the override's sheet of pairs (`pair_sticky`) replays through the engine's one call for a host in process, under the document the routing settings give for each line: 23 of its 25 lines as recorded, and the settings refuse the other 2 by name, a pair with one side under `consistent_hashing` |
 | `bucket` on that engine | **[partly]** | the same |
-| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; one of its 40 lines is held to an answer of the crate's own; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded, the 10 also over the classes a controller's pairing rule derives; the 23 lines of a pair that names its worker (`pair_named`) replay through the engine's one call for a host in process |
+| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) replays through the pair's decision function, not through the engine; two of its 40 lines are held to an answer of the crate's own, one by its reason and one by its role; the 8 lines behind the prefill admission's bound (`pair_bound`) and the 10 lines of a pair on one known runtime (`pair_runtime`) replay through that function as recorded, the 10 also over the classes a controller's pairing rule derives; the 23 lines of a pair that names its worker (`pair_named`) replay through the engine's one call for a host in process |
 | Encode-prefill-decode on that engine | **[partly]** | `InProcess::decide_encode_at` decides it over a host's three lists and issues the pair's lease, and `place` places it; the entry declines a request held to a wire that a worker of its pair's two lists is not dialed on, places its items on the encoders dialed on a wire it states, declines a request with items where the list holds encoders and none is, and declines one that states the later decode where its decode is held to the workers that take images, or where it carries items and demands vision or a way of processing its references: a decode asked again takes no items |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request, for a pair and for an encode request, with the route's rule and the decision made again, three decisions a call at most, and the later decisions of a single request, of a pair and of an encode request held to the workers the route's rule takes; an encode request's header for a target is not read |

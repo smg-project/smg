@@ -260,7 +260,11 @@ fn a_manual_side_of_a_pair_is_placed_by_the_rules_assignment() {
 
 /// A prefill picker's decline passes through among first partners too:
 /// the pair's decision is the decline, by the picker's name, and no
-/// request waits for a prefill the picker was shown.
+/// request waits for a prefill the picker was shown. It names the
+/// prefill side: the gateway's own pair selection refuses for the
+/// prefill's role where its prefill policy picks nobody
+/// (`model_gateway/src/routers/common/placement.rs:3044`, on main
+/// `d43c7b2a9`).
 #[test]
 fn a_prefill_pickers_decline_passes_through_among_first_partners() {
     let declining = Profile {
@@ -293,6 +297,7 @@ fn a_prefill_pickers_decline_passes_through_among_first_partners() {
             Decision::Shed(shed) => {
                 assert_eq!(shed.reason, ShedReason::PolicyDeclined);
                 assert_eq!(shed.emptied_by, "refuses-class");
+                assert_eq!(shed.side, Some(PairSide::Prefill));
             }
             other => panic!("a prefill picker that declines answered {other:?}"),
         }

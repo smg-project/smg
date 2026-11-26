@@ -348,6 +348,7 @@ fn a_call_shed_under_the_rules_name_leaves_no_holder() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "admits",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(engine.place(&request).err(), Some(shed));
     assert_eq!(entry.asked.get(), 1, "one decision");

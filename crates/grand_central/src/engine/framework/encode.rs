@@ -46,13 +46,13 @@
 
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
-    run_profile, shed, Buffers, ClassBits, Engine, PairPools, PairTable, Plan, Profile, Scratch,
-    Set, ShedOver, AFFINITY_COLUMN,
+    run_profile, shed, Buffers, ClassBits, Engine, PairPools, PairSide, PairTable, Plan, Profile,
+    Scratch, Set, ShedOver, AFFINITY_COLUMN,
 };
 use crate::{
     engine::{
         decision::{Decision, ShedReason, Target, Targets, Trace, PLACES, TARGET_WORKER},
-        demands::{DemandFacts, Demands, References},
+        demands::{DemandFacts, Demands, References, UnmetDemand},
         view::{
             AffinityFacts, Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts,
             WireModes,
@@ -904,13 +904,18 @@ impl Engine {
 
     /// [`Self::decide_encode_pair`] for a caller that judged a hard demand
     /// of the pair's two sides ahead of this call, each among its own
-    /// places. `unmet` is the stage of the demand that left a side nobody,
-    /// where one did: a request with items is shed under it with no
-    /// endpoint, behind three answers for its encoders (a gap of their
+    /// places. `unmet` is the demand that left a side nobody, and that
+    /// side, where one did: a request with items is shed under its stage
+    /// with no endpoint, for that side, behind three answers for its
+    /// encoders (a gap of their
     /// membership, none open, a saturated fleet) and ahead of the pair's.
-    /// Those three stand first, whatever its pair lacks. The encoders'
-    /// `places` answer waits behind the side's stage, as it waits behind
-    /// a gap of the pair's membership. A
+    /// Those three stand first, whatever its pair lacks. Where a list of
+    /// the pair holds no row, the request is answered there as its pair
+    /// alone is, over no candidate ([`Self::decide_over_an_empty_list`]):
+    /// with `unmet`, `cx` and `decode_cx` are the request's own
+    /// constraints, with no list's places or mask. The
+    /// encoders' `places` answer waits behind the side's stage, as it
+    /// waits behind a gap of the pair's membership. A
     /// request with no item reads no encoder: its caller sheds it ahead of
     /// this call, and `unmet` is not read for it.
     #[expect(
@@ -927,7 +932,7 @@ impl Engine {
         cx: &Constraints<'_>,
         decode_cx: &Constraints<'_>,
         encode_cx: &Constraints<'_>,
-        unmet: Option<&'static str>,
+        unmet: Option<(UnmetDemand, PairSide)>,
         scratch: &mut Scratch,
         placed: &mut EncodePlaced,
     ) -> Decision {
@@ -963,7 +968,7 @@ impl Engine {
         cx: &Constraints<'_>,
         decode_cx: &Constraints<'_>,
         encode_cx: &Constraints<'_>,
-        unmet: Option<&'static str>,
+        unmet: Option<(UnmetDemand, PairSide)>,
         scratch: &mut Scratch,
         side: &mut EncodeScratch,
         placed: &mut EncodePlaced,
@@ -1165,10 +1170,19 @@ impl Engine {
             side.far_member.sort_unstable();
             // A side of the pair that a hard demand left nobody, as this
             // call's caller judged it: said behind the encoders' own
-            // answers above and ahead of the pair's, under no profile, as
-            // the judge itself says it for a request with no item.
-            if let Some(stage) = unmet {
-                return turned_away(ShedReason::NoEndpoints, stage, unbound);
+            // answers above and ahead of the pair's, under no profile and
+            // for that side, as the judge itself says it for a request
+            // with no item. One list of the pair alone is no pair,
+            // whatever the demand left of the other: the answer is then
+            // its pair's own over no candidate, under the request's own
+            // constraints, which the caller hands for such a side.
+            if let Some((demand, lacking)) = unmet {
+                if pools.prefills.is_empty() || pools.decodes.is_empty() {
+                    let prefills = !pools.prefills.is_empty();
+                    return self.decide_over_an_empty_list(facts, pool, prefills, cx, scratch);
+                }
+                let stage = demand.stage();
+                return turned_away(ShedReason::NoEndpoints, stage, unbound).of_side(lacking);
             }
         }
         // The pairs by membership: one at all, one an encoder serves, and
