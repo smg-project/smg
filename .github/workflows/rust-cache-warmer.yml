@@ -10,7 +10,7 @@ name: Rust Cache Warmer
 # the same action inputs and the same environment those jobs have (the cache
 # key hashes both), and saves the complete entry the pull requests then
 # restore. Its concurrency group is its own, so no merge cancels it, and a run
-# that fails saves nothing (smg-project/smg-lab#157).
+# that fails saves nothing.
 on:
   schedule:
     - cron: '17 */6 * * *'
