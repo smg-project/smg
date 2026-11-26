@@ -36,8 +36,6 @@ pub(crate) use document_manager::Validate;
 pub(crate) use document_manager::{above, Checked, Entered, FollowerTurn, Held, Line};
 pub use document_manager::{dry_run_against, DocumentManager};
 #[cfg(feature = "controller")]
-pub(crate) use document_manager::{DRY_RUNS_WAITING, WRITES_WAITING};
-#[cfg(feature = "controller")]
 pub(crate) use reader::over_bound;
 pub use reader::{Format, MAX_DOCUMENT_BYTES};
 pub use turn::SerialTurn;
