@@ -1895,7 +1895,8 @@ fn decided_widths(bed: &Bed, table: PairTable<'_>) -> (Decision, [usize; 4]) {
         .encode
         .as_deref()
         .expect("the entry leaves its side in the scratch");
-    let sets = [&side.open, &side.member, &side.decodes_of, &side.vision_of];
+    let held = &side.decode_classes;
+    let sets = [&side.open, &side.member, &held.registered, &held.vision];
     (decision, sets.map(|set| set.words.len()))
 }
 
@@ -1967,6 +1968,63 @@ fn an_encode_class_above_the_rows_handed_is_a_class_still() {
         panic!("a pick, not {decision:?}");
     };
     assert_eq!(targets.first().map(|target| target.position), Some(1));
+}
+
+/// The index of `decodes`, of a fleet of as many, under `table`.
+fn index_of(decodes: &[Candidate], table: PairTable<'_>) -> DecodeClasses {
+    let mut classes = DecodeClasses::default();
+    classes.fill(decodes, decodes.len(), &table);
+    classes
+}
+
+#[test]
+fn a_far_decode_class_is_found_whatever_the_order_of_its_rows() {
+    // Under no table the numbers above the bits stand in two lists, and
+    // each is found whatever the order of its rows: four far classes, the
+    // largest first, and the third takes no images.
+    let far = |at: u32, below: u32| row(at, Role::Decode, u32::MAX - below, 0);
+    let mut decodes = vec![far(0, 0), far(1, 1), far(2, 5), far(3, 9)];
+    decodes[2].vision = false;
+    // A decode of no class stands beside them.
+    decodes.push(row(4, Role::Decode, 0, 0));
+    let classes = index_of(&decodes, PairTable::default());
+    for below in [0, 1, 5, 9] {
+        let class = u32::MAX - below;
+        assert!(classes.holds(class), "{below} below the largest");
+        let vision = classes.holds_vision(class);
+        assert_eq!(vision, below != 5, "{below} below the largest");
+    }
+    // A far number no decode names is no class, and neither is the number
+    // of the decode outside any pairing.
+    for class in [u32::MAX - 2, 0] {
+        assert!(!classes.holds(class), "class {class}");
+        assert!(!classes.holds_vision(class), "class {class}");
+    }
+}
+
+#[test]
+fn a_tables_decode_classes_stand_in_the_tables_own_width() {
+    // Under a table the sets are the table's width, whatever the count of
+    // the decodes: one decode of the last of a table's seventy classes.
+    let listed: Vec<u32> = (1..=70).collect();
+    let ends = [70];
+    let decodes = [row(0, Role::Decode, 70, 0)];
+    let classes = index_of(&decodes, PairTable::new(&ends, &listed));
+    assert!(classes.holds(70));
+    assert!(classes.holds_vision(70));
+    let sets = [&classes.registered, &classes.vision];
+    assert_eq!(sets.map(|set| set.words.len()), [2, 2]);
+    // A number above the table's count is no class of it, and no list
+    // keeps it.
+    let (ends, listed) = ([1], [1]);
+    let decodes = [
+        row(0, Role::Decode, 1, 0),
+        row(1, Role::Decode, u32::MAX, 0),
+    ];
+    let classes = index_of(&decodes, PairTable::new(&ends, &listed));
+    assert!(classes.holds(1));
+    assert!(!classes.holds(u32::MAX));
+    assert!(!classes.holds_vision(u32::MAX));
 }
 
 #[test]
