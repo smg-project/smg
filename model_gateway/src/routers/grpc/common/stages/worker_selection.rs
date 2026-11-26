@@ -2690,10 +2690,33 @@ impl WorkerSelectionStage {
         // post-encode dispatch check rejects actual grids before sending P/D.
         let prefer_vision = demand.decode_vision
             || (demand.encode.media_refs && demand.encode.vision && vision_pair_exists);
-        let eligible = |worker: &dyn Worker| {
+        let eligible_for = |encoders: &[Arc<dyn Worker>], worker: &dyn Worker| {
             (!prefer_vision || decode_vision(worker))
-                && (!needs_encode || available_encode.iter().any(|e| compatible(e, worker)))
+                && (!needs_encode || encoders.iter().any(|e| compatible(e, worker)))
         };
+        if needs_encode
+            && !shedding
+            && !encode_overload_lifted
+            && !pair_admitted_by(&pairs, demand.wire, &|worker| {
+                (worker.is_available() || overload::vetoed_by_overload_alone(worker))
+                    && eligible_for(&available_encode, worker)
+            })
+        {
+            // When non-overloaded encoders exist for another runtime/contract but none
+            // match any live P/D pair, fall back to overloaded compatible encoders.
+            let overloaded_encode: Vec<_> = registered_encode
+                .iter()
+                .filter(|worker| {
+                    capable(worker) && overload::vetoed_by_overload_alone(worker.as_ref())
+                })
+                .cloned()
+                .collect();
+            if !overloaded_encode.is_empty() {
+                available_encode = overloaded_encode;
+                encode_overload_lifted = true;
+            }
+        }
+        let eligible = |worker: &dyn Worker| eligible_for(&available_encode, worker);
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
@@ -9428,6 +9451,58 @@ mod tests {
             MediaDemands::NONE,
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn epd_encode_overload_fallback_ignores_incompatible_healthy_encoder() {
+        let (registry, stage, encoders) = prepared_epd_overload_fixture(false);
+        for encoder in &encoders {
+            registry.set_worker_overloaded(encoder, true);
+        }
+        // Register a healthy vLLM push encoder that is capable of vision media but
+        // incompatible with the SGLang P/D pair.
+        let vllm_encoder: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8999")
+                .model(ModelCard::new("epd-overload-model"))
+                .worker_type(WorkerType::Encode)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .label("supports_vision", "true")
+                .label("ec_role", "ec_producer")
+                .label("ec_connector", "ECCPUConnector")
+                .build(),
+        );
+        registry.register(vllm_encoder).unwrap();
+
+        let (assigned, prefill, decode, runtime) = stage
+            .select_encode_prefill_decode_workers(
+                "epd-overload-model",
+                PlacementInputs::default(),
+                &[vec![0xaa, 0xbb]],
+                EpdDemands {
+                    wire: None,
+                    encode: MediaDemands {
+                        media_refs: false,
+                        vision: true,
+                        pipeline: PipelinePin::Any,
+                    },
+                    decode_vision: false,
+                    image_fanout: false,
+                },
+                None,
+            )
+            .unwrap_or_else(|_| {
+                panic!("healthy incompatible encoder must not block overloaded compatible fallback")
+            });
+        assert_eq!(runtime, RuntimeType::Sglang);
+        assert_eq!(assigned.len(), 1);
+        assert!(
+            assigned[0].worker.url() == "grpc://127.0.0.1:8970"
+                || assigned[0].worker.url() == "grpc://127.0.0.1:8971"
+        );
+        assert_eq!(prefill.url(), "grpc://127.0.0.1:8972");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:8973");
     }
 }
 

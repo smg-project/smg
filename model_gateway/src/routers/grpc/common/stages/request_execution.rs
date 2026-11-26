@@ -448,12 +448,12 @@ pub(crate) fn execute_plan<'a>(
                         ledger,
                         room_residue,
                         None,
+                        None,
                         behind.take(),
                     ))
                     .await
                 }
                 ExecutionPlan::EncodePrefillDecode { request } => {
-                    let push_encode = matches!(encode, Some(EncodeOutputs::Push(_)));
                     // A rendezvous plan's bootstrap info went into the prefill
                     // request at request building and its encode jobs go with the
                     // prefill/decode pair; a push plan runs its encode call first.
@@ -470,14 +470,6 @@ pub(crate) fn execute_plan<'a>(
                         behind.take(),
                     ))
                     .await
-                    .map_err(|mut response| {
-                        // A push may already have reserved buffers on this
-                        // prefill replica.
-                        if push_encode {
-                            mark_non_retryable(&mut response);
-                        }
-                        response
-                    })
                 }
                 ExecutionPlan::Batch { kind, requests, .. } => {
                     execute_batch_dispatch(
@@ -816,6 +808,7 @@ async fn execute_pd_dispatch(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
+    prepared_deadline: Option<tokio::time::Instant>,
     behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
     let protocol = pd_protocol(workers)?;
@@ -873,6 +866,7 @@ async fn execute_pd_dispatch(
                         prefill_guard,
                         ledger,
                         encode,
+                        prepared_deadline,
                     )
                     .await
                 }
@@ -974,28 +968,38 @@ async fn execute_fanout_pd(
         samples = n,
         "PD fan-out: one single-sample pair per sample, each with its own room"
     );
-    let child_encodes: Vec<Option<EncodeWatch>> = if let Some(input) = prepared {
-        build_fanout_prepared_encodes(&mut subs, input, workers)?
-            .into_iter()
-            .map(|job| Some(launch_prepared_encode(job.dispatch())))
-            .collect()
-    } else {
-        vec![encode; subs.len()]
-    };
+    let child_encodes: Vec<(Option<EncodeWatch>, Option<tokio::time::Instant>)> =
+        if let Some(input) = prepared {
+            build_fanout_prepared_encodes(&mut subs, input, workers)?
+                .into_iter()
+                .map(|job| {
+                    let deadline = job.deadline();
+                    (Some(launch_prepared_encode(job.dispatch())), Some(deadline))
+                })
+                .collect()
+        } else {
+            vec![(encode, None); subs.len()]
+        };
     // The samples share the one admission slot; each pair's Prefill phase
     // ends on its own, so each carries its own handle.
     let guards = prefill_guard.replicate_to(subs.len());
-    let dispatches =
-        subs.into_iter()
-            .zip(guards)
-            .zip(child_encodes)
-            .map(|((sub, guard), child_encode)| {
-                let mut clients = clients.clone();
-                async move {
-                    execute_parallel_pd(sub, &mut clients, workers, guard, ledger, child_encode)
-                        .await
-                }
-            });
+    let dispatches = subs.into_iter().zip(guards).zip(child_encodes).map(
+        |((sub, guard), (child_encode, child_deadline))| {
+            let mut clients = clients.clone();
+            async move {
+                execute_parallel_pd(
+                    sub,
+                    &mut clients,
+                    workers,
+                    guard,
+                    ledger,
+                    child_encode,
+                    child_deadline,
+                )
+                .await
+            }
+        },
+    );
     let results = try_join_all(dispatches).await?;
 
     let mut prefills = Vec::with_capacity(results.len());
@@ -1064,50 +1068,66 @@ async fn execute_epd_dispatch(
     ledger: &AttemptLedger,
     behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
-    if let Some(n) = workers
-        .disaggregated_runtime_type()
-        .and_then(|runtime| PdProtocol::for_runtime(*runtime))
-        .and_then(|protocol| pd_fanout_width(&proto_request, protocol))
-    {
-        if let Some(EncodeOutputs::PreparedInput(input)) = encode {
-            let result = execute_fanout_pd(
-                proto_request,
-                n,
-                clients,
-                workers,
-                prefill.sent(),
-                ledger,
-                None,
-                None,
-                Some(*input),
-            )
-            .await?;
-            return Ok(attribute_pd_sides(result, workers));
-        }
-    }
-    let mut cleanup =
-        prepare_epd_attempt(&mut proto_request, workers, encode, encode_watch).await?;
-    // An EPD request's room is left as minted: no sticky prefill rank.
-    let result = execute_pd_dispatch(
-        proto_request,
-        clients,
-        workers,
-        model,
-        prefill,
-        ledger,
-        None,
-        encode_watch.clone(),
-        behind,
-    )
-    .await;
-    if result.is_ok() {
-        if let Some(cleanups) = cleanup.as_mut() {
-            for cleanup in cleanups {
-                cleanup.disarm();
+    let non_retryable_encode = matches!(
+        encode,
+        Some(EncodeOutputs::Push(_) | EncodeOutputs::PreparedInput(_))
+    );
+    let outcome: Result<ExecutionResult, Response> = async {
+        if let Some(n) = workers
+            .disaggregated_runtime_type()
+            .and_then(|runtime| PdProtocol::for_runtime(*runtime))
+            .and_then(|protocol| pd_fanout_width(&proto_request, protocol))
+        {
+            if let Some(EncodeOutputs::PreparedInput(input)) = encode {
+                let result = execute_fanout_pd(
+                    proto_request,
+                    n,
+                    clients,
+                    workers,
+                    prefill.sent(),
+                    ledger,
+                    None,
+                    None,
+                    Some(*input),
+                )
+                .await?;
+                return Ok(attribute_pd_sides(result, workers));
             }
         }
+        let (mut cleanup, prepared_deadline) =
+            prepare_epd_attempt(&mut proto_request, workers, encode, encode_watch).await?;
+        // An EPD request's room is left as minted: no sticky prefill rank.
+        let result = execute_pd_dispatch(
+            proto_request,
+            clients,
+            workers,
+            model,
+            prefill,
+            ledger,
+            None,
+            encode_watch.clone(),
+            prepared_deadline,
+            behind,
+        )
+        .await;
+        if result.is_ok() {
+            if let Some(cleanups) = cleanup.as_mut() {
+                for cleanup in cleanups {
+                    cleanup.disarm();
+                }
+            }
+        }
+        result
     }
-    result
+    .await;
+    outcome.map_err(|mut response| {
+        // A push or prepared-input handoff already bound encoder work to this
+        // attempt and consumed `encode_outputs`, so a retry cannot replay it.
+        if non_retryable_encode {
+            mark_non_retryable(&mut response);
+        }
+        response
+    })
 }
 
 /// Ready an EPD attempt's prefill request for its encode handoff, and leave
@@ -1127,7 +1147,7 @@ async fn prepare_epd_attempt(
     workers: &WorkerSelection,
     encode: Option<EncodeOutputs>,
     carried: &mut Option<EncodeWatch>,
-) -> Result<Option<Vec<PushCleanup>>, Response> {
+) -> Result<(Option<Vec<PushCleanup>>, Option<tokio::time::Instant>), Response> {
     match encode {
         Some(EncodeOutputs::PreparedInput(input)) => {
             let ProtoGenerateRequest::Sglang(request) = proto_request else {
@@ -1139,18 +1159,19 @@ async fn prepare_epd_attempt(
             let job = input
                 .build(request, workers)
                 .map_err(|s| s.to_http_error("prepared_input", s.message().to_owned()))?;
+            let deadline = job.deadline();
             *carried = Some(launch_prepared_encode(job.dispatch()));
-            Ok(None)
+            Ok((None, Some(deadline)))
         }
-        Some(EncodeOutputs::Push(plan)) => Ok(Some(plan.encode(proto_request).await?)),
+        Some(EncodeOutputs::Push(plan)) => Ok((Some(plan.encode(proto_request).await?), None)),
         Some(EncodeOutputs::Rendezvous { dispatch, .. }) => {
             *carried = launch_encode_dispatch(dispatch);
             proto_request.clear_mm_pixel_values();
-            Ok(None)
+            Ok((None, None))
         }
         None => {
             proto_request.clear_mm_pixel_values();
-            Ok(None)
+            Ok((None, None))
         }
     }
 }
@@ -1350,6 +1371,7 @@ async fn execute_batch_dispatch(
                             ledger,
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
+                            None, // no prepared-input handoff on batch completion path
                             None, // the decode's guard said its send where it was made
                         )
                         .await
@@ -1881,6 +1903,7 @@ async fn execute_parallel_pd(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
     encode: Option<EncodeWatch>,
+    prepared_deadline: Option<tokio::time::Instant>,
 ) -> Result<ExecutionResult, Response> {
     let streaming = proto_request.stream();
     let runtime = workers
@@ -1897,7 +1920,9 @@ async fn execute_parallel_pd(
         prepared_input::split_requests(p, d)
             .map_err(|s| s.to_http_error("prepared_input", s.message().to_owned()))?
             .map(|timeout| {
-                let deadline = tokio::time::Instant::now() + timeout;
+                let relative_deadline = tokio::time::Instant::now() + timeout;
+                let deadline =
+                    prepared_deadline.map_or(relative_deadline, |abs| abs.min(relative_deadline));
                 let (tx, rx) = oneshot::channel();
                 ((deadline, tx), (deadline, rx))
             })
@@ -4709,10 +4734,12 @@ pub(crate) mod tests {
         let (first_attempts_watch, failed_tx) = encode_watch();
         let mut carried = Some(first_attempts_watch);
         let mut request = tokenspeed_request(1, None);
-        let cleanups = prepare_epd_attempt(&mut request, &tokenspeed_pair(), None, &mut carried)
-            .await
-            .expect("nothing to encode");
+        let (cleanups, deadline) =
+            prepare_epd_attempt(&mut request, &tokenspeed_pair(), None, &mut carried)
+                .await
+                .expect("nothing to encode");
         assert!(cleanups.is_none(), "no push plan, nothing to disarm");
+        assert!(deadline.is_none());
         let mut watch = carried
             .clone()
             .expect("the first attempt's watch stands for the replay");
@@ -4736,11 +4763,12 @@ pub(crate) mod tests {
         let mut carried = None;
         let mut request = tokenspeed_request(1, None);
         for _attempt in 0..2 {
-            let cleanups =
+            let (cleanups, deadline) =
                 prepare_epd_attempt(&mut request, &tokenspeed_pair(), None, &mut carried)
                     .await
                     .expect("nothing to encode");
             assert!(cleanups.is_none());
+            assert!(deadline.is_none());
             assert!(carried.is_none());
         }
     }
@@ -7322,6 +7350,7 @@ pub(crate) mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                 };
@@ -7342,6 +7371,53 @@ pub(crate) mod tests {
                 );
             }
         }
+        engine.abort();
+    }
+
+    #[tokio::test]
+    async fn prepared_input_epd_failure_is_marked_non_retryable() {
+        use crate::routers::grpc::{
+            context::RequestContext, regular::stages::testing::mock_backend_client,
+        };
+
+        let (client, engine) = mock_backend_client("m").await;
+        let mut clients = ClientSelection::Disaggregated {
+            prefill: client.clone(),
+            decode: client,
+        };
+        let (_heard, workers, ahead) = a_pair_ahead_of_its_send("NixlConnector", RuntimeType::Vllm);
+        let ledger = AttemptLedger::default();
+        let mut watch = None;
+        let req = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]}]
+            }))
+            .unwrap(),
+        );
+        let ctx =
+            RequestContext::for_chat(req, None, "m".into(), prepared_input::test_components());
+        let prepared = prepared_input::prepare(&ctx)
+            .expect("valid image ref prepares")
+            .expect("image produces PreparedInput");
+        let Err(resp) = execute_epd_dispatch(
+            ProtoGenerateRequest::Vllm(Box::default()),
+            &mut clients,
+            &workers,
+            "m",
+            Some(EncodeOutputs::PreparedInput(Box::new(prepared))),
+            &mut watch,
+            ahead,
+            &ledger,
+            None,
+        )
+        .await
+        else {
+            panic!("non-SGLang request with PreparedInput must fail");
+        };
+        assert!(!is_retryable_response(&resp));
         engine.abort();
     }
 }

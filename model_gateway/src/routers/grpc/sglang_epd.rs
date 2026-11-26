@@ -366,6 +366,7 @@ impl PreparedInput {
             worker: Arc::clone(encoder),
             requests,
             timeout: remaining,
+            deadline: tokio::time::Instant::from_std(self.deadline),
             // Hold a load guard for the full lifetime of the encode RPC so load-aware
             // encoder policies observe in-flight encode concurrency in real time.
             _load_guard: WorkerLoadGuard::with_key(Arc::clone(encoder), None),
@@ -378,10 +379,16 @@ pub(crate) struct NativeEncode {
     worker: Arc<dyn Worker>,
     requests: Vec<EncodeRequest>,
     timeout: Duration,
+    deadline: tokio::time::Instant,
     _load_guard: WorkerLoadGuard,
 }
 
 impl NativeEncode {
+    /// Return the absolute handoff deadline anchored when this prepared request was built.
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
     /// Send all modality encode parts concurrently to the selected SGLang encoder worker.
     pub(crate) async fn dispatch(self) -> Result<(), String> {
         let backend = get_backend_client(self.worker.as_ref())
