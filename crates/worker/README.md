@@ -360,12 +360,19 @@ JSON at once. A forced call is shaped before a worker is selected, by the
 start the model's workers name together, so one worker without the label
 holds every forced call of its model to the schema on such a prompt. On a
 prompt that ends outside a thought, a worker without the label is sent the
-grammar a worker labelled `first_token` is sent.
+grammar a worker labelled `first_token` is sent, except for a JSON answer on a
+table whose thought is a message of its own: there it is sent the grammar of a
+worker labelled `after_reasoning`, whose way into the answer is optional.
 
 A registration warns once of a worker that names no start, where a
 gateway-shaped grammar reaches it: a worker on the gRPC pipeline, of a role
-that generates tokens, on a runtime whose request carries a constraint. To set
-the label by hand, put it among the labels of the worker's spec:
+that generates tokens, on a runtime whose request carries a constraint. It
+says nothing where the read of a gRPC engine failed: the engine has named
+nothing yet, and the label refresh of the worker's first transition into
+service reads it again. A ZMQ engine names no start at its handshake: its host
+writes what it knows ahead of the handshake, and a gateway writes
+`first_token`. To set the label by hand, put it among the labels of the
+worker's spec:
 
 ```json
 {"url": "grpc://worker:9000", "labels": {"constrained_decoding_start": "first_token"}}

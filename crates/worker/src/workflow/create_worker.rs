@@ -311,6 +311,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Create
             *connection_mode,
             runtime_type,
             config.worker_type,
+            &context.data.discovered_labels,
             &labels,
         ) {
             warn!("{warning}");
@@ -375,11 +376,18 @@ pub fn validate_constrained_decoding_label(
 /// of a runtime whose request carries no constraint. The roles and the
 /// runtimes that owe the warning are allow-listed, so one added later owes
 /// none until it is named.
+///
+/// `None` too for a gRPC worker whose `report` is empty: the read of its
+/// engine failed (`DiscoverMetadataStep` leaves no label behind one), so the
+/// engine has named nothing yet. The label refresh of the worker's first
+/// transition into service reads it again, and a label set by hand on this
+/// line's advice would stand over the start the engine names then.
 fn unnamed_grammar_start_warning(
     url: &str,
     connection_mode: ConnectionMode,
     runtime_type: RuntimeType,
     worker_type: WorkerType,
+    report: &HashMap<String, String>,
     labels: &HashMap<String, String>,
 ) -> Option<String> {
     let generates = matches!(worker_type, WorkerType::Regular | WorkerType::Decode);
@@ -388,9 +396,11 @@ fn unnamed_grammar_start_warning(
         RuntimeType::Vllm | RuntimeType::Sglang | RuntimeType::Trtllm | RuntimeType::TokenSpeed
     );
     let start = GrammarStart::from_label(labels.get(GrammarStart::LABEL).map(String::as_str));
+    let unread = matches!(connection_mode, ConnectionMode::Grpc) && report.is_empty();
     if !connection_mode.uses_grpc_pipeline()
         || !generates
         || !carries_a_constraint
+        || unread
         || start != GrammarStart::Unknown
     {
         return None;

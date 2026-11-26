@@ -454,11 +454,42 @@ async fn a_registration_warns_once_of_a_worker_that_names_no_grammar_start() {
     });
 }
 
+/// A registration whose read of the engine failed says nothing of the grammar
+/// start: the engine has named nothing yet, and the label refresh of the
+/// worker's first transition into service reads it again. A label set by hand
+/// meanwhile would stand over the start the engine names then.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_registration_whose_read_failed_owes_no_grammar_start_warning() {
+    use crate::workflow::discover_metadata::DiscoverMetadataStep;
+
+    let mut spec = WorkerSpec::new("worker-c:9000");
+    spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+    // No engine answers this host's connector: the read fails.
+    let mut data = local_data(spec, ConnectionMode::Grpc, ordinary_host());
+    data.detected_runtime_type = Some(RuntimeType::Vllm.to_string());
+    let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    assert_eq!(
+        DiscoverMetadataStep.execute(&mut ctx).await.unwrap(),
+        StepResult::Success
+    );
+    assert!(ctx.data.discovered_labels.is_empty());
+    assert_eq!(
+        CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+        StepResult::Success
+    );
+
+    assert!(logs_contain("Failed to fetch metadata for"));
+    assert!(!logs_contain("names no constrained_decoding_start label"));
+}
+
 /// Only a worker a gateway-shaped grammar reaches owes the warning: one on the
 /// gRPC pipeline, of a role that generates tokens, on a runtime whose request
 /// carries a constraint, whose label names no start a gateway reads.
 #[test]
 fn only_a_worker_a_grammar_reaches_owes_the_grammar_start_warning() {
+    // The report of an engine that answered and named no start.
+    let answered = labels_of(&[("served_model_name", "m")]);
     let warned =
         |mode: ConnectionMode, runtime: RuntimeType, role: WorkerType, labels: &[(&str, &str)]| {
             unnamed_grammar_start_warning(
@@ -466,6 +497,7 @@ fn only_a_worker_a_grammar_reaches_owes_the_grammar_start_warning() {
                 mode,
                 runtime,
                 role,
+                &answered,
                 &labels_of(labels),
             )
             .is_some()
@@ -492,6 +524,17 @@ fn only_a_worker_a_grammar_reaches_owes_the_grammar_start_warning() {
     assert!(!warned(grpc, vllm, WorkerType::Prefill, &[]));
     assert!(!warned(grpc, vllm, WorkerType::Encode, &[]));
     assert!(!warned(grpc, RuntimeType::Mlx, regular, &[]));
+
+    // A gRPC read that failed left no report: the engine named nothing yet. A
+    // ZMQ worker is never read at a registration, so an empty report says
+    // nothing of its engine.
+    let unread = HashMap::new();
+    let warned_unread = |mode: ConnectionMode| {
+        unnamed_grammar_start_warning("grpc://worker:9000", mode, vllm, regular, &unread, &unread)
+            .is_some()
+    };
+    assert!(!warned_unread(grpc));
+    assert!(warned_unread(ConnectionMode::Zmq));
 }
 
 /// The failure of creation for a worker that reports these labels.
