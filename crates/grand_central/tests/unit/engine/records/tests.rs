@@ -1444,8 +1444,10 @@ fn a_workers_place_is_found_by_its_id_and_by_no_id_two_rows_carry() {
 /// them is a rank of, each once, in the engine's ranks' order. A worker
 /// that stands alone and an id the list does not hold add nothing. A
 /// program's own ids come back as it stated them. Where two rows carry one
-/// id nothing is added, and a list of workers that each stand alone says
-/// it holds no ranks.
+/// id nothing is added. Two lists of one decision each add the ranks of
+/// their own engines behind the workers named. A list of workers that each
+/// stand alone says it holds no ranks: alone it hands no list back, and
+/// beside a list with ranks it is passed over.
 #[test]
 fn a_tried_worker_names_every_rank_of_its_engine_once() {
     let spec = applied("least_load");
@@ -1473,25 +1475,29 @@ fn a_tried_worker_names_every_rank_of_its_engine_once() {
     let pool = PoolRecords::new(&workers, &spec, &clock);
     assert!(pool.has_ranks());
     let id = |place: usize| worker_id(workers[place].as_ref());
-    // What the list held before is not kept.
-    let mut whole = vec![WorkerId(9)];
-    pool.tried_engines(&[id(5)], &mut whole);
-    assert_eq!(whole, [id(5), id(3), id(0)], "the tried rank first");
-    pool.tried_engines(&[id(1)], &mut whole);
-    assert_eq!(whole, [id(1), id(4), id(6)], "the second engine's own");
-    pool.tried_engines(&[id(2)], &mut whole);
-    assert_eq!(whole, [id(2)], "a worker alone names itself");
-    // A further list of the same decision adds its own engines' ranks to
-    // what the list holds, and takes nothing out of it.
+    // The one operation over the lists of a decision. What the list it is
+    // handed held before is not kept.
+    let of = |lists: &[&PoolRecords], tried: &[WorkerId]| {
+        PoolRecords::tried_engines(lists.iter().copied(), tried, || vec![WorkerId(9)])
+            .expect("a list with ranks")
+    };
+    let first = of(&[&pool], &[id(5)]);
+    assert_eq!(first, [id(5), id(3), id(0)], "the tried rank first");
+    let second = of(&[&pool], &[id(1)]);
+    assert_eq!(second, [id(1), id(4), id(6)], "the second engine's own");
+    let single = of(&[&pool], &[id(2)]);
+    assert_eq!(single, [id(2)], "a worker alone names itself");
+    // One list's part adds its own engines' ranks to what the list holds,
+    // and takes nothing out of it.
     let mut whole = vec![WorkerId(9), id(5)];
-    pool.more_tried_engines(&[id(5), id(1)], &mut whole);
+    pool.add_engines_of(&[id(5), id(1)], &mut whole);
     assert_eq!(
         whole,
         [WorkerId(9), id(5), id(3), id(0), id(1), id(4), id(6)]
     );
 
     let stranger = WorkerId(77);
-    pool.tried_engines(&[id(0), id(2), stranger, id(3), id(4)], &mut whole);
+    let whole = of(&[&pool], &[id(0), id(2), stranger, id(3), id(4)]);
     let both = [id(0), id(2), stranger, id(3), id(4), id(5), id(1), id(6)];
     assert_eq!(whole, both, "each rank once, behind the workers named");
 
@@ -1503,22 +1509,45 @@ fn a_tried_worker_names_every_rank_of_its_engine_once() {
             ..FixedFacts::default()
         }
     });
-    stated.tried_engines(&[WorkerId(106)], &mut whole);
+    let whole = of(&[&stated], &[WorkerId(106)]);
     assert_eq!(whole, [WorkerId(106), WorkerId(104), WorkerId(101)]);
+
+    // Two lists of one decision, as a pair hands them: the workers named
+    // stand once at the front, each list adds the ranks of its own
+    // engines, and the second takes nothing out of what the first wrote.
+    let whole = of(&[&stated, &pool], &[WorkerId(106), id(1)]);
+    let pair = [
+        WorkerId(106),
+        id(1),
+        WorkerId(104),
+        WorkerId(101),
+        id(4),
+        id(6),
+    ];
+    assert_eq!(whole, pair, "each list by its own engines");
 
     // One rank listed twice: no id of the list has a place.
     let twice = vec![rank(a, 0), rank(a, 1), rank(a, 0)];
-    let pool = PoolRecords::new(&twice, &spec, &clock);
+    let doubled = PoolRecords::new(&twice, &spec, &clock);
     let named = [worker_id(twice[1].as_ref())];
-    pool.tried_engines(&named, &mut whole);
-    assert_eq!(whole, named);
+    assert_eq!(of(&[&doubled], &named), named);
 
+    // A list of workers that each stand alone holds no ranks. Alone it
+    // hands no list back, and the list to write is not asked for. Beside
+    // a list with ranks it is passed over.
     let alone = fleet(3);
-    let pool = PoolRecords::new(&alone, &spec, &clock);
-    assert!(!pool.has_ranks());
+    let plain = PoolRecords::new(&alone, &spec, &clock);
+    assert!(!plain.has_ranks());
     let named = [worker_id(alone[1].as_ref())];
-    pool.tried_engines(&named, &mut whole);
-    assert_eq!(whole, named);
+    let asked = Cell::new(false);
+    let none = PoolRecords::tried_engines([&plain], &named, || {
+        asked.set(true);
+        Vec::new()
+    });
+    assert_eq!(none, None, "the request's own list stands");
+    assert!(!asked.get(), "no list to write is asked for");
+    let whole = of(&[&plain, &pool], &[id(5)]);
+    assert_eq!(whole, [id(5), id(3), id(0)], "the list with ranks is read");
 }
 
 /// A report's age stops at the far end: a decision one millisecond past
