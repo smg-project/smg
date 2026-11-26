@@ -655,7 +655,7 @@ pub mod bench_support {
 
     /// [`route_pair`] on a route that tells each side's end. Both loads
     /// stand where they are, shown to an opaque reader: the prefill's as a
-    /// pair route holds it with no admission bound ([`hold_unbounded`]),
+    /// pair route holds it with no admission bound (`hold_unbounded`),
     /// the decode's as its guard. Under [`Ended::Answer`] each side is told
     /// through its guard, as a pair read whole. Under [`Ended::Streamed`]
     /// the prefill is told through its guard, and the decode's reader
