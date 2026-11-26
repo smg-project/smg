@@ -3628,7 +3628,12 @@ fn a_claim_made_in_the_gap_beside_a_standing_pin_is_followed() {
         let pinned = ring[2] as usize;
         let table = engine.sessions();
         table.lookup(request.session(), request.now_micros, &rule);
-        table.dispatched(request.session(), SessionVerdict::Pinned, pool[pinned].id);
+        table.dispatched(
+            request.session(),
+            SessionVerdict::Pinned,
+            pool[pinned].id,
+            0,
+        );
         pool[pinned].health.overloaded = true;
         let mut theirs = pool.to_vec();
         theirs[ring[0] as usize].health.healthy = false;

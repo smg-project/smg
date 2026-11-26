@@ -1558,7 +1558,7 @@ pub struct Lease {
     pub generation: u64,                 // the document generation that decided
     pub session: Session,                // the request's session
     pub session_verdict: SessionVerdict, // copied from the pick
-    pub issued_micros: u64,              // the host's clock at issue
+    pub issued_micros: u64,              // its decision's instant on the host's clock, 0 for none
     pub tokens: u32,                     // the token count the request stated, 0 for text alone
     pub chars: u32,                      // its text's characters, which `bucket` books by
     pub bytes: u32,                      // its text's bytes; `prompt_size()` as the facts'
@@ -1576,15 +1576,18 @@ decide ──> lease issued ──> Dispatched ──> Completed
                 │                └───────> Released (client gone, send failed, worker removed)
                 └── never dispatched ──> Released when the host drops its guard
                                          (a controller releases one on its file 5 s after issue;
-                                          a pair's decode side behind its prefill, 5 s after
-                                          that prefill's end)
+                                          a pair's decode side behind its prefill, at least 5 s
+                                          after that prefill's end)
 ```
 
-A controller's deadline is the time to name a lease's first dispatch. A pair's decode side that
-was issued with its prefill is sent when that prefill has answered. So the file holds it while
-the prefill is dispatched, as its booking stands in a gateway's own process, and it has a whole
-deadline from the file's first pass behind the prefill's end. A side a decode call issued keeps
-the call's own deadline.
+A controller's deadline is the time to name a lease's first dispatch. A host that sends a pair's
+prefill first sends the decode side issued with it when that prefill has answered. So the file
+holds that side while the prefill is dispatched, as its booking stands in a gateway's own
+process.
+
+The side has a whole deadline from the file's first pass behind the prefill's end. A side that
+still waits is released between one and two deadlines behind that end, to the sweep's tick. A
+side a decode call issued keeps the call's own deadline.
 
 The engine stores nothing about a lease. The host keeps what it was handed and hands it back
 with each event (`DecisionEngine::say`). The crate has a guard for that, `DecisionGuard`
@@ -1599,13 +1602,24 @@ side of a pair that is still live. A release of a decode side behind its dispatc
 that side went to. It states the side's claim only where the side claimed that worker: behind a
 dispatch on another worker a release takes back no claim.
 
+The session table knows a claim by its worker and by the instant its lease was issued under
+(`Lease::issued_micros`, the decision's `now_micros`). An event of a lease takes back the claim
+that carries the same instant. A later decision's claim on the same worker is dated later, so a
+refusal told late leaves it, and the session's next request follows it. The crate's guard and a
+controller tell a pair's every event under its first decision's lease, so a decode call there
+dates its claim by that lease.
+
+A lease that states no instant reaches a claim by its worker alone. A host that builds a lease by
+hand dates it by the `now_micros` of the decision its verdict comes from, or states none. For the
+side a decode call issues, that decision is the decode call.
+
 What an event does:
 
 | Event | What the stages do with it |
 |---|---|
 | Dispatched | the session's pin follows the worker the request went to; every count of sends takes it, whichever profile placed the request; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone. A pin at its rule's cap moved already, to the worker under the cap that the request which met the cap was placed on: where that request was decided, or for a pair's prefill side where the pair formed (decision 13). The dispatch finds the pin there, or fronts the later target the request went to. A request placed on another worker at the cap moves no pin |
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
-| Released | the same stages hear the reason. Under a sessions rule a commit that refused every target takes back the pin its decision claimed, on each side of a pair. A pair's later decode, issued no lease, gives its claim back with its prefill, or with a release that names it alone: a controller's file tells that word, and a request's guard says none for a later decode its host gives up by name. On a controller's file a side a decode call issued stands in that later decode's place, and the release that ends the issued side gives the first decision's claim back as well where the call went to the decode that decision claimed |
+| Released | the same stages hear the reason. Under a sessions rule a commit that refused every target takes back the pin its decision claimed, on each side of a pair, and no pin a later decision claimed on the same worker. A pair's later decode, issued no lease, gives its claim back with its prefill, or with a release that names it alone: a controller's file tells that word, and a request's guard says none for a later decode its host gives up by name. On a controller's file a side a decode call issued stands in that later decode's place, and the release that ends the issued side gives the first decision's claim back as well where the call went to the decode that decision claimed |
 
 A count of sends holds a send until one of four ends: a load report of the worker sampled at or
 after the send (later by `sent_report_delay_ms`, where the profile sets it), the age `sent_ttl_ms`

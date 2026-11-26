@@ -729,7 +729,7 @@ fn capped_prefill_sides(engine: &Engine, keyed: &RequestFacts<'_>) -> [Vec<Candi
     let served = prefills[0].id;
     engine
         .sessions
-        .dispatched(prefill_session, SessionVerdict::Pinned, served);
+        .dispatched(prefill_session, SessionVerdict::Pinned, served, 0);
     prefills[0].session_in_flight = SESSIONS.inflight_cap;
     sides
 }
@@ -864,7 +864,7 @@ impl Picker for DecidesBeside {
         if let Some((table, session, worker)) = beside.staged.take() {
             beside.read = Some(table.lookup(session, facts.now_micros, &SESSIONS));
             table.respilled(session, worker);
-            table.dispatched(session, SessionVerdict::Respill, worker);
+            table.dispatched(session, SessionVerdict::Respill, worker, 0);
         }
     }
 }
@@ -932,7 +932,7 @@ fn a_decode_side_at_its_cap_respills_among_its_partners_where_it_is_decided() {
         .lookup(decode_session, keyed.now_micros, &SESSIONS);
     engine
         .sessions
-        .dispatched(decode_session, SessionVerdict::Pinned, served);
+        .dispatched(decode_session, SessionVerdict::Pinned, served, 0);
     sides[1][0].session_in_flight = SESSIONS.inflight_cap;
     let pools = PairPools {
         prefills: &sides[0],

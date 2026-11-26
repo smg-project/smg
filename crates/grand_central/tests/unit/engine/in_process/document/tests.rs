@@ -69,7 +69,8 @@ impl InProcess {
     }
 
     /// [`Loaded::decide_decode_without_lease`] under the document in
-    /// force, for a case of an engine by itself.
+    /// force, for a case of an engine by itself. The case states no date
+    /// of the pair's lease.
     pub(crate) fn decide_decode_without_lease(
         &self,
         maker: &impl RequestMaker,
@@ -78,7 +79,7 @@ impl InProcess {
     ) -> Result<Decision, DecisionRefused> {
         let document = self.in_force();
         self.under(&document)
-            .decide_decode_without_lease(maker, held, now)
+            .decide_decode_without_lease(maker, held, 0, now)
     }
 
     /// [`Loaded::decide_encode_without_lease`] under the document in

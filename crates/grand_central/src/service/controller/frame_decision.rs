@@ -85,13 +85,13 @@ use crate::{
         },
         lease_events,
         shadow::Shadowed,
-        view::{fingerprint, Identity, Phase, RequestFacts, Role, Session, WorkerId},
+        view::{fingerprint, Identity, Phase, RequestFacts, Role, Session},
         EncodeLists, PairLists,
     },
     stages::lifecycle::Lifecycle,
     store::{
-        DecodeIssue, DecodeSide, LeaseRecord, LeaseRefused, LeaseState, MemoryStore, PickRecord,
-        StoreSnapshot,
+        memory::HeldPair, DecodeIssue, DecodeSide, LeaseRecord, LeaseRefused, LeaseState,
+        MemoryStore, PickRecord, StoreSnapshot,
     },
     tracking::lease::{Lease, LeaseId, LeaseKind, Side},
     worker_host::{Members, Objects, OpenAdmission},
@@ -1115,6 +1115,10 @@ pub(crate) fn issue_pair(
 /// prefill's dispatch took. A decode profile that keeps its pick answers
 /// that decode again while its filters keep it.
 ///
+/// Last in `held` comes the instant the lease was issued at. A claim the
+/// call makes for its key is dated by it, as each word of the side it
+/// issues is.
+///
 /// The decode side's list alone is the asking gateway's to take, by its
 /// reach, wires and standing vetoes: the held prefill was sent already, and
 /// the engine finds it in its list wherever it stands. The answers come in
@@ -1145,7 +1149,7 @@ pub(crate) fn decide_decode(
     world: &StoreSnapshot,
     objects: &Objects<Members>,
     taken: &DecisionCall<'_, Checked>,
-    (prefill, first): (WorkerId, Option<(WorkerId, u16)>),
+    (prefill, first, issued_micros): HeldPair,
     buffers: &mut FrameBuffers,
     loads: &Arc<LoadSnapshot>,
     own: &Part,
@@ -1220,13 +1224,15 @@ pub(crate) fn decide_decode(
                     } else {
                         maker
                     };
-                    front.decide_decode_without_lease(&maker, &held, now)
+                    front.decide_decode_without_lease(&maker, &held, issued_micros, now)
                 }
                 Taken::Emptied(stage) => {
                     let (seed, generation) = (frame.seed(), spec.generation());
                     Ok(shed(ShedReason::NoEndpoints, stage, seed, generation))
                 }
-                Taken::Unreached => front.decide_decode_without_lease(&over_none(), &held, now),
+                Taken::Unreached => {
+                    front.decide_decode_without_lease(&over_none(), &held, issued_micros, now)
+                }
             };
             // Counted whatever the decision came to.
             let undialed = decode_places.undialed();
@@ -1236,7 +1242,7 @@ pub(crate) fn decide_decode(
             decided?
         }
         // A model nobody serves, and one with no decode.
-        None => front.decide_decode_without_lease(&over_none(), &held, now)?,
+        None => front.decide_decode_without_lease(&over_none(), &held, issued_micros, now)?,
     };
     // What the side's lease takes of its request, read where the frame's
     // lists still stand: a decode call's frame is read at the decode phase.

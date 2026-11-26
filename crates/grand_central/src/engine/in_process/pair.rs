@@ -135,6 +135,7 @@ use crate::{
         pair_classes::PartnerClasses,
         records::{vetoes, HeldCells, Live, PoolRecords},
         shadow::{budget_left, ShadowSide, Shadowed, SHADOW_FLOOR},
+        sticky_sessions::DecodeVerdict,
         view::{
             AffinityFacts, Candidate, Constraints, Feed, Phase, PoolFacts, RequestFacts, Role,
             Session, SessionCountedUnder, WorkerId,
@@ -1630,6 +1631,32 @@ fn decide_with(
     )
 }
 
+/// A decode call's claim takes the date of its pair's lease. The call's
+/// decision claims at its own instant, and every word of the side it
+/// issues is told under the lease the pair's first decision issued, at
+/// `issued_micros`. Where `decision` claimed its decode for the request's
+/// key, the session table dates that claim by the lease
+/// (`SessionTable::date_claim`). The side's own release, or its dispatch
+/// elsewhere, then takes the claim back. A lease that states no instant
+/// (`0`) dates nothing, and its words reach a claim by its worker.
+#[inline]
+pub(super) fn date_decode_claim(
+    own: Loaded<'_, '_>,
+    facts: &RequestFacts<'_>,
+    decision: &Decision,
+    issued_micros: u64,
+) {
+    let first = decision.pick().and_then(|pick| pick.targets.first());
+    let Some(pair) = first.and_then(|first| first.pair) else {
+        return;
+    };
+    if pair.decode_verdict == DecodeVerdict::CLAIMED {
+        let table = own.document.spec.engine().sessions();
+        let (key, at) = (decode_session(facts), facts.now_micros);
+        table.date_claim(key, pair.decode_id, at, issued_micros);
+    }
+}
+
 /// One decision of a pair by `own`, the engine of a gateway's own process,
 /// over the `lists` its host handed, as the host takes it: the pair's
 /// decision alone ([`decide`]), the wires' test in it, with the lease a
@@ -1768,6 +1795,13 @@ pub(super) fn issued(
     let first = held.and_then(|held| held.decision.pick());
     if let (Decision::Pick(pick), Some(first)) = (&mut outcome.decision, first) {
         pick.targets.placed_as(&first.targets);
+    }
+    // A decode asked again decides under the pair's lease: a claim it made
+    // takes that lease's date. The decision is read where the answer
+    // stands, as it is written above: read ahead of its issue, it cost a
+    // decode call 160 instructions more, counted with Callgrind.
+    if let Some(held) = held {
+        date_decode_claim(own, facts, &outcome.decision, held.lease.issued_micros);
     }
     outcome
 }

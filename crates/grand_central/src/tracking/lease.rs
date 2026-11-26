@@ -84,8 +84,18 @@ pub struct Lease {
     /// What the decision did with the session key, copied from its pick, so
     /// the commit moves the key's pins by its own decision alone.
     pub session_verdict: SessionVerdict,
-    /// The host's clock at issue, microseconds since its origin. In-process
-    /// only; the wire carries the dispatch deadline as a duration.
+    /// The instant the lease's decision was made at, in microseconds since
+    /// its host's origin ([`crate::engine::RequestFacts::now_micros`]); `0`
+    /// where a host states none. Under a sessions rule the decision's claim
+    /// keeps this instant, and a word of the lease takes the claim back
+    /// where it carries the same one. A lease that states `0` reaches a
+    /// claim by its worker alone. In-process only; the wire carries the
+    /// dispatch deadline as a duration.
+    ///
+    /// A decode call claims at its own instant. A host that asks
+    /// [`Engine::decide_decode`](crate::engine::Engine::decide_decode)
+    /// itself tells that call's side under a lease that states the call's
+    /// `now_micros`, not the pair's first decision's, or states none.
     pub issued_micros: u64,
     /// The prompt size the request stated, in tokens: 0 where it stated
     /// none, as a request of text alone does. The `least-load` and
@@ -239,8 +249,9 @@ pub enum ReleaseReason {
 
 /// The time a gateway has to name a lease's dispatch: the design's default.
 /// A lease still issued past it is released as abandoned. A pair's decode
-/// side that was issued with its prefill has that time from the prefill's
-/// end: a controller's file holds it while the prefill is dispatched.
+/// side that was issued with its prefill has at least that time from the
+/// prefill's end, and at most twice that to the sweep's tick. A
+/// controller's file holds it while the prefill is dispatched.
 pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What a gateway's `Dispatched` report says beside its lease.
