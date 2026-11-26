@@ -119,16 +119,16 @@ fn the_table_holds_every_slice_of_the_contract_in_its_order() {
         .collect();
     let table: Vec<&str> = SLICES.iter().map(|slice| slice.as_str_name()).collect();
     assert_eq!(table, named);
-    assert_eq!(table.len(), 10);
+    assert_eq!(table.len(), 9);
 }
 
 /// A slice this build does not serve is refused by its name, alone or
 /// beside a served one. A request that names no slice asks for every
-/// one, and is refused by the names of the eight not served.
+/// one, and is refused by the names of the seven not served.
 #[test]
 fn a_slice_this_build_does_not_serve_is_refused_by_its_name() {
     let unserved: Vec<Slice> = SLICES.into_iter().filter(|slice| !served(*slice)).collect();
-    assert_eq!(unserved.len(), 8);
+    assert_eq!(unserved.len(), 7);
     for slice in unserved {
         for request in [naming(&[slice]), naming(&[Slice::Workers, slice])] {
             let refused = asked(request).expect_err("refused");
@@ -152,15 +152,16 @@ fn a_slice_this_build_does_not_serve_is_refused_by_its_name() {
     assert_eq!(every.code(), Code::Unimplemented);
     assert_eq!(
             every.message(),
-            "slices: none named is every slice, and this build does not serve SLICE_HEALTH, SLICE_LOADS, SLICE_SESSIONS, SLICE_LEASES, SLICE_PAIRS, SLICE_PLUGINS, SLICE_KV_INDEX, SLICE_GATEWAYS: it serves SLICE_WORKERS, SLICE_SPEC"
+            "slices: none named is every slice, and this build does not serve SLICE_HEALTH, SLICE_LOADS, SLICE_SESSIONS, SLICE_LEASES, SLICE_PLUGINS, SLICE_KV_INDEX, SLICE_GATEWAYS: it serves SLICE_WORKERS, SLICE_SPEC"
         );
 }
 
 /// A number that names no slice is the caller's error, by the field:
-/// the slice of no kind, a number past the contract's, a negative one.
+/// the slice of no kind, the reserved number of the pair rows' slice, a
+/// number past the contract's, a negative one.
 #[test]
 fn a_number_that_names_no_slice_is_refused_by_the_field() {
-    for number in [0, 11, -1, i32::MAX] {
+    for number in [0, 6, 11, -1, i32::MAX] {
         let request = proto::SnapshotRequest {
             slices: vec![Slice::Workers.into(), number],
             ..proto::SnapshotRequest::default()

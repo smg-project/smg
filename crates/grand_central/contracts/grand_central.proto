@@ -1077,8 +1077,11 @@ message SnapshotRequest {
     SLICE_LOADS = 3;
     SLICE_SESSIONS = 4;
     SLICE_LEASES = 5;
-    // Its rows left the answer (Snapshot's number 9): no build serves it.
-    SLICE_PAIRS = 6;
+    // The pair rows' slice, which no build served: no later slice takes its
+    // number or its name. A request that still names it is refused as one
+    // that names no slice: INVALID_ARGUMENT by `slices`.
+    reserved 6;
+    reserved "SLICE_PAIRS";
     SLICE_SPEC = 7;
     SLICE_PLUGINS = 8;
     SLICE_KV_INDEX = 9;
