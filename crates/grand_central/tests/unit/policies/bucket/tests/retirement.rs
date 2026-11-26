@@ -1,5 +1,5 @@
-//! A partition that lists nobody leaves the table. Its cases cover what
-//! the feed, a later entry and a decider that held it find there.
+//! A partition leaves the table with its last worker. Its cases cover
+//! what the feed, a later entry and a decider that held it find there.
 
 use super::*;
 
