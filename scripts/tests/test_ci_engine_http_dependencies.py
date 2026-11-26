@@ -29,28 +29,51 @@ import json
 import os
 import sys
 import types
+from pathlib import Path
 
 args = sys.argv[1:]
 if args[0].endswith("ci_verify_sglang_rocm_cohort.py"):
+    if args[1:] == ["--repair-plan"]:
+        packages = json.loads(os.environ.get("NATIVE_REPAIR_PACKAGES",
+                              '["apache-tvm-ffi", "tilelang", "torch-c-dlpack-ext"]'))
+        if os.environ.get("NATIVE_CORRUPTION_FILE"):
+            packages = (["tilelang"] if Path(os.environ["NATIVE_CORRUPTION_FILE"]).read_text()
+                        != "repaired" else [])
+        print("\n".join(packages))
+        raise SystemExit(0)
     with open(os.environ["TOOL_NATIVE_LOG"], "a") as log:
         log.write(json.dumps(args) + "\n")
-    if os.environ.get("FAIL_NATIVE_CHECK"):
-        raise SystemExit(44)
-    # Run the real builtin rejection logic with native objects replaced by
-    # software fixtures. The remaining full-cohort checks are native acceptance,
-    # outside this shell-wiring test; RECORD is exercised separately below.
+    # Exercise the real CLI report/exit contract and real builtin guard.
+    # Only the filesystem/native/pip inputs are software fixtures here.
     spec = importlib.util.spec_from_file_location("cohort_verifier", args[0])
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
-    api = object()
-    torch = types.SimpleNamespace(Tensor=types.SimpleNamespace(__dlpack_c_exchange_api__=api))
-    core = types.SimpleNamespace(_lib=os.environ.get("IMAGE_DLPACK_LIB"),
-                                 load_torch_c_dlpack_extension=lambda: None)
-    verifier.verify_builtin_dlpack(core, torch, api)
-    if len(args) == 2 and os.environ.get("FAIL_PIP_STAGE") != "check":
-        with open(args[1], "w") as report:
-            json.dump({"verified": True, "fixture": True}, report)
-    args = ["-m", "pip", "check"]
+
+    def fixture_verify(report):
+        if os.environ.get("FAIL_NATIVE_CHECK"):
+            raise RuntimeError("injected native check failure")
+        api = object()
+        torch = types.SimpleNamespace(Tensor=types.SimpleNamespace(__dlpack_c_exchange_api__=api))
+        core = types.SimpleNamespace(_lib=os.environ.get("IMAGE_DLPACK_LIB"),
+                                     load_torch_c_dlpack_extension=lambda: None)
+        verifier.verify_builtin_dlpack(core, torch, api)
+        if os.environ.get("NATIVE_CORRUPTION_FILE"):
+            verifier.require(Path(os.environ["NATIVE_CORRUPTION_FILE"]).read_text() == "repaired",
+                             "Native official anchor still differs")
+        check = ["-m", "pip", "check"]
+        with open(os.environ["TOOL_LOG"], "a") as log:
+            log.write(json.dumps(check) + "\n")
+        with open(os.environ["TOOL_ENV_LOG"], "a") as log:
+            log.write(json.dumps({key: os.environ.get(key) for key in (
+                "PIP_CONSTRAINT", "PIP_BUILD_CONSTRAINT", "UV_CONSTRAINT"
+            )}) + "\n")
+        status = 43 if os.environ.get("FAIL_PIP_STAGE") == "check" else 0
+        report["pip_check"] = {"returncode": status}
+        verifier.require(status == 0, "pip check failed")
+
+    verifier.verify = fixture_verify
+    sys.argv = args
+    raise SystemExit(verifier.main())
 if args == ["-V"]:
     print("Python (test fixture)")
 elif args[0] == "-c":
@@ -78,6 +101,8 @@ elif args[0] == "-c":
     importlib.metadata.requires = requires
     importlib.metadata.version = version
     if "import torch" in args[1]:
+        if os.environ.get("FAIL_TORCH_PREFLIGHT"):
+            raise ImportError("injected installed Torch cache failure")
         torch = types.ModuleType("torch")
         torch.version = types.SimpleNamespace(hip=os.environ.get("IMAGE_TORCH_HIP", "fixture"))
         torch.Tensor = type("Tensor", (), {})
@@ -103,11 +128,17 @@ elif args[:2] == ["-m", "pip"]:
             and args[4].startswith("grpcio-reflection=="))
         or args == ["-m", "pip", "install", "-e", "crates/grpc_client/python/", "-e", "grpc_servicer/"]
         or (args[:8] == ["-m", "pip", "install", "--no-cache-dir", "--no-build-isolation",
-                        "--no-binary=torch-c-dlpack-ext", "apache-tvm-ffi==0.1.12", "tilelang==0.1.15"]
-            and len(args) == 9 and args[8].startswith("torch-c-dlpack-ext @ https://files.pythonhosted.org/"))
+                        "--no-binary=torch-c-dlpack-ext", "--force-reinstall", "--no-deps"]
+            and args[8:] and len(args[8:]) == len(set(args[8:]))
+            and all(arg in {"apache-tvm-ffi==0.1.12", "tilelang==0.1.15",
+                            "torch-c-dlpack-ext @ https://files.pythonhosted.org/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz#sha256=d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe"}
+                    for arg in args[8:]))
     )
     if not known:
         raise RuntimeError("unknown fixture pip command: " + repr(args))
+    if (os.environ.get("NATIVE_CORRUPTION_FILE") and "tilelang==0.1.15" in args
+            and "--force-reinstall" in args):
+        Path(os.environ["NATIVE_CORRUPTION_FILE"]).write_text("repaired")
     with open(os.environ["TOOL_LOG"], "a") as log:
         log.write(json.dumps(args) + "\n")
     with open(os.environ["TOOL_ENV_LOG"], "a") as log:
@@ -122,6 +153,13 @@ elif args[:2] == ["-m", "pip"]:
 else:
     raise RuntimeError(args)
 """
+
+
+@pytest.fixture(autouse=True)
+def ordinary_core_consumer(monkeypatch):
+    # Ordinary core tests must not inherit a job's optional consumer mode.
+    # The unsupported-consumer negative explicitly enables it again itself.
+    monkeypatch.setenv("E2E_SGLANG_GPTOSS_MXFP4_BF16", "0")
 
 
 def run_installer(
@@ -144,7 +182,16 @@ def run_installer(
     sleep.chmod(0o755)
     log = tmp_path / "pip.jsonl"
     env = {
-        **os.environ,
+        **{
+            key: os.environ[key]
+            for key in ("LD_LIBRARY_PATH", "PYTHONPYCACHEPREFIX")
+            if key in os.environ
+        },
+        "HOME": str(tmp_path),
+        "TMPDIR": str(tmp_path),
+        "LANG": "C.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "E2E_SGLANG_GPTOSS_MXFP4_BF16": "0",
         "PATH": str(binary) + os.pathsep + os.environ["PATH"],
         "ENGINE_REQUIREMENTS": json.dumps(packages),
         "TOOL_LOG": str(log),
@@ -166,6 +213,8 @@ def run_installer(
         "IMAGE_DLPACK_LIB",
         "FAIL_PIP_STAGE",
         "FAIL_NATIVE_CHECK",
+        "FAIL_TORCH_PREFLIGHT",
+        "NATIVE_REPAIR_PACKAGES",
     ):
         env.pop(name, None)
     env.update(extra_env or {})
@@ -240,6 +289,8 @@ def test_sglang_image_companion_survives_separate_actions_steps(
             "--no-cache-dir",
             "--no-build-isolation",
             "--no-binary=torch-c-dlpack-ext",
+            "--force-reinstall",
+            "--no-deps",
             "apache-tvm-ffi==0.1.12",
             "tilelang==0.1.15",
             EXTENSION_SOURCE,
@@ -400,7 +451,7 @@ def test_unsupported_rocm_cohort_stops_before_pip(tmp_path, bad_image, diagnosti
     assert calls == [] and not (tmp_path / "github.env").exists()
 
 
-@pytest.mark.parametrize("stage,exitcode", [("cohort", 42), ("native", 44), ("check", 43)])
+@pytest.mark.parametrize("stage,exitcode", [("cohort", 42), ("native", 1), ("check", 1)])
 def test_rocm_repair_failure_does_not_publish_handoff(tmp_path, stage, exitcode):
     result, calls = run_installer(
         tmp_path,
@@ -500,7 +551,9 @@ def test_verify_only_keeps_a_failed_check_nonzero(tmp_path):
             "FAIL_PIP_STAGE": "check",
         },
     )
-    assert result.returncode == 43
+    assert result.returncode == 1
+    failed = json.loads((tmp_path / "native.json").read_text())
+    assert failed["verified"] is False and failed["pip_check"]["returncode"] == 43
     assert calls == [["-m", "pip", "check"]]
     assert not (tmp_path / "github.env").exists()
 
@@ -608,7 +661,9 @@ def test_verify_only_rejects_own_library_before_check_or_success_report(tmp_path
     )
     assert result.returncode != 0
     assert "DLPack extension loaded its own library: 'fixture-dlpack-library'" in result.stderr
-    assert calls == [] and not report.exists()
+    assert calls == []
+    failed = json.loads(report.read_text())
+    assert failed["verified"] is False and "own library" in failed["error"]["message"]
     assert not (tmp_path / "github.env").exists()
 
 
@@ -1392,6 +1447,8 @@ def test_vllm_requested_mooncake_canary_is_scoped_and_fail_closed(
         "MISSING_MOONCAKE": "1" if unavailable else "0",
         "GITHUB_PATH": str(handoff),
     }
+    if "LD_LIBRARY_PATH" in os.environ:
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
     if field is not None:
         env[field] = value
     result = subprocess.run(
@@ -1414,3 +1471,94 @@ def test_vllm_requested_mooncake_canary_is_scoped_and_fail_closed(
     else:
         assert result.returncode == 0, result.stderr
         assert handoff.read_text() == str(tmp_path / ".venv/bin") + "\n"
+
+
+def test_verify_only_dispatches_before_torch_install_preflight(tmp_path):
+    report = tmp_path / "verify.json"
+    result, calls = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only", str(report)),
+        extra_env={"SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE, "FAIL_TORCH_PREFLIGHT": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(report.read_text())["verified"] is True
+    assert calls == [["-m", "pip", "check"]]
+    assert not (tmp_path / "github.env").exists()
+
+
+def test_native_repair_plan_selects_only_corrupt_same_version_tilelang(tmp_path, monkeypatch):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    assert verifier.native_repair_packages() == []
+    (root / "tilelang/lib/libtilelang.so").write_bytes(b"corrupted same-version library")
+    assert verifier.native_repair_packages() == ["tilelang"]
+    assert native == [] and pip == []
+
+
+def test_same_version_payload_is_replaced_without_touching_other_cohorts(tmp_path):
+    payload = tmp_path / "tilelang-payload"
+    payload.write_text("bad same-version payload")
+    result, calls = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        extra_env={
+            "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE,
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "NATIVE_CORRUPTION_FILE": str(payload),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    native = [call for call in calls if "--force-reinstall" in call]
+    assert len(native) == 1 and native[0][-1:] == ["tilelang==0.1.15"]
+    assert "--no-deps" in native[0]
+    assert all(
+        "apache-tvm-ffi==0.1.12" not in call
+        and EXTENSION_SOURCE not in call
+        and "torch" not in call
+        for call in native
+    )
+    assert payload.read_text() == "repaired"
+
+
+def test_healthy_native_cohort_is_not_reinstalled(tmp_path):
+    result, calls = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        extra_env={
+            "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE,
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "NATIVE_REPAIR_PACKAGES": "[]",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert not any(
+        "--force-reinstall" in call
+        or "apache-tvm-ffi==0.1.12" in call
+        or "tilelang==0.1.15" in call
+        or EXTENSION_SOURCE in call
+        for call in calls
+    )
+
+
+def test_record_validation_is_independent_of_current_pycache_prefix(tmp_path, monkeypatch):
+    verifier, _, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "external-cache"))
+    report = {}
+    verifier.verify(report)
+    assert report["pip_check"]["returncode"] == 0 and native and pip
+
+
+def test_record_cache_without_allowed_source_is_still_rejected(tmp_path, monkeypatch):
+    verifier, root, _, _ = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "external-cache"))
+    cached = root / "torch_c_dlpack_ext/__pycache__/orphan.cpython-313.pyc"
+    cached.parent.mkdir()
+    cached.write_bytes(b"fixture cache never executed")
+    record = root / "torch_c_dlpack_ext-0.1.5.dist-info/RECORD"
+    with record.open("a") as stream:
+        stream.write(str(cached.relative_to(root)) + ",,\n")
+    with pytest.raises(RuntimeError, match="Unhashed RECORD file"):
+        verifier.verify({})

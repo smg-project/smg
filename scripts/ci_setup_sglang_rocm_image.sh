@@ -67,6 +67,12 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
 
+# Verification owns source-only imports and always writes its failure report.
+# Do not import Torch or inspect install-only companions before this dispatch.
+if [ "$verify_only" -eq 1 ]; then
+    exec python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" "${verify_output[@]}"
+fi
+
 # Preserve this image's companions instead of the generic protobuf-6 fallback.
 SMG_CI_GRPC_COMPANION_VERSION="$(python3 -c '
 from importlib.metadata import PackageNotFoundError, version
@@ -122,8 +128,8 @@ if (sglang_version != "0.5.21"
         "ERROR: unsupported SGLang ROCm native dependency cohort: "
         "observed sglang=%s torch=%s hip=%r; "
         "expected sglang=0.5.21 torch=2.11.0+rocm10.0.0 and HIP enabled. "
-        "Update TVM/TileLang/DLPack pins in "
-        "scripts/ci_setup_sglang_rocm_image.sh with the image."
+        "Update the cohort pins in scripts/ci_setup_sglang_rocm_image.sh "
+        "and scripts/ci_verify_sglang_rocm_cohort.py with the image."
         % (sglang_version, torch_version, hip_version)
     )
 api = getattr(torch.Tensor, "__dlpack_c_exchange_api__", None)
@@ -134,10 +140,22 @@ if api is None or type(api).__name__ != "PyCapsule":
     )
 '
 if [ "$verify_only" -eq 0 ]; then
-    $RETRY 3 10 python3 -m pip install --no-cache-dir --no-build-isolation \
-        --no-binary=torch-c-dlpack-ext \
-        "apache-tvm-ffi==0.1.12" "tilelang==0.1.15" \
-        "torch-c-dlpack-ext @ https://files.pythonhosted.org/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz#sha256=d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe"
+    # A version pin alone leaves a same-version corrupted payload installed.
+    # Select only known bad native packages, and do not resolve/reinstall Torch.
+    repair_plan="$(python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" --repair-plan)"
+    repair_specs=()
+    if [ -n "$repair_plan" ]; then
+        while IFS= read -r package; do
+            case "$package" in
+                apache-tvm-ffi) repair_specs+=("apache-tvm-ffi==0.1.12") ;;
+                tilelang) repair_specs+=("tilelang==0.1.15") ;;
+                torch-c-dlpack-ext) repair_specs+=("torch-c-dlpack-ext @ https://files.pythonhosted.org/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz#sha256=d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe") ;;
+                *) echo "invalid native repair package: $package" >&2; exit 1 ;;
+            esac
+        done <<< "$repair_plan"
+        $RETRY 3 10 python3 -m pip install --no-cache-dir --no-build-isolation \
+            --no-binary=torch-c-dlpack-ext --force-reinstall --no-deps "${repair_specs[@]}"
+    fi
 
     # Install gRPC packages from source (not PyPI) so PR changes are always tested
     $RETRY 3 10 python3 -m pip install -e crates/grpc_client/python/ -e grpc_servicer/

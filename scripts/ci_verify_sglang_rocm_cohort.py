@@ -18,6 +18,7 @@ import sysconfig
 import traceback
 from contextlib import contextmanager
 from email.parser import Parser
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -67,6 +68,15 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def installed_cache_source(name):
+    """Map a recorded CPython cache path without consulting runtime cache settings."""
+    path = Path(name)
+    if path.parent.name != "__pycache__":
+        return None
+    match = re.fullmatch(r"(.+)\.cpython-[0-9]+(?:\.opt-[0-9]+)?\.pyc", path.name)
+    return str(path.parent.parent / (match[1] + ".py")) if match else None
+
+
 def verify_record(root, folder, consoles=()):
     record = folder / "RECORD"
     rows = list(csv.reader(io.StringIO(record.read_text())))
@@ -100,8 +110,7 @@ def verify_record(root, folder, consoles=()):
         else:
             pyc = path.suffix == ".pyc" and "__pycache__" in path.parts
             if pyc:
-                source = Path(importlib.util.source_from_cache(str(path))).relative_to(root)
-                pyc = str(source) in names
+                pyc = installed_cache_source(name) in names
             require((path == record or pyc) and size == "", "Unhashed RECORD file: " + name)
     return names
 
@@ -214,11 +223,7 @@ def verify(report):
                 folder.name + "/" + key
                 for key in ("WHEEL", "RECORD", "INSTALLER", "REQUESTED", "direct_url.json")
             }
-            pycs = {
-                str(Path(importlib.util.cache_from_source(str(root / key))).relative_to(root))
-                for key in source_names
-                if key.endswith(".py")
-            }
+            pycs = {key for key in names if installed_cache_source(key) in source_names}
             require(
                 source_names | metadata_names <= names <= source_names | metadata_names | pycs,
                 "Unexpected or missing extension payload",
@@ -361,10 +366,73 @@ def verify(report):
         require(check.returncode == 0, "pip check failed")
 
 
+def native_repair_packages():
+    """Select only version/RECORD/official-anchor mismatches; never install here."""
+    require(
+        os.environ.get("E2E_SGLANG_GPTOSS_MXFP4_BF16", "0") != "1",
+        "MXFP4 consumer requires its separately qualified extension",
+    )
+    require(sys.prefix == "/opt/venv", "Expected fixed-image interpreter")
+    root = Path(sysconfig.get_path("purelib")).resolve()
+    require(root.is_relative_to(Path("/opt/venv")), "Unexpected site-packages")
+    repair = []
+    for name, version, package in (
+        ("apache-tvm-ffi", "0.1.12", "tvm_ffi"),
+        ("tilelang", "0.1.15", "tilelang"),
+        ("torch-c-dlpack-ext", "0.1.5", "torch_c_dlpack_ext"),
+    ):
+        try:
+            require(md.version(name) == version, "Native version differs")
+            matches = [
+                dist
+                for dist in md.distributions()
+                if re.sub(r"[-_.]+", "-", dist.metadata["Name"]).lower() == name
+            ]
+            require(len(matches) == 1, "Ambiguous native distribution")
+            dist = matches[0]
+            folder = root / (name.replace("-", "_") + "-" + version + ".dist-info")
+            require(
+                Path(dist.locate_file("")).resolve() == root
+                and Path(dist._path).resolve() == folder
+                and not folder.is_symlink(),
+                "Unexpected native distribution location",
+            )
+            consoles = (
+                ("../../../bin/tvm-ffi-config", "../../../bin/tvm-ffi-stubgen")
+                if name == "apache-tvm-ffi"
+                else ()
+            )
+            names = verify_record(root, folder, consoles)
+            for key, expected in ANCHORS.items():
+                belongs = (
+                    key.startswith(package + "/")
+                    or key.startswith(folder.name + "/")
+                    or (name == "torch-c-dlpack-ext" and key == "build_backend.py")
+                )
+                if belongs:
+                    path = root / key
+                    require(
+                        key in names
+                        and not path.is_symlink()
+                        and path.is_file()
+                        and digest(path) == expected,
+                        "Native official anchor differs: " + key,
+                    )
+        except (PackageNotFoundError, OSError, RuntimeError, ValueError):
+            repair.append(name)
+    return repair
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", nargs="?")
+    parser.add_argument("--repair-plan", action="store_true")
     args = parser.parse_args()
+    if args.repair_plan:
+        require(args.output is None, "repair plan does not take a report path")
+        for package in native_repair_packages():
+            print(package)
+        return 0
     report = {
         "verified": False,
         "scope": (
