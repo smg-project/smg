@@ -531,10 +531,7 @@ impl MediaProcessor for SmgMediaProcessor {
                             )))
                         }
                     };
-                    Ok(WorkerMediaItem {
-                        modality,
-                        url: item.url,
-                    })
+                    Ok(WorkerMediaItem::new(modality, item.url))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let output = pipeline
@@ -583,17 +580,24 @@ fn worker_media_error_to_status(error: WorkerMediaError) -> tonic::Status {
     }
 }
 
-/// Resolve an optional modality placeholder token ID from managed config JSON or `config.json`.
-fn resolve_modality_token_id(
-    config: &serde_json::Value,
-    model_config: Option<&serde_json::Value>,
-    key: &str,
-) -> Option<u32> {
-    config
-        .get(key)
-        .or_else(|| model_config.and_then(|cfg| cfg.get(key)))
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|token| u32::try_from(token).ok())
+/// Parse an optional OpenAI image detail string (`auto`, `low`, `high`) into [`llm_multimodal::ImageDetail`].
+fn parse_image_detail(
+    raw: Option<&str>,
+) -> Result<Option<llm_multimodal::ImageDetail>, tonic::Status> {
+    let Some(detail) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if detail.eq_ignore_ascii_case("auto") {
+        Ok(Some(llm_multimodal::ImageDetail::Auto))
+    } else if detail.eq_ignore_ascii_case("low") {
+        Ok(Some(llm_multimodal::ImageDetail::Low))
+    } else if detail.eq_ignore_ascii_case("high") {
+        Ok(Some(llm_multimodal::ImageDetail::High))
+    } else {
+        Err(tonic::Status::invalid_argument(format!(
+            "unsupported image detail option: {detail:?}"
+        )))
+    }
 }
 
 struct SmgSglangMediaProcessor {
@@ -640,7 +644,7 @@ impl SglangMediaProcessor for SmgSglangMediaProcessor {
                 // The shared pipeline matches anchors per modality, preserving URL order.
                 let items = mm.image_urls.into_iter().map(|url| (Modality::Image, url))
                     .chain(mm.video_urls.into_iter().map(|url| (Modality::Video, url)))
-                    .map(|(modality, url)| WorkerMediaItem { modality, url })
+                    .map(|(modality, url)| WorkerMediaItem::new(modality, url))
                     .collect::<Vec<_>>();
                 let tokenized = request.tokenized.as_mut()
                     .ok_or_else(|| tonic::Status::invalid_argument("media references require tokenized input"))?;
@@ -2047,6 +2051,28 @@ impl PySglangGrpcServer {
 }
 
 /// Native encoder control shares the existing servicer runtime and Rust media pipeline.
+/// Convert managed encoder proto items into `WorkerMediaItem`s, forwarding validated image detail.
+fn encoder_items_to_worker_items(
+    modality: EncoderModality,
+    encoder_items: Vec<EncoderMediaItem>,
+) -> Result<Vec<WorkerMediaItem>, tonic::Status> {
+    let target_modality = match modality {
+        EncoderModality::Image => Modality::Image,
+        EncoderModality::Video => Modality::Video,
+    };
+    encoder_items
+        .into_iter()
+        .map(|item| {
+            let detail = parse_image_detail(item.detail.as_deref())?;
+            Ok(WorkerMediaItem {
+                modality: target_modality,
+                url: item.url,
+                detail,
+            })
+        })
+        .collect()
+}
+
 #[pyclass(name = "ManagedEncoderServer")]
 pub struct PyManagedEncoderServer {
     server: EncoderServer,
@@ -2073,17 +2099,6 @@ impl PyManagedEncoderServer {
                 "managed encoder requires finite nonzero limits",
             ));
         }
-        let config: serde_json::Value = serde_json::from_str(&config_json)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let model_config = std::fs::read_to_string(
-            std::path::Path::new(&native.settings.model_dir).join("config.json"),
-        )
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
-        let image_token_id =
-            resolve_modality_token_id(&config, model_config.as_ref(), "image_token_id");
-        let video_token_id =
-            resolve_modality_token_id(&config, model_config.as_ref(), "video_token_id");
         py.detach(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2105,34 +2120,9 @@ impl PyManagedEncoderServer {
                 move |modality: EncoderModality, encoder_items: Vec<EncoderMediaItem>| {
                     let pipeline = pipeline.clone();
                     Box::pin(async move {
-                        let (target_modality, placeholder_token) = match modality {
-                            EncoderModality::Image => (
-                                Modality::Image,
-                                image_token_id.ok_or_else(|| {
-                                    tonic::Status::invalid_argument(
-                                        "managed encoder config missing image_token_id",
-                                    )
-                                })?,
-                            ),
-                            EncoderModality::Video => (
-                                Modality::Video,
-                                video_token_id.or(image_token_id).ok_or_else(|| {
-                                    tonic::Status::invalid_argument(
-                                        "managed encoder config missing video_token_id",
-                                    )
-                                })?,
-                            ),
-                        };
-                        let tokens = vec![placeholder_token; encoder_items.len()];
-                        let items = encoder_items
-                            .into_iter()
-                            .map(|item| WorkerMediaItem {
-                                modality: target_modality,
-                                url: item.url,
-                            })
-                            .collect();
+                        let items = encoder_items_to_worker_items(modality, encoder_items)?;
                         let (_, inputs, extras) = pipeline
-                            .process_sglang(tokens, items)
+                            .process_sglang_encoder_items(items)
                             .await
                             .map_err(worker_media_error_to_status)?;
                         let embedding_tokens = std::iter::once(&inputs)
@@ -2185,5 +2175,51 @@ impl PyManagedEncoderServer {
         let duration = Duration::try_from_secs_f64(timeout)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         py.detach(|| self.server.stop(duration).map_err(to_py_err))
+    }
+}
+
+#[cfg(test)]
+mod managed_encoder_tests {
+    use super::*;
+
+    #[test]
+    fn encoder_items_to_worker_items_forwards_image_detail_and_rejects_invalid() {
+        let items = encoder_items_to_worker_items(
+            EncoderModality::Image,
+            vec![
+                EncoderMediaItem {
+                    url: "https://example.test/a.png".into(),
+                    detail: Some("low".into()),
+                },
+                EncoderMediaItem {
+                    url: "https://example.test/b.png".into(),
+                    detail: Some("HIGH".into()),
+                },
+                EncoderMediaItem {
+                    url: "https://example.test/c.png".into(),
+                    detail: Some("auto".into()),
+                },
+                EncoderMediaItem {
+                    url: "https://example.test/d.png".into(),
+                    detail: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].detail, Some(llm_multimodal::ImageDetail::Low));
+        assert_eq!(items[1].detail, Some(llm_multimodal::ImageDetail::High));
+        assert_eq!(items[2].detail, Some(llm_multimodal::ImageDetail::Auto));
+        assert_eq!(items[3].detail, None);
+
+        let err = encoder_items_to_worker_items(
+            EncoderModality::Image,
+            vec![EncoderMediaItem {
+                url: "https://example.test/bad.png".into(),
+                detail: Some("ultra".into()),
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

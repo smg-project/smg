@@ -805,3 +805,53 @@ def test_prefill_receiver_owner_deterministic_release_and_chunked_safety():
     boot_req, boot_released, boot_fin = _make_req("bootstrap_fail")
     assert plugin.release_bootstrap_failure_owner(None, object(), boot_req) is None
     assert boot_released == ["bootstrap_fail"] and not boot_fin.alive
+
+
+def test_managed_launcher_launch_wires_bootstrap_and_scheduler_metrics(monkeypatch):
+    """ManagedLauncher.launch delegates to SglangLauncher.launch so bootstrap + metrics both run."""
+    import smg_grpc_servicer.sglang.epd_launcher as epd_launcher
+    import smg_grpc_servicer.sglang.rust as sglang_rust
+
+    calls = []
+    metrics_sentinel = object()
+    monkeypatch.setattr(
+        sglang_rust,
+        "launch_scheduler_ranks",
+        lambda args, *, handshake_port, encode_bridge=None: (
+            calls.append(("ranks", handshake_port, encode_bridge)) or "engine"
+        ),
+    )
+    monkeypatch.setattr(
+        sglang_rust,
+        "serve_scheduler_metrics",
+        lambda args: calls.append(("metrics", args)) or metrics_sentinel,
+    )
+    args = SimpleNamespace(host="127.0.0.1", encoder_bootstrap_port=9100)
+
+    prefill_launcher = epd_launcher.launcher({"role": "prefill"})
+    assert not hasattr(prefill_launcher, "launch_ranks")
+    assert prefill_launcher.launch(args, 5555, {}) == "engine"
+    assert prefill_launcher.scheduler_metrics is metrics_sentinel
+    assert calls[0][0] == "ranks" and calls[0][1] == 5555
+    assert isinstance(calls[0][2], epd_launcher.ManagedBootstrap)
+    assert calls[1] == ("metrics", args)
+
+    calls.clear()
+    decode_launcher = epd_launcher.launcher({"role": "decode"})
+    assert decode_launcher.launch(args, 5556, {}) == "engine"
+    assert decode_launcher.scheduler_metrics is metrics_sentinel
+    assert calls[0] == ("ranks", 5556, None)
+    assert calls[1] == ("metrics", args)
+
+
+def test_encoder_embedding_width_accounts_for_deepstack():
+    """DeepStack multi-layer vision outputs widen per-token staging bytes beyond hidden_size."""
+    import smg_grpc_servicer.sglang.epd_launcher as epd_launcher
+
+    encoder = SimpleNamespace(model_config=SimpleNamespace(hidden_size=4096))
+    plain_cfg = SimpleNamespace(vision_config=SimpleNamespace())
+    deepstack_cfg = SimpleNamespace(
+        vision_config=SimpleNamespace(deepstack_visual_indexes=[8, 16, 24])
+    )
+    assert epd_launcher._encoder_embedding_width(encoder, plain_cfg) == 4096
+    assert epd_launcher._encoder_embedding_width(encoder, deepstack_cfg) == 16384

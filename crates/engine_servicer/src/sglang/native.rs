@@ -71,8 +71,9 @@ impl ManagedConfig {
     }
 
     /// Advertise the managed contract; readiness is checked per query.
-    pub fn capabilities(&self) -> proto::Capabilities {
-        normalized_capabilities(self.capabilities.clone(), false)
+    /// Return normalized managed capabilities stamped with live worker `ready` status.
+    pub fn capabilities(&self, ready: bool) -> proto::Capabilities {
+        normalized_capabilities(self.capabilities.clone(), ready)
     }
 }
 
@@ -436,12 +437,15 @@ impl ManagedNativeRuntime {
     }
 }
 
-/// Typed admission refusals (and pre-queue `ClientClosed` before `submit_owned` returns a stream)
+/// Typed admission refusals (and pre-queue errors before `submit_owned` returns a stream)
 /// precede enqueue; unknown transport writes retain ownership.
 pub(crate) fn definitely_unsubmitted(error: &Status) -> bool {
     matches!(
         error.code(),
-        tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition | tonic::Code::Unimplemented
+        tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::Unimplemented
+            | tonic::Code::AlreadyExists
     ) || std::error::Error::source(error)
         .and_then(|source| source.downcast_ref::<engine_zmq_client::Error>())
         .is_some_and(|error| {
@@ -450,6 +454,12 @@ pub(crate) fn definitely_unsubmitted(error: &Status) -> bool {
                 engine_zmq_client::Error::EngineInputFull { .. }
                     | engine_zmq_client::Error::EngineInputBytesFull { .. }
                     | engine_zmq_client::Error::ClientClosed { .. }
+                    | engine_zmq_client::Error::DuplicateRequestId { .. }
+                    | engine_zmq_client::Error::InvalidDataParallelRank { .. }
+                    | engine_zmq_client::Error::Encode { .. }
+                    | engine_zmq_client::Error::WireLayoutMismatch { .. }
+                    | engine_zmq_client::Error::UnsupportedField { .. }
+                    | engine_zmq_client::Error::InvalidStructuredOutputsParams { .. }
             )
         })
 }

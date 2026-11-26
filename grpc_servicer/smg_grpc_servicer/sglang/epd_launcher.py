@@ -190,6 +190,21 @@ def encoder_artifact_bytes(hf_config, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQ
     return max_tokens * channels * temporal * (patch * merge) ** 2 * element_bytes + 4 * 1024**2
 
 
+def _encoder_embedding_width(encoder, hf_config):
+    """Derive actual visual embedding width (accounting for DeepStack multi-layer outputs)."""
+    base_hidden = encoder.model_config.hidden_size
+    width = base_hidden
+    vision = getattr(hf_config, "vision_config", None)
+    deepstack = _cfg_first(vision, "deepstack_visual_indexes", default=None)
+    if isinstance(deepstack, (list, tuple)) and deepstack:
+        width = max(width, base_hidden * (1 + len(deepstack)))
+    for attr in ("embedding_dim", "output_dim", "_embedding_dim"):
+        val = getattr(encoder, attr, None)
+        if type(val) is int and val > 0:
+            width = max(width, val)
+    return width
+
+
 def encoder_staging_bytes(hidden_size, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST):
     """Compute per-request staging byte budget from embedding dimension and dtype."""
     element_bytes = _DTYPE_BYTES.get(dtype)
@@ -204,6 +219,15 @@ def encoder_staging_bytes(hidden_size, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_RE
     return max_tokens * hidden_size * element_bytes
 
 
+def _control_reserve_bytes(config):
+    """Return the shared queued-control byte reserve bounded by container memory."""
+    budget_bytes = config.get("max_context_bytes", MAX_CONTEXT_BYTES)
+    return min(
+        config["max_active"] * config["max_control_bytes"],
+        max(config["max_control_bytes"], budget_bytes // 8),
+    )
+
+
 def encoder_window(config):
     """Reserve queued controls, then bound materialized artifacts and native sends."""
     send_copies = 1 if config.get("embedding_backend") == "mooncake" else config["max_receivers"]
@@ -211,10 +235,7 @@ def encoder_window(config):
         1 + send_copies
     )
     budget_bytes = config.get("max_context_bytes", MAX_CONTEXT_BYTES)
-    control_reserve = min(
-        config["max_active"] * config["max_control_bytes"],
-        max(config["max_control_bytes"], budget_bytes // 8),
-    )
+    control_reserve = _control_reserve_bytes(config)
     capacity = min(config["max_active"], (budget_bytes - control_reserve) // execution_bytes)
     if capacity <= 0:
         raise ValueError("managed E context limit cannot admit queued controls and native work")
@@ -244,7 +265,7 @@ class ManagedBootstrap:
 
 def launcher(config):
     """Build a ``SglangLauncher`` subclass configured for managed P or D startup."""
-    from smg_grpc_servicer.sglang.rust import SglangLauncher, launch_scheduler_ranks
+    from smg_grpc_servicer.sglang.rust import SglangLauncher
 
     class ManagedLauncher(SglangLauncher):
         ipc_prefix = "sglang-managed-servicer"
@@ -264,12 +285,10 @@ def launcher(config):
                 )
             }
 
-        def launch_ranks(self, args, handshake_port):
-            """Launch headless scheduler ranks with an encoder bootstrap bridge on Prefill."""
-            bootstrap = ManagedBootstrap(args) if config["role"] == "prefill" else None
-            return launch_scheduler_ranks(
-                args, handshake_port=handshake_port, encode_bridge=bootstrap
-            )
+        def launch(self, args, handshake_port, facts):
+            """Attach the managed Prefill bootstrap listener, then delegate to ``SglangLauncher.launch``."""
+            self.encode = ManagedBootstrap(args) if config["role"] == "prefill" else None
+            return super().launch(args, handshake_port, facts)
 
     return ManagedLauncher()
 
@@ -337,14 +356,18 @@ async def serve(config, args):
             lambda: _normalize_dtype(getattr(visual, "dtype", config["embedding_dtype"])),
         )
         hf_config = backend.encoder.model_config.hf_config
+        staging_dtype = _normalize_dtype(
+            getattr(backend.encoder, "_embedding_dtype", None) or config["embedding_dtype"]
+        )
         config["max_staging_bytes_per_request"] = encoder_staging_bytes(
-            backend.encoder.model_config.hidden_size,
-            config["embedding_dtype"],
+            _encoder_embedding_width(backend.encoder, hf_config),
+            staging_dtype,
             max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST,
         )
         config["max_artifact_bytes"] = encoder_artifact_bytes(
             hf_config, vision_dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST
         )
+        config["max_queued_control_bytes"] = _control_reserve_bytes(config)
         config["execution_capacity"], _ = encoder_window(config)
         max_batch_size = getattr(backend.scheduler, "max_batch_size", None)
         config["max_cpu"] = resolve_max_cpu(
