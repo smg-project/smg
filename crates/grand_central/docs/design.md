@@ -729,6 +729,12 @@ This is classic under its default, `--cache-index tree`. Under `--cache-index ha
 none of the three: it keeps a table of placements with a time to live for requests with token
 ids, and balances a text request by load. This design covers the default.
 
+The engine builds no such table yet. A start under the engine whose routing settings state
+`cache_index = hash` runs, and `cache_aware` then remembers no request it placed. The start says
+so in one warning that names the setting. The warning is written for the settings alone: a
+supplied document whose index entry is of kind `hash` runs the same way and gets none, since it
+states its own entries and no setting names them.
+
 Both trees are read and written in one walk: the walk finds the longest stored prefix, hands the
 match to the policy, and stores the request for the worker the policy chose. So no write is lost
 when many requests decide at once. A tree is brought back under a size bound
