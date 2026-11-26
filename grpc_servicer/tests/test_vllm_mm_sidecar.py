@@ -390,7 +390,6 @@ class TestConnector:
         module("vllm.v1")
         module("vllm.v1.serial_utils", MsgpackEncoder=lambda **kwargs: object())
         monkeypatch.setattr(mm_sidecar, "config_fingerprint", lambda cfg: fingerprint())
-        monkeypatch.setattr(mm_sidecar, "floor_rule", lambda cfg: None)
 
         def build(domains):
             mm_config = types.SimpleNamespace(media_io_kwargs=None)
@@ -414,56 +413,6 @@ class TestConnector:
         # A list that names no host still refuses every host, as it did.
         assert build([" "])["allowed_media_domains"] == [" "]
         assert build(None)["allowed_media_domains"] is None
-
-
-class TestShortSideFloor:
-    def test_a_fetched_image_below_the_familys_floor_is_raised_before_the_renderer(self):
-        from smg_grpc_servicer.vllm.short_side_floor import FloorRule
-
-        M3_RULE = FloorRule(floor=112, factor=28, min_pixels=3136, max_pixels=451584)
-
-        class _Image:
-            def __init__(self, width, height):
-                self.size = (width, height)
-
-            def resize(self, size, resample):
-                assert resample == 3  # bicubic
-                return _Image(*size)
-
-        for size, floor, expected in [
-            ((16, 16), M3_RULE, (112, 112)),
-            ((400, 112), M3_RULE, (400, 112)),
-        ]:
-            s = sidecar(FakeRedis())
-            s._short_side_floor = floor
-            fetched = _Image(*size)
-            rendered = []
-
-            async def fetch_image(url, fetched=fetched):
-                return fetched
-
-            async def render(prompt, **kwargs):
-                rendered.append(prompt)
-                return {
-                    "prompt_token_ids": [1, 2, 3],
-                    "mm_kwargs": {},
-                    "mm_hashes": {},
-                    "mm_placeholders": {},
-                }
-
-            s._connector = types.SimpleNamespace(fetch_image_async=fetch_image)
-            s._tokens_prompt = lambda **kwargs: kwargs
-            s._renderer = types.SimpleNamespace(process_for_engine_async=render)
-            s._encoder = None
-            result = run(s.handle(job()))
-            assert result.ok, result
-            (image,) = rendered[0]["multi_modal_data"]["image"]
-            assert image.size == expected
-            if expected == size:
-                assert image is fetched
-
-    def test_a_sidecar_built_without_init_raises_nothing(self):
-        assert sidecar(FakeRedis())._short_side_floor is None
 
 
 class TestClassification:
