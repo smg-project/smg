@@ -40,8 +40,6 @@ use sha2::{Digest as _, Sha256};
 
 // The crate's own paths through this module still name the type here.
 pub(crate) use crate::document::applied::AppliedSpec;
-#[cfg(test)]
-use crate::engine::view::HashKind;
 use crate::{
     engine::{
         framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, WeightedScorer},

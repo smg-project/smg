@@ -1153,23 +1153,6 @@ impl DocumentManager {
             })
         })
     }
-
-    #[cfg(test)]
-    fn bound(&self) -> bool {
-        self.writable() || self.held.lock().is_some()
-    }
-}
-
-/// The door's two locks, for a case in another module.
-#[cfg(all(test, feature = "controller"))]
-impl DocumentManager {
-    pub(crate) fn applying_lock(&self) -> &Mutex<Option<SpecStore>> {
-        &self.applying
-    }
-
-    pub(crate) fn held_lock(&self) -> &Mutex<Option<Held>> {
-        &self.held
-    }
 }
 
 /// The door's apply lock, held for a follower's event
