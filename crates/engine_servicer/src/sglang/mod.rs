@@ -41,6 +41,7 @@ mod media_identity;
 pub mod native;
 mod service;
 #[cfg(test)]
+#[path = "../../tests/unit/sglang/tests/mod.rs"]
 mod tests;
 
 use std::{sync::Arc, time::Duration};
