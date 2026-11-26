@@ -11,6 +11,9 @@
 //! So the object stands when the write returns.
 //! No row of the store's table is read at the head of a write: every
 //! writer of a row holds the turn, so the object states the row.
+//! The store is handed the row a write takes out too, as it was read back:
+//! a removal's row, and the old life a key's next life replaces. The log
+//! is told from it, in the status the table holds.
 //!
 //! The store is told between the build and the registry's write: its write
 //! files the member's count slot, which a lease books the moment a decision
@@ -77,10 +80,14 @@ impl<G: Generation> Objects<G> {
         maker: Registrant,
     ) -> Option<MembershipChange> {
         let _turn = self.turn.lock();
-        let standing = self.row_under(&facts.key);
+        let mut standing = self.row_under(&facts.key);
         let seen = standing.as_ref().map(|row| row.revision);
         let (change, row) = WorkerRow::laid_over(facts, standing.as_ref(), maker, Instant::now());
-        self.lay_decided(store, change, &row, seen)
+        // A key's next life takes the standing row out: the store is
+        // handed that row, as it was read back here.
+        let replaced = matches!(change, MembershipChange::Replaced { .. });
+        let left = standing.as_mut().filter(|_| replaced);
+        self.lay_decided(store, change, &row, seen, left)
     }
 
     /// Write `patch` over the row `id` where its object was built at
@@ -100,7 +107,7 @@ impl<G: Generation> Objects<G> {
         patch.laid_on(&mut row.facts);
         row.revision += 1;
         let change = MembershipChange::Relabelled { id };
-        self.lay_decided(store, change, &row, Some(revision))
+        self.lay_decided(store, change, &row, Some(revision), None)
     }
 
     /// Remove the row `id` where its object was built at `revision`. The
@@ -116,8 +123,8 @@ impl<G: Generation> Objects<G> {
         revision: u64,
     ) -> Option<MembershipChange> {
         let _turn = self.turn.lock();
-        let row = self.guarded(id, revision)?;
-        self.take_decided(store, &row)
+        let mut row = self.guarded(id, revision)?;
+        self.take_decided(store, &mut row)
     }
 
     /// The row `id` as its object and what stands beside it state it,
@@ -131,16 +138,18 @@ impl<G: Generation> Objects<G> {
     /// at the revision `seen` in the holder's turn: the row's object is
     /// built, the store is told, and the object is put in the registry. A
     /// change the store does not take builds an object nobody sees
-    /// ([`Self::moved`]).
+    /// ([`Self::moved`]). `left` is the row a key's next life takes out,
+    /// as it was read back: the store tells the log from it.
     fn lay_decided(
         &self,
         store: &MemoryStore,
         change: MembershipChange,
         row: &WorkerRow,
         seen: Option<u64>,
+        left: Option<&mut WorkerRow>,
     ) -> Option<MembershipChange> {
         let built = self.build(row);
-        if !store.follow_objects(change, Some(row.clone()), seen) {
+        if !store.follow_objects(change, Some(row.clone()), seen, left) {
             return self.moved(store, &row.facts.key, change);
         }
         self.put(store, row, built);
@@ -165,11 +174,12 @@ impl<G: Generation> Objects<G> {
     /// does not take it, the row that stands gets an object anew
     /// ([`Self::moved`]): a new object under a new id in the registry. The
     /// leases the store counts on the row are stated on it, and what the
-    /// old object alone held is not.
-    fn take_decided(&self, store: &MemoryStore, row: &WorkerRow) -> Option<MembershipChange> {
+    /// old object alone held is not. The store is handed `row`, and tells
+    /// the log from it.
+    fn take_decided(&self, store: &MemoryStore, row: &mut WorkerRow) -> Option<MembershipChange> {
         self.end(row.id);
         let change = MembershipChange::Removed { id: row.id };
-        if !store.follow_objects(change, None, Some(row.revision)) {
+        if !store.follow_objects(change, None, Some(row.revision), Some(&mut *row)) {
             return self.moved(store, &row.facts.key, change);
         }
         self.forget_one(self.keeper_clock(), row.id);
