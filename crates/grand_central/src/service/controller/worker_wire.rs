@@ -19,7 +19,10 @@ use prost::Message as _;
 
 use crate::{
     document::operator::snapshot,
-    engine::view::{Role, WireModes, WorkerId},
+    engine::{
+        view::{Role, WireModes, WorkerId},
+        DemandFacts,
+    },
     service::{
         proto::{self, worker_event::Event},
         replication::{Entry, Event as Written},
@@ -218,8 +221,55 @@ fn numbers(
         max_running: facts.max_running.unwrap_or(0),
         dp_rank: u32::from(facts.dp_rank),
         health_policy: Some(health_policy(facts.health)),
+        demand_facts: stated_demand_facts(facts.demand_facts),
         ..Default::default()
     }
+}
+
+/// The contract's block of what a worker states for a request's hard
+/// demands. A worker that states none tells no block, so its row is the
+/// row a build before the block told, byte for byte.
+fn stated_demand_facts(facts: DemandFacts) -> Option<proto::DemandFacts> {
+    // Every field by its name: one the store's type gains stops the build
+    // here, so none stays behind unseen.
+    let DemandFacts {
+        runtime,
+        references,
+        host_pipeline,
+        window,
+        decoding,
+    } = facts;
+    (facts != DemandFacts::default()).then_some(proto::DemandFacts {
+        runtime,
+        references,
+        host_pipeline,
+        window,
+        decoding: u32::from(decoding),
+    })
+}
+
+/// The store's facts of the contract's block. The way to decide a
+/// constraint is a byte in the store: a wider number is refused by `path`,
+/// in a registration and in a told row alike.
+fn demand_facts(block: &proto::DemandFacts, path: &'static str) -> Result<DemandFacts, Refused> {
+    // Every field by its name: one the contract gains stops the build here,
+    // so none passes unread.
+    let proto::DemandFacts {
+        runtime,
+        references,
+        host_pipeline,
+        window,
+        decoding,
+    } = block;
+    let decoding = u8::try_from(*decoding)
+        .map_err(|_| refused(path, "a way to decide a constraint is at most 255"))?;
+    Ok(DemandFacts {
+        runtime: *runtime,
+        references: *references,
+        host_pipeline: *host_pipeline,
+        window: *window,
+        decoding,
+    })
 }
 
 /// A new key's row.
@@ -680,6 +730,12 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
                 .transpose()?,
             waiting_requests: overload.queue_limit,
         },
+        demand_facts: told
+            .demand_facts
+            .as_ref()
+            .map(|block| demand_facts(block, "row.demand_facts.decoding"))
+            .transpose()?
+            .unwrap_or_default(),
         ..WorkerFacts::default()
     };
     let maker = match &told.maker {
@@ -1003,6 +1059,11 @@ fn over(
     if let Some(block) = &spec.overload {
         facts.overload = overload(block, "spec.overload.kv_usage_permille")?;
     }
+    // What the worker states for a request's hard demands is the block's,
+    // whole: an empty one states none, and one left out keeps the row's.
+    if let Some(block) = &spec.demand_facts {
+        facts.demand_facts = demand_facts(block, "spec.demand_facts.decoding")?;
+    }
     // The health policy of record is the registration's, whole: one that
     // states none is checked under the defaults.
     let default = HealthPolicy::default();
@@ -1197,7 +1258,10 @@ mod tests {
         LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
     };
     use crate::{
-        engine::view::{Role, WireModes, WorkerId},
+        engine::{
+            view::{Role, WireModes, WorkerId},
+            DemandFacts,
+        },
         service::{
             proto::{self, replication_event::Event as Sent, worker_event::Event},
             replication::{Entry, Event as Written},
@@ -1297,6 +1361,13 @@ mod tests {
                 kv_usage_permille: Some(875),
                 waiting_requests: None,
             },
+            demand_facts: DemandFacts {
+                runtime: 7,
+                references: true,
+                host_pipeline: true,
+                window: 32_768,
+                decoding: 3,
+            },
             ..WorkerFacts::default()
         };
         WorkerRow {
@@ -1366,6 +1437,13 @@ mod tests {
                 timeout_ms: 900,
                 disabled: true,
             }),
+            demand_facts: Some(proto::DemandFacts {
+                runtime: 7,
+                references: true,
+                host_pipeline: true,
+                window: 32_768,
+                decoding: 3,
+            }),
         };
         assert_eq!(told, expected);
     }
@@ -1408,6 +1486,9 @@ mod tests {
             told.health_policy.map(|policy| policy.disabled),
             Some(false)
         );
+        // A worker that states nothing for a request's hard demands tells
+        // no block: its row is the row a build before the block told.
+        assert_eq!(told.demand_facts, None);
     }
 
     #[test]
@@ -1776,6 +1857,69 @@ mod tests {
                 waiting_requests: Some(40),
                 ..default
             }
+        );
+    }
+
+    /// What a worker states for a request's hard demands is its
+    /// registration's block, whole. A block left out keeps what the row
+    /// states, and an empty one states none.
+    #[test]
+    fn a_block_of_demand_facts_is_the_rows_whole_and_one_left_out_keeps_the_rows() {
+        let with = |block: proto::DemandFacts| proto::WorkerSpec {
+            demand_facts: Some(block),
+            ..spec()
+        };
+        let stated = |stated: &proto::WorkerSpec, standing: Option<&WorkerFacts>| {
+            facts(stated, standing).map(|made| made.demand_facts)
+        };
+        let every = proto::DemandFacts {
+            runtime: 7,
+            references: true,
+            host_pipeline: true,
+            window: 32_768,
+            decoding: 255,
+        };
+        let held = DemandFacts {
+            runtime: 7,
+            references: true,
+            host_pipeline: true,
+            window: 32_768,
+            decoding: 255,
+        };
+        assert_eq!(stated(&spec(), None), Ok(DemandFacts::default()));
+        assert_eq!(stated(&with(every), None), Ok(held));
+
+        // Over a standing row: no block keeps its facts, a block replaces
+        // them whole, and an empty block states none.
+        let standing = facts(&with(every), None).expect("a registration");
+        assert_eq!(stated(&spec(), Some(&standing)), Ok(held));
+        let window_alone = proto::DemandFacts {
+            window: 4_096,
+            ..Default::default()
+        };
+        assert_eq!(
+            stated(&with(window_alone), Some(&standing)),
+            Ok(DemandFacts {
+                window: 4_096,
+                ..DemandFacts::default()
+            })
+        );
+        assert_eq!(
+            stated(&with(proto::DemandFacts::default()), Some(&standing)),
+            Ok(DemandFacts::default())
+        );
+
+        // The store holds the way to decide a constraint in a byte.
+        let wide = proto::DemandFacts {
+            decoding: 256,
+            ..every
+        };
+        assert_eq!(
+            stated(&with(wide), None),
+            Err(refused(
+                "spec.demand_facts.decoding",
+                "a way to decide a constraint is at most 255",
+            ))
         );
     }
 
@@ -2591,19 +2735,33 @@ mod tests {
             },
             ..WorkerFacts::default()
         };
-        let mut numbers = row(&WorkerRow {
-            facts: widest.clone(),
-            id: WorkerId(u64::MAX),
-            revision: u64::MAX,
-            status: WorkerStatus::Ready,
-            ..full()
-        });
-        numbers.admitted_age_ms = u64::MAX;
-        assert!(
-            numbers.encoded_len() <= WorkerFacts::NUMBERS,
-            "{} numeric bytes",
+        // The same row where its worker states each demand fact at its
+        // widest: the store charges the wire's block beside the numbers.
+        let stating = WorkerFacts {
+            demand_facts: DemandFacts {
+                runtime: u32::MAX,
+                references: true,
+                host_pipeline: true,
+                window: u32::MAX,
+                decoding: u8::MAX,
+            },
+            ..widest.clone()
+        };
+        let numeric = |facts: &WorkerFacts| {
+            let mut numbers = row(&WorkerRow {
+                facts: facts.clone(),
+                id: WorkerId(u64::MAX),
+                revision: u64::MAX,
+                status: WorkerStatus::Ready,
+                ..full()
+            });
+            numbers.admitted_age_ms = u64::MAX;
             numbers.encoded_len()
-        );
+        };
+        let (plain, block) = (numeric(&widest), numeric(&stating));
+        assert!(plain <= WorkerFacts::NUMBERS, "{plain} numeric bytes");
+        // What the store charges for the block is the block at its widest.
+        assert_eq!(block - plain, WorkerFacts::DEMAND_FACTS);
 
         let makers = [
             Registrant::Control,
@@ -2612,7 +2770,14 @@ mod tests {
         ];
         for long in [false, true] {
             let sized = |least, most| text(if long { most } else { least });
-            for scrape in [false, true] {
+            // With a scrape and with none, the block stated and not.
+            let cells = [
+                (false, &widest),
+                (true, &widest),
+                (false, &stating),
+                (true, &stating),
+            ];
+            for (scrape, numbers) in cells {
                 let facts = WorkerFacts {
                     key: sized(1, 2_048),
                     engine: sized(0, 2_048),
@@ -2626,9 +2791,9 @@ mod tests {
                     .into(),
                     signals: Signals {
                         scrape_interval_ms: if scrape { u32::MAX } else { 0 },
-                        ..widest.signals
+                        ..numbers.signals
                     },
-                    ..widest.clone()
+                    ..numbers.clone()
                 };
                 for maker in &makers {
                     let wire = weight(&facts) + super::maker_weight(maker);
@@ -2640,6 +2805,31 @@ mod tests {
                 }
             }
         }
+
+        // The row whose texts leave the measure the least room: a long
+        // address, engine and runtime, and no other text, as a snapshot
+        // tells it, with its age. The texts' own room is less than the
+        // block there, so the block's charge is what keeps the measure
+        // over the row's bytes.
+        let lean = WorkerFacts {
+            key: text(2_048),
+            engine: text(2_048),
+            engine_kind: text(256),
+            ..stating
+        };
+        let mut told = row(&WorkerRow {
+            facts: lean.clone(),
+            id: WorkerId(u64::MAX),
+            revision: u64::MAX,
+            status: WorkerStatus::Ready,
+            ..full()
+        });
+        told.admitted_age_ms = u64::MAX;
+        let (wire, stored) = (told.encoded_len(), lean.weight(&Registrant::Control));
+        assert!(
+            wire <= stored,
+            "the leanest row: wire={wire}, store={stored}"
+        );
     }
 
     #[test]
@@ -2833,7 +3023,7 @@ mod tests {
         type Spoil = fn(&mut proto::WorkerRow);
         let sent = row(&full());
         let now = Instant::now();
-        let spoiled: [(&str, Spoil); 15] = [
+        let spoiled: [(&str, Spoil); 16] = [
             ("row.status", |row| row.status = 99),
             ("row.status", |row| row.status = 0),
             ("row.role", |row| row.role = 0),
@@ -2864,6 +3054,13 @@ mod tests {
             ("row.pairing.bootstrap_port", |row| {
                 row.pairing = Some(proto::PairingDescriptor {
                     bootstrap_port: 65_536,
+                    ..Default::default()
+                });
+            }),
+            // A way to decide a constraint past the store's byte.
+            ("row.demand_facts.decoding", |row| {
+                row.demand_facts = Some(proto::DemandFacts {
+                    decoding: 256,
                     ..Default::default()
                 });
             }),

@@ -313,6 +313,12 @@ impl WholeDecision for WithoutShadow {
 /// `late` is the request as the engine's own call made it, where that call
 /// asks ([`Loaded::decide_into`]): the lookup asks it for the prompt's
 /// block hashes on a road that reads them ([`Made::hashed_whole`]).
+///
+/// A request its own call made (`late`) is one whose decision is kept
+/// behind a placement, which hands out no trace. Where no stage of the
+/// document takes the issue too and the document keeps no sample, nothing
+/// reads the best rows of its trace, and the run reads none
+/// ([`records::Live::unread`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "a made request, its list, its maker and the request its call made, the loads, the instant and the whole decision"
@@ -369,8 +375,14 @@ pub(super) fn decide(
     } else {
         None
     };
-    let live =
-        records::Live::at(spec.engine(), &own.clock, now, loads, key).turning(&members.rotation.0);
+    // The engine's own call made the request (`late`): its decision is kept
+    // behind a placement, where a kept sample and a stage that takes the
+    // issue are the two readers of the best rows of its trace.
+    let document = own.document;
+    let read = document.samples || document.hears.contains(EventKind::Issued);
+    let live = records::Live::at(spec.engine(), &own.clock, now, loads, key)
+        .turning(&members.rotation.0)
+        .unread(late.is_some() && !read);
     // A retry leaves every worker of the engines it tried: over a list
     // where an engine holds several, its facts name them all.
     let decision = if facts.tried.is_empty() || !records.has_ranks() {

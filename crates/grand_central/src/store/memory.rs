@@ -1161,6 +1161,14 @@ impl MemoryStore {
         self.stats().outside
     }
 
+    /// How many members' reads under the standing generation's lists the
+    /// store keeps: one a member under lists that name an engine family or
+    /// a zone, and none under any other.
+    #[cfg(all(test, feature = "operator"))]
+    pub(crate) fn listed_members(&self) -> usize {
+        self.loads.lock().writer.listed()
+    }
+
     /// How many members the table of the ones no world lists holds.
     #[cfg(test)]
     pub(super) fn filed_members(&self) -> usize {
@@ -1646,8 +1654,8 @@ impl MemoryStore {
     ///   the status the log told of its row (`Objects::copy_status`).
     ///
     /// What else reads a row's status reads the table's whole row and
-    /// goes with the table: the holder's follow, for a row a writer left
-    /// outside the holder's turn, and the store's own reads of a row.
+    /// goes with the table: the holder's read of a row a writer left
+    /// outside its turn, and the store's own reads of a row.
     pub(crate) fn told(&self) -> Told {
         let workers = self.workers.lock();
         let at = self
@@ -2560,6 +2568,25 @@ impl Leases {
             return Err(DecodeRefused::DecodeStands);
         }
         Ok((held, found))
+    }
+
+    /// The chosen side a decode call's issue replaced on the lease under
+    /// `key`, as the pair's first decision filed it, while the side that
+    /// issue laid is issued or dispatched. It is read and stays kept. `None`
+    /// for a side no call issued, and for an issued side that ended: a
+    /// place keeps what an issue replaced past its lease's end, so the
+    /// side's own count of issues says whether a call laid it. A file no
+    /// decode call issued into looks no record up.
+    #[cfg(feature = "controller")]
+    fn replaced_decode(&self, key: &Key) -> Option<DecodeSide> {
+        if self.decodes.replaced.is_empty() {
+            return None;
+        }
+        let at = self.records.get(key)?.decode;
+        let issued = self.decodes.get(at, key)?;
+        let kept = self.decodes.replaced.get(at as usize)?.as_ref();
+        let (_, (first, _)) = kept.filter(|(owner, _)| owner == key)?;
+        (issued.issues != 0 && issued.side.state.is_live()).then_some(*first)
     }
 
     /// Undoes the current decode issue if `issue` is `None` or matches, returning both prior sides.

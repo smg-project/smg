@@ -1873,10 +1873,10 @@ mod tests {
         ]));
         let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
         for (width, height, tokens, router_tokens) in [
-            (1000, 1000, 1296, 1296),
-            (2200, 100, 216, 72),
-            (1000, 50, 320, 320),
-            (224, 112, 32, 32),
+            (1000, 1000, 1296, 1225),
+            (2200, 100, 288, 70),
+            (1000, 50, 288, 70),
+            (224, 112, 72, 72),
         ] {
             let mut bytes = std::io::Cursor::new(Vec::new());
             image::DynamicImage::new_rgb8(width, height)

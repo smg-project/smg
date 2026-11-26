@@ -200,6 +200,9 @@ struct Cell {
     /// The request of one turn of the cell's callers by the turn's seed. It
     /// is plain for every seed or for none: the bench asks it once a cell.
     request: fn(u64) -> Request<'static>,
+    /// What the cell stores behind its engine for a run's callers, ahead of
+    /// the list's first request.
+    stores: fn(&Run, &InProcess),
     /// The words the cell adds at the end of its result line.
     words: fn() -> String,
 }
@@ -207,8 +210,8 @@ struct Cell {
 impl Cell {
     /// A cell of plain requests that makes nothing behind its engine, whose
     /// callers ask the run's `decide`, which takes every run, which writes
-    /// nothing into its reports and whose line gains no word. An entry names
-    /// itself and its document.
+    /// nothing into its reports, which stores nothing for a run's callers
+    /// and whose line gains no word. An entry names itself and its document.
     const PLAIN: Self = Self {
         behind: |_| (),
         caller: None,
@@ -217,6 +220,7 @@ impl Cell {
         name: "",
         reports: |_| (),
         request: plain,
+        stores: |_, _| (),
         words: String::new,
     };
 
@@ -241,6 +245,16 @@ const CELLS: &[Cell] = &[
         behind: conversations::lends,
         caller: Some(conversations::caller),
         fits: conversations::fits,
+        words: conversations::words,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "cache_aware_held",
+        document: || preset("cache_aware"),
+        behind: indexed::holds,
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        stores: conversations::held,
         words: conversations::words,
         ..Cell::PLAIN
     },
@@ -986,6 +1000,7 @@ fn main() {
         document,
         fits,
         request,
+        stores,
         ..
     } = run.cell;
     fits(&run);
@@ -1028,6 +1043,7 @@ fn main() {
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(spec)));
     behind(engine);
+    stores(&run, engine);
     assert!(matches!(run.engines, 1 | 2), "one engine or two");
     // A cell whose callers make turns of their own times those turns
     // itself, and they ask one engine.

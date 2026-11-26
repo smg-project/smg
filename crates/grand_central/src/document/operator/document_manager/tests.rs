@@ -202,6 +202,63 @@ fn a_member_written_again_is_read_again_under_the_lists() {
     assert_eq!(written_under("alpha", "east"), inside);
 }
 
+/// Lists of label selectors alone leave no member outside them, and the
+/// store reads no member under them. The lists that follow count every
+/// standing member all the same, at their apply and at the build behind a
+/// join: a list of families counts by family, a list of zones by zone.
+#[test]
+fn lists_of_labels_alone_leave_no_member_outside_and_the_next_lists_count_every_member() {
+    use crate::store::{OutsideLists, WorkerFacts, WorkersStore};
+
+    let (store, generations) = generations();
+    let view = |lists: &str| {
+        let document = format!("{RANDOM}view:\n  {lists}\n");
+        yaml(&generations, document).expect("a valid document");
+        store.outside_lists()
+    };
+    let join = |key: &str| {
+        store.upsert(WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            engine_kind: "beta".to_owned(),
+            zone: Some("west".to_owned()),
+            models: vec!["m".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        });
+        store.publish_now();
+        store.outside_lists()
+    };
+    let outside = |engines: u32, zones: u32| OutsideLists { engines, zones };
+    assert_eq!(view("labels: [tier]"), outside(0, 0));
+    assert_eq!(join("http://a:8000"), outside(0, 0));
+    assert_eq!(join("http://b:8000"), outside(0, 0));
+    // The store keeps no member's read under the selectors alone: the
+    // lists pass ran at neither build.
+    assert_eq!(store.listed_members(), 0);
+    // A list of families counts both members at its apply, and the member
+    // that joins behind it at its build.
+    assert_eq!(view("engines: [alpha]"), outside(2, 0));
+    // Under such a list the store keeps a read for each member: the
+    // apply's two, then the build's third.
+    assert_eq!(store.listed_members(), 2);
+    assert_eq!(join("http://c:8000"), outside(3, 0));
+    assert_eq!(store.listed_members(), 3);
+    // The selectors alone again: none is outside, at the apply and at a
+    // build.
+    assert_eq!(view("labels: [tier]"), outside(0, 0));
+    // The apply let go of the three reads and read no member.
+    assert_eq!(store.listed_members(), 0);
+    assert_eq!(join("http://d:8000"), outside(0, 0));
+    // The build behind the join kept none either.
+    assert_eq!(store.listed_members(), 0);
+    // A list of zones counts the four at its apply and the fifth at its
+    // build.
+    assert_eq!(view("zones: [east]"), outside(0, 4));
+    assert_eq!(join("http://e:8000"), outside(0, 5));
+}
+
 /// The writer that applies mints the number: a document with no line
 /// starts as generation 1, and a changed one is the next.
 #[test]

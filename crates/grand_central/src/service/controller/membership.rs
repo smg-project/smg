@@ -313,9 +313,10 @@ impl MembershipCalls {
     /// `ADD` (and no mode) wants the URL absent; `REPLACE` wants it standing
     /// and makes its next incarnation; `UPSERT` registers an absent URL and
     /// lays the registration over a standing row: equal facts write nothing
-    /// and answer the row unmoved, a change of role, wire or models is a new
-    /// incarnation, any other change is made in place. Over a draining row
-    /// an `UPSERT` is the URL's next incarnation, whatever its facts.
+    /// and answer the row unmoved, a change of role, wire, models or demand
+    /// facts is a new incarnation, any other change is made in place. Over a
+    /// draining row an `UPSERT` is the URL's next incarnation, whatever its
+    /// facts.
     ///
     /// `wait_ready` is honoured where the checks are off (the answer is the
     /// row after its connect signal) and refused otherwise: no handshake
@@ -1832,8 +1833,9 @@ pub(crate) mod tests {
         assert_eq!(replaced.old.map(|old| old.id), Some(first.0));
         assert_eq!(store.get(first), None);
 
-        // The models alone, then the wire alone: each is another worker
-        // under the URL too.
+        // The models alone, then the wire alone, then what the worker
+        // states for a request's hard demands alone: each is another
+        // worker under the URL too.
         let remodelled = proto::WorkerSpec {
             models: vec!["model-b".to_owned()],
             ..decode
@@ -1842,7 +1844,19 @@ pub(crate) mod tests {
             wire: proto::WireMode::Http as i32,
             ..remodelled.clone()
         };
-        for (what, changed) in [("models", remodelled), ("wire", rewired)] {
+        let stating = proto::WorkerSpec {
+            demand_facts: Some(proto::DemandFacts {
+                runtime: 7,
+                ..Default::default()
+            }),
+            ..rewired.clone()
+        };
+        let changes = [
+            ("models", remodelled),
+            ("wire", rewired),
+            ("demand facts", stating.clone()),
+        ];
+        for (what, changed) in changes {
             let stood = store.by_key(URL).expect("the row");
             let told = door
                 .register(&operator(), under(TERM), &ask(changed, Mode::Upsert))
@@ -1853,6 +1867,16 @@ pub(crate) mod tests {
             assert_eq!(replaced.old.map(|old| old.id), Some(stood.id.0), "{what}");
             assert_eq!(store.get(stood.id), None, "{what}");
         }
+
+        // The row holds the block, and the same registration again finds
+        // equal facts: it writes nothing.
+        let stood = store.by_key(URL).expect("the row");
+        assert_eq!(stood.facts.demand_facts.runtime, 7);
+        let told = door
+            .register(&operator(), under(TERM), &ask(stating, Mode::Upsert))
+            .expect("answered");
+        assert!(matches!(told.event, Some(Event::Relabelled(_))));
+        assert_eq!(store.by_key(URL), Some(stood));
     }
 
     #[test]
@@ -2862,7 +2886,10 @@ pub(crate) mod tests {
     #[test]
     fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written() {
         use super::super::worker_wire;
-        use crate::store::{pairing::PairingDescriptor, EncodeHandoff, EncodeOffer};
+        use crate::{
+            engine::DemandFacts,
+            store::{pairing::PairingDescriptor, EncodeHandoff, EncodeOffer},
+        };
         type State = fn(&mut WorkerFacts);
 
         let (store, door) = door();
@@ -2906,11 +2933,22 @@ pub(crate) mod tests {
         }
         assert_eq!((store.by_key(URL), store.epoch()), (None, epoch));
 
-        // What the log carries is taken, and a standby reads it back whole.
-        hosted
-            .found_one(&maker, URL, &|_| found_facts())
-            .expect("found");
+        // What the log carries is taken, and a standby reads it back whole:
+        // what the worker states for a request's hard demands among it.
+        let stated = DemandFacts {
+            runtime: 7,
+            references: true,
+            host_pipeline: true,
+            window: 32_768,
+            decoding: 3,
+        };
+        let stating = |_: Option<&WorkerFacts>| WorkerFacts {
+            demand_facts: stated,
+            ..found_facts()
+        };
+        hosted.found_one(&maker, URL, &stating).expect("found");
         let row = store.by_key(URL).expect("the found row");
+        assert_eq!(row.facts.demand_facts, stated);
         let back = worker_wire::told_row(&worker_wire::row(&row), std::time::Instant::now());
         assert_eq!(back.map(|back| back.facts), Ok(row.facts));
     }

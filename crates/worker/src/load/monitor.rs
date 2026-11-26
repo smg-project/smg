@@ -293,9 +293,9 @@ pub(crate) enum NativeLoads {
     Available(WorkerLoadResponse),
     /// The backend answered, and the endpoint is not there. Memoizable.
     Absent,
-    /// The backend answered success with a body that is no load response,
-    /// or with one whose read failed: with why. What that says of the route
-    /// depends on whether it ever answered.
+    /// The backend answered success with a body that is no load response:
+    /// with why. What that says of the route depends on whether it ever
+    /// answered.
     Unreadable(FetchFailure),
     /// Nothing was learned about the endpoint — retry on the next tick. With
     /// why: the read's own failure.
@@ -2183,11 +2183,11 @@ impl<G: Generation> WorkerMonitor<G> {
                     response = Ok((path, load));
                     break;
                 }
-                // On a route that had answered, a body that does not read is
-                // one bad answer: the memo keeps the route and the next tick
-                // asks it again. On a route that never answered it means
-                // something else is mounted here, as definitive as a 404.
-                // The read ended on its own reason either way.
+                // On a route that had answered, a body that is no load
+                // response is one bad answer: the memo keeps the route and
+                // the next tick asks it again. On a route that never answered
+                // it means something else is mounted here, as definitive as
+                // a 404.
                 NativeLoads::Unreadable(reason) => {
                     if known.answered != Some(path) {
                         memo.record_absent(path);
@@ -2367,16 +2367,17 @@ impl<G: Generation> WorkerMonitor<G> {
         }
 
         // The body's read and its parse are two steps, so each failure has
-        // its own reason: a read that failed is the transport's or the
-        // deadline's, and a body that is no load response is the engine's
-        // answer. Whether the route is absent is the caller's to say: it
-        // knows if the route ever answered.
+        // its own reason. A read that failed is the transport's or the
+        // deadline's and says nothing about the route, as a request that
+        // failed ahead of its headers. A body that is no load response is
+        // the engine's answer, and whether its route is absent is the
+        // caller's to say: it knows if the route ever answered.
         let body = match Self::load_answer(resp, MAX_LOAD_ANSWER_BYTES).await {
             Ok(Some(body)) => body,
             // An answer past the size is a condition, no fact about the
             // route, as an answer of 5xx is.
             Ok(None) => return NativeLoads::Inconclusive(FetchFailure::Answer),
-            Err(error) => return NativeLoads::Unreadable(Self::request_failure(&error)),
+            Err(error) => return NativeLoads::Inconclusive(Self::request_failure(&error)),
         };
         match serde_json::from_slice::<NativeResponse>(&body) {
             // An empty native snapshot is still authoritative: no rank has

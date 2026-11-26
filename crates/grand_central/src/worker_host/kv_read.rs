@@ -162,7 +162,7 @@ mod tests {
             view::{AffinityHolder, RequestFacts, WorkerId},
             Affinity, PoolAffinity,
         },
-        store::{MemoryStore, Signals, WorkerFacts, WorkersStore},
+        store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkersStore},
         worker_host::{objects::stored_chain, Members},
     };
 
@@ -212,16 +212,15 @@ mod tests {
                 },
                 ..WorkerFacts::default()
             };
-            let id = self.store.upsert(facts).id();
-            self.objects.follow(&self.store);
-            id
+            let written = self.objects.upsert(&self.store, facts, Registrant::Control);
+            written.expect("the store takes the write").id()
         }
 
         /// The row `id` leaves, and the holder is told.
         fn leaves(&self, id: WorkerId) {
             let row = self.store.get(id).expect("the row stands");
-            assert!(self.store.remove(id, row.revision).is_some());
-            self.objects.follow(&self.store);
+            let removed = self.objects.remove(&self.store, id, row.revision);
+            assert!(removed.is_some());
         }
 
         /// One batch that stores a chain of `contents` for the row `id`.

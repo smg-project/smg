@@ -42,6 +42,7 @@ use crate::{
             AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Phase, PoolFacts,
             RequestFacts, Role, Session, WireModes, WorkerId,
         },
+        DemandFacts,
     },
     policies::random::Random,
     service::{
@@ -878,6 +879,19 @@ fn side_member(
     role: Role,
     only: Option<GatewayId>,
 ) -> WorkerId {
+    stating_member(store, objects, name, role, only, DemandFacts::default())
+}
+
+/// [`side_member`] for a worker that states `stated` for a request's hard
+/// demands.
+fn stating_member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    name: &str,
+    role: Role,
+    only: Option<GatewayId>,
+    stated: DemandFacts,
+) -> WorkerId {
     let key = format!("http://{name}:8000");
     let facts = WorkerFacts {
         key: key.clone(),
@@ -889,6 +903,7 @@ fn side_member(
         dp_size: 1,
         max_running: Some(4),
         reachable_from: only.map_or(Reachability::Any, Reachability::Gateway),
+        demand_facts: stated,
         ..WorkerFacts::default()
     };
     written_ready(store, objects, facts)
@@ -2622,6 +2637,83 @@ fn a_served_refused_pair_keeps_no_claim_on_a_decode_that_stood_chosen() {
     assert_eq!(pins(keys), [none; 2]);
 }
 
+/// A served pair whose commit refused every target keeps no claim on a
+/// decode side a decode call issued. The pair's first decision claims a
+/// decode for the key, and a call behind the prefill's dispatch follows
+/// that claim as the key's pin: the side it issues states a pin and stands
+/// in the place of the chosen side the claim was made for. The release
+/// that ends the issued side ends that chosen side too, so the first
+/// decision's claim goes with the pair's refusal, or with a release that
+/// names the decode alone. A release that names a side the pair's lease
+/// does not hold ends nothing and takes no claim. The prefill's dispatch
+/// confirmed its side's claim, and that pin stays.
+#[test]
+fn a_served_refused_pair_keeps_no_claim_behind_a_decode_call() {
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    store
+        .apply(ruled_pair_plan())
+        .expect("above the unbound start");
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    for name in ["d0", "d1"] {
+        side_member(&store, &objects, name, Role::Decode, None);
+    }
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    let hand = open(&store, GATEWAY);
+    let alone = |id| Some([id, WorkerId(0)]);
+    let none = Some([WorkerId(0); 2]);
+    let refused = |lease: &Lease, side: proto::Side| {
+        let word = proto::Released {
+            what: Some(proto::released::What::LeaseId(lease.id.0)),
+            reason: proto::released::Reason::CommitFailed.into(),
+            side: side.into(),
+        };
+        lifecycle::released(&store, &hand, &word).expect("the frame reads");
+    };
+    // The pair's refusal alone, then behind a release of the decode alone.
+    for (n, key, decode_first) in [(1, 7, false), (3, 8, true)] {
+        let mut frame = keyed(at_prefill(n, WireModes::NONE, None), key);
+        frame.decode_later = true;
+        let (decision, prefill, _) = leased_pair(&store, &objects, frame, now);
+        let first = pairs_of(&decision)[0].1;
+        let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+        let decode = sides.decode.expect("a pair's lease");
+        let pins = || [prefill.session, decode.session].map(|session| pins_of(&store, session));
+        let own = sent(&prefill, proto::Side::Prefill, 0);
+        lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+        let call = keyed(at_call(n + 1, prefill.id, WireModes::NONE, None), key);
+        let (_, issued) = leased_call(&store, &objects, call, now);
+        let (side, _) = issued.expect("a pick's issue");
+        assert_eq!(side.session_verdict, SessionVerdict::Pinned);
+        assert_eq!(
+            pins(),
+            [alone(p), alone(first)],
+            "the call follows the claim"
+        );
+        // A release that names a side a pair's lease does not hold ends
+        // nothing, and the claim stays.
+        for other in [proto::Side::Single, proto::Side::Encode] {
+            refused(&prefill, other);
+            assert_eq!(
+                pins(),
+                [alone(p), alone(first)],
+                "a release of another side leaves the claim"
+            );
+        }
+        if decode_first {
+            refused(&prefill, proto::Side::Decode);
+            assert_eq!(
+                pins(),
+                [alone(p), none],
+                "the claim goes at the decode's word"
+            );
+        }
+        refused(&prefill, proto::Side::Unspecified);
+        assert_eq!(pins(), [alone(p), none], "the first decision's claim goes");
+    }
+}
+
 /// The keys the worker objects of `names` count, in the names' order: a
 /// key counts once on each worker that carries a request of it.
 fn keys_on<const N: usize>(objects: &Objects<Members>, names: [&str; N]) -> [usize; N] {
@@ -2984,4 +3076,78 @@ fn a_served_pair_with_a_worker_of_unknown_runtime_goes_behind_every_other_pair()
     }
     let either = BTreeSet::from([any, same]);
     assert_eq!(calls, [BTreeSet::from([same]), either]);
+}
+
+/// No frame states a demand in this protocol version, so what a row states
+/// for one changes no decision. One worker stands in each role. Each states
+/// a runtime, a pipeline for media by reference, a way to decide a
+/// constraint and a window of sixteen tokens, and every frame's prompt is
+/// 4,096 tokens long. A single request's frame, a pair's at its prefill, a
+/// decode call, a prefill and a decode frame that stand alone and a frame
+/// that names its worker are each answered a pick, and it is the pick they
+/// are answered over workers that state nothing.
+#[test]
+fn a_frame_is_decided_over_rows_that_state_demand_facts_as_over_rows_that_state_none() {
+    let now = Instant::now();
+    // A store under `plan` with one worker a role, and its prefill.
+    let fleet = |plan: AppliedSpec, stated: DemandFacts| {
+        let store = Arc::new(MemoryStore::new());
+        let objects = holder(&store);
+        store.apply(plan).expect("above the unbound start");
+        let roles = [
+            ("s0", Role::Single),
+            ("p0", Role::Prefill),
+            ("d0", Role::Decode),
+        ];
+        let [_, prefill, _] =
+            roles.map(|(name, role)| stating_member(&store, &objects, name, role, None, stated));
+        (store, objects, prefill)
+    };
+    let wide = |mut frame: proto::DecideRequest| {
+        let facts = frame.facts.as_mut().expect("the case's frame has facts");
+        facts.prompt_tokens = 4_096;
+        frame
+    };
+    // Each target of an answer: its worker, and the decode beside it.
+    let named = |answer: &Decision| -> Vec<(WorkerId, Option<WorkerId>)> {
+        let Decision::Pick(pick) = answer else {
+            panic!("no pick: {answer:?}");
+        };
+        let sides = |target: &Target| (target.id, target.pair.map(|pair| pair.decode_id));
+        pick.targets.iter().map(sides).collect()
+    };
+    let answers = |stated: DemandFacts| {
+        let asking = (GATEWAY, now);
+        // Under the pair plan: a single request, a pair at its prefill and
+        // a decode call behind a prefill that was sent.
+        let (store, objects, prefill) = fleet(stock_pair_plan(), stated);
+        let frame = wide(frame_for(PAIRED, 1, 1));
+        let single = served(&store, &objects, frame, GATEWAY, (now, now), None);
+        let frame = wide(at_prefill(2, WireModes::NONE, None));
+        let pair = served_pair(&store, &objects, frame, GATEWAY, now);
+        let unread = Arc::new(LoadSnapshot::default());
+        let frame = wide(at_call(3, LeaseId(1), WireModes::NONE, None));
+        let held = (prefill, None);
+        let call = served_call(&store, &objects, frame, asking, held, (&unread, None));
+        // Under a plan of one profile: a frame that stands alone at each
+        // side's phase.
+        let (store, objects, _) = fleet(preset("random", 1), stated);
+        let [ahead, behind] = [proto::Phase::Prefill, proto::Phase::Decode]
+            .map(|phase| served_alone(&store, &objects, wide(alone_at(4, phase)), asking, None));
+        // Under the stock hash ring document, whose binding names a target
+        // source: a frame that names its worker.
+        let (store, objects, _) = fleet(preset("consistent_hashing", 1), stated);
+        let mut frame = wide(frame_for(PAIRED, 5, 5));
+        frame.named_worker = Some(0);
+        let reached = served(&store, &objects, frame, GATEWAY, (now, now), None);
+        [single, pair, call, ahead, behind, reached].map(|answer| named(&answer))
+    };
+    let stated = DemandFacts {
+        runtime: 7,
+        references: true,
+        host_pipeline: true,
+        window: 16,
+        decoding: 3,
+    };
+    assert_eq!(answers(stated), answers(DemandFacts::default()));
 }

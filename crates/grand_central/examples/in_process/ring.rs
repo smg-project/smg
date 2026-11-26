@@ -5,10 +5,11 @@
 //! Under a document whose ring stage places a routing value by its text,
 //! the value goes to the worker this ring's walk reaches from where the
 //! value stands: it stays where the program's own ring policy puts it.
-//! The program places no request by a head of its prompt, so it answers no
-//! place for one ([`LentRing::head_position`], as provided) and the prefix
-//! form of the ring places such a request by its own ring. Under any other
-//! document the engine asks the ring for an encode request's items alone.
+//! The program's ring places no request by a head of its prompt, so it
+//! answers no place for one ([`LentRing::head_position`], as provided) and
+//! the prefix form of the ring places such a request by its own ring. Under
+//! any other document the engine asks the ring for an encode request's
+//! items alone.
 //!
 //! The program makes its ring with each generation and lends it always. A
 //! host whose ring is costly makes it where its document places by one: the

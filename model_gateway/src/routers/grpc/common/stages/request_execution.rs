@@ -260,291 +260,303 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// [`pin_grouped_dp_prefill_room`]). `selection` is the selection stage,
 /// which states a pair's request again where its decode is asked again
 /// behind its prefill (see [`DecodeBehindPrefill`]).
-pub(crate) async fn execute_plan(
-    ctx: &mut DispatchContext,
+#[expect(
+    clippy::manual_async_fn,
+    reason = "an inline mark on an async fn stops at the function that makes the future; on the async block it reaches the body"
+)]
+pub(crate) fn execute_plan<'a>(
+    ctx: &'a mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
     request_timeout: Option<Duration>,
     grouped_dp_sticky: GroupedDpSticky,
-    selection: &WorkerSelectionStage,
-) -> Result<(), Response> {
-    // One bootstrap room per backend request the plan will post: a batched
-    // completion fans out one PD dispatch per sub-request, so admission has
-    // to claim for all of them or the siblings walk past a gate that only
-    // ever asked about one.
-    let sub_requests = plan_sub_requests(&execution_plan, ctx.workers.as_ref());
+    selection: &'a WorkerSelectionStage,
+) -> impl Future<Output = Result<(), Response>> + Send + 'a {
+    // Always in line: the pipeline's `run_attempt` is the one caller and
+    // awaits this on every request's path. The optimizer leaves a body of
+    // this size out of its caller, and each poll then pays an entry and an
+    // exit.
+    #[inline(always)]
+    async move {
+        // One bootstrap room per backend request the plan will post: a batched
+        // completion fans out one PD dispatch per sub-request, so admission has
+        // to claim for all of them or the siblings walk past a gate that only
+        // ever asked about one.
+        let sub_requests = plan_sub_requests(&execution_plan, ctx.workers.as_ref());
 
-    // Admission runs before this attempt claims anything else. The decode
-    // side's engine window is what clears the prefill's bootstrap deadline, so
-    // a request the decode cannot admit yet waits here rather than in the
-    // engine's queue — where it would burn the prefill's deadline and strand
-    // both rooms. Waiting ahead of the encode take below also keeps the
-    // encode jobs' SHM unclaimed for the duration: under the burst this gate
-    // targets, holding it would queue a second scarce resource behind the
-    // decode window and throw the finished encode work away on a shed. The
-    // gate abstains when the engine reports no window.
-    let admission = match ctx
-        .workers
-        .as_ref()
-        .and_then(WorkerSelection::decode_worker)
-    {
-        Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
-        None => None,
-    };
+        // Admission runs before this attempt claims anything else. The decode
+        // side's engine window is what clears the prefill's bootstrap deadline, so
+        // a request the decode cannot admit yet waits here rather than in the
+        // engine's queue — where it would burn the prefill's deadline and strand
+        // both rooms. Waiting ahead of the encode take below also keeps the
+        // encode jobs' SHM unclaimed for the duration: under the burst this gate
+        // targets, holding it would queue a second scarce resource behind the
+        // decode window and throw the finished encode work away on a shed. The
+        // gate abstains when the engine reports no window.
+        let admission = match ctx
+            .workers
+            .as_ref()
+            .and_then(WorkerSelection::decode_worker)
+        {
+            Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
+            None => None,
+        };
 
-    // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
-    // consumed it). Taking it transfers a rendezvous plan's encode jobs and
-    // their SHM Drop guards here: dispatch consumes them, while an early
-    // error before dispatch drops them and reclaims the SHM.
-    let encode = ctx.encode_outputs.take();
-    // The watch on a rendezvous plan's encode dispatch: made by the first
-    // attempt's launch, read by its replays (see `prepare_epd_attempt`).
-    let encode_watch = &mut ctx.encode_watch;
+        // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
+        // consumed it). Taking it transfers a rendezvous plan's encode jobs and
+        // their SHM Drop guards here: dispatch consumes them, while an early
+        // error before dispatch drops them and reclaims the SHM.
+        let encode = ctx.encode_outputs.take();
+        // The watch on a rendezvous plan's encode dispatch: made by the first
+        // attempt's launch, read by its replays (see `prepare_epd_attempt`).
+        let encode_watch = &mut ctx.encode_watch;
 
-    let clients = stage_output(ctx.clients.as_mut(), "execute_plan")?;
+        let clients = stage_output(ctx.clients.as_mut(), "execute_plan")?;
 
-    // Create load guards for worker load tracking (increment load when created)
-    // They will be automatically dropped (and decrement load) when the
-    // dispatch context (or the streaming body they are attached to) drops.
-    let workers = stage_output(ctx.workers.as_ref(), "execute_plan")?;
-    // Every breaker sample of this attempt goes through the request's
-    // ledger, which charges a worker once per request however often the
-    // request retried on it.
-    let ledger = &ctx.ledger;
+        // Create load guards for worker load tracking (increment load when created)
+        // They will be automatically dropped (and decrement load) when the
+        // dispatch context (or the streaming body they are attached to) drops.
+        let workers = stage_output(ctx.workers.as_ref(), "execute_plan")?;
+        // Every breaker sample of this attempt goes through the request's
+        // ledger, which charges a worker once per request however often the
+        // request retried on it.
+        let ledger = &ctx.ledger;
 
-    // A pair's decode goes out with the dispatch, and its guard says so
-    // where it is made. One request of a sequential dispatch is the
-    // exception, where its decode is owed anything behind its prefill: the
-    // guard is made ahead of the decode's send, and the dispatch asks the
-    // decode again and says the send once the prefill has answered. A
-    // classic pair is owed neither and takes the rule.
-    let behind_prefill = decode_is_owed_behind_its_prefill(&execution_plan, workers);
-    let sticky_key = ctx.sticky_key.as_deref();
-    let guards = if behind_prefill {
-        LoadGuards::behind_prefill(workers, sticky_key)
-    } else {
-        LoadGuards::scaled(workers, sticky_key, sub_requests)
-    };
-    let guards = ctx
-        .load_guards
-        .insert(LoadGuards::admitted(admission, guards));
-    // The selection that names the decode the dispatch sent, where a second
-    // ask moved it.
-    let mut moved = None;
-    // The dispatch below borrows this slot and a pair arm takes the hold out
-    // of it: moved in, the hold would sit in every request's dispatch future.
-    let mut behind = behind_prefill.then(|| DecodeBehindPrefill {
-        stage: selection,
-        model_id: ctx.model_id.as_str(),
-        routing: &ctx.routing,
-        headers: ctx.headers.as_ref(),
-        wire: ctx.wire,
-        tried: &ctx.tried,
-        guards,
-        moved: &mut moved,
-    });
-    // A sticky request to a grouped data-parallel worker goes to its key's
-    // engine.
-    pin_grouped_dp_rank(
-        &mut execution_plan,
-        workers,
-        || clients.single().and_then(BackendClient::pinnable_ranks),
-        ctx.sticky_key.as_deref(),
-        grouped_dp_sticky,
-    );
-    // A sticky disaggregated request's room carries its key's prefill rank
-    // on a grouped prefill worker; an n>1 request's samples, which get rooms
-    // of their own at dispatch, take the same residue.
-    let room_residue = pin_grouped_dp_prefill_room(
-        &mut execution_plan,
-        workers,
-        || match &*clients {
-            ClientSelection::Disaggregated { prefill, .. } => prefill.connected_engines(),
-            ClientSelection::Single { .. } => None,
-        },
-        ctx.sticky_key.as_deref(),
-        grouped_dp_sticky,
-    );
-    // The Prefill admission slot worker selection took for this attempt. It
-    // is released when the Prefill phase ends, not with the load guards.
-    let prefill_guard = ctx.pd_prefill_guard.take();
-
-    // Extract dispatch metadata for the tracing span and PD metric labels.
-    let dispatch = stage_output(ctx.dispatch.as_ref(), "execute_plan")?;
-    let request_id = dispatch.request_id.as_str();
-    let model = dispatch.model.as_str();
-    let request_type = execution_plan.request_type();
-    let mode = execution_plan.mode_label();
-    if cache_trace::enabled() {
-        let (engine_ids, engine_ids_complete) =
-            trace_engine_ids(&mut execution_plan, Some(workers));
-        ctx.cache_trace = cache_trace::dispatch(
-            ctx.root_request_id.as_deref(),
-            ctx.attempt,
-            engine_ids,
-            engine_ids_complete,
-            mode,
+        // A pair's decode goes out with the dispatch, and its guard says so
+        // where it is made. One request of a sequential dispatch is the
+        // exception, where its decode is owed anything behind its prefill: the
+        // guard is made ahead of the decode's send, and the dispatch asks the
+        // decode again and says the send once the prefill has answered. A
+        // classic pair is owed neither and takes the rule.
+        let behind_prefill = decode_is_owed_behind_its_prefill(&execution_plan, workers);
+        let sticky_key = ctx.sticky_key.as_deref();
+        let guards = if behind_prefill {
+            LoadGuards::behind_prefill(workers, sticky_key)
+        } else {
+            LoadGuards::scaled(workers, sticky_key, sub_requests)
+        };
+        let guards = ctx
+            .load_guards
+            .insert(LoadGuards::admitted(admission, guards));
+        // The selection that names the decode the dispatch sent, where a second
+        // ask moved it.
+        let mut moved = None;
+        // The dispatch below borrows this slot and a pair arm takes the hold out
+        // of it: moved in, the hold would sit in every request's dispatch future.
+        let mut behind = behind_prefill.then(|| DecodeBehindPrefill {
+            stage: selection,
+            model_id: ctx.model_id.as_str(),
+            routing: &ctx.routing,
+            headers: ctx.headers.as_ref(),
+            wire: ctx.wire,
+            tried: &ctx.tried,
+            guards,
+            moved: &mut moved,
+        });
+        // A sticky request to a grouped data-parallel worker goes to its key's
+        // engine.
+        pin_grouped_dp_rank(
+            &mut execution_plan,
+            workers,
+            || clients.single().and_then(BackendClient::pinnable_ranks),
+            ctx.sticky_key.as_deref(),
+            grouped_dp_sticky,
         );
-    }
+        // A sticky disaggregated request's room carries its key's prefill rank
+        // on a grouped prefill worker; an n>1 request's samples, which get rooms
+        // of their own at dispatch, take the same residue.
+        let room_residue = pin_grouped_dp_prefill_room(
+            &mut execution_plan,
+            workers,
+            || match &*clients {
+                ClientSelection::Disaggregated { prefill, .. } => prefill.connected_engines(),
+                ClientSelection::Single { .. } => None,
+            },
+            ctx.sticky_key.as_deref(),
+            grouped_dp_sticky,
+        );
+        // The Prefill admission slot worker selection took for this attempt. It
+        // is released when the Prefill phase ends, not with the load guards.
+        let prefill_guard = ctx.pd_prefill_guard.take();
 
-    // The upstream span: the dispatch, then the response stream (it closes
-    // with the load guards, which the response body holds to its last frame;
-    // see `LoadGuards::traced`). A failed dispatch sets its status to ERROR;
-    // success is left unset, as the RPC conventions have it.
-    let span = info_span!(
-        target: "smg::otel-trace",
-        "grpc_execute",
-        request_type,
-        request_id = %request_id,
-        model = %model,
-        mode = %mode,
-        otel.status_code = tracing::field::Empty,
-    );
+        // Extract dispatch metadata for the tracing span and PD metric labels.
+        let dispatch = stage_output(ctx.dispatch.as_ref(), "execute_plan")?;
+        let request_id = dispatch.request_id.as_str();
+        let model = dispatch.model.as_str();
+        let request_type = execution_plan.request_type();
+        let mode = execution_plan.mode_label();
+        if cache_trace::enabled() {
+            let (engine_ids, engine_ids_complete) =
+                trace_engine_ids(&mut execution_plan, Some(workers));
+            ctx.cache_trace = cache_trace::dispatch(
+                ctx.root_request_id.as_deref(),
+                ctx.attempt,
+                engine_ids,
+                engine_ids_complete,
+                mode,
+            );
+        }
 
-    // The deadline runs from here: the admission wait above is the gateway's
-    // own queueing, bounded by its own setting, not time the worker had. The
-    // instant is read once: the single dispatch's booking and its stream's
-    // generation duration run from the same one.
-    let dispatched_at = tokio::time::Instant::now();
-    let deadline =
-        request_timeout.map(|timeout| RequestDeadline::after_from(dispatched_at, timeout));
-    let dispatch = async {
-        match execution_plan {
-            ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => {
-                    execute_single(req, clients, workers, ledger, dispatched_at.into_std()).await
+        // The upstream span: the dispatch, then the response stream (it closes
+        // with the load guards, which the response body holds to its last frame;
+        // see `LoadGuards::traced`). A failed dispatch sets its status to ERROR;
+        // success is left unset, as the RPC conventions have it.
+        let span = info_span!(
+            target: "smg::otel-trace",
+            "grpc_execute",
+            request_type,
+            request_id = %request_id,
+            model = %model,
+            mode = %mode,
+            otel.status_code = tracing::field::Empty,
+        );
+
+        // The deadline runs from here: the admission wait above is the gateway's
+        // own queueing, bounded by its own setting, not time the worker had. The
+        // instant is read once: the single dispatch's booking and its stream's
+        // generation duration run from the same one.
+        let dispatched_at = tokio::time::Instant::now();
+        let deadline =
+            request_timeout.map(|timeout| RequestDeadline::after_from(dispatched_at, timeout));
+        let dispatch = async {
+            match execution_plan {
+                ExecutionPlan::Single(request) => match request {
+                    ProtoRequest::Generate(req) => {
+                        execute_single(req, clients, workers, ledger, dispatched_at.into_std())
+                            .await
+                    }
+                    ProtoRequest::Embed(req) => {
+                        execute_embed(vec![req], clients, workers, ledger).await
+                    }
+                },
+                ExecutionPlan::EmbedBatch { requests, .. } => {
+                    execute_embed(requests, clients, workers, ledger).await
                 }
-                ProtoRequest::Embed(req) => {
-                    execute_embed(vec![req], clients, workers, ledger).await
+                // The two disaggregated arms are boxed: their futures are over ten
+                // times the single arm's, and by value they would size every
+                // attempt's dispatch future (and the run's one box) for a path the
+                // request does not take.
+                ExecutionPlan::PrefillDecode(req) => {
+                    let prefill = require_prefill_guard(prefill_guard)?;
+                    Box::pin(execute_pd_dispatch(
+                        req,
+                        clients,
+                        workers,
+                        model,
+                        prefill,
+                        ledger,
+                        room_residue,
+                        None,
+                        behind.take(),
+                    ))
+                    .await
+                }
+                ExecutionPlan::EncodePrefillDecode { request } => {
+                    let push_encode = matches!(encode, Some(EncodeOutputs::Push(_)));
+                    // A rendezvous plan's bootstrap info went into the prefill
+                    // request at request building and its encode jobs go with the
+                    // prefill/decode pair; a push plan runs its encode call first.
+                    let prefill = require_prefill_guard(prefill_guard)?;
+                    Box::pin(execute_epd_dispatch(
+                        request,
+                        clients,
+                        workers,
+                        model,
+                        encode,
+                        encode_watch,
+                        prefill,
+                        ledger,
+                        behind.take(),
+                    ))
+                    .await
+                    .map_err(|mut response| {
+                        // A push may already have reserved buffers on this
+                        // prefill replica.
+                        if push_encode {
+                            mark_non_retryable(&mut response);
+                        }
+                        response
+                    })
+                }
+                ExecutionPlan::Batch { kind, requests, .. } => {
+                    execute_batch_dispatch(
+                        kind,
+                        requests,
+                        clients,
+                        workers,
+                        model,
+                        prefill_guard,
+                        ledger,
+                        dispatched_at.into_std(),
+                    )
+                    .await
+                }
+            }
+        }
+        .instrument(span.clone());
+        // The deadline bounds the dispatch itself: a call the worker has not
+        // answered when it passes is dropped, which cancels it on the worker as a
+        // client's leaving does (see `dispatch_timed_out`).
+        let mut result = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // The timeout is the decode's that was waited on: the one a
+                    // second ask moved the pair to, where it moved.
+                    let waited_on = moved.as_ref().unwrap_or(workers);
+                    Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
                 }
             },
-            ExecutionPlan::EmbedBatch { requests, .. } => {
-                execute_embed(requests, clients, workers, ledger).await
-            }
-            // The two disaggregated arms are boxed: their futures are over ten
-            // times the single arm's, and by value they would size every
-            // attempt's dispatch future (and the run's one box) for a path the
-            // request does not take.
-            ExecutionPlan::PrefillDecode(req) => {
-                let prefill = require_prefill_guard(prefill_guard)?;
-                Box::pin(execute_pd_dispatch(
-                    req,
-                    clients,
-                    workers,
-                    model,
-                    prefill,
-                    ledger,
-                    room_residue,
-                    None,
-                    behind.take(),
-                ))
-                .await
-            }
-            ExecutionPlan::EncodePrefillDecode { request } => {
-                let push_encode = matches!(encode, Some(EncodeOutputs::Push(_)));
-                // A rendezvous plan's bootstrap info went into the prefill
-                // request at request building and its encode jobs go with the
-                // prefill/decode pair; a push plan runs its encode call first.
-                let prefill = require_prefill_guard(prefill_guard)?;
-                Box::pin(execute_epd_dispatch(
-                    request,
-                    clients,
-                    workers,
-                    model,
-                    encode,
-                    encode_watch,
-                    prefill,
-                    ledger,
-                    behind.take(),
-                ))
-                .await
-                .map_err(|mut response| {
-                    // A push may already have reserved buffers on this
-                    // prefill replica.
-                    if push_encode {
-                        mark_non_retryable(&mut response);
-                    }
-                    response
-                })
-            }
-            ExecutionPlan::Batch { kind, requests, .. } => {
-                execute_batch_dispatch(
-                    kind,
-                    requests,
-                    clients,
-                    workers,
-                    model,
-                    prefill_guard,
-                    ledger,
-                    dispatched_at.into_std(),
-                )
-                .await
-            }
+            None => dispatch.await,
+        };
+        // Grand Central hears the attempt's end from here, and from no
+        // dispatch: the plan holds the guards the handle is asked of. No await
+        // lies between the dispatch's return and this, so a stream takes its
+        // layer ahead of any reader's watch for its client (see
+        // `ProtoStream::put_report_layer`) and a failed call is told ahead of
+        // its retry's backoff. The selection's test stands here in line: a
+        // request the classic policies placed pays it and no more.
+        if workers.tells_end() {
+            tell_end(&mut result, workers.end(ctx.load_guards.as_ref()));
         }
-    }
-    .instrument(span.clone());
-    // The deadline bounds the dispatch itself: a call the worker has not
-    // answered when it passes is dropped, which cancels it on the worker as a
-    // client's leaving does (see `dispatch_timed_out`).
-    let mut result = match deadline {
-        Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
+        // A pair's decode that moved behind its prefill: the attempt's selection
+        // names the decode that was sent, for the response's stages and for a
+        // retry.
+        if let Some(moved) = moved {
+            // The response states the weight version of the decode that answers
+            // it: the metadata was prepared for the decode named first.
+            if let Some(dispatch) = ctx.dispatch.as_mut() {
+                dispatch.weight_version = Some(weight_version_of(Some(&moved)));
+            }
+            ctx.workers = Some(moved);
+        }
+        // The engines hold the request bodies now. An earlier attempt keeps its
+        // share of the budget: the retained plan still owns the same media, and a
+        // replay would send it again.
+        if last_attempt {
+            ctx.multimodal_inflight.take();
+        }
+        let result = match result {
             Ok(result) => result,
-            Err(_) => {
-                // The timeout is the decode's that was waited on: the one a
-                // second ask moved the pair to, where it moved.
-                let waited_on = moved.as_ref().unwrap_or(workers);
-                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
+            Err(response) => {
+                span.record("otel.status_code", "ERROR");
+                return Err(response);
             }
-        },
-        None => dispatch.await,
-    };
-    // Grand Central hears the attempt's end from here, and from no
-    // dispatch: the plan holds the guards the handle is asked of. No await
-    // lies between the dispatch's return and this, so a stream takes its
-    // layer ahead of any reader's watch for its client (see
-    // `ProtoStream::put_report_layer`) and a failed call is told ahead of
-    // its retry's backoff. The selection's test stands here in line: a
-    // request the classic policies placed pays it and no more.
-    if workers.tells_end() {
-        tell_end(&mut result, workers.end(ctx.load_guards.as_ref()));
-    }
-    // A pair's decode that moved behind its prefill: the attempt's selection
-    // names the decode that was sent, for the response's stages and for a
-    // retry.
-    if let Some(moved) = moved {
-        // The response states the weight version of the decode that answers
-        // it: the metadata was prepared for the decode named first.
-        if let Some(dispatch) = ctx.dispatch.as_mut() {
-            dispatch.weight_version = Some(weight_version_of(Some(&moved)));
+        };
+        // The same deadline bounds every stream the dispatch opened (see
+        // `ProtoStream::apply_deadline`).
+        let mut result = result;
+        if let Some(deadline) = deadline {
+            result.apply_deadline(deadline);
         }
-        ctx.workers = Some(moved);
-    }
-    // The engines hold the request bodies now. An earlier attempt keeps its
-    // share of the budget: the retained plan still owns the same media, and a
-    // replay would send it again.
-    if last_attempt {
-        ctx.multimodal_inflight.take();
-    }
-    let result = match result {
-        Ok(result) => result,
-        Err(response) => {
-            span.record("otel.status_code", "ERROR");
-            return Err(response);
+        if let Some(guards) = ctx.load_guards.take() {
+            ctx.load_guards = Some(LoadGuards::traced(span, guards));
         }
-    };
-    // The same deadline bounds every stream the dispatch opened (see
-    // `ProtoStream::apply_deadline`).
-    let mut result = result;
-    if let Some(deadline) = deadline {
-        result.apply_deadline(deadline);
-    }
-    if let Some(guards) = ctx.load_guards.take() {
-        ctx.load_guards = Some(LoadGuards::traced(span, guards));
-    }
 
-    // Store result in context for response processing
-    ctx.response.execution_result = Some(result);
-    Ok(())
+        // Store result in context for response processing
+        ctx.response.execution_result = Some(result);
+        Ok(())
+    }
 }
 
 /// What one attempt's dispatch tells Grand Central of its request's

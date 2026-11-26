@@ -32,7 +32,7 @@ const DECODE: &str = "http://decode-0:8000";
 const ENCODE: &str = "http://encode-0:8000";
 const STRAY: &str = "http://stray-0:8000";
 
-/// A holder with the store it follows.
+/// A holder with the store it writes.
 struct Replica {
     store: MemoryStore,
     objects: Objects<Members>,

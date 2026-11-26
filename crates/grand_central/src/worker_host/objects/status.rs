@@ -203,9 +203,7 @@ impl<G: Generation> Objects<G> {
     /// stood in, the move with it. What laid it settles the two. A door
     /// tells the store its object's status behind the put
     /// ([`Self::tell_row`]). A told row's put and a cut are followed by
-    /// the table's status ([`mod@super::standby`]). The holder's own
-    /// follow, which lays a row written around the holder, settles no
-    /// status.
+    /// the table's status ([`mod@super::standby`]).
     fn status_under(
         &self,
         store: &MemoryStore,
@@ -285,8 +283,8 @@ pub(crate) mod tests {
         worker_host::Members,
     };
 
-    /// A leader's holder over a store: its objects lead their rows' status,
-    /// so it follows none. One row, registered through the holder.
+    /// A leader's holder over a store: its objects lead their rows' status.
+    /// One row, registered through the holder.
     struct Leader {
         store: MemoryStore,
         objects: Objects<Members>,
@@ -401,7 +399,7 @@ pub(crate) mod tests {
 
     /// A door's connect signal and its drain are written on the object,
     /// and the store is told in the same turn of the object's lock: the
-    /// two say one status when the write returns, with no follow. A ready
+    /// two say one status when the write returns. A ready
     /// object stands at a connect signal, and so does a draining one. A
     /// drain moves any other.
     #[test]

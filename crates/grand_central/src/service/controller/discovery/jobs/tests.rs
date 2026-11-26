@@ -180,13 +180,13 @@ async fn an_update_and_a_labels_refresh_are_refused() {
     assert_eq!(store.epoch(), written);
 }
 
-/// The README names what a controller fixes for a registration: a starting
+/// The reference names what a controller fixes for a registration: a starting
 /// worker is polled every 30 seconds for 1800 seconds from the job's start,
 /// over HTTP/1.1, and its row states the worker crate's default checks. The
 /// default overload thresholds are not fixed: a registration's settings
 /// state the ones its host is built with, which are the start's.
 #[tokio::test]
-async fn a_registrations_settings_are_the_ones_the_readme_names() {
+async fn a_registrations_settings_are_the_ones_the_reference_names() {
     let started = OverloadThresholds {
         waiting_requests: Some(4),
         token_usage: None,

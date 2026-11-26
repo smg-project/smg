@@ -15,8 +15,8 @@ on:
       - .cargo/config.toml
       - .github/workflows/release-docker.yml
       - docker/Dockerfile
-      - docker/ol9.Dockerfile
       - docker/grand-central.Dockerfile
+      - docker/ol9.Dockerfile
   workflow_dispatch:
     inputs:
       tag:

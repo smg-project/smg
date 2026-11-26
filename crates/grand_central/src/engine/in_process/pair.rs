@@ -71,7 +71,7 @@
 //! its report and where it hears a word.
 //!
 //! **Who holds the prompt.** A side whose phase reads affinity is handed
-//! its own list's column for the decision ([`overlap::side_column`]): what
+//! its own list's column for the decision ([`overlap::column`]): what
 //! each worker of the side holds of the request, by the host's index of
 //! cache events and by the record of sent prefixes, read at the side's
 //! phase. The record is read by the side's own profile's word of it: for
@@ -740,10 +740,9 @@ impl<'a> PairLists<'a> {
 /// what each fill read of the record of sent prefixes. A side whose phase
 /// reads affinity is handed its own list's column, read at the side's
 /// phase and by the side's own profile's word of the record
-/// ([`overlap::side_column`], [`Engine::side_reads_sent_alone`]): one
-/// lookup of the pair's binding a side. A side whose phase reads none pays
-/// one test and keeps an empty column. `prefill` is `None` for the decode
-/// asked again, which fills no column of the prefills.
+/// ([`overlap::column`]), which the list's table read. A side whose phase
+/// reads none pays one test and keeps an empty column. `prefill` is `None`
+/// for the decode asked again, which fills no column of the prefills.
 ///
 /// A pair's decision and an encode request's fill their columns here, so
 /// the two read one way.
@@ -766,17 +765,13 @@ pub(super) fn side_columns(
             return None;
         }
         let (workers, ids) = (side.workers(), records.ids());
-        // The side's own profile's word, whichever profile its pool's
-        // table read its word of the record from.
-        let alone = spec.engine().side_reads_sent_alone(facts.model, phase);
-        overlap::side_column(
+        overlap::column(
             kept,
             side.affinity(),
             spec,
             workers,
             ids,
             phase,
-            alone,
             facts,
             column,
         )
@@ -823,11 +818,11 @@ pub(super) fn record_sides(
         return;
     };
     if let Some(read) = prefill_read {
-        let (pool, column) = (prefill.affinity(), Some(prefill_column.as_slice()));
+        let (pool, column) = (prefill.affinity(), prefill_column.as_slice());
         overlap::record_by_column(pool, Phase::Prefill, facts, read, column, sent.id);
     }
     if let (Some(read), Some(pair)) = (decode_read, sent.pair) {
-        let (pool, column) = (decode.affinity(), Some(decode_column.as_slice()));
+        let (pool, column) = (decode.affinity(), decode_column.as_slice());
         overlap::record_by_column(pool, Phase::Decode, facts, read, column, pair.decode_id);
     }
 }
@@ -5809,11 +5804,22 @@ mod tests {
         seed: u64,
         held: Option<&Target>,
     ) -> Decision {
+        decide_prompt_at(host, hashes, seed, held, Instant::now())
+    }
+
+    /// [`decide_prompt`] at the instant `now`.
+    fn decide_prompt_at(
+        host: &Host,
+        hashes: &PromptHashes,
+        seed: u64,
+        held: Option<&Target>,
+        now: Instant,
+    ) -> Decision {
         let classes = every(host.prefills.len(), host.decodes.len() as u32);
         let Asks(mut request, lists, _) = host.asks(&classes, false);
         request.facts = RequestFacts { seed, ..facts() };
         hashes.write_to(&mut request.facts);
-        lists.decide(&host.engine, None, Instant::now(), &mut request, held)
+        lists.decide(&host.engine, None, now, &mut request, held)
     }
 
     /// Under `cache_aware` on both sides, a prompt sent to a pair goes to
@@ -5952,15 +5958,13 @@ mod tests {
         }
     }
 
-    /// A host of four prefills that take turns and four decodes under
-    /// `cache_aware`, behind a binding of the decode phase alone listed
-    /// ahead of the pair's, `cache_aware` too. The host's index of cache
-    /// events holds a block of another prompt for every decode. Where
+    /// The document of [`decodes_with_blocks`]: prefills that take turns
+    /// and decodes under `cache_aware`, behind a binding of the decode
+    /// phase alone listed ahead of the pair's, `cache_aware` too. Where
     /// `pair_alone`, the pair's decode profile reads sent prefixes alone
-    /// (`source: predictor`) and the binding ahead reads cache events too:
-    /// the decodes' pool keeps the word of the binding ahead. Where not,
-    /// the two stand the other way round.
-    fn decodes_with_blocks(pair_alone: bool) -> Host {
+    /// (`source: predictor`) and the binding ahead reads cache events too.
+    /// Where not, the two stand the other way round.
+    fn decode_binding_ahead(pair_alone: bool) -> PolicySpec {
         use crate::document::spec::{AffinitySource, ScoreSpec, ScoreStage};
 
         let pair = PolicySpec::pair_presets("round_robin", "cache_aware");
@@ -5980,7 +5984,16 @@ mod tests {
                 prefix.source = Some(AffinitySource::Predictor);
             }
         }
-        let host = host_of(document, 4, 4);
+        document
+    }
+
+    /// A host of four prefills and four decodes under
+    /// [`decode_binding_ahead`]. The host's index of cache events holds a
+    /// block of another prompt for every decode. The decodes' pool keeps
+    /// the word of the binding ahead, which is never the pair's decode
+    /// profile's here.
+    fn decodes_with_blocks(pair_alone: bool) -> Host {
+        let host = host_of(decode_binding_ahead(pair_alone), 4, 4);
         let spec = host.engine.spec();
         let engine = spec.engine();
         assert_eq!(
@@ -6028,6 +6041,43 @@ mod tests {
             .map(|seed| host.picked(&decide_prompt(&host, &sent, seed, None)).1)
             .collect();
         assert!(decodes.len() > 1, "{decodes:?}");
+    }
+
+    /// A document that turns a side's word of the record is read by the
+    /// pair's next decision, inside the second a list's table stands. The
+    /// word is read once a table, and the table is of the list's value,
+    /// which is made under one applied document and read under it alone.
+    /// Every decision here is made at one instant, so a table that stood
+    /// across the apply would be read by each of them. Under the first
+    /// document the pair's decode profile reads cache events too: the index
+    /// holds a block for every decode, the side reads no record, and a
+    /// prompt the index holds for no decode takes its draws. The next
+    /// document's decode profile reads sent prefixes alone: its first
+    /// decision writes the prompt's decode, and the prompt stays there.
+    #[test]
+    fn a_document_that_turns_a_sides_word_is_read_by_the_next_decision() {
+        let host = decodes_with_blocks(false);
+        let sent = prompt(&host, 1_000);
+        let now = Instant::now();
+        let decode = |seed| {
+            host.picked(&decide_prompt_at(&host, &sent, seed, None, now))
+                .1
+        };
+        let mut before = BTreeSet::new();
+        for seed in 1..33 {
+            before.insert(decode(seed));
+        }
+        assert!(before.len() > 1, "{before:?}");
+
+        let mut next = decode_binding_ahead(true);
+        next.generation = 4;
+        let next = AppliedSpec::validate(&next).expect("a valid document");
+        let applied = host.engine.apply(next);
+        applied.expect("a number above the standing one");
+        let first = decode(33);
+        for seed in 34..66 {
+            assert_eq!(decode(seed), first, "seed {seed}");
+        }
     }
 
     /// Each side's column is its own list's, whatever the lists' sizes:
@@ -6291,9 +6341,9 @@ mod tests {
         assert_eq!(asked(&Host::of(1, 1)), 0, "no rule");
     }
 
-    /// A pick of a decode that holds the whole prompt past the eight rows a
-    /// read keeps moves no count of writes left out through the pair's own
-    /// decision too: the decode side's write is handed the decode side's
+    /// A pick of a decode that holds the whole prompt, among however many
+    /// holders, moves no count of writes left out through the pair's own
+    /// decision: the decode side's write is handed the decode side's
     /// column. Ten decodes are each sent the prompt once. Then, while a
     /// reader holds the record, a thread of its own picks the ninth and the
     /// tenth and ends: a write it had kept would be left out there, as the
@@ -6333,6 +6383,49 @@ mod tests {
         assert_eq!(left_out_behind(&sent, &[8, 9]), 0);
         // The count is live in this setup: every block of a prompt no
         // decode was sent is still to add, and its write meets the reader.
+        assert_eq!(left_out_behind(&prompt(&host, 2_000), &[9]), 1);
+    }
+
+    /// The prefill side's twin of the case above: the prefill side's write
+    /// is handed the prefill side's column. Ten prefills are each sent the
+    /// prompt once, each decision held to its one place of the prefill
+    /// list. Then, while a reader holds the record, a thread of its own
+    /// picks the ninth and the tenth and ends, and no write is left out.
+    #[test]
+    fn a_pick_of_a_ninth_prefill_holder_leaves_nothing_out() {
+        let pair = PolicySpec::pair_presets("cache_aware", "round_robin");
+        let host = host_of(pair.expect("the pair presets"), 10, 2);
+        // One instant for every decision: the list's table is read once.
+        let now = Instant::now();
+        let classes = every(host.prefills.len(), host.decodes.len() as u32);
+        let decide_at = |sent: &PromptHashes, prefill: u32| {
+            let place = [prefill];
+            let Asks(mut request, mut lists, _) = host.asks(&classes, false);
+            lists.prefill_places = Some(&place);
+            request.facts = facts();
+            sent.write_to(&mut request.facts);
+            let decision = lists.decide(&host.engine, None, now, &mut request, None);
+            assert_eq!(host.picked(&decision).0, prefill as usize);
+        };
+        let sent = prompt(&host, 1_000);
+        (0..10).for_each(|prefill| decide_at(&sent, prefill));
+        let affinity = host.engine.affinity();
+        let left_out_behind = |sent: &PromptHashes, prefills: &[u32]| {
+            affinity.while_held(|| {
+                thread::scope(|scope| {
+                    let picks = scope.spawn(|| {
+                        for &prefill in prefills {
+                            decide_at(sent, prefill);
+                        }
+                    });
+                    picks.join().expect("the picks");
+                });
+            });
+            affinity.left_out()
+        };
+        assert_eq!(left_out_behind(&sent, &[8, 9]), 0);
+        // The count is live here too: a prompt no prefill was sent has
+        // every block still to add, and its write meets the reader.
         assert_eq!(left_out_behind(&prompt(&host, 2_000), &[9]), 1);
     }
 

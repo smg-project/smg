@@ -32,7 +32,7 @@ use crate::{
     document::spec::{AcrossRanks, AppliedSpec, Needs, PolicySpec, ShadowSpec, SignalSpec},
     engine::{
         decision::Targets,
-        framework::{Picker, TieBand},
+        framework::{Picker, Scorer, TieBand},
         in_process::{
             membership::{
                 tests::{fills::Program, handed},
@@ -1127,6 +1127,154 @@ async fn a_stage_that_panics_at_a_report_takes_none_from_the_stage_behind_it() {
     task.abort();
 }
 
+/// Under a document none of whose stages keeps a report the follow reads
+/// nothing of a worker for a telling. Its record of a worker holds none of
+/// what a telling reads, so a telling would find no worker to look up.
+/// Under a document with such a stage it holds each worker's.
+#[test]
+fn a_document_with_no_stage_that_keeps_reports_reads_nothing_of_a_worker_for_a_telling() {
+    let read = |engine: &InProcess| {
+        engine.set_registry(registry(3) as Arc<dyn Members>);
+        let mut members = None;
+        engine.follow_registry(&mut members);
+        let follow = members.as_ref().expect("the follow of the registry");
+        follow.joined().count()
+    };
+    let plain = InProcess::new(stock("random", 1));
+    assert_eq!(read(&plain), 0, "nothing is read for a telling");
+    let (keeps, _heard) = keeping("random", false);
+    assert_eq!(read(&keeps), 3, "each worker's, for the stage that keeps");
+}
+
+/// A host that hands the follow worker objects it keeps no longer than the
+/// call. Each answer of its standing workers builds every object anew,
+/// under the id its registry keeps, and holds none of them. `lent` names
+/// each object it handed, and holds none either.
+struct Lends {
+    registry: Arc<WorkerRegistry>,
+    lent: Mutex<Vec<Weak<dyn Worker>>>,
+}
+
+impl Members for Lends {
+    fn events(&self) -> Receiver<WorkerEvent> {
+        Members::events(&*self.registry)
+    }
+
+    fn standing(&self) -> Vec<(ObjectId, Arc<dyn Worker>)> {
+        let anew = |(id, worker): (ObjectId, Arc<dyn Worker>)| {
+            let lent = ready_worker(worker.url(), MODEL);
+            self.lent.lock().push(Arc::downgrade(&lent));
+            (id, lent)
+        };
+        let standing = Members::standing(&*self.registry);
+        standing.into_iter().map(anew).collect()
+    }
+
+    fn facts_of(&self, _worker: &Arc<dyn Worker>) -> FixedFacts {
+        FixedFacts::default()
+    }
+}
+
+/// A worker object its host keeps no longer than the call is still told
+/// its reports. The follow read what a telling needs off the object where
+/// it took it, and a telling reads through no pointer the follow keeps.
+#[tokio::test(start_paused = true)]
+async fn a_worker_object_its_host_keeps_no_longer_than_a_call_is_still_told() {
+    let (engine, heard) = keeping("least_load", false);
+    let host = Arc::new(Lends {
+        registry: registry(2),
+        lent: Mutex::default(),
+    });
+    engine.set_registry(Arc::clone(&host) as Arc<dyn Members>);
+    let (feed, channel) = monitor(&reports(&[1, 2], 0));
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+    let lent = std::mem::take(&mut *host.lent.lock());
+    let gone = lent.iter().all(|worker| worker.upgrade().is_none());
+    assert!(!lent.is_empty() && gone, "no object outlives its answer");
+    let told = steps_of(&engine, &told_since(&heard));
+    assert_eq!(told, [(id(0), 1), (id(1), 2)], "by what the follow read");
+    feed.publish(&reports(&[3, 4], 0));
+    settle().await;
+    let told = steps_of(&engine, &told_since(&heard));
+    assert_eq!(
+        told,
+        [(id(0), 3), (id(1), 4)],
+        "and at each snapshot behind"
+    );
+    task.abort();
+}
+
+/// A telling hears every word that stood ready at its start, not the
+/// first alone: of three workers registered beside one publication, each
+/// is told its report in it. The task takes its turns in no set order, so
+/// sixteen rounds would pass a report over where a telling heard one word.
+#[tokio::test(start_paused = true)]
+async fn a_telling_hears_every_word_that_stood_ready_and_not_the_first_alone() {
+    let (engine, heard) = keeping("least_load", false);
+    let registry = registry(1);
+    engine.set_registry(Arc::clone(&registry) as Arc<dyn Members>);
+    let mut steps = vec![1];
+    let (feed, channel) = monitor(&reports(&steps, 0));
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+    assert_eq!(steps_of(&engine, &told_since(&heard)), [(id(0), 1)]);
+
+    for round in 0..16 {
+        let three = [1, 2, 3].map(|nth| 3 * round + nth);
+        for at in three {
+            let joined = registry.register(ready_worker(&url(at), MODEL));
+            joined.expect("a free address");
+            steps.push(10 + at as u64);
+        }
+        feed.publish(&reports(&steps, 0));
+        settle().await;
+        let told = steps_of(&engine, &told_since(&heard));
+        let each = three.map(|at| (id(at), 10 + at as u64));
+        assert_eq!(told, each, "the three of round {round}");
+    }
+    task.abort();
+}
+
+/// Two reports of one worker whose sample instants lie inside one
+/// microsecond are two reports. The follow keeps the instant told last as
+/// the report states it, finer than the engine's clock reads it. Both are
+/// told, under one instant of that clock, and the second is not told again.
+#[tokio::test(start_paused = true)]
+async fn two_sample_instants_inside_one_microsecond_are_two_reports() {
+    let (engine, heard) = keeping("least_load", false);
+    engine.set_registry(registry(1) as Arc<dyn Members>);
+    // Two instants a nanosecond apart that the clock reads as one.
+    let (clock, nanosecond) = (engine.clock(), Duration::from_nanos(1));
+    let mut first = sample(1);
+    if clock.micros(first) != clock.micros(first + nanosecond) {
+        first += nanosecond;
+    }
+    let second = first + nanosecond;
+    assert_eq!(clock.micros(first), clock.micros(second));
+    let sampled = |at: Instant| {
+        let mut stated = reports(&[1], 0);
+        let report = stated.get_mut(&url(0)).expect("the worker's report");
+        report.sampled_at = Some(at);
+        stated
+    };
+    let (feed, channel) = monitor(&sampled(first));
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+    let earlier = told_since(&heard);
+    feed.publish(&sampled(second));
+    settle().await;
+    let later = told_since(&heard);
+    assert_eq!((earlier.len(), later.len()), (1, 1), "each is told");
+    let micros = [earlier[0], later[0]].map(|told| told.sampled_at_micros);
+    assert_eq!(micros[0], micros[1], "inside one microsecond");
+
+    feed.publish(&sampled(second));
+    settle().await;
+    assert_eq!(told_since(&heard), [], "the one told last");
+    task.abort();
+}
+
 /// What a stage that keeps the columns of the signals `held` and `queue`
 /// heard: each report's worker, whether the report stated no named value
 /// at all, and what it stated under each column, with the value's sample
@@ -1227,8 +1375,8 @@ fn named(name: &str, unit: &str, value: f64, age_ms: Option<u32>) -> NamedValue 
 /// A stage that keeps a signal's column is told, with each report, what the
 /// report states under the document's names, and reads it by its column
 /// with the value's own sample instant. A value under an age of its own is
-/// dated that much before its report, and is told however old it is: the
-/// second signal ends a millisecond old at a decision. A name a report
+/// dated that much before its report, and is told however old it is. The
+/// second signal ends past a millisecond at a decision. A name a report
 /// does not state reads none, whatever the report told ahead of it stated.
 /// A value under another unit than the signal's reads none, and so does
 /// one out of range. A report of two ranks states one value a name where
@@ -1291,7 +1439,11 @@ async fn a_stage_that_keeps_a_column_is_told_what_each_report_states_under_it() 
         (
             ids[0],
             false,
-            [Some((7.0, at(1))), Some((3.0, at(1) - 5_000_000))],
+            // No underflow where the sample stands before the clock's origin.
+            [
+                Some((7.0, at(1))),
+                Some((3.0, at(1).saturating_sub(5_000_000))),
+            ],
         ),
         (ids[1], false, [None, Some((9.0, at(2)))]),
         (ids[2], false, [Some((11.0, at(3))), None]),
@@ -1341,6 +1493,271 @@ async fn a_document_whose_stages_keep_no_column_is_told_no_named_value() {
     let told = steps_of(&engine, &told_since(&heard));
     assert_eq!(told, [(id(0), 1)], "the report is told");
     task.abort();
+}
+
+/// A scorer that resolves the columns of the two signals at its build: a
+/// decision's stage. No telling reaches it but where it keeps load reports
+/// (`keeps`).
+#[derive(Debug)]
+struct ReadsNamed {
+    keeps: bool,
+}
+
+impl Lifecycle for ReadsNamed {
+    fn keeps_loads(&self) -> bool {
+        self.keeps
+    }
+}
+
+impl Scorer for ReadsNamed {
+    fn name(&self) -> &'static str {
+        "reads-named"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(0.0);
+        TieBand::NORMALIZED
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            signal_cells: true,
+            ..Needs::default()
+        }
+    }
+}
+
+/// [`ReadsNamed`] under the name `reads-named` in `stages`, as a stage
+/// that keeps load reports where `keeps`.
+fn reading_named(stages: &mut StageRegistry, keeps: bool) {
+    let added = stages.scorer_with("reads-named", move |build| {
+        // Resolved, as a stage that reads them resolves them, and let go.
+        drop(build.signal_column("held")?);
+        drop(build.signal_column("queue")?);
+        Ok(Box::new(ReadsNamed { keeps }))
+    });
+    added.expect("a free name");
+}
+
+/// The engine of the `random` preset under a document that declares the
+/// two signals ([`declare`]), and what the stage in its pick's place
+/// heard. [`Keeps`] stands there: it keeps reports and holds no column.
+/// [`ReadsNamed`] stands among the scorers: it holds the columns, and
+/// keeps reports where `scorer_keeps`.
+fn keeping_beside_a_reader(scorer_keeps: bool) -> (Arc<InProcess>, Heard) {
+    let heard = Heard::default();
+    let own: Own = Arc::new(OnceLock::new());
+    let mut stages = StageRegistry::builtin();
+    let (kept, engine) = (Arc::clone(&heard), Arc::clone(&own));
+    let added = stages.picker("keeps", move || -> Box<dyn Picker> {
+        Box::new(Keeps {
+            name: "keeps",
+            heard: Arc::clone(&kept),
+            engine: Arc::clone(&engine),
+        })
+    });
+    added.expect("a free name");
+    reading_named(&mut stages, scorer_keeps);
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    document.generation = 1;
+    declare(&mut document);
+    let profile = document.profiles.get_mut("random");
+    let profile = profile.expect("the preset's profile");
+    profile.pick = "keeps".into();
+    profile.score.push("reads-named".into());
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = Arc::new(InProcess::new(spec.expect("the stages hold both")));
+    own.set(Arc::downgrade(&engine)).expect("set once");
+    (engine, heard)
+}
+
+/// A column held by a stage that keeps no report states a told report no
+/// value. Under a document that declares two signals, a scorer holds their
+/// columns and keeps no report, and the stage that keeps reports holds no
+/// column. A report that states both is told with no named value. The
+/// document's decisions read the values all the same. The engine says
+/// which of its documents states a told report's values: one in which a
+/// stage that keeps reports holds a column, a pick or a scorer.
+#[tokio::test(start_paused = true)]
+async fn a_column_held_by_a_stage_that_keeps_no_report_states_a_told_report_no_value() {
+    let (engine, heard) = keeping_beside_a_reader(false);
+    engine.set_registry(registry(1) as Arc<dyn Members>);
+    let mut stated = reports(&[1], 0);
+    let report = stated.get_mut(&url(0)).expect("the worker's report");
+    let both = [
+        named("held", "tokens", 7.0, None),
+        named("queue", "ms", 3.0, None),
+    ];
+    report.loads[0].values = both.into();
+    let (_feed, channel) = monitor(&stated);
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+    // The read holds each word to no named value.
+    let told = steps_of(&engine, &told_since(&heard));
+    assert_eq!(told, [(id(0), 1)], "the report is told");
+    task.abort();
+
+    let needs = engine.standing_spec().needs();
+    assert!(needs.signal_cells, "a decision reads the values");
+    let states = |engine: &InProcess| {
+        let spec = engine.standing_spec();
+        spec.engine().keepers_read_signals()
+    };
+    assert!(!states(&engine), "a column, held by no stage that keeps");
+    assert!(states(&keeping_named().0), "a pick that keeps holds one");
+    let (scorer_keeps, _heard) = keeping_beside_a_reader(true);
+    assert!(states(&scorer_keeps), "a scorer that keeps holds one");
+    let (plain, _heard) = keeping_under("random", false, true);
+    assert!(!states(&plain), "two signals declared and no column held");
+}
+
+/// What a stage read of each report it was told, by a column its host
+/// handed it: the value the report states under the signal `held`.
+type Handed = Arc<Mutex<Vec<Option<f64>>>>;
+
+/// The `random` picker as a stage that keeps load reports and resolves no
+/// column at its build, so its needs set no `signal_cells`. Its host hands
+/// it a column behind the build: a clone of one the applied document lists
+/// ([`AppliedSpec::signal_columns`]). It reads each told report by it.
+#[derive(Debug)]
+struct KeepsHanded {
+    column: Arc<OnceLock<SignalColumn>>,
+    heard: Handed,
+}
+
+impl Lifecycle for KeepsHanded {
+    fn keeps_loads(&self) -> bool {
+        true
+    }
+
+    fn on_signal(&self, signal: &Signal<'_>) {
+        let Signal::Load { signals, .. } = *signal else {
+            return;
+        };
+        let column = self.column.get().expect("handed ahead of the task");
+        let told = column.told(signals).map(|cell| cell.value);
+        self.heard.lock().push(told);
+    }
+}
+
+impl Picker for KeepsHanded {
+    fn name(&self) -> &'static str {
+        "keeps-handed"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        Random.pick(facts, candidates, kept, scores, band, out);
+    }
+}
+
+/// The engine of the `random` preset under a document that declares the
+/// two signals ([`declare`]), and what the stage in its pick's place read.
+/// [`KeepsHanded`] stands there, handed the column of `held` once the
+/// document is applied. [`ReadsNamed`] stands among the scorers: it
+/// resolves the columns, and keeps reports where `scorer_keeps`.
+fn keeping_handed(scorer_keeps: bool) -> (Arc<InProcess>, Handed) {
+    let heard = Handed::default();
+    let column = Arc::new(OnceLock::new());
+    let mut stages = StageRegistry::builtin();
+    let (kept, handed) = (Arc::clone(&heard), Arc::clone(&column));
+    let added = stages.picker("keeps-handed", move || -> Box<dyn Picker> {
+        Box::new(KeepsHanded {
+            column: Arc::clone(&handed),
+            heard: Arc::clone(&kept),
+        })
+    });
+    added.expect("a free name");
+    reading_named(&mut stages, scorer_keeps);
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    document.generation = 1;
+    declare(&mut document);
+    let profile = document.profiles.get_mut("random");
+    let profile = profile.expect("the preset's profile");
+    profile.pick = "keeps-handed".into();
+    profile.score.push("reads-named".into());
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let spec = spec.expect("the stages hold both");
+    let held = spec
+        .signal_columns()
+        .iter()
+        .find(|held| held.name() == "held");
+    let held = held.expect("the declared signal's column").clone();
+    column.set(held).expect("handed once");
+    (Arc::new(InProcess::new(spec)), heard)
+}
+
+/// A stage that keeps reports and reads by a column its own build did not
+/// resolve reads a told value only beside a stage that keeps reports and
+/// resolved one. Where a scorer that keeps no report alone resolved the
+/// columns, a report that states the value is told with none. Where that
+/// scorer keeps reports too, the stage reads the value by the same column.
+#[tokio::test(start_paused = true)]
+async fn a_stage_handed_a_column_reads_no_told_value_where_no_keeper_resolved_one() {
+    for (scorer_keeps, read) in [(false, None), (true, Some(7.0))] {
+        let (engine, heard) = keeping_handed(scorer_keeps);
+        engine.set_registry(registry(1) as Arc<dyn Members>);
+        let mut stated = reports(&[1], 0);
+        let report = stated.get_mut(&url(0)).expect("the worker's report");
+        report.loads[0].values = vec![named("held", "tokens", 7.0, None)];
+        let (_feed, channel) = monitor(&stated);
+        engine.set_loads(channel);
+        let task = running(&engine).await;
+        let heard = std::mem::take(&mut *heard.lock());
+        assert_eq!(heard, [read], "the scorer keeps reports: {scorer_keeps}");
+        task.abort();
+    }
+}
+
+/// The engine's word of whether a stage that keeps reports resolved a
+/// column, under a document of the `random` preset that declares the two
+/// signals ([`declare`]). [`ReadsNamed`] is the one such stage: a scorer
+/// that keeps reports. Where `second`, it stands in a second profile, the
+/// binding's shadow, and the first profile holds no scorer. Where `behind`,
+/// the stock `least-load` stands ahead of it in its profile.
+fn a_keeping_reader_states(second: bool, behind: bool) -> bool {
+    let mut stages = StageRegistry::builtin();
+    reading_named(&mut stages, true);
+    let mut document = PolicySpec::preset("random").expect("a built-in preset");
+    document.generation = 1;
+    declare(&mut document);
+    let profile = document.profiles.get("random");
+    let mut keeper = profile.expect("the preset's profile").clone();
+    if behind {
+        keeper.score.push("least-load".into());
+    }
+    keeper.score.push("reads-named".into());
+    if second {
+        document.profiles.insert("twin".into(), keeper);
+        document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    } else {
+        document.profiles.insert("random".into(), keeper);
+    }
+    let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+    let engine = InProcess::new(spec.expect("the stages hold the scorer"));
+    let spec = engine.standing_spec();
+    spec.engine().keepers_read_signals()
+}
+
+/// The engine finds a stage that keeps reports and resolved a column in a
+/// profile that is not its first: its word is yes.
+#[test]
+fn a_keeper_that_resolved_a_column_is_found_in_a_second_profile() {
+    assert!(a_keeping_reader_states(true, false));
+}
+
+/// The engine finds a scorer that keeps reports and resolved a column
+/// behind another scorer of its profile: its word is yes.
+#[test]
+fn a_keeper_that_resolved_a_column_is_found_behind_another_scorer() {
+    assert!(a_keeping_reader_states(false, true));
 }
 
 /// A stage for the count of a telling: the `random` picker as a stage that
@@ -1394,22 +1811,26 @@ impl Picker for Sums {
 /// The count of a telling, for the Numbers table: `TOLD_ROUNDS` tellings
 /// (two by default) of the reports of 64 workers to one stage ([`Sums`]),
 /// every report new at every telling. Where `TOLD_NAMED` is set, the
-/// document declares the two signals, the stage keeps their columns and
-/// each report states both. Run under an instruction counter at two counts
-/// of tellings: the counts' difference over the tellings' difference is
-/// one telling, and a 64th of it one report's.
+/// document declares the two signals and each report states both. The
+/// stage keeps their columns. Where the word reads `beside`, a scorer
+/// that keeps no report holds them instead ([`ReadsNamed`]), and the stage
+/// holds none. Run under an instruction counter at two counts of
+/// tellings: the counts' difference over the tellings' difference is one
+/// telling, and a 64th of it one report's.
 #[test]
 #[ignore = "a measurement for the Numbers table, run by name"]
 fn tellings_for_the_numbers_table() {
     const WORKERS: usize = 64;
     let rounds = std::env::var("TOLD_ROUNDS").ok();
     let rounds: usize = rounds.and_then(|rounds| rounds.parse().ok()).unwrap_or(2);
-    let declared = std::env::var_os("TOLD_NAMED").is_some();
+    let named_by = std::env::var("TOLD_NAMED").ok();
+    let declared = named_by.is_some();
+    let beside = named_by.as_deref() == Some("beside");
     let sum = Arc::new(AtomicU64::new(0));
     let kept = Arc::clone(&sum);
     let mut stages = StageRegistry::builtin();
     let added = stages.picker_with("sums", move |build| {
-        let columns = if declared {
+        let columns = if declared && !beside {
             Some([build.signal_column("held")?, build.signal_column("queue")?])
         } else {
             None
@@ -1424,7 +1845,12 @@ fn tellings_for_the_numbers_table() {
         declare(&mut document);
     }
     let profile = document.profiles.get_mut("random");
-    profile.expect("the preset's profile").pick = "sums".into();
+    let profile = profile.expect("the preset's profile");
+    profile.pick = "sums".into();
+    if beside {
+        reading_named(&mut stages, false);
+        profile.score.push("reads-named".into());
+    }
     let spec = AppliedSpec::validate_in(&document, &stages, &[]);
     let engine = InProcess::new(spec.expect("the stages hold the picker"));
     engine.set_registry(registry(WORKERS) as Arc<dyn Members>);

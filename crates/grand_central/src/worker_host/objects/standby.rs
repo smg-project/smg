@@ -9,7 +9,7 @@
 //! object of the row the event tells, hands the store the event
 //! ([`MemoryStore::follow_landed`]), and puts the object in the registry
 //! where the store took it. So the object stands when the applier goes on
-//! to its next event, with no follow.
+//! to its next event.
 //!
 //! The order is the one of a leader's write. The store is told between the
 //! build and the registry's write, and a removal's object leaves the
@@ -29,12 +29,11 @@
 //! the standing object's, and a probe of a term that ended can have moved
 //! that one ahead of the row's event. This is one of the two ways from a
 //! table's status to an object's where the objects lead. The other is a
-//! tell the store refuses ([`mod@super::status`]). A holder lays a told
-//! status whatever it follows of its store's own tail.
+//! tell the store refuses ([`mod@super::status`]).
 //!
 //! A restore is the store's restore and the read of its rows in one turn
 //! of the holder: nothing that takes the turn finds the objects of one
-//! history beside the place of another.
+//! history beside the rows of another.
 //!
 //! A gateway's watcher hands the holder the same two: each change of its
 //! watch's tail ([`Objects::follow_at`]), and the watch's snapshot at its
@@ -78,7 +77,7 @@ impl<G: Generation> Objects<G> {
         change: MembershipChange,
         row: Option<WorkerRow>,
     ) -> bool {
-        let _turn = self.read_to.lock();
+        let _turn = self.turn.lock();
         match (change, row) {
             // The object leaves the registry, then the store is told.
             (MembershipChange::Removed { id }, None) => {
@@ -144,9 +143,7 @@ impl<G: Generation> Objects<G> {
     /// One body for a cut the store takes whole: `door` is the store's own
     /// entry for it. The store's write and the read of its rows are one
     /// turn of the holder. The rows are read once, whole, and each is held
-    /// against the object that stands for it: the store's tail is not
-    /// read. The holder's place moves to the cut's rows, as at a follow's
-    /// snapshot, so a later read of the tail starts behind the cut. The
+    /// against the object that stands for it ([`Self::reconcile`]). The
     /// keeper forgets the rows that left behind the read.
     fn laid_whole(
         &self,
@@ -154,12 +151,13 @@ impl<G: Generation> Objects<G> {
         cut: StoreCheckpoint,
         door: impl FnOnce(&MemoryStore, StoreCheckpoint) -> bool,
     ) -> bool {
-        let mut place = self.read_to.lock();
+        let _turn = self.turn.lock();
         if !door(store, cut) {
             return false;
         }
         let read = self.keeper_clock();
-        let rows = self.read_whole(store, &mut place, store.history());
+        let (_, rows) = store.all_rows();
+        self.reconcile(store, &rows);
         self.forget_left(read);
         // A cut's statuses are told ones, as a status event's is.
         for row in rows {
@@ -171,7 +169,13 @@ impl<G: Generation> Objects<G> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        sync::{mpsc, Arc},
+        thread,
+        time::Duration,
+    };
 
     use smg_worker::{
         identity::basic::Worker, kv_events::port::BatchOutcome, registry::WorkerRegistry,
@@ -225,7 +229,7 @@ mod tests {
     }
 
     /// Each event a leader tells is laid as it comes: the object stands
-    /// when the event's write returns, with no follow, and the standby's
+    /// when the event's write returns, and the standby's
     /// journal, its table and the object state one row, the leader's. A row
     /// changed in place keeps its object's id in the registry, a key's next
     /// life takes another id, and a removal takes the object out.
@@ -303,14 +307,43 @@ mod tests {
         let seen = Rc::new(Cell::new(None));
         let (within, read) = (Rc::clone(&standby), Rc::clone(&seen));
         seam::on_release(move || {
-            let turn = within.objects.read_to.is_locked();
+            let turn = within.objects.turn.is_locked();
             let table = within.store.by_key(A).is_some();
             read.set(Some((turn, table, within.object(A).is_some())));
         });
         follow(&standby, &leader);
         assert_eq!(seen.get(), Some((true, true, false)));
         assert!(standby.object(A).is_some(), "put behind the store's write");
-        assert!(!standby.objects.read_to.is_locked(), "the turn is let go");
+        assert!(!standby.objects.turn.is_locked(), "the turn is let go");
+    }
+
+    /// A cut laid whole takes the holder's turn ahead of the store's write.
+    /// While another holds the turn the restore waits there, and the store
+    /// stands as it was. Behind the turn the cut is laid, and its row has
+    /// its object.
+    #[test]
+    fn a_cut_laid_whole_waits_for_the_holders_turn() {
+        let (leader, standby) = (Replica::new(), Replica::new());
+        leader.upsert(facts(1, "gold"));
+        let cut = leader.store.checkpoint();
+        let (store, objects) = (&standby.store, &standby.objects);
+        let (laid, lay) = mpsc::channel();
+        let turn = objects.turn.lock();
+        thread::scope(|scope| {
+            let call = scope.spawn(move || {
+                let took = objects.restore_from(store, cut);
+                let _ = laid.send(());
+                took
+            });
+            assert_eq!(
+                lay.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            assert_eq!(store.by_key(A), None, "the cut waits");
+            drop(turn);
+            assert!(call.join().expect("the call ends"), "the cut is laid");
+        });
+        assert!(standby.object(A).is_some(), "its row has its object");
     }
 
     /// The wire tells a row's age, so each event's row comes with an
@@ -403,8 +436,7 @@ mod tests {
     }
 
     /// A status the leader tells is laid on the object in the event's own
-    /// turn, by a holder that follows no status of its store's tail: no
-    /// follow reads it.
+    /// turn.
     #[test]
     fn a_told_status_is_on_the_object_when_the_event_returns() {
         let (leader, standby) = (Replica::new(), Replica::new());
@@ -422,7 +454,6 @@ mod tests {
         assert_eq!(table.status, WorkerStatus::Ready);
         let object = standby.object(A).expect("the row's object");
         assert_eq!(standby.objects.row_of(&object), Some(table));
-        assert_eq!(standby.objects.read_to(), None, "no follow read it");
     }
 
     /// A tell the store takes no word of leaves the object at the status
@@ -493,8 +524,7 @@ mod tests {
     }
 
     /// A restore lays the cut's rows in its own turn: each has its object
-    /// when the restore returns, a row the cut drops has none, and the
-    /// holder stands at the cut's epoch.
+    /// when the restore returns, and a row the cut drops has none.
     #[test]
     fn a_restores_rows_have_their_objects_when_it_returns() {
         let (leader, standby) = (Replica::new(), Replica::new());
@@ -512,14 +542,12 @@ mod tests {
         assert_eq!(standby.objects.row_of(&object), leader.store.by_key(A));
         assert_eq!(standby.object(B), None, "a row the cut drops");
         assert_eq!(standby.objects.len(), 1);
-        assert_eq!(standby.objects.read_to(), Some(leader.store.epoch()));
     }
 
     /// A cut's statuses are told ones. Each object states the status its
     /// row holds in the cut when the cut is laid, by a restore and by a
     /// watch's snapshot: here the object of a row that stood through it,
-    /// which no lay builds anew. The holder follows no status of its
-    /// store's tail.
+    /// which no lay builds anew.
     #[test]
     fn a_cuts_statuses_are_on_the_objects_when_it_is_laid() {
         type Lay = fn(&Objects<Members>, &MemoryStore, StoreCheckpoint) -> bool;
@@ -583,7 +611,6 @@ mod tests {
         assert!(Arc::ptr_eq(&stood, &stands().1), "the object that stood");
         assert!(watching.object(B).is_some(), "the row the snapshot brings");
         assert_eq!(objects.len(), 2);
-        assert_eq!(objects.read_to(), Some(told.store.epoch()));
     }
 
     /// A leader, and a standby whose holder was handed the KV tables that

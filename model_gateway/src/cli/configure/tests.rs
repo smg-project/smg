@@ -750,11 +750,16 @@ fn the_print_option_says_a_refusal_in_one_sentence() {
     // A setting no document says: no document, and one sentence with the
     // setting by its name at the head. The words behind the head are the
     // Grand Central crate's, and no case of the gateway holds them. The sticky
-    // override's rule places single requests alone, and this line plans a
-    // pair.
+    // override's rule places both sides of a pair, and this line's prefill
+    // policy reads the routing key itself.
     let mut line = vec!["smg"];
     line.extend_from_slice(PAIR);
-    line.extend_from_slice(&["--routing-key-override", "--print-policy-spec"]);
+    line.extend_from_slice(&[
+        "--prefill-policy",
+        "consistent_hashing",
+        "--routing-key-override",
+        "--print-policy-spec",
+    ]);
     let sticky = printed(&line);
     assert_eq!(sticky.document(), None);
     assert!(

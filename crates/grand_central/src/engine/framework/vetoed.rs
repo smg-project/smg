@@ -685,7 +685,7 @@ pub(super) fn steered(
     );
     let trace = Trace {
         lifted: buf.lifted,
-        ..trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores)
+        ..trace_of(index, facts, pool, candidates, &buf.kept, buf.traced())
     };
     Decision::Pick(Pick {
         targets,
