@@ -602,7 +602,7 @@ class OwnedClientLifecycle(unittest.TestCase):
             self.assert_closed(ns)
 
 
-def exercise_owned_cleanup_fault(directory, fault, *, foreign=False):
+def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_stop_stderr=None):
     """Run actual publisher teardown and real harmless clients, never Docker.
 
     Only the productive try-body is replaced by a fault after exact ownership
@@ -715,9 +715,10 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False):
             payload = ""
         else:
             raise AssertionError("No productive or unknown Docker command is allowed")
-        child = actual_popen(
-            [sys.executable, "-I", "-S", "-B", "-c", "print(" + repr(payload) + ")"], **kwargs
-        )
+        code = "print(" + repr(payload) + ")"
+        if argv[1] == "stop" and cleanup_stop_stderr is not None:
+            code = "import os; os.write(2, " + repr(cleanup_stop_stderr) + "); raise SystemExit(17)"
+        child = actual_popen([sys.executable, "-I", "-S", "-B", "-c", code], **kwargs)
         children.append(child)
         return child
 
@@ -826,6 +827,87 @@ class ReceiptFaultCleanup(unittest.TestCase):
             self.assertTrue(ns["state"]["cleanup_verified_absent"])
             self.assertEqual(stale.read_text(), "unrelated old file")
             self.assertTrue(calls)
+
+
+class CleanupStderrDiagnostics(unittest.TestCase):
+    run_owned = OwnedClientLifecycle.run_owned
+    assert_closed = OwnedClientLifecycle.assert_closed
+
+    def cleanup_client(self, directory, stderr, exitcode):
+        ns = actual_client_namespace(directory)
+        ns["client_control"]["cleaning"] = True
+        code = "import os; os.write(1, b'cleanup stdout'); os.write(2, " + repr(stderr) + ")"
+        code += "; raise SystemExit(" + str(exitcode) + ")"
+        if exitcode:
+            with self.assertRaises(AssertionError):
+                self.run_owned(directory, ns, code)
+        else:
+            self.assertEqual(self.run_owned(directory, ns, code), b"cleanup stdout")
+        self.assert_closed(ns)
+        self.assertEqual(ns["state"]["clients"][-1]["returncode"], exitcode)
+        return ns
+
+    def test_nonzero_cleanup_keeps_real_stderr_and_exit(self):
+        diagnostic = b"actual owned cleanup: daemon unavailable\n"
+        with tempfile.TemporaryDirectory() as directory:
+            ns = self.cleanup_client(directory, diagnostic, 7)
+            client = ns["state"]["clients"][-1]
+            self.assertEqual(client["stderr_sha256"], p.digest(diagnostic))
+            self.assertEqual(client["stderr_tail"], diagnostic.decode())
+            self.assertEqual(client["error_type"], "AssertionError")
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(saved["clients"][-1]["stderr_tail"], diagnostic.decode())
+            self.assertFalse((Path(directory) / "client.log").exists())
+
+    def test_healthy_cleanup_retains_metadata_and_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = self.cleanup_client(directory, b"healthy cleanup note", 0)
+            client = ns["state"]["clients"][-1]
+            self.assertEqual(client["stderr_tail"], "healthy cleanup note")
+            self.assertEqual(client["stderr_sha256"], p.digest(b"healthy cleanup note"))
+            self.assertNotIn("error_type", client)
+
+    def test_cleanup_tail_is_bounded_and_replaces_non_utf8(self):
+        diagnostic = b"not-retained-prefix:" + b"a" * 5000 + b"\xff\xfe-tail"
+        with tempfile.TemporaryDirectory() as directory:
+            ns = self.cleanup_client(directory, diagnostic, 9)
+            client = ns["state"]["clients"][-1]
+            self.assertEqual(client["stderr_sha256"], p.digest(diagnostic))
+            self.assertLessEqual(len(client["stderr_tail"].encode("utf-8")), 4096)
+            self.assertTrue(client["stderr_tail"].endswith("\ufffd\ufffd-tail"))
+            self.assertNotIn("not-retained-prefix", client["stderr_tail"])
+
+    def test_failed_writer_fallback_keeps_nonzero_cleanup_diagnostic(self):
+        diagnostic = b"actual owned stop: permission denied\n"
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as fallback:
+                ns, calls, error = exercise_owned_cleanup_fault(
+                    directory, "persistent", cleanup_stop_stderr=diagnostic
+                )
+            self.assertIsInstance(error, OSError)
+            self.assertIn("original persistent receipt fault", str(error))
+            stop = next(c for c in ns["state"]["clients"] if c["phase"] == "cleanup_stop")
+            self.assertEqual(stop["returncode"], 17)
+            self.assertEqual(stop["stderr_sha256"], p.digest(diagnostic))
+            self.assertEqual(stop["stderr_tail"], diagnostic.decode())
+            payload = json.loads(fallback.getvalue())
+            saved = next(c for c in payload["cleanup_clients"] if c["phase"] == "cleanup_stop")
+            self.assertEqual(saved["stderr_tail"], diagnostic.decode())
+            self.assertTrue(any(a[1] == "stop" for a in calls))
+            self.assertFalse(any(a[1:3] == ["buildx", "rm"] for a in calls))
+            self.assertTrue(all(c["reaped"] and c["PG_gone"] for c in ns["state"]["clients"]))
+
+    def test_failed_writer_healthy_owned_cleanup_still_completes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as fallback:
+                ns, calls, error = exercise_owned_cleanup_fault(directory, "persistent")
+            self.assertIsInstance(error, OSError)
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
+            payload = json.loads(fallback.getvalue())
+            self.assertTrue(payload["cleanup_verified_absent"])
+            self.assertIn(["docker", "buildx", "rm", "smg-moriio-123-1"], calls)
+            self.assertTrue(all("stderr_tail" in c for c in payload["cleanup_clients"]))
+            self.assertTrue(all(c["reaped"] and c["PG_gone"] for c in ns["state"]["clients"]))
 
 
 if __name__ == "__main__":

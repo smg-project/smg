@@ -8,7 +8,7 @@ by the normal-main publisher described below.
 `Dockerfile.rocm` preserves the successful recipe's executable instructions:
 the engine's original Dockerfile plus
 `ENV MAX_JOBS=16 CMAKE_BUILD_PARALLEL_LEVEL=16` in its `dev` stage. Comments
-expand the explanation of `HSA_NO_SCRATCH_RECLAIM`; the file is not a
+expand the explanation of `HSA_ENABLE_IPC_MODE_LEGACY`; the file is not a
 byte-identical copy of the original build input. `upstream-bake.hcl` is the engine's original bake file.
 `bake.hcl` binds the three official immutable stack/runtime/test-deps images
 and the actual gfx942 build arguments. It preserves the full own-source Csrc,

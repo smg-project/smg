@@ -478,13 +478,22 @@ def publish(engine_checkout, output):
                         break
                     except subprocess.TimeoutExpired:
                         continue
-                assert proc.returncode == 0, phase + " failed (see owned log)"
+                if cleaning:
+                    client["stdout_sha256"] = digest(stdout)
+                    client["stderr_sha256"] = digest(stderr)
+                    # Preserve diagnostics before a nonzero exit raises. Bound the
+                    # UTF-8 representation too, including replacement characters.
+                    tail = stderr[-4096:].decode("utf-8", errors="replace").encode("utf-8")
+                    client["stderr_tail"] = tail[-4096:].decode("utf-8", errors="ignore")
+                assert proc.returncode == 0, phase + (
+                    " failed (see cleanup client stderr_tail)"
+                    if cleaning
+                    else " failed (see owned log)"
+                )
                 if capture or cleaning:
                     assert len(stdout) <= 4 * 1024**2, "metadata output too large"
                 if cleaning:
                     assert len(stderr) <= 4 * 1024**2, "cleanup stderr too large"
-                    client["stdout_sha256"] = digest(stdout)
-                    client["stderr_sha256"] = digest(stderr)
         except BaseException as exc:
             error = exc
         finally:
