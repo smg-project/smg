@@ -1896,10 +1896,12 @@ mod tests {
         let mut sources = Vec::new();
         sources_under(package, &mut sources);
         for binding in ["golang", "python"] {
-            sources_under(
-                &package.join("../bindings").join(binding).join("src"),
-                &mut sources,
-            );
+            for folder in ["src", "tests"] {
+                sources_under(
+                    &package.join("../bindings").join(binding).join(folder),
+                    &mut sources,
+                );
+            }
         }
         assert!(
             sources.contains(&this_file),
@@ -1912,6 +1914,7 @@ mod tests {
             "test_harness/src/lib.rs",
             "../bindings/golang/src/lib.rs",
             "../bindings/python/src/lib.rs",
+            "../bindings/python/tests/unit/tests.rs",
         ] {
             assert!(
                 sources.contains(&package.join(known)),
