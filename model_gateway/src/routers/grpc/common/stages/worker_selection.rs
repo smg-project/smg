@@ -2583,7 +2583,11 @@ impl WorkerSelectionStage {
         if needs_encode && self.policy_registry.engine().is_some() {
             return Err(EpdSelectionFailure::EncodeUnderGrandCentral);
         }
-        let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
+        let mut available_encode = if needs_encode {
+            Self::available_workers(&snapshot, RoutingPool::GrpcEncode)
+        } else {
+            Vec::new()
+        };
         // An encoder serves the request by its runtime's encode handoff: a
         // push encoder must advertise the producer role of a connector and
         // may take references (it processes the media itself); a rendezvous
@@ -2601,7 +2605,9 @@ impl WorkerSelectionStage {
                 }
         };
         let capable = |worker: &Arc<dyn Worker>| capable_for(worker, demand.encode);
-        available_encode.retain(capable);
+        if needs_encode {
+            available_encode.retain(capable);
+        }
         let registered_encode = snapshot.pool(RoutingPool::GrpcEncode);
         let shedding = self.worker_registry.overload_shed_enabled();
         let mut encode_overload_lifted = false;
@@ -5944,14 +5950,19 @@ mod tests {
             }
         }
         let workers = registry.get_all();
-        assert!(prepared_input::pipeline_ready(&workers, Default::default()));
+        assert!(prepared_input::pipeline_ready(
+            &workers,
+            Default::default(),
+            false
+        ));
         let mismatched: Vec<_> = workers
             .into_iter()
             .filter(|w| !w.url().ends_with(":8962"))
             .collect();
         assert!(!prepared_input::pipeline_ready(
             &mismatched,
-            Default::default()
+            Default::default(),
+            false
         ));
     }
 

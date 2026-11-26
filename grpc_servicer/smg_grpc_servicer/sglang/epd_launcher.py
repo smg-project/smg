@@ -289,6 +289,21 @@ def _staging_bytes_per_token(hidden_size, dtype):
     return hidden_size * element_bytes
 
 
+def _encoder_embedding_width(encoder, hf_config):
+    """Derive actual visual embedding width (accounting for DeepStack multi-layer outputs)."""
+    base_hidden = encoder.model_config.hidden_size
+    width = base_hidden
+    vision = getattr(hf_config, "vision_config", None)
+    deepstack = _cfg_first(vision, "deepstack_visual_indexes", default=None)
+    if isinstance(deepstack, (list, tuple)) and deepstack:
+        width = max(width, base_hidden * (1 + len(deepstack)))
+    for attr in ("embedding_dim", "output_dim", "_embedding_dim"):
+        val = getattr(encoder, attr, None)
+        if type(val) is int and val > 0:
+            width = max(width, val)
+    return width
+
+
 def encoder_staging_bytes(hidden_size, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST):
     """Compute per-request staging byte budget from embedding dimension and dtype."""
     per_token = _staging_bytes_per_token(hidden_size, dtype)
@@ -297,8 +312,12 @@ def encoder_staging_bytes(hidden_size, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_RE
     return max_tokens * per_token
 
 
-def _control_reserve_bytes(config, budget_bytes):
-    """Reserve control-plane memory inside the encoder context byte budget."""
+def _control_reserve_bytes(config, budget_bytes=None):
+    """Reserve shared queued-control memory inside the encoder context byte budget."""
+    if budget_bytes is None:
+        budget_bytes = config.get("max_context_bytes")
+        if budget_bytes is None:
+            budget_bytes = resolve_max_context_bytes()
     return min(
         config["max_active"] * config["max_control_bytes"],
         max(config["max_control_bytes"], budget_bytes // 8),
@@ -370,13 +389,15 @@ class ManagedBootstrap:
 
 
 def launcher(config):
-    from smg_grpc_servicer.sglang.rust import SglangLauncher, launch_scheduler_ranks
+    """Build a ``SglangLauncher`` subclass configured for managed P or D startup."""
+    from smg_grpc_servicer.sglang.rust import SglangLauncher
 
     class ManagedLauncher(SglangLauncher):
         ipc_prefix = "sglang-managed-servicer"
         warmup_env = ""
 
         def server_extras(self, args, tokenizer_dir):
+            """Validate P/D CLI flags and attach serialized ``managed_config`` JSON."""
             if args.disaggregation_mode != config["role"]:
                 raise ValueError("managed role must equal native disaggregation mode")
             if not args.language_only:
@@ -389,11 +410,10 @@ def launcher(config):
                 )
             }
 
-        def launch_ranks(self, args, handshake_port):
-            bootstrap = ManagedBootstrap(args) if config["role"] == "prefill" else None
-            return launch_scheduler_ranks(
-                args, handshake_port=handshake_port, encode_bridge=bootstrap
-            )
+        def launch(self, args, handshake_port, facts):
+            """Attach the managed Prefill bootstrap listener, then delegate to ``SglangLauncher.launch``."""
+            self.encode = ManagedBootstrap(args) if config["role"] == "prefill" else None
+            return super().launch(args, handshake_port, facts)
 
     return ManagedLauncher()
 
@@ -461,25 +481,30 @@ async def serve(config, args):
         hf_config = backend.encoder.model_config.hf_config
         config.setdefault("max_context_bytes", resolve_max_context_bytes())
         max_batch_size = getattr(backend.scheduler, "max_batch_size", None)
+        staging_width = _encoder_embedding_width(backend.encoder, hf_config)
+        staging_dtype = _normalize_dtype(
+            getattr(backend.encoder, "_embedding_dtype", None) or config["embedding_dtype"]
+        )
         max_tokens = resolve_max_media_tokens(args, backend.encoder.model_config)
         if getattr(args, "context_length", None) is None:
             max_tokens = fit_auto_media_tokens(
                 max_tokens,
                 hf_config,
                 vision_dtype,
-                backend.encoder.model_config.hidden_size,
-                config["embedding_dtype"],
+                staging_width,
+                staging_dtype,
                 config,
                 max_batch_size=max_batch_size,
             )
         config["max_staging_bytes_per_request"] = encoder_staging_bytes(
-            backend.encoder.model_config.hidden_size,
-            config["embedding_dtype"],
+            staging_width,
+            staging_dtype,
             max_tokens=max_tokens,
         )
         config["max_artifact_bytes"] = encoder_artifact_bytes(
             hf_config, vision_dtype, max_tokens=max_tokens
         )
+        config["max_queued_control_bytes"] = _control_reserve_bytes(config)
         config["execution_capacity"], _ = encoder_window(config, max_batch_size=max_batch_size)
         config["max_cpu"] = resolve_max_cpu(
             config["execution_capacity"], max_batch_size=max_batch_size

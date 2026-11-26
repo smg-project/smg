@@ -172,35 +172,41 @@ async def test_native_encoder_early_facade_and_release_barrier(monkeypatch):
             },
         )
     )
-    await asyncio.sleep(0.02)
-    assert not early.done()
-    entry = epd_encoder.NativeEntry(time.monotonic() + 5.0, "r1", prefill_host="10.0.0.1")
-    owner.entries["r1"] = entry
-    owner._wake_waiters("r1", "registered")
-    await send_started.wait()
+    try:
+        await asyncio.sleep(0.02)
+        assert not early.done()
+        entry = epd_encoder.NativeEntry(time.monotonic() + 5.0, "r1", prefill_host="10.0.0.1")
+        owner.entries["r1"] = entry
+        owner._wake_waiters("r1", "registered")
+        await asyncio.wait_for(send_started.wait(), timeout=2.0)
 
-    # Wrong host is rejected.
-    with pytest.raises(epd_encoder.Rejected, match="frozen P host"):
-        await owner.facade(
-            "send",
-            {
-                "req_id": "r1",
-                "receive_count": 1,
-                "prefill_host": "10.0.0.2",
-                "embedding_port": 5000,
-            },
-        )
+        # Wrong host is rejected.
+        with pytest.raises(epd_encoder.Rejected, match="frozen P host"):
+            await owner.facade(
+                "send",
+                {
+                    "req_id": "r1",
+                    "receive_count": 1,
+                    "prefill_host": "10.0.0.2",
+                    "embedding_port": 5000,
+                },
+            )
 
-    finish_task = asyncio.create_task(owner._finish(entry, "cancelled"))
-    await asyncio.sleep(0.02)
-    assert not finish_task.done()
-    assert ("release", "r1") not in calls
+        finish_task = asyncio.create_task(owner._finish(entry, "cancelled"))
+        await asyncio.sleep(0.02)
+        assert not finish_task.done()
+        assert ("release", "r1") not in calls
 
-    release_send.set()
-    await early
-    receipt = await finish_task
-    assert receipt["released"] is False
-    assert "r1" in owner.entries
+        release_send.set()
+        await asyncio.wait_for(early, timeout=2.0)
+        receipt = await asyncio.wait_for(finish_task, timeout=2.0)
+        assert receipt["released"] is False
+        assert "r1" in owner.entries
+    finally:
+        release_send.set()
+        if not early.done():
+            early.cancel()
+            await asyncio.gather(early, return_exceptions=True)
 
     fail_release[0] = False
     entry2 = epd_encoder.NativeEntry(time.monotonic() + 5.0, "r2", prefill_host="10.0.0.1")

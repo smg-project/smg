@@ -65,6 +65,8 @@ pub enum PairingMismatch {
     Version,
     /// Both sides report the named KV layout fact and disagree.
     KvLayout(&'static str),
+    /// Managed prepared-input contracts differ or mix managed with unmanaged workers.
+    PreparedInput,
     /// A component one side does not report, rejected under strict mode.
     Unknown(&'static str),
 }
@@ -78,6 +80,7 @@ impl PairingMismatch {
             Self::Transport => "transport".to_string(),
             Self::Version => "version".to_string(),
             Self::KvLayout(fact) => fact.to_string(),
+            Self::PreparedInput => "prepared_input".to_string(),
             Self::Unknown(component) => format!("unknown {component}"),
         }
     }
@@ -233,27 +236,34 @@ impl PdPairing {
     /// is left out: it only counts under strict mode, and a rolling upgrade
     /// would otherwise show two keys for workers that do pair.
     pub fn key(&self) -> String {
-        if let Some(explicit) = &self.explicit {
-            return explicit.clone();
+        let mut base = if let Some(explicit) = &self.explicit {
+            explicit.clone()
+        } else {
+            let layout: Vec<String> = LAYOUT_FACTS
+                .iter()
+                .filter_map(|(short, _, _)| {
+                    self.kv_layout
+                        .get(short)
+                        .map(|value| format!("{short}={value}"))
+                })
+                .collect();
+            format!(
+                "{}/{}/{}",
+                self.runtime.as_str(),
+                self.transport.as_deref().unwrap_or("?"),
+                if layout.is_empty() {
+                    "?".to_string()
+                } else {
+                    layout.join(",")
+                },
+            )
+        };
+        if let Some(prepared) = &self.prepared {
+            let short = &prepared[..prepared.floor_char_boundary(12)];
+            base.push_str("+prepared=");
+            base.push_str(short);
         }
-        let layout: Vec<String> = LAYOUT_FACTS
-            .iter()
-            .filter_map(|(short, _, _)| {
-                self.kv_layout
-                    .get(short)
-                    .map(|value| format!("{short}={value}"))
-            })
-            .collect();
-        format!(
-            "{}/{}/{}",
-            self.runtime.as_str(),
-            self.transport.as_deref().unwrap_or("?"),
-            if layout.is_empty() {
-                "?".to_string()
-            } else {
-                layout.join(",")
-            },
-        )
+        base
     }
 
     /// How the two workers' runtimes compare. A worker whose runtime probe
@@ -292,7 +302,7 @@ impl PdPairing {
     /// `Strict`, and only when both sides report one.
     pub fn mismatch(&self, other: &Self, mode: PdPairingMode) -> Option<PairingMismatch> {
         if self.prepared != other.prepared {
-            return Some(PairingMismatch::KvLayout("prepared_input"));
+            return Some(PairingMismatch::PreparedInput);
         }
         if mode == PdPairingMode::Off {
             return None;
@@ -841,13 +851,16 @@ mod tests {
         ] {
             assert_eq!(
                 managed.mismatch(&unmanaged_a, mode),
-                Some(PairingMismatch::KvLayout("prepared_input"))
+                Some(PairingMismatch::PreparedInput)
             );
             assert_eq!(
                 managed.mismatch(&managed_other, mode),
-                Some(PairingMismatch::KvLayout("prepared_input"))
+                Some(PairingMismatch::PreparedInput)
             );
         }
+        assert_eq!(PairingMismatch::PreparedInput.describe(), "prepared_input");
+        assert!(managed.key().ends_with("+prepared=contract-a"));
+        assert!(!unmanaged_a.key().contains("+prepared="));
         assert!(managed.compatible(&managed_same, PdPairingMode::Lenient));
         assert!(managed.compatible(&managed_same, PdPairingMode::Off));
         // Unmanaged PD workers both carry `prepared: None` and keep pairing unchanged.

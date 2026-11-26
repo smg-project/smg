@@ -221,7 +221,11 @@ impl ModelReadiness {
             Some(*lacking)
         } else if router_config.is_sglang_epd()
             && has_encode_worker()
-            && !prepared_input::pipeline_ready(workers, router_config.pd_pairing_mode)
+            && !prepared_input::pipeline_ready(
+                workers,
+                router_config.pd_pairing_mode,
+                router_config.worker_overload_shed,
+            )
         {
             Some("no_compatible_epd_pipeline")
         } else if !router_config.disable_tokenizer_autoload

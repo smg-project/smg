@@ -2051,6 +2051,28 @@ impl PySglangGrpcServer {
 }
 
 /// Native encoder control shares the existing servicer runtime and Rust media pipeline.
+/// Convert managed encoder proto items into `WorkerMediaItem`s, forwarding validated image detail.
+fn encoder_items_to_worker_items(
+    modality: EncoderModality,
+    encoder_items: Vec<EncoderMediaItem>,
+) -> Result<Vec<WorkerMediaItem>, tonic::Status> {
+    let target_modality = match modality {
+        EncoderModality::Image => Modality::Image,
+        EncoderModality::Video => Modality::Video,
+    };
+    encoder_items
+        .into_iter()
+        .map(|item| {
+            let detail = parse_image_detail(item.detail.as_deref())?;
+            Ok(WorkerMediaItem {
+                modality: target_modality,
+                url: item.url,
+                detail,
+            })
+        })
+        .collect()
+}
+
 #[pyclass(name = "ManagedEncoderServer")]
 pub struct PyManagedEncoderServer {
     server: EncoderServer,
@@ -2100,21 +2122,7 @@ impl PyManagedEncoderServer {
                 move |modality: EncoderModality, encoder_items: Vec<EncoderMediaItem>| {
                     let pipeline = pipeline.clone();
                     Box::pin(async move {
-                        let target_modality = match modality {
-                            EncoderModality::Image => Modality::Image,
-                            EncoderModality::Video => Modality::Video,
-                        };
-                        let items = encoder_items
-                            .into_iter()
-                            .map(|item| {
-                                let detail = parse_image_detail(item.detail.as_deref())?;
-                                Ok(WorkerMediaItem {
-                                    modality: target_modality,
-                                    url: item.url,
-                                    detail,
-                                })
-                            })
-                            .collect::<Result<Vec<_>, tonic::Status>>()?;
+                        let items = encoder_items_to_worker_items(modality, encoder_items)?;
                         let compact = pipeline
                             .process_sglang_encoder_compact(items, max_artifact_bytes)
                             .await
@@ -2188,5 +2196,51 @@ impl PyManagedEncoderServer {
         let duration = Duration::try_from_secs_f64(timeout)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         py.detach(|| self.server.stop(duration).map_err(to_py_err))
+    }
+}
+
+#[cfg(test)]
+mod managed_encoder_tests {
+    use super::*;
+
+    #[test]
+    fn encoder_items_to_worker_items_forwards_image_detail_and_rejects_invalid() {
+        let items = encoder_items_to_worker_items(
+            EncoderModality::Image,
+            vec![
+                EncoderMediaItem {
+                    url: "https://example.test/a.png".into(),
+                    detail: Some("low".into()),
+                },
+                EncoderMediaItem {
+                    url: "https://example.test/b.png".into(),
+                    detail: Some("HIGH".into()),
+                },
+                EncoderMediaItem {
+                    url: "https://example.test/c.png".into(),
+                    detail: Some("auto".into()),
+                },
+                EncoderMediaItem {
+                    url: "https://example.test/d.png".into(),
+                    detail: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].detail, Some(llm_multimodal::ImageDetail::Low));
+        assert_eq!(items[1].detail, Some(llm_multimodal::ImageDetail::High));
+        assert_eq!(items[2].detail, Some(llm_multimodal::ImageDetail::Auto));
+        assert_eq!(items[3].detail, None);
+
+        let err = encoder_items_to_worker_items(
+            EncoderModality::Image,
+            vec![EncoderMediaItem {
+                url: "https://example.test/bad.png".into(),
+                detail: Some("ultra".into()),
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

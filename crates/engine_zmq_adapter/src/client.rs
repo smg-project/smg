@@ -470,12 +470,34 @@ impl ZmqEngineClient {
             .map_err(constraint_refused_status)?;
         }
         let original_text = req.tokenized.as_ref().map(|t| t.original_text.clone());
+        let bootstrap = binding
+            .bootstrap
+            .as_ref()
+            .ok_or_else(|| tonic::Status::invalid_argument("missing managed bootstrap"))?;
+        let bootstrap_port = i32::try_from(bootstrap.port)
+            .map_err(|_| tonic::Status::invalid_argument("managed bootstrap port out of range"))?;
         let pin = req.data_parallel_rank;
+        let replica_dp = self.meta.engine_ranks_are_replicas.get().is_some();
         let placement = if role == "prefill" {
-            RankPlacement::RoomResidue
+            // Prefill placement follows `binding.bootstrap.room` authoritatively;
+            // clear any caller pin before translation so `room_residue_rank`
+            // below performs the single pin-yield check without pre-rejecting it.
+            req.data_parallel_rank = None;
+            if replica_dp {
+                RankPlacement::ReplicaRoomResidue
+            } else {
+                RankPlacement::RoomResidue
+            }
         } else {
             RankPlacement::Pin
         };
+        if let Ok(room_i32) = i32::try_from(bootstrap.room) {
+            req.disaggregated_params = Some(sglang_proto::DisaggregatedParams {
+                bootstrap_host: bootstrap.host.clone(),
+                bootstrap_port,
+                bootstrap_room: room_i32,
+            });
+        }
         let connection = SglangConnection {
             max_model_len: self.prompt_bound()?,
             ranks: client.engines().len(),
@@ -485,24 +507,21 @@ impl ZmqEngineClient {
         };
         let mut native =
             translate_request_sglang(req, &connection).map_err(tonic::Status::invalid_argument)?;
-        let bootstrap = binding
-            .bootstrap
-            .as_ref()
-            .ok_or_else(|| tonic::Status::invalid_argument("missing managed bootstrap"))?;
         native.bootstrap_host = Some(bootstrap.host.clone());
-        native.bootstrap_port =
-            Some(i32::try_from(bootstrap.port).map_err(|_| {
-                tonic::Status::invalid_argument("managed bootstrap port out of range")
-            })?);
+        native.bootstrap_port = Some(bootstrap_port);
         native.bootstrap_room = Some(bootstrap.room);
         if role == "prefill" {
-            native.routed_dp_rank = room_residue_rank(
+            let rank = room_residue_rank(
                 bootstrap.room,
                 pin,
                 client.engines().len(),
                 &native.rid,
                 &self.meta.pin_yield,
             );
+            native.routed_dp_rank = rank;
+            if replica_dp {
+                native.disagg_prefill_dp_rank = rank;
+            }
         }
         if let Some(ext) = external {
             if ext.has_media() {
@@ -2597,6 +2616,75 @@ mod tests {
             wire.num_items_assigned,
             Some(BTreeMap::from([(1, vec![2, 2]), (2, vec![1, 0])]))
         );
+    }
+
+    #[tokio::test]
+    async fn sglang_managed_prefill_sets_disagg_prefill_dp_rank_on_replica_dp() {
+        use engine_zmq_client::{
+            codec::decode_msgpack,
+            mock_engine::connect_to_frontend,
+            protocol::{
+                handshake::ManagedSglangHandshake,
+                sglang::request::{SglangRequestType, TokenizedGenerateReqInput},
+            },
+            EngineId,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let mut ready = default_ready_response();
+        ready.sglang_managed = Some(ManagedSglangHandshake {
+            version: 1,
+            role: "prefill".into(),
+            layout: smg_grpc_client::sglang_managed::LAYOUT.into(),
+        });
+        let (client, rank0, rank1) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                2,
+                "m".to_string(),
+                crate::eos::EosTokenIds::default(),
+                RuntimeType::Sglang,
+                Duration::from_secs(10),
+            ),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready.clone()),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready),
+        );
+        let client = client.unwrap();
+        let _rank0 = rank0.unwrap();
+        let mut rank1 = rank1.unwrap();
+        client.note_engine_ranks_are_replicas();
+
+        let binding = managed::InputBinding {
+            prefill_rid: "prefill-dp-rid".into(),
+            decode_rid: "decode-dp-rid".into(),
+            bootstrap: Some(managed::Bootstrap {
+                host: "prefill".into(),
+                port: 8998,
+                room: 7,
+            }),
+            layout_contract: smg_grpc_client::sglang_managed::LAYOUT.into(),
+            processor_contract: "qwen3".into(),
+            model_revision: "weights".into(),
+        };
+        let mut req = managed_decode_request();
+        req.request_id = "prefill-dp-rid".into();
+        // Disagreeing/out-of-range caller pin must yield to binding.bootstrap.room (7 % 2 == 1).
+        req.data_parallel_rank = Some(0);
+        req.tokenized.as_mut().unwrap().original_text = "media prompt".into();
+
+        let _stream = client
+            .generate_sglang_managed(req, &binding, Some(("http://enc:30000", 1, 0)), None)
+            .await
+            .unwrap();
+        let frame = rank1.recv_request().await.unwrap();
+        assert_eq!(frame[0], SglangRequestType::Add.to_frame());
+        let wire: TokenizedGenerateReqInput = decode_msgpack(&frame[1]).unwrap();
+        assert_eq!(wire.routed_dp_rank, Some(1));
+        assert_eq!(wire.disagg_prefill_dp_rank, Some(1));
     }
 
     /// A route's JSON body becomes the control call's msgpack argument field

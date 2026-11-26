@@ -218,13 +218,13 @@ def split_work_and_control_reqs(original, receiver, recv_reqs, *args, **kwargs):
     if not dp_scoped:
         return work_reqs, control_reqs
 
-    remaining_control = []
-    for req in control_reqs:
-        if isinstance(req, dp_scoped):
-            work_reqs.append(req)
-        else:
-            remaining_control.append(req)
-    return work_reqs, remaining_control
+    dp_ids = {id(req) for req in control_reqs if isinstance(req, dp_scoped)}
+    if not dp_ids:
+        return work_reqs, control_reqs
+    work_ids = {id(req) for req in work_reqs}
+    ordered_work = [req for req in recv_reqs if id(req) in work_ids or id(req) in dp_ids]
+    remaining_control = [req for req in control_reqs if id(req) not in dp_ids]
+    return ordered_work, remaining_control
 
 
 def run_event_loop(original, scheduler, *args, **kwargs):

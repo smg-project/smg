@@ -568,6 +568,8 @@ pub struct EncoderConfig {
     pub max_images: usize,
     pub max_control_bytes: usize,
     #[serde(default)]
+    pub max_queued_control_bytes: usize,
+    #[serde(default)]
     pub control_listen: String,
     #[serde(default)]
     pub native_commands: String,
@@ -592,15 +594,23 @@ struct EncodeOwner {
     cancel: watch::Sender<bool>,
     result: watch::Sender<Option<Result<(), Status>>>,
     running: AtomicBool,
+    queued_control_bytes: AtomicUsize,
+}
+
+#[derive(Default)]
+struct OwnerLedger {
+    owners: HashMap<String, Arc<EncodeOwner>>,
+    queued_control_bytes: usize,
 }
 
 /// Rust owns E admission, CPU preprocessing, and execution-slot accounting.
 /// Execution permits return only on an explicit native release receipt.
 pub struct EncoderRuntime {
     config: EncoderConfig,
+    max_queued_control_bytes: usize,
     native: NativeEncoderLink,
     processor: EncoderProcessor,
-    owners: Mutex<HashMap<String, Arc<EncodeOwner>>>,
+    owners: Mutex<OwnerLedger>,
     pre_decode_cache: Mutex<PreDecodeCache>,
     execution: Arc<Semaphore>,
     cpu: Arc<Semaphore>,
@@ -635,13 +645,19 @@ impl EncoderRuntime {
         {
             return Err(Status::invalid_argument("invalid encoder control limits"));
         }
+        let max_queued_control_bytes = if config.max_queued_control_bytes > 0 {
+            config.max_queued_control_bytes
+        } else {
+            config.max_active.saturating_mul(config.max_control_bytes)
+        };
         Ok(Arc::new(Self {
             execution: Arc::new(Semaphore::new(config.execution_capacity)),
             cpu: Arc::new(Semaphore::new(config.max_cpu)),
+            max_queued_control_bytes,
             config,
             native,
             processor,
-            owners: Mutex::new(HashMap::new()),
+            owners: Mutex::new(OwnerLedger::default()),
             pre_decode_cache: Mutex::new(PreDecodeCache::new(PRE_DECODE_CACHE_MAX_ENTRIES)),
             draining: AtomicBool::new(false),
             quarantined: AtomicUsize::new(0),
@@ -663,14 +679,17 @@ impl EncoderRuntime {
     }
 
     pub fn loads(&self) -> (usize, usize) {
-        self.owners.lock().map_or((0, 0), |owners| {
-            owners.values().fold((0, 0), |(running, waiting), owner| {
-                if owner.running.load(Ordering::Acquire) {
-                    (running + 1, waiting)
-                } else {
-                    (running, waiting + 1)
-                }
-            })
+        self.owners.lock().map_or((0, 0), |ledger| {
+            ledger
+                .owners
+                .values()
+                .fold((0, 0), |(running, waiting), owner| {
+                    if owner.running.load(Ordering::Acquire) {
+                        (running + 1, waiting)
+                    } else {
+                        (running, waiting + 1)
+                    }
+                })
         })
     }
 
@@ -718,6 +737,7 @@ impl EncoderRuntime {
         remaining: Duration,
     ) -> Result<(Arc<EncodeOwner>, EncoderModality), Status> {
         let modality = EncoderModality::from_proto(&request.modality)?;
+        let control_bytes = request.encoded_len();
         if remaining.is_zero()
             || remaining > Duration::from_secs(122)
             || request.req_id.is_empty()
@@ -734,7 +754,7 @@ impl EncoderRuntime {
                         .item_options
                         .iter()
                         .any(|opt| !is_valid_detail(&opt.detail))))
-            || request.encoded_len() > self.config.max_control_bytes
+            || control_bytes > self.config.max_control_bytes
             || request.prefill_host.is_empty()
             || request.prefill_host.len() > 256
         {
@@ -745,24 +765,46 @@ impl EncoderRuntime {
             cancel: watch::channel(false).0,
             result: watch::channel(None).0,
             running: AtomicBool::new(false),
+            queued_control_bytes: AtomicUsize::new(control_bytes),
         });
-        let mut owners = self
+        let mut ledger = self
             .owners
             .lock()
             .map_err(|_| Status::internal("encoder ledger poisoned"))?;
-        if owners.contains_key(&request.req_id) {
+        if ledger.owners.contains_key(&request.req_id) {
             return Err(Status::already_exists("duplicate native request"));
         }
-        if self.draining.load(Ordering::Acquire) || owners.len() >= self.config.max_active {
+        if self.draining.load(Ordering::Acquire) || ledger.owners.len() >= self.config.max_active {
             return Err(Status::resource_exhausted("encoder admission full"));
         }
-        owners.insert(request.req_id.clone(), owner.clone());
+        if ledger.queued_control_bytes.saturating_add(control_bytes) > self.max_queued_control_bytes
+        {
+            return Err(Status::resource_exhausted(
+                "encoder queued control memory full",
+            ));
+        }
+        ledger.queued_control_bytes = ledger.queued_control_bytes.saturating_add(control_bytes);
+        ledger.owners.insert(request.req_id.clone(), owner.clone());
         Ok((owner, modality))
     }
 
+    /// Release `owner`'s queued-control byte reservation once it enters execution or exits.
+    fn release_queued_control(&self, owner: &EncodeOwner) {
+        let bytes = owner.queued_control_bytes.swap(0, Ordering::AcqRel);
+        if bytes > 0 {
+            if let Ok(mut ledger) = self.owners.lock() {
+                ledger.queued_control_bytes = ledger.queued_control_bytes.saturating_sub(bytes);
+            }
+        }
+    }
+
+    /// Remove `rid` from the active owner ledger after execution completes or is released.
     fn release_owner(&self, rid: &str) {
-        if let Ok(mut owners) = self.owners.lock() {
-            owners.remove(rid);
+        if let Ok(mut ledger) = self.owners.lock() {
+            if let Some(owner) = ledger.owners.remove(rid) {
+                let bytes = owner.queued_control_bytes.swap(0, Ordering::AcqRel);
+                ledger.queued_control_bytes = ledger.queued_control_bytes.saturating_sub(bytes);
+            }
         }
     }
 
@@ -771,7 +813,7 @@ impl EncoderRuntime {
         if self
             .owners
             .lock()
-            .is_ok_and(|owners| !owners.contains_key(rid))
+            .is_ok_and(|ledger| !ledger.owners.contains_key(rid))
         {
             self.native.notify_forget(rid);
         }
@@ -829,6 +871,17 @@ impl EncoderRuntime {
         cancelled: &mut watch::Receiver<bool>,
         owner: &Arc<EncodeOwner>,
     ) -> (PendingReply, bool) {
+        let header_bytes = serde_json::to_vec(&command)
+            .map(|bytes| bytes.len().saturating_add(32))
+            .unwrap_or(usize::MAX);
+        if header_bytes > self.config.max_control_bytes {
+            return (
+                Err(NativeCallError::NotSent(Status::invalid_argument(
+                    "serialized native encoder command exceeds max_control_bytes",
+                ))),
+                false,
+            );
+        }
         let mut timed_out_sent = false;
         let receipt: PendingReply = match self.native.enqueue(command, binary_frame).await {
             Ok((_pending, rx)) => {
@@ -858,6 +911,12 @@ impl EncoderRuntime {
                             "native encoder release receipt timed out",
                         ))));
                         let late = (&mut exec).await;
+                        let late_safe = late.as_ref().is_ok_and(|r| {
+                            r.get("released").and_then(Value::as_bool) == Some(true)
+                        });
+                        if !late_safe {
+                            self.draining.store(true, Ordering::Release);
+                        }
                         self.quarantined.fetch_sub(1, Ordering::AcqRel);
                         late
                     }
@@ -902,6 +961,7 @@ impl EncoderRuntime {
             owner.result.send_replace(Some(Err(status)));
             return;
         }
+        self.release_queued_control(&owner);
         let items: Vec<EncoderMediaItem> = raw_items
             .into_iter()
             .enumerate()
@@ -1151,6 +1211,7 @@ impl EncoderRuntime {
         if let Err(NativeCallError::NotSent(error)) = receipt {
             self.release_owner(rid);
             drop(permit);
+            self.native.notify_forget(&rid);
             if !timed_out_sent {
                 owner.result.send_replace(Some(Err(error)));
             }
@@ -1193,8 +1254,8 @@ impl EncoderRuntime {
 
     pub fn drain(&self) {
         self.draining.store(true, Ordering::Release);
-        if let Ok(owners) = self.owners.lock() {
-            for owner in owners.values() {
+        if let Ok(ledger) = self.owners.lock() {
+            for owner in ledger.owners.values() {
                 owner.cancel.send_replace(true);
             }
         }
@@ -1519,6 +1580,7 @@ mod tests {
             execution_capacity: 1,
             max_images: 4,
             max_control_bytes: 1024,
+            max_queued_control_bytes: 0,
             control_listen: String::new(),
             native_commands: String::new(),
             native_events: String::new(),
@@ -1571,7 +1633,8 @@ mod tests {
     }
 
     impl EncoderHarness {
-        async fn start(
+        async fn start_with_config(
+            config: EncoderConfig,
             connect_pull: bool,
             cancel_grace: Duration,
             processor: Option<EncoderProcessor>,
@@ -1617,6 +1680,14 @@ mod tests {
                 pull,
                 push,
             }
+        }
+
+        async fn start(
+            connect_pull: bool,
+            cancel_grace: Duration,
+            processor: Option<EncoderProcessor>,
+        ) -> Self {
+            Self::start_with_config(test_config(), connect_pull, cancel_grace, processor).await
         }
 
         async fn send_reply(&mut self, value: Value) {
@@ -2485,5 +2556,74 @@ mod tests {
                 "{rid}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn encoder_enforces_shared_queued_control_byte_budget() {
+        let mut config = test_config();
+        config.max_active = 8;
+        config.execution_capacity = 1;
+        config.max_control_bytes = 2048;
+        let large_req = |id: &str| EncodeRequest {
+            req_id: id.into(),
+            mm_items: vec![format!("data:image/png;base64,{}", "A".repeat(400))],
+            num_parts: 1,
+            part_idx: 0,
+            prefill_host: "127.0.0.1".into(),
+            embedding_port: vec![],
+            item_options: vec![],
+            modality: "image".into(),
+        };
+        let req_len = large_req("r1").encoded_len();
+        // Allow exactly 1 large request queued while another holds the single execution slot.
+        config.max_queued_control_bytes = req_len + 16;
+
+        let mut h =
+            EncoderHarness::start_with_config(config, true, Duration::from_secs(1), None).await;
+        h.mark_ready().await;
+        // r1 acquires the execution permit and releases its queued-control reservation.
+        let r1 = {
+            let rt = h.runtime.clone();
+            tokio::spawn(async move { rt.encode(large_req("r1"), Duration::from_secs(5)).await })
+        };
+        let r1_cmd = recv_cmd(h.pull.as_mut().unwrap()).await;
+
+        // r2 queues behind r1, consuming almost all of max_queued_control_bytes.
+        let r2 = {
+            let rt = h.runtime.clone();
+            tokio::spawn(async move { rt.encode(large_req("r2"), Duration::from_secs(5)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // r3 exceeds the shared queued-control byte budget even though max_active=8.
+        let err = h
+            .runtime
+            .encode(large_req("r3"), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(err.message().contains("queued control"));
+
+        // Releasing r1 promotes r2 into execution (freeing r2's queued reservation), so r3 now admits.
+        h.send_reply(json!({"sequence": r1_cmd["sequence"], "result": {"released": true}}))
+            .await;
+        r1.await.unwrap().unwrap();
+        let mut r2_cmd = recv_cmd(h.pull.as_mut().unwrap()).await;
+        while r2_cmd["operation"] == "forget" {
+            r2_cmd = recv_cmd(h.pull.as_mut().unwrap()).await;
+        }
+        assert_eq!(r2_cmd["rid"], "r2");
+
+        let r3 = {
+            let rt = h.runtime.clone();
+            tokio::spawn(async move { rt.encode(large_req("r3"), Duration::from_secs(5)).await })
+        };
+        h.send_reply(json!({"sequence": r2_cmd["sequence"], "result": {"released": true}}))
+            .await;
+        r2.await.unwrap().unwrap();
+        let r3_cmd = recv_cmd(h.pull.as_mut().unwrap()).await;
+        h.send_reply(json!({"sequence": r3_cmd["sequence"], "result": {"released": true}}))
+            .await;
+        r3.await.unwrap().unwrap();
     }
 }

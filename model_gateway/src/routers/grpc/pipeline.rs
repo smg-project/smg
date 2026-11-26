@@ -564,10 +564,8 @@ impl RequestPipeline {
         }
 
         if self.prepared_input {
-            use super::utils::tonic_ext::TonicStatusExt;
-            let prepared = super::sglang_epd::prepare(ctx).map_err(|status| {
-                status.to_http_error("sglang_epd_capability", status.message().to_owned())
-            })?;
+            let prepared = super::sglang_epd::prepare(ctx)
+                .map_err(super::sglang_epd::PrepareError::into_response)?;
             // Text-only requests use the existing PD dispatch, admission and cleanup.
             // The prepared-input protocol is needed only for encoder output.
             if let Some(prepared) = prepared {
