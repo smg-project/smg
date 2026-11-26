@@ -212,12 +212,6 @@ impl SignalCells {
         self.signals as usize
     }
 
-    /// The cells, row after row.
-    #[cfg(all(test, feature = "in-process"))]
-    pub(crate) fn cells(&self) -> &[SignalCell] {
-        &self.cells
-    }
-
     /// The cells of the row at `position`, in the columns' order: `None`
     /// for a row outside the cells.
     pub(crate) fn row(&self, position: u32) -> Option<&[SignalCell]> {
