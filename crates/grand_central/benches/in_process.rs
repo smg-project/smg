@@ -32,7 +32,9 @@
 //! partners` takes its every decode out of service: each decision is then
 //! refused, and a turn refused that way counts. `--refused overload` puts
 //! its every decode over its thresholds under a binding that sheds such a
-//! list: each request is then shed as saturated. `--shadow twin` names a
+//! list: each request is then shed as saturated. `--refused outage` takes
+//! its every decode out of service under such a binding: each request is
+//! then shed with no endpoint. `--shadow twin` names a
 //! copy of the cell's profile as its binding's shadow, so each decision is
 //! followed by its shadow profile's. `--shadow other` names that shadow at
 //! a binding of another model: the cell's decisions then have no shadow,

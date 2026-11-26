@@ -441,11 +441,14 @@ fn under_a_table_a_shed_is_named_by_the_decodes_a_routable_prefill_lists() {
         "the routable prefill's partner names the shed"
     );
     // Both prefills routable: the stage that drops the last of their
-    // partners names it, and that one is saturation.
+    // partners is the overload veto. The decode neither lists is under
+    // its thresholds, so the decode list is not wholly over them: the
+    // request has no endpoint, and that decode, which pairs with
+    // nobody, names the shed.
     prefills[1].health.healthy = true;
     assert_eq!(
         shed_of(&decide_tabled(&engine, &prefills, &decodes, &lists)),
-        Some((ShedReason::Saturated, "not-overloaded"))
+        Some((ShedReason::NoEndpoints, PARTNERED))
     );
     // By number the routable prefill's partner is the decode of its own
     // class, whatever the number: an overloaded one is saturation under

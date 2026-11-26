@@ -527,6 +527,8 @@ impl EncodeLists<'_> {
                 decode_affinity: decode_column.as_slice(),
                 table: pair.classes.table(),
                 first: pair.classes.first(),
+                // A demand left each side the workers that meet it.
+                part: demanded,
             };
             let encode = EncodePool {
                 encoders: rows,

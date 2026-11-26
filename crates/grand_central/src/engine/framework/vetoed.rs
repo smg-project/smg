@@ -47,7 +47,7 @@
 use super::{
     classed, engines::run_owned, filter, keep_folded, leads, places, reason_of, run_single, shed,
     single_emptied, trace_of, Assignment, Binding, Buffers, Engine, Filter, PairSide, PairTable,
-    Picker, Plan, Profile, Scorer, Scratch, SessionRule, Set,
+    Picker, Plan, Profile, Scorer, Scratch, SessionRule, Set, PARTNERED,
 };
 use crate::{
     engine::{
@@ -575,47 +575,19 @@ fn with_no_doubt(row: &Candidate) -> Candidate {
     }
 }
 
-/// Whether the gateway's own pair selection would read `rows` as wholly
-/// over their thresholds: one of them is ready and over them, and none
-/// that is ready is under them (`all_overloaded`,
-/// `model_gateway/src/routers/common/overload.rs:58-74`, on main
-/// `56773d28d`). A pair's decision says the list it shed over by this
-/// count ([`Engine::decide_pair`]).
-///
-/// That selection counts a worker under a liveness doubt as ready. So a
-/// row is ready here as the pass that lifts the liveness veto reads it
-/// ([`doubted`]): by the health stage's own test of the row with no doubt
-/// on it ([`with_no_doubt`]), under that pass's constraints
-/// ([`lifted_cx`]), in which a hold of the host stays. A row is over its
-/// thresholds by the overload veto's own test, under the decision's
-/// constraints. Each test is its stage's, so the count and the stages
-/// cannot part.
-///
-/// A row under a doubt and under its thresholds keeps its list from being
-/// wholly over them, though the passes of the decision that shed kept no
-/// such row. Under a veto its host lifted no row is over its thresholds,
-/// and no list is wholly over them.
-///
-/// Cold and out of line: asked behind a pair's saturated shed alone.
-#[cold]
-#[inline(never)]
-pub(super) fn wholly_over<'a>(
-    rows: impl Iterator<Item = &'a Candidate>,
-    facts: &RequestFacts<'_>,
-    cx: &Constraints<'_>,
-) -> bool {
-    let lifted = lifted_cx(cx, false, true);
-    let mut over = false;
-    for row in rows {
-        if !Healthy.keep(facts, &with_no_doubt(row), &lifted) {
-            continue;
-        }
-        if NotOverloaded.keep(facts, row, cx) {
-            return false;
-        }
-        over = true;
-    }
-    over
+/// What the gateway's own pair selection would read of a list it judges
+/// for its overload shed ([`Half::count`]), with the row the count names.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Count<'a> {
+    /// One row is ready and over its thresholds, and none that is ready is
+    /// under them: the list is wholly over its thresholds. The row is the
+    /// first that is ready and over them.
+    WhollyOver(&'a Candidate),
+    /// A row is ready and under its thresholds: it has room. The row is the
+    /// first such row in the list's order, where the count ends.
+    Room(&'a Candidate),
+    /// No row is ready. The row is the list's first, where it holds one.
+    NobodyReady(Option<&'a Candidate>),
 }
 
 /// Whether `row`, a prefill, has a decode to pair with anywhere in
@@ -704,8 +676,9 @@ pub(super) struct Half<'a> {
     facts: &'a RequestFacts<'a>,
     rows: &'a [Candidate],
     cx: &'a Constraints<'a>,
-    /// Whether the admission limit is set aside where a row is judged: the
-    /// prefill side's, whose limit is asked behind the pick.
+    /// Whether the admission limit is set aside where a row is judged: a
+    /// pair's prefill side's, whose limit is asked behind the pick, and
+    /// either side's for the name of a shed ([`Half::refused_room`]).
     limit_aside: bool,
 }
 
@@ -735,9 +708,28 @@ impl<'a> Half<'a> {
     /// outside any pairing stands in its pool, and pairs with nobody
     /// ([`paired`]).
     fn stands(&self, row: &Candidate, cx: &Constraints<'_>) -> bool {
+        self.hard().all(|f| f.keep(self.facts, row, cx))
+    }
+
+    /// The side's hard filters, in the profile's order: the filters a row
+    /// of the side is judged by wherever the pair's default or a pair's
+    /// shed reads one. No soft filter, and not the admission limit on a
+    /// side whose limit is set aside.
+    fn hard(&self) -> impl Iterator<Item = &'a dyn Filter> {
+        let aside = self.limit_aside;
         let hard = self.profile.filters.iter().filter(|f| !f.soft());
-        let mut asked = hard.filter(|f| !(self.limit_aside && f.name() == HasCapacity.name()));
-        asked.all(|f| f.keep(self.facts, row, cx))
+        let asked = hard.filter(move |f| !(aside && f.name() == HasCapacity.name()));
+        asked.map(|f| &**f)
+    }
+
+    /// This side with its admission limit set aside: a pair's prefill
+    /// side wherever a row of it is judged, and either side for the name
+    /// of a shed ([`Self::refused_room`]).
+    const fn limit_aside(self) -> Self {
+        Self {
+            limit_aside: true,
+            ..self
+        }
     }
 
     /// The side's rows the request may take ([`places::rows`]).
@@ -763,11 +755,94 @@ impl<'a> Half<'a> {
     /// that stand so and have an open partner, and names a refusal by the
     /// partners of every prefill that stands so ([`Engine::decide_pair`]).
     pub(super) fn but_for_the_limit(&self, row: &Candidate) -> bool {
-        let aside = Self {
-            limit_aside: true,
-            ..*self
+        self.limit_aside().stands(row, self.cx)
+    }
+
+    /// How the gateway's own pair selection would read `rows`, rows of
+    /// this side, for its overload shed: wholly over their thresholds
+    /// where one of them is ready and over them, and none that is ready is
+    /// under them (`all_overloaded` in
+    /// `model_gateway/src/routers/common/overload.rs`). A pair's decision
+    /// sheds as saturated by this count,
+    /// and says the list it shed over by it ([`Engine::decide_pair`]).
+    ///
+    /// That selection counts a worker under a liveness doubt as ready. So a
+    /// row is ready here as the pass that lifts the liveness veto reads it
+    /// ([`doubted`]): by the health stage's own test of the row with no
+    /// doubt on it ([`with_no_doubt`]), under that pass's constraints
+    /// ([`lifted_cx`]), in which a hold of the host stays. A row is over
+    /// its thresholds by the overload veto's own test, under the side's
+    /// constraints. Each test is its stage's, so the count and the stages
+    /// cannot part.
+    ///
+    /// A row under a doubt and under its thresholds keeps its list from
+    /// being wholly over them, though the passes of the decision that shed
+    /// kept no such row: the count ends at the first row with room. Under
+    /// a veto its host lifted no row is over its thresholds, and no list
+    /// is wholly over them.
+    ///
+    /// Cold and out of line: asked behind a pair's shed alone.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn count(&self, rows: impl Iterator<Item = &'a Candidate>) -> Count<'a> {
+        let lifted = lifted_cx(self.cx, false, true);
+        let (mut first, mut over) = (None, None);
+        for row in rows {
+            first = first.or(Some(row));
+            if !Healthy.keep(self.facts, &with_no_doubt(row), &lifted) {
+                continue;
+            }
+            if NotOverloaded.keep(self.facts, row, self.cx) {
+                return Count::Room(row);
+            }
+            over = over.or(Some(row));
+        }
+        over.map_or(Count::NobodyReady(first), Count::WhollyOver)
+    }
+
+    /// The stage that names a pair's shed with no endpoint where the pass
+    /// that was left nobody ended at the overload veto. `read` is the
+    /// count of this side's list, the one the gateway's own selection
+    /// judges ([`Self::count`]), and the request is not shed over it. The
+    /// veto's name is the engine's word for saturation ([`reason_of`]), so
+    /// such a shed takes the name of the stage that refused a worker with
+    /// room. This is the one rule for that name: no site of the decision
+    /// spells one.
+    ///
+    /// A worker with room is ready and under its thresholds, by the count.
+    /// The stage that refused it is the first of the side's hard filters
+    /// that refuses it as it stands ([`Self::hard`]), the overload veto
+    /// and the admission limit set aside. The veto keeps a worker with
+    /// room. The limit's name says that a prefill waits for room, and a
+    /// host waits on it (`prefills_full`): no shed of this rule says so,
+    /// on either side. The health stage refuses a worker under a liveness
+    /// doubt. A worker no such filter refuses is named `partnered`: it
+    /// stands and pairs with nobody that stands, or its own admission
+    /// limit alone refuses it beside a partner over its thresholds.
+    /// Where two stages each refused a worker with room, the first such
+    /// worker in the list's order names the shed, the one the count ends
+    /// at.
+    ///
+    /// Where no worker of the list has room, the worker the count names is
+    /// asked the same way: the list's first where none is ready, and the
+    /// first that is ready where each ready one is over its thresholds, a
+    /// list no request is shed over under a binding that steers. A list
+    /// that holds no worker names `partnered`: no prefill at the request's
+    /// places pairs with a decode, or no decode is at them.
+    ///
+    /// Cold and out of line, as the count is.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn refused_room(&self, read: Count<'_>) -> &'static str {
+        let row = match read {
+            Count::WhollyOver(row) | Count::Room(row) => Some(row),
+            Count::NobodyReady(first) => first,
         };
-        aside.stands(row, aside.cx)
+        let pass = lifted_cx(self.cx, true, false);
+        let judged = self.limit_aside();
+        let refused = |row| judged.hard().find(|f| !f.keep(self.facts, row, &pass));
+        row.and_then(refused)
+            .map_or(PARTNERED, |stage| stage.name())
     }
 
     /// Whether one of the side's rows of `classes` stands but for the
@@ -906,10 +981,7 @@ pub(super) fn paired_prefill<const SHADOW: bool>(
     pool: &PoolFacts<'_>,
     scratch: &mut Scratch,
 ) -> Option<Decision> {
-    let prefill = Half {
-        limit_aside: true,
-        ..prefill
-    };
+    let prefill = prefill.limit_aside();
     let lift = lifted_cx(prefill.cx, steers && weighs, false);
     let open = |row: &&Candidate| classed(&scratch.classes, row.pair_class);
     let mut partnered = prefill.places().filter(open);
