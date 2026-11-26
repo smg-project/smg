@@ -188,6 +188,8 @@ jobs:
         run: |
           if [ "${{ inputs.gpu_vendor }}" = amd ]; then
             python3 -c 'import uuid; print("E2E_JOB_MARKER=e2e-" + uuid.uuid4().hex)' >> "$GITHUB_ENV"
+            # Retitled gateways/workers must retain the marker in /proc.
+            echo "SPT_NOENV=1" >> "$GITHUB_ENV"
           else
             echo "E2E_JOB_MARKER=e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
           fi
