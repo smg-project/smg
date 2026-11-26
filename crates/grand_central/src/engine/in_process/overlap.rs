@@ -23,13 +23,13 @@
 //! A request whose host names its entry in a token tree ([`TokenKey`]) is
 //! decided another way where the host lends the tree of the request's place
 //! ([`CacheIndexes::token_tree`]) and the model has no index of cache
-//! events: inside the tree's match ([`TokenTree`]). The match names the
-//! workers sent the deepest prefix of the request, and the same descent
-//! writes the request for the worker picked. The pick states its first
-//! target's entry of the rows the match named, as every other pick states
-//! its rows'. The tree is the host's own, the one its policy reads and
-//! writes: the engine keeps none. A request its host holds as text is
-//! decided the same way inside the host's string tree
+//! events that holds a block: inside the tree's match ([`TokenTree`]). The
+//! match names the workers sent the deepest prefix of the request, and the
+//! same descent writes the request for the worker picked. The pick states
+//! its first target's entry of the rows the match named, as every other
+//! pick states its rows'. The tree is the host's own, the one its policy
+//! reads and writes: the engine keeps none. A request its host holds as
+//! text is decided the same way inside the host's string tree
 //! ([`CacheIndexes::string_tree`], [`TextKey`]), whether or not the model
 //! has an index: an index speaks of token blocks.
 //!
@@ -40,9 +40,10 @@
 //!   admitted, and the list's warming rows by the profile's own ruling
 //!   ([`WarmUpRule`]). It is a ruling read from the index and the worker
 //!   objects, never a copy of a worker's health or load. One decision reads
-//!   it again once its second is up, or once the index handed one of its
-//!   numbers on to another worker, behind one atomic flag, and swaps it in
-//!   by pointer. A decision loads the pointer and writes no shared word.
+//!   it again once its second is up, once the index handed one of its
+//!   numbers on to another worker, or once the index's word of holding a
+//!   block moved, behind one atomic flag, and swaps it in by pointer. A
+//!   decision loads the pointer and writes no shared word.
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
 //!   workers the index does not speak for, and to every worker by a request
 //!   hashed by its text or decided by a profile that reads sent prefixes
@@ -109,8 +110,9 @@ use crate::{
 const NONE: u32 = u32::MAX;
 
 /// How long a list's table stands before one decision reads it again, in
-/// microseconds. One whose numbers the index handed on is read again
-/// before that ([`Table::numbered`]).
+/// microseconds. One whose numbers the index handed on, or whose index's
+/// word of holding a block moved, is read again before that
+/// ([`Table::stands_by_index`]).
 const TABLE_STANDS_MICROS: u64 = 1_000_000;
 
 /// The index numbers a table maps. An index hands its numbers out from zero
@@ -149,6 +151,17 @@ pub trait CacheIndex: Send + Sync {
         0
     }
 
+    /// Whether the index holds a block for any worker. A list's table reads
+    /// it ahead of the numbers, reads an index that holds none as no index,
+    /// and is read again once the word moved: a decision asks it where it
+    /// takes the list's table, so the answer must cost as little as a
+    /// count's read. The default is an index that holds one, which is the
+    /// word of a host that hands no index while its index is empty
+    /// ([`CacheIndexes::index`]).
+    fn holds_a_block(&self) -> bool {
+        true
+    }
+
     /// How many blocks the index holds for the worker of `number`.
     fn worker_blocks(&self, number: u32) -> usize;
 
@@ -180,6 +193,11 @@ impl CacheIndex for ChainIndex {
 
     fn numbers_reused(&self) -> u64 {
         self.ids_reused()
+    }
+
+    /// The root's own test, in constant time.
+    fn holds_a_block(&self) -> bool {
+        !self.is_empty()
     }
 
     fn worker_blocks(&self, number: u32) -> usize {
@@ -353,12 +371,20 @@ fn keep_deepest(kept: &mut Vec<(u32, u32)>, cap: usize, below: &mut dyn FnMut(u3
 /// of the prompts it sent.
 pub trait CacheIndexes: Send + Sync {
     /// The index of `model`, the model id its workers registered under.
-    /// `None` where no worker of the model streams cache events, and while
-    /// the index holds no block: a request is then decided by the host's
-    /// token tree, where it lends one ([`Self::token_tree`]). An index
-    /// handed decides a single request of token ids alone where a prefix
-    /// stage of its profile reads cache events: no record of sent
-    /// prefixes is read or written for it.
+    /// `None` where no worker of the model streams cache events. An index
+    /// that holds no block is read as none: a request is then decided by
+    /// the host's token tree, where it lends one ([`Self::token_tree`]).
+    /// A host says so in one of two ways. It hands the index whenever the
+    /// model has one, and the index answers whether it holds a block
+    /// ([`CacheIndex::holds_a_block`]): a list's table is read again by
+    /// the first decision that finds the word moved, so a model's first
+    /// block and its last block's leaving decide from that table on. Or
+    /// it hands none while the index holds no block and keeps the word's
+    /// default: the engine then learns of either with the list's next
+    /// table, up to a second later. An index that holds a block decides a
+    /// single request of token ids alone where a prefix stage of its
+    /// profile reads cache events: no record of sent prefixes is read or
+    /// written for it.
     fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>>;
 
     /// The size of one cache block of `model` in tokens, as its workers'
@@ -864,8 +890,9 @@ impl Drop for Reading<'_> {
 /// One list of workers as the affinity stages' rows are named from it, for
 /// the decisions of one model and phase: read in one pass over the list and
 /// standing for a second, or until the index hands one of its numbers on
-/// ([`Self::numbered`]). It holds what the index and the worker objects
-/// said at its read, as a ruling: who the index speaks for, and who warms.
+/// or its word of holding a block moves ([`Self::stands_by_index`]). It
+/// holds what the index and the worker objects said at its read, as a
+/// ruling: who the index speaks for, and who warms.
 struct Table {
     /// The place the table answers for.
     model: Box<str>,
@@ -894,8 +921,19 @@ struct Table {
     /// worker where this costs one copy of the list. Empty where the stages
     /// read no affinity.
     column: Box<[AffinityFacts]>,
-    /// The model's index of cache events, where it has one.
+    /// The model's index of cache events, where its host handed one. It is
+    /// kept while it holds no block too: its word is asked again where a
+    /// decision takes the table ([`Self::stands_by_index`]).
     index: Option<Arc<dyn CacheIndex>>,
+    /// The index's word of holding a block ([`CacheIndex::holds_a_block`])
+    /// as the table was built under it, read ahead of the count and the
+    /// numbers below. An index that holds none is read as no index: no
+    /// number, no worker heard, and the host's token tree where it lends
+    /// one.
+    holds: bool,
+    /// Whether the index decides a single request of token ids by itself
+    /// ([`Self::index_alone`]): said once, at the table's read.
+    decides: bool,
     /// The index's count of numbers handed out a second time
     /// ([`CacheIndex::numbers_reused`]), read ahead of the numbers below:
     /// they are the index's while it reads the same ([`Self::numbered`]).
@@ -913,11 +951,16 @@ struct Table {
     /// token blocks. The row holds a number in the index and a block or more
     /// there. The record of sent prefixes speaks for every other row, and
     /// for every row on a request hashed by its text or read by a profile
-    /// that reads sent prefixes alone ([`Self::recorded`]).
+    /// that reads sent prefixes alone ([`Self::recorded`]). That is the
+    /// answer for a pair's side, and for a single request where the table
+    /// holds no index that holds a block: where the index decides a single
+    /// request alone, the record speaks for no row ([`Self::index_alone`]).
     heard: Box<[u64]>,
     /// Whether the index speaks for any row, and whether the record does on
     /// a request hashed by token blocks that a profile reading cache events
-    /// decides.
+    /// decides. The second is asked for a pair's side, and for a single
+    /// request where the table holds no index that holds a block
+    /// ([`Self::index_alone`]).
     heard_any: bool,
     unheard_any: bool,
     /// The model's record of sent prefixes, where the profile reads one.
@@ -943,10 +986,10 @@ struct Table {
     /// [`Engine::side_reads_sent_alone`]: crate::engine::Engine::side_reads_sent_alone
     side_alone: bool,
     /// The host's token tree for the place, where it lends one, the
-    /// profile reads a record and the model has no index of cache events: a
-    /// request whose host names its entry is decided inside the tree's
-    /// match. The handle is the host's own tree, kept while the table
-    /// stands.
+    /// profile reads a record and the model has no index of cache events
+    /// that holds a block ([`Self::holds`]): a request whose host names its
+    /// entry is decided inside the tree's match. The handle is the host's
+    /// own tree, kept while the table stands.
     sent: Option<Arc<TokenTree>>,
     /// The host's string tree for the place, where it lends one and the
     /// profile reads a record: a request hashed by its text whose host
@@ -1028,6 +1071,8 @@ impl Table {
             states: engine.profile_reads_affinity(model, phase),
             column: Box::default(),
             index: None,
+            holds: false,
+            decides: false,
             reused: 0,
             row_of: Box::default(),
             within: Box::default(),
@@ -1059,9 +1104,17 @@ impl Table {
             .indexes
             .get()
             .and_then(|indexes| indexes.index(registered));
+        // The word first, ahead of the count and the numbers: a first block
+        // or a last one's leaving under this pass leaves the table a word
+        // the index has moved past, and the next decision reads it again.
+        table.holds = index.as_ref().is_some_and(|index| index.holds_a_block());
+        table.decides = table.holds && phase == Phase::Single;
         // Ahead of the numbers: one that changes hands under this pass
         // leaves the table a count the index has moved past.
         table.reused = index.as_ref().map_or(0, |index| index.numbers_reused());
+        // An index that holds no block is read as none: no worker is asked
+        // for its number, as under a host that hands no such index.
+        let heard_by = index.as_ref().filter(|_| table.holds);
         let rows = workers.len();
         let mut numbers = vec![NONE; rows];
         let mut sizes = vec![0u32; rows];
@@ -1073,7 +1126,7 @@ impl Table {
             let age = micros(worker.admitted_age());
             admitted[row] = now.saturating_sub(age);
             column[row].admitted_age_ms = millis(age);
-            let Some(index) = &index else {
+            let Some(index) = heard_by else {
                 continue;
             };
             let number = index.worker_number(worker.url());
@@ -1138,7 +1191,7 @@ impl Table {
             table.side_alone = engine.side_reads_sent_alone(model, phase);
             if cap != 0 {
                 let lent = affinity.indexes.get();
-                if table.index.is_none() {
+                if !table.holds {
                     table.sent = lent.and_then(|indexes| indexes.token_tree(registered, phase));
                 }
                 // A request of text reads no index: its tree is asked for
@@ -1172,6 +1225,23 @@ impl Table {
     fn numbered(&self) -> bool {
         let index = self.index.as_ref();
         index.is_none_or(|index| index.numbers_reused() == self.reused)
+    }
+
+    /// Whether the table still stands by its index, asked where a decision
+    /// takes the table: the index's word of holding a block is the one the
+    /// table was built under ([`CacheIndex::holds_a_block`]), and under an
+    /// index that held one its numbers are still the index's
+    /// ([`Self::numbered`]). A table built under an index that held none
+    /// read no number, and is asked the word alone. So a model's first
+    /// block, and its last block's leaving, read the table again at the
+    /// first decision that finds the word moved. A table that was handed no
+    /// index answers at one test.
+    fn stands_by_index(&self) -> bool {
+        let Some(index) = self.index.as_ref() else {
+            return true;
+        };
+        index.holds_a_block() == self.holds
+            && (!self.holds || index.numbers_reused() == self.reused)
     }
 
     /// Whom the record of sent prefixes speaks for on a request hashed by
@@ -1211,13 +1281,17 @@ impl Table {
     /// a worker the index holds nothing for is named nothing. Each side of
     /// a pair is decided at its own phase and keeps both.
     ///
-    /// An index the table was handed holds a block: its host hands none
-    /// while the index holds none ([`CacheIndexes::index`]). The table
-    /// stands for a second, so the word is as old as the table.
+    /// The answer is the table's own, said once at its read from the
+    /// index's word of holding a block ([`CacheIndex::holds_a_block`]): the
+    /// rule asks this at every question and reads one field. The word is
+    /// as old as the table. A decision that finds it moved reads the table
+    /// again ([`Self::stands_by_index`]), and while it does, the others
+    /// decide by the table that stands: the old word decides for the
+    /// length of one read. Under a host that hands no index while its
+    /// index is empty the word keeps its default, and a model's first
+    /// block is seen with the list's next table, up to a second later.
     fn index_alone(&self) -> bool {
-        // The index first: the rule asks this at every question, and a
-        // table that was handed none answers at one test.
-        self.index.is_some() && self.phase == Phase::Single
+        self.decides
     }
 
     /// The row of the worker `id` where the record of sent prefixes speaks
@@ -2385,12 +2459,13 @@ impl PoolAffinity {
         let table = standing.as_deref();
         if let Some(table) = table.filter(|table| table.is_of(asked.model, asked.phase)) {
             // It stands for its second, while the index hands none of its
-            // numbers on.
-            let stands =
-                asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS && table.numbered();
+            // numbers on and keeps its word of holding a block.
+            let stands = asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS
+                && table.stands_by_index();
             // One decision reads a table again; the others decide by the
             // one that stands, whose lookup names nobody once a number of
-            // it was handed on.
+            // it was handed on, and whose word of the index is the old one
+            // for the length of that read.
             if stands || self.reading.swap(true, Ordering::AcqRel) {
                 return with(table);
             }

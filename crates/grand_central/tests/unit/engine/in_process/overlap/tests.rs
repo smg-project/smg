@@ -113,6 +113,10 @@ fn pool(count: usize) -> (Vec<Arc<dyn Worker>>, Vec<WorkerId>) {
 #[derive(Default)]
 struct Host {
     index: Option<Arc<ChainIndex>>,
+    /// The host hands its index while the index holds no block too, and the
+    /// index says so itself ([`CacheIndex::holds_a_block`]): the first of
+    /// the two ways the trait gives a host.
+    whenever: bool,
     asked: AtomicUsize,
     tree: Option<Arc<TokenTree>>,
     text: Option<Arc<StringTree>>,
@@ -121,8 +125,10 @@ struct Host {
 impl CacheIndexes for Host {
     fn index(&self, model: &str) -> Option<Arc<dyn CacheIndex>> {
         self.asked.fetch_add(1, Ordering::Relaxed);
-        // None while the index holds no block, as the trait asks of a host.
-        let held = |index: &&Arc<ChainIndex>| model == MODEL && !index.is_empty();
+        // None while the index holds no block, the second way the trait
+        // gives a host, unless the host hands it whenever it has one.
+        let held =
+            |index: &&Arc<ChainIndex>| model == MODEL && (self.whenever || !index.is_empty());
         let index = self.index.as_ref().filter(held)?;
         Some(Arc::clone(index) as Arc<dyn CacheIndex>)
     }
@@ -2860,6 +2866,302 @@ fn a_number_handed_on_under_a_lookup_names_nobody() {
     );
 }
 
+/// An engine's affinity over a host that keeps a chain index and a token
+/// tree of the prompts it sent, and lends both: the index whenever it is
+/// asked, while it holds no block too, as a gateway lends its own
+/// (`KvEventMonitor::index`,
+/// `model_gateway/src/policies/kv_index/event_monitor.rs`).
+fn lending_whenever() -> (Affinity, Arc<ChainIndex>, Arc<TokenTree>) {
+    let index = Arc::new(ChainIndex::new());
+    let tree = Arc::new(TokenTree::with_config(BLOCK as usize, Default::default()));
+    let host = Arc::new(Host {
+        index: Some(Arc::clone(&index)),
+        whenever: true,
+        tree: Some(Arc::clone(&tree)),
+        ..Host::default()
+    });
+    let affinity = Affinity::default();
+    affinity.set_indexes(host as Arc<dyn CacheIndexes>);
+    (affinity, index, tree)
+}
+
+/// A model's first block decides the next request by the index. The host
+/// lends its index while it holds no block, and the list's table reads it
+/// as none: a request is decided inside the lent token tree. Once a
+/// worker's events store a block, the next decision finds the index's word
+/// moved and reads the table again inside its second. The index then names
+/// the request's holder alone, and no tree's match is made. The classic
+/// policy asks its index before every request
+/// (`model_gateway/src/policies/cache_aware.rs:1802-1808`) and decides by
+/// the index alone once it holds a block (`:1516-1524`).
+#[test]
+fn a_models_first_block_decides_the_next_request_by_the_index() {
+    let (affinity, index, _tree) = lending_whenever();
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = tokens(1_000, 4);
+    // Under the index that holds no block the tree decides, and stores the
+    // pick's prompt for its worker.
+    assert!(bed.keyed(&asked, 0, Some(1)).is_empty());
+    let in_tree = bed.keyed_whole(&asked, 0, None);
+    assert_eq!(in_tree.holders, [(1, 0, 4)]);
+    assert!(in_tree.tree.is_some(), "a tree's match");
+    // Worker 2's events store the prompt. The next decision, at the same
+    // instant, is the index's: its one holder by its blocks.
+    store(&index, 2, &hashes_of(&hashed(&asked)));
+    let by_index = bed.keyed_whole(&asked, 0, None);
+    assert_eq!(by_index.holders, [(2, 4, 0)]);
+    assert_eq!(by_index.tree, None, "no tree's match under the index");
+}
+
+/// The last block's leaving returns the next request to the tree. While
+/// the index holds a block it decides alone, and a pick is written to no
+/// tree. Once its last block left, the next decision finds the word moved,
+/// reads the table again inside its second, and is decided inside the lent
+/// token tree: it is named the worker the tree was written for, and not the
+/// worker picked under the index. The classic policy reads an index that
+/// holds no block as no index
+/// (`model_gateway/src/policies/cache_aware.rs:1806-1808`) and decides in
+/// its token tree (`:1525-1533`).
+#[test]
+fn the_last_blocks_leaving_returns_the_next_request_to_the_tree() {
+    let (affinity, index, _tree) = lending_whenever();
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = tokens(1_000, 4);
+    // The tree is written for worker 1 while the index holds no block.
+    assert!(bed.keyed(&asked, 0, Some(1)).is_empty());
+    // Worker 2 holds the prompt by its events: the index decides, and the
+    // pick of worker 3 is written to no tree.
+    let (number, mut map) = stored(&index, 2, &hashes_of(&hashed(&asked)));
+    assert_eq!(bed.keyed(&asked, 0, Some(3)), [(2, 4, 0)]);
+    // Its blocks leave, and the index holds none. The next decision, at the
+    // same instant, is the tree's.
+    index.apply_cleared(number, &mut map);
+    let in_tree = bed.keyed_whole(&asked, 0, None);
+    assert_eq!(in_tree.holders, [(1, 0, 4)]);
+    assert!(in_tree.tree.is_some(), "a tree's match");
+}
+
+/// A table handed an index that holds no block reads as a table handed
+/// none. No worker is asked for its number and the index's lookup is not
+/// made. Under a host that lends no tree, the record of sent prefixes
+/// speaks for every worker of the list: a pick is written there, and the
+/// next request is named its worker.
+#[test]
+fn an_index_that_holds_no_block_is_read_as_no_index() {
+    /// An index that holds no block, and counts what it is asked.
+    #[derive(Default)]
+    struct Empty {
+        numbers: AtomicUsize,
+        lookups: AtomicUsize,
+    }
+
+    impl CacheIndex for Empty {
+        fn worker_number(&self, _: &str) -> Option<u32> {
+            self.numbers.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+
+        fn holds_a_block(&self) -> bool {
+            false
+        }
+
+        fn worker_blocks(&self, _: u32) -> usize {
+            0
+        }
+
+        fn deepest_into(
+            &self,
+            _: &[u64],
+            _: u32,
+            _: &[u64],
+            _: usize,
+            _: &mut dyn FnMut(u32) -> u32,
+            kept: &mut Vec<(u32, u32)>,
+        ) {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
+            kept.clear();
+        }
+    }
+
+    /// Hands the index whenever it is asked, and lends no tree.
+    struct Lends(Arc<Empty>);
+
+    impl CacheIndexes for Lends {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            Some(Arc::clone(&self.0) as Arc<dyn CacheIndex>)
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            Some(BLOCK)
+        }
+    }
+
+    let empty = Arc::new(Empty::default());
+    let bed = Bed::new(Affinity::default(), preset("cache_aware"), 2);
+    bed.affinity
+        .set_indexes(Arc::new(Lends(Arc::clone(&empty))) as Arc<dyn CacheIndexes>);
+    let asked = prompt(1_000, 4);
+    let picked = bed.decide(&request(&asked, 7, NOW), Some(0));
+    assert!(picked.expect("rows named").holders.is_empty());
+    assert_eq!(bed.holders(&asked, NOW), [(0, 0, 4)], "by the record");
+    assert_eq!(empty.numbers.load(Ordering::Relaxed), 0, "no number asked");
+    assert_eq!(empty.lookups.load(Ordering::Relaxed), 0, "no lookup made");
+}
+
+/// A host that hands no index while its index holds no block, and whose
+/// index keeps the word's default, is decided as before: the engine learns
+/// of a model's first block, and of its last block's leaving, with the
+/// list's next table, up to a second later.
+#[test]
+fn a_host_that_hands_no_empty_index_learns_of_a_block_with_the_next_table() {
+    /// A chain index that keeps the default word of holding a block.
+    struct Quiet(Arc<ChainIndex>);
+
+    impl CacheIndex for Quiet {
+        fn worker_number(&self, address: &str) -> Option<u32> {
+            self.0.worker_id(address)
+        }
+
+        fn numbers_reused(&self) -> u64 {
+            self.0.ids_reused()
+        }
+
+        fn worker_blocks(&self, number: u32) -> usize {
+            self.0.worker_block_count(number)
+        }
+
+        fn deepest_into(
+            &self,
+            block_hashes: &[u64],
+            block_size: u32,
+            within: &[u64],
+            cap: usize,
+            below: &mut dyn FnMut(u32) -> u32,
+            kept: &mut Vec<(u32, u32)>,
+        ) {
+            CacheIndex::deepest_into(&*self.0, block_hashes, block_size, within, cap, below, kept);
+        }
+    }
+
+    /// Hands the index while it holds a block, and its token tree.
+    struct Lends {
+        index: Arc<ChainIndex>,
+        tree: Arc<TokenTree>,
+    }
+
+    impl CacheIndexes for Lends {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            let held = !self.index.is_empty();
+            held.then(|| Arc::new(Quiet(Arc::clone(&self.index))) as Arc<dyn CacheIndex>)
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            Some(BLOCK)
+        }
+
+        fn token_tree(&self, _: &str, _: Phase) -> Option<Arc<TokenTree>> {
+            Some(Arc::clone(&self.tree))
+        }
+    }
+
+    let index = Arc::new(ChainIndex::new());
+    let tree = Arc::new(TokenTree::with_config(BLOCK as usize, Default::default()));
+    let bed = Bed::new(Affinity::default(), preset("cache_aware"), 4);
+    let lends = Lends {
+        index: Arc::clone(&index),
+        tree,
+    };
+    bed.affinity
+        .set_indexes(Arc::new(lends) as Arc<dyn CacheIndexes>);
+    let asked = tokens(1_000, 4);
+    let hashes = hashed(&asked);
+    // What the request is named at `now`, decided by a shed.
+    let named_at = |now: u64| {
+        let key = TokenKey {
+            tokens: Cow::Borrowed(&asked[..]),
+            marker: 0,
+        };
+        let named = bed.decide_keyed(&request(&hashes, 7, now), Some(key), None);
+        named.expect("rows named").holders
+    };
+    // No index is handed: the tree decides, and is written for worker 1.
+    assert!(bed.keyed(&asked, 0, Some(1)).is_empty());
+    assert_eq!(named_at(NOW), [(1, 0, 4)]);
+    // The model's first block. The table that stands was handed no index
+    // and asks nobody: the tree decides until its second is up.
+    let (number, mut map) = stored(&index, 2, &hashes_of(&hashes));
+    assert_eq!(named_at(NOW + SECOND - 1), [(1, 0, 4)]);
+    assert_eq!(named_at(NOW + SECOND), [(2, 4, 0)]);
+    // The last block leaves. The index's word is the default, so the table
+    // stands for its second and its lookup names nobody.
+    index.apply_cleared(number, &mut map);
+    assert_eq!(named_at(NOW + 2 * SECOND - 1), []);
+    assert_eq!(named_at(NOW + 2 * SECOND), [(1, 0, 4)]);
+}
+
+/// A decision that meets a table another decision is reading decides by
+/// the table that stands. The model's first block moves the index's word,
+/// and one decision reads the list's table again. A decision made inside
+/// that read is decided by the old table, inside the tree: the old word
+/// decides for the length of one read, and no decision waits.
+#[test]
+fn a_decision_that_meets_a_table_being_read_decides_by_the_one_that_stands() {
+    /// A host that lends its index whenever it is asked, and its token
+    /// tree, and runs `met` once inside its next lending of the index:
+    /// where the decision that reads the table again asks it.
+    struct Meets {
+        index: Arc<ChainIndex>,
+        tree: Arc<TokenTree>,
+        met: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl CacheIndexes for Meets {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            let met = self.met.lock().take();
+            if let Some(met) = met {
+                met();
+            }
+            Some(Arc::clone(&self.index) as Arc<dyn CacheIndex>)
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            Some(BLOCK)
+        }
+
+        fn token_tree(&self, _: &str, _: Phase) -> Option<Arc<TokenTree>> {
+            Some(Arc::clone(&self.tree))
+        }
+    }
+
+    let index = Arc::new(ChainIndex::new());
+    let host = Arc::new(Meets {
+        index: Arc::clone(&index),
+        tree: Arc::new(TokenTree::with_config(BLOCK as usize, Default::default())),
+        met: Mutex::new(None),
+    });
+    let bed = Arc::new(Bed::new(Affinity::default(), preset("cache_aware"), 4));
+    bed.affinity
+        .set_indexes(Arc::clone(&host) as Arc<dyn CacheIndexes>);
+    let asked = tokens(1_000, 4);
+    // Under the index that holds no block the tree is written for worker 1.
+    assert!(bed.keyed(&asked, 0, Some(1)).is_empty());
+    // The model's first block: worker 2 holds the prompt by its events.
+    store(&index, 2, &hashes_of(&hashed(&asked)));
+    // The next decision reads the table again. Inside its read, where it
+    // asks the host for the index, a second decision meets the list.
+    let inside = Arc::new(Mutex::new(None));
+    let (list, seen, key) = (Arc::clone(&bed), Arc::clone(&inside), asked.clone());
+    *host.met.lock() = Some(Box::new(move || {
+        *seen.lock() = Some(list.keyed_whole(&key, 0, None));
+    }));
+    let reading = bed.keyed_whole(&asked, 0, None);
+    assert_eq!(reading.holders, [(2, 4, 0)], "by the table it read");
+    assert_eq!(reading.tree, None);
+    let met = inside.lock().take().expect("a decision inside the read");
+    assert_eq!(met.holders, [(1, 0, 4)], "by the table that stood");
+    assert!(met.tree.is_some(), "inside the tree");
+}
+
 /// A profile whose stages read no affinity is named no row: its decision
 /// is handed the request as it stands, and the host is asked nothing. Under
 /// a document none of whose bindings reads affinity, its list keeps no
@@ -4755,8 +5057,9 @@ fn a_pool_whose_workers_are_all_heard_reads_the_record_for_a_request_of_text() {
 /// A single request of token ids under an index that holds a block reads
 /// no record and writes none, whoever of the list the index speaks for: a
 /// naming folds no key and a pick leaves no entry. Once the index holds no
-/// block its host hands none, and from the table's next read the record is
-/// read and written again.
+/// block it says so, the next decision reads the table again, and the
+/// record is read and written from that decision on: the table's second
+/// is not waited for.
 #[test]
 fn a_list_under_an_index_that_holds_a_block_reads_no_record() {
     let (affinity, _, index) = hosted(true);
@@ -4807,12 +5110,12 @@ fn a_list_under_an_index_that_holds_a_block_reads_no_record() {
     let (number, map) = &mut stored[0];
     index.apply_cleared(*number, map);
     check(NOW + SECOND, false);
-    // The last block leaves. The table that stands was read beside the
-    // index, the next one is handed none.
+    // The last block leaves. The table that stands holds the index, which
+    // says it holds none: the next decision reads the table again inside
+    // its second, and that one is handed no index.
     let (number, map) = &mut stored[1];
     index.apply_cleared(*number, map);
-    check(NOW + 2 * SECOND - 1, false);
-    check(NOW + 2 * SECOND, true);
+    check(NOW + SECOND + 1, true);
 }
 
 /// A worker the index numbers and holds no block for is the record's to
