@@ -2511,7 +2511,8 @@ request ──> route (HTTP or gRPC, any family)
   prefixes sent to each worker. The policy registry keeps them, classic's size pass runs over
   them on its timer, and a worker that left is taken out of them. The trees take the document's
   numbers: its block size is a token tree's page, and a model's `index` entry states the size
-  its trees are held to and how often.
+  its trees are held to and how often. The longest cadence, a `sweep_s` of 4294967295, starts no
+  pass: the trees under it are held to no size.
 
   The start makes the Grand Central crate's one start call as the last step of the context's build. The document is checked first against the table of stages the gateway's host hands the start, or the stock table where it hands none, and a refused document ends the start before the gateway listens. The engine's task follows the registry's events and tells the document's stages a worker that joined and a worker that was removed. With the engine on, the gateway builds its policy registry with no classic policy object: a stand-in that places nothing stands in its default and encode slots, and a worker's registration and a router's build add no policy.
 
