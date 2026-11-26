@@ -404,6 +404,41 @@ fn every_pool_reads_one_membership_epoch_that_a_new_pool_moves() {
     assert_eq!(facts.membership_epoch, 2);
 }
 
+/// A pool's number is the membership epoch its making moved to: the first
+/// pool made on a clock is number one, and no two pools of one clock take
+/// one number. A stage that keeps what it learned of a pool keeps it by
+/// that number and the epoch. The number is read on pools that list an
+/// engine of two ranks: a pool that lists no engine hands a stage an empty
+/// list, which states no pool.
+#[test]
+fn a_pool_is_numbered_by_the_epoch_its_making_moves_to() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let mut rows = Vec::new();
+    let live = Live::at(spec.engine(), &clock, Instant::now(), None, None);
+    // The two ranks of one engine.
+    let rank = |rank: usize| -> Arc<dyn Worker> {
+        Arc::new(
+            <BasicWorkerBuilder>::new("grpc://engine:9000".to_owned())
+                .dp_config(rank, 2)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let ranked = vec![rank(0), rank(1)];
+
+    let first = PoolRecords::new(&ranked, &spec, &clock);
+    let (_, facts) = first.write(&ranked, &live, &mut rows);
+    assert_eq!((facts.engines.pool(), facts.membership_epoch), (1, 1));
+
+    let second = PoolRecords::new(&ranked, &spec, &clock);
+    let (_, facts) = second.write(&ranked, &live, &mut rows);
+    assert_eq!((facts.engines.pool(), facts.membership_epoch), (2, 2));
+    // The first pool keeps its number under the epoch the second moved.
+    let (_, facts) = first.write(&ranked, &live, &mut rows);
+    assert_eq!((facts.engines.pool(), facts.membership_epoch), (1, 2));
+}
+
 /// A list builds its column of demand facts where a worker of it states
 /// one, and whether a worker registered a data-parallel rank is no such
 /// fact. A list of rank workers that states nothing builds no column, as a
