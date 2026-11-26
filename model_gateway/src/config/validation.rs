@@ -2057,7 +2057,7 @@ mod tests {
 
     use super::*;
 
-    /// The prepared encoder speaks gRPC; a local ZMQ URL cannot name that endpoint.
+    /// The prepared encoder speaks gRPC; ZMQ (`ipc://`/`tcp://`) and `https://` URLs are refused.
     #[test]
     fn prepared_encoder_requires_a_grpc_capable_url() {
         for url in [
@@ -2065,6 +2065,7 @@ mod tests {
             "http://encoder:8000",
             "https://encoder:8000",
             "ipc:///tmp/encoder",
+            "tcp://encoder:5555",
         ] {
             let config = RouterConfig {
                 mode: RoutingMode::EncodePrefillDecode {
@@ -2082,7 +2083,9 @@ mod tests {
             let result = ConfigValidator::validate(&config);
             assert_eq!(
                 result.is_ok(),
-                !url.starts_with("ipc://") && !url.starts_with("https://"),
+                !url.starts_with("ipc://")
+                    && !url.starts_with("tcp://")
+                    && !url.starts_with("https://"),
                 "{url}: {result:?}"
             );
         }
@@ -5708,33 +5711,5 @@ mod tests {
             matches!(built, Err(ConfigError::InvalidValue { ref field, .. }) if field == "cors_allowed_origins"),
             "{built:?}"
         );
-    }
-
-    #[test]
-    fn sglang_epd_rejects_tcp_and_ipc_encoder_urls() {
-        use smg_worker::identity::basic::RuntimeType;
-
-        for bad_encode in ["tcp://127.0.0.1:5555", "ipc:///tmp/encoder.sock"] {
-            let cfg = RouterConfig::builder()
-                .mode(RoutingMode::EncodePrefillDecode {
-                    encode_urls: vec![(bad_encode.to_string(), None)],
-                    prefill_urls: vec![("grpc://127.0.0.1:30001".to_string(), None)],
-                    decode_urls: vec!["grpc://127.0.0.1:30002".to_string()],
-                    encode_policy: None,
-                    prefill_policy: None,
-                    decode_policy: None,
-                })
-                .connection_mode(ConnectionMode::Grpc)
-                .startup_worker_runtime_type(Some(RuntimeType::Sglang))
-                .round_robin_policy()
-                .build_unchecked();
-            assert!(
-                matches!(
-                    ConfigValidator::validate(&cfg),
-                    Err(ConfigError::ValidationFailed { .. })
-                ),
-                "expected ValidationFailed for encoder url {bad_encode}"
-            );
-        }
     }
 }
