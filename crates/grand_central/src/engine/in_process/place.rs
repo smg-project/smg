@@ -537,8 +537,13 @@ pub(super) struct Made<'r, 'a> {
     heads: OnceCell<Places>,
     /// Where the request's heads stand on that ring for a pair's decode
     /// side, where the two sides cut a prompt by two rules
-    /// ([`Made::stated_apart`]): `heads` holds the prefill side's then.
+    /// ([`Made::stated_apart`]) or the two sides' shadows do (`shadow_heads`):
+    /// `heads` holds the prefill side's then.
     decode_heads: OnceCell<Places>,
+    /// The first shadow profile whose heads' places this maker was asked
+    /// for ([`RequestMaker::shadow_ring`]): its rule cut `heads`, and a
+    /// shadow of another rule is stated its own in `decode_heads`.
+    shadow_heads: OnceCell<u16>,
     /// The panic of the route's rule where it was asked inside a decision
     /// ([`RequestMaker::sends_to`]): kept for the call, which raises it
     /// again outside the decision ([`raise`]).
@@ -649,6 +654,7 @@ impl<'r, 'a> Made<'r, 'a> {
             place: OnceCell::new(),
             heads: OnceCell::new(),
             decode_heads: OnceCell::new(),
+            shadow_heads: OnceCell::new(),
             panicked: OnceCell::new(),
             sent: Cell::new(Sent::NONE),
             decodes: Cell::new(Sent::NONE),
@@ -814,7 +820,7 @@ impl<'r, 'a> Made<'r, 'a> {
                 lent.then_some(decode_places),
             );
         };
-        self.stated_heads::<false>(spec, ring, rule)
+        self.stated_heads::<false>(spec, ring, rule, &self.heads)
     }
 
     /// [`Self::stated`] by a stage that places a routing value by its own
@@ -835,14 +841,15 @@ impl<'r, 'a> Made<'r, 'a> {
     }
 
     /// [`Self::stated`] by the prefix form of the ring, which cuts the
-    /// request by `rule`: the places of its heads on `ring`. `SHADOW` as
-    /// in [`Self::stated_key`].
+    /// request by `rule`: the places of its heads on `ring`, kept in
+    /// `heads`. `SHADOW` as in [`Self::stated_key`].
     #[inline(always)]
     fn stated_heads<'w, const SHADOW: bool>(
         &'w self,
         spec: &AppliedSpec,
         ring: &'a dyn LentRing,
         rule: HeadRule<'_>,
+        heads: &'w OnceCell<Places>,
     ) -> Stated<'a, 'w> {
         let request = self.request;
         // A routing value a header handed leads the prompt: its text is the
@@ -850,14 +857,14 @@ impl<'r, 'a> Made<'r, 'a> {
         // neither does a value the request's own id handed: that request
         // is placed by its prompt's heads.
         let key_at = Cell::new(None);
-        let first = self.heads.get().is_none();
+        let first = heads.get().is_none();
         let keys = self.keys(spec, |text, source| {
             if first && source.is_some_and(leads_a_prompt) {
                 key_at.set(Some(ring.head_position(Head::Text(text))));
             }
             None
         });
-        let heads = self.heads.get_or_init(|| {
+        let heads = heads.get_or_init(|| {
             let prompt = (request.prompt.tokens, request.prompt.text);
             Places::of_heads::<SHADOW>(ring, rule, prompt, key_at.take())
         });
@@ -1229,7 +1236,22 @@ impl RequestMaker for Made<'_, '_> {
         let (_, ring, places, _) = if engine.key_place_of(profiles) {
             self.stated_key::<true>(spec, ring)
         } else {
-            self.stated_heads::<true>(spec, ring, engine.head_rule_of(profiles)?)
+            let rule = engine.head_rule_of(profiles)?;
+            // A pair's two sides' shadows may cut the request by two
+            // rules: two sides, so two rules at most. The first to ask
+            // fills `heads`; one of another rule fills the decode side's
+            // list, which no live side fills where a shadow asks. A
+            // routing value that leads the prompt is asked of the lender
+            // once a rule.
+            let first = usize::from(*self.shadow_heads.get_or_init(|| shadow));
+            let heads = match engine.head_rule_of((Some(first), profiles.0)) {
+                Some(_) => &self.heads,
+                // A lender that placed no head under the first rule is
+                // asked about none under the second.
+                None if self.heads.get().is_some_and(|heads| heads.unplaced) => return None,
+                None => &self.decode_heads,
+            };
+            self.stated_heads::<true>(spec, ring, rule, heads)
         };
         Some((ring?, places))
     }

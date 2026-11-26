@@ -2845,24 +2845,32 @@ fn a_sides_shadow_alone_walks_the_lent_ring() {
     );
 }
 
-/// The decode's shadow that cuts a request by another rule than the
-/// prefill's shadow is asked for no place: a request states one list of
-/// heads a call and the prefill's shadow takes it, so the decode's shadow
-/// places on its own ring. Two prefix forms of one depth walk the lent
-/// ring once each; of two depths the prefill's alone walks it.
+/// [`ring_shadowed`] with the prefix form as both sides' shadows, the
+/// decode's `depth` tokens deep where one is named: the prefill's cuts a
+/// request by the stock depth, 256 tokens. The stock weight keeps the
+/// ring's owner above the least loaded worker.
+fn prefix_shadowed(depth: Option<u32>, after: bool) -> PolicySpec {
+    let mut document = ring_shadowed("prefix_hash", "prefix_hash", after);
+    if let Some(depth) = depth {
+        let decode = document.profiles.get_mut("decode-next");
+        decode.expect("the decode's shadow").score[0] =
+            ScoreStage::ConsistentHash(ConsistentHashParams {
+                weight: 8.0,
+                prefix_tokens: Some(depth),
+                ..ConsistentHashParams::default()
+            })
+            .into();
+    }
+    document
+}
+
+/// A pair's two sides' shadows of the prefix form walk the lent ring once
+/// each, of one depth and of two: a routing value that leads the prompt
+/// is the request's one head under both rules.
 #[test]
-fn a_decodes_shadow_of_another_depth_is_lent_no_ring() {
+fn both_sides_shadows_of_the_prefix_form_walk_the_lent_ring() {
     let walks = |depth: Option<u32>| {
-        let mut document = ring_shadowed("prefix_hash", "prefix_hash", false);
-        if let Some(depth) = depth {
-            let decode = document.profiles.get_mut("decode-next");
-            decode.expect("the decode's shadow").score[0] =
-                ScoreStage::ConsistentHash(ConsistentHashParams {
-                    prefix_tokens: Some(depth),
-                    ..ConsistentHashParams::default()
-                })
-                .into();
-        }
+        let document = prefix_shadowed(depth, false);
         let engine = hosted(engine_of(&document));
         let list = pool(2);
         let members = PublishedList::new(Arc::clone(&list));
@@ -2879,7 +2887,205 @@ fn a_decodes_shadow_of_another_depth_is_lent_no_ring() {
         (ring.1.load(atomic::Ordering::Relaxed), engine.faults())
     };
     assert_eq!(walks(None), (2, 0), "one depth");
-    assert_eq!(walks(Some(128)), (1, 0), "another depth");
+    assert_eq!(walks(Some(128)), (2, 0), "another depth");
+}
+
+/// A decode's shadow that cuts a request by another depth than the
+/// prefill's shadow is stated the place of its own head on the lent ring,
+/// at the pair's decision and at the decode decided again. The prefill's
+/// shadow walks the ring from the place of the prompt's 256 tokens, where
+/// the walk reaches the idle worker both live sides take: it agrees. The
+/// decode's walks it from the place of the first sixteen, where the walk
+/// reaches the busy worker: it names another target, both times.
+#[test]
+fn a_decodes_shadow_of_another_depth_walks_the_lent_ring_from_its_own_head() {
+    let engine = hosted(engine_of(&prefix_shadowed(Some(16), true)));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    for _ in 0..8 {
+        list[1].increment_load();
+    }
+    let ring = ByDepth {
+        shallowest: list[1].url().to_owned(),
+        deeper: list[0].url().to_owned(),
+    };
+    let ids: Vec<u32> = (0..256).collect();
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&ids),
+            ..Prompt::NONE
+        },
+        ring: Some(&ring),
+        decode_again: true,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+    };
+    let (agreed, another) = ([1, 0, 0, 0], [0, 1, 0, 0]);
+    let mut placement = engine.place(&request).expect("a pair");
+    assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the idle worker");
+    let first = sides_said(engine);
+    placement.sent(Side::Prefill);
+    let decided = placement.decode_again(&request);
+    assert!(decided.is_ok(), "the decode decided again");
+    assert_eq!(
+        (first, sides_said(engine)),
+        ([agreed, another, [0; 4]], [agreed, another, another]),
+        "the pair's decision, then the later call"
+    );
+    assert_eq!(engine.faults(), 0, "no fault");
+}
+
+/// A decode's shadow of another depth moves no live side, and a maker is
+/// asked once for each side's shadow. Under the document of the test
+/// above, a maker that hands on the engine's own is asked for two shadow
+/// profiles in the pair's decision, and the request made again on it
+/// states no ring and no place: what a shadow's ask kept reaches no live
+/// statement. The live pair is the one the same document takes with no
+/// shadow, at the pair's decision and at the decode decided again.
+#[test]
+fn a_decodes_shadow_of_another_depth_asks_its_own_profile_and_moves_no_live_side() {
+    /// A maker that hands on the engine's own and keeps the shadow
+    /// profiles it was asked for.
+    struct Recorded<'r, 'a>(Made<'r, 'a>, RefCell<Vec<u16>>);
+
+    impl RequestMaker for Recorded<'_, '_> {
+        fn model(&self) -> &str {
+            self.0.model()
+        }
+
+        fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+            self.0.make(spec)
+        }
+
+        fn workers(&self) -> WorkerLists<'_> {
+            self.0.workers()
+        }
+
+        fn shadow_ring<'w>(
+            &'w self,
+            spec: &'w AppliedSpec,
+            shadow: u16,
+        ) -> Option<(&'w dyn LentRing, &'w [u64])> {
+            self.1.borrow_mut().push(shadow);
+            self.0.shadow_ring(spec, shadow)
+        }
+    }
+
+    let live = |shadowed: bool| {
+        let mut document = prefix_shadowed(Some(16), true);
+        if !shadowed {
+            document.bindings[0].shadow = None;
+        }
+        let engine = hosted(engine_of(&document));
+        let list = pool(2);
+        let members = PublishedList::new(Arc::clone(&list));
+        let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+        for _ in 0..8 {
+            list[1].increment_load();
+        }
+        let ring = ByDepth {
+            shallowest: list[1].url().to_owned(),
+            deeper: list[0].url().to_owned(),
+        };
+        let ids: Vec<u32> = (0..256).collect();
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            ring: Some(&ring),
+            decode_again: true,
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+        };
+        let at = |placed: &_| list.iter().position(|member| Arc::ptr_eq(member, placed));
+        let mut placement = engine.place(&request).expect("a pair");
+        let first = (
+            at(&placement.worker),
+            placement.decode.as_ref().and_then(at),
+        );
+        placement.sent(Side::Prefill);
+        let decided = placement.decode_again(&request);
+        assert!(decided.is_ok(), "the decode decided again");
+        let again = placement.decode.as_ref().and_then(at);
+        let sides = (first, again, engine.faults());
+        // The pair's decision once more, through a maker that keeps what
+        // it was asked: then the request made again on that maker.
+        let maker = Recorded(Made::new(engine, &request, &[]), RefCell::default());
+        let decided = engine.decide_at(&maker, Instant::now);
+        assert!(decided.is_ok(), "the pair's decision");
+        let facts = maker.0.make(engine.standing_spec()).facts;
+        let unstated = facts.ring.is_none()
+            && facts.ring_positions.is_empty()
+            && facts.decode_ring_positions.is_none();
+        (sides, unstated, maker.1.take())
+    };
+    let (shadowed, plain) = (live(true), live(false));
+    assert_eq!(shadowed.0, plain.0, "the live pair, shadowed or not");
+    let pair = plain.0;
+    assert!(
+        matches!(pair, ((Some(0), _), Some(_), 0)),
+        "the idle prefill, a decode, no fault: {pair:?}"
+    );
+    assert!(
+        shadowed.1 && plain.1,
+        "the request made again states no place"
+    );
+    let (asked, none) = (shadowed.2, plain.2);
+    assert_eq!(none, [0_u16; 0], "no shadow, no ask");
+    assert_eq!(asked.len(), 2, "one ask a side's shadow: {asked:?}");
+    assert_ne!(asked[0], asked[1], "each side's own profile");
+}
+
+/// A lender that places no head is asked about one head for a pair's two
+/// sides' shadows of two depths: it declined the prefill's shadow's, and
+/// is asked about none for the decode's. Neither shadow walks the ring.
+#[test]
+fn a_lender_that_declined_one_sides_shadow_is_asked_nothing_for_the_other() {
+    let engine = hosted(engine_of(&prefix_shadowed(Some(16), false)));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    let ring = Scripted(&[None], AtomicU32::new(0));
+    let ids: Vec<u32> = (0..256).collect();
+    let request = PlaceRequest {
+        prompt: Prompt {
+            tokens: Some(&ids),
+            ..Prompt::NONE
+        },
+        ring: Some(&ring),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+    };
+    engine.place(&request).expect("a pair");
+    let asked = ring.1.load(atomic::Ordering::Relaxed);
+    assert_eq!((asked, engine.faults()), (1, 0), "one head, no walk");
+}
+
+/// A lender that panics when it is asked a head's place faults each
+/// side's shadow that asks it, of one depth and of two: two faults a
+/// pair's decision, and neither shadow says a word. The pair is placed
+/// all the same.
+#[test]
+fn a_lender_that_panics_at_a_head_faults_both_sides_shadows() {
+    let reading = |depth: Option<u32>| {
+        let engine = hosted(engine_of(&prefix_shadowed(depth, false)));
+        let list = pool(2);
+        let members = PublishedList::new(Arc::clone(&list));
+        let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+        let ids: Vec<u32> = (0..256).collect();
+        let request = PlaceRequest {
+            prompt: Prompt {
+                tokens: Some(&ids),
+                ..Prompt::NONE
+            },
+            ring: Some(&Unasked),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+        };
+        let placed = engine.place(&request).is_ok();
+        (placed, engine.faults(), sides_said(engine))
+    };
+    let both = (true, 2, [[0; 4]; 3]);
+    assert_eq!(reading(None), both, "one depth");
+    assert_eq!(reading(Some(16)), both, "two depths");
 }
 
 /// A pair's decode decided again runs the decode's shadow once more, and

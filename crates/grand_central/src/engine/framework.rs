@@ -6024,28 +6024,16 @@ impl Engine {
     /// its profile ([`Self::shadow_side`]) and one whose set the filters
     /// emptied are asked nothing. `None` under every other binding: beside
     /// a live side that reads the ring, a side's shadow reads the place
-    /// the two live sides state, or none ([`Self::unlent`]). And `None`
-    /// for the decode's shadow that cuts a request by another rule than
-    /// the prefill's shadow does: a request states one list of heads a
-    /// call, so that shadow places on its own ring. A shadow that reads
-    /// the ring by the routing value's own text takes no head, and stands
-    /// beside one that cuts by a rule.
+    /// the two live sides state, or none ([`Self::unlent`]). Each side's
+    /// shadow is asked by its own word: two that cut a request by two
+    /// rules are each stated the places of their own heads.
     fn side_ring_profile(&self, at: u32, side: PairSide) -> Option<u16> {
         let sides = self.shadow_sides.get(at as usize)?;
         let shadow = sides[side.index()]?;
         let lives = live_sides(&self.bindings.get(at as usize)?.binding);
         let reads = |profile: u16| Some(self.profile_needs.get(usize::from(profile))?.ring);
-        if !reads(shadow)? || reads(lives[0])? || reads(lives[1])? {
-            return None;
-        }
-        let rule = |profile: u16| {
-            let places = self.head_places.get(usize::from(profile));
-            places.filter(|places| matches!(places, HeadPlaces::Rule(..)))
-        };
-        let first = sides[PairSide::Prefill.index()].filter(|_| matches!(side, PairSide::Decode));
-        let rules = (first.and_then(rule), rule(shadow));
-        let apart = matches!(rules, (Some(first), Some(own)) if first != own);
-        (!apart).then_some(shadow)
+        let alone = reads(shadow)? && !reads(lives[0])? && !reads(lives[1])?;
+        alone.then_some(shadow)
     }
 
     /// [`Self::states_key_place`] by the two profiles of
