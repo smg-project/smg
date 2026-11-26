@@ -561,10 +561,10 @@ async fn a_prefill_stream_that_fails_is_told_as_its_reader_samples_it() {
     }
 }
 
-/// A decode stream that fails is told once, by the status the circuit
-/// breaker samples for it, to a collected answer and a streamed one alike.
-/// The failure may be the stream's first item or lie behind its first
-/// frame. The prefill had answered, and keeps its good end.
+/// A decode stream that fails is told once, by the status it fails with,
+/// to a collected answer and a streamed one alike. The failure may be the
+/// stream's first item or lie behind its first frame. The prefill had
+/// answered, and keeps its good end.
 #[tokio::test]
 async fn a_decode_stream_that_fails_is_told_once_by_its_status() {
     for shape in SHAPES {
@@ -597,12 +597,16 @@ async fn a_decode_stream_that_fails_is_told_once_by_its_status() {
 }
 
 /// The request's deadline is a timeout of the decode, as the circuit breaker
-/// samples it, wherever it passes once the decode was sent. Before the decode's
+/// samples it, where it passes once the decode was sent. Before the decode's
 /// call answered, the stage's plan tells it. Behind that answer, the decode's
 /// stream ends with it and tells it. A prefill still in flight then is told
 /// nothing. A deadline that passes while a pair sent one behind the other still
 /// waits on its prefill tells nobody: the decode never went out. No answer
 /// leaves the stage with an end it owes.
+///
+/// One row is the prefill's. A collected answer reads the prefill's stream
+/// first: a deadline that passes under that reader is the prefill's timeout,
+/// over its good answer, and the decode's stream is dropped unread.
 ///
 /// A row whose prefill must have answered runs under a deadline that a
 /// loaded machine's prefill answers inside. The rows run side by side.
@@ -663,6 +667,17 @@ async fn a_pairs_deadline_is_told_to_its_decode_once_the_decode_was_sent() {
             REQUEST_TIMEOUT,
             [PREFILL_DROPPED, DECODE_NEVER_SENT],
         ),
+        (
+            "both at once, the prefill's stream under the collector",
+            Shape::Parallel,
+            GatedScheduler {
+                hold_after_first: true,
+                ..Default::default()
+            },
+            GatedScheduler::default(),
+            AMPLE,
+            [DECODE_DROPPED, "completed Prefill Timeout 504"],
+        ),
     ];
     let rows = rows.map(
         |(row, shape, prefill, decode, deadline, expected)| async move {
@@ -681,6 +696,29 @@ async fn a_pairs_deadline_is_told_to_its_decode_once_the_decode_was_sent() {
         },
     );
     futures::future::join_all(rows).await;
+}
+
+/// A batch of prompts says its decode's send with the dispatch, as before
+/// this telling, though each prompt's decode goes out behind its own
+/// prefill. A deadline that passes while the prefills are out is told as
+/// the decode's timeout, as the circuit breaker charges it. No prompt's
+/// decode was called.
+#[tokio::test]
+async fn a_batchs_deadline_behind_its_prefills_is_told_as_its_decodes_timeout() {
+    let decode = GatedScheduler::default();
+    let (pipeline, components, heard, _workers) =
+        hearing_within(Shape::Sequential, silent(), decode.clone(), REQUEST_TIMEOUT).await;
+    let batch = request_of(serde_json::json!({"prompt": ["Hello world", "Hello again"]}));
+
+    let response = complete(&pipeline, &components, batch, None).await;
+
+    assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+    assert!(!bears_untold_end(&response));
+    assert_eq!(decode.started.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        ends_at(&heard, 2).await,
+        ["completed Decode Timeout 504", PREFILL_DROPPED]
+    );
 }
 
 /// A pair's decode that moves behind its prefill is told its end on the decode
@@ -874,12 +912,14 @@ async fn a_failed_child_of_a_fan_out_or_a_batch_ends_its_side_once() {
 /// order: a child's failure waits for every child ahead of it. Here the
 /// last child's prefill is refused at once and the others answer behind
 /// it. Their good answers do not write the failure over: the request
-/// fails, and the engine hears its prefill side end with the refusal.
+/// fails, and the engine hears its prefill side end with the refusal. The
+/// stub refuses the last child by its index, in whatever order the
+/// children's calls arrive.
 #[tokio::test]
 async fn a_wide_fan_outs_early_failure_stands_against_late_good_answers() {
-    const SAMPLES: usize = 31;
+    const SAMPLES: u32 = 31;
     let prefill = GatedScheduler {
-        fail_call: Some(SAMPLES - 1),
+        fail_sample: Some(SAMPLES - 1),
         answer_after: Some(Duration::from_millis(200)),
         ..Default::default()
     };
@@ -893,6 +933,29 @@ async fn a_wide_fan_outs_early_failure_stands_against_late_good_answers() {
     assert_eq!(
         ends_at(&heard, 2).await,
         [DECODE_DROPPED, "completed Prefill ServerError 503"]
+    );
+}
+
+/// A fan-out's prefill stream that fails behind every sample's last
+/// message is told to no load: each sample let its load go at that
+/// message. The client is handed the failure, and the prefill keeps the
+/// good answer its first response told.
+#[tokio::test]
+async fn a_fan_outs_prefill_failure_behind_every_last_message_is_told_to_no_load() {
+    let prefill = GatedScheduler {
+        fail_behind_last: Some(1),
+        ..Default::default()
+    };
+    let (pipeline, components, heard, _workers) =
+        hearing(Shape::Parallel, prefill, GatedScheduler::default()).await;
+    let fan_out = request_of(serde_json::json!({"prompt": "Hello world", "n": 2}));
+
+    let response = complete(&pipeline, &components, fan_out, None).await;
+
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        ends_at(&heard, 2).await,
+        [DECODE_DROPPED, "completed Prefill Ok 200"]
     );
 }
 

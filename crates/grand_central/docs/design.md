@@ -2641,6 +2641,12 @@ request ──> route (HTTP or gRPC, any family)
   the decode. A decode sent behind its prefill is told once it was sent, on the worker the
   request went to.
 
+  A decode counts as sent once its send is said, and a deadline that passes then is the
+  decode's timeout, as the breaker charges it. One request sent one side behind the other says
+  the send once its prefill answered. A batch of prompts on that shape says it with the
+  dispatch, as before, and so does a pair sent at once whose decode waits on its prefill's
+  media identity. Their deadline is told as the decode's timeout though its call was held back.
+
   The prefill is told through its load. Its dispatch tells a failure where it records one, and
   its good answer once. That is at its drain where it goes out first, and at its first response
   where both sides go out at once. With the prefill's silence bound off the route reads nothing
@@ -2648,7 +2654,8 @@ request ──> route (HTTP or gRPC, any family)
 
   A reader that meets a failure on the prefill's stream tells it as that reader charges the
   breaker. A streamed answer tells the engine's own report of a failed request, and a collected
-  answer does not.
+  answer does not. A collected answer reads the prefill's stream first: a deadline that passes
+  under that reader is the prefill's timeout, and the unread decode is told nothing.
 
   A request of several samples and a batch of prompts place each side once. Every child tells
   the pair's one prefill side: a replica of the prefill's load keeps the handle of the load it
@@ -2662,6 +2669,13 @@ request ──> route (HTTP or gRPC, any family)
   prefill told its good answer keeps it where its reader is dropped: a client that left, a
   decode that failed. A collected answer's failed prefill stream is one charge of its request
   on the breaker, and one end of each attempt for the engine.
+
+  Three more follow from where an end is told. A fan-out's prefill stream that fails behind
+  every sample's last message is told to no load, and the prefill keeps its good answer. Each
+  sample let its load go at that message. A request of over thirty children hands on the answer
+  of its first failed child in their order, so a decode's end another child's answer bore is
+  told by nobody. A decode that ends clean with no message is told the worker's 200, as a
+  single request's stream is.
 
   A route tells every answer of its workers or none. One route tells no outcome yet
   **[planned]**: the transcription route. A stage hears a request sent there, like an end
@@ -2700,7 +2714,7 @@ The bar for that change:
 
    With the engine off, an outcome's report through the answer returns at its first test, of the answer's engine side. The HTTP pair route's count request pays that test. A streamed answer pays the route's ask of its guard and its reader's test of an empty handle. A report on a side of a pair through its guard returns at its first test, of what that guard keeps. A pair's streamed decode pays what a streamed answer pays.
 
-   On the gRPC wire the stage's ask returns at the answer's first test, a pair's at its decode's answer, and the request's stream is left as it is. A pair's prefill load returns at its first test of what it keeps, where its dispatch tells its good answer. A replica of a classic load keeps nothing and allocates nothing. The decision bench's `--end` flag counts a report against a cell that reports nothing. A pair of release builds counts what no cell runs: the gRPC pair and the count request.
+   On the gRPC wire the stage's ask returns at the answer's first test, a pair's at its decode's answer, and the request's stream is left as it is. A pair's prefill load returns at its first test of what it keeps, where its dispatch tells its good answer. A replica of a classic load keeps nothing, and allocates nothing it did not before. The decision bench's `--end` flag counts a report against a cell that reports nothing. A pair of release builds counts what no cell runs: the gRPC pair and the count request.
 4. With the engine on, every classic test of the gateway passes under the settings' own document.
 
 ### 9.3 The options

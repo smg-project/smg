@@ -509,12 +509,13 @@ pub(crate) fn execute_plan<'a>(
             },
             None => dispatch.await,
         };
-        // Grand Central hears the attempt's end from here, and from no
-        // dispatch: the plan holds the guards the handle is asked of. No await
-        // lies between the dispatch's return and this, so a stream takes its
+        // Grand Central hears a single request's end and a pair's decode from
+        // here: the plan holds the guards their handle is asked of. A pair's
+        // prefill is told inside its dispatch, through its load. No await
+        // lies between the dispatch's return and this. So a stream takes its
         // layer ahead of any reader's watch for its client (see
-        // `ProtoStream::put_report_layer`) and a failed call is told ahead of
-        // its retry's backoff. The selection's test stands here in line: a
+        // `ProtoStream::put_report_layer`), and a failed call is told ahead
+        // of its retry's backoff. The selection's test stands here in line: a
         // request the classic policies placed pays it and no more.
         match workers {
             WorkerSelection::Single { worker } => {
@@ -2137,7 +2138,9 @@ async fn parallel_sides_answered(
             return Err(response);
         }
         // Both sides failed: the client sees the prefill's answer, which
-        // takes the end the decode's answer owed.
+        // takes the end the decode's answer owed. The dispatch hands on its
+        // first failure alone today, so no request reaches this arm: it
+        // keeps the rule for a join that hands on both.
         (Err(response), Err(decode)) => {
             return Err(both_sides_failed(response, decode, sampled_apart));
         }
