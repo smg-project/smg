@@ -6,7 +6,9 @@
 //! the one entry a host asks for a request ([`InProcess::decide_at`]). A
 //! pair's decision is leased: its guard is told both dispatches and each
 //! side's end. A request that states the later decode has it decided again
-//! behind the prefill's dispatch (`pair_round_robin_later`).
+//! behind the prefill's dispatch (`pair_round_robin_later`). The cell
+//! `pair_round_robin_three_sided` places the same pair under a document of
+//! three sides, whose encode side places nothing of a pair.
 //!
 //! `--entry place` asks the one call a host makes for a request instead
 //! ([`InProcess::place`]): the model, the two lists and a prompt of the

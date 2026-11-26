@@ -420,6 +420,15 @@ const CELLS: &[Cell] = &[
         request: pair::later,
         ..Cell::PLAIN
     },
+    // A pair under the document of three sides, its encode side under the
+    // plain ring: what a pair pays for a side it does not use, counted
+    // against `pair_round_robin`, the same two sides under the pair plan.
+    Cell {
+        name: "pair_round_robin_three_sided",
+        document: encode::ringed,
+        request: pair::request,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "pair_signal_cost",
         document: signals::pair_document,
