@@ -27,6 +27,7 @@ use crate::{
         list_cell::PublishedList,
         records::worker_id,
     },
+    store::GatewayId,
     tracking::lease::EventSet,
 };
 

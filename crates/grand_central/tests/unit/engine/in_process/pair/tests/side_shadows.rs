@@ -284,7 +284,7 @@ fn a_pairs_decode_shadow_alone_is_compared_and_counted_by_its_side() {
     // A host is told no count of the prefill side or of single requests,
     // and neither table holds one.
     let document = host.engine.in_force();
-    let tables = document.shadow_counts.get();
+    let tables = document.shadow_tables().get();
     let held = |side, kind| tables.expect("the tables").of(0, side, kind);
     for side in [ShadowSide::Single, ShadowSide::Prefill] {
         let counts = ShadowKind::ALL.map(|kind| held(side, kind).load(Ordering::Relaxed));
@@ -338,7 +338,7 @@ fn a_decode_decided_again_counts_its_decode_shadow_apart() {
     // A host is told no count of a side that names no shadow, and the
     // table of the decodes decided again holds none.
     let document = other.engine.in_force();
-    let tables = document.shadow_counts.get().expect("the tables");
+    let tables = document.shadow_tables().get().expect("the tables");
     let again = ShadowSide::DecodeAgain;
     let counts = ShadowKind::ALL.map(|kind| tables.of(0, again, kind).load(Ordering::Relaxed));
     assert_eq!(counts, [0; 4]);

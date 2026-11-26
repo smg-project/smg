@@ -9,7 +9,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::Instant,
@@ -17,7 +17,7 @@ use std::{
 
 use parking_lot::Mutex;
 
-use super::{Loaded, SpecHandle};
+use super::{InForce, Loaded, SpecHandle};
 use crate::{
     document::spec::{AppliedSpec, BindingSpec, Match, PolicySpec},
     engine::{
@@ -34,7 +34,7 @@ use crate::{
         },
         list_cell::PublishedList,
         prompt_hashes::HashSeeds,
-        shadow::Shadowed,
+        shadow::{ShadowCounts, Shadowed},
         view::{Candidate, RequestFacts, WorkerId},
     },
     policies::random::Random,
@@ -101,6 +101,14 @@ impl InProcess {
     pub(crate) fn count_shadow(&self, said: Option<Shadowed>) {
         let document = self.in_force();
         self.under(&document).count_shadow(said);
+    }
+}
+
+impl InForce {
+    /// The tables of the shadow decisions counted so far, for a case that
+    /// reads whether they were allocated or writes a count of its own.
+    pub(in crate::engine::in_process) fn shadow_tables(&self) -> &OnceLock<Box<ShadowCounts>> {
+        &self.shadow_tables
     }
 }
 
