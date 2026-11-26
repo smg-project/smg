@@ -7,8 +7,9 @@ OpenAI /v1 endpoint; the official `tau2` CLI points --agent-llm at each arm and
 frontend (tokenization + tool/reasoning parsing). Arms must already be serving
 (see launch_arms.sh); this driver does not launch them.
 
-Exit codes: 0 clean, 1 score regression beyond --tolerance, 2 an arm did not
-finish (timed out or scored nothing), so there is nothing to compare.
+Exit codes: 0 clean, 1 paired-domain score regression beyond --tolerance,
+2 incomplete comparison (including budget, provenance, seed, infrastructure,
+or no common valid domain). Independent overall means are diagnostics only.
 """
 
 from __future__ import annotations
@@ -951,24 +952,41 @@ def score_arm(
     tau2_python: str | None = None,
 ) -> None:
     """Run tau2 for every domain against one already-serving arm, filling arm.scores."""
+
+    def stop_new_domains():
+        if budget_descriptor is not None:
+            scope = _scope_identity(budget_descriptor)
+            with _SCOPE_ADMISSION:
+                if not _scope_stopping(scope):
+                    _SCOPE_STATES[scope] = "HARD_DOMAIN_OUTCOME"
+
     for domain in domains:
-        run_tau2(
-            arm,
-            tau2=tau2,
-            agent_model=agent_model,
-            domain=domain,
-            num_trials=num_trials,
-            num_tasks=num_tasks,
-            max_concurrency=max_concurrency,
-            user_llm=user_llm,
-            data_dir=data_dir,
-            request_timeout=request_timeout,
-            run_timeout=run_timeout,
-            expected_task_ids=(expected_tasks or {}).get(domain),
-            seed=seed,
-            budget_descriptor=budget_descriptor,
-            tau2_python=tau2_python,
-        )
+        try:
+            run_tau2(
+                arm,
+                tau2=tau2,
+                agent_model=agent_model,
+                domain=domain,
+                num_trials=num_trials,
+                num_tasks=num_tasks,
+                max_concurrency=max_concurrency,
+                user_llm=user_llm,
+                data_dir=data_dir,
+                request_timeout=request_timeout,
+                run_timeout=run_timeout,
+                expected_task_ids=(expected_tasks or {}).get(domain),
+                seed=seed,
+                budget_descriptor=budget_descriptor,
+                tau2_python=tau2_python,
+            )
+        except Exception:
+            stop_new_domains()
+            raise
+        if _hard_outcome(arm.invocations.get(domain)):
+            # Stop future domain launches in either owned arm, without halting
+            # the ledger: an already-admitted sibling must still settle/drain.
+            stop_new_domains()
+            break
 
 
 def save_scores(arm: Arm, path: Path) -> None:
@@ -1245,6 +1263,39 @@ def main() -> int:
         try:
             baseline = load_scores(args.diff_baseline)
             candidate = load_scores(args.diff_candidate)
+            # Supplied caller inputs are authoritative, not a descriptor chosen
+            # by the saved evidence. Preserve the legacy offline diff contract
+            # when the caller supplies none of these budget inputs.
+            if any(
+                getattr(args, name) is not None
+                for name in (
+                    "budget_policy",
+                    "budget_contexts",
+                    "budget_contexts_sha256",
+                    "budget_ledger",
+                    "budget_scope",
+                )
+            ):
+                try:
+                    expected_budget = prepare_budget(args)
+                    if baseline.budget != expected_budget or candidate.budget != expected_budget:
+                        raise budget_guard.BudgetError(
+                            "Saved arms must match the caller-approved policy/context/scope/ledger"
+                        )
+                except (OSError, ValueError, TypeError, KeyError) as error:
+                    # Reject before opening a ledger selected by untrusted saved
+                    # evidence, while preserving the existing failure report.
+                    message = f"INCOMPLETE: caller budget binding failed: {error}"
+                    print(message, file=sys.stderr)
+                    if args.out:
+                        args.out.write_text(message + "\n", encoding="utf-8")
+                    if args.json_out:
+                        args.json_out.write_text(
+                            json.dumps({"incomplete": {"budget": str(error)}, "budget": None})
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                    return EXIT_INCOMPLETE
             # Requested domains are part of the expected set, so one that neither arm
             # scored still shows up as missing instead of silently vanishing.
             diff_domains = sorted(set(domains) | set(baseline.scores) | set(candidate.scores))
@@ -1326,4 +1377,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        # Exit 1 is reserved for a real quality regression, never a CLI crash.
+        print(f"INCOMPLETE: unexpected {type(error).__name__}: {error}", file=sys.stderr)
+        raise SystemExit(EXIT_INCOMPLETE) from error

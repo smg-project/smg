@@ -2916,3 +2916,192 @@ def test_asymmetric_saved_cli_quality_and_hard_gates(tmp_path, monkeypatch, mode
         assert "REGRESSION:" not in direct.stderr
     elif mode == "no_common":
         assert "NO COMPARABLE DOMAINS" in direct.stderr
+
+
+@pytest.mark.parametrize("entry", ["direct", "nightly"])
+def test_unexpected_saved_report_error_is_hard_incomplete(tmp_path, entry):
+    import subprocess
+
+    _, files, root, cli, env = _saved_shape_pair_and_cli(tmp_path)
+    payload = json.loads(files[0].read_text())
+    payload["scores"]["retail"]["pass1"] = 10**400
+    files[0].write_text(json.dumps(payload))
+    if entry == "nightly":
+        child = _actual_nightly_saved_gate(root, cli, env)
+    else:
+        child = subprocess.run(cli, env=env, capture_output=True, text=True, timeout=10)
+    (tmp_path / "unexpected-error-witness.json").write_text(
+        json.dumps(
+            {
+                "entry": entry,
+                "exit": child.returncode,
+                "stdout": child.stdout,
+                "stderr": child.stderr,
+            },
+            indent=2,
+        )
+    )
+    assert child.returncode == 2, (child.returncode, child.stdout, child.stderr)
+    assert "INCOMPLETE:" in child.stderr and "OverflowError" in child.stderr
+
+
+@pytest.mark.parametrize(
+    "field", ["policy", "contexts", "contexts_sha256", "ledger", "scope", "partial"]
+)
+def test_saved_diff_rejects_conflicting_caller_budget(tmp_path, field):
+    import subprocess
+
+    arms, _, _, cli, env = _saved_shape_pair_and_cli(tmp_path)
+    descriptor = arms[0].budget
+    if field in {"policy", "contexts"}:
+        original = Path(descriptor[field + "_path"])
+        changed = tmp_path / ("caller-" + original.name)
+        changed.write_bytes(original.read_bytes())
+        cli += ["--budget-" + field, str(changed)]
+    elif field == "ledger":
+        changed = tmp_path / "caller-ledger.db"
+        policy = run_ab.budget_guard.read_descriptor(descriptor).policy
+        run_ab.budget_guard.Ledger(changed, policy)
+        cli += ["--budget-ledger", str(changed)]
+    elif field == "scope":
+        cli += ["--budget-scope", "another-approved-scope"]
+    elif field == "contexts_sha256":
+        cli += ["--budget-contexts-sha256", "0" * 64]
+    else:
+        env = {key: value for key, value in env.items() if not key.startswith("TAU2_BUDGET_")}
+        cli += ["--budget-ledger", descriptor["ledger_path"]]
+    child = subprocess.run(cli, env=env, capture_output=True, text=True, timeout=10)
+    (tmp_path / "caller-budget-witness.json").write_text(
+        json.dumps(
+            {
+                "field": field,
+                "exit": child.returncode,
+                "stdout": child.stdout,
+                "stderr": child.stderr,
+            },
+            indent=2,
+        )
+    )
+    assert child.returncode == 2, (child.returncode, child.stdout, child.stderr)
+    assert run_ab.final_budget(*arms)["halted"] is False
+
+
+@pytest.mark.parametrize("caller_inputs", ["matching", "absent"])
+def test_saved_diff_keeps_matching_and_legacy_no_caller_contract(tmp_path, caller_inputs):
+    import subprocess
+
+    _, _, _, cli, env = _saved_shape_pair_and_cli(tmp_path)
+    if caller_inputs == "absent":
+        env = {key: value for key, value in env.items() if not key.startswith("TAU2_BUDGET_")}
+    child = subprocess.run(cli, env=env, capture_output=True, text=True, timeout=10)
+    assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "unexpected"])
+def test_hard_domain_stops_new_arms_domains_but_settles_admitted_sibling(
+    monkeypatch, tmp_path, failure
+):
+    import concurrent.futures
+
+    descriptor = run_ab.prepare_budget()
+    ledger = run_ab.budget_guard.read_descriptor(descriptor)
+    both_admitted = threading.Barrier(2, timeout=5)
+    failed_arm_finished = threading.Event()
+    calls = []
+    arms = [run_ab.Arm(name, "http://unused.invalid") for name in ("vllm", "smg")]
+
+    def child(command, **kwargs):
+        name = command[command.index("--arm") + 1]
+        domain = command[command.index("--domain") + 1]
+        invocation = command[command.index("--invocation") + 1]
+        calls.append((name, domain))
+        if domain == "retail":
+            if name == "smg":
+                ledger.reserve(
+                    "admitted-sibling",
+                    "smg",
+                    "openai/gpt-5.2",
+                    10,
+                    2,
+                    num_retries=0,
+                    output_limit_verified=True,
+                    metadata={"invocation_id": invocation, "domain": domain},
+                )
+            both_admitted.wait()
+            if name == "vllm":
+                if failure == "timeout":
+                    raise run_ab.subprocess.TimeoutExpired(command, 1)
+                if failure == "unexpected":
+                    raise RuntimeError("unexpected owned child accounting failure")
+                return types.SimpleNamespace(returncode=9)
+            assert failed_arm_finished.wait(5)
+            ledger.finish("admitted-sibling", 1, 1)
+        folder = tmp_path / "simulations" / command[command.index("--save-to") + 1]
+        folder.mkdir(parents=True)
+        rows = _rows(ids=(domain + "-task",), reward=1.0)
+        (folder / "results.json").write_text(
+            json.dumps(
+                {
+                    "simulations": [
+                        {
+                            "task_id": row["task_id"],
+                            "trial": row["trial"],
+                            "seed": row["seed"],
+                            "reward_info": {"reward": row["reward"]},
+                        }
+                        for row in rows
+                    ]
+                }
+            )
+        )
+        return types.SimpleNamespace(returncode=0)
+
+    def score(arm):
+        try:
+            run_ab.score_arm(
+                arm,
+                tau2="tau2",
+                agent_model="local-model",
+                domains=["retail", "airline", "telecom"],
+                num_trials=2,
+                num_tasks=0,
+                max_concurrency=1,
+                user_llm="gpt-5.2",
+                data_dir=tmp_path,
+                expected_tasks={d: [d + "-task"] for d in ["retail", "airline", "telecom"]},
+                budget_descriptor=descriptor,
+                run_timeout=1,
+            )
+        finally:
+            if arm.name == "vllm":
+                failed_arm_finished.set()
+
+    monkeypatch.setattr(run_ab.subprocess, "run", child)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(score, arm) for arm in arms]
+        for index, future in enumerate(futures):
+            if index == 0 and failure == "unexpected":
+                with pytest.raises(RuntimeError, match="unexpected owned child accounting"):
+                    future.result(timeout=8)
+            else:
+                future.result(timeout=8)
+    audit = ledger.audit()
+    (tmp_path / "hard-domain-witness.json").write_text(
+        json.dumps(
+            {
+                "failure": failure,
+                "calls": calls,
+                "ledger": audit,
+                "invocations": [arm.invocations for arm in arms],
+            },
+            indent=2,
+        )
+    )
+    assert sorted(calls) == [("smg", "retail"), ("vllm", "retail")], calls
+    if failure != "unexpected":
+        assert arms[0].invocations["retail"]["failure_kind"] == (
+            "timeout" if failure == "timeout" else "nonzero_exit"
+        )
+    assert arms[1].invocations["retail"]["status"] == "completed"
+    assert audit["pending"] == audit["unknown"] == 0 and audit["halted"] is False
+    assert len(audit["requests"]) == 1 and audit["requests"][0]["state"] == "complete"

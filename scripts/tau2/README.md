@@ -77,7 +77,7 @@ bash scripts/tau2/launch_arms.sh stop
 
 Key env knobs for `launch_arms.sh`: `TAU2_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `TAU2_TP` (tensor-parallel size — match the GPU count), `TAU2_MAX_MODEL_LEN`, `TAU2_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, `TAU2_VLLM_EXTRA` for extra vLLM flags, and `TAU2_ARM_A_PORT` / `TAU2_ARM_B_GRPC_PORT` / `TAU2_ARM_B_GW_PORT` / `TAU2_ARM_B_METRICS_PORT` to pin ports (default: OS-assigned free ports, so concurrent arms/jobs on one host don't collide).
 
-`run_ab.py` exits non-zero if the candidate's overall pass^k drops more than `--tolerance` (default 2pp) below the baseline. Use `--max-concurrency N` to run N tau2 simulations per arm in parallel (the lever that keeps large runs within a time budget).
+`run_ab.py` exits 1 if the candidate's pass^k on the common valid domains drops more than `--tolerance` (default 2pp) below the baseline. Independent overall means are diagnostics only; no common valid domain, budget/provenance/seed failures and infrastructure errors exit 2. Use `--max-concurrency N` to run N tau2 simulations per arm in parallel (the lever that keeps large runs within a time budget).
 
 ## Agent-vs-user routing (no config file)
 
@@ -135,7 +135,7 @@ dominated by model-load time, serialized by a host lock, so a PR run is not fast
 ## Validation status — ran end-to-end ✅
 
 These earlier experiment results predate the guarded entry below; they do not
-establish new H1 CPU, paid-request or quality acceptance.
+establish current guarded CPU, paid-request or quality acceptance.
 
 Brought up end-to-end on one node, **`Qwen/Qwen3.6-27B` at TP=1 per arm** (on a high-memory GPU: the 27B model's ~54 GB of BF16 weights fit on one card; the Quick start and the weekly matrix run a 27B at TP=2), user-sim **`gpt-5.2`** at temp 0. Stack: vLLM 0.24.0 (CUDA 13.0), smg 1.7.0, tau2-bench 1.0.0.
 
@@ -175,9 +175,9 @@ This is a boundary for the pinned text pipeline, not a general egress sandbox or
 support claim for all τ² modes. CUDA launch/cleanup and AMD qualification remain
 separate; this change does not add a paid or AMD execution authorization.
 
-Before live scoring through the C driver, supply these reviewed values (the
-`run_ab.py --budget-*` aliases belong to C). The independent F isolated entry
-uses `--policy`, `--contexts`, `--contexts-sha256`, `--ledger` and `--scope`.
+Before live scoring with `run_ab.py`, supply these reviewed environment values
+or their corresponding `--budget-*` arguments. The standalone `guarded_cli.py`
+entry uses `--policy`, `--contexts`, `--contexts-sha256`, `--ledger` and `--scope`.
 No real prices, provider limits or spending approval are supplied here:
 
 - `TAU2_BUDGET_POLICY`: JSON containing `scope_id`, integer `cap_nusd`, `calls`,
@@ -427,3 +427,16 @@ block new local admissions and require owner reconciliation. Memory cannot prove
 cross-process persistent stop if both existing stores are unavailable; paid
 resumption remains on hold in that case. Staging pairs the resolved database
 basename with its empty lexical marker, rather than a caller's symlink alias.
+
+Saved-score comparison validates any supplied caller budget arguments against
+both saved descriptors before opening their shared ledger for the final audit.
+A mismatched or partial caller policy/context/scope/ledger is incomplete (exit 2);
+when no caller budget inputs are supplied, the existing offline saved-comparison
+contract is retained. Neither path initializes a ledger.
+
+A hard domain outcome stops new domain launches in both owned arms. A sibling
+already admitted before that stop may finish and settle its paid work while the
+shared ledger remains healthy; independent paid-budget failures still fail
+closed. The domain stop does not erase reservations or claim that in-flight
+work was cancelled. Partial
+quality diagnostics alone do not trigger this admission stop.
