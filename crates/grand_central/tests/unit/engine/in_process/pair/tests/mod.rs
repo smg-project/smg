@@ -11,7 +11,7 @@ use smg_worker::{
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, Assignment, PolicySpec, RulePlaced},
+    document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
     engine::{
         decision::{Pair, Pick, PlacedBy, Target, Targets},
         decision_engine::{DecisionEngine, HeldDecode, RequestMaker, WorkerLists},
@@ -4839,6 +4839,41 @@ fn the_session_table_hears_the_dispatch_of_a_side_kept_from_the_profile() {
     let (places, words, heard) = served(&host, 7, Sent::Together);
     assert_eq!(places, (first.0, pair.decode_position as usize));
     assert_eq!((words, heard), ([ruled; 2], ends.to_vec()));
+}
+
+/// A guard's decode call dates the claim it makes by its pair's lease.
+/// The pair's first decision claims a decode for the key, and that
+/// decode is down at the call, a second later: the call claims the
+/// other decode. The guard's release for a refused commit is told under
+/// the pair's lease and takes the call's claim back. The key's next
+/// pair follows the decode the first decision claimed.
+#[test]
+fn a_guards_decode_call_claims_under_its_pairs_lease() {
+    let mut document = kept_document("round_robin", Assignment::Delegate, RulePlaced::Told);
+    let rule = document.bindings[0].sessions.as_mut();
+    // The claim made last leads the key's pins while it stands.
+    rule.expect("the pair's rule").recovery = Recovery::Latest;
+    let host = host_of(document, 2, 2);
+    let classes = every(2, 2);
+    let mut asks = host.asks(&classes, true);
+    asks.0.facts.session_key = Identity::hashed(7);
+    let now = Instant::now();
+    let guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now);
+    let mut guard = guard.expect("a decision");
+    let first = host.picked(guard.decision());
+    guard.dispatched(now);
+    let claimed = &host.decodes[first.1];
+    claimed.set_status(WorkerStatus::NotReady);
+    let call = now + Duration::from_secs(1);
+    let again = *guard.decide_decode_under(&asks, call).expect("a decision");
+    claimed.set_status(WorkerStatus::Ready);
+    let moved = host.picked(&again);
+    assert_eq!(moved.0, first.0, "the held prefill");
+    assert_ne!(moved.1, first.1, "the call claims the other decode");
+    guard.released(ReleaseReason::CommitFailed, call);
+    drop(guard);
+    let (next, _, _) = served(&host, 7, Sent::Together);
+    assert_eq!(next.1, first.1, "the call's claim left with its release");
 }
 
 /// A pair's pick of one prefill (worker 1) with two decodes (workers

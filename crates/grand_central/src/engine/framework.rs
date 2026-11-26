@@ -6830,7 +6830,7 @@ impl Engine {
             return Some(decision);
         };
         pick.session_verdict = SessionVerdict::Pinned;
-        match self.sessions.claim(key, pins, first) {
+        match self.sessions.claim(key, pins, first, facts.now_micros) {
             Claim::Made(id) => pick.session_verdict = SessionVerdict::Claimed(id),
             // A full table records nothing of the key.
             Claim::NoRoom => {}
@@ -7460,7 +7460,7 @@ impl Engine {
                     return decision;
                 }
                 let claim = if WRITE_SESSIONS {
-                    self.sessions.claim(key, pins, first)
+                    self.sessions.claim(key, pins, first, facts.now_micros)
                 } else if handed && found.stood {
                     // The live decision's claim was not taken: its shadow
                     // reads the pins the table held there against its own
@@ -8653,7 +8653,8 @@ impl Engine {
                     if let SessionVerdict::Claimed(claimed) = prefill_pick.session_verdict {
                         if claimed != prefill_target.id {
                             let (key, paired) = (prefill_facts.session(), prefill_target.id);
-                            *session_verdict = self.sessions.move_claim(key, claimed, paired);
+                            let at = prefill_facts.now_micros;
+                            *session_verdict = self.sessions.move_claim(key, claimed, paired, at);
                         }
                     }
                     // The prefill side's run met its key's pin at the cap
@@ -8686,8 +8687,8 @@ impl Engine {
         // No prefill paired: the claim the prefill side's run made is
         // withdrawn, and the key's next request is placed again.
         if let SessionVerdict::Claimed(claimed) = prefill_pick.session_verdict {
-            let key = prefill_facts.session();
-            self.sessions.move_claim(key, claimed, WorkerId(0));
+            let (key, at) = (prefill_facts.session(), prefill_facts.now_micros);
+            self.sessions.move_claim(key, claimed, WorkerId(0), at);
         }
         match last_shed {
             // The shed of the one decode a request names takes the
@@ -9045,6 +9046,11 @@ impl Engine {
     /// answers the decode it reaches, is shed under `target-worker` where
     /// that decode cannot be named, and is declined under that name where
     /// the number stands beside no places.
+    ///
+    /// Under a sessions rule the call may claim its decode for the decode
+    /// side's key, at this call's `now_micros`. A host that asks this entry
+    /// itself tells the side it issues under a lease that states that
+    /// instant, or none ([`Lease::issued_micros`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the request and the pair's pools, beside the pair the call is held by"
@@ -9197,14 +9203,20 @@ impl Engine {
     /// table, then the stages ([`Self::dispatched_stages`]), so a stage's
     /// call that unwinds leaves the table's entry written. Every teller of
     /// a dispatch keeps that order, the trait's own entry among them.
+    ///
+    /// The table is handed the instant the lease was issued under
+    /// ([`Lease::issued_micros`]). A dispatch elsewhere withdraws the claim
+    /// that lease's decision made, and no later decision's claim on the
+    /// same worker.
     pub(crate) fn dispatched_table(&self, lease: &Lease, target: &Target, side: Side) {
         let dispatched = match (side, target.pair) {
             (Side::Decode, Some(pair)) => pair.decode_id,
             _ => target.id,
         };
         if lease.session_verdict != SessionVerdict::None {
+            let (verdict, at) = (lease.session_verdict, lease.issued_micros);
             self.sessions
-                .dispatched(lease.session, lease.session_verdict, dispatched);
+                .dispatched(lease.session, verdict, dispatched, at);
         }
     }
 
@@ -9216,11 +9228,17 @@ impl Engine {
     /// the table each side a pair's release ends ahead of any stage, a
     /// decode stated for later among them: no stage hears that side's end,
     /// and the pair's first decision made its claim.
+    ///
+    /// The table is handed the instant the lease was issued under
+    /// ([`Lease::issued_micros`]). The claim that goes is the one that
+    /// lease's decision made: a refusal told late leaves a later decision's
+    /// claim on the same worker.
     pub(crate) fn released_table(&self, lease: &Lease, reason: ReleaseReason) {
         if reason == ReleaseReason::CommitFailed {
             if let SessionVerdict::Claimed(claimed) = lease.session_verdict {
+                let at = lease.issued_micros;
                 self.sessions
-                    .move_claim(lease.session, claimed, WorkerId(0));
+                    .move_claim(lease.session, claimed, WorkerId(0), at);
             }
         }
     }

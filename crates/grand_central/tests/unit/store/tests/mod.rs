@@ -604,7 +604,7 @@ fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> spec::AppliedSpec 
 fn pinned(store: &MemoryStore, key: u64, worker: WorkerId) {
     let world = store.snapshot();
     let table = world.spec().engine().sessions();
-    table.dispatched(Session::from_raw(key), SessionVerdict::Pinned, worker);
+    table.dispatched(Session::from_raw(key), SessionVerdict::Pinned, worker, 0);
 }
 
 /// The worker `key`'s first pin names in that table.
@@ -3997,6 +3997,9 @@ fn a_decode_take_back_looks_up_the_lease_once() {
 /// take-back put back names the first decision's decode again. The read is
 /// refused under the name its issue is refused under, it gives the file's
 /// turn back with its answer, and it moves nothing.
+///
+/// Last in the answer comes the instant the record's own lease states it
+/// was issued at.
 #[cfg(feature = "controller")]
 #[test]
 fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_took() {
@@ -4029,6 +4032,8 @@ fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_too
         if later {
             decode.state = LeaseState::Chosen;
         }
+        // Each lease is dated by its id, a thousand microseconds an id.
+        record.lease.issued_micros = id * 1_000;
         issue_pair(&store, (record, decode)).expect("the key is free");
     };
     for id in 1..=3 {
@@ -4055,8 +4060,8 @@ fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_too
     assert!(store.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
     assert!(store.dispatched(gateway, LeaseId(2), on(Side::Prefill, 2), now));
     assert!(store.dispatched(gateway, LeaseId(4), on(Side::Prefill, 0), now));
-    assert_eq!(held(gateway, 1), Ok((p, Some((d0, 2)))));
-    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)))));
+    assert_eq!(held(gateway, 1), Ok((p, Some((d0, 2)), 1_000)));
+    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)), 2_000)));
     // Each refusal by its name: another gateway's id, a prefill not sent,
     // a pair filed whole and a single's lease.
     assert_eq!(held(GatewayId(2), 1), Err(NoLease));
@@ -4078,7 +4083,7 @@ fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_too
     // Taken back, the side names the first decision's decode again, at the
     // target the prefill's dispatch took.
     assert!(store.take_back_decode(gateway, LeaseId(2), ReleaseReason::Abandoned));
-    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)))));
+    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)), 2_000)));
 }
 
 /// An undo takes back its own issue of a decode side and no other. Where a

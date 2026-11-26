@@ -380,7 +380,7 @@ fn a_keyed_lease_of_an_earlier_document_is_told_to_the_stage_kept_and_to_the_ses
         // document.
         let made = bed.store.with_snapshot(|world| {
             let table = world.spec().engine().sessions();
-            table.claim(KEY, [WorkerId(0); 2], WorkerId(7))
+            table.claim(KEY, [WorkerId(0); 2], WorkerId(7), 0)
         });
         assert_eq!(made, Claim::Made(WorkerId(7)));
         keyed(&bed.store, 1, 7, claimed, bed.now);

@@ -673,7 +673,12 @@ fn a_document_whose_engine_holds_a_key_is_not_handed_a_table() {
     document.generation = 1;
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     let made = spec.engine().sessions();
-    made.dispatched(Session::from_raw(71), SessionVerdict::Pinned, WorkerId(1));
+    made.dispatched(
+        Session::from_raw(71),
+        SessionVerdict::Pinned,
+        WorkerId(1),
+        0,
+    );
     assert_eq!(made.len(), 1);
     let engine = InProcess::new(spec);
     // A build with no debug check lets the key go with the table.

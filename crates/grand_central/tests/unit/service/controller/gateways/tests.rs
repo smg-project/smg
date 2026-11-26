@@ -718,7 +718,7 @@ async fn the_sweeps_task_ends_the_absence_of_a_key_that_stays_away() {
     let world = store.snapshot();
     let table = world.spec().engine().sessions();
     table.lookup(key, store.micros(left), &never);
-    table.dispatched(key, SessionVerdict::Pinned, w);
+    table.dispatched(key, SessionVerdict::Pinned, w, 0);
     assert_eq!(held(), Some(w), "inside its time");
     let (stop, stopped) = watch::channel(false);
     let mut task = JoinSet::new();

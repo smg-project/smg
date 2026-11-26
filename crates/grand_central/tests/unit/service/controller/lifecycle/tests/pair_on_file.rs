@@ -448,11 +448,14 @@ fn a_decodes_release_behind_a_dispatch_elsewhere_takes_back_no_claim() {
         bed.store.deciding(read).unwrap_or_default()
     };
     // A decision of the key that read its pins as they stand claims `on`.
+    // Every claim is dated as the bed's leases are: the word the file
+    // lends tells a side's own claim from a later decision's here, and no
+    // date does.
     let claims = |on: WorkerId| {
         let seen = pins();
         let claim = |world: &StoreSnapshot| {
             let table = world.spec().engine().sessions();
-            table.claim(DECODE_KEY, seen, on)
+            table.claim(DECODE_KEY, seen, on, ISSUED_MICROS)
         };
         assert_eq!(bed.store.deciding(claim), Claim::Made(on));
     };

@@ -2242,6 +2242,13 @@ pub(crate) struct DecodeIssue(u8);
 #[cfg(feature = "controller")]
 type Replaced = (DecodeSide, Instant);
 
+/// What a decode call reads of the lease it names
+/// ([`MemoryStore::held_pair`]). The held prefill's worker comes first,
+/// then the worker and the rank of the decode its first decision chose.
+/// Last comes the instant the lease was issued at.
+#[cfg(feature = "controller")]
+pub(crate) type HeldPair = (WorkerId, Option<(WorkerId, u16)>, u64);
+
 impl FiledDecode {
     /// `side` as a door files it with `booked`, the slot of its worker's
     /// count. Only a live side books a count at filing.
@@ -3348,6 +3355,10 @@ impl MemoryStore {
     /// target, or the one that dispatch named. The call reads this before
     /// it decides, and its issue tests the same again under its own turn.
     ///
+    /// Last comes the instant the lease was issued at, as the record's own
+    /// lease states it (`Lease::issued_micros`). Every word of the lease is
+    /// told under that date, and a claim the call makes is dated by it.
+    ///
     /// # Errors
     ///
     /// Why the lease takes no decode side: the test of an issue
@@ -3357,10 +3368,13 @@ impl MemoryStore {
         &self,
         gateway: GatewayId,
         lease: LeaseId,
-    ) -> Result<(WorkerId, Option<(WorkerId, u16)>), DecodeRefused> {
+    ) -> Result<HeldPair, DecodeRefused> {
         self.turn_of(self.file_of(lease))
             .chosen_decode(&(gateway, lease))
-            .map(|(held, decode)| (held.record.target, decode.taken_decode()))
+            .map(|(held, decode)| {
+                let issued_micros = held.record.lease.issued_micros;
+                (held.record.target, decode.taken_decode(), issued_micros)
+            })
     }
 
     /// The one issue behind the doors: a single's lease with no `pair`,

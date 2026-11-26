@@ -682,7 +682,7 @@ fn a_draw_that_loses_its_claim_leads_with_the_claimed_worker_or_answers_nothing(
             }
             asked += 1;
             if asked == 2 {
-                let claim = engine.sessions.claim(key, [WorkerId(0); 2], other);
+                let claim = engine.sessions.claim(key, [WorkerId(0); 2], other, 0);
                 assert_eq!(claim, Claim::Made(other));
             }
         };
@@ -701,6 +701,53 @@ fn a_draw_that_loses_its_claim_leads_with_the_claimed_worker_or_answers_nothing(
             assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
         }
     }
+}
+
+/// A draw that claims dates its claim by its decision's instant, as the
+/// whole decision does. The refusal of a lease issued at another instant
+/// leaves the claim, and the refusal of the decision's own lease takes it
+/// back.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_draw_that_claims_dates_its_claim_by_its_decisions_instant() {
+    let engine = session_engine_of(round_robin_profile(), SESSIONS);
+    let fixed = pool_of(20, |_| false);
+    let word = AtomicU64::new(3);
+    let pool = PoolFacts {
+        word: Some(&word),
+        ..PoolFacts::default()
+    };
+    let facts = RequestFacts {
+        session_key: Identity::hashed(41),
+        now_micros: 500,
+        ..request(0)
+    };
+    let drawn = engine.drawn_for(&facts, &pool, fixed.len());
+    let mut rows = vec![Candidate::default(); fixed.len()];
+    let decision = engine.decide_claimed(
+        drawn.expect("a draw that claims"),
+        &facts,
+        &pool,
+        &fixed,
+        &mut rows,
+        &mut |head: &Candidate, row: &mut Candidate| *row = *head,
+        &Constraints::default(),
+        &mut Scratch::new(),
+    );
+    let pick = decision.as_ref().and_then(Decision::pick).expect("a pick");
+    let claimed = pick.targets.first().expect("a target").id;
+    assert_eq!(pick.session_verdict, SessionVerdict::Claimed(claimed));
+    let pins = || engine.sessions().pins(facts.session());
+    let lease = |issued_micros: u64| Lease {
+        session: facts.session(),
+        session_verdict: pick.session_verdict,
+        issued_micros,
+        ..Lease::default()
+    };
+    engine.on_released(&lease(501), ReleaseReason::CommitFailed);
+    assert_eq!(pins(), Some([claimed, WorkerId(0)]), "another instant");
+    engine.on_released(&lease(500), ReleaseReason::CommitFailed);
+    assert_eq!(pins(), Some([WorkerId(0); 2]), "its own lease");
 }
 
 #[test]
