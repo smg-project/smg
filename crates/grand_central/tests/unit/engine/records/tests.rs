@@ -1073,6 +1073,86 @@ fn a_decision_that_holds_another_snapshot_reads_its_own_reports() {
 }
 
 #[test]
+fn a_decision_that_waited_ahead_of_the_claim_leaves_the_rows_of_a_later_decision() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let workers = fleet(2);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let mut rows = Vec::new();
+    let begun = Instant::now();
+    let at = |millis: u64| begun + Duration::from_millis(millis);
+    let (first, _) = reports(&[100, 200], Duration::from_millis(40));
+    let (older, _) = reports(&[300, 400], Duration::from_millis(30));
+    let (newer, _) = reports(&[900, 950], Duration::from_millis(10));
+
+    // The list holds the first snapshot's rows.
+    let live = Live::at(spec.engine(), &clock, at(1), Some(&first), None);
+    let _ = pool.write(&workers, &live, &mut rows);
+    assert_eq!(pool.conversions(), 1);
+
+    // A decision under the older of the two snapshots that follow began
+    // after those rows were converted, so it may convert. It has read the
+    // slot and has not taken the list's claim yet.
+    let waiting = Live::at(spec.engine(), &clock, at(2), Some(&older), None);
+    let read_first = pool.reported.load();
+
+    // Meanwhile a decision that began later converts the newer snapshot.
+    let live = Live::at(spec.engine(), &clock, at(3), Some(&newer), None);
+    let _ = pool.write(&workers, &live, &mut rows);
+    let converted = held(&pool).expect("the rows of the newer snapshot");
+    assert!(converted.is_of(&newer));
+    assert_eq!(pool.conversions(), 2);
+
+    // The decision that waited goes on with what it read and pays the
+    // list's length, as one that writes every record does. Under the claim it
+    // finds the rows of a decision that began later: it converts nothing and
+    // leaves them in place.
+    let again = pool.convert(&workers, &older, &waiting, &read_first, 2);
+    assert_eq!(pool.conversions(), 2, "its snapshot is no newer");
+    assert!(again.is_none());
+    assert!(Arc::ptr_eq(
+        &converted,
+        &held(&pool).expect("the same rows")
+    ));
+
+    // It writes its records from its own snapshot all the same.
+    let (written, _) = pool.write(&workers, &waiting, &mut rows);
+    assert_eq!(
+        written[0].load.expect("a report").waiting_uncached_tokens,
+        300
+    );
+    assert_eq!(
+        written[1].load.expect("a report").waiting_uncached_tokens,
+        400
+    );
+    assert_eq!(pool.conversions(), 2);
+
+    // So the next decision under the newer snapshot converts nothing.
+    let live = Live::at(spec.engine(), &clock, at(4), Some(&newer), None);
+    let (written, _) = pool.write(&workers, &live, &mut rows);
+    assert_eq!(
+        written[0].load.expect("a report").waiting_uncached_tokens,
+        900
+    );
+    assert_eq!(pool.conversions(), 2);
+
+    // The rule is of the two instants alone. With the same read, a decision
+    // that began at the instant of the rows' conversion converts nothing,
+    // and one that began later converts its own snapshot.
+    let equal = Live::at(spec.engine(), &clock, at(3), Some(&older), None);
+    assert!(pool
+        .convert(&workers, &older, &equal, &read_first, 2)
+        .is_none());
+    assert_eq!(pool.conversions(), 2);
+    let later = Live::at(spec.engine(), &clock, at(5), Some(&older), None);
+    let replaced = pool
+        .convert(&workers, &older, &later, &read_first, 2)
+        .expect("a decision that began later converts");
+    assert!(replaced.is_of(&older));
+    assert_eq!(pool.conversions(), 3);
+}
+
+#[test]
 fn a_decision_that_meets_a_conversion_under_way_converts_nothing_and_waits_for_nothing() {
     let spec = applied("least_load");
     let clock = DecisionClock::new();

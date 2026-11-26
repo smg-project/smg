@@ -1237,7 +1237,9 @@ impl PoolRecords {
     ///
     /// A decision that began no later than the decision that converted
     /// the list's rows holds a snapshot no newer than theirs, and does not
-    /// replace them.
+    /// replace them. That holds for the rows it read as `held` and for the
+    /// rows it finds under the claim, where another decision left them
+    /// since: it converts nothing and counts nothing.
     ///
     /// The conversion is one look-up of each worker's address in the
     /// snapshot, one conversion of each report, and one allocation of the
@@ -1264,6 +1266,14 @@ impl PoolRecords {
         let again = self.reported.load();
         if let Some(reported) = again.as_ref().filter(|reported| reported.is_of(loads)) {
             return Some(Arc::clone(reported));
+        }
+        // The same rule again, for rows another decision left since `held`
+        // was read.
+        if again
+            .as_deref()
+            .is_some_and(|reported| live.now_micros <= reported.since_micros)
+        {
+            return None;
         }
         if !claim.paid(loads, looked_up, self.fixed.len()) {
             return None;
