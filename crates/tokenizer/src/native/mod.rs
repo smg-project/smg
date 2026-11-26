@@ -426,8 +426,10 @@ const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
 /// Inputs at least this long are encoded unit by unit on the thread pool (a
 /// text between added tokens, or a chunk of one cut at a stable boundary)
-/// when the pool has more than one thread (see `worth_the_pool`); shorter
-/// inputs would spend more on the hand-offs than they save.
+/// when the pool has more than one thread (see `worth_the_pool`), or whole
+/// on one of its threads while it is full (`NativeEncoder::encode_units`,
+/// under `CUT_ALWAYS_MIN_BYTES`); shorter inputs would spend more on the
+/// hand-offs than they save.
 const PARALLEL_MIN_BYTES: usize = 64 << 10;
 /// A thread's first text at least this long has the merge table read before
 /// it (`NativeEncoder::piece_cache_for_text`): the read is half the time of
@@ -460,8 +462,9 @@ fn processors() -> usize {
     std::thread::available_parallelism().map_or(usize::MAX, usize::from)
 }
 
-/// A thread inside a long text (`NativeEncoder::inside`). The count gives
-/// it up on drop, so an encode that unwinds leaves the count right.
+/// A thread inside a long text (`NativeEncoder::inside`) or a long text in
+/// flight (`NativeEncoder::long_texts`). The count gives it up on drop, so
+/// an encode that unwinds leaves the count right.
 struct Inside<'a>(&'a AtomicUsize);
 
 impl Drop for Inside<'_> {
@@ -469,6 +472,10 @@ impl Drop for Inside<'_> {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
+/// A text at least this long is cut for the pool however many long texts
+/// are in flight (`NativeEncoder::encode_units`): the whole-text rule was
+/// measured under it.
+const CUT_ALWAYS_MIN_BYTES: usize = 256 << 10;
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
@@ -1885,8 +1892,14 @@ pub(crate) struct NativeEncoder {
     processors: usize,
     /// The threads that encode the units of a long text of their own now
     /// (`READ_BACK_MIN_BYTES` or more): no unit on the pool, and no thread
-    /// that still normalizes or cuts its text or waits for the pool.
+    /// that still normalizes or cuts its text or waits for the pool. A text
+    /// that a pool thread takes whole (`Self::encode_units`) counts as that
+    /// thread's own.
     inside: AtomicUsize,
+    /// The texts this encoder has with a pool now, cut into units for its
+    /// threads or taken whole by one of them: one count, whichever pool
+    /// each went to.
+    long_texts: AtomicUsize,
 }
 
 impl std::fmt::Debug for NativeEncoder {
@@ -2011,6 +2024,7 @@ impl NativeEncoder {
             load_read: OnceLock::new(),
             processors: processors(),
             inside: AtomicUsize::new(0),
+            long_texts: AtomicUsize::new(0),
         })
     }
 
@@ -2096,6 +2110,7 @@ impl NativeEncoder {
             load_read: OnceLock::new(),
             processors: processors(),
             inside: AtomicUsize::new(0),
+            long_texts: AtomicUsize::new(0),
         })
     }
 
@@ -2835,6 +2850,7 @@ impl NativeEncoder {
             load_read: OnceLock::new(),
             processors: processors(),
             inside: AtomicUsize::new(0),
+            long_texts: AtomicUsize::new(0),
         })
     }
 
@@ -3113,8 +3129,9 @@ impl NativeEncoder {
     /// `tokenizers` instead, for the caller to count: a piece the model
     /// declines, found after the pieces before it were tokenized, so that
     /// the error surfaces from the `tokenizers` encode. A long input is
-    /// encoded on the thread pool, unit by unit (see [`Self::units`]), with
-    /// the same code per unit, when the pool has more than one thread (see
+    /// encoded on the thread pool, unit by unit (see [`Self::units`]) or
+    /// whole on one of its threads (see [`Self::encode_units`]), with the
+    /// same code per unit, when the pool has more than one thread (see
     /// [`Self::worth_the_pool`]). `model` is the model behind the vocabulary,
     /// read for the whole-piece lookup of `ignore_merges` and for the
     /// pieces of a model whose merge table declined; `None` for a
@@ -3209,7 +3226,23 @@ impl NativeEncoder {
         } else {
             (&[], &[])
         };
-        if parallel && units.len() >= 2 {
+        let pooled = parallel && units.len() >= 2;
+        let in_flight = pooled.then(|| {
+            let ahead = self.long_texts.fetch_add(1, Ordering::Relaxed);
+            (Inside(&self.long_texts), ahead + 1)
+        });
+        // While this encoder has more texts with a pool than the pool this
+        // text goes to has threads (one count over every pool, this text
+        // in it), a text of long units is taken whole, its units in order
+        // on one pool thread: taken by every thread, they wait behind those
+        // of the other texts. A text cut finer goes as it did.
+        let whole = in_flight.as_ref().is_some_and(|&(_, with_this)| {
+            text.len() < CUT_ALWAYS_MIN_BYTES
+                && units.len() * OWN_UNIT_MIN_BYTES <= text.len()
+                && rayon::current_thread_index().is_none()
+                && with_this > rayon::current_num_threads()
+        });
+        if pooled && !whole {
             // One Vec per unit, reserved for its text's estimate up front
             // (see `ids_capacity`: a denser unit grows past it by doubling)
             // and filled in place, then joined; the pool's collection makes
@@ -3325,6 +3358,8 @@ impl NativeEncoder {
                     "a unit of the text was left unread"
                 );
             }
+            // The pool is through with this text; the join is the caller's.
+            drop(in_flight);
             let body: usize = parts.iter().map(Vec::len).sum();
             let mut ids = Vec::with_capacity(before.len() + body + after.len());
             ids.extend_from_slice(before);
@@ -3334,30 +3369,39 @@ impl NativeEncoder {
             ids.extend_from_slice(after);
             return Ok(ids);
         }
-        let mut ids = Vec::with_capacity(before.len() + text.len() / 3 + 8 + after.len());
-        ids.extend_from_slice(before);
-        let mut cache = self.piece_cache_for_text(text.len());
-        // Only while more threads are inside a long text than the process
-        // has processors, and the clock is read only then. Not for a unit
-        // on the pool: it is no text of its thread.
-        let inside = (text.len() >= READ_BACK_MIN_BYTES).then(|| {
-            let others = self.inside.fetch_add(1, Ordering::Relaxed);
-            (Inside(&self.inside), others)
-        });
-        match &inside {
-            Some((_, others)) if *others >= self.processors => {
-                if cache.reads_back(Instant::now(), text.len()) {
-                    cache.packed.read_through();
+        let on_one_thread = || -> Result<Vec<u32>, Fallback> {
+            let mut ids = Vec::with_capacity(before.len() + text.len() / 3 + 8 + after.len());
+            ids.extend_from_slice(before);
+            let mut cache = self.piece_cache_for_text(text.len());
+            // Only while more threads are inside a long text than the process
+            // has processors, and the clock is read only then. Not for a unit
+            // on the pool: it is no text of its thread.
+            let inside = (text.len() >= READ_BACK_MIN_BYTES).then(|| {
+                let others = self.inside.fetch_add(1, Ordering::Relaxed);
+                (Inside(&self.inside), others)
+            });
+            match &inside {
+                Some((_, others)) if *others >= self.processors => {
+                    if cache.reads_back(Instant::now(), text.len()) {
+                        cache.packed.read_through();
+                    }
                 }
+                // A long text run with a processor to spare: the next gap is
+                // not measured across it.
+                Some(_) => cache.last_long = None,
+                None => {}
             }
-            // A long text run with a processor to spare: the next gap is
-            // not measured across it.
-            Some(_) => cache.last_long = None,
-            None => {}
+            self.encode_serial(model, units, words, at_start, &mut ids, &mut cache)?;
+            ids.extend_from_slice(after);
+            Ok(ids)
+        };
+        if whole {
+            // A scope entered from outside the pool runs on one of its
+            // threads, and the caller sleeps until it ends.
+            rayon::scope(|_| on_one_thread())
+        } else {
+            on_one_thread()
         }
-        self.encode_serial(model, units, words, at_start, &mut ids, &mut cache)?;
-        ids.extend_from_slice(after);
-        Ok(ids)
     }
 
     /// The units of one call encoded in order onto `ids`, on `cache`: the

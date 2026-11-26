@@ -5016,6 +5016,46 @@ fn callers_of_long_texts_alone_are_not_counted() {
     assert!(native.learned.get().is_none(), "no table is made");
 }
 
+/// A long text that meets as many in flight as the pool has threads is
+/// encoded whole on one of the pool's threads: that thread alone takes a
+/// cache, and notes the text in it as only the serial tail does.
+#[test]
+fn a_full_pool_takes_a_long_text_whole() {
+    let (tokenizer, mut native) = waiting_fixture();
+    // The tail notes a long text while every processor is inside one.
+    native.processors = 1;
+    native.inside.store(1, Ordering::Relaxed);
+    let mut state = 0x5EED_0000_0000_0009u64;
+    let text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
+    native
+        .long_texts
+        .store(rayon::current_num_threads(), Ordering::Relaxed);
+    let model = tokenizer.get_model();
+    let ids = native
+        .encode_with(Some(model), &text, true, false)
+        .expect("ids");
+    assert_eq!(native.threads.load(Ordering::Relaxed), 1, "taken whole");
+    assert_eq!(native.callers.load(Ordering::Relaxed), 0, "by the pool");
+    assert_eq!(
+        native.long_texts.load(Ordering::Relaxed),
+        rayon::current_num_threads(),
+        "the text gave its count back"
+    );
+    let noted = native
+        .piece_cache
+        .iter_mut()
+        .any(|cache| cache.get_mut().last_long.is_some());
+    assert!(noted, "in the serial tail");
+    // Last: the serial encode takes a cache of the calling thread.
+    let serial = native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    assert!(
+        ids == serial,
+        "the whole text's ids are not those of one thread"
+    );
+}
+
 /// A waiting piece is merged under its own flag, not the flag of the unit
 /// being encoded when its answer comes, and that unit's flag is as it was.
 #[test]
