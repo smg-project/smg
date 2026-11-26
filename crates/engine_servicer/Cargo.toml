@@ -23,6 +23,7 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 # `tower/log` and `tracing/log` for every crate in the graph, so the gRPC
 # stack's per-frame tracing events would pay the `log` facade too.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true

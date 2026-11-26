@@ -46,6 +46,12 @@ def register():
     if role == "encoder":
         hooks = [
             (f"{_ENCODER}.__init__", encoder_initialized, HookType.AFTER),
+            (
+                f"{_ENCODER}._calculate_hashes_from_features",
+                reuse_materialized_feature_hashes,
+                HookType.AROUND,
+            ),
+            (f"{_ENCODER}._compute_direct_embedding", cached_direct_embedding, HookType.AROUND),
             (f"{_ENCODER}._compute_embedding", await_encoder_forward, HookType.AROUND),
         ]
     else:
@@ -116,6 +122,37 @@ def load_role_hooks():
     HookRegistry.apply_hooks()
 
 
+def reuse_materialized_feature_hashes(original, encoder, mm_feature, *args, **kwargs):
+    """Reuse Rust-derived per-item keys without re-hashing unpacked pixel tensors.
+
+    Supports both sglang 0.5.23+ ``(mm_feature, preprocess_result, modality)`` and
+    sglang v0.5.21 ``(mm_feature, grid_thw, modality, mm_inputs=None)`` signatures.
+    """
+    preprocess_or_grid = args[0] if args else kwargs.get("preprocess_result")
+    keys = getattr(preprocess_or_grid, "_smg_item_keys", None)
+    if keys is not None:
+        grid_thw = getattr(preprocess_or_grid, "grid_thw", None)
+        if grid_thw is not None and len(keys) == len(grid_thw):
+            return list(keys)
+    mm_inputs = args[2] if len(args) >= 3 else kwargs.get("mm_inputs")
+    if isinstance(mm_inputs, dict):
+        keys = mm_inputs.get("_smg_item_keys")
+    else:
+        keys = getattr(mm_inputs, "_smg_item_keys", None)
+    grid_thw = args[0] if args else kwargs.get("grid_thw")
+    if keys is not None and grid_thw is not None and len(keys) == len(grid_thw):
+        return list(keys)
+    return original(encoder, mm_feature, *args, **kwargs)
+
+
+async def cached_direct_embedding(original, encoder, ctx, *args, **kwargs):
+    """Serve per-item cached image embeddings around ``MMEncoder._compute_direct_embedding``."""
+    from .epd_encoder import cached_compute_direct_embedding
+
+    keep_on_gpu = kwargs.get("keep_on_gpu", args[0] if args else False)
+    return await cached_compute_direct_embedding(original, encoder, ctx, keep_on_gpu=keep_on_gpu)
+
+
 async def await_encoder_forward(original, encoder, *args, **kwargs):
     """Retain dispatch/encode owners while GPU readiness waits outside the control loop."""
     result = await original(encoder, *args, **kwargs)
@@ -138,12 +175,12 @@ async def await_encoder_forward(original, encoder, *args, **kwargs):
 def encoder_initialized(result, encoder, *args, **kwargs):
     """AFTER ``MMEncoder.__init__``: install the managed Rust preprocessor bridge."""
     from .epd_encoder import install_bridge
-    from .epd_launcher import MAX_CONTEXT_BYTES, PROCESSOR_CONTRACT
+    from .epd_launcher import PROCESSOR_CONTRACT, resolve_max_context_bytes
 
     # Per-request artifacts are bounded by config["max_artifact_bytes"] in ManagedEncoderServer
     # and serve_native; RustPreprocessorBridge bounds the fused multi-request batch total across
     # all TP ranks (including spawned followers initialized before serve() computes per-model caps).
-    install_bridge(encoder, PROCESSOR_CONTRACT, MAX_CONTEXT_BYTES)
+    install_bridge(encoder, PROCESSOR_CONTRACT, resolve_max_context_bytes())
     return None
 
 

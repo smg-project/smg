@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use engine_zmq_adapter::ZmqEngineClient;
+use engine_zmq_adapter::{ManagedExternalEncode, ZmqEngineClient};
 use futures::{Stream, StreamExt};
 use prost::Message;
 use smg_grpc_client::{
@@ -102,10 +102,11 @@ pub(super) fn generate(
             "prepared metadata exceeds byte limit",
         ));
     }
-    let control = proto::PrefillStart::decode(request.prepared_control.as_slice())
+    let mut control = proto::PrefillStart::decode(request.prepared_control.as_slice())
         .map_err(|_| Status::invalid_argument("malformed prepared control"))?;
     let binding = control
         .binding
+        .take()
         .ok_or_else(|| Status::invalid_argument("missing prepared binding"))?;
     validate_binding(&binding)?;
     if control.version != VERSION
@@ -134,20 +135,8 @@ pub(super) fn generate(
         if request.request_id != binding.prefill_rid || !request.prepared_input.is_empty() {
             return Err(Status::invalid_argument("invalid prepared prefill request"));
         }
-        let total_items = control.image_count.saturating_add(control.video_count);
-        if total_items as usize > limits.images
-            || (total_items > 0 && control.encoder_receive_endpoint.is_empty())
-        {
-            return Err(Status::invalid_argument("invalid prepared encode plan"));
-        }
-        (
-            Some((
-                control.encoder_receive_endpoint,
-                control.image_count,
-                control.video_count,
-            )),
-            None,
-        )
+        let external = parse_external_encode(&control, limits)?;
+        (Some(external), None)
     } else {
         if request.request_id != binding.decode_rid || request.prepared_input.is_empty() {
             return Err(Status::invalid_argument("invalid prepared decode request"));
@@ -172,11 +161,70 @@ pub(super) fn generate(
     )
 }
 
+/// Validate `PrefillStart` encoder endpoints and per-encoder modality counts.
+fn parse_external_encode(
+    control: &proto::PrefillStart,
+    limits: Limits,
+) -> Result<ManagedExternalEncode, Status> {
+    let total_items = control.image_count.saturating_add(control.video_count);
+    if total_items as usize > limits.images {
+        return Err(Status::invalid_argument("invalid prepared encode plan"));
+    }
+    if control.encoder_receive_endpoints.is_empty() {
+        if !control.encoder_image_counts.is_empty()
+            || !control.encoder_video_counts.is_empty()
+            || (total_items > 0 && control.encoder_receive_endpoint.is_empty())
+        {
+            return Err(Status::invalid_argument("invalid prepared encode plan"));
+        }
+        return Ok(ManagedExternalEncode::single(
+            control.encoder_receive_endpoint.clone(),
+            control.image_count,
+            control.video_count,
+        ));
+    }
+    let num_encoders = control.encoder_receive_endpoints.len();
+    if total_items == 0
+        || num_encoders > total_items as usize
+        || control
+            .encoder_receive_endpoints
+            .iter()
+            .any(String::is_empty)
+    {
+        return Err(Status::invalid_argument("invalid prepared encode plan"));
+    }
+    let valid_counts = |expected: u32, counts: &[u32]| -> bool {
+        if expected == 0 {
+            counts.is_empty()
+        } else {
+            counts.len() == num_encoders
+                && counts.iter().try_fold(0u32, |acc, &n| acc.checked_add(n)) == Some(expected)
+        }
+    };
+    if !valid_counts(control.image_count, &control.encoder_image_counts)
+        || !valid_counts(control.video_count, &control.encoder_video_counts)
+    {
+        return Err(Status::invalid_argument("invalid prepared encode plan"));
+    }
+    for idx in 0..num_encoders {
+        let img = control.encoder_image_counts.get(idx).copied().unwrap_or(0);
+        let vid = control.encoder_video_counts.get(idx).copied().unwrap_or(0);
+        if img == 0 && vid == 0 {
+            return Err(Status::invalid_argument("invalid prepared encode plan"));
+        }
+    }
+    Ok(ManagedExternalEncode {
+        encoder_urls: control.encoder_receive_endpoints.clone(),
+        image_counts: control.encoder_image_counts.clone(),
+        video_counts: control.encoder_video_counts.clone(),
+    })
+}
+
 /// Validated request passed from prepared admission to its independent native owner.
 pub(crate) struct PreparedRequest {
     pub(crate) request: sg::GenerateRequest,
     pub(crate) binding: proto::InputBinding,
-    pub(crate) external: Option<(String, u32, u32)>,
+    pub(crate) external: Option<ManagedExternalEncode>,
     pub(crate) manifest: Option<Box<proto::PreparedDecodeInput>>,
     pub(crate) deadline: Instant,
 }
@@ -530,11 +578,8 @@ async fn run_native(
         );
         return (true, false);
     }
-    let ext_ref = external
-        .as_ref()
-        .map(|(ep, imgs, vids)| (ep.as_str(), *imgs, *vids));
     let mut native = match client
-        .generate_sglang_managed(request, &binding, ext_ref, manifest.as_deref())
+        .generate_sglang_managed(request, &binding, external.as_ref(), manifest.as_deref())
         .await
     {
         Ok(stream) => stream,
@@ -551,7 +596,7 @@ async fn run_native(
     let mut stalled = output.is_closed();
     let needs_layout = external
         .as_ref()
-        .is_some_and(|(_, imgs, vids)| *imgs > 0 || *vids > 0);
+        .is_some_and(ManagedExternalEncode::has_media);
     let mut native_finished = false;
     let mut pending = Vec::new();
     let active_deadline = external.is_some().then_some(deadline);

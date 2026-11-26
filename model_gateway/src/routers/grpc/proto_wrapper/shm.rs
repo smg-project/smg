@@ -403,6 +403,136 @@ fn collect_vllm_tensor_shm_handles(
 /// (see [`next_tokenspeed_shm_name`]). Cleanup only ever unlinks names
 /// carrying this prefix so it cannot remove unrelated `/dev/shm` entries.
 const TOKENSPEED_SHM_NAME_PREFIX: &str = "smg-tokenspeed-";
+const EPD_SHM_NAME_PREFIX: &str = "smg-epd-";
+static EPD_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// RAII handle for a `/dev/shm` segment carrying preprocessed EPD pixel tensors.
+/// Unlinks the segment on drop unless ownership was explicitly transferred via [`Self::into_parts`].
+#[derive(Debug)]
+pub struct EpdShmGuard {
+    name: String,
+    path: Option<PathBuf>,
+    nbytes: usize,
+}
+
+impl EpdShmGuard {
+    /// Return the segment basename under `/dev/shm`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Return the allocated payload size in bytes.
+    pub fn nbytes(&self) -> usize {
+        self.nbytes
+    }
+
+    /// Transfer ownership of the `/dev/shm` file to another guard (disarming local unlink-on-drop).
+    pub fn into_parts(mut self) -> (String, PathBuf, usize) {
+        let path = self
+            .path
+            .take()
+            .unwrap_or_else(|| tokenspeed_shm_path(&self.name));
+        (self.name.clone(), path, self.nbytes)
+    }
+}
+
+impl Drop for EpdShmGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = remove_file(&path);
+        }
+    }
+}
+
+/// Remove orphaned `smg-epd-*` segments left behind by dead producer PIDs once per process.
+fn sweep_orphan_epd_shm_once() {
+    static SWEEP: OnceLock<()> = OnceLock::new();
+    SWEEP.get_or_init(|| {
+        let dir = Path::new("/dev/shm");
+        let Ok(entries) = read_dir(dir) else {
+            return;
+        };
+        let my_pid = process::id();
+        let mut removed = 0u32;
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix(EPD_SHM_NAME_PREFIX) else {
+                continue;
+            };
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid == my_pid || Path::new(&format!("/proc/{pid}")).exists() {
+                continue;
+            }
+            if remove_file(dir.join(name)).is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::warn!(
+                count = removed,
+                "Swept orphaned EPD SHM files from dead producer processes"
+            );
+        }
+    });
+}
+
+/// Allocate a unique `/dev/shm` segment basename prefixed with `smg-epd-`.
+fn next_epd_shm_name() -> String {
+    let seq = EPD_SHM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}{}-{}-{}", EPD_SHM_NAME_PREFIX, process::id(), nanos, seq)
+}
+
+/// Create a private `/dev/shm/smg-epd-...` segment, write `nbytes` directly into its mapping,
+/// and return an RAII [`EpdShmGuard`] that unlinks the segment on error or cancellation.
+#[expect(
+    unsafe_code,
+    reason = "mapping a new, exclusively owned, fixed-length EPD SHM file"
+)]
+pub fn write_epd_shm_with(
+    nbytes: usize,
+    write_fn: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+) -> std::io::Result<EpdShmGuard> {
+    sweep_orphan_epd_shm_once();
+    let name = next_epd_shm_name();
+    let path = tokenspeed_shm_path(&name);
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&path)?;
+    let result = if nbytes == 0 {
+        write_fn(&mut [])
+    } else {
+        reserve_tokenspeed_shm_file(&file, nbytes).and_then(|()| {
+            // SAFETY: this process exclusively owns the newly created file,
+            // reserves its full length before mapping, and does not expose or
+            // truncate it until the callback and mapping have both dropped.
+            let mut mapping = unsafe { MmapOptions::new().len(nbytes).map_mut(&file)? };
+            write_fn(&mut mapping)
+        })
+    };
+    if let Err(error) = result {
+        let _ = remove_file(&path);
+        return Err(error);
+    }
+    Ok(EpdShmGuard {
+        name,
+        path: Some(path),
+        nbytes,
+    })
+}
 
 fn validate_tokenspeed_shm_name_for_cleanup(name: &str) -> Option<&str> {
     let name = name.strip_prefix('/').unwrap_or(name);

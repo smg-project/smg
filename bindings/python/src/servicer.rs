@@ -2067,7 +2067,9 @@ impl PyManagedEncoderServer {
         tokenizer_dir: String,
         max_artifact_bytes: usize,
     ) -> PyResult<Self> {
-        use engine_servicer::sglang::encoder::{EncoderArtifact, EncoderProcessor};
+        use engine_servicer::sglang::encoder::{
+            EncoderArtifact, EncoderPayload, EncoderProcessor, NativeBatchMeta, ShmGuard,
+        };
         let native = native_media_options(&options, "managed-encoder")?;
         if max_artifact_bytes == 0
             || native.max_inflight == 0
@@ -2113,29 +2115,48 @@ impl PyManagedEncoderServer {
                                 })
                             })
                             .collect::<Result<Vec<_>, tonic::Status>>()?;
-                        let (_, inputs, extras) = pipeline
-                            .process_sglang_encoder_items(items)
+                        let compact = pipeline
+                            .process_sglang_encoder_compact(items, max_artifact_bytes)
                             .await
                             .map_err(worker_media_error_to_status)?;
-                        let embedding_tokens = std::iter::once(&inputs)
-                            .chain(extras.iter())
-                            .flat_map(|batch| batch.mm_placeholders.iter())
-                            .map(|item| u64::from(item.length))
-                            .sum();
-                        let artifact = smg_grpc_client::sglang_proto::GenerateRequest {
-                            mm_inputs: Some(Box::new(inputs)),
-                            extra_mm_inputs: extras,
-                            ..Default::default()
+                        let (shm_name, shm_nbytes, shm_guard) = match compact.shm_guard {
+                            Some(guard) => {
+                                let (name, path, nbytes) = guard.into_parts();
+                                (Some(name), nbytes, Some(ShmGuard::new(path)))
+                            }
+                            None => (None, 0, None),
                         };
-                        let encoded_len = artifact.encoded_len();
-                        if encoded_len > max_artifact_bytes {
-                            return Err(tonic::Status::invalid_argument(format!(
-                                "managed CPU artifact exceeds byte budget ({encoded_len} > {max_artifact_bytes} bytes)"
-                            )));
-                        }
+                        let batches = compact
+                            .batches
+                            .into_iter()
+                            .map(|batch| {
+                                let (second_per_grid_ts, second_per_grid_shape) =
+                                    match batch.second_per_grid_ts {
+                                        Some((data, shape)) => (Some(data), shape),
+                                        None => (None, Vec::new()),
+                                    };
+                                NativeBatchMeta {
+                                    pixel_dtype: batch.pixel_dtype,
+                                    pixel_shape: batch.pixel_shape,
+                                    pixel_offset: batch.pixel_offset,
+                                    pixel_nbytes: batch.pixel_nbytes,
+                                    grid_thw: batch.grid_thw,
+                                    placeholder_lengths: batch.placeholder_lengths,
+                                    second_per_grid_ts,
+                                    second_per_grid_shape,
+                                    item_hashes: batch.item_hashes,
+                                }
+                            })
+                            .collect();
                         Ok(EncoderArtifact {
-                            bytes: artifact.encode_to_vec().into(),
-                            embedding_tokens,
+                            payload: EncoderPayload::Compact {
+                                batches,
+                                shm_name,
+                                shm_nbytes,
+                                shm_guard,
+                                inline_pixels: compact.inline_pixels,
+                            },
+                            embedding_tokens: compact.embedding_tokens,
                         })
                     })
                 },

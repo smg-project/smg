@@ -29,8 +29,8 @@ use tracing::{info, warn};
 
 use super::{
     assemble::{
-        assemble_sglang_batches, assemble_vllm_batches_with, FloatsForDeviceNormalization,
-        VllmAssembly,
+        assemble_sglang_batches, assemble_sglang_compact_batches, assemble_vllm_batches_with,
+        CompactItemOptions, FloatsForDeviceNormalization, SglangCompactOutput, VllmAssembly,
     },
     capability::runtime_reads_format,
     config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
@@ -357,6 +357,11 @@ pub type SglangMediaOutput = (
     sglang::MultimodalInputs,
     Vec<sglang::MultimodalInputs>,
 );
+
+pub use super::assemble::{
+    SglangCompactBatch as WorkerSglangCompactBatch,
+    SglangCompactOutput as WorkerSglangCompactOutput,
+};
 
 /// What the pipeline produced: the prompt with its anchors expanded, the
 /// request's multimodal batches (the first is `mm_inputs`, the rest
@@ -847,6 +852,46 @@ impl WorkerMediaPipeline {
     ) -> Result<SglangMediaOutput, WorkerMediaError> {
         self.process_sglang_with_wire_dtype(None, items, self.assembly.image_wire_dtype())
             .await
+    }
+
+    /// Preprocess items for Managed E into compact metadata + zero-copy `/dev/shm` (or inline)
+    /// pixel bytes with Rust BLAKE3 item hashes, avoiding protobuf pixel serialization.
+    pub async fn process_sglang_encoder_compact(
+        &self,
+        items: Vec<WorkerMediaItem>,
+        max_artifact_bytes: usize,
+    ) -> Result<SglangCompactOutput, WorkerMediaError> {
+        let item_options: Vec<CompactItemOptions> = items
+            .iter()
+            .map(|item| CompactItemOptions {
+                modality: Some(item.modality),
+                detail: item.detail,
+            })
+            .collect();
+        let output = self
+            .process_inputs_inner(
+                None,
+                items,
+                RuntimeType::Sglang,
+                self.assembly.image_wire_dtype(),
+            )
+            .await?;
+        let encoder_dtype = self.assembly.encoder_dtype.clone();
+        let spec_name = self.spec_name;
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
+            assemble_sglang_compact_batches(
+                output.intermediate,
+                &encoder_dtype,
+                spec_name,
+                &item_options,
+                max_artifact_bytes,
+            )
+        })
+        .await
+        .map_err(|error| WorkerMediaError::Internal(format!("media assembly task: {error}")))?
+        .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))
     }
 
     /// Share SGLang assembly while applying a visual dtype only when explicitly supplied.

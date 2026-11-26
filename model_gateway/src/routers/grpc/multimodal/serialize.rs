@@ -33,7 +33,7 @@ pub(super) fn serialize_encoder_input_owned(
 /// gateway's own transient error, not the worker's and not the client's: the
 /// request builders answer it with a retryable status.
 #[derive(Debug)]
-pub(crate) struct WireMismatch(String);
+pub(crate) struct WireMismatch(pub(super) String);
 
 impl std::fmt::Display for WireMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

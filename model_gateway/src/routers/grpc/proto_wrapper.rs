@@ -67,7 +67,8 @@ pub use self::{
     shm::{
         cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
         collect_tokenspeed_multimodal_inputs_shm_handles,
-        collect_vllm_generate_request_shm_handles, mm_shm_dev_writable, write_tokenspeed_shm_with,
+        collect_vllm_generate_request_shm_handles, mm_shm_dev_writable, write_epd_shm_with,
+        write_tokenspeed_shm_with, EpdShmGuard,
     },
 };
 pub(crate) use self::{

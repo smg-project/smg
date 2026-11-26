@@ -72,53 +72,56 @@ impl ConsistentHashingPolicy {
         Self
     }
 
+    /// Check whether `worker` is eligible under the current overload-lift setting.
+    #[inline]
+    fn is_worker_eligible(worker: &Arc<dyn Worker>, overload_lifted: bool) -> bool {
+        if overload_lifted {
+            worker.routing_state().eligible_ignoring_overload()
+        } else {
+            worker.is_healthy_and_eligible()
+        }
+    }
+
+    /// Effective bounded-load cap for one worker: never exceed its advertised
+    /// in-flight capacity (`max_running_requests` / `max_num_seqs`) when present.
+    #[inline]
+    fn worker_bounded_cap(worker: &Arc<dyn Worker>, global_cap: usize) -> usize {
+        worker
+            .max_running_requests()
+            .map_or(global_cap, |limit| global_cap.min(usize::from(limit)))
+    }
+
     /// Use consistent hashing to find a worker for the given key.
     /// Uses pre-computed ring from SelectWorkerInfo if available.
     ///
-    /// The ring returns a worker URL, which we then map to an index in the workers array.
-    /// This correctly handles filtered worker arrays since we match by URL, not by index.
-    ///
-    /// Complexity: O(log n) ring lookup + O(k) walk, each probed node read for
-    /// eligibility and found in the pool by a scan of its URLs (the last
-    /// eligible worker at that URL, as the map this replaced answered).
+    /// When `max_load` is `Some(cap)`, prefers workers below both the bounded-load
+    /// ceiling and each worker's advertised `max_running_requests` capacity, spilling
+    /// clockwise on the ring (or rotated eligible slice) when hot or full.
     fn find_by_consistent_hash(
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         key: &str,
+        max_load: Option<usize>,
     ) -> Option<usize> {
-        // A lifted overload veto keeps an owner over the thresholds.
-        let eligible = |worker: &Arc<dyn Worker>| {
-            if info.overload_lifted {
-                worker.routing_state().eligible_ignoring_overload()
-            } else {
-                worker.is_healthy_and_eligible()
-            }
+        let admits = |worker: &Arc<dyn Worker>| {
+            Self::is_worker_eligible(worker, info.overload_lifted)
+                && max_load.is_none_or(|cap| worker.load() < Self::worker_bounded_cap(worker, cap))
         };
 
         // Use pre-computed ring if available
         if let Some(ref ring) = info.hash_ring {
-            let eligible_at = |url: &str| {
-                workers
-                    .iter()
-                    .rposition(|worker| worker.url() == url && eligible(worker))
-            };
-            // The probe that accepts the ring's answer keeps the position it
-            // found: one scan and one eligibility read per probed node, and
-            // the answer cannot disagree with the probe that admitted it.
             let found = Cell::new(None);
             let on_ring = ring.find_healthy_url(key, |url| {
-                found.set(eligible_at(url));
+                found.set(
+                    workers
+                        .iter()
+                        .rposition(|worker| worker.url() == url && admits(worker)),
+                );
                 found.get().is_some()
             });
             if on_ring.is_some() {
                 return found.get();
             }
-            // No eligible worker is on the ring. The ring can be of another
-            // membership than `workers`, kept while the next ring is
-            // filled: the key is then placed below over the workers that
-            // joined since, as with no ring. On the ring of these very
-            // workers none is eligible, and the answer below is the same
-            // `None`.
         }
 
         // No ring, as for a model's first requests, or none of its workers
@@ -127,7 +130,7 @@ impl ConsistentHashingPolicy {
         let healthy_indices: Vec<usize> = workers
             .iter()
             .enumerate()
-            .filter(|(_, worker)| eligible(worker))
+            .filter(|(_, worker)| Self::is_worker_eligible(worker, info.overload_lifted))
             .map(|(idx, _)| idx)
             .collect();
         if healthy_indices.is_empty() {
@@ -136,8 +139,56 @@ impl ConsistentHashingPolicy {
 
         // The ring's position hash, so the fallback spells a key's position
         // as the ring does.
-        let idx = (HashRing::hash_position(key) as usize) % healthy_indices.len();
-        Some(healthy_indices[idx])
+        let start = (HashRing::hash_position(key) as usize) % healthy_indices.len();
+        let Some(cap) = max_load else {
+            return Some(healthy_indices[start]);
+        };
+        let rotated = (0..healthy_indices.len())
+            .map(|off| healthy_indices[(start + off) % healthy_indices.len()]);
+        rotated
+            .clone()
+            .find(|&idx| workers[idx].load() < Self::worker_bounded_cap(&workers[idx], cap))
+            .or_else(|| {
+                rotated.min_by_key(|&idx| {
+                    let worker = &workers[idx];
+                    let at_capacity = worker
+                        .max_running_requests()
+                        .is_some_and(|limit| worker.load() >= usize::from(limit));
+                    (at_capacity, worker.load())
+                })
+            })
+    }
+
+    /// Compute the bounded-load ceiling across eligible workers (`1` while idle workers exist,
+    /// `ceil(1.25 * (total_load + 1) / n)` once saturated), or `None` if no worker is eligible.
+    fn bounded_load_cap(workers: &[Arc<dyn Worker>], overload_lifted: bool) -> Option<usize> {
+        let (n, total_load) = workers
+            .iter()
+            .filter(|worker| Self::is_worker_eligible(worker, overload_lifted))
+            .fold((0usize, 0usize), |(count, load), worker| {
+                (count + 1, load.saturating_add(worker.load()))
+            });
+        if n == 0 {
+            return None;
+        }
+        Some(if total_load < n {
+            1
+        } else {
+            (total_load + 1)
+                .saturating_mul(5)
+                .div_ceil(n.saturating_mul(4))
+        })
+    }
+
+    /// Select an eligible worker using bounded-load consistent hashing.
+    pub(crate) fn select_worker_bounded(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
+        let (result, branch) = self.select_worker_with_bound(workers, info, true);
+        Metrics::record_worker_consistent_hashing_policy_branch(branch.as_str());
+        result
     }
 
     /// The place among `workers` that the explicit target of `headers`
@@ -171,14 +222,25 @@ impl ConsistentHashingPolicy {
             .or(info.rid_key)
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "consistent with LoadBalancingPolicy trait pattern; may use self in future"
-    )]
+    /// Select a worker without bounded-load spilling (legacy consistent hashing path).
     fn select_worker_impl(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
+    ) -> (Option<usize>, Branch) {
+        self.select_worker_with_bound(workers, info, false)
+    }
+
+    /// Core consistent hashing selection with optional bounded-load spilling.
+    #[expect(
+        clippy::unused_self,
+        reason = "consistent with LoadBalancingPolicy trait pattern; may use self in future"
+    )]
+    fn select_worker_with_bound(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        bounded: bool,
     ) -> (Option<usize>, Branch) {
         if workers.is_empty() {
             return (None, Branch::NoHealthyWorkers);
@@ -195,7 +257,15 @@ impl ConsistentHashingPolicy {
 
         // Priority 2: X-SMG-Routing-Key - consistent hash routing (O(log n))
         if let Some(key) = routing_key {
-            return match Self::find_by_consistent_hash(workers, info, key) {
+            let max_load = if bounded {
+                let Some(cap) = Self::bounded_load_cap(workers, info.overload_lifted) else {
+                    return (None, Branch::NoHealthyWorkers);
+                };
+                Some(cap)
+            } else {
+                None
+            };
+            return match Self::find_by_consistent_hash(workers, info, key, max_load) {
                 Some(idx) => (Some(idx), Branch::RoutingKeyHit),
                 None => (None, Branch::NoHealthyWorkers),
             };
@@ -213,7 +283,15 @@ impl ConsistentHashingPolicy {
         });
 
         if let Some(key) = implicit_key {
-            return match Self::find_by_consistent_hash(workers, info, key) {
+            let max_load = if bounded {
+                let Some(cap) = Self::bounded_load_cap(workers, info.overload_lifted) else {
+                    return (None, Branch::NoHealthyWorkers);
+                };
+                Some(cap)
+            } else {
+                None
+            };
+            return match Self::find_by_consistent_hash(workers, info, key, max_load) {
                 Some(idx) => (Some(idx), Branch::ImplicitKeyHit),
                 None => (None, Branch::NoHealthyWorkers),
             };
@@ -222,7 +300,7 @@ impl ConsistentHashingPolicy {
         // Fallback: random selection (truly anonymous client)
         let healthy_count = workers
             .iter()
-            .filter(|w| w.is_healthy_and_eligible())
+            .filter(|w| Self::is_worker_eligible(w, info.overload_lifted))
             .count();
         if healthy_count == 0 {
             return (None, Branch::NoHealthyWorkers);
@@ -232,7 +310,7 @@ impl ConsistentHashingPolicy {
         let idx = workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_healthy_and_eligible())
+            .filter(|(_, w)| Self::is_worker_eligible(w, info.overload_lifted))
             .nth(random_healthy_idx)
             .map(|(i, _)| i);
 
@@ -899,5 +977,111 @@ mod tests {
             moved, RECORDED_THREE_NOT_READY,
             "with three workers not ready the keys placed {moved:?}"
         );
+    }
+
+    fn make_capped_workers(specs: &[(&str, usize)]) -> Vec<Arc<dyn Worker>> {
+        use smg_worker::{
+            identity::basic::{ConnectionMode, WorkerType},
+            test_support::no_health_check,
+        };
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+
+        specs
+            .iter()
+            .map(|(url, cap)| {
+                Arc::new(
+                    BasicWorkerBuilder::new((*url).to_string())
+                        .worker_type(WorkerType::Encode)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .label("max_running_requests", cap.to_string())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_worker_bounded_spills_at_advertised_worker_capacity_below_1_25x_cap() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = make_capped_workers(&[("grpc://e0:30010", 64), ("grpc://e1:30010", 64)]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        let info = SelectWorkerInfo {
+            routing_key: Some("hot-image-digest"),
+            hash_ring: Some(Arc::clone(&ring)),
+            ..Default::default()
+        };
+
+        let primary = policy.select_worker_bounded(&workers, &info).unwrap();
+        let other = 1 - primary;
+
+        // Legacy unbounded select_worker stays pinned on primary even when loaded.
+        for _ in 0..64 {
+            workers[primary].increment_load();
+        }
+        for _ in 0..50 {
+            workers[other].increment_load();
+        }
+        assert_eq!(policy.select_worker(&workers, &info), Some(primary));
+        assert_eq!(
+            policy.select_worker_bounded(&workers, &info),
+            Some(other),
+            "must spill off encoder at advertised max_running_requests=64 even when global cap=72"
+        );
+    }
+
+    #[test]
+    fn select_worker_bounded_heterogeneous_capacity_prefers_worker_with_headroom() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = make_capped_workers(&[("grpc://e0:30010", 64), ("grpc://e1:30010", 256)]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        let info = SelectWorkerInfo {
+            routing_key: Some("hot-image-digest"),
+            hash_ring: Some(Arc::clone(&ring)),
+            ..Default::default()
+        };
+
+        for _ in 0..64 {
+            workers[0].increment_load();
+        }
+        for _ in 0..200 {
+            workers[1].increment_load();
+        }
+        assert_eq!(
+            policy.select_worker_bounded(&workers, &info),
+            Some(1),
+            "must route to worker with remaining advertised capacity instead of full worker"
+        );
+    }
+
+    #[test]
+    fn select_worker_bounded_c128_burst_never_exceeds_advertised_cap_and_keeps_idle_affinity() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = make_capped_workers(&[("grpc://e0:30010", 64), ("grpc://e1:30010", 64)]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        let info = SelectWorkerInfo {
+            routing_key: Some("warm-image-key"),
+            hash_ring: Some(Arc::clone(&ring)),
+            ..Default::default()
+        };
+
+        let primary = policy.select_worker_bounded(&workers, &info).unwrap();
+        for _ in 0..8 {
+            assert_eq!(policy.select_worker_bounded(&workers, &info), Some(primary));
+        }
+
+        for i in 0..128 {
+            let key = format!("img-{}", i % 8);
+            let req_info = SelectWorkerInfo {
+                routing_key: Some(&key),
+                hash_ring: Some(Arc::clone(&ring)),
+                ..Default::default()
+            };
+            let idx = policy.select_worker_bounded(&workers, &req_info).unwrap();
+            workers[idx].increment_load();
+        }
+        assert_eq!(workers[0].load(), 64);
+        assert_eq!(workers[1].load(), 64);
     }
 }

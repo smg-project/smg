@@ -45,8 +45,8 @@ mod trtllm;
 mod vllm;
 
 pub use client::{
-    connect_for_worker, connect_with_eos, kv_transfer_rejection_params, ZmqDialect,
-    ZmqEngineClient, ZmqModelInfo, ZmqServerInfo,
+    connect_for_worker, connect_with_eos, kv_transfer_rejection_params, ManagedExternalEncode,
+    ZmqDialect, ZmqEngineClient, ZmqModelInfo, ZmqServerInfo,
 };
 pub use embed::translate_embed_request;
 pub use engine_zmq_client::{
