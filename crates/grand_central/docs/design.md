@@ -3401,7 +3401,7 @@ and it has served traffic on a cluster beside classic.
 
 Each is the maintainer's. Work inside the crate goes on where a decision is not needed for it.
 
-All seventeen at a glance. An answer can be as short as the numbers with their letters.
+All eighteen at a glance. An answer can be as short as the numbers with their letters.
 
 | # | Decision | Recommended | Needed for |
 |---|---|---|---|
@@ -3422,6 +3422,7 @@ All seventeen at a glance. An answer can be as short as the numbers with their l
 | 15 | The workers a session's first request reads | recorded, the answer is open: (a) the workers its turn asks about | rule 6, for a sessions rule that leaves a new key to round robin |
 | 16 | `least_load`'s count of a request that is never sent | decided 2026-11-24: (a) the engine counts a send at its dispatch | rule 6, for `least_load` where a route refuses a request behind its selection |
 | 17 | The pick among workers that tie at the fewest requests | decided 2026-11-25: (a) the engine draws among them | rule 6, for `prefix_hash` where it places a request by load |
+| 18 | The workers a tree decision reads over a large list | decided 2026-11-26: (a) the engine reads a draw of 16 and the workers its host names | rule 6, for `cache_aware` in a tree over more than 32 workers, with its `kv-pressure` gate off |
 
 ### Decision 1: the name of a cache partition
 
@@ -3838,6 +3839,43 @@ side of a pair.
 | (b) The engine takes the first of them in its list's order, as classic does. | The two agree. Each request that finds its workers at one count then goes to the first of them. |
 
 **Decided 2026-11-25: (a).** The engine's draw stays.
+
+### Decision 18: the workers a tree decision reads over a large list
+
+*Needed for:* rule 6 (section 1), for `cache_aware` over a list of more than 32 workers, where it
+decides in a tree with its `kv-pressure` gate off.
+
+Classic's `cache_aware` reads every worker once for such a decision (`select_worker_scanned` in
+`model_gateway/src/policies/cache_aware.rs`). A request that follows no holder of its prefix is
+placed by load among all the workers it may use. The mean load a holder's load is compared with is
+taken over all of them.
+
+The engine's profile for `cache_aware` picks with `best` over a sample of 16 (section 7). With its
+`kv-pressure` gate off, the picker draws first over a list of more than 32 workers: at most 32
+draws, until 16 workers are kept (`draw_first` in `stages/pickers.rs`). The host names the
+request's holders and the list's workers in warm-up, at most 16 of each, and they join the drawn
+ones (`join_named` in `engine/framework.rs`). The stages score those workers alone, and the mean
+load is the drawn workers'.
+
+So over more than 32 workers a request that follows no holder goes to the best of the drawn and
+the named workers, where classic places it among all.
+
+A request with a holder can differ too. The spill gate weighs the holder's load against the mean
+of the drawn workers, where classic weighs it against the mean of all. And the host names at most
+16 of the holders, by a draw where the match names more.
+
+At 32 workers or fewer both read every worker. Both do too where the gate is on, a `spread` or a
+`ceiling` of `kv-pressure` under 1: that gate reads every worker. The engine does too where a draw
+gives no pick, and for a request held to places. Where classic decides by events over more than
+32 workers with its gate off, it draws 16 workers the same way (`FLEET_SAMPLE` in
+`model_gateway/src/policies/cache_aware.rs`).
+
+| Option | Cost |
+|---|---|
+| (a) The engine reads the drawn workers and the named ones. | Over more than 32 workers the engine's pick can differ from classic's, by this decision. A decision made from a draw scores at most 48 workers, however long the list. How far the two picks differ in load on a real fleet is not measured. |
+| (b) The engine reads every worker, as classic's tree decision does. | The two read the same workers. A decision then reads one record for each worker, 512 at 512 workers, and that cost is not measured. |
+
+**Decided 2026-11-26: (a).** The engine's draw stays.
 
 ## 16. The order of work
 
