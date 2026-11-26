@@ -22,6 +22,7 @@ use super::{
     WATCHES_MAX,
 };
 use crate::{
+    document::operator::SerialTurn,
     engine::view::WorkerId,
     service::{
         controller::{
@@ -29,19 +30,43 @@ use crate::{
             election::LeasePlace,
             gateways::tests::PATIENT,
             membership::tests::Logged,
-            principal::tests::told,
-            replication::{journaled, journaled_from, FIRST_PLACES, WATCHED_EVENTS},
+            principal::{tests::told, Principal},
+            replication::{journaled, tests::journaled_from, FIRST_PLACES, WATCHED_EVENTS},
             worker_wire,
         },
         elector::{Elector, TickOutcome},
         proto::{self, worker_event::Event},
     },
     store::{
-        Journal, LeasesStore, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        Journal, LeasesStore, MembershipChange, MemoryStore, Position, Registrant, StoreCheckpoint,
+        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     worker_host::{stand, Members, Objects},
 };
+
+impl Feed {
+    /// The cuts of every row this feed took, for a case.
+    pub(in crate::service::controller) fn cuts(&self) -> usize {
+        self.cuts.load(Ordering::Relaxed)
+    }
+
+    /// The kept cut, for a case.
+    pub(in crate::service::controller) fn kept(&self) -> Option<Arc<StoreCheckpoint>> {
+        self.rows.lock().clone()
+    }
+}
+
+impl Readers {
+    /// The snapshots' turn, for a case that fills it or holds it.
+    pub(in crate::service::controller) fn snapshots(&self) -> &SerialTurn {
+        &self.snapshots
+    }
+
+    /// The watches `by` holds open.
+    fn open_of(&self, by: &Principal) -> usize {
+        self.held.lock().get(&by.gateway()).copied().unwrap_or(0)
+    }
+}
 
 /// A replica that leads under term 1, its store standing in that term.
 struct Leader {

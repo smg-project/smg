@@ -25,6 +25,51 @@ use crate::{
     tracking::lease::{Lease, LeaseId},
 };
 
+impl SessionPlace {
+    /// The session ended at `now`, where a case names the instant.
+    pub(in crate::service::controller) fn end(self, now: Instant) {
+        self.gateways
+            .gone(self.gateway, self.session, &self.superseded, now);
+    }
+}
+
+impl Gateways {
+    /// The ceiling of rows.
+    pub(in crate::service::controller) fn ceiling(&self) -> usize {
+        self.ceiling
+    }
+
+    /// How many replaced sessions the row of `gateway` notes.
+    fn noted(&self, gateway: GatewayId) -> usize {
+        self.table
+            .lock()
+            .rows
+            .get(&gateway)
+            .map_or(0, |row| row.replaced.len())
+    }
+
+    /// How many rows the sweep has visited.
+    fn take_sweep_visits(&self) -> usize {
+        std::mem::take(&mut self.table.lock().sweep_visits)
+    }
+
+    /// How many ends the table keeps for the gateway: the row's count,
+    /// which every write keeps in step with the note.
+    fn kept(&self, gateway: GatewayId) -> usize {
+        let table = self.table.lock();
+        table.rows.get(&gateway).map_or(0, |row| {
+            let noted: usize = row.vetoes.values().map(Vec::len).sum();
+            assert_eq!(row.held, noted, "the count follows the note");
+            let earliest = row.vetoes.values().flatten().map(|&(_, end)| end).min();
+            assert!(
+                earliest.is_none_or(|end| row.next_end.is_some_and(|next| next <= end)),
+                "no end is earlier than the note says"
+            );
+            row.held
+        })
+    }
+}
+
 pub(crate) const GRACE: Duration = Duration::from_secs(10);
 const A: GatewayId = GatewayId(11);
 const B: GatewayId = GatewayId(12);

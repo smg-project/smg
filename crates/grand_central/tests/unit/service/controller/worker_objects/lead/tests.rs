@@ -1,5 +1,17 @@
 use super::*;
-use crate::service::elector::Elector;
+use crate::service::{elector, elector::Elector};
+
+/// Election settings under which a fence, once taken, stays open through a
+/// case of any length: a case steps its elector by hand and renews nothing.
+pub(in crate::service::controller::worker_objects) fn lasting() -> elector::ElectionSettings {
+    use std::time::Duration;
+
+    elector::ElectionSettings {
+        duration: Duration::from_secs(3 * 3_600),
+        renew_period: Duration::from_secs(3_600),
+        renew_deadline: Duration::from_secs(2 * 3_600),
+    }
+}
 
 #[test]
 fn the_lead_names_its_term_while_the_word_and_the_fence_both_hold() {

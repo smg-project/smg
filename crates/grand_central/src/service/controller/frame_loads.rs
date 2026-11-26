@@ -11,8 +11,6 @@
 use std::sync::Arc;
 
 use smg_worker::load::state::{LoadReceiver, LoadSnapshot};
-#[cfg(test)]
-use tokio::sync::watch;
 
 /// The newest snapshot of the replica's load monitor, as one deciding
 /// thread holds it between its frames.
@@ -47,13 +45,6 @@ impl FrameLoads {
     }
 }
 
-/// A channel nobody publishes on, with an empty snapshot: a case's
-/// deciders read no load report.
-#[cfg(test)]
-pub(crate) fn silent() -> LoadReceiver {
-    watch::channel(Arc::new(LoadSnapshot::default())).1
-}
-
 #[cfg(test)]
 #[path = "../../../tests/unit/service/controller/frame_loads/tests.rs"]
-mod tests;
+pub(super) mod tests;

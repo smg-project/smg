@@ -1,5 +1,6 @@
 use super::{
-    busy, credit, decided, Checked, Items, ItemsPlaced, Lists, Refusal, MAX_FRAME, MAX_ITEMS,
+    busy, credit, decided, Checked, Decided, Items, ItemsPlaced, Lists, Refusal, MAX_FRAME,
+    MAX_ITEMS,
 };
 use crate::{
     document::spec::{AppliedSpec, MAX_BLOCK_HASHES},
@@ -16,6 +17,32 @@ use crate::{
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     },
 };
+
+impl Checked {
+    /// The request's block hashes, in order from its first block. Its one
+    /// reader is a case of the client's wire.
+    #[cfg(feature = "client")]
+    pub(in crate::service) fn block_hashes(&self) -> &[u64] {
+        &self.facts.block_hashes
+    }
+}
+
+impl Decided {
+    /// The frame the wire carries, as a stream builds it that sends at its
+    /// decider's last read: what a case of the deciders reads.
+    pub(in crate::service) fn frame(self) -> proto::DecideAnswer {
+        match self {
+            Self::Decision {
+                id,
+                term,
+                decision,
+                lease,
+                encode,
+            } => decided(id, term, &decision, lease.as_ref(), encode),
+            Self::Frame(frame) => frame,
+        }
+    }
+}
 
 #[test]
 fn plain_spec_answers_keep_each_wire_field() {

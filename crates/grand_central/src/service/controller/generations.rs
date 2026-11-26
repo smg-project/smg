@@ -69,8 +69,6 @@ use super::{
     wire,
     worker_wire::{self, Refused as Unfollowed},
 };
-#[cfg(test)]
-pub(crate) use crate::document::operator::Validate;
 pub(crate) use crate::document::operator::{
     ApplyOutcome, Format, SpecRejected, DRY_RUNS_WAITING, MAX_DOCUMENT_BYTES, WRITES_WAITING,
 };
@@ -309,32 +307,6 @@ impl Generations {
         Self::over(door.telling(entered), fence)
     }
 
-    /// A door with a controller's pass that states nothing on a holder, for
-    /// a case.
-    #[cfg(test)]
-    pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<StageRegistry>) -> Self {
-        Self::over(
-            DocumentManager::validating(store, catalog, Vec::new(), one_switch),
-            None,
-        )
-    }
-
-    /// [`Generations::new`] with the validator as its argument, and with
-    /// the fence its door is built under, as [`Generations::stating`]
-    /// takes it: a case hands in a validator that faults, or one that
-    /// stalls, and the fence of an election of its own where its replica
-    /// stands under a shared lease.
-    #[cfg(test)]
-    pub(crate) fn validating(
-        store: Arc<MemoryStore>,
-        catalog: Arc<StageRegistry>,
-        validate: Validate,
-        fence: Option<Arc<Fence>>,
-    ) -> Self {
-        let door = DocumentManager::validating(store, catalog, Vec::new(), validate);
-        Self::over(door, fence)
-    }
-
     fn over(door: DocumentManager, fence: Option<Arc<Fence>>) -> Self {
         Self {
             door,
@@ -404,6 +376,7 @@ impl Generations {
             |store, spec| store.apply_admitted(spec, || self.leads(lead)),
             |passed| {
                 if news {
+                    // A case counts a replica's notices, and this step itself tells each one.
                     #[cfg(test)]
                     tests::count_replica_notice(self, false);
                     match passed {
@@ -643,15 +616,6 @@ impl Generations {
             self.file_sourced.store(true, Ordering::Relaxed);
             Ok(())
         })
-    }
-
-    /// Whether the source writes now: always for a replica alone over its
-    /// lease, and while the fence shows a term for one under a shared lease
-    /// ([`Generations::stating`]). A case's question: the source takes its
-    /// lead ahead of a read ([`Generations::lead`]).
-    #[cfg(test)]
-    pub(crate) fn source_writes(&self) -> bool {
-        self.lead().is_some()
     }
 
     /// The lead this replica writes under now: a source takes it ahead of

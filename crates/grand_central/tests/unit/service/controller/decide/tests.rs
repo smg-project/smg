@@ -180,7 +180,7 @@ async fn bed_over(
     let (workers, _sides) = fleet(&store, &objects);
     let reads = Reads {
         objects,
-        loads: frame_loads::silent(),
+        loads: frame_loads::tests::silent(),
         store,
         fence: elector.fence(),
         standing: stood,

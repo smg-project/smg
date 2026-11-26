@@ -585,7 +585,10 @@ mod linked {
             Demands,
         },
         service::{
-            client::{poll, DecisionUnavailable, Error, Peer},
+            client::{
+                tests::{poll, Peer},
+                DecisionUnavailable, Error,
+            },
             proto::{
                 self,
                 completed::Class,

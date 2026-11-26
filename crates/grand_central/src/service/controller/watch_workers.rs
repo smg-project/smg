@@ -254,18 +254,6 @@ impl Feed {
         kept.as_ref().filter(|cut| cut.at == head).cloned()
     }
 
-    /// The cuts of every row this feed took, for a case.
-    #[cfg(test)]
-    pub(crate) fn cuts(&self) -> usize {
-        self.cuts.load(Ordering::Relaxed)
-    }
-
-    /// The kept cut, for a case.
-    #[cfg(test)]
-    pub(crate) fn kept(&self) -> Option<Arc<StoreCheckpoint>> {
-        self.rows.lock().clone()
-    }
-
     /// A membership entry the wire has no form for: no watch is told it,
     /// so a watcher's rows miss that write. The store writes none. One
     /// that lands is logged once a replica, with its change, by the first
@@ -622,18 +610,6 @@ impl Readers {
     /// kept cut, so a clone of the feed they were built over is theirs too.
     fn are_of(&self, feed: &Feed) -> bool {
         self.feed.shares_with(feed)
-    }
-
-    /// The snapshots' turn, for a case that fills it or holds it.
-    #[cfg(test)]
-    pub(crate) fn snapshots(&self) -> &SerialTurn {
-        &self.snapshots
-    }
-
-    /// The watches `by` holds open.
-    #[cfg(test)]
-    fn open_of(&self, by: &Principal) -> usize {
-        self.held.lock().get(&by.gateway()).copied().unwrap_or(0)
     }
 }
 

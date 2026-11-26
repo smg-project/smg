@@ -20,6 +20,73 @@ use crate::{
     },
 };
 
+/// The same over one file of leases with the log's places starting after
+/// `first`: zero in the cases, whose tables read a log's places from one.
+pub(in crate::service::controller) fn journaled_from(
+    place: &LeasePlace,
+    first: u64,
+) -> (Arc<MemoryStore>, watch_workers::Feed) {
+    journaled_at(place, first, 1)
+}
+
+impl Replication {
+    /// A restore's hold as a stream that took no part since `at` leaves
+    /// it, over the cut at the head with no admission: a served case's own.
+    pub(in crate::service::controller) fn stalled_since(&self, at: Instant) {
+        let cut = self.cuts.at_head(&self.objects, &self.store, &self.log);
+        self.cuts.stalled(cut, at);
+    }
+
+    /// How many restores this leader holds: a served case's own.
+    pub(in crate::service::controller) fn held(&self) -> usize {
+        self.cuts.held()
+    }
+}
+
+impl Hold {
+    /// A hold of `cut` from `now`, with no room taken first: a case's own.
+    fn of(cut: Arc<StoreCheckpoint>, now: Instant) -> Self {
+        Self(Mutex::new(Held::Cut(cut, now)))
+    }
+}
+
+impl Kept {
+    /// A hold of `cut` as a stream that took no part since `at` leaves
+    /// it, with no room counted: a case's own.
+    fn stalled(&self, cut: Arc<StoreCheckpoint>, at: Instant) {
+        self.holds.lock().push(Arc::new(Hold::of(cut, at)));
+    }
+
+    /// How many holds stand: a case's own.
+    fn held(&self) -> usize {
+        self.holds.lock().len()
+    }
+}
+
+impl Parts {
+    /// The parts of `cut` from `now`, counted by no leader: a case's own.
+    fn of(cut: Arc<StoreCheckpoint>, now: Instant) -> Self {
+        Self::held(Arc::new(Hold::of(cut, now)))
+    }
+}
+
+/// Every part of the snapshot of `cut`, as sent at `now`: the cases'
+/// leader.
+pub(in crate::service::controller) fn parts(
+    cut: Arc<StoreCheckpoint>,
+    now: Instant,
+) -> Vec<proto::ReplicationBatch> {
+    let mut parts = Parts::of(cut, now);
+    let mut sent = Vec::new();
+    while let Some((batch, ends)) = parts.next(now) {
+        sent.push(batch);
+        if ends.is_some() {
+            break;
+        }
+    }
+    sent
+}
+
 const IDENTITY: &str = "controller-0@10.0.0.7:30100";
 
 /// The standby the cases' feeds name.

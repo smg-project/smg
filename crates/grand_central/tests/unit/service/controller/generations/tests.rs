@@ -22,7 +22,7 @@ use crate::{
     document::operator::{
         needs_rows,
         test_support::{document_of, standing, stock},
-        ApplyCounts, NotHeld, OnFile,
+        ApplyCounts, NotHeld, OnFile, Validate,
     },
     engine::view::WorkerId,
     service::{
@@ -34,6 +34,43 @@ use crate::{
     },
     store::{Registrant, WorkerFacts, WorkerStatus, WorkersStore},
 };
+
+impl Generations {
+    /// A door with a controller's pass that states nothing on a holder, for
+    /// a case.
+    pub(in crate::service::controller) fn new(
+        store: Arc<MemoryStore>,
+        catalog: Arc<StageRegistry>,
+    ) -> Self {
+        Self::over(
+            DocumentManager::validating(store, catalog, Vec::new(), one_switch),
+            None,
+        )
+    }
+
+    /// [`Generations::new`] with the validator as its argument, and with
+    /// the fence its door is built under, as [`Generations::stating`]
+    /// takes it: a case hands in a validator that faults, or one that
+    /// stalls, and the fence of an election of its own where its replica
+    /// stands under a shared lease.
+    pub(in crate::service::controller) fn validating(
+        store: Arc<MemoryStore>,
+        catalog: Arc<StageRegistry>,
+        validate: Validate,
+        fence: Option<Arc<Fence>>,
+    ) -> Self {
+        let door = DocumentManager::validating(store, catalog, Vec::new(), validate);
+        Self::over(door, fence)
+    }
+
+    /// Whether the source writes now: always for a replica alone over its
+    /// lease, and while the fence shows a term for one under a shared lease
+    /// ([`Generations::stating`]). A case's question: the source takes its
+    /// lead ahead of a read ([`Generations::lead`]).
+    pub(in crate::service::controller) fn source_writes(&self) -> bool {
+        self.lead().is_some()
+    }
+}
 
 thread_local! {
     static REPLICA_NOTICES: Cell<Option<u32>> = const { Cell::new(None) };

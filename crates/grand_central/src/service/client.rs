@@ -77,8 +77,6 @@ use crate::service::{
 mod link;
 pub(crate) mod wire;
 
-#[cfg(test)]
-pub(crate) use link::tests::{poll, Peer};
 pub use link::{DecisionUnavailable, Link, SpecPushes};
 
 /// Frames the client may queue toward the controller.
@@ -1091,4 +1089,4 @@ pub mod blocking {
 
 #[cfg(test)]
 #[path = "../../tests/unit/service/client/tests.rs"]
-mod tests;
+pub(crate) mod tests;
