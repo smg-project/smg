@@ -82,7 +82,7 @@ use crate::{
             pd_failure::{PdSide, SidePhase},
             placement::{
                 self, CandidateFilter, PairFailure, Placed, PlacementFailure, PlacementInputs,
-                RefusalSite,
+                RefusalSite, RequestEnd,
             },
             prefill_admission::{
                 acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
@@ -105,7 +105,7 @@ use crate::{
             route_to_endpoint,
         },
         http::router::{
-            convert_reqwest_error, read_body_capped, send_with_stale_conn_retry,
+            convert_reqwest_error, read_body_capped, send_with_stale_conn_retry, worker_answered,
             worker_body_too_large, BodyReadError, RerankResponseSpec, Router,
         },
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
@@ -135,6 +135,17 @@ fn own_failure(response: &Response) -> Option<PdSide> {
         .extensions()
         .get::<OwnFailure>()
         .map(|&OwnFailure(side)| side)
+}
+
+/// The status recorded for a side's call that failed below HTTP, on the
+/// route that sends both sides at once. It is the gateway's 504 for the
+/// request's own timeout, else the 502. The side's end is told with it.
+fn below_http_status(e: &reqwest::Error) -> StatusCode {
+    if is_request_timeout(e) {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
 }
 
 /// The load one admitted PD request holds, each side's ahead of its send.
@@ -1592,6 +1603,7 @@ impl PDRouter {
                 metrics_labels::WORKER_DECODE,
                 status,
             );
+            RequestEnd::of(&decode_guard).report(status.as_u16(), || true);
             return Self::decode_refused(decode.as_ref(), decode_response, self.max_payload_size)
                 .await;
         }
@@ -1693,20 +1705,25 @@ impl PDRouter {
         )
     }
 
-    /// A decode side whose call failed below HTTP before its first byte.
+    /// A decode side whose call failed below HTTP before its first byte. The
+    /// decode's end is told through `guard`, its own, with the status the
+    /// route answers and records, as no answer of its worker's.
     fn decode_transport_failed(
         ledger: &AttemptLedger,
         decode: &dyn Worker,
+        guard: &WorkerLoadGuard,
         e: &reqwest::Error,
     ) -> Response {
-        Self::side_failed_below_http(
+        let refusal = Self::side_failed_below_http(
             ledger,
             PdSide::Decode,
             SidePhase::Start,
             "Decode request",
             decode,
             e,
-        )
+        );
+        RequestEnd::of(guard).report(refusal.status().as_u16(), || false);
+        refusal
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
@@ -1780,7 +1797,15 @@ impl PDRouter {
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
                 .await
-                .map_err(|e| DispatchError::Transport(PdSide::Prefill, e))?;
+                .map_err(|e| {
+                    // The prefill's guard stands in this future alone: its
+                    // failed call is told here, with the status the attempt
+                    // records for it.
+                    prefill_guard
+                        .end()
+                        .report(below_http_status(&e).as_u16(), || false);
+                    DispatchError::Transport(PdSide::Prefill, e)
+                })?;
             if context.is_stream && !context.return_logprob && resp.status().is_success() {
                 let prefill = Arc::clone(&prefill);
                 let charges = ledger.charges().clone();
@@ -1793,9 +1818,10 @@ impl PDRouter {
                     reason = "drains a prefill body concurrently with Decode; aborted before client commitment and detached after it"
                 )]
                 let drain = tokio::spawn(async move {
-                    let _prefill_guard = prefill_guard;
+                    // The worker's own success status, as the read whole
+                    // keeps it, or the 502 of a body cut before its end.
+                    let mut drained = resp.status();
                     let mut chunks = resp.bytes_stream();
-                    let mut drained = StatusCode::OK;
                     while let Some(chunk) = chunks.next().await {
                         if let Err(e) = chunk {
                             warn!(
@@ -1810,6 +1836,13 @@ impl PDRouter {
                     // Through the request's charges: retried attempts whose
                     // drains all fail charge the worker once.
                     charges.record_outcome(prefill.as_ref(), drained.as_u16());
+                    // The drain owns the prefill's guard to its end, and
+                    // tells the prefill's end through it. It tells the
+                    // status it charges: the worker's own where the body
+                    // was read to its end.
+                    prefill_guard
+                        .end()
+                        .report(drained.as_u16(), || drained.is_success());
                     if drained.is_server_error() {
                         Metrics::record_worker_error(
                             metrics_labels::WORKER_PREFILL,
@@ -1847,6 +1880,18 @@ impl PDRouter {
                     );
                 }
             }
+            // The prefill is told its own answer where its guard is let go,
+            // ahead of the decode's: the status its body left on it, or its
+            // refusal's. No handle goes on to the attempt's account, which
+            // would hold this side's end for the decode's whole answer.
+            match &result {
+                Ok((consumed, _)) => prefill_guard
+                    .end()
+                    .report(consumed.as_u16(), || consumed.is_success()),
+                Err(refusal) => prefill_guard
+                    .end()
+                    .report(refusal.status().as_u16(), || worker_answered(refusal)),
+            }
             drop(prefill_guard);
             let (_, body) = result.map_err(DispatchError::Prefill)?;
             Metrics::record_pd_prefill_duration(
@@ -1879,6 +1924,13 @@ impl PDRouter {
                     PdSide::Prefill => &prefill,
                     PdSide::Decode => &decode,
                 };
+                // The decode's guard stands here. Its own failed call is told
+                // through it, and so is the request's own timeout whichever
+                // side's call it cut, as the attempt records it. A prefill
+                // told its failed call where it failed.
+                if side == PdSide::Decode || is_request_timeout(&e) {
+                    RequestEnd::of(&decode_guard).report(below_http_status(&e).as_u16(), || false);
+                }
                 // The request's own timeout on either side is the request's
                 // end (see `retry::request_timeout_response`). It names no
                 // side, so the caller records the 504 on both workers.
@@ -1906,6 +1958,7 @@ impl PDRouter {
             }
             Err(DispatchError::Prefill(response)) => return response,
             Err(DispatchError::Decode(response)) => {
+                RequestEnd::of(&decode_guard).report(response.status().as_u16(), || true);
                 return Self::decode_refused(decode.as_ref(), response, self.max_payload_size)
                     .await;
             }
@@ -2161,7 +2214,15 @@ impl PDRouter {
             .await
             {
                 Ok(bytes) => bytes,
-                Err(refusal) => return refusal,
+                Err(refusal) => {
+                    // The prefill is told its refusal here, where its load
+                    // stands: the status the client is answered with, the
+                    // worker's own where the worker answered.
+                    prefill_guard
+                        .end()
+                        .report(refusal.status().as_u16(), || worker_answered(&refusal));
+                    return refusal;
+                }
             };
             Metrics::record_pd_prefill_duration(
                 metrics_labels::BACKEND_PD,
@@ -2173,7 +2234,10 @@ impl PDRouter {
             // Harvest the handoff params the prefill engine returned (NIXL and
             // opportunistic passthrough; Mooncake returns nothing and is minted).
             let harvested = Self::harvest_kv_transfer_params(&prefill_bytes);
-            // The Prefill phase is over: its load is released.
+            // The Prefill phase is over: the prefill is told its good answer
+            // through its load, and the load is released. The read keeps the
+            // body and no status, so the answer is told as the worker's 200.
+            prefill_guard.end().report(StatusCode::OK.as_u16(), || true);
             drop(prefill_guard);
             harvested
         } else {
@@ -2285,7 +2349,9 @@ impl PDRouter {
         let (decode, decode_guard) = decode.sent();
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
-            Err(e) => return Self::decode_transport_failed(ledger, decode.as_ref(), &e),
+            Err(e) => {
+                return Self::decode_transport_failed(ledger, decode.as_ref(), &decode_guard, &e);
+            }
         };
 
         self.forward_decode_head(
@@ -2381,7 +2447,12 @@ impl PDRouter {
                         }
                         Ok(response) => break Err(response),
                         Err(e) => {
-                            return Self::decode_transport_failed(ledger, decode.as_ref(), &e);
+                            return Self::decode_transport_failed(
+                                ledger,
+                                decode.as_ref(),
+                                &decode_guard,
+                                &e,
+                            );
                         }
                     },
                 }
@@ -2392,10 +2463,19 @@ impl PDRouter {
             // A decode engine that refused the request takes no push.
             Err(refused) => refused,
             Ok(prefill_outcome) => {
+                // The prefill finished: it is told its own answer here,
+                // where its load stands, as the shape that sends one side
+                // behind the other tells it.
                 let prefill_bytes = match prefill_outcome {
                     Ok(bytes) => bytes,
-                    Err(response) => return response,
+                    Err(response) => {
+                        prefill_guard
+                            .end()
+                            .report(response.status().as_u16(), || worker_answered(&response));
+                        return response;
+                    }
                 };
+                prefill_guard.end().report(StatusCode::OK.as_u16(), || true);
                 drop(prefill_guard);
                 Metrics::record_pd_prefill_duration(
                     metrics_labels::BACKEND_PD,
@@ -2430,7 +2510,12 @@ impl PDRouter {
                     None => match decode_side.await {
                         Ok(response) => response,
                         Err(e) => {
-                            return Self::decode_transport_failed(ledger, decode.as_ref(), &e);
+                            return Self::decode_transport_failed(
+                                ledger,
+                                decode.as_ref(),
+                                &decode_guard,
+                                &e,
+                            );
                         }
                     },
                 }
@@ -2608,6 +2693,13 @@ impl PDRouter {
             // The decode worker is the one that produced the body the client
             // sees, on both the merged-logprob and passthrough paths.
             header_utils::insert_routed_worker_id(response.headers_mut(), decode.redacted_url());
+            // The decode's answer read whole is told here for every shape,
+            // through its guard, with the status the route records on its
+            // worker. A status of 500 and over is the route's own, made of
+            // a body it gave up. A body over the limit is the worker's
+            // answer still, and one whose read failed is not.
+            RequestEnd::of(&decode_guard)
+                .report(response.status().as_u16(), || worker_answered(&response));
             if let Some(ledger) = outcome_ledger {
                 Self::record_sequential_side(
                     ledger,
@@ -2845,10 +2937,10 @@ impl PDRouter {
                 status,
                 upstream_sse,
                 source,
+                // The relay tells the decode's end through the handle of
+                // its guard, asked here ahead of the guard's move.
+                end: RequestEnd::of(&decode_guard),
                 guard: decode_guard,
-                // The pair routes tell Grand Central no end yet, so
-                // the relay is handed no handle and says nothing.
-                end: placement::RequestEnd::default(),
                 headers: response_headers,
                 mode: ChunkMode::Hook(hook),
             },
@@ -3546,7 +3638,9 @@ impl RouterTrait for PDRouter {
             Ok(bytes) => bytes,
             Err(e) => return Self::handle_serialization_error(e),
         };
-        let _load_guard = placed.guard(self.policy_registry.sticky_header_key(headers));
+        // This route keeps its answer to its end and tells the request's
+        // outcome through it, beside each record on the worker.
+        let _load_guard = placed.guard_keeping_end(self.policy_registry.sticky_header_key(headers));
         let request = header_utils::apply_forwarded_request_headers(
             attach_sized_body(
                 worker
@@ -3571,6 +3665,7 @@ impl RouterTrait for PDRouter {
                     cause(&e)
                 );
                 worker.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                placed.ended(StatusCode::GATEWAY_TIMEOUT.as_u16(), || false);
                 return request_timeout_response(format!("count-tokens timed out: {}", cause(&e)));
             }
             Err(e) => {
@@ -3583,6 +3678,7 @@ impl RouterTrait for PDRouter {
                     cause(&e)
                 );
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                placed.ended(StatusCode::BAD_GATEWAY.as_u16(), || false);
                 return error::bad_gateway(
                     "prefill_count_tokens_failed",
                     format!("Prefill server error: {}", cause(&e)),
@@ -3595,6 +3691,7 @@ impl RouterTrait for PDRouter {
         match read_body_capped(res.bytes_stream(), self.max_payload_size).await {
             Ok(bytes) => {
                 worker.record_outcome(status.as_u16());
+                placed.ended(status.as_u16(), || true);
                 let mut response = Response::new(Body::from(bytes));
                 *response.status_mut() = status;
                 *response.headers_mut() = response_headers;
@@ -3602,6 +3699,8 @@ impl RouterTrait for PDRouter {
             }
             Err(BodyReadError::TooLarge) => {
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                // The worker answered, and the route refused what it gave.
+                placed.ended(StatusCode::BAD_GATEWAY.as_u16(), || true);
                 worker_body_too_large(self.max_payload_size, worker.url())
             }
             Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
@@ -3612,6 +3711,7 @@ impl RouterTrait for PDRouter {
                     cause(&e)
                 );
                 worker.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                placed.ended(StatusCode::GATEWAY_TIMEOUT.as_u16(), || false);
                 request_timeout_response(format!("count-tokens timed out: {}", cause(&e)))
             }
             Err(BodyReadError::Transport(e)) => {
@@ -3622,6 +3722,7 @@ impl RouterTrait for PDRouter {
                     cause(&e)
                 );
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                placed.ended(StatusCode::BAD_GATEWAY.as_u16(), || false);
                 error::bad_gateway(
                     "prefill_count_tokens_failed",
                     format!("Failed to read prefill response: {}", cause(&e)),
@@ -3718,7 +3819,9 @@ mod tests {
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::{
             common::{
-                placement::tests::{engine_on, hearing_pairs_on, Heard},
+                placement::tests::{
+                    engine_on, hearing_engine_on, hearing_pair_sides_on, hearing_pairs_on, Heard,
+                },
                 prefill_admission::PrefillLoadGuard,
                 sse::SSE_CHANNEL_BUFFER,
             },
@@ -5287,6 +5390,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_side_answer_above_the_payload_limit_reads_502() {
+        use crate::routers::common::attempt_ledger::WORKER_BODY_TOO_LARGE;
+
         const OVER: &str =
             r#"{"object":"response","output":"one side's answer above the payload limit"}"#;
         // The limit fits one side's answer, not the other's. The prefill
@@ -5334,7 +5439,7 @@ mod tests {
             ));
         }
 
-        let code = Some("upstream_response_too_large".to_owned());
+        let code = Some(WORKER_BODY_TOO_LARGE.to_owned());
         let refused = |charged: [bool; 2]| (StatusCode::BAD_GATEWAY, code.clone(), charged);
         // Charged, prefill then decode: the side above the limit, alone.
         assert_eq!(
@@ -9495,7 +9600,8 @@ mod tests {
     /// Both sides at once: the engine hears the prefill's dispatch and the
     /// decode's where the two requests go out, then each side's end where
     /// its guard is dropped, the prefill's at its answer and the decode's
-    /// behind the answer's body. Nothing is released.
+    /// behind the answer's body, each with that side's own good answer.
+    /// Nothing is released.
     #[tokio::test]
     async fn the_engine_hears_both_sides_of_a_pair_sent_at_once() {
         assert_eq!(
@@ -9505,8 +9611,8 @@ mod tests {
                 "issued",
                 "dispatched Prefill",
                 "dispatched Decode",
-                "completed Cancelled",
-                "completed Cancelled",
+                "completed Ok 200",
+                "completed Ok 200",
             ]
         );
     }
@@ -9526,9 +9632,9 @@ mod tests {
                 "issued",
                 "issued",
                 "dispatched Prefill",
-                "completed Cancelled",
+                "completed Ok 200",
                 "dispatched Decode",
-                "completed Cancelled",
+                "completed Ok 200",
             ]
         );
     }
@@ -9545,51 +9651,730 @@ mod tests {
                 "issued",
                 "dispatched Prefill",
                 "dispatched Decode",
-                "completed Cancelled",
-                "completed Cancelled",
+                "completed Ok 200",
+                "completed Ok 200",
             ]
         );
     }
 
-    /// A streamed pair tells the engine no outcome yet. The decode's answer
-    /// goes through the relay that the regular router's streams go through,
-    /// and this route hands that relay no handle: under a stage that takes
-    /// an end the decode's guard holds one, and both sides still end with
-    /// class cancelled and no status.
+    /// What the stage heard of each side's end, sorted: a completion or a
+    /// release, as a stage that names sides says it
+    /// (`hearing_pair_sides_on`). The two guards of an attempt drop in an
+    /// order the cases do not hold.
+    fn ends_heard(heard: &Heard) -> Vec<String> {
+        let heard = heard.lock().expect("the stage heard");
+        let ends = heard
+            .iter()
+            .filter(|word| word.starts_with("completed") || word.starts_with("released"));
+        let mut ends: Vec<String> = ends.cloned().collect();
+        ends.sort();
+        ends
+    }
+
+    /// [`ends_heard`] once the stage heard `count` ends: a drain and a relay
+    /// tell their side's end from a task of their own.
+    async fn ends_heard_at(heard: &Heard, count: usize) -> Vec<String> {
+        for _ in 0..2_000 {
+            if ends_heard(heard).len() >= count {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        ends_heard(heard)
+    }
+
+    /// A ready worker for `side` of a pair that is sent in `shape`, whose
+    /// calls time out after `timeout` where one is given.
+    fn pair_worker(
+        shape: Shape,
+        side: PdSide,
+        url: String,
+        timeout: Option<std::time::Duration>,
+    ) -> Arc<dyn Worker> {
+        let worker_type = match side {
+            PdSide::Prefill => WorkerType::Prefill,
+            PdSide::Decode => WorkerType::Decode,
+        };
+        let mut worker = BasicWorkerBuilder::new(url).worker_type(worker_type);
+        if let Shape::Sequential = shape {
+            worker = worker.runtime_type(RuntimeType::Vllm);
+            if side == PdSide::Prefill {
+                worker = worker.kv_connector("NixlConnector");
+            }
+        }
+        if let Some(timeout) = timeout {
+            let client = http_client_builder().timeout(timeout).build().unwrap();
+            worker = worker.http_client(Arc::new(client));
+        }
+        let worker: Arc<dyn Worker> = Arc::new(worker.build());
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        worker
+    }
+
+    /// A streamed pair tells both ends from tasks of their own. The
+    /// prefill's drain tells through the guard it owns. The decode's relay
+    /// tells through the handle the route asked of the decode's guard,
+    /// behind the body's last byte. A decode stream cut behind its good
+    /// head is told as a failed connection, as the relay accounts it, and
+    /// leaves the prefill its own answer.
     #[tokio::test]
-    async fn the_engine_hears_no_outcome_of_a_pairs_streamed_decode() {
-        let (router, heard) = heard_pair_router(Sends::BothAtOnce).await;
-        let response = chat_through(&router, true).await;
+    async fn the_engine_hears_both_ends_of_a_streamed_pair() {
+        for (cut, decode_end) in [
+            (false, "completed Decode Ok 200"),
+            (true, "completed Decode ConnectFailed 502"),
+        ] {
+            let decode_url = spawn_cut_stub(
+                "/v1/chat/completions",
+                "text/event-stream",
+                CHAT_SSE_CHUNKS,
+                cut,
+            )
+            .await;
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            register_fragile_pair(&router, decode_url).await;
+
+            let response = stream_chat_through(&router).await;
+            assert_eq!(response.status(), StatusCode::OK, "cut={cut}");
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                ends_heard_at(&heard, 2).await,
+                [decode_end, "completed Prefill Ok 200"],
+                "cut={cut}"
+            );
+        }
+    }
+
+    /// Each side of a pair is told its own answer where its route records
+    /// that side, row by row on both dispatch shapes. It is told the status
+    /// its worker answered, as the worker's own. Or it is told the status
+    /// the route made of its failed call, as no answer of the worker's. A
+    /// side the gateway dropped is told by nobody: a decode that was never
+    /// sent is released, and the partner of a side that failed first ends
+    /// with no status. Where both sides go out at once and the decode
+    /// fails, the prefill's server never answers, so the prefill is in
+    /// flight when it is dropped.
+    #[tokio::test]
+    async fn the_engine_hears_each_sides_own_answer_where_a_side_fails() {
+        use Fault::{CutAfterHead, Refuses, Unreachable};
+        use PdSide::{Decode, Prefill};
+        use Shape::{Parallel, Sequential};
+        const UNAVAILABLE: Fault = Refuses(StatusCode::SERVICE_UNAVAILABLE);
+        const BUSY: Fault = Refuses(StatusCode::TOO_MANY_REQUESTS);
+        const NEVER_SENT: &str = "released Decode Abandoned";
+        const DROPPED: &str = "Cancelled";
+        const GOOD: &str = "Ok 200";
+        const NO_CONNECTION: &str = "ConnectFailed 502";
+        const SERVER: &str = "ServerError 503";
+        const CLIENT: &str = "ClientError 429";
+
+        // (shape, failing side, its fault, streamed request, the decode's
+        // end, the prefill's end). An end is a completion's class, with its
+        // status where one was told, or the release of a decode never sent.
+        let rows = [
+            // One behind the other: a prefill's failure ends the request
+            // ahead of the decode's send.
+            (
+                Sequential,
+                Prefill,
+                Unreachable,
+                false,
+                NEVER_SENT,
+                NO_CONNECTION,
+            ),
+            (Sequential, Prefill, UNAVAILABLE, false, NEVER_SENT, SERVER),
+            (Sequential, Prefill, BUSY, false, NEVER_SENT, CLIENT),
+            (
+                Sequential,
+                Prefill,
+                CutAfterHead,
+                false,
+                NEVER_SENT,
+                NO_CONNECTION,
+            ),
+            // A decode fails behind a prefill that was told its good answer.
+            (Sequential, Decode, Unreachable, false, NO_CONNECTION, GOOD),
+            (Sequential, Decode, UNAVAILABLE, false, SERVER, GOOD),
+            (Sequential, Decode, UNAVAILABLE, true, SERVER, GOOD),
+            (Sequential, Decode, CutAfterHead, false, NO_CONNECTION, GOOD),
+            // Both at once: the decode was sent, and is dropped where its
+            // prefill fails first.
+            (
+                Parallel,
+                Prefill,
+                Unreachable,
+                false,
+                DROPPED,
+                NO_CONNECTION,
+            ),
+            (Parallel, Prefill, UNAVAILABLE, false, DROPPED, SERVER),
+            (Parallel, Prefill, BUSY, false, DROPPED, CLIENT),
+            // A prefill body that breaks off while it is only consumed does
+            // not end the request: the decode's answer is the client's.
+            (Parallel, Prefill, CutAfterHead, false, GOOD, NO_CONNECTION),
+            // Both at once, and the decode fails while its prefill is in
+            // flight: the prefill is dropped.
+            (Parallel, Decode, Unreachable, false, NO_CONNECTION, DROPPED),
+            (Parallel, Decode, UNAVAILABLE, false, SERVER, DROPPED),
+            (Parallel, Decode, UNAVAILABLE, true, SERVER, DROPPED),
+        ];
+        let total = rows.len();
+        let mut mismatches = Vec::new();
+        for (shape, side, fault, streamed, decode_end, prefill_end) in rows {
+            let (failing, _refusing) = faulty_stub(fault).await;
+            let healthy = match (shape, side) {
+                (Parallel, Decode) => spawn_held_stub("{}").await.url,
+                _ => healthy_stub(shape, side.partner()).await,
+            };
+            let (prefill_url, decode_url) = match side {
+                Prefill => (failing, healthy),
+                Decode => (healthy, failing),
+            };
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
+
+            let response = chat_through(&router, streamed).await;
+            let status = response.status();
+            drop(response);
+            let said = |side: &str, end: &str| match end {
+                NEVER_SENT => NEVER_SENT.to_owned(),
+                end => format!("completed {side} {end}"),
+            };
+            let mut ends = [said("Decode", decode_end), said("Prefill", prefill_end)];
+            ends.sort_unstable();
+            let got = ends_heard(&heard);
+            if got != ends {
+                mismatches.push(format!(
+                    "{shape:?} {side:?} {fault:?} streamed={streamed}: answered {status}, heard {got:?}, expected {ends:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} of {total} rows tell another end:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    /// A prefill that answers a success other than 200 is told by what its
+    /// route's read keeps of it. Sent at once with its decode, the read
+    /// answers the worker's own status, and so does the drain of a streamed
+    /// pair: the prefill is told it. Sent ahead of its decode, the read
+    /// keeps the body and no status, and the prefill's good answer is told
+    /// as status 200. The class is `Ok` on each, and the decode is told its
+    /// own 200.
+    #[tokio::test]
+    async fn the_engine_hears_a_prefills_other_success_by_what_its_read_keeps() {
+        for (shape, streamed, prefill_end) in [
+            (Shape::Parallel, false, "completed Prefill Ok 202"),
+            (Shape::Parallel, true, "completed Prefill Ok 202"),
+            (Shape::Sequential, false, "completed Prefill Ok 200"),
+        ] {
+            let answer = serde_json::from_str(healthy_answer(shape, PdSide::Prefill))
+                .expect("a healthy answer is JSON");
+            let (prefill_url, _) =
+                spawn_delayed_stub(StatusCode::ACCEPTED, answer, std::time::Duration::ZERO).await;
+            let decode_url = if streamed {
+                let (path, kind) = ("/v1/chat/completions", "text/event-stream");
+                spawn_cut_stub(path, kind, CHAT_SSE_CHUNKS, false).await
+            } else {
+                healthy_stub(shape, PdSide::Decode).await
+            };
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
+
+            let response = chat_through(&router, streamed).await;
+            assert_eq!(response.status(), StatusCode::OK, "{shape:?} {streamed}");
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            // A drain and a relay tell their side's end from a task of
+            // their own.
+            assert_eq!(
+                ends_heard_at(&heard, 2).await,
+                ["completed Decode Ok 200", prefill_end],
+                "{shape:?} {streamed}"
+            );
+        }
+    }
+
+    /// Both sides at once, and the decode fails behind a prefill that had
+    /// answered. The engine hears the prefill's own good answer, told where
+    /// its guard was let go, and then the decode's refusal. The breaker's
+    /// record differs: the attempt is the decode's own failure, recorded on
+    /// the decode alone, so nothing is recorded on the prefill.
+    #[tokio::test]
+    async fn the_engine_hears_a_prefills_own_answer_ahead_of_its_decodes_failure() {
+        let decode_stub = spawn_held_stub_answering(
+            StatusCode::SERVICE_UNAVAILABLE,
+            |_| json!({"error": {"message": REFUSAL}}),
+        )
+        .await;
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        let (prefill, decode) = register_fragile_pair(&router, decode_stub.url.clone()).await;
+
+        let prefill_ends = async {
+            decode_stub.reached.notified().await;
+            assert_eq!(ends_heard_at(&heard, 1).await, ["completed Prefill Ok 200"]);
+            decode_stub.answers.notify_one();
+        };
+        let (response, ()) = served_beside(chat_through(&router, false), prefill_ends).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(response);
+
+        assert_eq!(
+            ends_heard(&heard),
+            [
+                "completed Decode ServerError 503",
+                "completed Prefill Ok 200"
+            ]
+        );
+        assert!(!decode.circuit_breaker_can_execute());
+        assert!(prefill.circuit_breaker_can_execute());
+    }
+
+    /// The request's own timeout on a pair. One behind the other, the side
+    /// whose call met it is told the timeout. A prefill that had answered
+    /// was told its answer, and a decode that was never sent is released.
+    /// Both at once, the engine hears the timeout on the decode always, as
+    /// the attempt records it. On the prefill it hears the timeout where
+    /// the prefill's own call met it, and the prefill's own answer where it
+    /// had answered. It hears nothing where the prefill was still in
+    /// flight. The breaker's record differs in those last two: the
+    /// attempt's 504 is recorded on both workers.
+    #[tokio::test]
+    async fn the_engine_hears_the_requests_own_timeout_by_what_each_side_had_done() {
+        use std::time::Duration;
+
+        use Shape::{Parallel, Sequential};
+        const SHORT: Option<Duration> = Some(Duration::from_millis(300));
+        // Long enough for the other side's answer to come first on a loaded
+        // machine.
+        const AMPLE: Option<Duration> = Some(Duration::from_secs(3));
+        const SILENT: Duration = Duration::from_secs(30);
+        const AT_ONCE: (Duration, Option<Duration>) = (Duration::ZERO, None);
+        const TIMED_OUT: &str = "completed Decode Timeout 504";
+
+        // (shape, the prefill's delay and timeout, the decode's delay and
+        // timeout, the decode's end, the prefill's end)
+        let rows = [
+            (
+                Sequential,
+                (SILENT, SHORT),
+                AT_ONCE,
+                "released Decode Abandoned",
+                "completed Prefill Timeout 504",
+            ),
+            (
+                Sequential,
+                AT_ONCE,
+                (SILENT, SHORT),
+                TIMED_OUT,
+                "completed Prefill Ok 200",
+            ),
+            // The prefill had answered when the decode's call timed out.
+            (
+                Parallel,
+                AT_ONCE,
+                (SILENT, AMPLE),
+                TIMED_OUT,
+                "completed Prefill Ok 200",
+            ),
+            // The prefill was still in flight.
+            (
+                Parallel,
+                (SILENT, None),
+                (SILENT, SHORT),
+                TIMED_OUT,
+                "completed Prefill Cancelled",
+            ),
+            // The prefill's own call met the timeout.
+            (
+                Parallel,
+                (SILENT, SHORT),
+                AT_ONCE,
+                TIMED_OUT,
+                "completed Prefill Timeout 504",
+            ),
+        ];
+        for (shape, prefill, decode, decode_end, prefill_end) in rows {
+            let case = format!("{shape:?}: {decode_end}, {prefill_end}");
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            for ((delay, timeout), side) in [(prefill, PdSide::Prefill), (decode, PdSide::Decode)] {
+                let reply =
+                    serde_json::from_str(healthy_answer(shape, side)).expect("a JSON reply");
+                let (url, _arrivals) = spawn_delayed_stub(StatusCode::OK, reply, delay).await;
+                let worker = pair_worker(shape, side, url, timeout);
+                router.worker_registry.register_or_replace(worker);
+            }
+
+            let response = chat_through(&router, false).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT, "{case}");
+            drop(response);
+            let mut ends = [decode_end, prefill_end];
+            ends.sort_unstable();
+            assert_eq!(ends_heard(&heard), ends, "{case}");
+        }
+    }
+
+    /// A side's body over the payload limit is told as the server's error
+    /// on that side: the worker answered, and the route refused what it
+    /// gave. One behind the other the prefill's handoff is over
+    /// the limit and the decode is never sent. Both at once the decode's
+    /// body is over it behind a good prefill. Or the prefill's body is,
+    /// which the route reads whole where the request asks for logprobs, and
+    /// the decode is dropped.
+    #[tokio::test]
+    async fn the_engine_hears_a_body_over_the_limit_as_the_servers_error() {
+        const OVER: &str =
+            r#"{"object":"response","output":"one side's answer above the payload limit"}"#;
+        const NEVER_SENT: &str = "released Decode Abandoned";
+        const DECODE_REFUSED: &str = "completed Decode ServerError 502";
+        const PREFILL_REFUSED: &str = "completed Prefill ServerError 502";
+        // (shape, the prefill's answer, the decode's answer, logprobs, the
+        // decode's end, the prefill's end)
+        let rows = [
+            (
+                Shape::Sequential,
+                healthy_answer(Shape::Sequential, PdSide::Prefill),
+                "{}",
+                false,
+                NEVER_SENT,
+                PREFILL_REFUSED,
+            ),
+            (
+                Shape::Parallel,
+                "{}",
+                OVER,
+                false,
+                DECODE_REFUSED,
+                "completed Prefill Ok 200",
+            ),
+            (
+                Shape::Parallel,
+                "{}",
+                OVER,
+                true,
+                DECODE_REFUSED,
+                "completed Prefill Ok 200",
+            ),
+            (
+                Shape::Parallel,
+                OVER,
+                "{}",
+                true,
+                "completed Decode Cancelled",
+                PREFILL_REFUSED,
+            ),
+        ];
+        for (shape, prefill, decode, logprobs, decode_end, prefill_end) in rows {
+            let case = format!("{shape:?} logprobs={logprobs}: {decode_end}, {prefill_end}");
+            let router = PDRouter {
+                max_payload_size: 64,
+                ..single_attempt_router()
+            };
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            for (reply, side) in [(prefill, PdSide::Prefill), (decode, PdSide::Decode)] {
+                let (url, _seen) = spawn_recording_stub(reply).await;
+                let worker = pair_worker(shape, side, url, None);
+                router.worker_registry.register_or_replace(worker);
+            }
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": logprobs,
+            }))
+            .expect("valid chat request");
+
+            let response = router
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
+            drop(response);
+            let mut ends = [decode_end, prefill_end];
+            ends.sort_unstable();
+            assert_eq!(ends_heard(&heard), ends, "{case}");
+        }
+    }
+
+    /// The route reads a prefill's body whole where the request asks for
+    /// logprobs. One that its worker cuts short is told as a failed
+    /// connection: the refusal is the route's own, and no answer of the
+    /// worker's stands. The decode is dropped.
+    #[tokio::test]
+    async fn the_engine_hears_a_prefill_body_cut_while_read_whole_as_a_failed_connection() {
+        let (prefill_url, _refusing) = faulty_stub(Fault::CutAfterHead).await;
+        let decode_url = healthy_stub(Shape::Parallel, PdSide::Decode).await;
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        for (url, side) in [(prefill_url, PdSide::Prefill), (decode_url, PdSide::Decode)] {
+            let worker = pair_worker(Shape::Parallel, side, url, None);
+            router.worker_registry.register_or_replace(worker);
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true,
+        }))
+        .expect("valid chat request");
+
+        let response = router
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        drop(response);
+        assert_eq!(
+            ends_heard(&heard),
+            [
+                "completed Decode Cancelled",
+                "completed Prefill ConnectFailed 502"
+            ]
+        );
+    }
+
+    /// A fan-out of more than one answer sends no prefill. The route lets
+    /// the prefill's guard go unsent and tells its end nothing, and the
+    /// decode is told its own answer.
+    #[tokio::test]
+    async fn the_engine_hears_no_answer_of_a_prefill_a_fan_out_never_sends() {
+        let (prefill_url, prefill_seen) =
+            spawn_recording_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let decode_url = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        register_fleet(
+            &router,
+            Shape::Sequential,
+            &prefill_url,
+            &[decode_url.as_str()],
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request = serde_json::from_value(json!({
+            "model": "m",
+            "n": 2,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+
+        let response = router
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+            .await;
         assert_eq!(response.status(), StatusCode::OK);
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        // A relay that held a handle would tell the end from its task,
-        // behind the body's last byte.
-        let said = || heard.lock().expect("the stage heard").clone();
-        for _ in 0..1024 {
-            if said().len() >= 6 {
-                break;
-            }
-            tokio::task::yield_now().await;
+
+        assert!(taken(&prefill_seen).is_empty(), "no prefill is sent");
+        let ends = ends_heard(&heard);
+        assert_eq!(ends.len(), 2, "{ends:?}");
+        assert_eq!(ends[0], "completed Decode Ok 200");
+        // The prefill's end, whatever its word, states no status.
+        let stated = ends[1].ends_with(|last: char| last.is_ascii_digit());
+        assert!(ends[1].contains("Prefill") && !stated, "{ends:?}");
+    }
+
+    /// A MoRI-IO pair written concurrently tells the side that answered and
+    /// leaves the side it dropped to nobody. The rows: a decode that
+    /// refuses, or whose call fails, while its prefill is in flight, and a
+    /// prefill that refuses while its decode is.
+    #[tokio::test]
+    async fn the_engine_hears_the_side_that_answered_of_a_pair_written_concurrently() {
+        use Fault::{Refuses, Unreachable};
+        const UNAVAILABLE: Fault = Refuses(StatusCode::SERVICE_UNAVAILABLE);
+        // (the side that fails, its fault, the decode's end, the prefill's
+        // end)
+        let rows = [
+            (
+                PdSide::Decode,
+                UNAVAILABLE,
+                "completed Decode ServerError 503",
+                "completed Prefill Cancelled",
+            ),
+            (
+                PdSide::Decode,
+                Unreachable,
+                "completed Decode ConnectFailed 502",
+                "completed Prefill Cancelled",
+            ),
+            (
+                PdSide::Prefill,
+                UNAVAILABLE,
+                "completed Decode Cancelled",
+                "completed Prefill ServerError 503",
+            ),
+        ];
+        for (fails, fault, decode_end, prefill_end) in rows {
+            let case = format!("{fails:?} {fault:?}");
+            let (failing, _refusing) = faulty_stub(fault).await;
+            // Never let to answer: in flight where its partner fails.
+            let held = spawn_held_stub("{}").await;
+            let (prefill_url, decode_url) = match fails {
+                PdSide::Prefill => (failing, held.url.clone()),
+                PdSide::Decode => (held.url.clone(), failing),
+            };
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            register_moriio_pair_with(
+                &router,
+                (prefill_url, Some("write")),
+                (decode_url, "write"),
+                &[CONCURRENT_WRITE],
+            );
+
+            let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+            assert!(!response.status().is_success(), "{case}");
+            drop(response);
+            assert_eq!(ends_heard(&heard), [decode_end, prefill_end], "{case}");
         }
+    }
+
+    /// A MoRI-IO pair written concurrently whose decode's call fails behind
+    /// a prefill that had answered. The engine hears the prefill's own good
+    /// answer, told where its load was let go, and then the decode's failed
+    /// connection, as the route answers it.
+    #[tokio::test]
+    async fn the_engine_hears_a_concurrent_writes_prefill_ahead_of_its_decodes_failed_call() {
+        let (prefill, _) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decode = format!("http://{}", listener.local_addr().unwrap());
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        register_moriio_pair_with(
+            &router,
+            (prefill, Some("write")),
+            (decode, "write"),
+            &[CONCURRENT_WRITE],
+        );
+
+        let decode_hangs_up = async {
+            // The decode's call is taken and left without an answer.
+            let held = listener.accept().await.unwrap();
+            assert_eq!(ends_heard_at(&heard, 1).await, ["completed Prefill Ok 200"]);
+            drop(held);
+            // The route sends the call once more: it is hung up on too.
+            drop(listener.accept().await.unwrap());
+        };
+        let no_fields = json!({});
+        let call = moriio_call(&router, "/v1/chat/completions", None, &no_fields);
+        let (response, ()) = served_beside(call, decode_hangs_up).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        drop(response);
+
         assert_eq!(
-            said(),
+            ends_heard(&heard),
             [
-                "issued",
-                "issued",
-                "dispatched Prefill",
-                "dispatched Decode",
-                "completed Cancelled",
-                "completed Cancelled",
+                "completed Decode ConnectFailed 502",
+                "completed Prefill Ok 200"
             ]
         );
     }
 
+    /// The last word the engine hears of one count request. The router
+    /// makes one attempt on its one prefill worker at `url`, under a payload
+    /// `limit` and the call's own `timeout` where one is given.
+    async fn count_heard(
+        url: String,
+        limit: Option<usize>,
+        timeout: Option<std::time::Duration>,
+    ) -> Option<String> {
+        let mut router = single_attempt_router();
+        if let Some(limit) = limit {
+            router.max_payload_size = limit;
+        }
+        let heard = hearing_engine_on(&router.policy_registry);
+        let worker = pair_worker(Shape::Parallel, PdSide::Prefill, url, timeout);
+        router.worker_registry.register_or_replace(worker);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body = serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant, body, UNKNOWN_MODEL_ID)
+            .await;
+        drop(response);
+        let heard = heard.lock().expect("the stage heard");
+        heard.last().cloned()
+    }
+
+    /// The count route places one prefill worker and keeps its answer to
+    /// its end. The engine hears the count's outcome beside each record on
+    /// the worker. It hears the worker's own status where it answered, and
+    /// a failed connection where its call failed below HTTP. It hears the
+    /// server's error where its answer was over the payload limit.
+    ///
+    /// It hears the request's own timeout where the call met it, ahead of
+    /// the answer's head or in its body. It hears a failed connection where
+    /// the body broke off.
+    #[tokio::test]
+    async fn the_engine_hears_a_count_requests_outcome() {
+        use std::time::Duration;
+
+        const SHORT: Option<Duration> = Some(Duration::from_millis(300));
+        const TIMED_OUT: &str = "completed Timeout 504";
+
+        // (the worker's fault, a payload limit under its answer, the end)
+        let rows = [
+            (None, None, "completed Ok 200"),
+            (
+                Some(Fault::Refuses(StatusCode::SERVICE_UNAVAILABLE)),
+                None,
+                "completed ServerError 503",
+            ),
+            (
+                Some(Fault::Unreachable),
+                None,
+                "completed ConnectFailed 502",
+            ),
+            (None, Some(8), "completed ServerError 502"),
+        ];
+        for (fault, limit, end) in rows {
+            let (url, _refusing) = match fault {
+                None => (spawn_recording_stub(r#"{"input_tokens":3}"#).await.0, None),
+                Some(fault) => faulty_stub(fault).await,
+            };
+            let heard = count_heard(url, limit, None).await;
+            assert_eq!(heard.as_deref(), Some(end), "{fault:?} {limit:?}");
+        }
+
+        // (what the worker's server does, the call's own timeout, the end)
+        // A loaded machine may meet the timeout ahead of the stalled body's
+        // head: the word is the same.
+        let (silent, _) =
+            spawn_delayed_stub(StatusCode::OK, json!({}), Duration::from_secs(30)).await;
+        let rows = [
+            ("sends no head", silent, SHORT, TIMED_OUT),
+            (
+                "stalls in its body",
+                spawn_stalled_body_stub().await,
+                SHORT,
+                TIMED_OUT,
+            ),
+            (
+                "breaks its body off",
+                spawn_cut_body_stub().await,
+                None,
+                "completed ConnectFailed 502",
+            ),
+        ];
+        for (serves, url, timeout, end) in rows {
+            let heard = count_heard(url, None, timeout).await;
+            assert_eq!(heard.as_deref(), Some(end), "{serves}");
+        }
+    }
+
     /// A decode that is never sent is no dispatch: where the prefill refuses
     /// a pair that is sent prefill first, the engine hears the prefill's
-    /// dispatch and end, and the decode's side released. The decode worker
-    /// was counted from the selection, and is counted no more.
+    /// dispatch and its end with the refusal's status, and the decode's side
+    /// released. The decode worker was counted from the selection, and is
+    /// counted no more.
     #[tokio::test]
     async fn the_engine_hears_a_decode_that_is_never_sent_as_released() {
         let router = single_attempt_router();
@@ -9612,7 +10397,7 @@ mod tests {
         assert_eq!(
             heard,
             [
-                "completed Cancelled",
+                "completed ServerError 503",
                 "dispatched Prefill",
                 "issued",
                 "issued",
@@ -9649,9 +10434,9 @@ mod tests {
                 "issued",
                 "dispatched Prefill",
                 "issued",
-                "completed Cancelled",
+                "completed Ok 200",
                 "dispatched Decode",
-                "completed Cancelled",
+                "completed Ok 200",
             ]
         );
     }
@@ -9701,6 +10486,14 @@ mod tests {
     async fn spawn_held_stub_with(
         reply: impl Fn(&Value) -> Value + Clone + Send + Sync + 'static,
     ) -> HeldStub {
+        spawn_held_stub_answering(StatusCode::OK, reply).await
+    }
+
+    /// [`spawn_held_stub_with`] under `status`.
+    async fn spawn_held_stub_answering(
+        status: StatusCode,
+        reply: impl Fn(&Value) -> Value + Clone + Send + Sync + 'static,
+    ) -> HeldStub {
         let hits = Arc::new(AtomicUsize::new(0));
         let reached = Arc::new(tokio::sync::Notify::new());
         let answers = Arc::new(tokio::sync::Notify::new());
@@ -9720,7 +10513,7 @@ mod tests {
                 hits.fetch_add(1, Ordering::SeqCst);
                 reached.notify_one();
                 answers.notified().await;
-                axum::Json(reply(&sent))
+                (status, axum::Json(reply(&sent)))
             }
         }));
         HeldStub {
@@ -9826,9 +10619,9 @@ mod tests {
                 "issued",
                 "dispatched Prefill",
                 "issued",
-                "completed Cancelled",
+                "completed Ok 200",
                 "dispatched Decode",
-                "completed Cancelled",
+                "completed Ok 200",
             ]
         );
     }
@@ -9920,8 +10713,8 @@ mod tests {
                     "dispatched Prefill",
                     "issued",
                     "dispatched Decode",
-                    "completed Cancelled",
-                    "completed Cancelled",
+                    "completed Ok 200",
+                    "completed Ok 200",
                 ],
                 "{transfer}"
             );

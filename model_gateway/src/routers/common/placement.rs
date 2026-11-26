@@ -527,13 +527,15 @@ pub(crate) struct RequestEnd(SideEnd);
 
 impl RequestEnd {
     /// The handle on the end of the request `guard` counts. A classic
-    /// guard pays one test of the word it keeps nothing in.
+    /// guard pays one test of the word it keeps nothing in: the word is
+    /// compared where it lies, and read only for a guard that keeps
+    /// something.
     #[inline]
     pub(crate) fn of(guard: &WorkerLoadGuard) -> Self {
-        match guard.kept() {
-            None => Self::default(),
-            Some(kept) => Self(kept_side_end(kept)),
+        if guard.kept().is_none() {
+            return Self::default();
         }
+        Self(kept_side_end(guard))
     }
 
     /// The request ended with `status`, as the reader of its answer took
@@ -612,10 +614,13 @@ impl SharedEnd {
 }
 
 /// [`RequestEnd::of`] for a guard that keeps something, out of line: a
-/// classic guard never comes here.
+/// classic guard never comes here. It takes the guard and reads the kept
+/// value itself, so the caller's test loads nothing.
 #[inline(never)]
-fn kept_side_end(kept: &(dyn std::any::Any + Send + Sync)) -> SideEnd {
-    kept.downcast_ref::<PlacementSide>()
+fn kept_side_end(guard: &WorkerLoadGuard) -> SideEnd {
+    guard
+        .kept()
+        .and_then(|kept| kept.downcast_ref::<PlacementSide>())
         .map_or_else(SideEnd::default, PlacementSide::side_end)
 }
 
@@ -7233,12 +7238,27 @@ pub(crate) mod tests {
     /// lease, so the engine leases each pick under it. Where the request it
     /// ranks for states an output limit, it says `limit <tokens>` ahead of
     /// that decision's words: a request that states none adds no word.
+    /// With `sides` it names the side at each end (`completed Prefill Ok
+    /// 200`, `released Decode Abandoned`), for a case that holds which
+    /// side of a pair was told what.
     #[derive(Debug)]
-    struct Hears(Heard);
+    struct Hears {
+        heard: Heard,
+        sides: bool,
+    }
 
     impl Hears {
         fn note(&self, word: String) {
-            self.0.lock().expect("the stage heard").push(word);
+            self.heard.lock().expect("the stage heard").push(word);
+        }
+
+        /// The side an end is said of, where this stage names sides.
+        fn side(&self, lease: &Lease) -> String {
+            if self.sides {
+                format!(" {:?}", lease.side)
+            } else {
+                String::new()
+            }
         }
     }
 
@@ -7255,18 +7275,19 @@ pub(crate) mod tests {
             self.note(format!("dispatched {side:?}"));
         }
 
-        fn on_completed(&self, _: &Lease, outcome: &Outcome) {
+        fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
             // An end nobody reported states no status, and is noted by its
             // class alone.
             let status = match outcome.status {
                 0 => String::new(),
                 status => format!(" {status}"),
             };
-            self.note(format!("completed {:?}{status}", outcome.class));
+            let side = self.side(lease);
+            self.note(format!("completed{side} {:?}{status}", outcome.class));
         }
 
-        fn on_released(&self, _: &Lease, reason: ReleaseReason) {
-            self.note(format!("released {reason:?}"));
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.note(format!("released{} {reason:?}", self.side(lease)));
         }
     }
 
@@ -7311,8 +7332,12 @@ pub(crate) mod tests {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
         let mut stages = StageRegistry::builtin();
+        let hears = move || Hears {
+            heard: Arc::clone(&kept),
+            sides: false,
+        };
         stages
-            .scorer("hears", move || Box::new(Hears(Arc::clone(&kept))))
+            .scorer("hears", move || Box::new(hears()))
             .expect("a free name");
         let document: PolicySpec = serde_json::from_str(
             r#"{"apiVersion":"smg.policy/v1","generation":1,"profiles":{"p":{"score":["hears"],"pick":"best"}}}"#,
@@ -9735,11 +9760,25 @@ pub(crate) mod tests {
     /// sides, and what that stage heard. The document picks a pair's decode
     /// with its prefill, or behind it where `later`.
     pub(crate) fn hearing_pairs_on(policies: &PolicyRegistry, later: bool) -> Heard {
+        hearing_pairs(policies, later, false)
+    }
+
+    /// [`hearing_pairs_on`] under a stage that names the side at each end,
+    /// where the document picks a pair's decode with its prefill.
+    pub(crate) fn hearing_pair_sides_on(policies: &PolicyRegistry) -> Heard {
+        hearing_pairs(policies, false, true)
+    }
+
+    fn hearing_pairs(policies: &PolicyRegistry, later: bool, sides: bool) -> Heard {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
         let mut stages = StageRegistry::builtin();
+        let hears = move || Hears {
+            heard: Arc::clone(&kept),
+            sides,
+        };
         stages
-            .scorer("hears", move || Box::new(Hears(Arc::clone(&kept))))
+            .scorer("hears", move || Box::new(hears()))
             .expect("a free name");
         let document = PolicySpec::pair_presets("round_robin", "round_robin");
         let mut document = document.expect("the pair presets");

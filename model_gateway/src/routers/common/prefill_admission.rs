@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 
 use crate::{
     observability::metrics::Metrics,
-    routers::common::placement::{Placed, Unsent},
+    routers::common::placement::{Placed, RequestEnd, Unsent},
 };
 
 const HEAD_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -213,6 +213,27 @@ impl PrefillLoadGuard {
                 }
                 Self::Admission { _reservation }
             }
+        }
+    }
+
+    /// The handle on the end of the prefill this load counts
+    /// ([`RequestEnd::of`]), asked of the worker guard the load holds: its
+    /// own, or its reservation's. A pair route tells the prefill's end
+    /// through it where it records the prefill's status, and keeps no
+    /// handle past this load: the prefill's end waits for none.
+    ///
+    /// A replica that shares the reservation asks the same side, so a
+    /// later report writes over an earlier one. A replica that is a guard
+    /// of its own keeps no side, and a load whose guard is gone holds
+    /// none: each answers the empty handle.
+    #[inline]
+    pub(crate) fn end(&self) -> RequestEnd {
+        match self {
+            Self::Admission { _reservation } => _reservation
+                .load_guard
+                .as_ref()
+                .map_or_else(RequestEnd::default, RequestEnd::of),
+            Self::Unbounded { _guard } => RequestEnd::of(_guard),
         }
     }
 
