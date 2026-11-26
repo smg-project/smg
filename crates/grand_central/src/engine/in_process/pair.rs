@@ -126,10 +126,12 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 use super::{overlap, signals, single, with_shadow, InProcess, Loaded, PoolMembers};
 use crate::{
     engine::{
-        decision::{shed, Decision, Pick, ShadowKind, ShedReason, Target, SUBSET_HINT, WIRES},
+        decision::{
+            shed, Decision, PairSide, Pick, ShadowKind, ShedReason, Target, SUBSET_HINT, WIRES,
+        },
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         demands::{Demands, UnmetDemand},
-        framework::{Engine, PairPools, PairSide, Scratch, ShadowRows, ShedOver},
+        framework::{Engine, PairPools, Scratch, ShadowRows, ShedOver},
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,

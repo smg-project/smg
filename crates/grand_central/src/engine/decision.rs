@@ -13,7 +13,6 @@ use crate::service::proto;
 use crate::{
     document::spec::RulePlaced,
     engine::{
-        framework::PairSide,
         sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{Candidate, WorkerId},
     },
@@ -104,6 +103,36 @@ impl Pair {
             decode_dp_rank: decode.dp_rank,
             decode_verdict: DecodeVerdict::NONE,
             decode_placing: DecodePlacing::STAGES,
+        }
+    }
+}
+
+/// One side of a pair decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PairSide {
+    Prefill,
+    Decode,
+}
+
+impl PairSide {
+    /// Both sides, the prefill first: the order a pair decides them in.
+    pub const BOTH: [Self; 2] = [Self::Prefill, Self::Decode];
+
+    /// The side's place in a table of the two ([`Self::BOTH`]).
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Prefill => 0,
+            Self::Decode => 1,
+        }
+    }
+
+    /// The side's label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
         }
     }
 }

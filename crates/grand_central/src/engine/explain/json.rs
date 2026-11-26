@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use super::DecisionRecord;
 use crate::engine::{
-    decision::{Decision, LiftedVeto, ShedReason, Target},
-    framework::{Engine, PairSide},
+    decision::{Decision, LiftedVeto, PairSide, ShedReason, Target},
+    framework::Engine,
     view::WorkerId,
 };
 
