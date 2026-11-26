@@ -1,7 +1,7 @@
 //! The records a policy document states, as a crate outside this one comes
-//! to them. A document alone states ten: each of their cases reads one from
-//! a document's text, the one road to it, and reads its fields back by a
-//! pattern that ends open. Eight start from their default and take a field
+//! to them. Ten have no start: each of their cases reads one from a
+//! document's text, a road to it, and reads its fields back by a pattern
+//! that ends open. Eight start from their default and take a field
 //! by assignment. Two are made by a call that takes the one field a
 //! document must write, and each call is held to a document that writes
 //! that field and nothing else.
@@ -383,8 +383,12 @@ fn a_rows_query_starts_from_its_default_and_takes_a_field_by_assignment() {
 /// A profile is made by its call from the picker alone, the one field a
 /// document must write. It equals the profile a document states by its
 /// picker and nothing else, and it is read by a pattern that ends open.
+/// The call builds in a constant where its argument does.
 #[test]
 fn a_profile_spec_is_made_by_its_call_as_a_document_of_its_picker_alone_reads() {
+    const NAMED: ProfileSpec = ProfileSpec::of(PickSpec::Name(String::new()));
+
+    assert_eq!(NAMED.pick, PickSpec::Name(String::new()));
     let made = ProfileSpec::of(PickSpec::from("best"));
     assert_eq!(made, profiled("{pick: best}"));
     let ProfileSpec {
@@ -405,8 +409,12 @@ fn a_profile_spec_is_made_by_its_call_as_a_document_of_its_picker_alone_reads() 
 /// A routing key is made by its call from its sources alone, the one field
 /// a document must write. It equals the block a document states by its
 /// sources and nothing else, and it is read by a pattern that ends open.
+/// The call builds in a constant where its argument does.
 #[test]
 fn a_routing_key_is_made_by_its_call_as_a_document_of_its_sources_alone_reads() {
+    const NO_SOURCE: RoutingKeySpec = RoutingKeySpec::of(Vec::new());
+
+    assert!(NO_SOURCE.sources.is_empty());
     let mut source = KeySourceSpec::default();
     source.rid = true;
     let made = RoutingKeySpec::of(vec![source.clone()]);

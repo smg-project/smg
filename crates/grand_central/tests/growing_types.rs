@@ -13,9 +13,9 @@
 //! where its module still expects the lint.
 //!
 //! The records a policy document states have a file of their own,
-//! `growing_types_cases/document.rs`. A document alone states ten of them:
-//! their cases read one from a document's text, the one road a crate
-//! outside this one has to it.
+//! `growing_types_cases/document.rs`. Ten of them have no start: their
+//! cases read one from a document's text, a road a crate outside this one
+//! has to it.
 
 #![deny(unreachable_patterns)]
 

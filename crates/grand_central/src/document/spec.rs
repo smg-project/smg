@@ -14,23 +14,6 @@
 //! by name as not in this build, so a document written against the published
 //! schema validates the day its stage lands. [`PolicySpec::schema`] is that
 //! schema; the field documentation of this module is its descriptions.
-//!
-//! A Rust caller outside this crate writes no literal of a record of this
-//! module: the records gain fields, and a pattern of one ends with `..`. No
-//! record's own doc says so, because that doc is the record's description in
-//! the published schema. How such a caller comes to nineteen of them:
-//!
-//! - Ten are stated by a document alone: [`ResidentWorkParams`],
-//!   [`LeastCostParams`], [`BestParams`], [`BestWithTemperatureParams`],
-//!   [`HasRoomParams`], [`Bounds`], [`HeaderMatch`], [`SessionsSpec`],
-//!   [`CanarySpec`] and [`SignalSpec`]. Code outside this crate reads one
-//!   from a document's text and builds none. A start comes the day a caller
-//!   needs one.
-//! - Seven start from their `Default`, and the caller assigns what it states
-//!   otherwise: [`IndexSpec`], [`BucketParams`], [`CostMargin`], [`Match`],
-//!   [`OverloadSpec`], [`KeySourceSpec`] and [`BindingSpec`].
-//! - Two start from a call that takes the one field a document must write:
-//!   [`ProfileSpec::of`] and [`RoutingKeySpec::of`].
 
 use std::{
     borrow::Cow,

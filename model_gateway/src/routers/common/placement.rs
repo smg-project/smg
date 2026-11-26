@@ -8782,10 +8782,9 @@ pub(crate) mod tests {
     /// stock pair of two rotations under that word, on `policies`.
     fn shedding_pair_engine_on(policies: &PolicyRegistry) {
         let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
-        sheds.bindings[0].overload = Some(OverloadSpec {
-            shed_when_all_vetoed: true,
-            ..OverloadSpec::default()
-        });
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = true;
+        sheds.bindings[0].overload = Some(overload);
         engine_on(
             policies,
             AppliedSpec::validate(&sheds).expect("a valid document"),
