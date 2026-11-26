@@ -1,11 +1,10 @@
 //! The program's own stage, decided over records a caller makes by hand.
 //!
-//! A program that adds a stage tests it where it controls every record: it
-//! makes the records, a pair's two pools and the targets it expects with
-//! the constructors of the crate's types ([`Candidate::ready`],
-//! [`PairPools::of`], [`Target::of`], [`Target::paired`]) and writes over
-//! them the fields its stage reads. No case here writes a literal of one of
-//! those types.
+//! A program that adds a stage tests it where it controls every record. It
+//! makes the records, a pair's two pools and the targets it expects with the
+//! constructors of the crate's types ([`Candidate::ready`], [`PairPools::of`],
+//! [`Target::of`], [`Target::paired`]). Over them it writes the fields its
+//! stage reads. No case here writes a literal of one of those types.
 //!
 //! The last case places requests through the program, over the lists its
 //! registry publishes: the stage reads the same fields there.
@@ -79,9 +78,9 @@ fn first(decision: &Decision) -> Target {
 }
 
 /// A request goes to the engine that holds the fewest requests over all its
-/// ranks: past the idle rank of an engine whose other rank holds three, to
-/// a worker that stands alone and holds two. Once the worker alone holds
-/// more than the engine does, the request goes to a rank of that engine.
+/// ranks. Here it goes past the idle rank of an engine whose other rank holds
+/// three, to a worker that stands alone and holds two. Once the worker alone
+/// holds more than the engine does, the request goes to a rank of that engine.
 #[test]
 fn a_request_goes_past_an_idle_rank_of_the_busier_engine() {
     let engine = decided(PolicySpec::preset("round_robin").expect("a preset"));
@@ -129,10 +128,10 @@ fn a_rank_a_filter_drops_still_counts_on_its_engine() {
     }
 }
 
-/// A pair is decided over two pools made by hand, each side by the
-/// program's scorer: the prefill that holds nothing, with the decode that
-/// stands alone and holds two, past the idle rank of a decode engine whose
-/// other rank holds three. The target is the pair of those two records.
+/// A pair is decided over two pools made by hand, each side by the program's
+/// scorer. The prefill is the one that holds nothing. The decode is the one
+/// that stands alone and holds two, past the idle rank of a decode engine
+/// whose other rank holds three. The target is the pair of those two records.
 #[test]
 fn a_pair_is_decided_over_two_pools_made_by_hand() {
     let pair = PolicySpec::pair_presets("round_robin", "round_robin");
@@ -156,10 +155,9 @@ fn a_pair_is_decided_over_two_pools_made_by_hand() {
     }
 }
 
-/// The scorer decides a request the program places, over the list its
-/// registry publishes: each worker there is an engine of its own, so a
-/// request goes past every worker that has a request under way, to the one
-/// that has none.
+/// The scorer decides a request the program places, over the list its registry
+/// publishes. Each worker there is an engine of its own. So a request goes
+/// past every worker that has a request under way, to the one that has none.
 #[test]
 fn the_programs_scorer_places_a_request_past_the_workers_under_way() {
     const PLAIN: Asked<'static> = Asked {
