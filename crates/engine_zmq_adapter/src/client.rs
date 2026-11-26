@@ -2676,8 +2676,9 @@ mod tests {
         req.data_parallel_rank = Some(0);
         req.tokenized.as_mut().unwrap().original_text = "media prompt".into();
 
+        let ext = ManagedExternalEncode::single("http://enc:30000", 1, 0);
         let _stream = client
-            .generate_sglang_managed(req, &binding, Some(("http://enc:30000", 1, 0)), None)
+            .generate_sglang_managed(req, &binding, Some(&ext), None)
             .await
             .unwrap();
         let frame = rank1.recv_request().await.unwrap();

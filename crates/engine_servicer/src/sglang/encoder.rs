@@ -41,6 +41,7 @@ enum NativeCallError {
 }
 
 impl NativeCallError {
+    /// Unwrap the underlying gRPC status regardless of send certainty.
     fn into_status(self) -> Status {
         match self {
             Self::NotSent(status) | Self::Ambiguous(status) => status,
@@ -90,6 +91,7 @@ struct NativeReply {
 }
 
 impl NativeEncoderLink {
+    /// Bind same-host IPC command/event sockets and spawn the writer and reader tasks.
     pub async fn bind(
         commands_endpoint: &str,
         events_endpoint: &str,
@@ -233,6 +235,7 @@ impl NativeEncoderLink {
         !self.state.failed.load(Ordering::Acquire) && self.state.connected.load(Ordering::Acquire)
     }
 
+    /// Build a JSON control frame for `rid` when the native IPC link is healthy and connected.
     fn control_frame(&self, operation: &str, rid: &str) -> Option<ZmqMessage> {
         if rid.is_empty()
             || rid.len() > 256
@@ -265,6 +268,7 @@ impl NativeEncoderLink {
 }
 
 impl NativeState {
+    /// Decode one JSON reply frame from Python and resolve the matching pending waiter.
     fn receive(&self, message: ZmqMessage) -> Result<(), Status> {
         let frames = message.into_vec();
         if frames.len() != 1 || frames[0].len() > 4 * 1024 * 1024 {
@@ -292,6 +296,7 @@ impl NativeState {
         Ok(())
     }
 
+    /// Mark the IPC link failed and wake all in-flight waiters with an ambiguous error.
     fn fail(&self, error: Status) {
         self.failed.store(true, Ordering::Release);
         if let Ok(mut pending) = self.pending.lock() {
@@ -302,6 +307,7 @@ impl NativeState {
     }
 }
 
+/// Convert a transport or serialization failure into an `UNAVAILABLE` gRPC status.
 fn wire_error(error: impl std::fmt::Display) -> Status {
     Status::unavailable(error.to_string())
 }
@@ -497,7 +503,12 @@ fn compute_source_key(modality: EncoderModality, item: &EncoderMediaItem) -> Opt
     if modality != EncoderModality::Image {
         return None;
     }
-    if item.url.len() < 5 || !item.url[..5].eq_ignore_ascii_case("data:") {
+    if !item
+        .url
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"data:"))
+    {
         return None;
     }
     let mut hasher = blake3::Hasher::new();
@@ -524,6 +535,7 @@ pub enum EncoderModality {
 }
 
 impl EncoderModality {
+    /// Return the lowercase protocol label (`"image"` or `"video"`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Image => "image",
@@ -531,6 +543,7 @@ impl EncoderModality {
         }
     }
 
+    /// Parse the optional protobuf modality string, defaulting empty values to image.
     pub fn from_proto(raw: &str) -> Result<Self, Status> {
         if raw.is_empty() || raw.eq_ignore_ascii_case("image") {
             Ok(Self::Image)
@@ -621,6 +634,7 @@ pub struct EncoderRuntime {
 }
 
 impl EncoderRuntime {
+    /// Create a managed encoder runtime with the default post-cancel receipt grace period.
     pub fn new(
         config: EncoderConfig,
         native: NativeEncoderLink,
@@ -678,6 +692,7 @@ impl EncoderRuntime {
             && self.native.ready()
     }
 
+    /// Return `(running, waiting)` request counts across currently admitted encoder owners.
     pub fn loads(&self) -> (usize, usize) {
         self.owners.lock().map_or((0, 0), |ledger| {
             ledger
@@ -693,6 +708,7 @@ impl EncoderRuntime {
         })
     }
 
+    /// Admit an encode RPC, spawn an independent execution owner, and observe its outcome.
     pub async fn encode(
         self: &Arc<Self>,
         request: EncodeRequest,
@@ -731,6 +747,7 @@ impl EncoderRuntime {
         }
     }
 
+    /// Validate request limits, modality, and options, then register a bounded execution owner.
     fn admit(
         &self,
         request: &EncodeRequest,
@@ -1211,7 +1228,7 @@ impl EncoderRuntime {
         if let Err(NativeCallError::NotSent(error)) = receipt {
             self.release_owner(rid);
             drop(permit);
-            self.native.notify_forget(&rid);
+            self.native.notify_forget(rid);
             if !timed_out_sent {
                 owner.result.send_replace(Some(Err(error)));
             }
@@ -1252,6 +1269,7 @@ impl EncoderRuntime {
         }
     }
 
+    /// Begin draining active requests and reject new admissions.
     pub fn drain(&self) {
         self.draining.store(true, Ordering::Release);
         if let Ok(ledger) = self.owners.lock() {
@@ -1269,6 +1287,7 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Return whether an image detail override is empty or one of `auto`, `low`, or `high`.
 fn is_valid_detail(detail: &str) -> bool {
     detail.is_empty()
         || detail.eq_ignore_ascii_case("auto")
@@ -1276,6 +1295,7 @@ fn is_valid_detail(detail: &str) -> bool {
         || detail.eq_ignore_ascii_case("high")
 }
 
+/// Wait until either the cancellation channel triggers or `deadline` elapses.
 async fn wait_cancel(cancel: &mut watch::Receiver<bool>, deadline: Instant) {
     if *cancel.borrow_and_update() {
         return;
@@ -1289,6 +1309,7 @@ struct EncoderService {
 }
 
 impl EncoderService {
+    /// Snapshot current running and waiting encoder requests as a scheduler load record.
     fn load(&self) -> sg::SchedulerLoad {
         let (running, waiting) = self.runtime.loads();
         sg::SchedulerLoad {
@@ -1300,6 +1321,7 @@ impl EncoderService {
         }
     }
 
+    /// Build the advertised managed encoder capability payload with current readiness.
     fn capability(&self) -> Capabilities {
         let mut cap = self.runtime.config.capabilities.clone();
         cap.role = "encoder".into();
@@ -1309,6 +1331,7 @@ impl EncoderService {
 
 #[tonic::async_trait]
 impl ep::sglang_encoder_server::SglangEncoder for EncoderService {
+    /// Admit an encode RPC, spawn an independent execution owner, and observe its outcome.
     async fn encode(
         &self,
         request: Request<EncodeRequest>,
@@ -1483,6 +1506,7 @@ pub struct EncoderServer {
 }
 
 impl EncoderServer {
+    /// Parse `config_json`, bind the IPC and gRPC endpoints, and start the encoder server thread.
     pub fn start(config_json: &str, processor: EncoderProcessor) -> Result<Self, ServicerError> {
         let config: EncoderConfig = serde_json::from_str(config_json)
             .map_err(|error| ServicerError::InvalidConfig(error.to_string()))?;
@@ -1536,15 +1560,18 @@ impl EncoderServer {
         Ok(Self { thread, runtime })
     }
 
+    /// Begin draining active requests and reject new admissions.
     pub fn drain(&self) {
         self.runtime.drain();
     }
 
+    /// Return the total number of currently running and queued encode requests.
     pub fn active(&self) -> usize {
         let (running, waiting) = self.runtime.loads();
         running + waiting
     }
 
+    /// Return whether the background gRPC server thread is still running.
     pub fn running(&self) -> bool {
         self.thread.running()
     }
@@ -1557,6 +1584,7 @@ impl EncoderServer {
         Ok(self.runtime.fatal_error())
     }
 
+    /// Drain in-flight requests and shut down the control server thread within `timeout`.
     pub fn stop(&self, timeout: Duration) -> Result<(), ServicerError> {
         self.drain();
         self.thread.stop(timeout)
@@ -1633,15 +1661,6 @@ mod tests {
     }
 
     impl EncoderHarness {
-        async fn start_with_config(
-            config: EncoderConfig,
-            connect_pull: bool,
-            cancel_grace: Duration,
-            processor: Option<EncoderProcessor>,
-        ) -> Self {
-            Self::start_with_config(test_config(), connect_pull, cancel_grace, processor).await
-        }
-
         async fn start_with_config(
             config: EncoderConfig,
             connect_pull: bool,
@@ -2625,5 +2644,30 @@ mod tests {
         h.send_reply(json!({"sequence": r3_cmd["sequence"], "result": {"released": true}}))
             .await;
         r3.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn utf8_multibyte_url_does_not_panic_or_leak_admission_slot() {
+        let item = EncoderMediaItem {
+            url: "ééé".into(),
+            detail: None,
+        };
+        assert_eq!(compute_source_key(EncoderModality::Image, &item), None);
+
+        let processor: EncoderProcessor = Arc::new(|_, _| {
+            Box::pin(async { Err(Status::invalid_argument("malformed media url")) })
+        });
+        let mut h = EncoderHarness::start(true, CANCEL_RECEIPT_GRACE, Some(processor)).await;
+        h.mark_ready().await;
+
+        let mut req = encode_request("utf8-bad");
+        req.mm_items = vec!["ééé".into()];
+        let err = h
+            .runtime
+            .encode(req, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(h.runtime.loads(), (0, 0));
     }
 }

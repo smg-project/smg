@@ -2735,7 +2735,8 @@ impl WorkerSelectionStage {
         let hash_ring = (!hashes.is_empty() && policy_reads_hash_ring(encode_policy.as_ref()))
             .then(|| self.policy_registry.hash_ring_of(model_id, &snapshot))
             .flatten();
-        let assignments = if handoff == Some(EncodeHandoff::PreparedInput) && hashes.len() > 1 {
+        let is_prepared = handoff == Some(EncodeHandoff::PreparedInput);
+        let assignments = if is_prepared && hashes.len() > 1 {
             assign_prepared_encode_workers(
                 &available_encode,
                 hashes,
@@ -2752,6 +2753,7 @@ impl WorkerSelectionStage {
                 encode_policy.as_ref(),
                 hash_ring,
                 encode_overload_lifted,
+                is_prepared,
             )
         }
         .ok_or(EpdSelectionFailure::Unavailable)?;
@@ -2863,6 +2865,7 @@ fn assign_prepared_encode_workers(
             policy,
             hash_ring,
             overload_lifted,
+            true,
         );
     }
     if candidates.is_empty() {
@@ -2873,6 +2876,7 @@ fn assign_prepared_encode_workers(
             policy,
             hash_ring,
             overload_lifted,
+            true,
         );
     }
 
@@ -2914,7 +2918,8 @@ fn assign_prepared_encode_workers(
     Some(assignments)
 }
 
-/// Assign encode workers per item hash, using bounded-load consistent hashing when configured.
+/// Assign encode workers per item hash, using bounded-load consistent hashing only for
+/// SGLang managed EPD (`bounded_ch = true`) so vLLM/TokenSpeed preserve standard CH affinity.
 fn assign_encode_workers(
     encode_workers: &[Arc<dyn Worker>],
     item_hashes: &[Vec<u8>],
@@ -2922,6 +2927,7 @@ fn assign_encode_workers(
     policy: &dyn LoadBalancingPolicy,
     hash_ring: Option<Arc<HashRing>>,
     overload_lifted: bool,
+    bounded_ch: bool,
 ) -> Option<Vec<EncodeWorkerAssignment>> {
     if item_hashes.is_empty() {
         return Some(Vec::new());
@@ -2946,10 +2952,12 @@ fn assign_encode_workers(
                 overload_lifted,
                 named: None,
             };
-            let worker_idx = if let Some(ch_policy) =
-                policy.as_any().downcast_ref::<ConsistentHashingPolicy>()
-            {
-                ch_policy.select_worker_bounded(encode_workers, &info)?
+            let worker_idx = if bounded_ch {
+                if let Some(ch_policy) = policy.as_any().downcast_ref::<ConsistentHashingPolicy>() {
+                    ch_policy.select_worker_bounded(encode_workers, &info)?
+                } else {
+                    policy.select_worker(encode_workers, &info)?
+                }
             } else {
                 policy.select_worker(encode_workers, &info)?
             };
@@ -6000,6 +6008,7 @@ mod tests {
             &policy,
             Some(Arc::clone(&ring)),
             false,
+            true,
         )
         .unwrap();
         let two_items = assign_prepared_encode_workers(
@@ -6047,6 +6056,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(saturated.len(), 1);
+
+        // Non-PreparedInput callers (bounded_ch=false, e.g. vLLM Push / TokenSpeed) preserve
+        // standard consistent-hashing affinity even when the home encoder has active load.
+        let home_url = turn1[0].worker.url().to_string();
+        let home_worker = encoders
+            .iter()
+            .find(|w| w.url() == home_url)
+            .cloned()
+            .unwrap();
+        let _home_guards: Vec<_> = (0..4)
+            .map(|_| WorkerLoadGuard::with_key(Arc::clone(&home_worker), None))
+            .collect();
+        let unbounded = assign_encode_workers(
+            &encoders,
+            std::slice::from_ref(&h0),
+            "test-model",
+            &policy,
+            Some(Arc::clone(&ring)),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(unbounded[0].worker.url(), home_url);
     }
 
     /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.

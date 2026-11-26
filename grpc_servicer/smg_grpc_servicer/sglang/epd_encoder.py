@@ -49,6 +49,7 @@ _HTTP_STATUS = {
 
 
 def _err(exc):
+    """Format a bounded single-line error message from an exception."""
     return str(exc)[:1024] or type(exc).__name__
 
 
@@ -266,6 +267,7 @@ class RustPreprocessorBridge:
         identity_sink=None,
         tp_size=1,
     ):
+        """Wrap SGLang's encoder preprocessor to consume immutable Rust-produced artifacts."""
         self.original = original
         self.max_artifact_bytes = max_artifact_bytes
         self.stable_identity_ns = (
@@ -277,14 +279,17 @@ class RustPreprocessorBridge:
         self.tp_size = max(1, int(tp_size))
 
     def supports_modality(self, modality):
+        """Return True only for IMAGE and VIDEO modalities supported by managed EPD."""
         return modality.name in ("IMAGE", "VIDEO")
 
     def get_num_patches(self, grid, modality):
+        """Delegate patch-count calculation to the native preprocessor for supported modalities."""
         if not self.supports_modality(modality):
             raise ValueError("managed encoder supports image and video artifacts only")
         return self.original.get_num_patches(grid, modality)
 
     async def process_batch_mm_items(self, requests, modality):
+        """Materialize a fused batch of Rust artifacts on the preprocessor executor."""
         return await run_uninterruptible(
             self.original.preproc_executor, self._materialize_batch, requests, modality
         )
@@ -379,9 +384,8 @@ class RustPreprocessorBridge:
                 shm_name = art_v2.get("shm_name")
                 if shm_name is not None:
                     shm_nbytes = art_v2.get("shm_nbytes", 0)
-                    total_bytes += shm_nbytes
-                    if total_bytes > self.max_artifact_bytes:
-                        raise ValueError("managed native batch exceeds artifact budget")
+                    if shm_nbytes > self.max_artifact_bytes:
+                        raise ValueError("managed native request exceeds artifact budget")
                     source_buf = _open_shm_mmap(
                         shm_name, shm_nbytes, unlink_immediately=(self.tp_size == 1)
                     )
@@ -390,9 +394,8 @@ class RustPreprocessorBridge:
                     source_buf = art_v2.get("inline_pixels", b"")
                     if not isinstance(source_buf, (bytes, bytearray, memoryview)):
                         raise ValueError("managed compact artifact missing inline pixel bytes")
-                    total_bytes += len(source_buf)
-                    if total_bytes > self.max_artifact_bytes:
-                        raise ValueError("managed native batch exceeds artifact budget")
+                    if len(source_buf) > self.max_artifact_bytes:
+                        raise ValueError("managed native request exceeds artifact budget")
                     copy_pixels = True
 
                 item_count = 0
@@ -563,20 +566,49 @@ class RustPreprocessorBridge:
         if all_keys_valid and len(all_keys) == len(counts):
             result._smg_item_keys = all_keys
         if has_cache_hit:
+            if not all_keys_valid or len(all_keys) != len(counts):
+                raise ValueError("cannot fuse cache-hit requests with items lacking valid keys")
             result._smg_pinned_embeddings = pinned_embs
             if pixels:
                 result._smg_pixel_item_indices = pixel_item_indices
         return result, items_per_req
 
 
-def _item_cache_budget_bytes():
-    """Return configured per-item encoder cache budget in bytes, or 0 when disabled."""
-    raw = os.environ.get(ITEM_CACHE_MB_ENV, "").strip()
+_SGLANG_CACHE_MB_ENV = "SGLANG_VLM_CACHE_SIZE_MB"
+
+
+def _parse_non_negative_int_env(env_name, raw):
+    """Parse a non-negative integer MB env var, rejecting negative or non-integer values."""
     try:
-        mb = int(raw) if raw else _DEFAULT_ITEM_CACHE_MB
-    except ValueError:
-        mb = _DEFAULT_ITEM_CACHE_MB
-    return max(0, mb) * 1024 * 1024
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be a non-negative integer, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{env_name} must be a non-negative integer, got {raw!r}")
+    return value
+
+
+def _item_cache_budget_bytes():
+    """Return configured per-item encoder cache budget in bytes, or 0 when disabled.
+
+    Validates ``SMG_SGLANG_ENCODER_ITEM_CACHE_MB`` strictly when set; when unset, honors
+    ``SGLANG_VLM_CACHE_SIZE_MB`` if set, or derives a container-safe default bounded by
+    1/16 of available container/host RAM (1/8 of the 50% encoder context budget, capped at
+    ``_DEFAULT_ITEM_CACHE_MB``).
+    """
+    raw = os.environ.get(ITEM_CACHE_MB_ENV)
+    if raw is not None and raw.strip() != "":
+        return _parse_non_negative_int_env(ITEM_CACHE_MB_ENV, raw.strip()) * 1024 * 1024
+    sglang_raw = os.environ.get(_SGLANG_CACHE_MB_ENV)
+    if sglang_raw is not None and sglang_raw.strip() != "":
+        return _parse_non_negative_int_env(_SGLANG_CACHE_MB_ENV, sglang_raw.strip()) * 1024 * 1024
+    default_bytes = _DEFAULT_ITEM_CACHE_MB * 1024 * 1024
+    from .epd_launcher import available_memory_bytes
+
+    mem_bytes = available_memory_bytes()
+    if mem_bytes is not None and mem_bytes > 0:
+        return min(default_bytes, mem_bytes // 16)
+    return default_bytes
 
 
 class PerItemEmbeddingCache:
@@ -725,10 +757,14 @@ async def cached_compute_direct_embedding(original, encoder, ctx, *, keep_on_gpu
 
     keys = smg_keys if smg_keys is not None else _compute_image_item_keys(encoder, ctx)
     if keys is None or len(keys) != len(preproc.token_counts):
+        if pinned_embs is not None:
+            raise ValueError("partial-pixel cache-hit batch is missing valid per-item keys")
         return await original(encoder, ctx, keep_on_gpu=keep_on_gpu)
 
     token_counts = [int(c) for c in preproc.token_counts]
-    if pinned_embs is not None and len(pinned_embs) == len(keys):
+    if pinned_embs is not None:
+        if len(pinned_embs) != len(keys):
+            raise ValueError("partial-pixel cache-hit batch pinned embeddings length mismatch")
         cached_items = list(pinned_embs)
         if cache is not None:
             for idx, existing in enumerate(cached_items):
@@ -803,7 +839,7 @@ async def cached_compute_direct_embedding(original, encoder, ctx, *, keep_on_gpu
         miss_indices,
     ):
         if cache is not None:
-            evictions += cache.put(keys[item_idx], slice_tensor.detach().clone().contiguous())
+            evictions += cache.put(keys[item_idx], slice_tensor.detach().cpu().clone().contiguous())
         cached_items[item_idx] = slice_tensor
 
     _record_item_cache_metrics(ctx, cache, hit_count, hit_tokens, total_tokens, evictions=evictions)
@@ -890,6 +926,7 @@ def install_bridge(encoder, processor_contract, max_artifact_bytes):
 
 
 def launch_managed_rank(server_args, schedule_path, dist_init_method, rank):
+    """Load SMG plugins inside a spawned TP follower rank before launching SGLang's encoder."""
     from sglang.srt.plugins import load_plugins
 
     load_plugins()
@@ -924,6 +961,7 @@ def _configure_meta_registry_sweep_timeout(min_ttl=ABANDONED_TTL_SECONDS):
 
 
 def launch_runtime(server_args, max_active):
+    """Launch SGLang's local encoder runtime with SMG's plugin rank loader and bounded queue."""
     from sglang.srt.disaggregation.encoder import runtime
     from sglang.srt.runtime_context import publish
 
@@ -947,9 +985,11 @@ class OwnedBatchSubmitter:
     """Enqueue once and await real batch completion; never cancel the shared batch future."""
 
     def __init__(self, scheduler):
+        """Bind the submitter to SGLang's encoder batch scheduler."""
         self.scheduler = scheduler
 
     async def submit(self, request):
+        """Enqueue ``request`` onto ``pending_queue`` and shield its completion future."""
         from sglang.srt.disaggregation.encoder.runtime import PendingRequest
 
         pending = PendingRequest(request, asyncio.get_running_loop())
@@ -958,12 +998,16 @@ class OwnedBatchSubmitter:
 
 
 class Rejected(Exception):
+    """Typed control-plane error carrying a gRPC status code mapped to an HTTP status."""
+
     def __init__(self, code, message):
+        """Store gRPC status ``code`` alongside the human-readable error ``message``."""
         super().__init__(message)
         self.code = code
 
 
 def require(condition, message, code=grpc.StatusCode.INVALID_ARGUMENT):
+    """Raise :class:`Rejected` with ``code`` when ``condition`` is falsy."""
     if not condition:
         raise Rejected(code, message)
 
@@ -987,6 +1031,7 @@ class NativeEntry:
 
     @contextmanager
     def retain(self, *, cancelling=False):
+        """Track an active receiver/cleanup reference so release waits until all users drain."""
         if self.closing.done() and not cancelling:
             raise Rejected(grpc.StatusCode.CANCELLED, "managed part no longer accepts work")
         self.active += 1
@@ -1003,6 +1048,7 @@ class NativeEncoder:
     """Owns native GPU batches, HTTP receiver calls, and explicit release receipts."""
 
     def __init__(self, config, backend):
+        """Initialize entry/waiter registries for one managed encoder runtime."""
         self.config, self.backend = config, backend
         self.entries = {}
         self.waiters = {}
@@ -1011,11 +1057,13 @@ class NativeEncoder:
         self.submitter = OwnedBatchSubmitter(backend.scheduler)
 
     def _wake_waiters(self, rid, reason):
+        """Resolve all pending early-arrival receiver waiters for ``rid`` with ``reason``."""
         for waiter in self.waiters.pop(rid, ()):
             if not waiter.done():
                 waiter.set_result(reason)
 
     def _mark_abandoned(self, rid):
+        """Record a bounded-TTL tombstone so late receiver HTTP calls fail fast with CANCELLED."""
         if not isinstance(rid, str) or not 0 < len(rid) <= 512:
             return
         now = time.monotonic()
@@ -1031,6 +1079,7 @@ class NativeEncoder:
         self._wake_waiters(rid, "abandoned")
 
     def _require_not_abandoned(self, rid):
+        """Reject ``rid`` with CANCELLED if a non-expired abandoned tombstone exists."""
         expiry = self.abandoned.get(rid)
         if expiry is not None and expiry <= time.monotonic():
             self.abandoned.pop(rid, None)
@@ -1042,6 +1091,7 @@ class NativeEncoder:
         )
 
     async def _receiver_control(self, entry, operation):
+        """Race a receiver coroutine against ``entry.closing`` so cancellation aborts waits promptly."""
         work = asyncio.create_task(operation)
         try:
             done, _ = await asyncio.wait((work, entry.closing), return_when=asyncio.FIRST_COMPLETED)
@@ -1094,6 +1144,7 @@ class NativeEncoder:
         return entry
 
     def _validate_destination(self, kind, request, expected_host):
+        """Verify that a receiver's ZMQ or Mooncake destination matches the frozen Prefill host."""
         if kind == "register":
             require(
                 self.backend.encoder.transfer_backend == "zmq_to_scheduler",
@@ -1123,6 +1174,7 @@ class NativeEncoder:
         return destination
 
     async def facade(self, kind, request):
+        """Handle one P->E HTTP facade request (``metadata``, ``register``, or ``send``)."""
         entry = await self._wait_entry(request.get("req_id"))
         from sglang.srt.disaggregation.encoder import server as native
         from sglang.srt.disaggregation.encoder.runtime import send_staged_embedding
@@ -1215,6 +1267,7 @@ class NativeEncoder:
                 ready.set()
 
     async def cancel(self, rid):
+        """Cancel an active or not-yet-arrived encoder request and wake abandoned send waiters."""
         entry = self.entries.get(rid)
         if entry is None:
             self._mark_abandoned(rid)
@@ -1227,6 +1280,7 @@ class NativeEncoder:
                 await self.backend.encoder.abandon_request(rid)
 
     async def execute(self, command, artifact):
+        """Run one Rust-dispatched encode command through SGLang's encoder pipeline and await delivery."""
         from sglang.srt.disaggregation.encoder.runtime import execute_encode_pipeline
 
         try:
@@ -1356,6 +1410,7 @@ class NativeEncoder:
         return await self._finish(entry, error)
 
     async def _finish(self, entry, error):
+        """Drain active facade users, release native staged memory, and emit a release receipt."""
         from sglang.srt.disaggregation.encoder.server import meta_registry
 
         rid = entry.rid
@@ -1404,6 +1459,7 @@ class NativeEncoder:
         return receipt
 
     def close(self):
+        """Mark the encoder shutting down and wake all pending receiver waiters."""
         self.closed = True
         for rid in list(self.waiters):
             self._wake_waiters(rid, "closed")

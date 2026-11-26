@@ -149,6 +149,7 @@ def resolve_max_cpu(execution_capacity, max_batch_size=None):
 
 
 def _normalize_dtype(value):
+    """Normalize torch dtype strings (e.g. ``torch.bfloat16``, ``half``) to canonical names."""
     dtype = str(value).removeprefix("torch.")
     return _DTYPE_ALIASES.get(dtype, dtype)
 
@@ -242,6 +243,7 @@ def complete(args, role):
 
 
 def _cfg_first(obj, *keys, default=None):
+    """Return the first non-None attribute or mapping entry matching ``keys``."""
     if obj is None:
         return default
     for key in keys:
@@ -324,6 +326,14 @@ def _control_reserve_bytes(config, budget_bytes=None):
     )
 
 
+def _item_cache_reserve_bytes(config):
+    """Return configured host-RAM reserve for the managed per-item embedding cache."""
+    raw = config.get("item_cache_bytes", 0)
+    if type(raw) is not int or raw < 0:
+        raise ValueError("item_cache_bytes must be a non-negative integer")
+    return raw
+
+
 def fit_auto_media_tokens(
     target_tokens,
     hf_config,
@@ -343,7 +353,13 @@ def fit_auto_media_tokens(
     budget_bytes = config.get("max_context_bytes")
     if budget_bytes is None:
         budget_bytes = resolve_max_context_bytes()
-    available = budget_bytes - _control_reserve_bytes(config, budget_bytes)
+    available = (
+        budget_bytes
+        - _control_reserve_bytes(config, budget_bytes)
+        - _item_cache_reserve_bytes(config)
+    )
+    if available <= 0:
+        return MAX_IMAGE_TOKENS_PER_REQUEST
     exec_cap = config.get("max_execution_capacity", max_execution_capacity(max_batch_size))
     target_slots = max(1, min(config["max_active"], exec_cap))
     per_slot = available // target_slots
@@ -355,7 +371,7 @@ def fit_auto_media_tokens(
 
 
 def encoder_window(config, max_batch_size=None):
-    """Reserve queued controls, then bound materialized artifacts and native sends."""
+    """Reserve queued controls and item cache, then bound materialized artifacts and native sends."""
     send_copies = 1 if config.get("embedding_backend") == "mooncake" else config["max_receivers"]
     execution_bytes = 2 * config["max_artifact_bytes"] + config["max_staging_bytes_per_request"] * (
         1 + send_copies
@@ -364,8 +380,10 @@ def encoder_window(config, max_batch_size=None):
     if budget_bytes is None:
         budget_bytes = resolve_max_context_bytes()
     control_reserve = _control_reserve_bytes(config, budget_bytes)
-    budget_cap = (budget_bytes - control_reserve) // execution_bytes
-    if budget_cap <= 0:
+    cache_reserve = _item_cache_reserve_bytes(config)
+    available = budget_bytes - control_reserve - cache_reserve
+    budget_cap = available // execution_bytes
+    if available <= 0 or budget_cap <= 0:
         raise ValueError("managed E context limit cannot admit queued controls and native work")
     exec_cap = config.get("max_execution_capacity", max_execution_capacity(max_batch_size))
     capacity = min(config["max_active"], budget_cap, exec_cap)
@@ -373,10 +391,14 @@ def encoder_window(config, max_batch_size=None):
 
 
 class ManagedBootstrap:
+    """Lifecycle wrapper for SGLang's ``EncoderBootstrapServer`` on managed Prefill ranks."""
+
     def __init__(self, args):
+        """Store server arguments for deferred bootstrap listener startup."""
         self.args, self.server = args, None
 
     def start(self):
+        """Start the encoder bootstrap HTTP listener on the configured host/port."""
         from sglang.srt.disaggregation.encoder.receiver import EncoderBootstrapServer
 
         self.server = EncoderBootstrapServer(
@@ -384,6 +406,7 @@ class ManagedBootstrap:
         )
 
     def shutdown(self):
+        """Close the encoder bootstrap listener if it was started."""
         if self.server is not None:
             self.server.close()
 
@@ -419,6 +442,7 @@ def launcher(config):
 
 
 def run_server(args):
+    """Entry point dispatching managed E, P, or D worker startup behind SGLang's launcher."""
     from smg_grpc_servicer.sglang.rust import resolve_servicer_impl
 
     if resolve_servicer_impl(args) != "rust":
@@ -444,6 +468,7 @@ def run_server(args):
 
 
 async def wait_encoder_shutdown(server, stopped):
+    """Poll Rust ``ManagedEncoderServer`` health until ``stopped`` is signaled or an error occurs."""
     while not stopped.is_set():
         error = server.last_error()
         if error or not server.running():
@@ -460,8 +485,9 @@ async def serve(config, args):
 
     from smg_grpc_servicer.sglang.model_artifacts import encoder_artifact_dirs
 
-    from .epd_encoder import launch_runtime, serve_native
+    from .epd_encoder import _item_cache_budget_bytes, launch_runtime, serve_native
 
+    item_cache_bytes = _item_cache_budget_bytes()
     model_dir, tokenizer_dir = encoder_artifact_dirs(args)
     backend = launch_runtime(args, config["max_active"])
     server = native_task = shutdown_deadline = None
@@ -480,22 +506,21 @@ async def serve(config, args):
         )
         hf_config = backend.encoder.model_config.hf_config
         config.setdefault("max_context_bytes", resolve_max_context_bytes())
+        config["item_cache_bytes"] = item_cache_bytes
         max_batch_size = getattr(backend.scheduler, "max_batch_size", None)
         staging_width = _encoder_embedding_width(backend.encoder, hf_config)
         staging_dtype = _normalize_dtype(
             getattr(backend.encoder, "_embedding_dtype", None) or config["embedding_dtype"]
         )
-        max_tokens = resolve_max_media_tokens(args, backend.encoder.model_config)
-        if getattr(args, "context_length", None) is None:
-            max_tokens = fit_auto_media_tokens(
-                max_tokens,
-                hf_config,
-                vision_dtype,
-                staging_width,
-                staging_dtype,
-                config,
-                max_batch_size=max_batch_size,
-            )
+        max_tokens = fit_auto_media_tokens(
+            resolve_max_media_tokens(args, backend.encoder.model_config),
+            hf_config,
+            vision_dtype,
+            staging_width,
+            staging_dtype,
+            config,
+            max_batch_size=max_batch_size,
+        )
         config["max_staging_bytes_per_request"] = encoder_staging_bytes(
             staging_width,
             staging_dtype,
@@ -586,6 +611,7 @@ async def serve(config, args):
 
 
 async def stop_followers(backend):
+    """Terminate and reap spawned encoder TP follower processes."""
     for process in backend.tp_processes:
         if process.is_alive():
             process.terminate()
@@ -597,6 +623,7 @@ async def stop_followers(backend):
 
 
 def encoder_main(args):
+    """Configure thread/timeout defaults, register encoder hooks, and run the managed E event loop."""
     from smg_grpc_servicer.sglang.mm_defaults import configure_threads
 
     configure_threads()

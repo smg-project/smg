@@ -1763,17 +1763,91 @@ def test_plugin_registers_feature_hash_reuse_hook(monkeypatch):
     assert any(t.endswith(".MMEncoder._calculate_hashes_from_features") for t in targets)
 
 
-def test_item_cache_budget_env_defaults_disable_and_invalid_fallback(monkeypatch):
+def test_item_cache_budget_env_defaults_disable_and_strict_validation(monkeypatch):
     monkeypatch.delenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", raising=False)
+    monkeypatch.delenv("SGLANG_VLM_CACHE_SIZE_MB", raising=False)
+    monkeypatch.setattr(epd_launcher, "available_memory_bytes", lambda: 256 * 1024**3)
     assert epd_encoder._item_cache_budget_bytes() == 16384 * 1024 * 1024
+
+    # Container-safe scaling on smaller cgroup RAM limits (1/16 of available RAM = 1/8 of context).
+    monkeypatch.setattr(epd_launcher, "available_memory_bytes", lambda: 8 * 1024**3)
+    assert epd_encoder._item_cache_budget_bytes() == 512 * 1024**2
+
+    # Falls back to SGLANG_VLM_CACHE_SIZE_MB when SMG_SGLANG_ENCODER_ITEM_CACHE_MB is unset.
+    monkeypatch.setenv("SGLANG_VLM_CACHE_SIZE_MB", "0")
+    assert epd_encoder._item_cache_budget_bytes() == 0
+    monkeypatch.setenv("SGLANG_VLM_CACHE_SIZE_MB", "256")
+    assert epd_encoder._item_cache_budget_bytes() == 256 * 1024 * 1024
+    monkeypatch.delenv("SGLANG_VLM_CACHE_SIZE_MB", raising=False)
+
+    # Explicit SMG_SGLANG_ENCODER_ITEM_CACHE_MB overrides and validates strictly.
     monkeypatch.setenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", "0")
     assert epd_encoder._item_cache_budget_bytes() == 0
-    monkeypatch.setenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", "-32")
-    assert epd_encoder._item_cache_budget_bytes() == 0
-    monkeypatch.setenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", "not-a-number")
-    assert epd_encoder._item_cache_budget_bytes() == 16384 * 1024 * 1024
     monkeypatch.setenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", "512")
     assert epd_encoder._item_cache_budget_bytes() == 512 * 1024 * 1024
+    for bad in ("-32", "not-a-number"):
+        monkeypatch.setenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", bad)
+        with pytest.raises(ValueError, match="SMG_SGLANG_ENCODER_ITEM_CACHE_MB"):
+            epd_encoder._item_cache_budget_bytes()
+
+
+@pytest.mark.asyncio
+async def test_partial_pixel_cache_hit_with_invalid_keys_raises_instead_of_fallback(monkeypatch):
+    """Never fall through to original() when pinned_embs is present on a partial-pixel batch."""
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    preproc = SimpleNamespace(
+        token_counts=[4, 4],
+        _smg_item_keys=[b"only-one"],
+        _smg_pinned_embeddings=[object(), None],
+    )
+    ctx = SimpleNamespace(
+        is_health_check=False,
+        modality=SimpleNamespace(name="IMAGE"),
+        num_items=2,
+        preprocess_result=preproc,
+    )
+    encoder = SimpleNamespace(tp_size=1)
+    called = []
+
+    async def original(*_a, **_kw):
+        called.append(True)
+        return "should-not-run"
+
+    with pytest.raises(ValueError, match="missing valid per-item keys"):
+        await epd_encoder.cached_compute_direct_embedding(original, encoder, ctx)
+    assert not called
+
+
+def test_explicit_large_context_length_still_fits_within_memory_budget():
+    """fit_auto_media_tokens bounds explicit --context-length and reserves item_cache_bytes."""
+    qwen3_cfg = SimpleNamespace(
+        vision_config={
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "in_chans": 3,
+        }
+    )
+    cfg = {
+        "max_active": 64,
+        "max_control_bytes": 256 * 1024**2,
+        "max_receivers": 8,
+        "embedding_backend": "mooncake",
+        "max_context_bytes": 24 * 1024**3,
+        "item_cache_bytes": 4 * 1024**3,
+    }
+    target = epd_launcher.resolve_max_media_tokens(SimpleNamespace(context_length=262144))
+    fitted = epd_launcher.fit_auto_media_tokens(
+        target, qwen3_cfg, "bfloat16", 4096, "bfloat16", cfg, max_batch_size=8
+    )
+    cfg["max_artifact_bytes"] = epd_launcher.encoder_artifact_bytes(
+        qwen3_cfg, "bfloat16", max_tokens=fitted
+    )
+    cfg["max_staging_bytes_per_request"] = epd_launcher.encoder_staging_bytes(
+        4096, "bfloat16", max_tokens=fitted
+    )
+    cap, _ = epd_launcher.encoder_window(cfg, max_batch_size=8)
+    assert fitted <= target and cap >= 8
 
 
 def test_encoder_initialized_uses_derived_context_bytes_without_handoff_envs(monkeypatch):
@@ -2315,14 +2389,17 @@ async def test_serve_auto_derives_budgets_from_cgroup_and_context_length(monkeyp
         SimpleNamespace(vision_config=qwen3_vision), "bfloat16", max_tokens=32768
     )
 
-    # Case 3: Explicit --context-length 262144 on 128 GiB container (64 GiB budget) honors the
-    # explicit 262144 token budget without auto-shrinking and bounds execution_capacity to 5.
+    # Case 3: Explicit --context-length 262144 on 128 GiB container (64 GiB budget) uses 262144 as
+    # upper cap and fits media tokens to preserve full target execution_capacity (8 slots).
     cfg_explicit, art_explicit = await run_case(
         128, hidden_size=6144, vision_cfg=glm54_vision, model_ctx=202752, cli_ctx=262144
     )
     assert cfg_explicit["max_context_bytes"] == 64 * gib
-    assert art_explicit == 262144 * 9408 + 4 * 1024**2
-    assert cfg_explicit["execution_capacity"] == 5
+    assert art_explicit <= 262144 * 9408 + 4 * 1024**2
+    assert art_explicit > epd_launcher.encoder_artifact_bytes(
+        SimpleNamespace(vision_config=glm54_vision), "bfloat16", max_tokens=32768
+    )
+    assert cfg_explicit["execution_capacity"] == 8
 
 
 @pytest.mark.parametrize(

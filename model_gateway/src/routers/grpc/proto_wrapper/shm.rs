@@ -71,21 +71,27 @@ pub fn mm_shm_dev_writable() -> bool {
 /// behind by a *previous* SMG process that crashed between writing a segment and
 /// the consumer unlinking it. Files are named `smg-tokenspeed-<pid>-...`; we only
 /// remove those whose producer pid is no longer alive (and never our own).
-fn sweep_orphan_tokenspeed_shm_once() {
-    static SWEEP: OnceLock<()> = OnceLock::new();
-    SWEEP.get_or_init(|| {
+/// Minimum age before a `/proc/<pid>`-missing `/dev/shm` segment is treated as orphaned,
+/// preventing cross-PID-namespace (`--ipc=host` / `hostIPC`) neighbors from unlinking live
+/// in-flight segments belonging to another container.
+const ORPHAN_SHM_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Sweep orphaned `/dev/shm` segments for `prefix` once per process.
+fn sweep_orphans_once(prefix: &str, once: &OnceLock<()>, label: &str) {
+    once.get_or_init(|| {
         let dir = Path::new("/dev/shm");
         let Ok(entries) = read_dir(dir) else {
             return;
         };
         let my_pid = process::id();
+        let now = SystemTime::now();
         let mut removed = 0u32;
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let Some(name) = file_name.to_str() else {
                 continue;
             };
-            let Some(rest) = name.strip_prefix("smg-tokenspeed-") else {
+            let Some(rest) = name.strip_prefix(prefix) else {
                 continue;
             };
             // pid is the first '-'-separated field after the prefix.
@@ -97,6 +103,17 @@ fn sweep_orphan_tokenspeed_shm_once() {
             if pid == my_pid || Path::new(&format!("/proc/{pid}")).exists() {
                 continue;
             }
+            // In shared `/dev/shm` across PID namespaces (`--ipc=host` / k8s `hostIPC`),
+            // a live sibling container's PID is absent from our `/proc`; skip recent files.
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .is_some_and(|age| age >= ORPHAN_SHM_MIN_AGE);
+            if !stale {
+                continue;
+            }
             if remove_file(dir.join(name)).is_ok() {
                 removed += 1;
             }
@@ -104,10 +121,16 @@ fn sweep_orphan_tokenspeed_shm_once() {
         if removed > 0 {
             tracing::warn!(
                 count = removed,
-                "Swept orphaned TokenSpeed SHM files from dead producer processes"
+                kind = label,
+                "Swept orphaned SHM files from dead producer processes"
             );
         }
     });
+}
+
+fn sweep_orphan_tokenspeed_shm_once() {
+    static SWEEP: OnceLock<()> = OnceLock::new();
+    sweep_orphans_once("smg-tokenspeed-", &SWEEP, "tokenspeed");
 }
 
 // TODO: pack all of a request's tensors (encoder_input + model_specific) into
@@ -447,38 +470,7 @@ impl Drop for EpdShmGuard {
 /// Remove orphaned `smg-epd-*` segments left behind by dead producer PIDs once per process.
 fn sweep_orphan_epd_shm_once() {
     static SWEEP: OnceLock<()> = OnceLock::new();
-    SWEEP.get_or_init(|| {
-        let dir = Path::new("/dev/shm");
-        let Ok(entries) = read_dir(dir) else {
-            return;
-        };
-        let my_pid = process::id();
-        let mut removed = 0u32;
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            let Some(rest) = name.strip_prefix(EPD_SHM_NAME_PREFIX) else {
-                continue;
-            };
-            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
-                continue;
-            };
-            if pid == my_pid || Path::new(&format!("/proc/{pid}")).exists() {
-                continue;
-            }
-            if remove_file(dir.join(name)).is_ok() {
-                removed += 1;
-            }
-        }
-        if removed > 0 {
-            tracing::warn!(
-                count = removed,
-                "Swept orphaned EPD SHM files from dead producer processes"
-            );
-        }
-    });
+    sweep_orphans_once(EPD_SHM_NAME_PREFIX, &SWEEP, "epd");
 }
 
 /// Allocate a unique `/dev/shm` segment basename prefixed with `smg-epd-`.
