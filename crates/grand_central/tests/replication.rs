@@ -49,7 +49,10 @@ use smg_grand_central::{
             replication_event::Event as Sent, worker_event::Event,
         },
     },
-    store::{HealthPolicy, MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{
+        EncodeHandoff, EncodeOffer, HealthPolicy, MemoryStore, Registrant, WorkerFacts,
+        WorkerStatus, WorkersStore,
+    },
     worker_host::{HealthAdapter, Members, Objects, SoleLead},
 };
 use smg_worker::health::port::{HealthSink, ProbeAnswer};
@@ -1818,19 +1821,24 @@ async fn a_promoted_standby_holds_every_row_of_its_leader() {
     let port = leader.replication.port();
     let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
     // A ready worker the load monitor polls, at an address nobody answers.
-    // It states what a worker states for a request's hard demands, and it
-    // takes images: the log's row tells both, so the standby holds the row
-    // whole.
+    // It states what a worker states for a request's hard demands, it
+    // takes images, and it states an end of the encode handoff: the log's
+    // row tells the three, so the standby holds the row whole.
     let mut stated = DemandFacts::default();
     stated.runtime = 7;
     stated.references = true;
     stated.host_pipeline = true;
     stated.window = 32_768;
     stated.decoding = 3;
+    let mut offered = EncodeOffer::default();
+    offered.handoff = EncodeHandoff::Push;
+    offered.producer = true;
+    offered.connector = Some("connector-a".to_owned());
     let polled = WorkerFacts {
         wire_modes: WireModes::GRPC,
         demand_facts: stated,
         vision: true,
+        encode: offered,
         ..facts("grpc://127.0.0.1:1", 1, 0)
     };
     let written = leader

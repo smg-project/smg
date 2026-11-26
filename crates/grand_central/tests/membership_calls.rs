@@ -627,9 +627,18 @@ async fn the_store_holds_the_rows_the_door_answered() {
             }),
             // It states that its worker takes images too.
             vision: Some(true),
+            // And its worker's end of the encode handoff.
+            encode: Some(proto::EncodeOffer {
+                handoff: proto::EncodeHandoff::Push as i32,
+                producer: true,
+                consumer: false,
+                connector: "connector-a".to_owned(),
+                references: false,
+            }),
             ..unchecked("http://127.0.0.1:9/b")
         };
         let block = stating.demand_facts;
+        let offer = stating.encode.clone();
         let waited = proto::RegisterWorkerRequest {
             wait_ready: true,
             ..ask(stating, Mode::Add)
@@ -683,6 +692,18 @@ async fn the_store_holds_the_rows_the_door_answered() {
         // states none is told as taking none.
         assert_eq!(told.each_ref().map(|told| told.vision), [false, true]);
         assert_eq!([rows[0].facts.vision, rows[1].facts.vision], [false, true]);
+        // So does the worker's end of the encode handoff. A registration
+        // that states none is told no block.
+        assert_eq!(
+            told.each_ref().map(|told| told.encode.clone()),
+            [None, offer]
+        );
+        let end = |row: &WorkerRow| {
+            let offer = &row.facts.encode;
+            (offer.producer, offer.connector.clone())
+        };
+        assert_eq!(end(&rows[0]), (false, None));
+        assert_eq!(end(&rows[1]), (true, Some("connector-a".to_owned())));
 
         // A registration that states two ranks is answered a row a rank.
         let ranked = proto::WorkerSpec {
