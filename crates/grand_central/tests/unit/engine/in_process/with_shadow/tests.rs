@@ -644,6 +644,65 @@ fn what_a_shadow_said_names_its_binding_its_kind_and_its_first_target() {
     assert_eq!(kinds(&engine), [0; 4]);
 }
 
+/// Under the floor every profile draws from, a pick of two draws with no
+/// shadow and is decided by the whole pass with one, whose records are all
+/// written. The two hand out the same workers in the same order at every
+/// seed, also where the two drawn tie: the draw leaves the order of the two
+/// to the request's own seed, as the pass does. With no load report every
+/// worker ties.
+#[test]
+fn a_shadow_leaves_a_pick_of_two_as_it_is_under_the_floor_of_the_draws() {
+    let stages = StageRegistry::builtin();
+    let engine = engine_of(
+        with_shadow_profile("power_of_two", profile_of("power_of_two")),
+        &stages,
+    );
+    let unshadowed = engine_of(
+        PolicySpec::preset("power_of_two").expect("a built-in preset"),
+        &stages,
+    );
+    for workers in [8, 12] {
+        let list = pool(workers);
+        let reports = (0..workers).map(|at| {
+            let queued = i32::try_from(at * 7 % 13).expect("a small count") * 4_000;
+            let url = format!("http://worker-{at}:8000");
+            (url, one_rank_load(queued, 0.1, 1_000.0))
+        });
+        let snapshot = LoadSnapshot::from_loads_for_test(reports.collect());
+        let answer = |engine: &InProcess, loads: &Option<Arc<LoadSnapshot>>, seed: u64| {
+            let members = PublishedList::new(Arc::clone(&list));
+            let asks = Asks {
+                loads: loads.clone(),
+                ..Asks::of(request(seed), Some(&members))
+            };
+            match answered(engine, &asks).whole() {
+                Some((decided, _)) => decided.decision,
+                None => {
+                    let whole = engine.decide_without_lease(&asks, Instant::now());
+                    whole.expect("a whole decision").0
+                }
+            }
+        };
+        for loads in [None, Some(Arc::clone(&snapshot))] {
+            for seed in 0..64 {
+                let (with, without) = (
+                    answer(&engine, &loads, seed),
+                    answer(&unshadowed, &loads, seed),
+                );
+                assert!(without.trace().drew_first(), "{workers} workers: a draw");
+                assert!(!with.trace().drew_first(), "{workers} workers: the pass");
+                assert_eq!(
+                    with.pick().map(|pick| &pick.targets),
+                    without.pick().map(|pick| &pick.targets),
+                    "{workers} workers, seed {seed}, reports {}",
+                    loads.is_some()
+                );
+                assert_eq!(without.pick().expect("a pick").targets.len(), 2);
+            }
+        }
+    }
+}
+
 /// A shadow profile equal to the live one agrees with it on every decision
 /// of a run: both read the records written once for the two of them. The
 /// answers are the ones the document gives with no shadow, with and without

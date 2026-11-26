@@ -557,7 +557,7 @@ pub const DRAW_BOUND: u32 = 8;
 /// The smallest pool at which a decision draws first for speed, set by
 /// run. A draw pays more than the whole pass for each row it asks about, so
 /// a small pool is read whole where the two place a request by one rule
-/// (the last paragraph names the picker whose draw is asked under it). With
+/// (the last two paragraphs name the pickers whose draw is asked under it). With
 /// every row ready the draw reads faster than the pass from eight rows on,
 /// and with one row in seventeen not ready from sixteen, for every built-in
 /// that draws: sixteen is the first size the `draw` bench reads at which it
@@ -573,6 +573,11 @@ pub const DRAW_BOUND: u32 = 8;
 /// under this size too, over a pool that lends its own word
 /// ([`PoolFacts::word`]): its draw takes the list's own turn, which the
 /// whole pass does not, so there the size is no matter of speed.
+///
+/// A picker that draws two rows is asked under this size too, from eight
+/// rows, by a host that writes a row's record when the decision asks about
+/// the row (`WRITTEN_PAIR_FROM`): there a draw saves the records it does
+/// not write, and it is asked only where its pick of a seed is the pass's.
 pub const DRAW_FROM: usize = 16;
 
 /// The pool size from which a profile whose leading stages are ranks is
@@ -654,7 +659,8 @@ pub trait Picker: Lifecycle + Debug {
     /// is no. The engine reads it once per profile when it is built, and
     /// asks such a picker to draw over a pool of [`DRAW_FROM`] rows or more,
     /// and over a smaller one where its draw is a turn
-    /// ([`Picker::takes_turns`]).
+    /// ([`Picker::takes_turns`]) or a pick of two before the records of the
+    /// pool are written ([`DRAW_FROM`]'s last paragraph).
     fn draws_first(&self) -> bool {
         false
     }
@@ -677,11 +683,13 @@ pub trait Picker: Lifecycle + Debug {
     /// nothing is decided, what `kept` holds is dropped and the whole pass
     /// runs: the picker does not draw first, its rule leaves this request to
     /// the pass, as a rotation leaves a retry, or its bound ran out before it
-    /// held its pick ([`DRAW_BOUND`] refused rows, or a sample's draws). A
+    /// held its pick ([`DRAW_BOUND`] refused rows, a smaller bound of the
+    /// picker's own, or a sample's draws). A
     /// draw that keeps nobody says
     /// nothing of the pool: the pass alone sheds. `draw` is the seed's stream: the
     /// picker takes its values from it and from nowhere else, and whatever
-    /// follows the draw reads the stream past them.
+    /// follows the draw reads the stream past them, or as it came where the
+    /// picker drew from a copy to hand out the whole pass's own pick.
     fn draw_first(
         &self,
         _facts: &RequestFacts<'_>,
@@ -2910,7 +2918,12 @@ fn order_joined(
 /// Whatever follows the draw reads the seed's stream past the values the
 /// draw read. The stream is continued, never restarted: a pass behind
 /// refused draws that read those values again would decide by the values
-/// that refused them, and skew the picker's law on that path. The trace
+/// that refused them, and skew the picker's law on that path. One draw
+/// reads a copy of the stream instead: a pick of two over a pool under
+/// [`DRAW_FROM`] rows, which is asked only where every row is expected
+/// kept and gives up at its first refused row. There the draw's pick of a
+/// seed is the pass's own, so the pass behind it decides as if nothing had
+/// been drawn and no seed's pick moves. The trace
 /// keeps the request's seed, from which the whole decision replays.
 ///
 /// Out of line, so a decision that draws nothing keeps the engine's decision
@@ -3051,6 +3064,65 @@ const DRAWS_BY_ITS_TEST: [&str; 6] = [
 /// the crate's, as one of [`DRAWS_BY_ITS_TEST`] is.
 #[cfg(feature = "in-process")]
 const PICKS_BY_NO_COUNT: [&str; 2] = ["random", "round-robin"];
+
+/// The crate's own pickers that draw two rows and compare them, by name.
+/// Such a picker's draw and its whole pass place a request by one rule at
+/// every pool size: two distinct uniform rows among the rows every filter
+/// keeps, the better one leading and the other the alternate. With every
+/// row kept the two draw the same two rows of a seed, and the better leads
+/// in both. Two that tie are ordered by the request's own seed in a pool
+/// under [`DRAW_FROM`] rows, by the draw as by the pass: there a seed's pick
+/// is one pick, whichever of the two made it. From that size on, where the
+/// pass decides only behind a draw that gave up, the draw orders two that
+/// tie by a later value of its stream. With a row refused the pass draws
+/// among the survivors and the draw among every row, so the two no longer
+/// hand out one pick of a seed: under [`DRAW_FROM`] rows the draw gives the
+/// pool to the pass at its first refused row and leaves the stream as it
+/// came, and from that size on it draws again, as a draw over rows handed
+/// written does. No other picker of [`DRAWS_BY_ITS_TEST`] is
+/// listed: under
+/// [`DRAW_FROM`] rows a sample's draw compares fewer rows than its pass, a
+/// draw of one row hands out fewer alternates behind refused rows, and a
+/// turn's draw is asked there by its own rule.
+#[cfg(feature = "in-process")]
+const DRAWS_TWO: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
+
+/// The smallest pool over which a picker that draws two rows
+/// ([`DRAWS_TWO`]) is asked to draw before the pool's records are written
+/// ([`Engine::drawn_for`]), in a document whose every profile draws first
+/// under such a picker and keeps a row by the engine's one folded test of
+/// it (`RowTests`). Beside a profile of any other kind a pair's draw keeps
+/// [`DRAW_FROM`]: the least floor would have that profile's request
+/// resolved twice over a small pool, and a filter the engine does not fold
+/// may refuse a row by a fact no word of the list says. A pool whose host
+/// lists its engines is not meant under `power-of-two`, which decides a
+/// pair over them at any size; `power-of-two-count-first` names no unit
+/// and draws that pool's rows from [`DRAW_FROM`] on. A host that
+/// writes a row's record when the decision asks about the row pays the
+/// whole pass one write a row beside the pass's own reading, and the draw
+/// the rows it lands on: so its draw wins under [`DRAW_FROM`] rows, where a
+/// draw over rows handed written does not. Eight is the size
+/// [`DRAW_FROM`]'s run names for a pool with every row ready. A pool of
+/// fewer rows is written whole and read by the pass. Under
+/// [`DRAW_FROM`] rows the host of the records asks the draw only where it
+/// expects every row kept: of a request that names no worker tried or
+/// excluded, carries no session key, is held to no places and stands under
+/// no veto of its host,
+/// over a list whose every worker publishes its routing state available
+/// (`PoolRecords::stands`) and that holds no engine's ranks
+/// (`PoolRecords::has_ranks`). Every other decision there is written whole
+/// and read by the pass: no refused row costs a draw, and the pick of a
+/// seed is the pass's in each. What it costs: a worker whose state moves
+/// behind the list's answer may still refuse a row to the draw, which
+/// gives up at that row, and the whole pass runs behind the rows it asked
+/// about.
+#[cfg(feature = "in-process")]
+pub(super) const WRITTEN_PAIR_FROM: usize = 8;
+
+// The written floor of a pair's draw stands under the floor of a draw over
+// rows handed written, and holds the two rows it draws.
+#[cfg(feature = "in-process")]
+const _: () = assert!(2 <= WRITTEN_PAIR_FROM && WRITTEN_PAIR_FROM <= DRAW_FROM);
 
 /// A plain single decision that is a draw's, as [`Engine::drawn_for`] found
 /// it: the profile that draws and its binding's word for a pool the
@@ -3891,12 +3963,26 @@ pub struct Engine {
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
     orders: Vec<Order>,
-    /// Per profile, whether its draw may be asked before a row's record is
-    /// written ([`Engine::drawn_for`]): it draws first, and its picker is
-    /// one of the crate's own, whose draw reads a row through the test it
-    /// is handed and in no other way ([`DRAWS_BY_ITS_TEST`]).
+    /// Per profile, the smallest pool over which its draw may be asked
+    /// before a row's record is written ([`Engine::drawn_for`]), and
+    /// `usize::MAX` for a profile whose draw is never asked so. A profile
+    /// is asked where it draws first and its picker is one of the crate's
+    /// own, whose draw reads a row through the test it is handed and in no
+    /// other way ([`DRAWS_BY_ITS_TEST`]): from [`WRITTEN_PAIR_FROM`] rows
+    /// under a picker that draws two rows ([`DRAWS_TWO`]) where every
+    /// profile of the document draws first under such a picker and keeps a
+    /// row by the one folded test, and from [`DRAW_FROM`] in every other
+    /// case. So the profiles of one document that are asked hold one
+    /// floor, [`Self::written_least`]: it stands per profile for the one
+    /// compare that tells [`Engine::drawn_for`] both whether a profile is
+    /// asked and from what size.
     #[cfg(feature = "in-process")]
-    written_draws: Box<[bool]>,
+    written_from: Box<[usize]>,
+    /// The least of [`Self::written_from`]: a smaller pool is no draw's
+    /// under any profile, and is told so at one compare, before its
+    /// request's binding is resolved.
+    #[cfg(feature = "in-process")]
+    written_least: usize,
     /// Whether no stage of any profile and no sessions rule's assignment
     /// reads a count a worker object alone holds ([`Self::rows_stand`]).
     #[cfg(feature = "in-process")]
@@ -5345,13 +5431,35 @@ impl Engine {
         let sessions = Arc::new(sessions);
         let head_places: Vec<HeadPlaces> = profiles.iter().map(HeadPlaces::of).collect();
         let keeping = marks.iter().any(|marks| marks.scoped());
+        // A pair's draw is asked under `DRAW_FROM` rows only in a document
+        // whose every profile draws two: beside another profile the least
+        // floor would resolve that profile's request twice over a small
+        // pool, once to be told its own floor and once in the whole pass.
+        // And only where every profile keeps a row by the folded test: a
+        // filter the engine does not fold may refuse a row of a list that
+        // stands, and behind a refused row the draw is not the pass's pick.
         #[cfg(feature = "in-process")]
-        let written_draws = profiles
+        let pairs_alone = profiles.iter().all(|profile| {
+            draws_first(profile)
+                && DRAWS_TWO.contains(&profile.picker.name())
+                && RowTests::of(&profile.filters).is_some()
+        });
+        #[cfg(feature = "in-process")]
+        let written_from: Box<[usize]> = profiles
             .iter()
             .map(|profile| {
-                draws_first(profile) && DRAWS_BY_ITS_TEST.contains(&profile.picker.name())
+                let name = profile.picker.name();
+                if !draws_first(profile) || !DRAWS_BY_ITS_TEST.contains(&name) {
+                    usize::MAX
+                } else if pairs_alone && DRAWS_TWO.contains(&name) {
+                    WRITTEN_PAIR_FROM
+                } else {
+                    DRAW_FROM
+                }
             })
             .collect();
+        #[cfg(feature = "in-process")]
+        let written_least = written_from.iter().copied().min().unwrap_or(usize::MAX);
         let row_tests: Vec<Option<RowTests>> = profiles
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
@@ -5505,7 +5613,9 @@ impl Engine {
             row_tests,
             orders,
             #[cfg(feature = "in-process")]
-            written_draws,
+            written_from,
+            #[cfg(feature = "in-process")]
+            written_least,
             #[cfg(feature = "in-process")]
             rows_stand,
             seat_flags: (u8::from(keeping) * KEEPS_SLOT_STATE) | (u8::from(shadows) * SHADOWS),
@@ -6671,13 +6781,33 @@ impl Engine {
         self.decide_as::<true>(facts, pool, candidates, cx, scratch)
     }
 
+    /// Whether a draw over a pool of `rows` rows is asked only where its
+    /// host expects every row kept (a list that stands, under a request
+    /// that names no row refused): a pool under the floor of every
+    /// profile's draw
+    /// ([`DRAW_FROM`]) and at or over the least a draw is asked from
+    /// before the records are written ([`WRITTEN_PAIR_FROM`], where every
+    /// profile of the document draws two rows; no size in any other
+    /// document). The host of the records asks its list first and
+    /// [`Self::drawn_for`] behind it: two compares say so, and no binding
+    /// is resolved for a list that does not stand.
+    #[cfg(feature = "in-process")]
+    #[inline]
+    pub(crate) fn asks_standing(&self, rows: usize) -> bool {
+        (self.written_least..DRAW_FROM).contains(&rows)
+    }
+
     /// The draw a plain single decision of `facts` is, over a pool of
     /// `rows` rows whose host writes a row's record when the decision asks
     /// about the row ([`Self::decide_drawn`]). `None` where
     /// [`Self::decide`] would not decide these facts by its draw at once,
     /// or the profile's draw may not be asked before the records
     /// ([`DRAWS_BY_ITS_TEST`]): that host writes every row and asks
-    /// [`Self::decide`].
+    /// [`Self::decide`]. One draw is asked where [`Self::decide`] reads
+    /// the pool whole: a picker that draws two rows ([`DRAWS_TWO`]) draws
+    /// over a pool of [`WRITTEN_PAIR_FROM`] rows or more in a document
+    /// whose every profile draws so, by the rule its whole pass places the
+    /// request by.
     ///
     /// The conditions are the ones [`Self::decide`] comes to its draw
     /// under, in its order: the binding the request resolves to; no column
@@ -6688,11 +6818,16 @@ impl Engine {
     /// of a row: that draw claims ([`Drawn::claims`]), and its host asks
     /// [`Self::decide_claimed`]; no encode item; no list of the
     /// pool's engines for a profile that decides over them; a pool of
-    /// [`DRAW_FROM`] rows or more; and a profile that draws for every
+    /// [`DRAW_FROM`] rows or more, or of [`WRITTEN_PAIR_FROM`] under a
+    /// picker that draws two rows beside no other kind of profile; and a
+    /// profile that draws for every
     /// request, or for this one, which names rows. A smaller pool is
     /// written whole, also where [`Self::decide`] then draws over it for
     /// a picker that takes turns. `pool` is read for its list of engines
     /// alone.
+    ///
+    /// A pool under [`DRAW_FROM`] rows is asked about only where its host
+    /// expects every row kept ([`Self::asks_standing`]).
     #[cfg(feature = "in-process")]
     pub(crate) fn drawn_for(
         &self,
@@ -6700,12 +6835,12 @@ impl Engine {
         pool: &PoolFacts<'_>,
         rows: usize,
     ) -> Option<Drawn> {
-        if rows < DRAW_FROM || !facts.affinity.is_empty() {
+        if rows < self.written_least || !facts.affinity.is_empty() {
             return None;
         }
         let (entry, index, _) = self.resolve(facts.model, facts.phase)?;
         let at = usize::from(index);
-        if !self.written_draws.get(at).copied().unwrap_or(false) {
+        if rows < self.written_from.get(at).copied().unwrap_or(usize::MAX) {
             return None;
         }
         let marks = self.marks[at];
@@ -6760,8 +6895,12 @@ impl Engine {
     /// record there: it is called for each row the draw asks about, for
     /// each row the request names, and for every row where the draw keeps
     /// nobody and the whole pass decides. The decision is the one
-    /// [`Self::decide`] makes over the same rows written whole. No lock
-    /// and no allocation beyond the stages' own.
+    /// [`Self::decide`] makes over the same rows written whole, from
+    /// [`DRAW_FROM`] rows on. Under that size [`Self::decide`] reads such
+    /// a pool whole and this is its picker's draw ([`DRAWS_TWO`]): the
+    /// same rule and, with every row kept, the same two rows; behind it
+    /// the trace counts no survivors, as behind every draw. No lock and no
+    /// allocation beyond the stages' own.
     #[cfg(feature = "in-process")]
     #[expect(
         clippy::too_many_arguments,
