@@ -4,14 +4,6 @@ thread_local! {
     /// held word's: the row as a read finds it there.
     pub(crate) static BETWEEN_A_RETIREMENTS_WRITES: Cell<Option<fn(&RankCredit)>> =
         const { Cell::new(None) };
-    /// What a case runs on its own thread ahead of a copy's read of a
-    /// row's dispatches, with that row: a release that crosses the
-    /// copy.
-    pub(crate) static AHEAD_OF_A_COPYS_READ: Cell<Option<fn(&RankCredit)>> =
-        const { Cell::new(None) };
-    /// How many dispatches the case's thread landed ahead of their
-    /// lane's end: each was searched a place among the dispatches held.
-    pub(crate) static LANDED_AHEAD: Cell<u32> = const { Cell::new(0) };
 }
 
 use super::*;
@@ -28,8 +20,10 @@ use crate::{
     Draw,
 };
 
-/// Pins this thread's lane, so a test owns one lane per thread.
+/// Pins this thread's lane, so a test owns one lane per thread. A lane
+/// that a row does not have is refused here, not at the next dispatch.
 pub(crate) fn take_lane(lane: usize) {
+    assert!(lane < DISPATCH_LANES, "a row has {DISPATCH_LANES} lanes");
     LANE.with(|drawn| drawn.set(Some(lane)));
 }
 
@@ -1082,45 +1076,41 @@ fn a_read_between_a_retirements_writes_adds_no_estimate_of_a_dispatch_let_go() {
     assert_eq!(row.words_for_test(), words);
 }
 
-/// A copy reads every standing row of a rank under that row's locks
-/// and takes the longest read. Two tallies hold one dispatch at a
-/// rank, and the first lets its own go just ahead of the copy's read
-/// of it, as a decision's release does: the copy holds the dispatch
-/// the second still holds. A row chosen by the two counts, read with
-/// no lock, would be the first, read empty.
+/// A copy takes the longest of its reads of a rank's standing rows,
+/// and of two as long the earlier. Of an empty read and a read of one
+/// dispatch the second is handed, and of two reads of one dispatch the
+/// first: their sizes tell them apart. So a copy of two tallies whose
+/// first let its one dispatch go holds the dispatch the second still
+/// holds.
 #[test]
-fn a_copy_holds_the_longest_read_where_a_row_lets_go_ahead_of_its_read() {
-    thread_local!(static READS: Cell<u32> = const { Cell::new(0) });
-    fn let_the_first_go(row: &RankCredit) {
-        let reads = READS.get();
-        READS.set(reads + 1);
-        if reads == 0 {
-            row.release_through(u64::MAX);
-        }
-    }
+fn a_copy_holds_the_longest_of_its_reads_and_of_two_as_long_the_earlier() {
+    let read = |tokens| vec![(91_300, SendSize::stated(tokens))];
+    let longest = Credits::longest_read([Vec::new(), read(317)].into_iter());
+    assert_eq!(longest, read(317), "the read that holds a dispatch");
+    let longest = Credits::longest_read([read(317), read(211)].into_iter());
+    assert_eq!(longest, read(317), "the earlier of two as long");
     let worker = WorkerId(7);
     let standing = [Credits::default(), Credits::default()];
     for tally in &standing {
         let row = tally.entry((worker, 0)).expect("the rank's entry");
         row.record(91_300, SendSize::stated(317));
     }
+    let first = standing[0].entry((worker, 0)).expect("the rank's entry");
+    first.release_through(u64::MAX);
     let copy = Credits::default();
-    AHEAD_OF_A_COPYS_READ.set(Some(let_the_first_go));
     copy.copy_fullest(standing.iter());
-    AHEAD_OF_A_COPYS_READ.set(None);
     assert_eq!(copy.held(worker), 1, "the dispatch the second holds");
     let held: Vec<_> = standing.iter().map(|tally| tally.held(worker)).collect();
     assert_eq!(held, [0, 1], "the first let its own go");
-    assert_eq!(READS.get(), 2, "each standing row read once");
 }
 
-/// A copy enters a row's dispatches oldest first, so each lands at its
-/// lane's end and none is searched a place. The standing row holds its
-/// newer dispatches in an earlier lane than its older ones, so a read
-/// of its lanes hands the newer first. Entered as read, each of the
-/// two older ones would land ahead of the lane's end.
+/// The longest read is handed oldest first, whatever order the row's
+/// lanes hand it in. The standing row holds its newer dispatches in an
+/// earlier lane than its older ones, so its own read hands the newer
+/// first. The longest of the reads holds the same five by their
+/// instants, and the copy holds every one.
 #[test]
-fn a_copy_lands_no_dispatch_ahead_of_its_lanes_end() {
+fn the_longest_read_of_a_copy_is_handed_oldest_first() {
     let worker = WorkerId(7);
     let standing = Credits::default();
     let row = standing.entry((worker, 0)).expect("the rank's entry");
@@ -1134,12 +1124,13 @@ fn a_copy_lands_no_dispatch_ahead_of_its_lanes_end() {
     for at in [91_300, 91_305] {
         row.record(at, SendSize::stated(317));
     }
-    let read: Vec<u64> = row.held_sends().iter().map(|&(at, _)| at).collect();
-    assert_eq!(read, [91_310, 91_320, 91_330, 91_300, 91_305]);
+    let instants = |read: &[(u64, SendSize)]| read.iter().map(|&(at, _)| at).collect::<Vec<_>>();
+    let read = row.held_sends();
+    assert_eq!(instants(&read), [91_310, 91_320, 91_330, 91_300, 91_305]);
+    let longest = Credits::longest_read(std::iter::once(read));
+    assert_eq!(instants(&longest), [91_300, 91_305, 91_310, 91_320, 91_330]);
     let copy = Credits::default();
-    LANDED_AHEAD.set(0);
     copy.copy_fullest(std::iter::once(&standing));
-    assert_eq!(LANDED_AHEAD.get(), 0, "each at its lane's end");
     assert_eq!(copy.held(worker), 5, "every dispatch");
 }
 

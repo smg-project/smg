@@ -514,9 +514,6 @@ impl Dispatches {
     fn hold(&mut self, at_micros: u64, size: SendSize) -> bool {
         let newest = self.0.back().map(|&(held_at, _)| held_at);
         if newest.is_some_and(|newest| newest > at_micros) {
-            // A case counts the dispatches that land ahead of a lane's end.
-            #[cfg(test)]
-            tests::LANDED_AHEAD.set(tests::LANDED_AHEAD.get() + 1);
             let at = self.0.partition_point(|&(held_at, _)| held_at <= at_micros);
             self.0.insert(at, (at_micros, size));
             at == 0
@@ -868,11 +865,6 @@ impl RankCredit {
     /// lane by lane. Read under one hold of every lane's lock, as a
     /// release holds them: none lands and none goes meanwhile.
     fn held_sends(&self) -> Vec<(u64, SendSize)> {
-        // A case lets a row's dispatches go here, ahead of the read.
-        #[cfg(test)]
-        if let Some(ahead) = tests::AHEAD_OF_A_COPYS_READ.get() {
-            ahead(self);
-        }
         let held_lanes = self.lock_lanes();
         let lanes = held_lanes.iter();
         lanes.flat_map(|lane| lane.0.iter().copied()).collect()
@@ -1164,15 +1156,17 @@ impl Credits {
     /// that came of a copy lacks it, and so does a copy made of that row.
     /// Every standing row of a rank is read, one row's lanes held at a
     /// time for the read of its dispatches alone, and the longest read is
-    /// the one copied. The rows are compared by what was read under their
-    /// locks: a release that crosses the copy takes no dispatch between
-    /// the choice of a row and its read. The reads of a rank's rows are of
-    /// different instants: a dispatch told between two of them is in the
-    /// copy only where the longest read holds it. Each dispatch enters its
-    /// row here as a send does ([`RankCredit::record`]), at its instant
-    /// and its size: a row past its bound lets its oldest go. They enter
-    /// oldest first, so each lands at its lane's end. What this tally held
-    /// until then is let go, and it shares no row with the standing ones.
+    /// the one copied ([`Self::longest_read`]). The rows are compared by
+    /// what was read under their locks, since the choice is handed the
+    /// reads and no row: a release that crosses the copy takes no dispatch
+    /// between the choice of a row and its read. The reads of a rank's
+    /// rows are of different instants: a dispatch told between two of them
+    /// is in the copy only where the longest read holds it. Each dispatch
+    /// enters its row here as a send does ([`RankCredit::record`]), at its
+    /// instant and its size: a row past its bound lets its oldest go. They
+    /// enter oldest first, so each lands at its lane's end. What this
+    /// tally held until then is let go, and it shares no row with the
+    /// standing ones.
     pub(crate) fn copy_fullest<'a>(&self, standing: impl Iterator<Item = &'a Self>) {
         let tallies: Vec<_> = standing.map(|credits| credits.tally.load_full()).collect();
         let mut next = RankTable::default();
@@ -1184,24 +1178,30 @@ impl Credits {
                     continue;
                 }
                 let later = tallies[at + 1..].iter();
-                let rows = later.filter_map(|tally| tally.get(rank));
-                let mut fullest = rows.fold(since.held_sends(), |fullest, row| {
-                    let sends = row.held_sends();
-                    if sends.len() > fullest.len() {
-                        sends
-                    } else {
-                        fullest
-                    }
-                });
-                fullest.sort_unstable_by_key(|&(at_micros, _)| at_micros);
+                let rows = std::iter::once(since).chain(later.filter_map(|tally| tally.get(rank)));
                 let copy = RankCredit::default();
-                for (at_micros, size) in fullest {
+                for (at_micros, size) in Self::longest_read(rows.map(|row| row.held_sends())) {
                     copy.record(at_micros, size);
                 }
                 next.insert(*rank, Arc::new(copy));
             }
         }
         self.tally.store(Arc::new(next));
+    }
+
+    /// The longest of `reads`, oldest first: of two as long, the earlier.
+    /// A read is one row's dispatches as its lanes hand them, lane by
+    /// lane, so the longest is put in the order of its instants here.
+    fn longest_read(reads: impl Iterator<Item = Vec<(u64, SendSize)>>) -> Vec<(u64, SendSize)> {
+        let mut longest = reads.fold(Vec::new(), |longest, read| {
+            if read.len() > longest.len() {
+                read
+            } else {
+                longest
+            }
+        });
+        longest.sort_unstable_by_key(|&(at_micros, _)| at_micros);
+        longest
     }
 
     /// Credits the rank a dispatch landed on. `credit` is handed the
