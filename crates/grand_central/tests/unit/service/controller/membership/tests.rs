@@ -527,7 +527,7 @@ fn a_replace_wants_a_standing_row_and_makes_its_next_incarnation() {
     door.register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
         .expect("registered");
     let old = store.get(numbered(URL, 0)).expect("the first life");
-    door.connect_row(old.id, old.revision);
+    door.connect_row(old.id, old.revision, TERM);
     let old = store.get(old.id).expect("the first life, ready");
 
     let told = door
@@ -1666,7 +1666,10 @@ fn a_caller_that_did_not_make_a_row_changes_nothing_of_it() {
         revision: by_hand.revision,
         drain: false,
     };
-    refused(door.remove(&operator(), &maker, &leave), "a control call");
+    refused(
+        door.remove(&operator(), &maker, TERM, &leave),
+        "a control call",
+    );
     door.deregister(&operator(), under(TERM), &leave)
         .expect("the control call removes its row");
 }
@@ -2478,6 +2481,410 @@ fn a_call_that_lost_the_lead_while_it_waited_its_turn_is_refused_and_writes_noth
     let refused = answer.expect_err("the lead was lost before the call's turn");
     assert_eq!(refused.code(), Code::FailedPrecondition);
     assert_eq!((store.epoch(), store.by_key(URL)), (0, None));
+}
+
+/// A drain goes with the word of the term its call was admitted under.
+/// Here the fence names the term and the store takes the next one ahead
+/// of the write, as a call finds it that waited for a lock through the
+/// end of its term. The drain writes no status, on the object or in the
+/// table, and the call answers that the replica does not lead, never
+/// that the row moved. Under the term the log leads, the same drain is
+/// written.
+#[test]
+fn a_drain_whose_call_lost_its_term_writes_nothing_and_is_refused_as_not_leading() {
+    let (store, door) = door();
+    let row = row_of(
+        &door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered"),
+    );
+    let id = WorkerId(row.id);
+    let drain = proto::DeregisterWorkerRequest {
+        worker_id: row.id,
+        revision: row.revision,
+        drain: true,
+    };
+    let lost = || {
+        store::LeasesStore::set_term(store.as_ref(), TERM + 1);
+        Ok(TERM)
+    };
+    let epoch = store.epoch();
+    let refused = door
+        .deregister(&operator(), lost, &drain)
+        .expect_err("the term ended ahead of the write");
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (Code::Unavailable, super::LEADS_NO_TERM)
+    );
+    let status = |row: Option<WorkerRow>| row.map(|row| row.status);
+    let pending = Some(WorkerStatus::Pending);
+    assert_eq!(
+        (status(store.get(id)), status(door.row(id))),
+        (pending, pending)
+    );
+    assert_eq!(store.epoch(), epoch);
+    door.deregister(&operator(), under(TERM + 1), &drain)
+        .expect("draining");
+    assert_eq!(status(store.get(id)), Some(WorkerStatus::Draining));
+}
+
+/// A door whose registration `request`, under [`TERM`], lost its lead
+/// as a membership write of its own landed, the one behind the `held`
+/// writes its lead held for: the store, the door and what the call
+/// answered. The log leads no term behind it.
+fn lost_its_lead_at(
+    held: usize,
+    request: &proto::RegisterWorkerRequest,
+) -> (
+    Arc<MemoryStore>,
+    MembershipCalls,
+    Result<proto::WorkerEvent, Status>,
+) {
+    let (_, feed) = journaled_from(&LeasePlace::Process, 0);
+    let journal = Arc::new(LosesTheLead {
+        log: Arc::clone(&feed.log),
+        holds: AtomicUsize::new(held),
+    });
+    let store = Arc::new(MemoryStore::journaled(journal).with_decision_slots(1));
+    store::LeasesStore::set_term(store.as_ref(), TERM);
+    let log = Arc::clone(&feed.log);
+    let door = MembershipCalls::based(Arc::clone(&store), log, 0, holder(&store));
+    let answer = door.register(&operator(), under(TERM), request);
+    (store, door, answer)
+}
+
+/// A connect signal goes with the word of its call's term too. This
+/// registration loses its lead as its own write lands, so the signal
+/// for its row, whose checks are off, writes nothing: the row stays
+/// pending on the object and in the table, and the call that waits
+/// answers it so. The registration sent again states equal facts and
+/// writes no row. Under a term the log leads it sends the signal: the
+/// row is ready under its id, at the revision it stood at.
+#[test]
+fn a_connect_signal_whose_call_lost_its_term_leaves_the_row_pending() {
+    let waits = proto::RegisterWorkerRequest {
+        wait_ready: true,
+        ..ask(unchecked(URL), Mode::Add)
+    };
+    let (store, door, told) = lost_its_lead_at(0, &waits);
+    let row = row_of(&told.expect("registered"));
+    assert_eq!(row.status, proto::WorkerStatus::Pending as i32);
+    let id = WorkerId(row.id);
+    let status = |row: Option<WorkerRow>| row.map(|row| row.status);
+    let pending = Some(WorkerStatus::Pending);
+    assert_eq!(
+        (status(store.get(id)), status(door.row(id))),
+        (pending, pending)
+    );
+    assert_eq!(store.epoch(), 1, "the registration's write alone");
+    // The registration sent again finds the row unmoved, and its signal
+    // has the word of its own term. The log leads a later term now: a
+    // call admitted under the one that ended sends nothing.
+    store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+    let again = proto::RegisterWorkerRequest {
+        wait_ready: true,
+        ..ask(unchecked(URL), Mode::Upsert)
+    };
+    let ended = door
+        .register(&operator(), under(TERM), &again)
+        .expect("unmoved");
+    assert_eq!(row_of(&ended), row);
+    assert_eq!((status(store.get(id)), store.epoch()), (pending, 1));
+    // One admitted under the term the log leads sends the signal, and
+    // as it waits it answers the row behind it: ready, with no row
+    // written and no life made.
+    let told = door
+        .register(&operator(), under(TERM + 2), &again)
+        .expect("unmoved");
+    assert!(matches!(told.event, Some(Event::Relabelled(_))), "{told:?}");
+    let ready = row_of(&told);
+    assert_eq!(
+        (ready.id, ready.revision, ready.status),
+        (row.id, row.revision, proto::WorkerStatus::Ready as i32)
+    );
+    let stored = store.get(id).expect("the row");
+    assert_eq!(
+        (stored.status, stored.revision),
+        (WorkerStatus::Ready, row.revision)
+    );
+    assert_eq!(status(door.row(id)), Some(WorkerStatus::Ready));
+    assert_eq!(
+        (store.epoch(), store.all_rows().1.len()),
+        (2, 1),
+        "the status alone"
+    );
+    // Sent once more it finds the row ready and writes nothing.
+    let once_more = door
+        .register(&operator(), under(TERM + 2), &again)
+        .expect("unmoved");
+    assert_eq!((row_of(&once_more), store.epoch()), (ready, 2));
+}
+
+/// A call that does not wait answers the row as it stood, and the
+/// signal it sent again readies the row behind its answer, as a
+/// registration that wrote answers its row ahead of the signal. The
+/// registration is sent again as an upsert: the same add is refused
+/// where its row stands, as any add is, and sends no signal.
+#[test]
+fn an_equal_registration_that_does_not_wait_answers_the_row_ahead_of_its_signal() {
+    let (store, door, _) = lost_its_lead_at(0, &ask(unchecked(URL), Mode::Add));
+    store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+    let stood = store.by_key(URL).expect("the row");
+    let refused = door
+        .register(
+            &operator(),
+            under(TERM + 2),
+            &ask(unchecked(URL), Mode::Add),
+        )
+        .expect_err("the row stands");
+    assert_eq!(refused.code(), Code::AlreadyExists);
+    assert_eq!(store.get(stood.id).as_ref(), Some(&stood));
+    let told = door
+        .register(
+            &operator(),
+            under(TERM + 2),
+            &ask(unchecked(URL), Mode::Upsert),
+        )
+        .expect("unmoved");
+    assert_eq!(
+        told.event,
+        Some(Event::Relabelled(super::worker_wire::row(&stood)))
+    );
+    assert_eq!(told.membership_epoch, 1);
+    let ready = store.get(stood.id).expect("the row");
+    assert_eq!(
+        (ready.status, ready.revision, store.epoch()),
+        (WorkerStatus::Ready, stood.revision, 2)
+    );
+}
+
+/// A registration that changes its row in place asks no term ahead of
+/// its signal, so the signal's own word is all that stands between a
+/// call whose term ended and the status. The log leads a later term,
+/// and a call admitted under the one that ended relabels the waiting
+/// row: the row's write lands, which asks no term under the lock yet,
+/// and the signal asks the call's term and writes nothing. The
+/// same registration under the term the log leads finds the row
+/// unmoved and sends it.
+#[test]
+fn a_change_in_place_sends_its_signal_under_the_term_of_its_call() {
+    let (store, door, _) = lost_its_lead_at(0, &ask(unchecked(URL), Mode::Add));
+    store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+    let stood = store.by_key(URL).expect("the row");
+    let relabelled = || {
+        let labelled = proto::WorkerSpec {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..unchecked(URL)
+        };
+        ask(labelled, Mode::Upsert)
+    };
+    door.register(&operator(), under(TERM), &relabelled())
+        .expect("in place");
+    let row = store.get(stood.id).expect("the row");
+    assert_eq!(
+        (row.status, row.revision, row.facts.labels.len()),
+        (WorkerStatus::Pending, stood.revision + 1, 1)
+    );
+    door.register(&operator(), under(TERM + 2), &relabelled())
+        .expect("unmoved");
+    let ready = store.get(stood.id).expect("the row");
+    assert_eq!(
+        (ready.status, ready.revision),
+        (WorkerStatus::Ready, row.revision)
+    );
+}
+
+/// The host door's routine sends the signal again too, for a rank
+/// that stands unmoved. This add of three ranks, their checks off,
+/// lost its lead as its first rank's write landed: the rank stands
+/// pending, its signal not written, and the call was refused at the
+/// next. The same add called again lays the two ranks left and sends
+/// the first its signal, which asks its own term: a call admitted under
+/// the term that ended sends nothing. It waits, so it answers each
+/// rank behind its signal, the unmoved one too. An add writes only
+/// where a rank is left to write: the next case has the engine whole.
+#[test]
+fn an_add_called_again_sends_an_unmoved_ranks_connect_signal_again() {
+    use proto::rank_row::Made;
+    let ranks = || proto::WorkerSpec {
+        dp_size: 3,
+        ..unchecked(URL)
+    };
+    let (store, door, lost) = lost_its_lead_at(0, &ask(ranks(), Mode::Add));
+    let lost = lost.expect_err("the lead was lost at the second rank");
+    assert_eq!(lost.code(), Code::Unavailable);
+    store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+    let first = store.by_key(&format!("{URL}@0")).expect("the first rank");
+    assert_eq!(
+        (first.status, store.epoch(), store.all_rows().1.len()),
+        (WorkerStatus::Pending, 1, 1)
+    );
+    let again = proto::RegisterWorkerRequest {
+        wait_ready: true,
+        ..ask(ranks(), Mode::Add)
+    };
+    // The log leads a later term. A call admitted under the one that
+    // ended is refused ahead of its first rank, and sends nothing.
+    let ended = door
+        .register(&operator(), under(TERM), &again)
+        .expect_err("its term ended");
+    assert_eq!(ended.code(), Code::Unavailable);
+    assert_eq!(store.get(first.id).as_ref(), Some(&first));
+    let told = door
+        .register(&operator(), under(TERM + 2), &again)
+        .expect("the same add");
+    let made = made_of(&told);
+    let ready = proto::WorkerStatus::Ready as i32;
+    assert!(
+        matches!(
+            made.as_slice(),
+            [Made::Relabelled(stood), Made::Registered(second), Made::Registered(third)]
+                if (stood.id, stood.revision) == (first.id.0, first.revision)
+                    && [stood.status, second.status, third.status] == [ready; 3]
+        ),
+        "{made:?}"
+    );
+    let (_, rows) = store.all_rows();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        assert_eq!(row.status, WorkerStatus::Ready, "{}", row.facts.key);
+    }
+    assert_eq!(
+        store.get(first.id).map(|row| row.revision),
+        Some(first.revision)
+    );
+}
+
+/// An add sent again over an engine that stands whole is refused ahead
+/// of every write and sends no signal, as an add over one row is: an
+/// add changes no row that stands. This add of two ranks, their checks
+/// off, lost its lead as its last rank's write landed, so both ranks
+/// stand and the last waits for its signal. The same add is refused
+/// and the rank waits on. An upsert of equal facts sends the signal.
+/// It does not wait, so it answers the rank as it stood, ahead of the
+/// signal.
+#[test]
+fn an_add_over_an_engine_that_stands_whole_sends_no_signal_and_an_upsert_sends_it() {
+    use proto::rank_row::Made;
+    let ranks = || proto::WorkerSpec {
+        dp_size: 2,
+        ..unchecked(URL)
+    };
+    // The lead holds for the first rank's row and its signal, and is
+    // lost as the last rank's row lands.
+    let (store, door, told) = lost_its_lead_at(2, &ask(ranks(), Mode::Add));
+    assert_eq!(made_of(&told.expect("both ranks registered")).len(), 2);
+    let status = |rank: u32| {
+        let row = store.by_key(&format!("{URL}@{rank}"));
+        row.map(|row| row.status)
+    };
+    let (ready, pending) = (Some(WorkerStatus::Ready), Some(WorkerStatus::Pending));
+    assert_eq!((status(0), status(1), store.epoch()), (ready, pending, 3));
+    store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+    let whole = door
+        .register(&operator(), under(TERM + 2), &ask(ranks(), Mode::Add))
+        .expect_err("the engine stands whole");
+    assert_eq!(whole.code(), Code::AlreadyExists);
+    assert_eq!((status(1), store.epoch()), (pending, 3));
+    let waiting = store.by_key(&format!("{URL}@1")).expect("the last rank");
+    let told = door
+        .register(&operator(), under(TERM + 2), &ask(ranks(), Mode::Upsert))
+        .expect("unmoved");
+    let made = made_of(&told);
+    assert!(
+        matches!(
+            made.as_slice(),
+            [Made::Relabelled(first), Made::Relabelled(last)]
+                if first.status == proto::WorkerStatus::Ready as i32
+                    && *last == super::worker_wire::row(&waiting)
+        ),
+        "{made:?}"
+    );
+    assert_eq!((status(0), status(1), store.epoch()), (ready, ready, 4));
+    assert_eq!(
+        store.get(waiting.id).map(|row| row.revision),
+        Some(waiting.revision)
+    );
+}
+
+/// A checked row takes no connect signal from equal facts, pending as
+/// it stands: a prober's verdict readies it, and the registration sent
+/// again writes nothing. So it is for a call of one row and for each
+/// rank of a wide call, which the host door's routine lays.
+#[test]
+fn a_pending_row_whose_checks_are_on_takes_no_signal_from_equal_facts() {
+    let (store, door) = door();
+    for stated in [spec(URL), wide("grpc://10.0.0.6:8000", 2)] {
+        door.register(&operator(), under(TERM), &ask(stated.clone(), Mode::Add))
+            .expect("registered");
+        let epoch = store.epoch();
+        door.register(&operator(), under(TERM), &ask(stated, Mode::Upsert))
+            .expect("unmoved");
+        assert_eq!(store.epoch(), epoch);
+    }
+    let (_, rows) = store.all_rows();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let held = door.row(row.id).map(|row| row.status);
+        assert_eq!(
+            (row.status, held),
+            (WorkerStatus::Pending, Some(WorkerStatus::Pending)),
+            "{}",
+            row.facts.key
+        );
+    }
+}
+
+/// The replica's own drain asks its turn's term, as a control call's
+/// does. Where the term ended ahead of the write, the drain writes
+/// nothing and is refused as a turn that does not lead.
+#[test]
+fn a_replicas_own_drain_whose_term_ended_is_refused_as_not_leading() {
+    let (store, door) = door();
+    let door = Arc::new(door);
+    let maker = found("pods/a");
+    ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM))
+        .found_one(&maker, URL, &|_| found_facts())
+        .expect("registered");
+    let row = store.by_key(URL).expect("the registered row");
+    let (seen, epoch) = (standing(&row), store.epoch());
+    let taken = Arc::clone(&store);
+    let hosted = ReplicaMembershipWriter::new(door, operator(), move || {
+        store::LeasesStore::set_term(taken.as_ref(), TERM + 1);
+        Ok(TERM)
+    });
+    assert_eq!(
+        hosted.drained(Remover::Registrant(&maker), URL, seen),
+        Err(MembershipWriteRefused::NotLeading(
+            super::LEADS_NO_TERM.to_owned()
+        ))
+    );
+    assert_eq!((store.by_key(URL), store.epoch()), (Some(row), epoch));
+}
+
+/// The holder's two public entries hand a word that always holds, as
+/// before the door handed its own: a host with no term to end calls
+/// them, and they write whatever a log leads. Over a log that left the
+/// term, the door's two write nothing under it, and the public two
+/// write.
+#[test]
+fn the_holders_public_connect_signal_and_drain_write_under_no_term() {
+    let (store, door) = door();
+    let row = row_of(
+        &door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered"),
+    );
+    let (id, revision) = (WorkerId(row.id), row.revision);
+    store::LeasesStore::set_term(store.as_ref(), TERM + 1);
+    let status = || store.get(id).map(|row| row.status);
+    door.connect_row(id, revision, TERM);
+    assert!(!door.drain_row(id, revision, TERM));
+    assert_eq!(status(), Some(WorkerStatus::Pending));
+    door.objects.connect_row(&store, id, revision);
+    assert_eq!(status(), Some(WorkerStatus::Ready));
+    assert!(door.objects.drain_row(&store, id, revision));
+    assert_eq!(status(), Some(WorkerStatus::Draining));
 }
 
 #[test]

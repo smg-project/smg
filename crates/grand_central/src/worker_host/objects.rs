@@ -234,7 +234,7 @@ impl Held {
 ///
 /// [`Self::upsert`], [`Self::patch`], [`Self::remove`], [`Self::connect_row`]
 /// and [`Self::drain_row`] are the write side of a host that keeps worker
-/// objects: a controller's own registration calls write through them. Each
+/// objects: a controller's registration calls write a row through them. Each
 /// call decides over the object that stands and tells `store` what it
 /// decided. The object the call leaves stands when it returns, and a
 /// removed row's object is gone by then. The three calls that write a row
@@ -256,12 +256,15 @@ impl Held {
 /// caller states, and a key registered again under an incarnation it had
 /// stands under its old id at the first revision: a patch or a removal
 /// guarded by the earlier life's id and revision lands on it. No call asks
-/// whether its replica leads. A host asks that before it calls. A leader's
-/// write through these calls is told to its log, and its standbys and
-/// watchers are sent it as they are sent a registration call's. A host
-/// that does not lead must not write: such a write lands in its own store
-/// alone, its leader's next event no longer fits that store, and the
-/// leader's snapshot takes the write back.
+/// whether its replica leads. A host asks that before it calls. A
+/// controller's door, whose term can end while a status waits for a lock,
+/// writes one through the crate's `connect_row_under` and
+/// `drain_row_under`, which ask its word of its term under the object's
+/// lock and the store's. A leader's write through these calls is told to
+/// its log, and its standbys and watchers are sent it as they are sent a
+/// registration call's. A host that does not lead must not write: such a
+/// write lands in its own store alone, its leader's next event no longer
+/// fits that store, and the leader's snapshot takes the write back.
 ///
 /// The registry numbers its own objects, so an object's id is not its row's.
 /// The holder keeps the two together ([`Self::standing`], [`Self::object`]).
