@@ -647,10 +647,13 @@ jobs:
   benchmarks:
     needs: [build-wheel, detect-changes]
     # Neither for a docs-only change nor for a version-only one: its numbers are
-    # the commit's it inherits the card tier from.
+    # the commit's it inherits the card tier from. Nor for a pull request whose
+    # changed paths reach no e2e lane and leave the benchmarks themselves alone
+    # (the "Decide the e2e lanes" step decides it).
     if: >-
       needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.card-tier-from == ''
+      && needs.detect-changes.outputs.skip-benchmarks != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -823,6 +826,9 @@ jobs:
       skip-agentic: ${{ steps.lanes.outputs.skip-agentic }}
       skip-vendor: ${{ steps.lanes.outputs.skip-vendor }}
       skip-go-bindings: ${{ steps.lanes.outputs.skip-go-bindings }}
+      # The standalone benchmarks' decision (the same step): a pull request whose
+      # changed paths reach no lane and leave the benchmarks themselves alone.
+      skip-benchmarks: ${{ steps.lanes.outputs.skip-benchmarks }}
       tokenspeed-image: ${{ steps.tokenspeed-image.outputs.image }}
     steps:
       - uses: actions/checkout@v7
@@ -1443,8 +1449,17 @@ jobs:
           if card_tier_from:
               print(f"card tier inherited from {card_tier_from}: the lanes on GPU runners skip")
 
+          # The standalone benchmarks (the job `benchmarks`) skip where the changed
+          # paths reach no lane, unless a path is the benchmarks' own: their row
+          # reaches no lane, because no e2e lane runs them. No lane is reached on a
+          # pull request alone, with its list of files and without the label: a
+          # push, a manual run, the label and a failed filter reach every lane above.
+          benchmarks_changed = any(path.startswith("e2e_test/benchmarks/") for path in files or [])
+          skip_benchmarks = not reached and not benchmarks_changed
+
           decided = {"docs-only": docs_only}
           decided.update((f"skip-{area}", skipped) for area, skipped in skip.items())
+          decided["skip-benchmarks"] = skip_benchmarks
           with open(env["GITHUB_OUTPUT"], "a") as outputs:
               for name, value in decided.items():
                   line = f"{name}={str(value).lower()}"
