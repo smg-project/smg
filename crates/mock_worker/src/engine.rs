@@ -382,7 +382,8 @@ pub enum OutputSeed {
     /// Preserve the existing request-ID-based output sequence.
     #[default]
     RequestId,
-    /// Equal prompt token IDs produce equal outputs across transports and retries.
+    /// Equal prompt token IDs produce equal outputs across transports and retries
+    /// (the ids as the cache keys them: a media item's tokens by the item).
     Prompt,
 }
 
@@ -961,7 +962,9 @@ pub(crate) enum Place {
 
 /// Messages into the engine actor.
 enum EngineMsg {
-    Request(NewRequest),
+    /// A request, and the ids the cache keys its prompt by where they differ
+    /// from the ids as sent ([`Engine::submit_keyed`]).
+    Request(NewRequest, Option<Vec<u32>>),
     Abort(String),
     /// Drop every cached block and announce `AllBlocksCleared` (an engine
     /// restart, as far as the gateway's index is concerned).
@@ -1222,7 +1225,15 @@ impl Engine {
 
     /// Submit a request. Dropped silently if the engine has shut down.
     pub fn submit(&self, req: NewRequest) {
-        let _ = self.tx.send(EngineMsg::Request(req));
+        self.submit_keyed(req, None);
+    }
+
+    /// Submit a request whose prompt the cache keys by `key_token_ids`, one
+    /// for each id of the prompt, where they are given: the keyed ids of a
+    /// transport whose engine keys a media item's tokens by the item and
+    /// keeps the ids as sent in its stored-block events.
+    pub(crate) fn submit_keyed(&self, req: NewRequest, key_token_ids: Option<Vec<u32>>) {
+        let _ = self.tx.send(EngineMsg::Request(req, key_token_ids));
     }
 
     /// Abort a queued or running request. Unknown or completed IDs are harmless.
@@ -2014,9 +2025,10 @@ fn handle_msg(
     msg: EngineMsg,
 ) {
     match msg {
-        EngineMsg::Request(req) => {
+        EngineMsg::Request(req, key_ids) => {
             let oracle_tokens = if params.prefix_cache {
-                let keys = prompt_blocks(&req.prompt_token_ids, params.block_size as usize).0;
+                let ids = key_ids.as_deref().unwrap_or(&req.prompt_token_ids);
+                let keys = prompt_blocks(ids, params.block_size as usize).0;
                 let fleet_best = fleet_engines()
                     .iter()
                     .map(|e| e.match_prefix(&keys))
@@ -2057,7 +2069,7 @@ fn handle_msg(
             if state.is_idle() {
                 shared.note_output();
             }
-            state.enqueue_with_oracle(req, params, oracle_tokens);
+            state.enqueue_with_oracle(req, key_ids, params, oracle_tokens);
             shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
         }
         EngineMsg::Abort(request_id) => {
@@ -2107,6 +2119,9 @@ struct RunningReq {
     /// Tokens to (re)compute: the prompt, extended by the output generated
     /// before a preemption.
     seq_prompt: Vec<u32>,
+    /// The ids the cache keys `seq_prompt` by, where they differ from it
+    /// ([`Engine::submit_keyed`]), extended as it is by a preemption.
+    seq_key: Option<Vec<u32>>,
     /// Content keys of `seq_prompt`'s full blocks.
     seq_keys: Vec<u64>,
     /// Prompt / cached tokens as reported on the stream (constant per request).
@@ -2174,6 +2189,9 @@ struct Resume {
 /// A request admitted to the queue but not yet running.
 struct WaitingReq {
     req: NewRequest,
+    /// The ids the cache keys the prompt by, where they differ from it
+    /// ([`Engine::submit_keyed`]).
+    key_ids: Option<Vec<u32>>,
     /// Content keys of the prompt's full blocks and the hash of every token.
     keys: Vec<u64>,
     rolling_hash: u64,
@@ -2521,15 +2539,22 @@ impl SchedulerState {
     /// Queue a request with no oracle information (tests).
     #[cfg(test)]
     fn enqueue(&mut self, req: NewRequest, p: &EngineParams) {
-        self.enqueue_with_oracle(req, p, 0);
+        self.enqueue_with_oracle(req, None, p, 0);
     }
 
     /// Queue a request, recording the queued token-work it contributes, together
     /// with the fleet oracle's cached-token count at arrival (what the
     /// best-informed router could have obtained).
-    fn enqueue_with_oracle(&mut self, req: NewRequest, p: &EngineParams, oracle_tokens: u32) {
+    fn enqueue_with_oracle(
+        &mut self,
+        req: NewRequest,
+        key_ids: Option<Vec<u32>>,
+        p: &EngineParams,
+        oracle_tokens: u32,
+    ) {
         let prompt_tokens = req.prompt_token_ids.len() as u32;
-        let (keys, rolling_hash, _) = prompt_blocks(&req.prompt_token_ids, p.block_size as usize);
+        let ids = key_ids.as_deref().unwrap_or(&req.prompt_token_ids);
+        let (keys, rolling_hash, _) = prompt_blocks(ids, p.block_size as usize);
         let cached_blocks = if p.prefix_cache {
             self.pool.match_prefix(&keys, p)
         } else {
@@ -2540,6 +2565,7 @@ impl SchedulerState {
         let cached = ((cached_blocks + restored_blocks) as u32 * p.block_size).min(prompt_tokens);
         self.waiting.push_back(WaitingReq {
             req,
+            key_ids,
             keys,
             rolling_hash,
             prompt_tokens,
@@ -2828,6 +2854,7 @@ impl SchedulerState {
                 events,
                 seq_keys: w.keys,
                 seq_prompt: prompt_token_ids,
+                seq_key: w.key_ids,
                 prompt_tokens: w.prompt_tokens,
                 cached_tokens: reported_cached,
                 computed: cached,
@@ -3036,9 +3063,17 @@ impl SchedulerState {
         };
         self.release(&r, p);
         self.preemptions += 1;
+        let output = &r.output_ids[r.resumed_output as usize..];
         let mut seq = r.seq_prompt;
-        seq.extend_from_slice(&r.output_ids[r.resumed_output as usize..]);
-        let (keys, rolling_hash, _) = prompt_blocks(&seq, p.block_size.max(1) as usize);
+        seq.extend_from_slice(output);
+        let seq_key = r.seq_key.map(|mut ids| {
+            ids.extend_from_slice(output);
+            ids
+        });
+        let (keys, rolling_hash, _) = prompt_blocks(
+            seq_key.as_deref().unwrap_or(&seq),
+            p.block_size.max(1) as usize,
+        );
         let len = seq.len() as u32;
         let cached_blocks = if p.prefix_cache {
             self.pool.match_prefix(&keys, p)
@@ -3055,6 +3090,7 @@ impl SchedulerState {
                 choice: r.choice,
                 events: r.events,
             },
+            key_ids: seq_key,
             keys,
             rolling_hash,
             prompt_tokens: r.prompt_tokens,
@@ -4414,7 +4450,7 @@ mod tests {
         let p = EngineParams::default();
         let mut st = SchedulerState::new();
         let (r1, rx1) = req("first", vec![9; 64], 1);
-        st.enqueue_with_oracle(r1, &p, 48);
+        st.enqueue_with_oracle(r1, None, &p, 48);
         let step = st.step(&p);
         assert_eq!(step.admitted.len(), 1);
         assert_eq!(step.admitted[0].prompt_tokens, 64);
@@ -4430,7 +4466,7 @@ mod tests {
         // The same prompt again: every block is cached, and the last one is
         // recomputed anyway (vLLM's rule), so 48 of 64 tokens are served.
         let (r2, rx2) = req("second", vec![9; 64], 1);
-        st.enqueue_with_oracle(r2, &p, 0);
+        st.enqueue_with_oracle(r2, None, &p, 0);
         let step = st.step(&p);
         let admitted = step
             .admitted

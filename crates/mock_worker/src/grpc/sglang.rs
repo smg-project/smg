@@ -19,7 +19,10 @@ use sg::{
 use smg_grpc_client::{common_proto as common, sglang_proto as sg};
 use tonic::{Request, Response, Status};
 
-use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
+use super::{
+    media_identity, Frame, GenerateInput, LogProbs, MediaSpan, MockScheduler, Rendezvous,
+    TokenizerStream,
+};
 use crate::{engine::KvEventStream, script::MatchedStop};
 
 pub(super) type Server = SglangSchedulerServer<MockScheduler>;
@@ -169,6 +172,37 @@ impl SglangScheduler for MockScheduler {
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let req = request.into_inner();
         check_mm_inputs(&req)?;
+        // One identity keys all the spans of a batch, as this wire's engine
+        // pads a request's images as one item: the batch's feature hash, or
+        // a fold of its pixel tensor where the request carries none, as the
+        // gateway's carries none. The tensor is tens of megabytes an image,
+        // so the fold takes eight bytes a step and waits until the cache
+        // reads the spans: a prefill-role or scripted request, and the
+        // canned engine, never pay for it.
+        let (batch, extra) = (req.mm_inputs, req.extra_mm_inputs);
+        let media = move || -> Vec<MediaSpan> {
+            let batches = batch.as_deref().into_iter().chain(&extra);
+            batches
+                .flat_map(|batch| {
+                    let identity = batch.feature_hash.unwrap_or_else(|| {
+                        let pixels = batch.pixel_values.as_ref();
+                        let pixels = pixels.map_or(&[][..], |tensor| &tensor.data[..]);
+                        let (words, rest) = pixels.as_chunks::<8>();
+                        words.iter().fold(media_identity(rest), |digest, word| {
+                            let word = u64::from_le_bytes(*word);
+                            let digest = (digest ^ word).wrapping_mul(0x0100_0000_01b3);
+                            digest ^ (digest >> 32)
+                        })
+                    });
+                    batch.mm_placeholders.iter().map(move |span| MediaSpan {
+                        identity,
+                        offset: span.offset,
+                        length: span.length,
+                        slot: batch.im_token_id,
+                    })
+                })
+                .collect()
+        };
         let tokenized = req.tokenized.unwrap_or_default();
         let params = req.sampling_params.unwrap_or_default();
         let rendezvous = req
@@ -193,6 +227,7 @@ impl SglangScheduler for MockScheduler {
                 score_ids: req.token_ids_logprob.clone(),
                 pin: req.data_parallel_rank,
                 rendezvous,
+                media: Box::new(media),
             })
             .await?;
         let request_id = req.request_id;
@@ -1296,5 +1331,44 @@ mod tests {
                 && status.message().contains("references but no pixel_values"),
             "{status:?}"
         );
+    }
+
+    /// The realistic engine keys a batch's tokens by the batch: with no
+    /// feature hash on the request the fold of its pixel tensor stands in, so
+    /// the same pixels are served from the cache and other pixels under the
+    /// same placeholder id part the prompt at the batch's first token.
+    #[tokio::test]
+    async fn a_media_batchs_tokens_are_cached_by_the_batch() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                grpc_wire: SchedulerWire::Sglang,
+                realistic: true,
+                engine: engine::EngineParams {
+                    timing: engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            65_263,
+        );
+        // A block of text, two blocks under the placeholder id, text again.
+        let ids: Vec<u32> = (100..116).chain([9; 32]).chain(200..219).collect();
+        let mut cached = Vec::new();
+        for (id, pixel) in [("sw-media-a1", 1), ("sw-media-a2", 1), ("sw-media-b", 2)] {
+            let mut batch = image_batch(16, 32);
+            batch.pixel_values = Some(sg::TensorData {
+                data: vec![pixel; 16].into(),
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+            });
+            read_frames(&service, with_batch(request(id, &ids, false), batch)).await;
+            cached.push(
+                engine::records_since(0, usize::MAX)
+                    .into_iter()
+                    .find(|record| record.request_id == id)
+                    .map(|record| record.cached_tokens),
+            );
+        }
+        assert_eq!(cached, [Some(0), Some(64), Some(16)]);
     }
 }
