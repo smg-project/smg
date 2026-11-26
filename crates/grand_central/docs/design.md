@@ -2874,9 +2874,9 @@ crate's own client states for no request.
   Its count passes over a worker a demand leaves out, as a gateway's own process does. An encode
   request's frame that states one is refused by the field, and a host decides its request by
   itself. It ends when that frame states a request's demands **[planned]**. A frame that demands
-  vision is held to the workers that take images. No registration over the wire states that bit,
-  so such a frame is shed unless the controller's own host laid a worker that does. The handle
-  refuses that part by its name. A shed keeps its demand's stage through the handle, and any
+  vision is held to the workers that take images. A registration states that bit
+  (`WorkerSpec.vision`) **[built]**, the log's row tells it, and the handle sends that part as it
+  sends any other. A shed keeps its demand's stage through the handle, and any
   other stage reads `controller` there. `wires` and `vision` also name the controller's own shed
   of a gateway's reach and of an encode request's media, as they do in process. What a worker
   states for the other demands crosses already **[built]**: a registration states it and the

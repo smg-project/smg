@@ -706,8 +706,8 @@ fn an_upsert_changes_a_standing_row_in_place_or_makes_a_new_incarnation() {
     assert_eq!(store.get(first), None);
 
     // The models alone, then the wire alone, then what the worker
-    // states for a request's hard demands alone: each is another
-    // worker under the URL too.
+    // states for a request's hard demands alone, then whether it takes
+    // images alone: each is another worker under the URL too.
     let remodelled = proto::WorkerSpec {
         models: vec!["model-b".to_owned()],
         ..decode
@@ -723,10 +723,15 @@ fn an_upsert_changes_a_standing_row_in_place_or_makes_a_new_incarnation() {
         }),
         ..rewired.clone()
     };
+    let seeing = proto::WorkerSpec {
+        vision: Some(true),
+        ..stating.clone()
+    };
     let changes = [
         ("models", remodelled),
         ("wire", rewired),
         ("demand facts", stating.clone()),
+        ("whether it takes images", seeing.clone()),
     ];
     for (what, changed) in changes {
         let stood = store.by_key(URL).expect("the row");
@@ -740,15 +745,20 @@ fn an_upsert_changes_a_standing_row_in_place_or_makes_a_new_incarnation() {
         assert_eq!(store.get(stood.id), None, "{what}");
     }
 
-    // The row holds the block, and the same registration again finds
-    // equal facts: it writes nothing.
+    // The row holds the block and the bit, and the same registration
+    // again finds equal facts: it writes nothing. Neither does one that
+    // states the block and leaves the bit out, since a bit left out
+    // keeps the row's.
     let stood = store.by_key(URL).expect("the row");
     assert_eq!(stood.facts.demand_facts.runtime, 7);
-    let told = door
-        .register(&operator(), under(TERM), &ask(stating, Mode::Upsert))
-        .expect("answered");
-    assert!(matches!(told.event, Some(Event::Relabelled(_))));
-    assert_eq!(store.by_key(URL), Some(stood));
+    assert!(stood.facts.vision);
+    for again in [seeing, stating] {
+        let told = door
+            .register(&operator(), under(TERM), &ask(again, Mode::Upsert))
+            .expect("answered");
+        assert!(matches!(told.event, Some(Event::Relabelled(_))));
+        assert_eq!(store.by_key(URL).as_ref(), Some(&stood));
+    }
 }
 
 #[test]
@@ -1772,7 +1782,7 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
     let maker = found("pods/a");
     let epoch = store.epoch();
-    let lost: [(&str, State); 9] = [
+    let lost: [(&str, State); 8] = [
         ("row.pairing", |facts| {
             facts.pairing = Some(Arc::new(PairingDescriptor {
                 protocol: Some("pd".to_owned()),
@@ -1786,7 +1796,6 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
                 ..EncodeOffer::default()
             };
         }),
-        ("row.vision", |facts| facts.vision = true),
         ("row.priority", |facts| facts.priority = 5),
         ("row.zone", |facts| facts.zone = Some(String::new())),
         ("row.max_running", |facts| facts.max_running = Some(0)),
@@ -1810,7 +1819,8 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     assert_eq!((store.by_key(URL), store.epoch()), (None, epoch));
 
     // What the log carries is taken, and a standby reads it back whole:
-    // what the worker states for a request's hard demands among it.
+    // what the worker states for a request's hard demands among it, and
+    // whether it takes images.
     let stated = DemandFacts {
         runtime: 7,
         references: true,
@@ -1820,11 +1830,13 @@ fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written()
     };
     let stating = |_: Option<&WorkerFacts>| WorkerFacts {
         demand_facts: stated,
+        vision: true,
         ..found_facts()
     };
     hosted.found_one(&maker, URL, &stating).expect("found");
     let row = store.by_key(URL).expect("the found row");
     assert_eq!(row.facts.demand_facts, stated);
+    assert!(row.facts.vision);
     let back = worker_wire::told_row(&worker_wire::row(&row), std::time::Instant::now());
     assert_eq!(back.map(|back| back.facts), Ok(row.facts));
 }
