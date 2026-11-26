@@ -13,9 +13,10 @@ use super::{
     *,
 };
 use crate::{
+    service::replication::{Event, Log},
     store::{
-        identity, HealthPolicy, MembershipChange, MembershipTail, Registrant, WorkerFacts,
-        WorkerStatus, WorkersStore,
+        identity, HealthPolicy, Journal, MembershipChange, Registrant, WorkerFacts, WorkerStatus,
+        WorkersStore,
     },
     worker_host::Members,
 };
@@ -50,7 +51,12 @@ impl Leader {
     }
 
     fn with(failure: u32, success: u32) -> Self {
-        let store = MemoryStore::default();
+        Self::over(MemoryStore::default(), failure, success)
+    }
+
+    /// The same over `store`: a case that reads the store's journal
+    /// hands a journaled one.
+    fn over(store: MemoryStore, failure: u32, success: u32) -> Self {
         let objects: Objects<Members> = Objects::new(Arc::new(WorkerRegistry::new()));
         let facts = stated(1, "gold", failure, success);
         let change = objects.upsert(&store, facts, Registrant::Control);
@@ -264,9 +270,11 @@ fn a_refused_tell_behind_a_second_move_takes_nothing_back() {
 /// event of its own: here a move the table was not told.
 #[test]
 fn a_row_laid_in_place_tells_the_status_its_object_took() {
-    let leader = Leader::new();
+    let log = Arc::new(Log::new(16));
+    let journal: Arc<dyn Journal> = Arc::<Log>::clone(&log);
+    let leader = Leader::over(MemoryStore::journaled(journal), 1, 1);
     assert!(matches!(leader.probe(true), ProbeAnswer::Moved { .. }));
-    let epoch = leader.store.epoch();
+    let mark = log.head();
     let relabelled = stated(1, "iron", 1, 1);
     let change = leader
         .objects
@@ -276,15 +284,21 @@ fn a_row_laid_in_place_tells_the_status_its_object_took() {
         Some(MembershipChange::Relabelled { id: leader.row })
     );
     assert_eq!(leader.statuses(), both(WorkerStatus::Ready));
-    let MembershipTail::Changes(tail) = leader.store.changes_since(epoch) else {
-        panic!("the store's tail reaches back to the write");
-    };
+    let mut tail = Vec::new();
+    log.read(mark, Log::BATCH, &mut tail)
+        .expect("the journal's log holds the mark");
     let told = MembershipChange::StatusChanged {
         id: leader.row,
         from: WorkerStatus::Pending,
         to: WorkerStatus::Ready,
     };
-    let tail: Vec<_> = tail.into_iter().map(|(_, change)| change).collect();
+    let tail: Vec<_> = tail
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            Event::Member { change, .. } => Some(change),
+            Event::Term | Event::Generation { .. } => None,
+        })
+        .collect();
     assert_eq!(
         tail,
         [MembershipChange::Relabelled { id: leader.row }, told]

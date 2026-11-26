@@ -1494,7 +1494,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // not-ready row on to failed three failures later: that step
         // follows the death, it is not its verdict.
         let verdicts = |harness: &Harness| {
-            let mut moved = harness.moved(killed).expect("the store's tail");
+            let mut moved = harness.moved(killed).expect("the controller's log");
             moved.retain(|moved| moved.engine == dead && moved.to != WorkerStatus::Failed);
             moved
         };
@@ -1581,7 +1581,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         .await
         .expect("the hang is seen");
         let hung_seen = hang.elapsed();
-        let moved = harness.moved(hanged).expect("the store's tail");
+        let moved = harness.moved(hanged).expect("the controller's log");
         assert_eq!(
             moved
                 .iter()
@@ -1625,7 +1625,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ],
             "the turn that waited out the bound went on to every engine"
         );
-        let mut others = harness.moved(hanged).expect("the store's tail");
+        let mut others = harness.moved(hanged).expect("the controller's log");
         others.retain(|moved| moved.engine != hung && moved.engine != dead);
         assert!(
             others.is_empty(),

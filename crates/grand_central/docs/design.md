@@ -2864,8 +2864,10 @@ A leader's write of a record is decided over the worker object since step 1 belo
 table follows it. The object leads a status too since step 3, and the table is told it. The
 object leads a first copy's facts since the last part of step 2, and the log its statuses. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
-remainder is the copy that stays. The table of records and the second copy of the facts end
-with step 4 below. The published copy holds no row of a record, and a status change makes no
+remainder is the copy that stays. Step 4 below takes the table of records apart and ends the
+second copy of the facts. The records themselves end later, with the published copy, whose
+membership build reads them.
+The published copy holds no row of a record, and a status change makes no
 publication. It ends when the two readers of what it holds of a worker, a pick's booking and
 a gateway's vetoes, read the worker objects: a later step **[planned]**.
 
@@ -2959,12 +2961,17 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    connect signal and a drain are written the same way **[built]**. The store's own machine
    for a health outcome is deleted **[built]**. A decision reads the object's status, as a single
    request's does on main.
-4. The table of records, the second copy of the facts, the two conversions between a record
-   and an object, and the task that follows the table are deleted. The task is deleted
+4. The table of records is taken apart in removals. The second copy of the facts, the two
+   conversions between a record and an object, and the task that follows the table are
+   deleted. The removals come in this order. First the store's log of its changes
+   **[built]**, then a cut's read back and the store's own write entries. Then its read
+   entries with its own cut, and last the store's reads of the record before a write. The
+   records themselves stay for the published copy's membership build, and go with that copy.
+   The task is deleted
    **[built]**: the calls a record is written by are public, a host of the worker objects
    writes through them, and a served controller hands the code that keeps its objects. A
    record written through the store's own entries gets its object in two places: at its
-   key's next refused write, and where a cut is laid whole.
+   key's next refused registration, and where a cut is laid whole.
    No task lays it. No turn that takes the controller's own store starts with
    a read of its table **[built]**: a write call decides over the object that stands, a call's read
    and a first copy read the objects, and a standby's applier lays its leader's event. A
@@ -3012,11 +3019,11 @@ A copy reads the log's place and the store's epoch in one
 hold, and no record of the table. So a copy holds
 each record the log told at the copy's place, and none it did not, beside every writer that holds the turn. A
 record the store took and the registry did not get is in no copy until it is laid (step 1).
-One written through the store's own entries is laid at its key's next refused write, or
+One written through the store's own entries is laid at its key's next refused registration, or
 where a cut is laid whole. A copy's statuses are the
 ones the log last told at its place, and not the objects': an object can stand one tell
 ahead of the log. The store keeps what the log last told of each record's status, beside its
-epoch and its tail. A copy reads the log's place, the epoch and those statuses in one hold
+epoch. A copy reads the log's place, the epoch and those statuses in one hold
 of the membership lock, which it holds for one status a record and for no record. A copy
 takes no object's lock.
 
@@ -3065,7 +3072,7 @@ object there are two ways, both of a told status. A standby's applier and a gate
 lay each status their leader tells, the status of each record it tells, and each status of a
 first copy. A tell the store refuses gives the object the status its record holds. The
 code that keeps a
-controller's objects copies no status from its own store's tail: with that copy, two moves in
+controller's objects follows no log of its own store: if it did, two moves in
 a row could end with the object at the older one. The store judges no health outcome: its
 own machine for one is deleted.
 

@@ -14,6 +14,10 @@
 //! moment its fence closes, whether or not its election thread has noticed.
 //! A waiter is woken at that moment too: it sleeps to the instant the
 //! fence's window ends, and to the one a take's window opens.
+//!
+//! The read handle also answers two reads of the replica's membership log
+//! for a host: where the log stands, and the entries behind a place
+//! ([`Readiness::log_head`], [`Readiness::log_after`]).
 
 use std::{
     sync::Arc,
@@ -23,7 +27,13 @@ use std::{
 use tokio::sync::watch;
 
 use super::{election::ElectionObservation, standby::Lag};
-use crate::service::elector::Fence;
+use crate::{
+    service::{
+        elector::Fence,
+        replication::{Entry, Log, LogPositionLost},
+    },
+    store::Position,
+};
 
 /// Where the controller is between its start and its exit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,7 +93,9 @@ pub(crate) enum Phase {
 }
 
 /// A read handle on the controller's state: cheap to clone, cheap to read,
-/// and awaitable for a transition.
+/// and awaitable for a transition. A host also reads the replica's
+/// membership log through it ([`Self::log_head`], [`Self::log_after`]),
+/// and writes nothing.
 #[derive(Clone, Debug)]
 pub struct Readiness {
     phase: watch::Receiver<Phase>,
@@ -94,6 +106,9 @@ pub struct Readiness {
     lag: Arc<Lag>,
     /// The lag's turns: a waiter looks again after each.
     turns: watch::Receiver<u64>,
+    /// The replica's membership log, for the two reads a host has of it.
+    /// The handle hands no log out: a host writes nothing through it.
+    log: Arc<Log>,
 }
 
 /// One scrape's read of the controller: its state and its standby's lag.
@@ -125,6 +140,36 @@ impl Readiness {
     /// follower's sync from its standby's lag at the same one.
     pub fn state(&self) -> State {
         self.read().0
+    }
+
+    /// Where the replica's membership log stands: the place of its last
+    /// entry ([`Log::head`]), or the default before any. The entry is a
+    /// write its store journaled or one of the log's own marks. A host
+    /// keeps the place as a mark and reads on behind it
+    /// ([`Self::log_after`]).
+    pub fn log_head(&self) -> Position {
+        self.log.head()
+    }
+
+    /// The entries of the replica's membership log after `after`, oldest
+    /// first, into `out` (cleared first), as [`Log::read`] answers them.
+    /// They are the membership and status writes the replica's store
+    /// journaled, in the order written. The log's own marks stand among
+    /// them ([`Event::Term`](crate::service::replication::Event::Term),
+    /// [`Event::Generation`](crate::service::replication::Event::Generation)).
+    ///
+    /// A call reads at most `at_most` and never more than [`Log::BATCH`],
+    /// all under one term. So a short batch is not the head. A host reads
+    /// on from the place of the last entry it took until a read finds
+    /// nothing. The read answers [`LogPositionLost`] where the log no
+    /// longer holds `after`.
+    pub fn log_after(
+        &self,
+        after: Position,
+        at_most: usize,
+        out: &mut Vec<Entry>,
+    ) -> Result<(), LogPositionLost> {
+        self.log.read(after, at_most, out)
     }
 
     /// The state, the lag and the sync at one instant.
@@ -243,6 +288,7 @@ pub(crate) fn channel(
     fence: Arc<Fence>,
     steps: watch::Receiver<ElectionObservation>,
     lag: Arc<Lag>,
+    log: Arc<Log>,
 ) -> (watch::Sender<Phase>, Readiness) {
     let (sender, phase) = watch::channel(Phase::Starting);
     let turns = lag.turns();
@@ -254,6 +300,7 @@ pub(crate) fn channel(
             fence,
             lag,
             turns,
+            log,
         },
     )
 }

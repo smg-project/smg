@@ -79,9 +79,9 @@ pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreS
 pub use reservations::{ReservationKind, ReservationStore};
 pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{
-    identity, identity_of, token, HealthPolicy, MembershipChange, MembershipTail, Overload,
-    ProviderKey, ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch,
-    WorkerRow, WorkerStatus, WorkersStore,
+    identity, identity_of, token, HealthPolicy, MembershipChange, Overload, ProviderKey,
+    ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch, WorkerRow,
+    WorkerStatus, WorkersStore,
 };
 
 /// The verified identity of a gateway: the fingerprint of the subject its

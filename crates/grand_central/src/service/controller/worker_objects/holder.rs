@@ -41,7 +41,7 @@ use crate::{
 /// on its object. While the replica leads, a probe's outcome, a connect
 /// signal and a drain are written on the object, and the store is told.
 /// While it follows, the holder lays each status its leader's log tells.
-/// So the holder follows no status of its store's own tail.
+/// So the holder follows no log of its own store.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
     objects: Arc<Objects<Members>>,

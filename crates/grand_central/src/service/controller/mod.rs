@@ -511,8 +511,12 @@ impl Controller {
             config.decide_shards,
         )
         .map_err(Error::DecisionThreads)?;
-        let (phase, readiness) =
-            readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
+        let (phase, readiness) = readiness::channel(
+            elector.fence(),
+            steps,
+            Arc::clone(&shared.lag),
+            Arc::clone(&shared.feed.log),
+        );
         let shared = Arc::new(shared);
         #[cfg(feature = "discovery")]
         let discovery = config

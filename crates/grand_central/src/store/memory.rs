@@ -45,8 +45,8 @@ use crate::{
             PUBLISH_WINDOW,
         },
         workers::{
-            MembershipChange, MembershipTail, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
-            WorkerStatus, WorkersStore,
+            MembershipChange, Registrant, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+            WorkersStore,
         },
         GatewayId,
     },
@@ -60,10 +60,6 @@ mod turn;
 
 use blocks::{Blocks, Minted};
 pub use turn::{AtWork, Hand, LookOutcome};
-
-/// Membership changes kept for watchers; a watcher further behind snapshots
-/// again (the registry's broadcast is sized the same today).
-const CHANGE_LOG: usize = 1_024;
 
 /// The host's wake: what the store calls to have its host read
 /// [`MemoryStore::publish_due`] again. It is called under the writer's
@@ -385,9 +381,7 @@ impl MemoryStore {
                 drop(loads.writer.rebuild(std::iter::empty()));
             }
             workers.by_key.clear();
-            workers.log.clear();
             workers.epoch = cut.epoch;
-            workers.history += 1;
             workers.rows.reserve(cut.rows.len());
             for mut row in cut.rows {
                 let id = row.id;
@@ -496,7 +490,7 @@ impl MemoryStore {
     }
 
     /// A decided membership change, written under the write's hold of the
-    /// membership lock: the tables, the epoch, the change log and the
+    /// membership lock: the tables, the epoch and the
     /// journal's telling, the member's count slot, the build
     /// the write owes or pays, the word to the stages and the session
     /// pins. One body for every writer that hands a change with the
@@ -1308,10 +1302,6 @@ struct Workers {
     /// follows and at the rows a snapshot drops ([`Self::lay_gone`]).
     gone: HashMap<String, Gone>,
     epoch: u64,
-    /// How often the rows were replaced whole by another store's
-    /// ([`WorkersStore::history`]).
-    history: u64,
-    log: VecDeque<(u64, MembershipChange)>,
     /// The store's journal: every membership and status write passes
     /// [`Writing::record`] or [`Writing::record_over`], which tell it.
     journal: Option<Arc<dyn Journal>>,
@@ -1503,22 +1493,17 @@ impl DerefMut for Writing<'_> {
 /// the membership lock bare has no way to journal a write, so none is
 /// journaled whose release the journal does not hear.
 impl Writing<'_> {
-    /// The epoch `change` makes, with the change filed in the change log.
-    fn step(&mut self, change: MembershipChange) -> u64 {
-        let workers = &mut *self.workers;
-        workers.epoch += 1;
-        if workers.log.len() == CHANGE_LOG {
-            workers.log.pop_front();
-        }
-        workers.log.push_back((workers.epoch, change));
-        workers.epoch
+    /// The epoch the next change makes.
+    fn step(&mut self) -> u64 {
+        self.workers.epoch += 1;
+        self.workers.epoch
     }
 
     /// Record a change that comes with no row of its writer's: a status,
     /// which is the log's own word, and the store's own patch. The journal
     /// is told the row as the table holds it.
     fn record(&mut self, change: MembershipChange) -> MembershipChange {
-        let epoch = self.step(change);
+        let epoch = self.step();
         if let Some(journal) = &self.workers.journal {
             let row = self.workers.rows.get(&change.id()).map(|row| &row.row);
             journal.member(self.at, epoch, change, row, None);
@@ -1537,7 +1522,7 @@ impl Writing<'_> {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> MembershipChange {
-        let epoch = self.step(change);
+        let epoch = self.step();
         if let Some(journal) = &self.workers.journal {
             journal.member(self.at, epoch, change, row, left);
         }
@@ -1638,8 +1623,8 @@ impl MemoryStore {
     /// no status stands half told here. The hold copies a place and one
     /// status a row, and no row.
     ///
-    /// The told status is the log's own word, kept beside the epoch and
-    /// the tail: no copy of what a decision reads. A decision reads a
+    /// The told status is the log's own word, kept beside the epoch:
+    /// no copy of what a decision reads. A decision reads a
     /// worker's status on its object. The told status has five readers:
     ///
     /// - the next status event, which says the status its row moved from
@@ -1854,10 +1839,6 @@ impl WorkersStore for MemoryStore {
         self.workers.lock().epoch
     }
 
-    fn history(&self) -> u64 {
-        self.workers.lock().history
-    }
-
     /// Kept beside the cell of the row's slot in the counts, the one the
     /// leases' doors book. Under the workers lock, as the write that takes
     /// a row is: no count is kept for a row that left.
@@ -1879,28 +1860,6 @@ impl WorkersStore for MemoryStore {
         self.pause_snapshot();
         rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
         (epoch, rows)
-    }
-
-    fn changes_since(&self, epoch: u64) -> MembershipTail {
-        let workers = self.workers.lock();
-        if epoch > workers.epoch {
-            return MembershipTail::SnapshotRequired;
-        }
-        if epoch == workers.epoch {
-            return MembershipTail::Changes(Vec::new());
-        }
-        match workers.log.front() {
-            // The change after `epoch` is still in the log.
-            Some(&(first, _)) if first <= epoch + 1 => MembershipTail::Changes(
-                workers
-                    .log
-                    .iter()
-                    .filter(|(at, _)| *at > epoch)
-                    .copied()
-                    .collect(),
-            ),
-            _ => MembershipTail::SnapshotRequired,
-        }
     }
 }
 

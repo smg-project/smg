@@ -14,9 +14,9 @@ use super::{
     identity, identity_of,
     leases::{InFlightCounts, WorkerSlot},
     AtWork, DecodeMark, DecodeSide, GatewayId, Hand, HealthSink, Journal, LeaseRecord,
-    LeaseRefused, LeaseState, LeasesStore, LookOutcome, MembershipChange, MembershipTail,
-    MemoryStore, PickRecord, Position, ReservationKind, ReservationStore, Sides, StoreSnapshot,
-    VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    LeaseRefused, LeaseState, LeasesStore, LookOutcome, MembershipChange, MemoryStore, PickRecord,
+    Position, ReservationKind, ReservationStore, Sides, StoreSnapshot, VetoWrite, WorkerFacts,
+    WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 use crate::{
     document::spec,
@@ -194,7 +194,7 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
 }
 
 #[test]
-fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log() {
+fn a_snapshot_holds_every_row_at_its_epoch_ordered_by_key() {
     let store = MemoryStore::new();
     let workers: &dyn WorkersStore = &store;
     let (epoch, rows) = workers.all_rows();
@@ -202,38 +202,10 @@ fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log(
     let a = workers.upsert(facts("http://a:8000", 1)).id();
     let (epoch, rows) = workers.all_rows();
     assert_eq!((epoch, rows.len()), (1, 1));
-    let b = workers.upsert(facts("http://b:8000", 1)).id();
-    assert_eq!(
-        workers.changes_since(epoch),
-        MembershipTail::Changes(vec![(2, MembershipChange::Registered { id: b })])
-    );
-    assert_eq!(
-        workers.changes_since(workers.epoch()),
-        MembershipTail::Changes(Vec::new()),
-        "a watcher at the head has nothing to read"
-    );
-    assert_eq!(
-        workers.changes_since(99),
-        MembershipTail::SnapshotRequired,
-        "an epoch from another era snapshots"
-    );
-    for i in 0..1_100u64 {
-        let mut facts = facts("http://a:8000", 1);
-        facts.priority = i32::try_from(i).expect("small");
-        workers.upsert(facts);
-    }
-    assert_eq!(
-        workers.changes_since(epoch),
-        MembershipTail::SnapshotRequired,
-        "a watcher past the log snapshots again"
-    );
-    let (head, rows) = workers.all_rows();
-    assert_eq!(rows.len(), 2);
+    workers.upsert(facts("http://b:8000", 1));
+    let (epoch, rows) = workers.all_rows();
+    assert_eq!((epoch, rows.len()), (2, 2));
     assert_eq!(rows[0].id, a, "the snapshot is ordered by key");
-    assert!(matches!(
-        workers.changes_since(head - 1),
-        MembershipTail::Changes(changes) if changes.len() == 1
-    ));
 }
 
 #[test]
@@ -2542,7 +2514,6 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     store.apply(spec).expect("the generation is applied");
 
     let mut cut = store.checkpoint();
-    let earlier = cut.epoch;
     // The same revision can name other facts in another history.
     cut.rows[0]
         .facts
@@ -2561,11 +2532,6 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
         "a world of the cut stands at once"
     );
     assert_eq!(store.epoch(), epoch);
-    assert_eq!(store.history(), 1);
-    assert_eq!(
-        store.changes_since(earlier),
-        MembershipTail::SnapshotRequired
-    );
     assert_eq!(store.publish_due(), None);
     assert_eq!(store.filed_members(), 0);
     let (_, rows) = store.all_rows();
@@ -2688,7 +2654,6 @@ fn a_watch_snapshot_the_journal_refuses_changes_nothing() {
         (after.at, after.epoch, after.rows),
         (before.at, before.epoch, before.rows)
     );
-    assert_eq!(store.history(), 0);
     assert!(Arc::ptr_eq(&store.snapshot(), &world));
     assert_eq!(in_flight(&store), [(id, 0)]);
 }

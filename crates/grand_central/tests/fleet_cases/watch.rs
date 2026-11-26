@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// A watcher of `store` over worker objects of its own. The holder follows
-/// no status of the store's tail: it lays each status the watch tells.
+/// no log of the store: it lays each status the watch tells.
 fn watcher_of(store: Arc<MemoryStore>) -> Watcher<Members> {
     let objects = Objects::new(Arc::new(WorkerRegistry::new()));
     Watcher::new(store, Arc::new(objects))

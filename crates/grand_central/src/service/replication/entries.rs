@@ -37,9 +37,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
     ("WorkersStore", "by_key", EntryReplication::Read),
     ("WorkersStore", "epoch", EntryReplication::Read),
     ("WorkersStore", "all_rows", EntryReplication::Read),
-    ("WorkersStore", "changes_since", EntryReplication::Read),
-    // Each replica counts the snapshots it takes.
-    ("WorkersStore", "history", EntryReplication::Read),
     // A count is of the replica's own worker object: no journal names it.
     (
         "WorkersStore",
