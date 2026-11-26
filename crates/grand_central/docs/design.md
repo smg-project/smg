@@ -2,8 +2,10 @@
 
 How Grand Central is built: its parts, the data it reads and keeps, and what happens to a
 request. It is written for a reader who knows the gateway and has not followed the work. The
-README beside this folder is the user's guide (how to write a policy document, how to run the
-service). This file is the design.
+README beside this folder is the user's first page (how a decision works, how to run the
+service). A policy document's fields stand on a page of their own,
+`crates/grand_central/docs/policy-spec.md`, and `crates/grand_central/REFERENCE.md` holds the rest
+of the guide. This file is the design.
 
 It describes the crate as it stands on main and what is planned. It was read whole at commit
 `882be6f4f` (2026-11-22). Four subjects were read again at commit `ce421ddd3` (2026-11-23): the
@@ -860,7 +862,9 @@ was made in. On a controller the document in force at a word is the one its stor
 holds, and a lease of a generation above it tells no stage (section 10.2).
 
 A request's entry of the engine (a decision, a lease's word, a borrowed read of the document) reads
-the document through a reference its own thread keeps. The entries that are handed their document
+the document through a reference its own thread keeps. So do two reads that no request makes: the
+shadow counts a host reads at a scrape (`InProcess::shadow_counts`) and a kept decision a host
+reads for its explain answer (`InProcess::explained`). The entries that are handed their document
 are one exception. A controller's deciding thread calls such entries under its world's document
 (section 10.2), among them `decide_without_lease`, `decide_decode_without_lease`,
 `decide_encode_without_lease` and `count_shadow`. An entry that is handed its document keeps
