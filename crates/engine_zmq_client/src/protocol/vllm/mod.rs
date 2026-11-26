@@ -77,9 +77,10 @@ impl EngineOutput for EngineCoreOutput {
 /// add-request, told by the release its ready response reports
 /// ([`EngineCoreReadyResponse::vllm_version`]). The add-request of 0.31 to
 /// 0.34 was read against the engine's source, where nothing else this client
-/// writes differs; an older release, and a version that names none, keep the
-/// list every engine has been sent so far. A release above 0.34 is sent the
-/// array of 0.34, and warned about as its engine connects.
+/// writes differs but a filled adapter request (see [`lora::LoraRequest`]);
+/// an older release, and a version that names none, keep the list every
+/// engine has been sent so far. A release above 0.34 is sent the array of
+/// 0.34, and warned about as its engine connects.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum VllmLayout {
     /// A list of integers: every release before 0.34.

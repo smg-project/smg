@@ -50,7 +50,7 @@ use smg_grand_central::{
             worker_event::Event,
         },
     },
-    store::{WorkerStatus, WorkersStore},
+    store::{WorkerRow, WorkerStatus, WorkersStore},
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinSet};
 use tonic::{metadata::AsciiMetadataValue, transport::Channel, Code, Request};
@@ -615,9 +615,22 @@ async fn the_store_holds_the_rows_the_door_answered() {
             .await
             .expect("registered")
             .into_inner();
+        // The second registration states what its worker states for a
+        // request's hard demands.
+        let stating = proto::WorkerSpec {
+            demand_facts: Some(proto::DemandFacts {
+                runtime: 7,
+                references: true,
+                host_pipeline: false,
+                window: 32_768,
+                decoding: 3,
+            }),
+            ..unchecked("http://127.0.0.1:9/b")
+        };
+        let block = stating.demand_facts;
         let waited = proto::RegisterWorkerRequest {
             wait_ready: true,
-            ..ask(unchecked("http://127.0.0.1:9/b"), Mode::Add)
+            ..ask(stating, Mode::Add)
         };
         let unchecked = operator
             .register_worker(stated(waited))
@@ -653,6 +666,17 @@ async fn the_store_holds_the_rows_the_door_answered() {
             rows.iter().map(|row| row.status).collect::<Vec<_>>(),
             [WorkerStatus::Pending, WorkerStatus::Ready]
         );
+        // What a registration states for a request's hard demands crosses
+        // the call: the answer's row tells the block, and the store's row
+        // holds it. A registration that states none is told no block.
+        assert_eq!(told.each_ref().map(|told| told.demand_facts), [None, block]);
+        let held = |row: &WorkerRow| {
+            let held = row.facts.demand_facts;
+            let media = (held.references, held.host_pipeline);
+            (held.runtime, media, held.window, held.decoding)
+        };
+        assert_eq!(held(&rows[0]), (0, (false, false), 0, 0));
+        assert_eq!(held(&rows[1]), (7, (true, false), 32_768, 3));
 
         // A registration that states two ranks is answered a row a rank.
         let ranked = proto::WorkerSpec {

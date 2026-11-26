@@ -51,6 +51,7 @@ use crate::engine::{
 };
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/encode/tests/mod.rs"]
 mod tests;
 
 /// What a request that states the later decode is declined under where its

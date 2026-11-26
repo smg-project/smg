@@ -52,7 +52,10 @@ pub enum EngineCoreFinishReason {
     Length = 1,
     /// The request was aborted by the client.
     Abort = 2,
-    /// A retryable request-level internal error occurred.
+    /// A request-level error occurred. The engine calls it retryable; from
+    /// 0.33 on it may name a cause that says whether this one is (the decoder
+    /// logs a cause it is sent and nothing where none is sent;
+    /// [`EngineCoreOutput`] does not carry it).
     Error = 3,
     /// A repetitive token pattern was detected.
     Repetition = 4,
@@ -271,6 +274,7 @@ struct WireEngineCoreOutput {
     /// The engine's `prompt_token_id_logprobs` tensor: not read.
     #[serde(default)]
     prompt_token_id_logprobs: IgnoredAny,
+    /// The cause of an error finish, sent from 0.33 on: see [`RequestError`].
     #[serde(default, deserialize_with = "lenient")]
     error: Option<Box<RequestError>>,
 }

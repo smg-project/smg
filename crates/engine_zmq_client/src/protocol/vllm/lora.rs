@@ -9,6 +9,10 @@ use crate::codec::OpaqueValue;
 
 /// Request for a LoRA adapter. Mirrors Python `vllm.lora.request.LoRARequest`,
 /// a msgspec `array_like=True` struct — keep the field order aligned with Python.
+///
+/// These are the seven positions of vLLM 0.31. From 0.32 on the engine reads
+/// six (it has no `tensorizer_config_dict`), so a filled request must not be
+/// sent to such a release as it stands.
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct LoraRequest {
     pub lora_name: String,

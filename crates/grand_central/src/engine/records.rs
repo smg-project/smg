@@ -211,6 +211,9 @@ pub struct Live<'a> {
     /// Whether a stage of the document reads a worker's count of session
     /// keys with a request in flight.
     sessions: bool,
+    /// Whether nobody reads the best rows of the decision's trace
+    /// ([`Self::unread`]).
+    unread: bool,
     /// The list's own word, where the decision is over one list
     /// ([`Self::turning`]).
     word: Option<&'a AtomicU64>,
@@ -249,6 +252,7 @@ impl<'a> Live<'a> {
             loads,
             counted_key: session_key.filter(|_| needs.session_in_flight),
             sessions: needs.active_sessions,
+            unread: false,
             word: None,
             rest: false,
         }
@@ -289,6 +293,18 @@ impl<'a> Live<'a> {
             word: Some(word),
             ..self
         }
+    }
+
+    /// These reads for a decision nobody reads the best rows of, where
+    /// `unread`: one kept behind a placement, which hands out no trace,
+    /// under a document none of whose stages takes its issue and that
+    /// keeps no sample. The front that runs the decision states the word
+    /// to the engine's scratch ([`Scratch::unread`]), which the borrow of
+    /// the thread's buffers hands it cleared, and no pass over the
+    /// decision's scores runs for the best rows of its trace.
+    #[must_use]
+    pub(crate) fn unread(self, unread: bool) -> Self {
+        Self { unread, ..self }
     }
 
     /// These reads with the request's key counted under `session_key`: for
@@ -463,8 +479,8 @@ pub(super) fn stated_report(
 }
 
 /// A report's named values as a record states them, written into the row
-/// of `cells` at `position`, and whether a named value is read of the
-/// report at all. They are made by the crate's one conversion
+/// of `cells` at `position`, and whether the report is the whole of its
+/// worker object. They are made by the crate's one conversion
 /// ([`signal_values`]) under `columns`, the document's, and written where
 /// a decision may read them ([`SignalCells::write`]): under the signal's
 /// own unit and in range, each sample instant on `clock`. A report that
@@ -1718,6 +1734,9 @@ pub fn decide(
     facts.now_micros = live.now_micros;
     let facts = &*facts;
     let decide = |buffers: &mut Buffers| {
+        if live.unread {
+            buffers.scratch.unread(true);
+        }
         let Buffers {
             rows,
             whole,
@@ -1773,6 +1792,12 @@ pub fn decide(
 /// Runs one decision over the calling thread's own buffers: the one borrow
 /// of them, for a decision without a shadow ([`decide`]) and for one
 /// followed by its binding's shadow profile ([`with_shadow::decide`]).
+///
+/// The scratch is handed out with its word on the best rows of a trace
+/// cleared ([`Live::unread`]): the word of the thread's last decision
+/// never stands for this one, and a decision that states none reads them.
+/// A live decision and the shadow profile decided behind it on this
+/// borrow share the word: the front states it once, for both.
 #[inline]
 fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
     // The key's own call hands out the pointer alone: what a decision
@@ -1783,6 +1808,7 @@ fn with_buffers<T>(decide: impl FnOnce(&mut Buffers) -> T) -> T {
         // thread: that decision takes buffers of its own.
         return decide(&mut Buffers::default());
     };
+    buffers.scratch.unread(false);
     decide(&mut buffers)
 }
 
@@ -1835,4 +1861,5 @@ fn claimed(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/engine/records/tests.rs"]
 mod tests;

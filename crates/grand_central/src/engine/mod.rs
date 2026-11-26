@@ -64,7 +64,7 @@ pub use in_process::encode::EncodeLists;
 #[cfg(feature = "in-process")]
 pub use in_process::membership::Members;
 #[cfg(feature = "in-process")]
-pub use in_process::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffinity, PrefixRead};
+pub use in_process::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffinity};
 #[cfg(feature = "in-process")]
 pub use in_process::pair::{prefills_full, PairAdmission, PairLists};
 #[cfg(feature = "in-process")]

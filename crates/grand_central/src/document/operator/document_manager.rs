@@ -79,6 +79,8 @@ use std::{
 };
 
 use parking_lot::Mutex;
+#[cfg(feature = "controller")]
+use parking_lot::MutexGuard;
 use tracing::{info, warn};
 
 #[cfg(any(test, feature = "controller"))]
@@ -91,6 +93,8 @@ use super::{
     ApplyCounts, ApplyOutcome, Document, DryRun, EnforceOutcome, EnforceRefused, Format, NeedsRow,
     NotHeld, SpecRejected, Status,
 };
+#[cfg(feature = "controller")]
+use crate::store::Position;
 use crate::{
     document::spec::{AppliedSpec, Digest, PolicySpec, SpecError},
     engine::{framework, framework::Engine},
@@ -404,7 +408,7 @@ pub(crate) const WRITES_WAITING: usize = 32;
 /// no-change rule, the held document and counts. With a spec store it also
 /// owns the directory and the generations a rollback can name.
 pub struct DocumentManager {
-    pub(crate) store: Arc<MemoryStore>,
+    store: Arc<MemoryStore>,
     /// The stages a document may name: the ones the bind was handed, the
     /// host's own among them.
     catalog: Arc<StageRegistry>,
@@ -418,7 +422,7 @@ pub struct DocumentManager {
     /// pass run and the store's entry called under this lock, and a spec
     /// store's directory is written under it alone. No reader takes it. It
     /// holds the spec store, once one is bound.
-    pub(crate) applying: Mutex<Option<SpecStore>>,
+    applying: Mutex<Option<SpecStore>>,
     /// One side of a store's bind: the bind holds this from before it
     /// applies the newest generation on file until the directory is set,
     /// and a dry run holds it while it reads the standing generation and
@@ -442,7 +446,7 @@ pub struct DocumentManager {
     /// lock with its call of the store's entry, so a reader sees the number
     /// and the document move together and waits on no validation. `None`
     /// until a source has applied its first document.
-    pub(crate) held: Mutex<Option<Held>>,
+    held: Mutex<Option<Held>>,
     applied: AtomicU64,
     rejected: AtomicU64,
 }
@@ -650,6 +654,82 @@ impl DocumentManager {
             denied_headers.as_slice(),
         );
         holding(|| check(validator, standing, document, format, rule))
+    }
+
+    /// Admits a source that passes its document and applies none. Such a
+    /// source is the start of a replica under a shared lease.
+    ///
+    /// The whole step holds the apply lock, as an apply does. A spec store
+    /// bound here refuses the source as a second one. Then `admit` runs the
+    /// caller's pass against the generation that stands. Where it admits
+    /// and no generation stands, the store is marked as awaiting its
+    /// document.
+    #[cfg(feature = "controller")]
+    pub(crate) fn admit_deferred(
+        &self,
+        admit: impl FnOnce((u64, Option<Digest>)) -> Result<(), SpecRejected>,
+    ) -> Result<(), SpecRejected> {
+        let applying = self.applying.lock();
+        if applying.is_some() {
+            return Err(SpecRejected::SecondSource);
+        }
+        let standing = self.standing();
+        admit(standing)?;
+        // Until the document lands a request is no decision: the unbound
+        // start says so, where the start of a store with no source sheds
+        // by the binding.
+        if standing.0 == 0 {
+            self.store.snapshot().spec().mark_document_awaited();
+        }
+        drop(applying);
+        Ok(())
+    }
+
+    /// Takes the apply lock for a follower's event ([`FollowerTurn`]). The
+    /// caller takes it ahead of the event's pass. The turn holds it to its
+    /// commit or its drop.
+    #[cfg(feature = "controller")]
+    pub(crate) fn follower_turn(&self) -> FollowerTurn<'_> {
+        FollowerTurn {
+            door: self,
+            applying: self.applying.lock(),
+        }
+    }
+
+    /// Whether a document is held: a source applied one, or a leader's
+    /// generation was followed.
+    #[cfg(feature = "controller")]
+    pub(crate) fn holds(&self) -> bool {
+        self.held.lock().is_some()
+    }
+
+    /// The held document, where it is `generation`'s. The read takes the
+    /// lock a publication holds across the store's entry and the swap.
+    #[cfg(feature = "controller")]
+    pub(crate) fn held_under(&self, generation: u64) -> Option<Document> {
+        let held = self.held.lock();
+        held.as_ref()
+            .filter(|held| held.generation == generation)
+            .map(Held::document)
+    }
+
+    /// Whether the held document is `generation`'s, in `format`, with the
+    /// bytes `document`. The bytes are compared, never a digest.
+    #[cfg(feature = "controller")]
+    pub(crate) fn holds_bytes(&self, generation: u64, format: Format, document: &[u8]) -> bool {
+        self.held.lock().as_ref().is_some_and(|held| {
+            held.generation == generation && held.format == format && held.document == document
+        })
+    }
+
+    /// Runs `observe` under the lock a publication takes. It hands the
+    /// generation that stands and its digest. What a source records there
+    /// stands in one order with every entry, whichever thread runs first.
+    #[cfg(feature = "controller")]
+    pub(crate) fn observing(&self, observe: impl FnOnce(u64, Option<Digest>)) {
+        let _entry = self.held.lock();
+        let (number, digest) = self.standing();
+        observe(number, digest);
     }
 
     /// The standing number and digest, from one load, where `expected`
@@ -1080,6 +1160,63 @@ impl DocumentManager {
     }
 }
 
+/// The door's two locks, for a case in another module.
+#[cfg(all(test, feature = "controller"))]
+impl DocumentManager {
+    pub(crate) fn applying_lock(&self) -> &Mutex<Option<SpecStore>> {
+        &self.applying
+    }
+
+    pub(crate) fn held_lock(&self) -> &Mutex<Option<Held>> {
+        &self.held
+    }
+}
+
+/// The door's apply lock, held for a follower's event
+/// ([`DocumentManager::follower_turn`]). The turn holds it from ahead of
+/// the event's pass to its commit or its drop. No apply and no second
+/// source comes between the two.
+#[cfg(feature = "controller")]
+pub(crate) struct FollowerTurn<'a> {
+    door: &'a DocumentManager,
+    applying: MutexGuard<'a, Option<SpecStore>>,
+}
+
+#[cfg(feature = "controller")]
+impl FollowerTurn<'_> {
+    /// Whether a spec store is bound here: no standby follows beside one.
+    pub(crate) fn beside_spec_store(&self) -> bool {
+        self.applying.is_some()
+    }
+
+    /// Commits a generation the turn passed, and ends the turn
+    /// ([`DocumentManager::enter`]). `at` is the place of the leader's
+    /// event, which the store's entry journals. A restore hands none: its
+    /// snapshot stands at one place for all it holds.
+    pub(crate) fn enter(
+        self,
+        at: Option<Position>,
+        next: AppliedSpec,
+        kept: Held,
+        on_standing: impl FnOnce(u64, Digest),
+    ) -> Result<(), StaleGeneration> {
+        let publish = |store: &MemoryStore, spec| {
+            match at {
+                Some(at) => store.follow_generation(at, spec),
+                None => store.apply(spec),
+            }
+            .map(|()| true)
+        };
+        self.door.enter(next, kept, publish, on_standing).map(drop)
+    }
+
+    /// Commits an event that changes nothing here, and ends the turn. The
+    /// store journals the event's place alone, under `number`.
+    pub(crate) fn place(self, at: Position, number: u64) {
+        self.door.store.follow_generation_place(at, number);
+    }
+}
+
 impl Held {
     /// The source's bytes and the record beside them.
     pub(crate) fn document(&self) -> Document {
@@ -1094,4 +1231,5 @@ impl Held {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/document/operator/document_manager/tests/mod.rs"]
 mod tests;

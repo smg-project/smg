@@ -119,4 +119,5 @@ impl LoadReportPass {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/load/load_report_reader/tests.rs"]
 mod tests;

@@ -63,6 +63,7 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "../../tests/unit/store/pairing/tests.rs"]
 mod tests;
 
 /// The KV layout facts a descriptor may report, in the order they are

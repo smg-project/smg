@@ -406,4 +406,5 @@ fn reported_through(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/tracking/dispatch_credit/tests.rs"]
 mod tests;
