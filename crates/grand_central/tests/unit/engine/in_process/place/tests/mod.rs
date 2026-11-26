@@ -3489,6 +3489,135 @@ fn the_last_of_256_view_headers_is_named_by_its_place() {
     assert_eq!(made.make(engine.standing_spec()).facts.headers, [last]);
 }
 
+/// A later document whose view differs in its header list alone keeps the
+/// profile's stages, however the list changed. A kept stage that reads a
+/// header by its place reads that place of the later list. A stage built
+/// anew from the later document reads the same.
+#[test]
+fn a_stage_kept_across_a_new_header_list_reads_its_place_of_that_list() {
+    /// Draws among the workers the filters keep, and notes the value the
+    /// request is shown at the view's first place: the empty text for none.
+    #[derive(Debug)]
+    struct ReadsFirst(Arc<Mutex<Vec<String>>>);
+
+    impl Lifecycle for ReadsFirst {}
+
+    impl Picker for ReadsFirst {
+        fn name(&self) -> &'static str {
+            "reads-first"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            _: &[f32],
+            _: TieBand,
+            out: &mut Targets,
+        ) {
+            let first = facts.headers.iter().find(|header| header.name == 0);
+            let value = first.map_or("", |header| header.value);
+            self.0.lock().push(value.to_owned());
+            push_drawn(candidates, kept, out);
+        }
+    }
+
+    let read = Arc::new(Mutex::new(Vec::new()));
+    let noted = Arc::clone(&read);
+    let mut stages = StageRegistry::builtin();
+    let make = move || -> Box<dyn Picker> { Box::new(ReadsFirst(Arc::clone(&noted))) };
+    stages.picker("reads-first", make).expect("a free name");
+    let listing = |generation: u64, headers: &[&str]| {
+        let mut document = PolicySpec::preset("random").expect("a built-in preset");
+        document.generation = generation;
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "reads-first".into();
+        document.view.headers = headers.iter().map(|name| (*name).to_owned()).collect();
+        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
+        spec.expect("the stages hold the picker")
+    };
+    let members = PublishedList::new(pool(2));
+    // What the picker in force notes of a request that carries two headers.
+    let asked = |engine: &'static InProcess| {
+        let headers = [("x-a", "one"), ("x-b", "two")];
+        let request = PlaceRequest {
+            headers: &headers,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        assert!(engine.place(&request).is_ok(), "a placement");
+        std::mem::take(&mut *read.lock())
+    };
+    let engine = hosted(InProcess::new(listing(1, &["x-a"])));
+    assert_eq!(asked(engine), ["one"]);
+    // The later list, and the value at its first place. The list grew at
+    // its end, shrank from its end, took another header first, and took a
+    // first header the request does not carry.
+    let later: [(&[&str], &str); 4] = [
+        (&["x-a", "x-b"], "one"),
+        (&["x-a"], "one"),
+        (&["x-b", "x-a"], "two"),
+        (&["x-c", "x-a"], ""),
+    ];
+    for (generation, (headers, value)) in (2..).zip(later) {
+        let stood = engine.standing_spec().engine();
+        let applied = engine.apply(listing(generation, headers));
+        applied.expect("a number above the standing one");
+        let stands = engine.standing_spec().engine();
+        let kept = Arc::ptr_eq(&stands.profiles()[0], &stood.profiles()[0]);
+        assert!(kept, "{headers:?}: the profile stands");
+        assert_eq!(asked(engine), [value], "{headers:?}: the stage kept");
+        let anew = hosted(InProcess::new(listing(generation, headers)));
+        assert_eq!(asked(anew), [value], "{headers:?}: a stage built anew");
+    }
+}
+
+/// A later document that lists another header ahead of the sessions rule's
+/// keeps the profile's stages, and the rule reads its key from its own
+/// header at its new place. A pinned key's request follows its pin, though
+/// the header now first carries a text no key holds. A request that
+/// carries a pinned key's text under that first header, and a new key
+/// under the rule's own, is a new key's.
+#[test]
+fn a_sessions_rule_reads_its_header_behind_a_new_header_list() {
+    let listing = |generation: u64, headers: &[&str]| {
+        let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+        document.generation = generation;
+        document.view.headers = headers.iter().map(|name| (*name).to_owned()).collect();
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    let engine = hosted(InProcess::new(listing(1, &[MANUAL_SESSION_HEADER])));
+    let members = PublishedList::new(pool(16));
+    let went = |headers: &dyn HeaderRead| {
+        let request = PlaceRequest {
+            headers,
+            ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+        };
+        let mut placement = engine.place(&request).expect("a placement");
+        placement.sent(Side::Single);
+        placement.id()
+    };
+    let pins = || engine.standing_spec().engine().sessions().len();
+    let keys = ["talk-1", "talk-2", "talk-3", "talk-4"];
+    let homes = keys.map(|key| went(&[(MANUAL_SESSION_HEADER, key)]));
+    assert_eq!(pins(), keys.len());
+
+    let stood = engine.standing_spec().engine();
+    let applied = engine.apply(listing(2, &["x-first", MANUAL_SESSION_HEADER]));
+    applied.expect("a number above the standing one");
+    let stands = engine.standing_spec().engine();
+    let kept = Arc::ptr_eq(&stands.profiles()[0], &stood.profiles()[0]);
+    assert!(kept, "the profile stands");
+    for (key, home) in keys.into_iter().zip(homes) {
+        let headers = [("x-first", "talk-none"), (MANUAL_SESSION_HEADER, key)];
+        assert_eq!(went(&headers), home, "{key} follows its pin");
+    }
+    assert_eq!(pins(), keys.len(), "no new key");
+    let headers = [("x-first", "talk-1"), (MANUAL_SESSION_HEADER, "talk-new")];
+    went(&headers);
+    assert_eq!(pins(), keys.len() + 1, "a new key");
+}
+
 /// The profile's picker receives the request's stated budget in microseconds.
 /// The request gets a leased pick.
 #[test]

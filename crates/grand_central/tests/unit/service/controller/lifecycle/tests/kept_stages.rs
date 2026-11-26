@@ -161,12 +161,13 @@ impl Bed {
         }
     }
 
-    /// `generation` of the bed's document, validated over the bed's table:
-    /// the profile `kept` for every model and the profile `moved` for the
-    /// model `m`, each with a picker that keeps what it hears. `filters`
-    /// are the filters of `moved`, and `view` the document's view block: a
-    /// document that states other filters builds `moved` anew, and one
-    /// that states another view builds both.
+    /// `generation` of the bed's document, validated over the bed's table.
+    /// It binds the profile `kept` for every model and the profile `moved`
+    /// for the model `m`, each with a picker that keeps what it hears.
+    /// `filters` are the filters of `moved`, and `view` the document's view
+    /// block. A document that states other filters builds `moved` anew. One
+    /// that states another view builds both, unless the two views differ
+    /// in their header lists alone.
     fn spec_under(&self, generation: u64, filters: &str, view: &str) -> AppliedSpec {
         let text = format!(
             r#"{{
@@ -443,9 +444,9 @@ fn a_pairs_lease_of_an_earlier_document_is_told_by_side_to_the_stage_kept() {
     assert!(lease_words(&bed.moved, replaced).is_empty());
 }
 
-/// A document that states another view builds every profile anew, as an
-/// engine does that takes it itself: no stage is kept, and a lease of the
-/// earlier document is told to no stage.
+/// A document that states another block size of its view builds every
+/// profile anew, as an engine does that takes it itself. No stage is kept,
+/// and a lease of the earlier document is told to no stage.
 #[test]
 fn a_document_of_another_view_keeps_no_stage() {
     let bed = Bed::new();
@@ -461,6 +462,37 @@ fn a_document_of_another_view_keeps_no_stage() {
         assert_eq!(heard(log, made[1]), [Word::Members(Vec::new())]);
         assert!(lease_words(log, made[0]).is_empty());
     }
+}
+
+/// A document whose view differs from the standing one's in its header
+/// list alone keeps its stages. The lists here grew, shrank, changed
+/// inside and named other headers. A served controller's apply runs the
+/// engine's one rule. A lease of the first document is told to the stage
+/// kept.
+#[test]
+fn a_document_that_changes_its_header_list_alone_keeps_its_stages() {
+    let bed = Bed::new();
+    let listing = |generation: u64, headers: &str| {
+        let view = format!(r#""headers": [{headers}]"#);
+        bed.spec_under(generation, "", &view)
+    };
+    bed.store.apply(listing(1, r#""x-a""#)).expect("the first");
+    issued(&bed.store, 1, 1, bed.now);
+    let later = [r#""x-a", "x-b""#, r#""x-a""#, r#""x-b", "x-a""#, r#""x-c""#];
+    for (generation, headers) in (2..).zip(later) {
+        let applied = bed.store.apply(listing(generation, headers));
+        applied.expect("a later generation");
+    }
+    bed.dispatched(1, proto::Side::Single);
+    bed.released(1);
+    for log in [&bed.kept, &bed.moved] {
+        assert_eq!(objects(log).len(), 1, "one object over five documents");
+    }
+    let words = [
+        Word::Dispatched(1, WorkerId(7)),
+        Word::Released(1, Side::Single),
+    ];
+    assert_eq!(lease_words(&bed.kept, objects(&bed.kept)[0]), words);
 }
 
 /// A standby keeps as a leader does: a generation it follows keeps the

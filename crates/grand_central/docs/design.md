@@ -360,20 +360,27 @@ that finds the model with none decides, and the binding leaves with the model's 
 name is resolved as classic resolves it, and an unknown name adds no binding.
 
 The gateway then puts the new document in force on the running engine. A document put in force keeps
-the stages of a profile that did not change, under the rules of section 5.1: its name stands in
-both documents, its stages are built from the same text (the profile's own block, `view` and
-`signals`), over one stage table, and each stage built again says of itself what the standing one
-says. Such a profile's stages keep what they hold, and a decision under way and a new one run the
-same stage objects. A profile that changed, and a new one, start empty, and read the count of
-sends that the profiles kept beside them read. So a label's binding resets
-nothing of another model's policy where it leaves the document's `view` and `signals` as they
-stand. A label whose binding writes into them restarts every profile's stages. A label writes
-no signal, and into the view only headers the view does not list yet: a `manual` label its key's
-headers, and under the sticky override a label of a policy the override places adds the
-override's headers, beside a main policy whose binding lists none (`consistent_hashing`). A
-`cache_aware` label also writes the document's `index` block where the settings wrote none.
-Where the new document cannot be built, the document in force stays and the registration is
-answered with a warning.
+the stages of a profile that did not change, under the rules of section 5.1. Its name and its own
+block stand in both documents, and the document's `signals` and `view` stand as that section asks.
+Both documents were validated over one stage table, and each stage built again says of itself what
+the standing one says.
+
+Such a profile's stages keep what they hold, and a decision under way and a new one run the same
+stage objects. A profile that changed, and a new one, start empty, and read the count of sends that
+the profiles kept beside them read.
+
+A label writes no signal. Into the view it writes only headers the view does not list yet. A
+`manual` label adds its key's headers. Under the sticky override a label of a policy the override
+places adds the override's headers, beside a main policy whose binding lists none
+(`consistent_hashing`).
+
+Section 5.1 keeps every profile across a view that differs in its header list alone. So a label
+that comes or goes resets no stage of another model's profile, wherever its headers stand in the
+list.
+
+A `cache_aware` label also writes the document's `index` block where the settings wrote none. Where
+the new document cannot be built, the document in force stays and the registration is answered with
+a warning.
 
 That holds where the document is built from the routing settings. Where the operator supplies a
 document, and on a controller, the document decides, and a registration whose label names
@@ -850,26 +857,47 @@ The engine is in `engine/`.
 ### 5.1 The engine object **[built]**
 
 A gateway has one engine object. It is built once, from the policy document in force at its start,
-and holds the document's stages and what they remember. A later document is put in force on the same
-object (`InProcess::apply`): the engine holds its document as one value and replaces it whole,
-and a decision reads one document from its entry to its end. The session table and the record of
-sent prompts stand across the call. So do the stages of a profile whose name and text did not
-change, with what they remember, under the rules that follow. A new document that changes `view` or
-`signals` builds every profile anew. Nothing is kept unless both documents were validated over one
-stage table: the stock one, or one table of the host's own that took no stage between the two
-validations.
-A profile is built anew too where one of its stages, built again, says otherwise of itself than the
-standing one: another name, other words of a request's life to hear, or anything else the engine
-reads of a stage when it builds a profile. A factory of the host's own may build such a stage.
-A count of sends stands where a profile that reads it is kept: a profile built new beside it reads
-the same count, and a send is counted once. A count none of whose readers is kept is built new, and
-takes over the sends of a standing one (`Engine::succeed`). Profiles whose
-stages read a count under the same `sent_ttl_ms` and `sent_report_delay_ms` read one count, and a
-document that states neither, as the one built from the routing settings does, puts them all under
-one. It holds no worker of its own: the registry that its host hands it (section 8.1) holds them. A
-controller keeps one engine object too, built at its store's start: the store puts each document it
-applies in force on it, by `InProcess::apply`, the call of a host that keeps one engine (section
+and holds the document's stages and what they remember. It holds no worker of its own: the registry
+that its host hands it (section 8.1) holds them. A later document is put in force on the same object
+(`InProcess::apply`). The engine holds its document as one value and replaces it whole, and a
+decision reads one document from its entry to its end.
+
+A controller keeps one engine object too, built at its store's start. The store puts each document
+it applies in force on it, by `InProcess::apply`, the call of a host that keeps one engine (section
 8.1, step 6, and section 10.2).
+
+The session table and the record of sent prompts stand across the call. So do the stages of a
+profile whose name and text did not change, with what they remember, under the rules that follow.
+Nothing is kept unless both documents were validated over one stage table: the stock one, or one
+table of the host's own that took no stage between the two validations.
+
+A profile's stages are built from its own block, the document's `view` and its `signals`. So a new
+document that changes `view` or `signals` builds every profile anew, with one exception. The
+exception is a view that differs in its header list alone (`AppliedSpec::keep_from`). A view that
+differs in any other field builds every profile anew.
+
+The exception is safe because no stage is built from the header list. A validation's own stages
+read four values of the view: the block size, the boundaries, the bound of block hashes and the age
+limit of load reports (`check_profile`, `document/spec.rs`). A stage of the host's own is built by a
+factory that is handed no header list. Of the view it is handed the age limit of load reports alone
+(`StageBuild::load_report_reader`, `stages/registry.rs`). The keep's own premise holds here too: a
+factory builds from what it is handed.
+
+A stage that reads a request's header reads it by its place in the list of the document its
+decision runs under. A plugin's stage reads the places its host's exposure names, and a stage of
+the host's own reads the places its code names. So a kept stage and one built anew read the same
+header under any list. A binding names its headers by name, and every binding is built new.
+
+A profile is built anew too where one of its stages, built again, says otherwise of itself than the
+standing one. That is another name, other words of a request's life to hear, or anything else the
+engine reads of a stage when it builds a profile. A factory of the host's own may build such a
+stage.
+
+A count of sends stands where a profile that reads it is kept. A profile built new beside it reads
+the same count, and a send is counted once. A count none of whose readers is kept is built new, and
+takes over the sends of a standing one (`Engine::succeed`). Profiles whose stages read a count under
+the same `sent_ttl_ms` and `sent_report_delay_ms` read one count. A document that states neither,
+as the one built from the routing settings does, puts them all under one.
 
 A word of a lease issued under an earlier document is told by one rule, in a gateway's own process
 and on a controller: the stages kept since the lease's document hear it, every count of sends in

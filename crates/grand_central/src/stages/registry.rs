@@ -87,6 +87,9 @@ pub(crate) enum Found<T: ?Sized, F = Infallible> {
 /// The factory borrows the parameters for the call. A stage owns any
 /// parameters it keeps.
 pub struct StageBuild<'a> {
+    // No field holds the view's header list, so no factory reads it. The
+    // keep of a profile's stages across a new header list rests on that
+    // (`AppliedSpec::keep_from`).
     written: &'a Map<String, Value>,
     profile: &'a str,
     sent_settings: SentSettings,
