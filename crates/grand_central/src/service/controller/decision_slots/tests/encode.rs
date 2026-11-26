@@ -8,7 +8,10 @@ use super::{
 };
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
-    engine::view::{Role, WireModes, WorkerId},
+    engine::{
+        view::{Role, WireModes, WorkerId},
+        DemandFacts,
+    },
     service::proto::{self, busy::Reason, decision::Outcome},
     stages::registry::StageRegistry,
     store::{
@@ -86,6 +89,26 @@ pub(crate) fn member_of(
     role: Role,
     stated: Stated,
 ) -> WorkerId {
+    member_stating(
+        store,
+        objects,
+        model,
+        (name, role),
+        stated,
+        DemandFacts::default(),
+    )
+}
+
+/// [`member_of`] for a worker that states `demands` for a request's hard
+/// demands.
+pub(crate) fn member_stating(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    model: &str,
+    (name, role): (&str, Role),
+    stated: Stated,
+    demands: DemandFacts,
+) -> WorkerId {
     let key = format!("http://{name}:8000");
     let encode = match role {
         Role::Encode | Role::Prefill if stated.pushes => EncodeOffer {
@@ -109,6 +132,7 @@ pub(crate) fn member_of(
         max_running: Some(4),
         reachable_from: stated.only.map_or(Reachability::Any, Reachability::Gateway),
         encode,
+        demand_facts: demands,
         ..WorkerFacts::default()
     };
     written_ready(store, objects, facts)

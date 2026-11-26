@@ -787,6 +787,10 @@ message WorkerRow {
   // ALREADY_EXISTS whoever made it. A reader that knows no such field
   // reads every row as a control call's.
   Maker maker = 27;
+  // What the worker states for a request's hard demands. Absent: it
+  // states none, and the row reads as it did before this field. A reader
+  // that knows no such field reads every row as one that states none.
+  DemandFacts demand_facts = 28;
 }
 
 // A provider that finds workers by itself, as a row's maker. Neither
@@ -886,6 +890,29 @@ message Signals {
   string scrape_family = 5;
 }
 
+// What a worker states for a request's hard demands, by its registration.
+// The two numbers are the registering party's own: equal numbers are one
+// runtime, or one way to decide a constraint. The controller compares them
+// and reads no more of them. A worker that states none meets no demand for
+// a runtime, for media by reference or for a way to decide a constraint,
+// and it takes a request of any size. Whether the worker takes images is
+// no field here. No frame states a demand in this protocol version, so a
+// frame's decision reads none of these facts yet.
+message DemandFacts {
+  // The worker's runtime, as a number. 0 states none.
+  uint32 runtime = 1;
+  // The worker processes media by reference.
+  bool references = 2;
+  // It processes that media by its registering party's pipeline, and not
+  // by one of its own. Read only beside `references`.
+  bool host_pipeline = 3;
+  // The worker's context window, in tokens. 0 states none.
+  uint32 window = 4;
+  // How the worker decides a request's constraint, as a number of at most
+  // 255: INVALID_ARGUMENT above, by this field. 0 states none.
+  uint32 decoding = 5;
+}
+
 // --- Control scope: membership ----------------------------------------------
 
 message RegisterWorkerRequest {
@@ -902,13 +929,13 @@ message RegisterWorkerRequest {
     // did not make the standing row is PERMISSION_DENIED (WorkerRow.maker).
     MODE_REPLACE = 2;
     // Registers an absent URL. Over a standing row: equal facts write nothing
-    // and answer the row unmoved, a change of role, wire or models is a new
-    // incarnation, any other change is made in place. The models change
-    // when their set does: the same ids in another order are written in
-    // place, and the row tells the stated order. Over a draining row every
-    // registration is the URL's next incarnation, whatever its facts: a
-    // drain ends with the registration it named. A caller that did not make
-    // the standing row is PERMISSION_DENIED, whatever the facts.
+    // and answer the row unmoved, a change of role, wire, models or demand
+    // facts is a new incarnation, any other change is made in place. The
+    // models change when their set does: the same ids in another order are
+    // written in place, and the row tells the stated order. Over a draining
+    // row every registration is the URL's next incarnation, whatever its
+    // facts: a drain ends with the registration it named. A caller that did
+    // not make the standing row is PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
@@ -925,10 +952,11 @@ message RegisterWorkerRequest {
 // character is INVALID_ARGUMENT. Over a standing row (MODE_REPLACE,
 // MODE_UPSERT) the labels and the health policy are the registration's,
 // whole; any other field left unset or empty keeps the row's value, and an
-// overload or a signals block that is present replaces the row's. A URL's
-// first registration names its wire and its role: INVALID_ARGUMENT by the
-// field it leaves unset. A wire or a role that states a number this
-// contract does not name is INVALID_ARGUMENT at every registration.
+// overload, a signals or a demand facts block that is present replaces the
+// row's. A URL's first registration names its wire and its role:
+// INVALID_ARGUMENT by the field it leaves unset. A wire or a role that
+// states a number this contract does not name is INVALID_ARGUMENT at every
+// registration.
 //
 // Bounds, each INVALID_ARGUMENT by its field: a URL at most 2,048 bytes; a
 // runtime, a zone and a model id at most 256 bytes each; at most 128 labels,
@@ -991,6 +1019,10 @@ message WorkerSpec {
   // Unset: checked, under the controller's defaults, whatever stood under
   // the URL: every registration that wants its checks off says so.
   HealthPolicy health_policy = 14;
+  // What the worker states for a request's hard demands. A block that is
+  // present is the row's, whole: an empty one states none. Unset keeps the
+  // row's.
+  DemandFacts demand_facts = 15;
 }
 
 message PatchWorkerRequest {

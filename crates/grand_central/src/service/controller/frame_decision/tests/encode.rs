@@ -22,11 +22,13 @@ use crate::{
         decision_slot::DecisionSlot,
         framework::{Picker, TieBand},
         view::{Candidate, RequestFacts, Role, WireModes, WorkerId},
+        DemandFacts,
     },
     service::{
         controller::{
             decision_slots::tests::encode::{
-                encode_plan, encode_plan_in, frame_of, member_of, Stated, ENCODED, PUSHING,
+                encode_plan, encode_plan_in, frame_of, member_of, member_stating, Stated, ENCODED,
+                PUSHING,
             },
             frame_decision::{decide_encode, issue_pair},
             wire,
@@ -680,4 +682,42 @@ fn an_encode_requests_frame_is_read_for_no_number() {
     for number in [0, 1, 2, u32::MAX] {
         assert_eq!(asked(Some(number)), unnamed, "{number}");
     }
+}
+
+/// No frame states a demand in this protocol version, so what the workers
+/// of an encode request state for one changes no decision either. Its
+/// prefill, its decode and its encoder each state a runtime, a pipeline for
+/// media by reference, a way to decide a constraint and a window of sixteen
+/// tokens. The frame is answered the pair and the encoders it is answered
+/// over workers that state nothing.
+#[test]
+fn an_encode_request_is_decided_over_rows_that_state_demand_facts_as_over_rows_that_state_none() {
+    let answers = |stated: DemandFacts| {
+        let store = encode_store();
+        let objects = holder(&store);
+        for member in [
+            ("p0", Role::Prefill),
+            ("d0", Role::Decode),
+            ("e0", Role::Encode),
+        ] {
+            member_stating(&store, &objects, ENCODED, member, PUSHING, stated);
+        }
+        let frame = encode_frame(1, 2);
+        let (answer, placed) = served_encode(&store, &objects, frame, GATEWAY, Instant::now());
+        (pairs_of(&answer), encoders_of(placed.as_ref()))
+    };
+    let stated = DemandFacts {
+        runtime: 7,
+        references: true,
+        host_pipeline: true,
+        window: 16,
+        decoding: 3,
+    };
+    let (pairs, encoders) = answers(stated);
+    assert_eq!(
+        (pairs.len(), encoders.len()),
+        (1, 2),
+        "a pair, a key an item"
+    );
+    assert_eq!((pairs, encoders), answers(DemandFacts::default()));
 }
