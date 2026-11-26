@@ -1,15 +1,17 @@
 //! The program's token tree.
 //!
 //! The program keeps a token tree of the prompts it sent, one a model, and
-//! lends it to the engine at its start ([`Program::start`]). A request
-//! states its prompt's token ids and its entry in that tree
-//! ([`Asked::tokens`]). Under a document that reads the prefixes sent to
-//! each worker, the engine decides a single request inside the tree's
-//! match, and the same descent writes the request for the worker it goes
-//! to. The tree stays the program's: it takes a worker that left out of it
-//! and holds it to a size. Each case serves the turns of conversations and
-//! reads where each went and what the tree holds. A gateway's own policy
-//! keeps such trees and reads them the same way
+//! lends it to the engine at its start ([`Program::start`]). A request states
+//! its prompt's token ids and its entry in that tree ([`Asked::tokens`]).
+//!
+//! Under a document that reads the prefixes sent to each worker, the engine
+//! decides a single request inside the tree's match. The same descent writes
+//! the request for the worker it goes to. The tree stays the program's: it
+//! takes a worker that left out of it and holds it to a size.
+//!
+//! Each case serves the turns of conversations and reads where each went and
+//! what the tree holds. A gateway's own policy keeps such trees and reads them
+//! the same way: `CacheAwarePolicy`
 //! (`model_gateway/src/policies/cache_aware.rs`).
 //!
 //! [`Asked::tokens`]: crate::program::Asked::tokens
@@ -68,17 +70,17 @@ fn holders(program: &Program, said: &[u32]) -> Vec<String> {
     holders
 }
 
-/// A conversation goes back to the worker its first turn was sent to,
-/// however long it grows: the tree matches the whole prompt. Eight workers
-/// and a conversation of a thousand pages that grows a page a turn. A
-/// program that lends no tree is named a prompt's holders from the engine's
-/// own record of hashed prefixes, which holds the first 256 blocks of a
+/// A conversation goes back to the worker its first turn was sent to, however
+/// long it grows: the tree matches the whole prompt. Eight workers stand, and
+/// a conversation of a thousand pages grows a page a turn.
+///
+/// A program that lends no tree is named a prompt's holders from the engine's
+/// own record of hashed prefixes. That record holds the first 256 blocks of a
 /// prompt: too small a share of this one to send it back.
 ///
-/// A gateway's own policy sends a request to a worker its tree's match
-/// found, where the match is over its threshold
-/// (`select_worker_with_tokens`,
-/// `model_gateway/src/policies/cache_aware.rs:3429-3516`).
+/// A gateway's own policy sends a request to a worker its tree's match found,
+/// where the match is over its threshold: the test of `cache_threshold` in
+/// `select_worker_with_tokens` (`model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_conversation_goes_back_to_the_worker_it_was_sent_to() {
     let fleet = workers(8);
@@ -91,14 +93,14 @@ fn a_conversation_goes_back_to_the_worker_it_was_sent_to() {
     }
 }
 
-/// The tree holds a prompt for the worker its request was sent to, and for
-/// no other. Two workers and four conversations: behind each one's first
-/// turn the tree holds its prompt whole for the worker the client's
-/// request went to.
+/// The tree holds a prompt for the worker its request was sent to, and for no
+/// other. Two workers serve four conversations. Behind each one's first turn
+/// the tree holds its prompt whole for the worker the client's request went
+/// to.
 ///
 /// A gateway's own policy writes a request into its tree for the worker it
-/// selected alone, inside the match (`select_worker_with_tokens`,
-/// `model_gateway/src/policies/cache_aware.rs:3457-3492`).
+/// selected alone, inside the match: `match_and_insert_with_hash` in
+/// `select_worker_with_tokens` (`model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn the_tree_holds_a_prompt_for_the_worker_it_was_sent_to() {
     let fleet = workers(2);
@@ -112,16 +114,16 @@ fn the_tree_holds_a_prompt_for_the_worker_it_was_sent_to() {
 }
 
 /// A worker that left holds nothing in the tree, and one that joins at its
-/// address starts with nothing. The engine reads no worker that left, but
-/// the tree is the program's to keep: without the purge it would hold the
-/// worker's prompts for good, and hand them to the worker that joins there.
-/// The worker leaves under its address written without the scheme, which
-/// the registry finds it by: the purge goes by the address the worker
-/// states, the one the engine wrote its prompts under.
+/// address starts with nothing. The engine reads no worker that left, but the
+/// tree is the program's to keep. Without the purge it would hold the worker's
+/// prompts for good, and hand them to the worker that joins there.
 ///
-/// A gateway's own policy takes a removed worker out of every tree
-/// (`remove_worker_by_url`,
-/// `model_gateway/src/policies/cache_aware.rs:721-739`).
+/// The worker leaves under its address written without the scheme, which the
+/// registry finds it by. The purge goes by the address the worker states, the
+/// one the engine wrote its prompts under.
+///
+/// A gateway's own policy takes a removed worker out of every tree:
+/// `remove_worker_by_url` (`model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_worker_that_left_holds_nothing_in_the_tree() {
     let fleet = workers(2);
@@ -141,11 +143,11 @@ fn a_worker_that_left_holds_nothing_in_the_tree() {
 }
 
 /// The program's pass holds its tree to a size. Eight conversations of 64
-/// pages fill the tree with 8,192 tokens, and the pass at half of them
-/// leaves at most that many.
+/// pages fill the tree with 8,192 tokens, and the pass at half of them leaves
+/// at most that many.
 ///
-/// A gateway's own policy runs such a pass over its trees on a timer
-/// (`evict_trees`, `model_gateway/src/policies/cache_aware.rs:338-386`).
+/// A gateway's own policy runs such a pass over its trees on a timer:
+/// `evict_trees` (`model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn the_programs_pass_holds_its_tree_to_a_size() {
     let fleet = workers(2);
@@ -172,13 +174,13 @@ fn a_document_that_reads_no_sent_prefix_asks_for_no_tree() {
     assert!(program.tree(MODEL).is_none());
 }
 
-/// A pair's request is decided inside no tree: the engine decides a single
+/// A pair's request is decided inside no tree. The engine decides a single
 /// request there and no other, and the program lends its tree to a single
-/// request alone. Two prefills and two decodes under the same policy, and a
-/// request that states its prompt.
+/// request alone. Two prefills and two decodes stand under the same policy,
+/// and a request states its prompt.
 ///
-/// A gateway lends its trees to a single request alone
-/// (`model_gateway/src/policies/lent_trees.rs:334-341`).
+/// A gateway lends its trees to a single request alone:
+/// `EngineCaches::token_tree` (`model_gateway/src/policies/lent_trees.rs`).
 #[test]
 fn a_pairs_request_is_lent_no_tree() {
     let fleet = fleet(2, 2);
