@@ -31,8 +31,8 @@ impl Replica {
         Self { store, objects }
     }
 
-    /// Have the holder lay each row written around it, by the read of
-    /// a refused write.
+    /// Have the holder lay each row written around it, by its pass over
+    /// a cut's rows.
     fn lay_standing(&self) {
         lay_standing(&self.objects, &self.store);
     }

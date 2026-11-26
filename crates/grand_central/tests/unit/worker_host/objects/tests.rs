@@ -109,8 +109,8 @@ impl Replica {
         }
     }
 
-    /// Have the holder lay each row written around it, by the read
-    /// of a refused write.
+    /// Have the holder lay each row written around it, by its pass
+    /// over a cut's rows.
     fn lay_standing(&self) {
         lay_standing(&self.objects, &self.store);
     }
@@ -137,16 +137,11 @@ impl Replica {
     }
 
     /// A registration's write as a door over the holder makes it,
-    /// decided over the object that stands. A write the store refuses
-    /// is decided once more, over what its read left.
+    /// decided over the object that stands.
     fn write(&self, facts: WorkerFacts) -> WorkerId {
         let store = self.store.as_ref();
-        let lay = || {
-            self.objects
-                .upsert(store, facts.clone(), Registrant::Control)
-        };
-        let change = lay().or_else(lay);
-        change.expect("the store takes the second write").id()
+        let change = self.objects.upsert(store, facts, Registrant::Control);
+        change.expect("the store takes the write").id()
     }
 
     /// A registration's keep, its answer left to the case.
@@ -717,9 +712,7 @@ fn the_overload_switch_stated_ahead_of_the_first_write_builds_each_object_once()
 /// read by the holder yet, is another life. A moved word lays the first
 /// life's object again under the word, and nothing of the second life
 /// takes its place: the second takes no status and no count in flight
-/// of the first. The holder's next read of the row, behind a write the
-/// store refuses, ends the first life's object and builds the second's
-/// anew, under the word.
+/// of the first.
 #[test]
 fn the_overload_switch_lays_no_row_the_holder_has_not_read() {
     let defaults = OverloadThresholds {
@@ -747,7 +740,7 @@ fn the_overload_switch_lays_no_row_the_holder_has_not_read() {
         .told()
         .into_iter()
         .filter(|told| told.0 == "replaced");
-    assert_eq!(replaced.collect::<Vec<_>>(), [("replaced", old_id.clone())]);
+    assert_eq!(replaced.collect::<Vec<_>>(), [("replaced", old_id)]);
     // The first life's object under the word: its status and its count,
     // and no label of the second life.
     let laid = replica.at(A);
@@ -758,20 +751,6 @@ fn the_overload_switch_lays_no_row_the_holder_has_not_read() {
     );
     assert_eq!(laid.metadata().overload, none);
     assert_eq!((laid.status(), laid.load()), (ObjectStatus::Ready, 1));
-
-    let store = replica.store.as_ref();
-    let refused = replica.objects.patch(store, first, labels("silver"), 2);
-    assert_eq!(refused, None, "decided over a life that left");
-    let new_id = replica.id(A);
-    assert_ne!(old_id, new_id);
-    assert_eq!(
-        replica.told(),
-        [("removed", old_id), ("registered", new_id)]
-    );
-    let second = replica.at(A);
-    assert_eq!(replica.tier(A).as_deref(), Some("gold"));
-    assert_eq!(second.metadata().overload, none, "built under the word");
-    assert_eq!(second.load(), 0, "nothing of the first life runs on");
 }
 
 /// A report that lands inside the registry's replacement leaves no
@@ -1438,7 +1417,7 @@ fn laying_again_reaches_each_rank_row_that_dials_the_address_and_no_other() {
 
 /// Laying again reads no store. A row a registration wrote around the
 /// holder has no object for the call to lay, and the keeper forgets
-/// it: its object, laid at its key's next refused write, takes no
+/// it: its object, laid where a cut's rows are laid, takes no
 /// credential. A row
 /// written through the holder is laid again from the row its object
 /// states, not from the store's.
@@ -1518,16 +1497,15 @@ fn a_registration_with_no_credential_clears_one_a_removed_worker_left() {
     assert!(replica.holds_credential(A, None));
 }
 
-/// A refused write's read and a cut laid whole forget, each what it
-/// read. A registration decided over a row that left around the holder
-/// is refused: its read ends the key's object, and the keeper drops
-/// that row and asks about no other. So a row a registration bound and
-/// the holder has not read yet keeps its credential, and its object is
-/// built with it. A cut that drops a row ends its object, and the
-/// keeper drops every row that left. A credential goes with its
-/// address's last row.
+/// A cut laid whole forgets the rows that left, and a refused write
+/// forgets none. A registration decided over a row that left around
+/// the holder is refused, and the keeper is asked about no row. So a
+/// row a registration bound and the holder has not read yet keeps its
+/// credential, and its object is built with it. A cut that drops a row
+/// ends its object, and the keeper drops every row that left. A
+/// credential goes with its address's last row.
 #[test]
-fn a_refused_write_and_a_cut_laid_whole_forget_the_rows_that_left() {
+fn a_cut_laid_whole_forgets_the_rows_that_left_and_a_refused_write_none() {
     let replica = Replica::new();
     let store = replica.store.as_ref();
     replica.register(facts(A, 1), Some(KEY_A));
@@ -1542,7 +1520,11 @@ fn a_refused_write_and_a_cut_laid_whole_forget_the_rows_that_left() {
     };
     let refused = replica.objects.upsert(store, labelled, Registrant::Control);
     assert_eq!(refused, None, "decided over a row that left");
-    assert_eq!(replica.credentials.len(), 1, "the row that left alone");
+    assert_eq!(
+        replica.credentials.len(),
+        2,
+        "a refused write forgets nothing"
+    );
     replica.lay_standing();
     assert!(replica.holds_credential(B, Some(KEY_B)), "the unread row's");
 
@@ -1553,12 +1535,13 @@ fn a_refused_write_and_a_cut_laid_whole_forget_the_rows_that_left() {
     assert!(replica.credentials.is_empty(), "behind the cut's read");
 }
 
-/// A refused write names the row it was decided over to the keeper,
-/// whatever it decided: a change in place, a new width, a key's next
-/// life, a removal. That row left around the holder, and the keeper
-/// forgets it.
+/// A refused write forgets nothing, whatever it decided: a change in
+/// place, a new width, a key's next life, a removal. The row it was
+/// decided over left around the holder. Its object stands as it stood
+/// with its credential, and a removal's is laid again with it. A cut
+/// laid whole ends the object, and the keeper forgets the row.
 #[test]
-fn a_refused_write_of_each_kind_forgets_the_row_it_was_decided_over() {
+fn a_refused_write_of_each_kind_forgets_nothing_and_a_cut_forgets_the_row() {
     type Refused = fn(&Replica, WorkerId) -> Option<MembershipChange>;
     fn lay(replica: &Replica, facts: WorkerFacts) -> Option<MembershipChange> {
         let store = replica.store.as_ref();
@@ -1586,44 +1569,12 @@ fn a_refused_write_of_each_kind_forgets_the_row_it_was_decided_over() {
         // Another writer's removal, around the holder.
         replica.remove_around(A);
         assert_eq!(write(&replica, row), None, "{name}: over a row that left");
-        assert!(replica.credentials.is_empty(), "{name}");
+        assert_eq!(replica.credentials.len(), 1, "{name}: nothing forgotten");
+        assert!(replica.holds_credential(A, Some(KEY_A)), "{name}");
+        let store = replica.store.as_ref();
+        assert!(replica.objects.restore_from(store, store.checkpoint()));
+        assert!(replica.credentials.is_empty(), "{name}: behind the cut");
     }
-}
-
-/// A write refused over a row another writer moved in place reads the
-/// row and lays it. The row stands, so the keeper keeps what is bound
-/// to it: the forgetting behind that read drops a row that left alone.
-/// A refused removal keeps it too: its object is out by then, and the
-/// keeper forgets only behind the store's word.
-#[test]
-fn a_refused_write_over_a_row_moved_in_place_keeps_its_credential() {
-    let replica = Replica::new();
-    let store = replica.store.as_ref();
-    let row = replica.register(facts(A, 1), Some(KEY_A));
-    // Another writer's patch, around the holder.
-    let late = WorkerPatch {
-        priority: Some(7),
-        ..WorkerPatch::default()
-    };
-    replica.patch_around(A, late);
-    let refused = replica.objects.patch(store, row, labels("gold"), 1);
-    assert_eq!(refused, None, "decided over a row that moved");
-    assert_eq!(replica.credentials.len(), 1, "the row stands");
-    assert!(replica.holds_credential(A, Some(KEY_A)));
-    // What is bound still: an object laid later takes it.
-    replica.patch_around(A, labels("silver"));
-    let refused = replica.objects.patch(store, row, labels("gold"), 2);
-    assert_eq!(refused, None, "moved once more");
-    assert!(replica.holds_credential(A, Some(KEY_A)), "laid with it");
-    // A removal decided over the object that read left, refused too.
-    replica.patch_around(A, labels("bronze"));
-    let refused = replica.objects.remove(store, row, 3);
-    assert_eq!(refused, None, "the removal's row moved");
-    assert_eq!(replica.credentials.len(), 1, "the row stands");
-    assert!(
-        replica.holds_credential(A, Some(KEY_A)),
-        "laid anew with it"
-    );
 }
 
 #[test]
