@@ -1286,6 +1286,8 @@ impl Loaded<'_, '_> {
                 let loads = read.snapshot();
                 let sends_to = |target: &_| maker.sends_to(target);
                 let counted = || maker.session_counted_under();
+                let spec = &self.document.spec;
+                let lends = |shadow| maker.shadow_ring(spec, shadow);
                 let decided = pair::decided(
                     self,
                     &lists,
@@ -1295,6 +1297,7 @@ impl Loaded<'_, '_> {
                     now,
                     sends_to,
                     counted,
+                    &lends,
                 );
                 *whole = Some((decided, later));
                 sample::whole(self, maker, &request, now, whole.as_ref(), None);
@@ -1371,6 +1374,8 @@ impl DecisionEngine for InProcess {
                     // The decode asked again is asked which decode it is sent to.
                     let sends_to = |target: &_| maker.sends_to(target);
                     let counted = || maker.session_counted_under();
+                    let spec = &own.document.spec;
+                    let lends = |shadow| maker.shadow_ring(spec, shadow);
                     pair::decided(
                         own,
                         &lists,
@@ -1380,6 +1385,7 @@ impl DecisionEngine for InProcess {
                         now,
                         sends_to,
                         counted,
+                        &lends,
                     )
                 }
                 _ => single::issued(own, single::over_none(own, &request), &request, now),

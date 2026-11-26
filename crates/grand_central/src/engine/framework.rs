@@ -25,7 +25,7 @@ use crate::{
         warm_up::WarmUpRule,
     },
     load::signals::SignalCells,
-    policies::{prefix_hash::HeadRule, random::Random},
+    policies::{consistent_hashing::LentRing, prefix_hash::HeadRule, random::Random},
     stages::{
         filters::{HasCapacity, RowTests},
         lifecycle::Lifecycle,
@@ -87,6 +87,13 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
     /// [`Needs::text_hashes`], and one that declares neither may be handed
     /// none.
+    ///
+    /// A filter that reads the ring its request lends
+    /// ([`RequestFacts::ring`]) declares [`Needs::ring`], and a live
+    /// profile one of whose scorers places by the ring shows it the ring
+    /// and the request's place on it. A pair side's shadow that reads a
+    /// ring where neither live side does is lent that ring for its
+    /// scoring half alone: its filters are shown no ring and no place.
     ///
     /// Asked only while the stage's generation is built, perhaps more than
     /// once there. The answer stands for that generation: no decision and
@@ -2552,10 +2559,11 @@ fn run_profile(
 
 /// The body of [`run_profile`], which hands no `first`. A pair's decode
 /// decided again enters here with the decode its first decision named,
-/// where its profile keeps such a decode ([`keeps_its_first`]), and so
-/// does that call's shadow ([`Engine::decide_decode`],
-/// [`Engine::shadow_decode_later`]): the scoring half keeps that decode
-/// where it is a survivor ([`score_survivors`]).
+/// where its profile keeps such a decode ([`keeps_its_first`],
+/// [`Engine::decide_decode`]): the scoring half keeps that decode where
+/// it is a survivor ([`score_survivors`]). That call's shadow hands the
+/// decode to its own run the same way ([`run_side_lent`],
+/// [`Engine::shadow_decode_later`]).
 /// Inlined into each, so a run that hands none is the code it was.
 #[inline(always)]
 #[expect(
@@ -2576,6 +2584,45 @@ fn run_side(
     if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
         return single_emptied(index, facts, pool, candidates, emptied_by, buf);
     }
+    score_survivors(profile, index, facts, pool, candidates, buf, first)
+}
+
+/// [`run_side`] for a pair side's shadow, which may be stated a place of
+/// its own on the ring its request lends ([`Engine::side_ring_profile`]):
+/// `lent` is asked between the two halves, behind the filter half. A set
+/// the filters emptied ends where every side's does ([`single_emptied`]),
+/// in the all-vetoed rule's pick or in a shed, and asks nothing: no stage
+/// would read the place. The filter half reads `facts` as they stand: a
+/// filter is shown no ring and no place here, one of the host's own that
+/// declares the ring need ([`Filter::needs`]) too, which a live profile
+/// shows both. The scoring half reads them with the ring and the places
+/// `lent` answers, where it answers any. Out of line: a shadow's run
+/// alone enters here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a side's run, beside what its shadow is lent"
+)]
+fn run_side_lent<'l>(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    set: Set<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+    first: Option<(WorkerId, u16)>,
+    lent: &dyn Fn() -> Option<(&'l dyn LentRing, &'l [u64])>,
+) -> Decision {
+    let candidates = set.candidates;
+    if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
+        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
+    }
+    let stated = lent().map(|(ring, places)| RequestFacts {
+        ring: Some(ring),
+        ring_positions: places,
+        ..*facts
+    });
+    let facts = stated.as_ref().unwrap_or(facts);
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
 
@@ -5992,6 +6039,40 @@ impl Engine {
         (placed && !reads(live)?).then_some(shadow)
     }
 
+    /// The shadow profile of `side` of the pair binding at `at` that is
+    /// stated a place of its own on a lent ring: one that reads a ring
+    /// where neither live side of the pair does. Such a pair's request
+    /// states no place when it is made, so the side's shadow is asked for
+    /// its own inside its run, as a single binding's is
+    /// ([`Self::shadow_ring_profile`]). A side's run asks behind its
+    /// filter half ([`run_side_lent`]): a shadow that says none ahead of
+    /// its profile ([`Self::shadow_side`]) and one whose set the filters
+    /// emptied are asked nothing. `None` under every other binding: beside
+    /// a live side that reads the ring, a side's shadow reads the place
+    /// the two live sides state, or none ([`Self::unlent`]). And `None`
+    /// for the decode's shadow that cuts a request by another rule than
+    /// the prefill's shadow does: a request states one list of heads a
+    /// call, so that shadow places on its own ring. A shadow that reads
+    /// the ring by the routing value's own text takes no head, and stands
+    /// beside one that cuts by a rule.
+    fn side_ring_profile(&self, at: u32, side: PairSide) -> Option<u16> {
+        let sides = self.shadow_sides.get(at as usize)?;
+        let shadow = sides[side.index()]?;
+        let lives = live_sides(&self.bindings.get(at as usize)?.binding);
+        let reads = |profile: u16| Some(self.profile_needs.get(usize::from(profile))?.ring);
+        if !reads(shadow)? || reads(lives[0])? || reads(lives[1])? {
+            return None;
+        }
+        let rule = |profile: u16| {
+            let places = self.head_places.get(usize::from(profile));
+            places.filter(|places| matches!(places, HeadPlaces::Rule(..)))
+        };
+        let first = sides[PairSide::Prefill.index()].filter(|_| matches!(side, PairSide::Decode));
+        let rules = (first.and_then(rule), rule(shadow));
+        let apart = matches!(rules, (Some(first), Some(own)) if first != own);
+        (!apart).then_some(shadow)
+    }
+
     /// [`Self::states_key_place`] by the two profiles of
     /// [`Self::ring_profiles`].
     pub(crate) fn key_place_of(&self, (own, decode): RingProfiles) -> bool {
@@ -7221,7 +7302,9 @@ impl Engine {
     /// which places on its own ring. A profile that reads no ring is apart
     /// from none, and a live profile that reads none states no place: its
     /// shadow under a single binding is stated one of its own inside its
-    /// run ([`Self::shadow_ring_profile`]).
+    /// run ([`Self::shadow_ring_profile`]), and so is a side's shadow
+    /// under a pair neither side of which reads a ring
+    /// ([`Self::side_ring_profile`]).
     ///
     /// `None` where the facts stand: the request lends no ring, or the
     /// shadow is apart from no live profile.
@@ -8872,6 +8955,12 @@ impl Engine {
     /// side does is lent none. A shadow lent none places on its own ring
     /// ([`Self::unlent`]).
     ///
+    /// A shadow that reads a ring where neither live side does is stated
+    /// its own place on the ring the request lends
+    /// ([`Self::side_ring_profile`]), asked of `lends` behind the filter
+    /// half of its run ([`run_side_lent`]): a shadow whose set the filters
+    /// emptied, which the all-vetoed rule steers or sheds, asks nothing.
+    ///
     /// The decode's shadow is put to the binding's all-vetoed rule by the
     /// binding's word, as its live side is ([`Set::ruled`]): where a veto
     /// leaves the live prefill's partners nobody, the rule steers the
@@ -8906,7 +8995,7 @@ impl Engine {
             reason = "the one caller is the engine over worker lists, built under `in-process`"
         )
     )]
-    pub(crate) fn shadow_side(
+    pub(crate) fn shadow_side<'l>(
         &self,
         at: u32,
         side: PairSide,
@@ -8917,6 +9006,7 @@ impl Engine {
         decode_cx: &Constraints<'_>,
         live: &Pick,
         scratch: &mut Scratch,
+        lends: &dyn Fn(u16) -> Option<(&'l dyn LentRing, &'l [u64])>,
     ) -> Option<Decision> {
         let index = self.shadow_sides.get(at as usize)?[side.index()]?;
         // A pair the default made, or one the weighing lift alone placed:
@@ -8942,6 +9032,8 @@ impl Engine {
         let facts = unlent.as_ref().unwrap_or(facts);
         let (prefills, prefill_facts) = pools.side(PairSide::Prefill, facts)?;
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
+        // The shadow's own place, asked behind the filter half alone.
+        let lent = || self.side_ring_profile(at, side).and_then(lends);
         Some(match side {
             PairSide::Prefill => {
                 // The prefills the live prefill profile was shown: the
@@ -8953,7 +9045,7 @@ impl Engine {
                 // its own profile's word, as the live run is by the live
                 // profile's ([`Self::weighing_lift`]).
                 let lifted_run = self.weighing_lift(index, entry.vetoed, cx);
-                run_profile(
+                run_side_lent(
                     profile,
                     index,
                     &prefill_facts,
@@ -8961,6 +9053,8 @@ impl Engine {
                     Set::side(prefills, None, Some(&scratch.classes)),
                     lifted_run.as_ref().unwrap_or(cx),
                     &mut scratch.single,
+                    None,
+                    &lent,
                 )
             }
             PairSide::Decode => {
@@ -8972,7 +9066,7 @@ impl Engine {
                 let class = prefills.get(prefill.position as usize)?.pair_class;
                 let firsts = scratch.among_first;
                 let partners = Set::side(decodes, Some(pools.partners(&class, firsts)), None);
-                run_profile(
+                run_side_lent(
                     profile,
                     index,
                     &decode_facts,
@@ -8980,6 +9074,8 @@ impl Engine {
                     partners.ruled(entry.vetoed),
                     decode_cx,
                     &mut scratch.decode,
+                    None,
+                    &lent,
                 )
             }
         })
@@ -8997,7 +9093,8 @@ impl Engine {
     /// lends by the rule of a side's at the pair's decision
     /// ([`Self::shadow_side`]): held against both live sides, or against
     /// the decode's own alone where each side is stated its own places
-    /// ([`Self::unlent`]).
+    /// ([`Self::unlent`]). And it is asked its own place of `lends` as a
+    /// side's is there: behind the filter half of its run.
     ///
     /// `first_decode` is the decode the pair's first decision named, as
     /// that call is handed it. A shadow profile that keeps such a decode
@@ -9028,7 +9125,7 @@ impl Engine {
             reason = "the one caller is the engine over worker lists, built under `in-process`"
         )
     )]
-    pub(crate) fn shadow_decode_later(
+    pub(crate) fn shadow_decode_later<'l>(
         &self,
         at: u32,
         facts: &RequestFacts<'_>,
@@ -9038,6 +9135,7 @@ impl Engine {
         first_decode: Option<(WorkerId, u16)>,
         decode_cx: &Constraints<'_>,
         scratch: &mut Scratch,
+        lends: &dyn Fn(u16) -> Option<(&'l dyn LentRing, &'l [u64])>,
     ) -> Option<Decision> {
         let side = PairSide::Decode;
         let index = self.shadow_sides.get(at as usize)?[side.index()]?;
@@ -9065,7 +9163,7 @@ impl Engine {
         let class = prefill.pair_class;
         let firsts = scratch.among_first;
         let partners = Set::side(decodes, Some(pools.partners(&class, firsts)), None);
-        Some(run_side(
+        Some(run_side_lent(
             profile,
             index,
             &decode_facts,
@@ -9074,6 +9172,7 @@ impl Engine {
             decode_cx,
             &mut scratch.decode,
             first_decode.filter(|_| keeps_its_first(profile)),
+            &|| self.side_ring_profile(at, side).and_then(lends),
         ))
     }
 

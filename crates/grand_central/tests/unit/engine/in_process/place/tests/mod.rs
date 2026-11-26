@@ -27,9 +27,9 @@ use tokio::time::sleep;
 use super::*;
 use crate::{
     document::spec::{
-        Assignment, BoundedLoadParams, ConsistentHashParams, FilterSpec, KeySourceSpec, Needs,
-        OverloadSpec, PolicySpec, Recovery, RoutingKeySpec, ScoreStage, SessionsSpec, ShadowSpec,
-        MANUAL_SESSION_HEADER,
+        Assignment, BoundedLoadParams, ConsistentHashParams, DecodePick, FilterSpec, KeySourceSpec,
+        Needs, OverloadSpec, PolicySpec, Recovery, RoutingKeySpec, ScoreStage, SessionsSpec,
+        ShadowSpec, MANUAL_SESSION_HEADER,
     },
     engine::{
         decision::{Queue, Shed, Target, Targets, Trace},
@@ -2720,6 +2720,253 @@ fn a_shadow_alone_walks_the_lent_ring() {
     };
     assert_eq!(engine.place(&empty).err(), refused("none"));
     assert_eq!((counted(), engine.faults()), ([1, 1, 0, 1], 1), "nobody");
+}
+
+/// The `least_load` pair with the ring pair of `prefill` and `decode` as
+/// its sides' shadows: the ring pair's binding keeps its routing key, its
+/// two profiles are the sides' shadows, and the profiles of the
+/// `least_load` pair decide. `after` picks the decode once the prefill is
+/// sent.
+fn ring_shadowed(prefill: &str, decode: &str, after: bool) -> PolicySpec {
+    let document = PolicySpec::pair_presets(prefill, decode);
+    let mut document = document.expect("the pair presets");
+    let live = PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+    let profiles = &mut document.profiles;
+    let sides = live.profiles.into_iter().map(|(side, live)| {
+        let twin = profiles.insert(side.clone(), live);
+        let name = format!("{side}-next");
+        profiles.insert(name.clone(), twin.expect("the side's ring profile"));
+        (side, name)
+    });
+    let sides = ShadowSpec::Sides(sides.collect());
+    document.bindings[0].shadow = Some(sides);
+    if after {
+        document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    }
+    document.generation = 1;
+    document
+}
+
+/// What each side's shadow said under `engine`: agreed, another target,
+/// another outcome, skipped; the prefill's shadow, the decode's, and the
+/// decode's beside a decode decided again.
+fn sides_said(engine: &InProcess) -> [[u64; 4]; 3] {
+    use crate::engine::shadow::ShadowSide;
+
+    let mut kinds = [[0; 4]; 3];
+    let _ = engine.shadow_counts(|count| {
+        let side = match count.side {
+            ShadowSide::Prefill => 0,
+            ShadowSide::Decode => 1,
+            ShadowSide::DecodeAgain => 2,
+            _ => return,
+        };
+        kinds[side][count.kind.index()] = count.count;
+    });
+    kinds
+}
+
+/// A pair side's shadow profile that places by a ring is lent the
+/// request's ring behind two live sides that read none, and walks it as it
+/// would live: each live side takes the idle worker and each side's shadow
+/// the ring's owner. A side's shadow of the plain ring beside the other
+/// side's of the prefix form is stated its own place too: the key's text
+/// for the one, the key as the request's one head for the other.
+#[test]
+fn a_sides_shadow_alone_walks_the_lent_ring() {
+    // The lent ring's walks under one request, what each side's shadow
+    // said and the engine's faults, under the pair of `ring_shadowed`.
+    let walks = |prefill: &str, decode: &str, lifted: bool| {
+        let document = ring_shadowed(prefill, decode, false);
+        let engine = hosted(engine_of(&document));
+        let list = pool(2);
+        let members = PublishedList::new(Arc::clone(&list));
+        let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+        let addresses = list.iter().map(|worker| worker.url().to_owned());
+        let ring = Walked(Lent(addresses.collect()), AtomicU32::new(0));
+        // The key stands at the second address: the ring's owner is the
+        // busy worker, and each live side takes the idle one.
+        assert_eq!(ring.position("conv-1") % 2, 1, "the key's owner");
+        for _ in 0..8 {
+            list[1].increment_load();
+        }
+        // Every worker overloaded: no prefill stands but for the veto, and
+        // the pair is made past it, which the prefill's buffer marks. The
+        // ring lent then panics where it is asked.
+        if lifted {
+            for worker in list.iter() {
+                worker.set_overloaded(true);
+            }
+        }
+        let headers = [("x-smg-routing-key", "conv-1")];
+        let lender: &dyn LentRing = if lifted { &Unasked } else { &ring };
+        let request = PlaceRequest {
+            headers: &headers,
+            ring: Some(lender),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+        };
+        let placement = engine.place(&request).expect("a pair");
+        assert!(Arc::ptr_eq(&placement.worker, &list[0]), "the idle worker");
+        (
+            ring.1.load(atomic::Ordering::Relaxed),
+            sides_said(engine),
+            engine.faults(),
+        )
+    };
+    let (plain, prefix) = ("consistent_hashing", "prefix_hash");
+    let (agreed, another) = ([1, 0, 0, 0], [0, 1, 0, 0]);
+    assert_eq!(
+        walks(plain, plain, false),
+        (2, [another, another, [0; 4]], 0),
+        "the ring's owner"
+    );
+    // The key as the prefix form's one head stands at the idle worker on
+    // the lent ring: that side's shadow agrees with its live side, and
+    // the plain ring's beside it names the key's owner.
+    assert_eq!(
+        walks(plain, prefix, false),
+        (2, [another, agreed, [0; 4]], 0),
+        "the decode's prefix form"
+    );
+    assert_eq!(
+        walks(prefix, plain, false),
+        (2, [agreed, another, [0; 4]], 0),
+        "the prefill's prefix form"
+    );
+    // Beside a pair made past a veto that left the prefills nobody, a
+    // side's shadow is said as skipped and is stated no place: the lender
+    // is not asked, so a ring that panics where it is asked counts no
+    // fault.
+    assert_eq!(
+        walks(plain, plain, true),
+        (0, [[0, 0, 0, 1], [0, 0, 0, 1], [0; 4]], 0),
+        "the veto's mark"
+    );
+}
+
+/// The decode's shadow that cuts a request by another rule than the
+/// prefill's shadow is asked for no place: a request states one list of
+/// heads a call and the prefill's shadow takes it, so the decode's shadow
+/// places on its own ring. Two prefix forms of one depth walk the lent
+/// ring once each; of two depths the prefill's alone walks it.
+#[test]
+fn a_decodes_shadow_of_another_depth_is_lent_no_ring() {
+    let walks = |depth: Option<u32>| {
+        let mut document = ring_shadowed("prefix_hash", "prefix_hash", false);
+        if let Some(depth) = depth {
+            let decode = document.profiles.get_mut("decode-next");
+            decode.expect("the decode's shadow").score[0] =
+                ScoreStage::ConsistentHash(ConsistentHashParams {
+                    prefix_tokens: Some(depth),
+                    ..ConsistentHashParams::default()
+                })
+                .into();
+        }
+        let engine = hosted(engine_of(&document));
+        let list = pool(2);
+        let members = PublishedList::new(Arc::clone(&list));
+        let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+        let addresses = list.iter().map(|worker| worker.url().to_owned());
+        let ring = Walked(Lent(addresses.collect()), AtomicU32::new(0));
+        let headers = [("x-smg-routing-key", "conv-1")];
+        let request = PlaceRequest {
+            headers: &headers,
+            ring: Some(&ring),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+        };
+        engine.place(&request).expect("a pair");
+        (ring.1.load(atomic::Ordering::Relaxed), engine.faults())
+    };
+    assert_eq!(walks(None), (2, 0), "one depth");
+    assert_eq!(walks(Some(128)), (1, 0), "another depth");
+}
+
+/// A pair's decode decided again runs the decode's shadow once more, and
+/// that shadow is stated its own place on the lent ring once more: it
+/// walks the lent ring a further time, and names the ring's owner beside
+/// the idle worker its call takes.
+#[test]
+fn a_decode_decided_again_walks_the_lent_ring_once_more() {
+    let plain = "consistent_hashing";
+    let engine = hosted(engine_of(&ring_shadowed(plain, plain, true)));
+    let list = pool(2);
+    let members = PublishedList::new(Arc::clone(&list));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    let addresses = list.iter().map(|worker| worker.url().to_owned());
+    let ring = Walked(Lent(addresses.collect()), AtomicU32::new(0));
+    // The key's owner is the busy worker, as in the test above.
+    for _ in 0..8 {
+        list[1].increment_load();
+    }
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&ring),
+        decode_again: true,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair_of(&members, &classes)))
+    };
+    let seen = || (ring.1.load(atomic::Ordering::Relaxed), sides_said(engine));
+    let another = [0, 1, 0, 0];
+    let mut placement = engine.place(&request).expect("a pair");
+    assert_eq!(
+        seen(),
+        (2, [another, another, [0; 4]]),
+        "the first decision"
+    );
+    placement.sent(Side::Prefill);
+    let decided = placement.decode_again(&request);
+    assert!(decided.is_ok(), "the decode decided again");
+    assert_eq!(seen(), (3, [another; 3]), "one more walk");
+    assert_eq!(engine.faults(), 0, "no fault");
+}
+
+/// A decode's shadow the all-vetoed rule steers is stated no place: every
+/// partner of the prefill stands over its thresholds, the rule picks among
+/// them for the shadow as it does for the live decode, and no stage reads
+/// a place. The lender is not asked, at the pair's decision or at the
+/// decode decided again: a ring that panics where it is asked counts no
+/// fault, and the shadow agrees both times.
+#[test]
+fn a_steered_decodes_shadow_asks_the_lender_nothing() {
+    let plain = "consistent_hashing";
+    let mut document = ring_shadowed(plain, plain, true);
+    // The decode's shadow alone: the prefill's would ask for its place.
+    if let Some(ShadowSpec::Sides(sides)) = document.bindings[0].shadow.as_mut() {
+        sides.retain(|side, _| side.contains("decode"));
+    }
+    let engine = hosted(engine_of(&document));
+    let members = PublishedList::new(pool(1));
+    let decodes: Arc<[Arc<dyn Worker>]> = (0..2)
+        .map(|at| ready_worker(&format!("http://decode-{at}:8000"), MODEL))
+        .collect();
+    let decode_members = PublishedList::new(Arc::clone(&decodes));
+    let classes = PartnerClasses::number(2, [&[0_u32, 1][..]]);
+    for worker in decodes.iter() {
+        worker.set_overloaded(true);
+    }
+    // One decode the busier: the rule's pick is the other, for both.
+    for _ in 0..8 {
+        decodes[1].increment_load();
+    }
+    let headers = [("x-smg-routing-key", "conv-1")];
+    let pair = PairLists {
+        decode: decode_members.lent(),
+        ..pair_of(&members, &classes)
+    };
+    let request = PlaceRequest {
+        headers: &headers,
+        ring: Some(&Unasked),
+        decode_again: true,
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
+    };
+    let seen = || (sides_said(engine), engine.faults());
+    let agreed = [1, 0, 0, 0];
+    let mut placement = engine.place(&request).expect("a pair");
+    assert_eq!(seen(), ([[0; 4], agreed, [0; 4]], 0), "the pair's decision");
+    placement.sent(Side::Prefill);
+    let decided = placement.decode_again(&request);
+    assert!(decided.is_ok(), "the decode decided again");
+    assert_eq!(seen(), ([[0; 4], agreed, agreed], 0), "the later call");
 }
 
 /// The prefix form of the ring as a shadow behind a live profile that

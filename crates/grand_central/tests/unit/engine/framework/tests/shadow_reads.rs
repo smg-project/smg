@@ -637,8 +637,18 @@ fn a_pairs_side_is_decided_once_more_over_the_rows_its_live_side_saw() {
     let word = both.shadow_for("m", Phase::Prefill);
     assert_eq!(word, Some((0, ShadowRows::Sides)));
     let mut side = |engine: &Engine, side| {
-        let shadow =
-            engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+        let shadow = engine.shadow_side(
+            0,
+            side,
+            &facts,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            &mut scratch,
+            &|_| None,
+        );
         shadow.map(|shadow| lead(&shadow))
     };
     // The last prefill with a partner: never the one with none.
@@ -658,8 +668,17 @@ fn a_pairs_side_is_decided_once_more_over_the_rows_its_live_side_saw() {
         ..facts
     };
     let mut later = |engine: &Engine, held: WorkerId| {
-        let shadow =
-            engine.shadow_decode_later(0, &call, &pool, pools, held, None, &cx, &mut scratch);
+        let shadow = engine.shadow_decode_later(
+            0,
+            &call,
+            &pool,
+            pools,
+            held,
+            None,
+            &cx,
+            &mut scratch,
+            &|_| None,
+        );
         shadow.map(|shadow| lead(&shadow))
     };
     assert_eq!(later(&both, prefills[0].id), Some(Some(1)));
@@ -741,8 +760,18 @@ fn a_pair_sides_shadow_asks_no_stage_of_a_live_profile_again() {
     // closed scope.
     open.store(false, Ordering::Relaxed);
     let mut side = |side| {
-        let shadow =
-            engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+        let shadow = engine.shadow_side(
+            0,
+            side,
+            &facts,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            &mut scratch,
+            &|_| None,
+        );
         shadow.map(|shadow| lead(&shadow))
     };
     assert_eq!(side(PairSide::Prefill), Some(Some(1)));
