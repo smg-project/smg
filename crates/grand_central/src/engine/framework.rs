@@ -9318,6 +9318,17 @@ impl Engine {
         }
     }
 
+    /// The session table's part of a decode call that claimed
+    /// ([`SessionTable::date_claim`]). The call claimed `leased` for `key` at
+    /// `at`, its own instant, and that claim takes `issued`, the instant of
+    /// the lease its pair's first decision issued. The pair's decode
+    /// entries ask here, so they read no table of the engine's.
+    #[cfg(feature = "in-process")]
+    #[inline]
+    pub(crate) fn date_claim(&self, key: Session, leased: WorkerId, at: u64, issued: u64) {
+        self.sessions.date_claim(key, leased, at, issued);
+    }
+
     /// The stages' part of a release, behind the table's
     /// ([`Self::released_table`]).
     pub(crate) fn released_stages(&self, lease: &Lease, reason: ReleaseReason) {

@@ -1632,13 +1632,18 @@ fn decide_with(
 }
 
 /// A decode call's claim takes the date of its pair's lease. The call's
-/// decision claims at its own instant, and every word of the side it
-/// issues is told under the lease the pair's first decision issued, at
-/// `issued_micros`. Where `decision` claimed its decode for the request's
-/// key, the session table dates that claim by the lease
-/// (`SessionTable::date_claim`). The side's own release, or its dispatch
-/// elsewhere, then takes the claim back. A lease that states no instant
-/// (`0`) dates nothing, and its words reach a claim by its worker.
+/// decision claims at its own instant, and each dispatch and release of
+/// the side it issues is told under the lease the pair's first decision
+/// issued, at `issued_micros`. Where `decision` claimed its decode for the
+/// request's key, the engine dates that claim by the lease
+/// ([`Engine::date_claim`]). The pair's refused commit, or the side's
+/// dispatch elsewhere, then takes the claim back. A lease that states no
+/// instant (`0`) dates nothing, and its words reach a claim by its worker.
+///
+/// A call that faults behind its claim dates nothing. The claim then keeps
+/// the call's instant, as the claim of any decision that faults stands.
+/// The lease's words do not reach it: it ends at a dispatch on its worker
+/// or with the key's idle time.
 #[inline]
 pub(super) fn date_decode_claim(
     own: Loaded<'_, '_>,
@@ -1651,9 +1656,9 @@ pub(super) fn date_decode_claim(
         return;
     };
     if pair.decode_verdict == DecodeVerdict::CLAIMED {
-        let table = own.document.spec.engine().sessions();
+        let engine = own.document.spec.engine();
         let (key, at) = (decode_session(facts), facts.now_micros);
-        table.date_claim(key, pair.decode_id, at, issued_micros);
+        engine.date_claim(key, pair.decode_id, at, issued_micros);
     }
 }
 

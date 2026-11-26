@@ -85,12 +85,14 @@ pub struct Lease {
     /// the commit moves the key's pins by its own decision alone.
     pub session_verdict: SessionVerdict,
     /// The instant the lease's decision was made at, in microseconds since
-    /// its host's origin ([`crate::engine::RequestFacts::now_micros`]); `0`
-    /// where a host states none. Under a sessions rule the decision's claim
-    /// keeps this instant, and a word of the lease takes the claim back
-    /// where it carries the same one. A lease that states `0` reaches a
-    /// claim by its worker alone. In-process only; the wire carries the
-    /// dispatch deadline as a duration.
+    /// its host's origin ([`crate::engine::RequestFacts::now_micros`]). A
+    /// stage dates the lease's dispatch from it. Under a sessions rule the
+    /// decision's claim keeps its low 32 bits, and a word of the lease
+    /// takes the claim back where it carries the same ones. In-process
+    /// only; the wire carries the dispatch deadline as a duration.
+    ///
+    /// A lease that states `0` states no instant. It reaches a claim by its
+    /// worker alone, and a stage reads its dispatch from 0.
     ///
     /// A decode call claims at its own instant. A host that asks
     /// [`Engine::decide_decode`](crate::engine::Engine::decide_decode)
@@ -250,8 +252,8 @@ pub enum ReleaseReason {
 /// The time a gateway has to name a lease's dispatch: the design's default.
 /// A lease still issued past it is released as abandoned. A pair's decode
 /// side that was issued with its prefill has at least that time from the
-/// prefill's end, and at most twice that to the sweep's tick. A
-/// controller's file holds it while the prefill is dispatched.
+/// prefill's end: a whole deadline from its file's first sweep behind that
+/// end. A controller's file holds it while the prefill is dispatched.
 pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What a gateway's `Dispatched` report says beside its lease.

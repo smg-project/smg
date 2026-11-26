@@ -18,9 +18,11 @@
 //! `call_claims=` counts the calls that claimed.
 //!
 //! A session met a second time claims nothing, and the list's first
-//! requests take the seeds of the first caller's first 4,096 turns. So
-//! count the cell by two values of `--decisions` above that. The rule
-//! sweeps nothing within a run: the table keeps two keys a turn.
+//! requests take the seeds of the first caller's first turns: eight a
+//! worker, and 4,096 at the least. So count the cell by two values of
+//! `--decisions` above that count. Where each counted call claims,
+//! `call_claims=` rises by their difference. The rule sweeps nothing
+//! within a run: the table keeps two keys a turn.
 //!
 //! `--entry place` asks the one call a host makes for a request instead
 //! ([`InProcess::place`]): the model, the two lists and a prompt of the
