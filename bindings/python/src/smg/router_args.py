@@ -2596,7 +2596,10 @@ class RouterArgs:
             f"--{prefix}decode-expected-workers",
             type=_positive_int,
             default=None,
-            help="Desired decode fleet size, used only as the fixed percentage denominator",
+            help=(
+                "Desired decode fleet size: the fixed percentage denominator."
+                " The minimum of healthy decode workers may not exceed it."
+            ),
         )
         health_group.add_argument(
             f"--{prefix}decode-min-ready-percent",
@@ -2616,7 +2619,10 @@ class RouterArgs:
             f"--{prefix}prefill-expected-workers",
             type=_positive_int,
             default=None,
-            help="Desired prefill fleet size, used only as the fixed percentage denominator",
+            help=(
+                "Desired prefill fleet size: the fixed percentage denominator."
+                " The minimum of healthy prefill workers may not exceed it."
+            ),
         )
         health_group.add_argument(
             f"--{prefix}prefill-min-ready-percent",
