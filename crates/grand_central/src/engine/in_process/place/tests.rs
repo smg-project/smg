@@ -1296,6 +1296,70 @@ fn a_placement_states_what_its_pick_states_of_the_worker_taken() {
     assert_eq!(placed.overlap, Overlap::NONE);
 }
 
+/// A decision kept behind a placement, which hands out no trace, reads no
+/// best row for it where no stage of the document takes its issue and the
+/// document keeps no sample: the debug text of the placement names none,
+/// under a profile that draws first and beside a shadow profile too. A
+/// caller that is handed a decision reads them, right behind such a
+/// placement too, and so do a stage that takes the issue and the record of
+/// a document that keeps a sample.
+#[test]
+fn a_trace_names_its_best_rows_for_whoever_can_read_them() {
+    // The smallest pool a profile that draws first draws over.
+    let list = pool(DRAW_FROM);
+    let members = PublishedList::new(Arc::clone(&list));
+    let request = PlaceRequest {
+        explain_id: Some("host-1"),
+        ..PlaceRequest::of(MODEL, WorkerLists::Single(members.lent()))
+    };
+    // The debug text of a placement prints the decision its lease keeps.
+    // Each preset here takes a word of a lease: `least_load` and
+    // `power_of_two` the dispatch alone, `bucket` the issue too.
+    let kept =
+        |engine: &'static InProcess| format!("{:?}", engine.place(&request).expect("a placement"));
+    // The best rows of a decision its caller is handed.
+    let handed = |engine: &'static InProcess| {
+        let handed = engine.decide_at(&Made::new(engine, &request, &[]), Instant::now);
+        let handed = handed
+            .ok()
+            .and_then(Decided::whole)
+            .expect("a whole decision");
+        handed.0.decision.pick().expect("a pick").trace.top_len
+    };
+    let scores = hosted(preset("least_load"));
+    assert!(kept(scores).contains("top_len: 0"), "nobody reads them");
+    assert_eq!(handed(scores), 3, "a caller reads them");
+    let draws = hosted(preset("power_of_two"));
+    assert!(kept(draws).contains("top_len: 0"), "nor behind a draw");
+    // Beside a shadow profile the front of the two decisions states that
+    // nobody reads them, for that placement alone.
+    let mut document = PolicySpec::preset("least_load").expect("a built-in preset");
+    let twin = document.profiles.values().next().cloned();
+    document
+        .profiles
+        .insert("twin".into(), twin.expect("the preset's profile"));
+    document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+    document.generation = 1;
+    let shadowed = hosted(engine_of(&document));
+    assert!(kept(shadowed).contains("top_len: 0"), "nor beside a shadow");
+    assert_eq!(handed(shadowed), 3, "a caller reads them behind it");
+    let books = hosted(preset("bucket"));
+    assert!(kept(books).contains("top_len: 3"), "a stage is handed them");
+    // A document that keeps a sample keeps a placement's decision as it
+    // stands: the record names them.
+    let mut document = PolicySpec::preset("least_load").expect("a built-in preset");
+    document.generation = 1;
+    document.explain.sample = 1;
+    let sampled = hosted(engine_of(&document));
+    assert!(
+        kept(sampled).contains("top_len: 3"),
+        "a sample is kept of them"
+    );
+    let record = sampled.explained(b"host-1").expect("the decision is kept");
+    let pick = record.decision.pick().expect("a pick");
+    assert_eq!(pick.trace.top_len, 3, "the record names them");
+}
+
 /// A program that asks `place` states no worker id of its own: a placement
 /// of a place names its worker by the fingerprint of its address, and a
 /// retry states that id as tried. A program whose list states ids of its

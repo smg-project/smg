@@ -1323,9 +1323,23 @@ struct Buffers {
     lifted: LiftedVeto,
     /// The pool size every buffer holds room for ([`Buffers::reserve`]).
     room: usize,
+    /// Whether nobody reads the best rows of a trace made with these
+    /// buffers: the word a front states to the scratch.
+    unread: bool,
 }
 
 impl Buffers {
+    /// The scores a trace reads its best rows from: none where nobody
+    /// reads them, so no pass over the scores runs for them.
+    #[inline(always)]
+    fn traced(&self) -> &[f32] {
+        if self.unread {
+            &[]
+        } else {
+            &self.scores
+        }
+    }
+
     /// Room in every buffer for the whole pass over a pool of `rows`. A
     /// decision that draws first writes a few rows and asks for the room
     /// all the same: the pass it widens to may be many decisions away, and
@@ -1357,6 +1371,20 @@ impl Buffers {
 impl Scratch {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// States whether nobody reads the best rows of a trace made with this
+    /// scratch from here on: a single decision kept behind a placement,
+    /// which hands out no trace, under a document none of whose stages
+    /// takes its issue and that keeps no sample, and the shadow profile
+    /// decided behind it. A trace that reads its best rows of the scores
+    /// then names none ([`Trace::top_len`] is `0`) and is whole in every
+    /// other field; a decision that names its rows without that read names
+    /// them as before. The word stands until it is stated again.
+    #[cfg(feature = "in-process")]
+    #[inline(always)]
+    pub(crate) fn unread(&mut self, unread: bool) {
+        self.single.unread = unread;
     }
 
     /// The list the last pair's decision or encode decision made with
@@ -1949,7 +1977,7 @@ fn run_ranked(
             .picker
             .pick(facts, candidates, asked, &buf.stage, band, &mut targets);
     }
-    let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
+    let trace = trace_of(index, facts, pool, candidates, &buf.kept, buf.traced());
     if targets.is_empty() {
         return shed(ShedReason::PolicyDeclined, profile.picker.name(), trace);
     }
@@ -2482,7 +2510,7 @@ fn score_survivors(
     }
     // The trace counts every survivor of the filters; its top rows are of
     // the compared set, which leads the survivors and alone holds scores.
-    let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
+    let trace = trace_of(index, facts, pool, candidates, &buf.kept, buf.traced());
     if targets.is_empty() {
         return shed(ShedReason::PolicyDeclined, profile.picker.name(), trace);
     }
@@ -2918,7 +2946,7 @@ fn run_drawn(
             }
         }
         if !targets.is_empty() {
-            let trace = trace_drawn(index, facts, pool, candidates, &buf.kept, &buf.scores);
+            let trace = trace_drawn(index, facts, pool, candidates, &buf.kept, buf.traced());
             return Decision::Pick(Pick {
                 targets,
                 trace,
@@ -3126,7 +3154,7 @@ fn run_drawn_written(
             }
         }
         if !targets.is_empty() {
-            let trace = trace_drawn(index, facts, pool, rows, &buf.kept, &buf.scores);
+            let trace = trace_drawn(index, facts, pool, rows, &buf.kept, buf.traced());
             return Decision::Pick(Pick {
                 targets,
                 trace,
@@ -7834,8 +7862,15 @@ impl Engine {
             return None;
         }
         // The pass ran before the draw: its survivors are counted.
-        let mut trace = trace_drawn(index, facts, pool, candidates, drawn, scores);
-        trace.survivors = Survivors::counted(kept.len() as u32);
+        let mut trace = trace_drawn(
+            index,
+            facts,
+            pool,
+            candidates,
+            &buf.before_soft,
+            buf.traced(),
+        );
+        trace.survivors = Survivors::counted(buf.kept.len() as u32);
         Some(Decision::Pick(Pick {
             targets,
             trace,
@@ -7914,7 +7949,7 @@ impl Engine {
                 picker
             }
         };
-        let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
+        let trace = trace_of(index, facts, pool, candidates, &buf.kept, buf.traced());
         if targets.is_empty() {
             return shed(ShedReason::PolicyDeclined, picker.name(), trace);
         }

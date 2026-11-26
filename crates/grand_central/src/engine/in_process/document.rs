@@ -113,7 +113,9 @@ pub(in crate::engine) struct InForce {
     /// `explain.sample` is not zero
     /// ([`Engine::explain_sample`](crate::engine::Engine::explain_sample)).
     /// Read once, here. A whole decision tests it once
-    /// ([`super::sample::whole`]).
+    /// ([`super::sample::whole`]), and a single request's kept behind a
+    /// placement once more, for the best rows of its trace
+    /// ([`super::single::decide`]).
     pub(super) samples: bool,
     /// The decisions kept under the document, newest last
     /// ([`super::sample`]): one ring of them, behind one lock that a kept

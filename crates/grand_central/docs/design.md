@@ -1212,7 +1212,10 @@ pub struct Trace {
     pub profile: u16,                      // which profile decided
     pub survivors: Survivors,              // how many workers passed the filters, or none behind a draw
     pub top: [(WorkerId, f32); TRACE_TOP], // the best workers and their scores
-    pub top_len: u8,                       // how many of `top` are set
+    pub top_len: u8,                       // how many of `top` are set; a decision `place` keeps
+                                           // for a single request sets none where no stage takes
+                                           // its issue and the document keeps no sample: no scan
+                                           // of the scores runs for them
     pub seed: u64,
     pub generation: u64,                   // which generation of the document
     pub lifted: LiftedVeto,                // a soft veto that was lifted for this pick
