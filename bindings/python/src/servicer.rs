@@ -21,6 +21,7 @@ use std::{
 
 use bytes::Bytes;
 use engine_servicer::{
+    sglang::encoder::{EncoderMediaItem, EncoderModality, EncoderServer},
     BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, MediaError,
     MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia, ServicerConfig, ServicerError,
@@ -561,6 +562,40 @@ impl MediaProcessor for SmgMediaProcessor {
     }
 }
 
+/// Convert a worker-side media pipeline error into a typed tonic status.
+fn worker_media_error_to_status(error: WorkerMediaError) -> tonic::Status {
+    match error {
+        WorkerMediaError::Invalid(message) => tonic::Status::invalid_argument(message),
+        WorkerMediaError::Internal(message) => tonic::Status::internal(message),
+        WorkerMediaError::Media {
+            fault,
+            code,
+            message,
+        } => smg_grpc_client::stamp_media_code(
+            fault.stamp(match fault {
+                smg_grpc_client::WorkerMediaFault::Client => {
+                    tonic::Status::invalid_argument(message)
+                }
+                smg_grpc_client::WorkerMediaFault::Transient => tonic::Status::unavailable(message),
+            }),
+            code.as_str(),
+        ),
+    }
+}
+
+/// Resolve an optional modality placeholder token ID from managed config JSON or `config.json`.
+fn resolve_modality_token_id(
+    config: &serde_json::Value,
+    model_config: Option<&serde_json::Value>,
+    key: &str,
+) -> Option<u32> {
+    config
+        .get(key)
+        .or_else(|| model_config.and_then(|cfg| cfg.get(key)))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|token| u32::try_from(token).ok())
+}
+
 struct SmgSglangMediaProcessor {
     pipeline: Arc<WorkerMediaPipeline>,
     admission: Arc<tokio::sync::Semaphore>,
@@ -609,20 +644,10 @@ impl SglangMediaProcessor for SmgSglangMediaProcessor {
                     .collect::<Vec<_>>();
                 let tokenized = request.tokenized.as_mut()
                     .ok_or_else(|| tonic::Status::invalid_argument("media references require tokenized input"))?;
-                let (tokens, inputs, extras) = pipeline.process_sglang(
-                    std::mem::take(&mut tokenized.input_ids), items,
-                ).await.map_err(|error| match error {
-                    WorkerMediaError::Invalid(message) => tonic::Status::invalid_argument(message),
-                    WorkerMediaError::Internal(message) => tonic::Status::internal(message),
-                    WorkerMediaError::Media { fault, code, message } => {
-                        smg_grpc_client::stamp_media_code(
-                            fault.stamp(match fault {
-                                smg_grpc_client::WorkerMediaFault::Client => tonic::Status::invalid_argument(message),
-                                smg_grpc_client::WorkerMediaFault::Transient => tonic::Status::unavailable(message),
-                            }), code.as_str(),
-                        )
-                    }
-                })?;
+                let (tokens, inputs, extras) = pipeline
+                    .process_sglang(std::mem::take(&mut tokenized.input_ids), items)
+                    .await
+                    .map_err(worker_media_error_to_status)?;
                 tokenized.input_ids = tokens;
                 request.mm_inputs = Some(Box::new(inputs));
                 request.extra_mm_inputs = extras;
@@ -1760,6 +1785,7 @@ impl PySglangGrpcServer {
         kv_events_topic = String::new(),
         encode_dispatcher = None,
         smg_media_processor = None,
+        managed_config = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
@@ -1803,6 +1829,7 @@ impl PySglangGrpcServer {
         kv_events_topic: String,
         encode_dispatcher: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
+        managed_config: Option<String>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
@@ -1877,6 +1904,17 @@ impl PySglangGrpcServer {
             media_processor: None,
         };
         let inner = py.detach(|| -> PyResult<SglangServicerServer> {
+            if let Some(json) = managed_config {
+                if native.is_some() {
+                    return Err(PyValueError::new_err(
+                        "managed P/D cannot use legacy media preprocessing",
+                    ));
+                }
+                let managed = serde_json::from_str(&json).map_err(|e| {
+                    PyValueError::new_err(format!("invalid managed configuration: {e}"))
+                })?;
+                return SglangServicerServer::start_managed(config, managed).map_err(to_py_err);
+            }
             if let Some(native) = native {
                 if !matches!(
                     native.settings.encoder_dtype.as_str(),
@@ -2005,5 +2043,147 @@ impl PySglangGrpcServer {
         }
         let timeout = Duration::from_secs_f64(timeout_secs);
         py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// Native encoder control shares the existing servicer runtime and Rust media pipeline.
+#[pyclass(name = "ManagedEncoderServer")]
+pub struct PyManagedEncoderServer {
+    server: EncoderServer,
+}
+
+#[pymethods]
+impl PyManagedEncoderServer {
+    #[new]
+    /// Start Rust encoder control with the shared Rust media pipeline.
+    fn new(
+        py: Python<'_>,
+        config_json: String,
+        options: Bound<'_, PyDict>,
+        tokenizer_dir: String,
+        max_artifact_bytes: usize,
+    ) -> PyResult<Self> {
+        use engine_servicer::sglang::encoder::{EncoderArtifact, EncoderProcessor};
+        let native = native_media_options(&options, "managed-encoder")?;
+        if max_artifact_bytes == 0
+            || native.max_inflight == 0
+            || native.max_inflight > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(PyValueError::new_err(
+                "managed encoder requires finite nonzero limits",
+            ));
+        }
+        let config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let model_config = std::fs::read_to_string(
+            std::path::Path::new(&native.settings.model_dir).join("config.json"),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        let image_token_id =
+            resolve_modality_token_id(&config, model_config.as_ref(), "image_token_id");
+        let video_token_id =
+            resolve_modality_token_id(&config, model_config.as_ref(), "video_token_id");
+        py.detach(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            let pipeline = Arc::new(
+                runtime
+                    .block_on(async {
+                        let tokenizer =
+                            llm_tokenizer::factory::create_tokenizer_async(&tokenizer_dir).await?;
+                        let mut settings = native.settings;
+                        settings.tokenizer_dir = Some(tokenizer_dir);
+                        WorkerMediaPipeline::new_sglang(settings, tokenizer).await
+                    })
+                    .map_err(|error| PyValueError::new_err(format!("{error:#}")))?,
+            );
+            drop(runtime);
+            let process: EncoderProcessor = Arc::new(
+                move |modality: EncoderModality, encoder_items: Vec<EncoderMediaItem>| {
+                    let pipeline = pipeline.clone();
+                    Box::pin(async move {
+                        let (target_modality, placeholder_token) = match modality {
+                            EncoderModality::Image => (
+                                Modality::Image,
+                                image_token_id.ok_or_else(|| {
+                                    tonic::Status::invalid_argument(
+                                        "managed encoder config missing image_token_id",
+                                    )
+                                })?,
+                            ),
+                            EncoderModality::Video => (
+                                Modality::Video,
+                                video_token_id.or(image_token_id).ok_or_else(|| {
+                                    tonic::Status::invalid_argument(
+                                        "managed encoder config missing video_token_id",
+                                    )
+                                })?,
+                            ),
+                        };
+                        let tokens = vec![placeholder_token; encoder_items.len()];
+                        let items = encoder_items
+                            .into_iter()
+                            .map(|item| WorkerMediaItem {
+                                modality: target_modality,
+                                url: item.url,
+                            })
+                            .collect();
+                        let (_, inputs, extras) = pipeline
+                            .process_sglang(tokens, items)
+                            .await
+                            .map_err(worker_media_error_to_status)?;
+                        let embedding_tokens = std::iter::once(&inputs)
+                            .chain(extras.iter())
+                            .flat_map(|batch| batch.mm_placeholders.iter())
+                            .map(|item| u64::from(item.length))
+                            .sum();
+                        let artifact = smg_grpc_client::sglang_proto::GenerateRequest {
+                            mm_inputs: Some(Box::new(inputs)),
+                            extra_mm_inputs: extras,
+                            ..Default::default()
+                        };
+                        let encoded_len = artifact.encoded_len();
+                        if encoded_len > max_artifact_bytes {
+                            return Err(tonic::Status::invalid_argument(format!(
+                                "managed CPU artifact exceeds byte budget ({encoded_len} > {max_artifact_bytes} bytes)"
+                            )));
+                        }
+                        Ok(EncoderArtifact {
+                            bytes: artifact.encode_to_vec().into(),
+                            embedding_tokens,
+                        })
+                    })
+                },
+            );
+            EncoderServer::start(&config_json, process)
+                .map(|server| Self { server })
+                .map_err(to_py_err)
+        })
+    }
+
+    /// Stop admission and request cancellation without claiming native release.
+    fn drain(&self) {
+        self.server.drain();
+    }
+    /// Count encoder owners that still lack a native release receipt.
+    fn active(&self) -> usize {
+        self.server.active()
+    }
+    /// Expose control-thread liveness to the Python shutdown observer.
+    fn running(&self) -> bool {
+        self.server.running()
+    }
+    /// Return the recorded control failure so the launcher can begin cleanup.
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.server.last_error().map_err(to_py_err)
+    }
+    /// Stop the Rust listeners after the caller has drained native owners.
+    fn stop(&self, py: Python<'_>, timeout: f64) -> PyResult<()> {
+        let duration = Duration::try_from_secs_f64(timeout)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        py.detach(|| self.server.stop(duration).map_err(to_py_err))
     }
 }

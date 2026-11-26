@@ -501,3 +501,58 @@ def test_signal_handler_raises_only_on_the_first_signal():
         handler(signal.SIGINT, None)
     handler(signal.SIGQUIT, None)
     assert stop.is_set() and faulted.is_set()
+
+
+def test_split_work_and_control_reqs_preserves_dp_scoped_aborts_on_normal_pd(monkeypatch):
+    """Normal SGLang PD (DP>1) keeps DP-rank-targeted aborts in work_reqs while leaving
+    global control requests and non-msgpack receivers untouched."""
+    import sys
+    import types
+
+    class AbortReq:
+        def __init__(self, rid):
+            self.rid = rid
+
+    class EncoderDispatchErrorReq:
+        def __init__(self, rid):
+            self.rid = rid
+
+    class FlushCacheReq:
+        pass
+
+    io_struct = types.ModuleType("sglang.srt.managers.io_struct")
+    io_struct.AbortReq = AbortReq
+    io_struct.EncoderDispatchErrorReq = EncoderDispatchErrorReq
+    monkeypatch.setitem(sys.modules, "sglang", types.ModuleType("sglang"))
+    monkeypatch.setitem(sys.modules, "sglang.srt", types.ModuleType("sglang.srt"))
+    monkeypatch.setitem(sys.modules, "sglang.srt.managers", types.ModuleType("sglang.srt.managers"))
+    monkeypatch.setitem(sys.modules, "sglang.srt.managers.io_struct", io_struct)
+    sys.modules["sglang.srt.managers"].io_struct = io_struct
+
+    work_item = SimpleNamespace(rid="normal-pd-req")
+    abort_dp1 = AbortReq("dp1-abort")
+    dispatch_err = EncoderDispatchErrorReq("dp1-enc-err")
+    flush_ctrl = FlushCacheReq()
+
+    def original(_receiver, _recv_reqs):
+        return [work_item], [abort_dp1, flush_ctrl, dispatch_err]
+
+    class FakeMsgpackRecv(MsgpackRecvSocket):
+        def __init__(self):
+            pass
+
+    # MsgpackRecvSocket (normal SMG ZMQ PD worker): move AbortReq & EncoderDispatchErrorReq to work_reqs.
+    msgpack_receiver = SimpleNamespace(recv_from_tokenizer=FakeMsgpackRecv())
+    work_reqs, control_reqs = zmq_plugin.split_work_and_control_reqs(
+        original, msgpack_receiver, [work_item, abort_dp1, flush_ctrl, dispatch_err]
+    )
+    assert work_reqs == [work_item, abort_dp1, dispatch_err]
+    assert control_reqs == [flush_ctrl]
+
+    # Non-Msgpack receiver (native SGLang without SMG ZMQ): untouched.
+    native_receiver = SimpleNamespace(recv_from_tokenizer=object())
+    work_reqs, control_reqs = zmq_plugin.split_work_and_control_reqs(
+        original, native_receiver, [work_item, abort_dp1, flush_ctrl, dispatch_err]
+    )
+    assert work_reqs == [work_item]
+    assert control_reqs == [abort_dp1, flush_ctrl, dispatch_err]

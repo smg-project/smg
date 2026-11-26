@@ -70,6 +70,8 @@ pub struct SglangGenerateStream {
     /// the tick's rows, the completion the whole list with absolute positions.
     hidden_states: Vec<Vec<f32>>,
     hidden_states_sent: usize,
+    /// A transport error is not an acknowledgement that native resources exited.
+    native_terminal_received: bool,
 }
 
 impl SglangGenerateStream {
@@ -85,6 +87,7 @@ impl SglangGenerateStream {
             selected_logprobs_delta: Vec::new(),
             hidden_states: Vec::new(),
             hidden_states_sent: 0,
+            native_terminal_received: false,
         }
     }
 
@@ -107,6 +110,11 @@ impl SglangGenerateStream {
     /// engine whose identity names no index.
     pub fn engine_index(&self) -> Option<u32> {
         self.inner.engine_index()
+    }
+
+    /// True only after a terminal scheduler output, including an acknowledged abort.
+    pub fn native_terminal_received(&self) -> bool {
+        self.native_terminal_received
     }
 
     /// Convert a stream item without discarding the SGLang-only rows: the
@@ -302,6 +310,7 @@ impl MappedGenerateStream for SglangGenerateStream {
         &mut self,
         mut output: SglangOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
+        self.native_terminal_received |= output.finish_reason.is_some();
         if let Some(error) = &output.selected_logprobs_error {
             return Err(tonic::Status::internal(error.clone()));
         }
@@ -741,7 +750,7 @@ pub(crate) enum RankPlacement {
 /// connection, at DEBUG after), never refused, since placing by the pin
 /// would fail the request at the engine's KV sender. A single rank takes
 /// everything.
-fn room_residue_rank(
+pub(crate) fn room_residue_rank(
     room: i64,
     pin: Option<i32>,
     ranks: usize,

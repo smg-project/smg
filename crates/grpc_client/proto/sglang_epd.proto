@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package smg.sglang.managed.v1;
+
+message Capabilities {
+  uint32 version = 1;
+  string role = 2;
+  string model_revision = 3;
+  string processor_contract = 4;
+  string layout_contract = 5;
+  string embedding_dtype = 6;
+  string kv_backend = 7;
+  string embedding_backend = 8;
+  string topology_contract = 9;
+  string bootstrap_host = 10;
+  uint32 bootstrap_port = 11;
+  string receive_endpoint = 12;
+  uint32 tp_size = 13;
+  bool ready = 14;
+}
+
+message Bootstrap {
+  string host = 1;
+  uint32 port = 2;
+  int64 room = 3;
+}
+
+message InputBinding {
+  string prefill_rid = 1;
+  string decode_rid = 2;
+  Bootstrap bootstrap = 3;
+  string layout_contract = 4;
+  string processor_contract = 5;
+  string model_revision = 6;
+}
+
+message IntegerArray {
+  repeated uint32 shape = 1;
+  repeated sint64 values = 2;
+}
+
+message Offset {
+  uint32 start = 1;
+  uint32 end = 2;
+}
+
+message ImageMetadata {
+  uint32 occurrence = 1;
+  bytes full_identity = 2;
+  repeated sint64 pad_values = 3;
+  optional string processor_fingerprint = 4;
+  repeated Offset offsets = 5;
+  uint32 native_format = 6;
+  repeated uint32 grid_thw = 7;
+  optional string routing_label = 8;
+  uint64 native_hash = 9;
+  uint32 modality = 10;
+  repeated float second_per_grid_ts = 11;
+}
+
+message PreparedDecodeInput {
+  uint32 version = 1;
+  InputBinding binding = 2;
+  repeated uint32 unpadded_ids = 3;
+  repeated sint64 padded_ids = 4;
+  repeated ImageMetadata images = 5;
+  IntegerArray mrope_positions = 6;
+  IntegerArray mrope_delta = 7;
+  IntegerArray token_types = 8;
+  uint32 image_token_id = 9;
+  uint32 image_start_id = 10;
+  uint32 image_end_id = 11;
+  uint32 video_token_id = 12;
+}
+
+message PrefillStart {
+  uint32 version = 1;
+  uint64 timeout_ms = 2;
+  InputBinding binding = 3;
+  string encoder_receive_endpoint = 4;
+  uint32 image_count = 5;
+  uint32 video_count = 6;
+}

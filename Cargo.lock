@@ -2250,6 +2250,7 @@ dependencies = [
  "half",
  "llm-tokenizer",
  "openai-protocol",
+ "prost",
  "prost-types",
  "rustix",
  "serde_json",
