@@ -6891,6 +6891,41 @@ fn a_lazy_init_long_on_the_clock_is_the_decisions_budget_spent() {
     );
 }
 
+/// A cold slot opened under a budget an earlier open spent makes no
+/// instance. The plugin in front is the one of the case above, whose `init`
+/// outlasts the 10 ms decision. The neighbour's slot is cold at its open:
+/// the open is the decision's budget spent, no `init` runs under nothing,
+/// and the close has no slot of the decision's to rebuild. Nothing counts
+/// on the breaker, and the slot stays as cold as the open found it.
+#[test]
+fn a_cold_slot_opened_under_a_spent_budget_makes_no_instance() {
+    let (clock, runtime, cold) = plugin_whose_init_asks(20, |_| {});
+    let neighbour = load(
+        &runtime,
+        "after-the-init",
+        guest::record_guest(),
+        mode::LEAST_IN_FLIGHT,
+    );
+    neighbour.forget_instance();
+    let made = neighbour.stats().instantiations;
+    decide_on_a_cold_slot(&clock, 1, &cold, &neighbour, FRAME_MICROS);
+    let n = neighbour.stats();
+    assert_eq!(
+        (n.budget_spent, n.answered, n.breaker_opens),
+        (1, 0, 0),
+        "the open is the decision's budget spent and no failure: {n:?}"
+    );
+    assert_eq!(
+        (n.instantiations - made, n.lazy_instantiations),
+        (0, 0),
+        "no `init` ran under nothing and the close rebuilt nothing: {n:?}"
+    );
+    assert!(
+        !neighbour.is_warm(),
+        "the slot is as cold as its open found it"
+    );
+}
+
 /// The same `init` refusing after its 20 ms: the failure is the breaker's,
 /// and the time it took is the decision's all the same.
 #[test]
@@ -6923,7 +6958,9 @@ fn a_lazy_init_that_fails_long_on_the_clock_is_the_decisions_budget_spent_too() 
 /// wall time is charged its fuel at the calibration, the 100 ms of the init
 /// frame, which is the whole of a 100 ms decision. One failure on the breaker
 /// (the frame it ran out under was its own), and the neighbour's open finds
-/// the remainder gone. An `init` the wall clock ended with its thread off
+/// the remainder gone. The plugin itself counts no budget spent: its `init`
+/// was granted its whole frame, so no clamp ended it, though its charge took
+/// all that was left. An `init` the wall clock ended with its thread off
 /// the CPU burnt no frame: such a decision says so and is made again,
 /// [`TRIES`] at most.
 #[test]
@@ -6959,9 +6996,14 @@ fn a_lazy_init_that_burns_its_frame_out_is_charged_its_fuel_at_the_calibration()
             "the fuel the failed init burnt is in the plugin's count (try {made}, the thread off the CPU {held:?}): {s:?}"
         );
         assert_eq!(
-            (s.lazy_instantiations, s.answered, s.breaker_opens),
-            (0, 0, 0),
-            "the init ran its own frame out: one failure, short of the breaker's five: {s:?}"
+            (
+                s.lazy_instantiations,
+                s.answered,
+                s.breaker_opens,
+                s.budget_spent
+            ),
+            (0, 0, 0, 0),
+            "the init ran its own frame out: one failure, short of the breaker's five, and no budget spent of its own: {s:?}"
         );
         assert!(!cold.is_warm(), "an init that ran out leaves no instance");
         let n = neighbour.stats();
