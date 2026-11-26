@@ -7,9 +7,9 @@
     affinity is abandoned fleet-wide only under backend KV pressure.
 
     Three types of cache-aware routing (mutually exclusive, selected by
-    worker connection mode and KV event availability):
+    what a request carries and KV event availability):
 
-    1. Event-Driven (gRPC + KV events)
+    1. Event-Driven (requests routed by token ids, with KV events)
     -------------------------------------------
     Uses the KV index's overlap scoring from KvEventMonitor. Routes based
     on actual backend KV cache state. Selects the worker with the highest
@@ -20,13 +20,13 @@
     than 32 workers the decision reads the holders of the request's blocks
     and a sample of 16 others, not the pool (see `FLEET_SAMPLE`).
 
-    2. Approximate Token Tree (gRPC, no KV events)
+    2. Approximate Token Tree (requests routed by token ids, no KV events)
     -------------------------------------------
     Maintains a TokenTree per model tracking which token prefixes were routed
     where. If match_rate > cache_threshold, routes to the best-matching worker.
     Otherwise routes with LeastLoad's expected-wait algorithm.
 
-    3. Approximate String Tree (HTTP)
+    3. Approximate String Tree (requests routed by text)
     -------------------------------------------
     Same algorithm as (2) but operates on raw text characters instead of
     token IDs, avoiding tokenization overhead.
@@ -214,9 +214,9 @@ impl PrefixUnit {
 /// Supports mesh synchronization of tree operations across cluster nodes.
 /// When mesh is not enabled, the policy works independently without synchronization.
 ///
-/// Supports both HTTP (string-based) and gRPC (token-based) connections:
-/// - HTTP requests use StringTree (character-based prefix matching)
-/// - gRPC requests use TokenTree (token-based prefix matching, page-aligned)
+/// Supports requests routed by text and requests routed by token ids:
+/// - requests routed by text use StringTree (character-based prefix matching)
+/// - requests routed by token ids use TokenTree (token-based prefix matching, page-aligned)
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
@@ -232,8 +232,8 @@ pub struct CacheAwarePolicy {
     /// Optimistic self-accounting of dispatches the engines have not yet
     /// reported; `None` unless `selection_accounting_ttl_ms > 0`.
     accounting: Option<OptimisticAccounting>,
-    /// The trees by model: string-based for HTTP connections (text input),
-    /// token-based for gRPC connections (pre-tokenized input). Shared with
+    /// The trees by model: string-based for requests routed by text,
+    /// token-based for requests routed by token ids. Shared with
     /// the eviction task.
     trees: Arc<ModelTrees>,
     _eviction_task: Option<PeriodicTask>,
@@ -339,14 +339,14 @@ fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
 /// per-model gauges and the log line of the tree sizes: what the eviction
 /// task runs on its interval.
 pub(super) fn evict_trees(trees: &ModelTrees, max_tree_size: usize) {
-    // Evict string trees (HTTP)
-    let mut total_chars: usize = 0;
+    // Evict string trees (requests routed by text)
+    let mut total_size: usize = 0;
     let mut string_hashed: usize = 0;
     trees.evict_string_trees(max_tree_size, |model_id, tree| {
-        let (chars, tenants) = string_tree_totals(tree);
-        total_chars += chars;
+        let (size, tenants) = string_tree_totals(tree);
+        total_size += size;
         string_hashed += tree.hashed_paths();
-        Metrics::set_cache_tree_chars(model_id, chars);
+        Metrics::set_cache_tree_chars(model_id, size);
         Metrics::set_cache_tree_tenants(model_id, "string", tenants);
 
         debug!(
@@ -354,7 +354,7 @@ pub(super) fn evict_trees(trees: &ModelTrees, max_tree_size: usize) {
             model_id, max_tree_size
         );
     });
-    // Evict token trees (gRPC)
+    // Evict token trees (requests routed by token ids)
     let mut total_tokens: usize = 0;
     let mut token_hashed: usize = 0;
     trees.evict_token_trees(max_tree_size, |model_id, tree| {
@@ -374,10 +374,10 @@ pub(super) fn evict_trees(trees: &ModelTrees, max_tree_size: usize) {
     // DO NOT call tree.snapshot() here — it clones all
     // edge text (~170 MB) every cycle.
     tracing::info!(
-        "Tree memory: string_trees={} models / {} chars / {} hashed paths, \
+        "Tree memory: string_trees={} models / {} chars with 1024 a node / {} hashed paths, \
          token_trees={} models / {} tokens / {} hashed paths",
         trees.string_tree_count(),
-        total_chars,
+        total_size,
         string_hashed,
         trees.token_tree_count(),
         total_tokens,
@@ -769,14 +769,14 @@ impl CacheAwarePolicy {
     /// eviction task does on its interval (without the gauges it publishes).
     #[cfg(test)]
     pub(crate) fn evict_cache(&self, max_size: usize) {
-        // Evict string trees (HTTP)
+        // Evict string trees (requests routed by text)
         self.trees.evict_string_trees(max_size, |model_id, _| {
             debug!(
                 "String tree eviction for model {}, max_size: {}",
                 model_id, max_size
             );
         });
-        // Evict token trees (gRPC)
+        // Evict token trees (requests routed by token ids)
         self.trees.evict_token_trees(max_size, |model_id, _| {
             debug!(
                 "Token tree eviction for model {}, max_size: {}",
@@ -787,7 +787,7 @@ impl CacheAwarePolicy {
 
     /// Select the expected-wait worker (used when KV pressure abandons
     /// affinity), then record only that final dispatch in the local tree.
-    /// Handles both HTTP (text-based) and gRPC (token-based) requests.
+    /// Handles requests routed by token ids and requests routed by text.
     fn select_worker_fallback(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -801,11 +801,11 @@ impl CacheAwarePolicy {
         // Even in imbalanced mode, update the appropriate tree to maintain cache
         // state, under the request's cache namespace so a partitioned request
         // never seeds affinity for other partitions. Prefer the token tree for
-        // gRPC requests, fall back to the string tree for HTTP.
+        // a request that carries token ids, fall back to the string tree for text.
         if let Some(tokens) = info.tokens {
             let (keyed, _marker_len) = self.keyed_tokens(info, tokens);
             let tokens: &[u32] = &keyed;
-            // gRPC request: update token tree
+            // Routed by token ids: update token tree
             let tree = self.trees.token_tree(model_id);
             if let Some(tree) = tree {
                 // With the mesh attached the path's hash rides on the insert, so
@@ -827,7 +827,7 @@ impl CacheAwarePolicy {
         } else if let Some(text) = info.request_text {
             let (keyed, _marker_len) = Self::keyed_text(info, text);
             let text: &str = &keyed;
-            // HTTP request: update string tree
+            // Routed by text: update string tree
             let tree = self.trees.string_tree(model_id);
 
             if let Some(tree) = tree {
@@ -1505,9 +1505,9 @@ impl CacheAwarePolicy {
         }
 
         // Cache-aware routing when balanced — three types (mutually exclusive):
-        //   1. Event-driven: KV index overlap scoring (gRPC + KV events)
-        //   2. Approximate token tree: TokenTree prefix matching (gRPC, no events)
-        //   3. Approximate string tree: Tree prefix matching (HTTP)
+        //   1. Event-driven: KV index overlap scoring (token ids, with KV events)
+        //   2. Approximate token tree: TokenTree prefix matching (token ids, no events)
+        //   3. Approximate string tree: Tree prefix matching (text)
         if let Some(tokens) = request_tokens {
             // Event-driven mode re-hashes engine-reported blocks from their
             // token ids on both sides, so it keys a namespace through the
@@ -3426,7 +3426,7 @@ impl CacheAwarePolicy {
         total
     }
 
-    /// Select worker using token-based tree (gRPC path)
+    /// Select worker using token-based tree (requests routed by token ids)
     fn select_worker_with_tokens(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -3515,7 +3515,7 @@ impl CacheAwarePolicy {
         Some(idx)
     }
 
-    /// Select worker using string-based tree (HTTP path)
+    /// Select worker using string-based tree (requests routed by text)
     fn select_worker_with_text(
         &self,
         workers: &[Arc<dyn Worker>],
