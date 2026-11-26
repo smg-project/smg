@@ -8,8 +8,6 @@ use smg_worker::{
     registry::WorkerRegistry,
 };
 
-#[cfg(test)]
-use crate::service::controller::Config;
 use crate::{
     engine::CacheIndexes,
     store::MemoryStore,
@@ -59,13 +57,6 @@ impl WorkerObjects {
         Self::with_connector(store, Arc::new(GrpcConnector), overload)
     }
 
-    /// [`Self::stating`] the default thresholds of a start, for a case that
-    /// sets no others.
-    #[cfg(test)]
-    pub(crate) fn new(store: Arc<MemoryStore>) -> Self {
-        Self::stating(store, Config::DEFAULT_WORKER_OVERLOAD)
-    }
-
     /// [`Self::stating`] with `connector` making each object's engine
     /// connection.
     pub(super) fn with_connector(
@@ -109,12 +100,6 @@ impl WorkerObjects {
     /// The holder shared with readers of the replica's worker objects.
     pub(crate) fn holder(&self) -> Arc<Objects<Members>> {
         Arc::clone(&self.objects)
-    }
-
-    /// The holder, for a case that reads what stands.
-    #[cfg(test)]
-    pub(crate) fn objects(&self) -> &Objects<Members> {
-        &self.objects
     }
 }
 

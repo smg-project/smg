@@ -98,16 +98,6 @@ pub(crate) fn journaled(
     journaled_at(place, first, deciders)
 }
 
-/// The same over one file of leases with the log's places starting after
-/// `first`: zero in the cases, whose tables read a log's places from one.
-#[cfg(test)]
-pub(crate) fn journaled_from(
-    place: &LeasePlace,
-    first: u64,
-) -> (Arc<MemoryStore>, watch_workers::Feed) {
-    journaled_at(place, first, 1)
-}
-
 /// The store and its feed with the log's places starting after `first`,
 /// the store with a file of leases a decider, `deciders` of them
 /// ([`MemoryStore::with_decision_slots`]): the one place the two are built.
@@ -349,20 +339,6 @@ impl Replication {
             }
         }
     }
-
-    /// A restore's hold as a stream that took no part since `at` leaves
-    /// it, over the cut at the head with no admission: a served case's own.
-    #[cfg(test)]
-    pub(super) fn stalled_since(&self, at: Instant) {
-        let cut = self.cuts.at_head(&self.objects, &self.store, &self.log);
-        self.cuts.stalled(cut, at);
-    }
-
-    /// How many restores this leader holds: a served case's own.
-    #[cfg(test)]
-    pub(super) fn held(&self) -> usize {
-        self.cuts.held()
-    }
 }
 
 /// The watched kinds' cut at one place of the log: taken by the first stream
@@ -413,12 +389,6 @@ enum Held {
 }
 
 impl Hold {
-    /// A hold of `cut` from `now`, with no room taken first: a case's own.
-    #[cfg(test)]
-    fn of(cut: Arc<StoreCheckpoint>, now: Instant) -> Self {
-        Self(Mutex::new(Held::Cut(cut, now)))
-    }
-
     /// The cut made for the room taken, held from `now`.
     fn fill(&self, cut: Arc<StoreCheckpoint>, now: Instant) {
         *self.0.lock() = Held::Cut(cut, now);
@@ -485,19 +455,6 @@ impl Kept {
         Some(Reservation(hold))
     }
 
-    /// A hold of `cut` as a stream that took no part since `at` leaves
-    /// it, with no room counted: a case's own.
-    #[cfg(test)]
-    fn stalled(&self, cut: Arc<StoreCheckpoint>, at: Instant) {
-        self.holds.lock().push(Arc::new(Hold::of(cut, at)));
-    }
-
-    /// How many holds stand: a case's own.
-    #[cfg(test)]
-    fn held(&self) -> usize {
-        self.holds.lock().len()
-    }
-
     fn at_head(
         &self,
         objects: &Objects<Members>,
@@ -556,12 +513,6 @@ impl Drop for Parts {
 }
 
 impl Parts {
-    /// The parts of `cut` from `now`, counted by no leader: a case's own.
-    #[cfg(test)]
-    fn of(cut: Arc<StoreCheckpoint>, now: Instant) -> Self {
-        Self::held(Arc::new(Hold::of(cut, now)))
-    }
-
     const fn held(hold: Arc<Hold>) -> Self {
         Self {
             hold,
@@ -603,21 +554,6 @@ impl Parts {
         }
         Some((batch, last.then_some(cut.at)))
     }
-}
-
-/// Every part of the snapshot of `cut`, as sent at `now`: the cases'
-/// leader.
-#[cfg(test)]
-pub(super) fn parts(cut: Arc<StoreCheckpoint>, now: Instant) -> Vec<proto::ReplicationBatch> {
-    let mut parts = Parts::of(cut, now);
-    let mut sent = Vec::new();
-    while let Some((batch, ends)) = parts.next(now) {
-        sent.push(batch);
-        if ends.is_some() {
-            break;
-        }
-    }
-    sent
 }
 
 /// An instant's age at `now`, in milliseconds: what crosses in its place.
@@ -1086,4 +1022,4 @@ impl Stream for Batches {
 
 #[cfg(test)]
 #[path = "../../../tests/unit/service/controller/replication/tests.rs"]
-mod tests;
+pub(super) mod tests;

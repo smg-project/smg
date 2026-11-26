@@ -556,13 +556,6 @@ impl Checked {
         self.constraints.subset_hint
     }
 
-    /// The request's block hashes, in order from its first block. Its one
-    /// reader is a case of the client's wire.
-    #[cfg(all(test, feature = "client"))]
-    pub(crate) fn block_hashes(&self) -> &[u64] {
-        &self.facts.block_hashes
-    }
-
     /// The frame's facts in the engine's form: every fact the frame
     /// carries, its block hashes as deep as `depth` and its budget as
     /// `budget_micros`, what is left of it at the decision. The request
@@ -886,24 +879,6 @@ pub(crate) enum Decided {
     },
     /// An answer that carries no list: a `Busy`.
     Frame(proto::DecideAnswer),
-}
-
-#[cfg(test)]
-impl Decided {
-    /// The frame the wire carries, as a stream builds it that sends at its
-    /// decider's last read: what a case of the deciders reads.
-    pub(crate) fn frame(self) -> proto::DecideAnswer {
-        match self {
-            Self::Decision {
-                id,
-                term,
-                decision,
-                lease,
-                encode,
-            } => decided(id, term, &decision, lease.as_ref(), encode),
-            Self::Frame(frame) => frame,
-        }
-    }
 }
 
 /// The answer that carries `decision`, made under `term`, with the lease

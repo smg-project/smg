@@ -337,13 +337,6 @@ impl SpecFile {
         )))
     }
 
-    /// [`SpecFile::poll_looking`] with the file system's own look: a case's
-    /// step.
-    #[cfg(test)]
-    fn poll(&mut self) -> Look {
-        self.poll_looking(look)
-    }
-
     /// One look at the file: the watch's whole step, which the loop takes a
     /// poll after the last one ended and a case takes when it chooses. The
     /// look is its argument: the identity is the file system's word, and a

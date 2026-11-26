@@ -692,12 +692,6 @@ impl Log {
         }
     }
 
-    /// The log's lock, held: for a case that shows what waits for it.
-    #[cfg(test)]
-    pub(crate) fn held(&self) -> impl Sized + '_ {
-        self.ring.lock()
-    }
-
     /// A standby's application of the leader's event at `at`: while the
     /// returned guard stands, the write that names that place is journaled
     /// there under that term, the leader's own, so a position and its term

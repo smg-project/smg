@@ -21,7 +21,7 @@ use crate::{
             decision_slots::tests::holder,
             election::LeasePlace,
             principal::{tests::told, Principal},
-            replication::{journaled, journaled_from},
+            replication::{journaled, tests::journaled_from},
         },
         proto::{self, register_worker_request::Mode, worker_event::Event},
         replication,

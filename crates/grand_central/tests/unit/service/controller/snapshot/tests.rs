@@ -22,7 +22,7 @@ use crate::{
         controller::{
             election::LeasePlace,
             generations::{tests::LEAST_LOAD, Format, Generations},
-            replication::journaled_from,
+            replication::tests::journaled_from,
             watch_workers::{fill_within, PAGE_BYTES},
             worker_wire,
         },

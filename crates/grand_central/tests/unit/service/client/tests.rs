@@ -28,6 +28,7 @@ use tonic::{
     Code, Request, Status, Streaming,
 };
 
+pub(crate) use super::link::tests::{poll, Peer};
 use super::{
     blocking, controller_frame, decide_answer, fit, gateway_frame, hello, numbered, Answer, Busy,
     Client, ControllerFrame, Decide, DecideAnswer, DecideRequest, Decision, Error, GatewayFrame,

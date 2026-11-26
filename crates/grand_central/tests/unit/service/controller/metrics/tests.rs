@@ -13,6 +13,13 @@ use crate::{
     store::{EngineFaults, OutsideLists},
 };
 
+impl Metrics {
+    /// Whether the spec series are bound, as a case reads it.
+    pub(in crate::service::controller) fn spec_bound(&self) -> bool {
+        self.spec.get().is_some()
+    }
+}
+
 fn line(rendered: &str, series: &str, label: &str) -> Option<String> {
     rendered
         .lines()

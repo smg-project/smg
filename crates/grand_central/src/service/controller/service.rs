@@ -492,25 +492,6 @@ pub(crate) enum Call {
 }
 
 impl Call {
-    /// Every call, in the contract's order.
-    #[cfg(test)]
-    pub(crate) const ALL: [Call; 14] = [
-        Call::Session,
-        Call::Decide,
-        Call::WatchWorkers,
-        Call::RegisterWorker,
-        Call::PatchWorker,
-        Call::DeregisterWorker,
-        Call::GetSnapshot,
-        Call::Explain,
-        Call::ApplyPolicySpec,
-        Call::GetPolicySpec,
-        Call::RollbackPolicySpec,
-        Call::StepDown,
-        Call::WatchRegime,
-        Call::Replicate,
-    ];
-
     /// The call's name in the contract.
     pub(crate) const fn name(self) -> &'static str {
         match self {

@@ -20,7 +20,7 @@ use crate::{
         election::LeasePlace,
         membership::{MembershipCalls, ReplicaMembershipWriter},
         principal::Principal,
-        replication::journaled_from,
+        replication::tests::journaled_from,
         Config,
     },
     store::{self, MemoryStore, Registrant, WorkerStatus, WorkersStore},

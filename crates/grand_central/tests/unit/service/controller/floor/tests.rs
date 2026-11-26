@@ -1,5 +1,12 @@
 use super::{unbelieved, Floors, Told, FLOORS_SPENT_MAX, FLOOR_BELIEVED, FLOOR_REACH};
-use crate::service::{controller::election::Said, elector::TERM_CEILING};
+use crate::service::{controller::election::tests::Said, elector::TERM_CEILING};
+
+impl Floors {
+    /// The terms spent so far.
+    fn spent(&self) -> u64 {
+        self.words.lock().spent
+    }
+}
 
 #[test]
 fn a_floor_is_believed_up_to_its_range_above_the_term_and_under_the_last_term() {
