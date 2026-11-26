@@ -34,6 +34,8 @@ from pathlib import Path
 args = sys.argv[1:]
 if args[0].endswith("ci_verify_sglang_rocm_cohort.py"):
     if args[1:] == ["--repair-plan"]:
+        if os.environ.get("REPAIR_PLAN_ERROR"):
+            raise SystemExit("Unsafe uninstall RECORD path (controlled admission failure)")
         packages = json.loads(os.environ.get("NATIVE_REPAIR_PACKAGES",
                               '["apache-tvm-ffi", "tilelang", "torch-c-dlpack-ext"]'))
         if os.environ.get("NATIVE_CORRUPTION_FILE"):
@@ -1562,3 +1564,221 @@ def test_record_cache_without_allowed_source_is_still_rejected(tmp_path, monkeyp
         stream.write(str(cached.relative_to(root)) + ",,\n")
     with pytest.raises(RuntimeError, match="Unhashed RECORD file"):
         verifier.verify({})
+
+
+def _rewrite_fixture_record(root, folder):
+    """Rehash only the test-authored payload, never installed runtime files."""
+    record = folder / "RECORD"
+    rows = []
+    for name, _, _ in __import__("csv").reader(record.read_text().splitlines()):
+        path = root / name
+        if name == folder.name + "/RECORD":
+            continue
+        if not path.exists():
+            continue
+        body = path.read_bytes()
+        encoded = base64.urlsafe_b64encode(hashlib.sha256(body).digest()).rstrip(b"=").decode()
+        rows.append(f"{name},sha256={encoded},{len(body)}\n")
+    record.write_text("".join(rows) + folder.name + "/RECORD,,\n")
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ["escaping-python", "foreign-torch", "symlink", "wrong-location", "wrong-version-escape"],
+)
+def test_unsafe_uninstall_admission_never_becomes_a_repair_plan(tmp_path, monkeypatch, attack):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    sentinel = root.parents[2] / "bin/python3"
+    sentinel.write_bytes(b"owned fixture interpreter sentinel; never execute or uninstall")
+    original = sentinel.read_bytes()
+    folder = root / "tilelang-0.1.15.dist-info"
+    if attack == "wrong-location":
+        dist = next(d for d in verifier.md.distributions() if d.metadata["Name"] == "tilelang")
+        dist._path = tmp_path / "foreign.dist-info"
+    else:
+        if attack == "wrong-version-escape":
+            changed = root / "tilelang-0.1.14.dist-info"
+            folder.rename(changed)
+            dist = next(d for d in verifier.md.distributions() if d.metadata["Name"] == "tilelang")
+            dist._path = changed
+            old_version = verifier.md.version
+            verifier.md.version = lambda name: "0.1.14" if name == "tilelang" else old_version(name)
+            record = changed / "RECORD"
+            record.write_text(record.read_text().replace(folder.name, changed.name))
+            folder = changed
+        if attack == "foreign-torch":
+            target = root / "torch/__init__.py"
+            target.parent.mkdir()
+            target.write_bytes(b"owned fake Torch sentinel")
+            name = "torch/__init__.py"
+        elif attack == "symlink":
+            outside = tmp_path / "outside"
+            outside.mkdir()
+            (outside / "payload").write_bytes(b"owned outside sentinel")
+            (root / "tilelang/link").symlink_to(outside, target_is_directory=True)
+            name = "tilelang/link/payload"
+        else:
+            name = "../../../bin/python3"
+        with (folder / "RECORD").open("a") as stream:
+            stream.write(name + ",,\n")
+    with pytest.raises(RuntimeError, match="Unsafe"):
+        verifier.native_repair_packages()
+    assert native == [] and pip == []
+    assert sentinel.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["binary-wheel", "wrong-direct-url", "impure-wheel", "missing-requested", "unrecorded-source"],
+)
+def test_dlpack_repair_and_final_verifier_share_the_complete_payload_contract(
+    tmp_path, monkeypatch, shape
+):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    folder = root / "torch_c_dlpack_ext-0.1.5.dist-info"
+    if shape == "binary-wheel":
+        addon = root / "torch_c_dlpack_ext/libtorch_c_dlpack_addon_torch2x.so"
+        addon.write_bytes(b"\x7fELF owned fake addon; never load")
+        with (folder / "RECORD").open("a") as stream:
+            stream.write(str(addon.relative_to(root)) + ",,\n")
+        (folder / "direct_url.json").unlink()
+        (folder / "REQUESTED").unlink()
+    elif shape == "wrong-direct-url":
+        (folder / "direct_url.json").write_text(
+            json.dumps({"url": "https://example.invalid/not-the-fixed-sdist"})
+        )
+    elif shape == "impure-wheel":
+        (folder / "WHEEL").write_text(
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp313-cp313-manylinux_x86_64\n"
+        )
+    elif shape == "unrecorded-source":
+        (root / "torch_c_dlpack_ext/unrecorded.py").write_text("# never import this fixture\n")
+    else:
+        (folder / "REQUESTED").unlink()
+    _rewrite_fixture_record(root, folder)
+    assert verifier.native_repair_packages() == ["torch-c-dlpack-ext"]
+    with pytest.raises(RuntimeError):
+        verifier.verify({})
+    assert native == [] and pip == []
+
+
+def test_setup_stops_before_any_pip_when_repair_admission_fails(tmp_path):
+    result, calls = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        extra_env={
+            "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE,
+            "IMAGE_REFLECTION_VERSION": "1.84.0",
+            "REPAIR_PLAN_ERROR": "1",
+        },
+    )
+    assert result.returncode != 0
+    assert "Unsafe uninstall RECORD" in result.stderr
+    assert calls == []
+    assert not (tmp_path / "github.env").exists()
+
+
+def _add_script_metadata_fixture(root, folder, kind, name):
+    if kind == "dist-info-scripts":
+        payload = folder / "scripts" / name
+        payload.parent.mkdir(parents=True)
+        payload.write_bytes(b"# owned metadata fixture, never execute\n")
+    else:
+        payload = folder / "entry_points.txt"
+        if kind == "malformed-console":
+            payload.write_text("[console_scripts]\npython3 without equals\n")
+        else:
+            payload.write_text(f"[{kind}]\n{name} = never_import_this_fixture:main\n")
+    with (folder / "RECORD").open("a") as stream:
+        stream.write(str(payload.relative_to(root)) + ",,\n")
+    _rewrite_fixture_record(root, folder)
+
+
+@pytest.mark.parametrize(
+    "kind,name",
+    [
+        ("console_scripts", "python3"),
+        ("gui_scripts", "python3.13"),
+        ("console_scripts", "foreign-cli"),
+        ("console_scripts", "../python3"),
+        ("gui_scripts", "subdir/wrapper"),
+        ("console_scripts", "/owned-fixture-only/foreign"),
+        ("dist-info-scripts", "python3"),
+        ("dist-info-scripts", "foreign-cli"),
+        ("malformed-console", "python3"),
+    ],
+)
+def test_repair_metadata_never_authorizes_foreign_script_deletion(
+    tmp_path, monkeypatch, capsys, kind, name
+):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    sentinels = [
+        root.parents[2] / "bin" / leaf for leaf in ("python3", "python3.13", "foreign-cli")
+    ]
+    for sentinel in sentinels:
+        sentinel.write_bytes(b"owned fake interpreter/foreign wrapper; never uninstall")
+    before = {p: p.read_bytes() for p in sentinels}
+    # A prior safe repair candidate must not leak a partial stdout plan if a
+    # later candidate has unsafe metadata-derived pip deletion targets.
+    (root / "tvm_ffi/core.abi3.so").write_bytes(b"earlier repairable owned fixture")
+    (root / "tilelang/lib/libtilelang.so").write_bytes(b"later repairable owned fixture")
+    _add_script_metadata_fixture(root, root / "tilelang-0.1.15.dist-info", kind, name)
+    monkeypatch.setattr(sys, "argv", ["ci_verify_sglang_rocm_cohort.py", "--repair-plan"])
+    with pytest.raises(RuntimeError, match="Automatic native repair refused"):
+        verifier.main()
+    assert capsys.readouterr().out == ""
+    assert {p: p.read_bytes() for p in before} == before
+    assert native == [] and pip == []
+
+
+def test_wrong_version_still_requires_script_metadata_admission(tmp_path, monkeypatch, capsys):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    old = root / "tilelang-0.1.15.dist-info"
+    folder = root / "tilelang-0.1.14.dist-info"
+    old.rename(folder)
+    dist = next(d for d in verifier.md.distributions() if d.metadata["Name"] == "tilelang")
+    dist._path = folder
+    version = verifier.md.version
+    verifier.md.version = lambda name: "0.1.14" if name == "tilelang" else version(name)
+    record = folder / "RECORD"
+    record.write_text(record.read_text().replace(old.name, folder.name))
+    _add_script_metadata_fixture(root, folder, "gui_scripts", "python3")
+    monkeypatch.setattr(sys, "argv", ["ci_verify_sglang_rocm_cohort.py", "--repair-plan"])
+    with pytest.raises(RuntimeError, match="Automatic native repair refused"):
+        verifier.main()
+    assert capsys.readouterr().out == ""
+    assert native == [] and pip == []
+
+
+def test_healthy_cohort_keeps_tvm_wrappers_and_non_script_plugin_metadata(tmp_path, monkeypatch):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    folder = root / "apache_tvm_ffi-0.1.12.dist-info"
+    _add_script_metadata_fixture(root, folder, "console_scripts", "tvm-ffi-config")
+    entrypoints = folder / "entry_points.txt"
+    with entrypoints.open("a") as stream:
+        stream.write("tvm-ffi-stubgen = never_import_this_fixture:main\n")
+    _rewrite_fixture_record(root, folder)
+    _add_script_metadata_fixture(
+        root, root / "tilelang-0.1.15.dist-info", "fixture_plugins", "allowed-non-script-plugin"
+    )
+    assert verifier.native_repair_packages() == []
+    assert native == [] and pip == []
+    report = {}
+    verifier.verify(report)
+    assert report["pip_check"]["returncode"] == 0
+    assert "never_import_this_fixture" not in native
+
+
+def test_unqualified_tvm_script_metadata_holds_only_when_repair_is_needed(tmp_path, monkeypatch):
+    verifier, root, native, pip = _fixed_cohort_before_native(tmp_path, monkeypatch)
+    _add_script_metadata_fixture(
+        root, root / "apache_tvm_ffi-0.1.12.dist-info", "console_scripts", "tvm-ffi-config"
+    )
+    assert verifier.native_repair_packages() == []
+    (root / "tvm_ffi/core.abi3.so").write_bytes(
+        b"repair requires explicit script identity qualification"
+    )
+    with pytest.raises(RuntimeError, match="Automatic native repair refused"):
+        verifier.native_repair_packages()
+    assert native == [] and pip == []

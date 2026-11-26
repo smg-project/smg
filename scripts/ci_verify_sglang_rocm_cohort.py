@@ -18,7 +18,7 @@ import sysconfig
 import traceback
 from contextlib import contextmanager
 from email.parser import Parser
-from importlib.metadata import PackageNotFoundError
+from importlib.metadata import PackageNotFoundError, PathDistribution
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -139,6 +139,52 @@ def _source_imports():
             sys.pycache_prefix, sys.dont_write_bytecode = previous
 
 
+def verify_extension_payload(root, folder, names):
+    """One filesystem contract for final verification and safe repair selection."""
+    source_names = {
+        key for key in ANCHORS if key == "build_backend.py" or key.startswith("torch_c_dlpack_ext")
+    }
+    metadata_names = {
+        folder.name + "/" + key
+        for key in ("WHEEL", "RECORD", "INSTALLER", "REQUESTED", "direct_url.json")
+    }
+    pycs = {key for key in names if installed_cache_source(key) in source_names}
+    require(
+        source_names | metadata_names <= names <= source_names | metadata_names | pycs,
+        "Unexpected or missing extension payload",
+    )
+    require(
+        all(not (root / key).read_bytes().startswith(b"\x7fELF") for key in names),
+        "Extension contains ELF payload",
+    )
+    direct = json.loads((folder / "direct_url.json").read_text())
+    require(
+        direct.get("url") == SDIST_URL
+        and direct.get("archive_info", {}).get("hashes", {}).get("sha256") == SDIST_SHA
+        and not direct.get("dir_info")
+        and not direct.get("vcs_info"),
+        "Extension is not the official sdist build",
+    )
+    wheel = Parser().parsestr((folder / "WHEEL").read_text())
+    require(
+        wheel["Wheel-Version"] == "1.0"
+        and wheel["Root-Is-Purelib"] == "true"
+        and wheel.get_all("Tag") == ["py3-none-any"],
+        "Expected pure Python extension wheel",
+    )
+    for path in (root / "torch_c_dlpack_ext", folder):
+        require(not path.is_symlink(), "Linked extension directory")
+        for child in path.rglob("*"):
+            require(not child.is_symlink(), "Linked extension payload")
+            if child.is_file():
+                require(str(child.relative_to(root)) in names, "Unrecorded extension payload")
+                require(
+                    child.suffix not in (".so", ".dll", ".dylib", ".pth")
+                    and not child.read_bytes().startswith(b"\x7fELF"),
+                    "Unexpected extension native/startup payload",
+                )
+
+
 def verify(report):
     require(
         os.environ.get("E2E_SGLANG_GPTOSS_MXFP4_BF16", "0") != "1",
@@ -214,24 +260,7 @@ def verify(report):
         names = verify_record(root, folder, consoles)
         record_names.update(names)
         if name == "torch-c-dlpack-ext":
-            source_names = {
-                key
-                for key in ANCHORS
-                if key == "build_backend.py" or key.startswith("torch_c_dlpack_ext")
-            }
-            metadata_names = {
-                folder.name + "/" + key
-                for key in ("WHEEL", "RECORD", "INSTALLER", "REQUESTED", "direct_url.json")
-            }
-            pycs = {key for key in names if installed_cache_source(key) in source_names}
-            require(
-                source_names | metadata_names <= names <= source_names | metadata_names | pycs,
-                "Unexpected or missing extension payload",
-            )
-            require(
-                all(not (root / key).read_bytes().startswith(b"\x7fELF") for key in names),
-                "Extension contains ELF payload",
-            )
+            verify_extension_payload(root, folder, names)
         for path in (root / package, folder):
             require(not path.is_symlink(), "Linked package directory")
             for child in path.rglob("*"):
@@ -247,30 +276,6 @@ def verify(report):
             "Invalid anchor path",
         )
         require(digest(path) == anchor_sha, "Official payload anchor differs: " + name)
-    folder = root / "torch_c_dlpack_ext-0.1.5.dist-info"
-    direct = json.loads((folder / "direct_url.json").read_text())
-    require(
-        direct.get("url") == SDIST_URL
-        and direct.get("archive_info", {}).get("hashes", {}).get("sha256") == SDIST_SHA
-        and not direct.get("dir_info")
-        and not direct.get("vcs_info"),
-        "Extension is not the official sdist build",
-    )
-    wheel = Parser().parsestr((folder / "WHEEL").read_text())
-    require(
-        wheel["Wheel-Version"] == "1.0"
-        and wheel["Root-Is-Purelib"] == "true"
-        and wheel.get_all("Tag") == ["py3-none-any"],
-        "Expected pure Python extension wheel",
-    )
-    for path in (root / "torch_c_dlpack_ext", folder):
-        for child in path.rglob("*"):
-            if child.is_file():
-                require(
-                    child.suffix not in (".so", ".dll", ".dylib", ".pth")
-                    and not child.read_bytes().startswith(b"\x7fELF"),
-                    "Unexpected extension native/startup payload",
-                )
     module_names = (
         "sglang",
         "mooncake",
@@ -366,6 +371,89 @@ def verify(report):
         require(check.returncode == 0, "pip check failed")
 
 
+def validate_uninstall_record(root, folder, package, consoles=()):
+    """Reject unsafe pip-uninstall paths before considering any payload repair."""
+    require(not folder.is_symlink() and folder.is_dir(), "Unsafe native distribution location")
+    record = folder / "RECORD"
+    require(not record.is_symlink() and record.is_file(), "Unsafe or absent uninstall RECORD")
+    rows = list(csv.reader(io.StringIO(record.read_text())))
+    require(all(len(row) == 3 for row in rows), "Malformed uninstall RECORD")
+    names = [row[0] for row in rows]
+    require(len(names) == len(set(names)), "Duplicate uninstall RECORD path")
+    require(folder.name + "/RECORD" in names, "Uninstall RECORD does not identify itself")
+    package_root = root / package
+    require(not package_root.is_symlink(), "Unsafe linked native package directory")
+    if package_root.exists():
+        require(package_root.is_dir(), "Unsafe native package directory")
+    for parent in (package_root, folder):
+        require(
+            not any(child.is_symlink() for child in parent.rglob("*")),
+            "Unsafe linked native package payload",
+        )
+    for name in names:
+        relative = Path(name)
+        path = root / name
+        if name in consoles:
+            expected = Path("/opt/venv/bin") / relative.name
+            require(
+                path.resolve() == expected and not expected.parent.is_symlink(),
+                "Unsafe uninstall console path",
+            )
+        else:
+            require(
+                not relative.is_absolute()
+                and ".." not in relative.parts
+                and bool(relative.parts)
+                and str(relative) == name
+                and (
+                    relative.parts[0] in (package, folder.name)
+                    or (package == "torch_c_dlpack_ext" and name == "build_backend.py")
+                )
+                and path.resolve().is_relative_to(root),
+                "Unsafe uninstall RECORD path: " + name,
+            )
+            require(
+                not any(
+                    parent.is_symlink()
+                    for parent in path.parents
+                    if parent != root and parent.is_relative_to(root)
+                ),
+                "Unsafe linked uninstall parent",
+            )
+        require(
+            not path.is_symlink() and (not path.exists() or path.is_file()),
+            "Unsafe uninstall RECORD file: " + name,
+        )
+
+
+def validate_repair_script_metadata(folder):
+    """Reject unqualified pip-generated deletion targets for actual repairs only."""
+    # pip's importlib backend consumes these stdlib EntryPoint objects as data.
+    # Never call EntryPoint.load(): entry-point target code must not execute.
+    try:
+        wrappers = [
+            (entry.group, entry.name)
+            for entry in PathDistribution(folder).entry_points
+            if entry.group in ("console_scripts", "gui_scripts")
+        ]
+    except Exception as exc:
+        raise RuntimeError("Automatic native repair refused: malformed script metadata") from exc
+    # No extra wrapper deletion identity is qualified by this source contract.
+    # This includes TVM: its existing two recorded wrappers remain valid on a
+    # healthy cohort, but repairing script-bearing metadata needs explicit review.
+    require(
+        not wrappers,
+        "Automatic native repair refused: unqualified console/gui wrappers: " + repr(wrappers),
+    )
+    scripts = folder / "scripts"
+    require(not scripts.is_symlink(), "Automatic native repair refused: linked scripts metadata")
+    if scripts.exists():
+        require(
+            scripts.is_dir() and not any(scripts.iterdir()),
+            "Automatic native repair refused: unqualified dist-info/scripts metadata",
+        )
+
+
 def native_repair_packages():
     """Select only version/RECORD/official-anchor mismatches; never install here."""
     require(
@@ -381,28 +469,47 @@ def native_repair_packages():
         ("tilelang", "0.1.15", "tilelang"),
         ("torch-c-dlpack-ext", "0.1.5", "torch_c_dlpack_ext"),
     ):
-        try:
-            require(md.version(name) == version, "Native version differs")
-            matches = [
-                dist
-                for dist in md.distributions()
-                if re.sub(r"[-_.]+", "-", dist.metadata["Name"]).lower() == name
-            ]
-            require(len(matches) == 1, "Ambiguous native distribution")
-            dist = matches[0]
-            folder = root / (name.replace("-", "_") + "-" + version + ".dist-info")
+        matches = [
+            dist
+            for dist in md.distributions()
+            if re.sub(r"[-_.]+", "-", dist.metadata["Name"]).lower() == name
+        ]
+        if not matches:
+            # Nothing is installed for pip to uninstall. Do not infer a healthy payload.
             require(
-                Path(dist.locate_file("")).resolve() == root
-                and Path(dist._path).resolve() == folder
-                and not folder.is_symlink(),
-                "Unexpected native distribution location",
+                not (root / package).exists() and not (root / package).is_symlink(),
+                "Unregistered native payload requires explicit recovery",
             )
-            consoles = (
-                ("../../../bin/tvm-ffi-config", "../../../bin/tvm-ffi-stubgen")
-                if name == "apache-tvm-ffi"
-                else ()
-            )
+            repair.append(name)
+            continue
+        require(len(matches) == 1, "Unsafe ambiguous native distribution")
+        dist = matches[0]
+        observed = md.version(name)
+        require(
+            isinstance(observed, str) and re.fullmatch(r"[A-Za-z0-9_.+!-]+", observed),
+            "Unsafe native distribution version",
+        )
+        folder = root / (name.replace("-", "_") + "-" + observed + ".dist-info")
+        require(
+            Path(dist.locate_file("")).resolve() == root
+            and Path(dist._path).resolve() == folder
+            and not folder.is_symlink(),
+            "Unsafe native distribution location",
+        )
+        consoles = (
+            ("../../../bin/tvm-ffi-config", "../../../bin/tvm-ffi-stubgen")
+            if name == "apache-tvm-ffi"
+            else ()
+        )
+        # This admission is outside the repairable-integrity catch, even when
+        # versions differ. Pip must never receive an unsafe installed RECORD.
+        validate_uninstall_record(root, folder, package, consoles)
+        needs_repair = False
+        try:
+            require(observed == version, "Native version differs")
             names = verify_record(root, folder, consoles)
+            if name == "torch-c-dlpack-ext":
+                verify_extension_payload(root, folder, names)
             for key, expected in ANCHORS.items():
                 belongs = (
                     key.startswith(package + "/")
@@ -419,6 +526,11 @@ def native_repair_packages():
                         "Native official anchor differs: " + key,
                     )
         except (PackageNotFoundError, OSError, RuntimeError, ValueError):
+            needs_repair = True
+        if needs_repair:
+            # Fatal admission is not inside the repairable-integrity try/catch.
+            # Check all pip metadata deletion inputs before append or any output.
+            validate_repair_script_metadata(folder)
             repair.append(name)
     return repair
 

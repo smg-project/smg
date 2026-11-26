@@ -88,7 +88,7 @@ echo "image: $(python3 -V) at $(command -v python3)"
 
 # Existing benchmark callers keep their editable install and HIP import check.
 # Only callers that explicitly supply the verified image pin opt into repair.
-if [ "$verify_only" -eq 0 ] && [ -z "${SMG_SGLANG_ROCM_IMAGE:-}" ]; then
+if [ -z "${SMG_SGLANG_ROCM_IMAGE:-}" ]; then
     $RETRY 3 10 python3 -m pip install -e crates/grpc_client/python/ -e grpc_servicer/
     python3 -c "import torch, sglang, mooncake, smg_grpc_servicer; assert torch.version.hip; print('sglang', sglang.__version__, 'HIP', torch.version.hip)"
     if [ -n "${GITHUB_ENV:-}" ]; then
@@ -139,33 +139,30 @@ if api is None or type(api).__name__ != "PyCapsule":
         "expected PyCapsule, observed %s" % type(api).__name__
     )
 '
-if [ "$verify_only" -eq 0 ]; then
-    # A version pin alone leaves a same-version corrupted payload installed.
-    # Select only known bad native packages, and do not resolve/reinstall Torch.
-    repair_plan="$(python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" --repair-plan)"
-    repair_specs=()
-    if [ -n "$repair_plan" ]; then
-        while IFS= read -r package; do
-            case "$package" in
-                apache-tvm-ffi) repair_specs+=("apache-tvm-ffi==0.1.12") ;;
-                tilelang) repair_specs+=("tilelang==0.1.15") ;;
-                torch-c-dlpack-ext) repair_specs+=("torch-c-dlpack-ext @ https://files.pythonhosted.org/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz#sha256=d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe") ;;
-                *) echo "invalid native repair package: $package" >&2; exit 1 ;;
-            esac
-        done <<< "$repair_plan"
-        $RETRY 3 10 python3 -m pip install --no-cache-dir --no-build-isolation \
-            --no-binary=torch-c-dlpack-ext --force-reinstall --no-deps "${repair_specs[@]}"
-    fi
-
-    # Install gRPC packages from source (not PyPI) so PR changes are always tested
-    $RETRY 3 10 python3 -m pip install -e crates/grpc_client/python/ -e grpc_servicer/
-
+# A version pin alone leaves a same-version corrupted payload installed.
+# Select only known bad native packages, and do not resolve/reinstall Torch.
+repair_plan="$(python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" --repair-plan)"
+repair_specs=()
+if [ -n "$repair_plan" ]; then
+    while IFS= read -r package; do
+        case "$package" in
+            apache-tvm-ffi) repair_specs+=("apache-tvm-ffi==0.1.12") ;;
+            tilelang) repair_specs+=("tilelang==0.1.15") ;;
+            torch-c-dlpack-ext) repair_specs+=("torch-c-dlpack-ext @ https://files.pythonhosted.org/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz#sha256=d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe") ;;
+            *) echo "invalid native repair package: $package" >&2; exit 1 ;;
+        esac
+    done <<< "$repair_plan"
+    $RETRY 3 10 python3 -m pip install --no-cache-dir --no-build-isolation \
+        --no-binary=torch-c-dlpack-ext --force-reinstall --no-deps "${repair_specs[@]}"
 fi
 
-python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" "${verify_output[@]}"
+# Install gRPC packages from source (not PyPI) so PR changes are always tested
+$RETRY 3 10 python3 -m pip install -e crates/grpc_client/python/ -e grpc_servicer/
+
+python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py"
 
 # Carry the observed image version into the next Actions step.
-if [ "$verify_only" -eq 0 ] && [ -n "${GITHUB_ENV:-}" ]; then
+if [ -n "${GITHUB_ENV:-}" ]; then
     echo "SMG_CI_OTEL_API_VERSION=${SMG_CI_OTEL_API_VERSION}" >> "$GITHUB_ENV"
     echo "SMG_CI_GRPC_COMPANION_VERSION=${SMG_CI_GRPC_COMPANION_VERSION}" >> "$GITHUB_ENV"
 fi
