@@ -7,6 +7,7 @@ mod provider_trait;
 mod registry;
 mod sglang;
 #[cfg(test)]
+#[path = "../../../tests/unit/openai/provider/tests.rs"]
 mod tests;
 mod types;
 mod xai;
