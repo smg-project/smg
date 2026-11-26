@@ -1137,6 +1137,10 @@ fn decide_shadowed(
 /// ([`Engine::side_apart`]), and beside a side its binding's sessions rule
 /// or its picker's assignment placed.
 ///
+/// A prefill's shadow that would ask the pair's default says none too,
+/// under a live decode profile with a hard filter that holds a scope or
+/// reads more than a row ([`Engine::shadow_side`]).
+///
 /// Beside a pair whose decode side the binding's all-vetoed rule steered,
 /// the decode's shadow is put to that rule and compared. Beside a pair the
 /// pair's default made, each side's shadow follows the default as its live
@@ -1194,9 +1198,9 @@ fn side_shadows(
                 let (kind, first) = beside(side, pick, &shadow);
                 said(kind, first)
             }
-            // The engine's run says none for a profile of another column
-            // and beside a side its rule or its picker's assignment
-            // placed.
+            // The engine's run says none for a profile of another column,
+            // beside a side its rule or its picker's assignment placed,
+            // and for a prefill's shadow that may not ask the default.
             Ok(None) => said(ShadowKind::Skipped, None),
             // The shadow panicked: counted where it was caught.
             Err(_) => None,

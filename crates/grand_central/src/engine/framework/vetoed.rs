@@ -745,6 +745,18 @@ impl<'a> Half<'a> {
         places::rows(self.rows, self.cx)
     }
 
+    /// Whether each hard filter of the side reads a row alone
+    /// ([`Filter::row_wise`]) and holds no decision scope. Such a filter
+    /// answers alike behind the decision it stood in. Any other may answer
+    /// by a scope that is closed by then, or by what it kept of being
+    /// asked. A prefill side's shadow asks this of the live decode profile
+    /// before its default asks that profile's filters
+    /// ([`Engine::shadow_side`]).
+    pub(super) fn reads_rows_alone(&self) -> bool {
+        let mut hard = self.profile.filters.iter().filter(|f| !f.soft());
+        hard.all(|f| f.row_wise() && f.scope().is_none())
+    }
+
     /// Whether `row` stands but for the side's admission limit: the side's
     /// hard filters keep it with the limit set aside, under the side's own
     /// constraints. A pair's decision judges the limit over the prefills
@@ -880,8 +892,8 @@ pub(super) fn paired(
 /// decodes it kept in `scratch.decode.kept`, where the second step reads
 /// them ([`paired_decode`]).
 ///
-/// A prefill side's shadow whose own run shed asks this step alone, with
-/// its profile in the prefill's place.
+/// A prefill side's shadow whose own run shed asks this step alone
+/// ([`shadow_prefill`]).
 ///
 /// No line reads `SHADOW`. It gives the default and a shadow a copy of
 /// this step each, so the default's copy is compiled into its one caller.
@@ -959,6 +971,54 @@ pub(super) fn paired_prefill<const SHADOW: bool>(
         return Some(Decision::Pick(taken));
     }
     None
+}
+
+/// The scratch of a pair's decision while the default's first step reads
+/// it for a prefill side's shadow ([`shadow_prefill`]). Its end puts back
+/// what that step changed and the decode's shadow reads: the classes, and
+/// the mark on the prefill's buffer. It runs on a return and on a panic.
+struct PutBack<'a> {
+    scratch: &'a mut Scratch,
+    /// The mark the pair's decision left on the prefill's buffer.
+    mark: LiftedVeto,
+}
+
+impl Drop for PutBack<'_> {
+    fn drop(&mut self) {
+        let scratch = &mut *self.scratch;
+        if scratch.among_first {
+            std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
+        }
+        scratch.single.lifted = self.mark;
+    }
+}
+
+/// The default's first step ([`paired_prefill`]) for a prefill side's
+/// shadow whose own run shed ([`Engine::shadow_side`]), with its profile in
+/// the prefill's place.
+///
+/// The step reads every open class. Among first partners the pair's
+/// decision left those in `scratch.firsts`, so the two lists are swapped
+/// for the call. The step also writes the prefill buffer's mark, which
+/// held `mark` until then.
+///
+/// The scratch is left as the pair's decision left it ([`PutBack`]), where
+/// the step panics too. A host catches each side's shadow by itself, so
+/// the decode's shadow runs on this scratch behind a prefill's that
+/// panicked.
+pub(super) fn shadow_prefill(
+    sides: [Half<'_>; 2],
+    table: &PairTable<'_>,
+    words: (bool, bool),
+    pool: &PoolFacts<'_>,
+    scratch: &mut Scratch,
+    mark: LiftedVeto,
+) -> Option<Decision> {
+    if scratch.among_first {
+        std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
+    }
+    let back = PutBack { scratch, mark };
+    paired_prefill::<true>(sides, table, words, pool, &mut *back.scratch)
 }
 
 /// The second step of the pair's default ([`paired`]): the decode, which is

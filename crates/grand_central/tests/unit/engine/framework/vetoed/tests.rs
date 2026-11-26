@@ -1570,7 +1570,18 @@ fn a_weighing_shadows_default_judges_the_pool_with_no_lift() {
     assert_eq!(pair_of(&live), (1, 1));
     let pick = live.pick().expect("a pair");
     let side = PairSide::Prefill;
-    let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch, &|_| None);
+    let twin = engine.shadow_side(
+        0,
+        side,
+        &req,
+        &pool,
+        pools,
+        &cx,
+        &cx,
+        pick,
+        scratch,
+        &|_| None,
+    );
     assert_eq!(twin.map(|shadow| order(&shadow)[0]), Some(1));
 }
 
@@ -2346,7 +2357,18 @@ fn a_first_decisions_decode_shadow_is_steered_past_a_doubt() {
     let live = first.pick().expect("a pair");
     assert_eq!(live.trace.lifted, LiftedVeto::None);
     let side = PairSide::Decode;
-    let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, live, scratch, &|_| None);
+    let twin = engine.shadow_side(
+        0,
+        side,
+        &req,
+        &pool,
+        pools,
+        &cx,
+        &cx,
+        live,
+        scratch,
+        &|_| None,
+    );
     let twin = twin.expect("the decode's shadow");
     let taken = (order(&twin)[0], twin.trace().lifted);
     assert_eq!(taken, (1, LiftedVeto::Liveness));
@@ -2380,7 +2402,18 @@ fn a_twin_follows_the_pairs_default_on_both_sides() {
         let live = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
         let pick = live.pick().expect("a pair");
         let twins = PairSide::BOTH.map(|side| {
-            let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch, &|_| None);
+            let twin = engine.shadow_side(
+                0,
+                side,
+                &req,
+                &pool,
+                pools,
+                &cx,
+                &cx,
+                pick,
+                scratch,
+                &|_| None,
+            );
             twin.map(|shadow| order(&shadow)[0])
         });
         (pair_of(&live), live.trace().lifted, twins)
@@ -2444,7 +2477,18 @@ fn a_decodes_shadow_takes_its_ruled_run_behind_a_prefills_that_asked_the_default
         let live = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
         let pick = live.pick().expect("a pair");
         let twins = PairSide::BOTH.map(|side| {
-            let twin = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch, &|_| None);
+            let twin = engine.shadow_side(
+                0,
+                side,
+                &req,
+                &pool,
+                pools,
+                &cx,
+                &cx,
+                pick,
+                scratch,
+                &|_| None,
+            );
             order(&twin.expect("the side's shadow"))[0]
         });
         (pair_of(&live), twins)
@@ -2465,9 +2509,11 @@ fn a_decodes_shadow_takes_its_ruled_run_behind_a_prefills_that_asked_the_default
 /// Among first partners a prefill's shadow that sheds over the prefills
 /// its live side was shown goes the live decision's way with its own
 /// profile. One of those prefills that stands but for its admission
-/// limit keeps the request under the limit's stage. Else the shadow
-/// runs over every open class and takes its own pick there. Where that
-/// run sheds too it takes the default's prefill, by load.
+/// limit keeps the request under the limit's stage, and the shed names
+/// the prefill side. Else the shadow runs over every open class and
+/// takes its own pick there. Where that run sheds too it takes the
+/// default's prefill, by load. A default's prefill at its admission
+/// limit is the limit's shed, in place of the run's own refusal.
 ///
 /// The default asked for the shadow reads every open class, as the live
 /// default does. A prefill of another open class that stands but for
@@ -2494,13 +2540,25 @@ fn a_prefills_shadow_shed_among_first_partners_goes_the_live_decisions_way() {
         assert_eq!(pair_of(&live), (1, 1));
         let pick = live.pick().expect("a pair");
         let side = PairSide::Prefill;
-        let shadow = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch, &|_| None);
+        let shadow = engine.shadow_side(
+            0,
+            side,
+            &req,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            scratch,
+            &|_| None,
+        );
         shadow.expect("the prefill's shadow")
     };
     // The prefill shown is at its limit and nothing else refuses it: the
     // request waits on the limit, beside a prefill with room.
     let waits = shadow_beside([room(free(0, 0), 2), classed(free(1, 0), 1)], open);
-    assert_eq!(shed_of(&waits), (ShedReason::NoEndpoints, "has-capacity"));
+    let limit = (ShedReason::NoEndpoints, "has-capacity");
+    assert_eq!(sided(&waits), (limit, Some(PairSide::Prefill)));
     // The prefill shown is over its thresholds: the shadow's profile
     // runs over every open class and takes the free prefill itself.
     let own = shadow_beside([room(free(0, 0), 2), room(over(1, 0), 1)], open);
@@ -2510,6 +2568,12 @@ fn a_prefills_shadow_shed_among_first_partners_goes_the_live_decisions_way() {
     let default = shadow_beside([room(over(0, 1), 2), room(over(1, 5), 1)], open);
     let taken = (order(&default)[0], default.trace().lifted);
     assert_eq!(taken, (0, LiftedVeto::Overload));
+    // That prefill is at its limit: the shadow's answer is the limit's
+    // shed of the default, which names the prefill side and no lifted
+    // veto. The run's own refusal was the overload veto's.
+    let full = shadow_beside([classed(over(0, 1), 2), room(over(1, 5), 1)], open);
+    assert_eq!(sided(&full), (limit, Some(PairSide::Prefill)));
+    assert_eq!(full.trace().lifted, LiftedVeto::None);
     // Every decode is over, so the default would pair past the overload
     // veto. The prefill of the other open class stands but for its
     // limit: the default answers nothing, and the run's own refusal
@@ -2584,9 +2648,256 @@ fn a_prefill_shadows_decline_passes_through_among_first_partners() {
     assert_eq!(pair_of(&live), (1, 1));
     let pick = live.pick().expect("a pair");
     let side = PairSide::Prefill;
-    let shadow = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, pick, scratch, &|_| None);
+    let shadow = engine.shadow_side(
+        0,
+        side,
+        &req,
+        &pool,
+        pools,
+        &cx,
+        &cx,
+        pick,
+        scratch,
+        &|_| None,
+    );
     let declined = shadow.expect("the prefill's shadow");
     assert_eq!(shed_of(&declined), (ShedReason::PolicyDeclined, "declines"));
+}
+
+/// A prefill's shadow asks the pair's default only under a live decode
+/// profile whose hard filters each read a row alone and hold no scope.
+/// The default asks those filters behind the decision they stood in,
+/// where another filter may answer otherwise. Under such a filter the
+/// side says none, and the filter is asked as often as with no shadow.
+/// A soft filter is not asked by the default, and stops none.
+#[test]
+fn a_prefills_shadow_says_none_where_its_default_would_ask_a_decode_filter_again() {
+    /// Keeps every row and counts the rows it was asked about. `rows` is
+    /// its word that it reads a row alone.
+    #[derive(Debug)]
+    struct Keeps {
+        rows: bool,
+        soft: bool,
+        scope: Option<Arc<Scope>>,
+        asked: Arc<AtomicUsize>,
+    }
+
+    impl Filter for Keeps {
+        fn name(&self) -> &'static str {
+            "keeps"
+        }
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        fn soft(&self) -> bool {
+            self.soft
+        }
+        fn row_wise(&self) -> bool {
+            self.rows
+        }
+        fn scope(&self) -> Option<&dyn DecisionScope> {
+            let scope = self.scope.as_deref()?;
+            Some(scope)
+        }
+    }
+
+    let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+    // Every prefill is over its thresholds. The live prefill profile reads
+    // the health stage alone and takes one. Its shadow reads the vetoes:
+    // it sheds, and the default takes the prefill of the least pair.
+    let prefills = [over(0, 1), over(1, 5)].map(|worker| classed(worker, 1));
+    let decodes = [free(0, 0), free(1, 0)].map(|worker| classed(worker, 1));
+    let pools = PairPools {
+        prefills: &prefills,
+        decodes: &decodes,
+        ..PairPools::default()
+    };
+    // What the shadow answers under the filter, and whether its run asked
+    // the filter again.
+    let shadow_under = |rows: bool, soft: bool, scoped: bool| {
+        let scope = scoped.then(|| Arc::new(Scope::default()));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let keeps = Keeps {
+            rows,
+            soft,
+            scope,
+            asked: Arc::clone(&asked),
+        };
+        let healthy: Vec<Box<dyn Filter>> = vec![Box::new(Healthy)];
+        let mut decode = vetoes();
+        decode.push(Box::new(keeps));
+        let engine = pair_engine_shadowed(false, [healthy, decode, vetoes()], [None, None]);
+        let scratch = &mut Scratch::new();
+        let live = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
+        let pick = live.pick().expect("a pair");
+        let alone = asked.load(Ordering::Relaxed);
+        let side = PairSide::Prefill;
+        let shadow = engine.shadow_side(
+            0,
+            side,
+            &req,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            scratch,
+            &|_| None,
+        );
+        let again = asked.load(Ordering::Relaxed) > alone;
+        let taken = shadow.map(|shadow| (order(&shadow)[0], shadow.trace().lifted));
+        (taken, again)
+    };
+    let default = Some((0, LiftedVeto::Overload));
+    // A hard filter that reads a row alone and holds no scope: the
+    // default asks it.
+    assert_eq!(shadow_under(true, false, false), (default, true));
+    // One that does not say it reads a row alone.
+    assert_eq!(shadow_under(false, false, false), (None, false));
+    // One that reads a row alone and holds a scope.
+    assert_eq!(shadow_under(true, false, true), (None, false));
+    // A soft filter is not asked by the default, whatever it says.
+    assert_eq!(shadow_under(false, true, true), (default, false));
+}
+
+/// A prefill's shadow that panics inside the pair's default leaves the
+/// scratch as the pair's decision left it: the classes it was shown and
+/// the mark on the prefill's buffer. A host catches each side's shadow
+/// by itself, so the decode's shadow runs on that scratch behind the
+/// panic. It answers as it does where no prefill's shadow ran, by its
+/// ruled run among the live prefill's first partners. Left with the
+/// default's mark, it would take the default's second step, and the
+/// decode that holds the fewest requests.
+#[test]
+fn a_prefills_shadow_that_panics_in_the_default_leaves_the_scratch_as_it_found_it() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// Panics where it is asked about a row.
+    #[derive(Debug)]
+    struct Unwinds;
+
+    impl Filter for Unwinds {
+        fn name(&self) -> &'static str {
+            "unwinds"
+        }
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            panic!("this stage unwinds where it is asked");
+        }
+    }
+
+    let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+    // The live prefill profile reads no health stage and takes a doubted
+    // prefill. Its shadow lists the health stage ahead of the stage that
+    // panics. The health stage refuses every prefill in the shadow's own
+    // runs and in the default's overload pass, which leaves its mark. The
+    // default's liveness pass reads the prefills with no doubt, and asks
+    // the stage that panics.
+    let loaded: Vec<Box<dyn Filter>> = vec![Box::new(NotOverloaded)];
+    let shadow: Vec<Box<dyn Filter>> = vec![Box::new(Healthy), Box::new(Unwinds)];
+    let engine = pair_engine_shadowed(false, [loaded, vetoes(), shadow], [None, None]);
+    // Place 1 of each side holds the two workers that pair first. The
+    // other decode holds fewer requests.
+    let prefills = [classed(doubted(0, 0), 2), classed(doubted(1, 0), 1)];
+    let decodes = [classed(free(0, 0), 2), classed(free(1, 3), 1)];
+    let pools = first_pools(&prefills, &decodes);
+    let left = |scratch: &Scratch| {
+        let classes = (scratch.classes.clone(), scratch.firsts.clone());
+        (classes, scratch.single.lifted)
+    };
+    // What the decode's shadow says beside the pair, behind a prefill's
+    // shadow that panicked or with none.
+    let decode_said = |scratch: &mut Scratch, panics: bool| {
+        let live = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
+        assert_eq!(pair_of(&live), (1, 1));
+        let pick = live.pick().expect("a pair");
+        if panics {
+            // Among first partners the two lists of classes differ.
+            let found = left(scratch);
+            assert_ne!(found.0 .0, found.0 .1);
+            assert_eq!(found.1, LiftedVeto::None);
+            let side = PairSide::Prefill;
+            let unwound = catch_unwind(AssertUnwindSafe(|| {
+                engine.shadow_side(
+                    0,
+                    side,
+                    &req,
+                    &pool,
+                    pools,
+                    &cx,
+                    &cx,
+                    pick,
+                    scratch,
+                    &|_| None,
+                )
+            }));
+            assert!(unwound.is_err(), "the stage unwound");
+            assert_eq!(left(scratch), found);
+        }
+        let side = PairSide::Decode;
+        let twin = engine.shadow_side(
+            0,
+            side,
+            &req,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            scratch,
+            &|_| None,
+        );
+        let twin = twin.expect("the decode's shadow");
+        (order(&twin), twin.trace().lifted)
+    };
+    let alone = decode_said(&mut Scratch::new(), false);
+    assert_eq!((alone.0[0], alone.1), (1, LiftedVeto::None));
+    assert_eq!(decode_said(&mut Scratch::new(), true), alone);
+}
+
+/// Beside a pair the default made, a decode's shadow sheds where its own
+/// hard filters keep no partner of the live prefill in the pass that
+/// paired. The shed is a decode side's with no partner: it stands under
+/// `partners`, and names the decode side and no lifted veto.
+///
+/// Under a binding that sheds, the default lifts the liveness veto
+/// alone. The live decode profile reads the health stage alone, and
+/// keeps a decode over its thresholds there. Its twin reads the overload
+/// veto too, and keeps none.
+#[test]
+fn a_decodes_shadow_with_no_partner_beside_the_default_sheds_under_partners() {
+    let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+    let healthy: Vec<Box<dyn Filter>> = vec![Box::new(Healthy)];
+    let engine = pair_engine_of(true, [vetoes(), healthy]);
+    let prefills = [doubted(0, 0), doubted(1, 1)].map(|worker| classed(worker, 1));
+    let decodes = [over(0, 0), over(1, 2)].map(|worker| classed(worker, 1));
+    let pools = PairPools {
+        prefills: &prefills,
+        decodes: &decodes,
+        ..PairPools::default()
+    };
+    let scratch = &mut Scratch::new();
+    let live = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
+    let made = (pair_of(&live), live.trace().lifted);
+    assert_eq!(made, ((0, 0), LiftedVeto::Liveness));
+    let pick = live.pick().expect("a pair");
+    let side = PairSide::Decode;
+    let shadow = engine.shadow_side(
+        0,
+        side,
+        &req,
+        &pool,
+        pools,
+        &cx,
+        &cx,
+        pick,
+        scratch,
+        &|_| None,
+    );
+    let shadow = shadow.expect("the decode's shadow");
+    let partners = (ShedReason::NoEndpoints, "partners");
+    assert_eq!(sided(&shadow), (partners, Some(PairSide::Decode)));
+    assert_eq!(shadow.trace().lifted, LiftedVeto::None);
 }
 
 /// An engine of one profile: `veto` and a filter that refuses every row,

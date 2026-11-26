@@ -76,6 +76,11 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// read whole, and in the draw's order behind a draw. The default is
     /// no, and a profile that holds such a filter runs its whole pass: a
     /// plugin's filter is shown the whole view.
+    ///
+    /// A row-wise filter that holds no decision scope may be asked about a
+    /// row once more behind its decision: a pair's prefill shadow asks the
+    /// live decode profile's hard filters so. Its word on a row must not
+    /// turn on how often it is asked.
     fn row_wise(&self) -> bool {
         false
     }
@@ -8952,6 +8957,8 @@ impl Engine {
     /// ([`Self::side_ring_profile`]), asked of `lends` behind the filter
     /// half of its run ([`run_side_lent`]): a shadow whose set the filters
     /// emptied, which the all-vetoed rule steers or sheds, asks nothing.
+    /// Neither does the pair's default that a side's shadow follows: no
+    /// step of it scores.
     ///
     /// The decode's shadow is put to the binding's all-vetoed rule by the
     /// binding's word, as its live side is ([`Set::ruled`]): where a veto
@@ -8960,34 +8967,46 @@ impl Engine {
     /// put to no all-vetoed rule, as its live side is put to none.
     ///
     /// A side's shadow follows the pair's default as its live side does
-    /// ([`vetoed::paired`]). It is the pair's decision with that side's
-    /// profile replaced, under every rule of the engine as it stands.
+    /// ([`vetoed::paired`]). It starts where the pair's decision ended, on
+    /// the scratch that decision left. A prefill's shadow is shown the
+    /// classes its live side was shown last. Where the live side shed among
+    /// first partners and ran again over every open class, the shadow's
+    /// one run reads every open class.
     ///
     /// A prefill's shadow that sheds goes the live decision's way
     /// ([`Self::decide_pair`]), in this order:
     ///
     /// - Among first partners, the admission limit's test of the prefills
     ///   shown. Where one of them waits on its limit, the shed is the
-    ///   limit's.
+    ///   limit's and names the prefill side.
     /// - Among first partners, its run over every open class.
     /// - The default's first step, which answers its prefill
-    ///   ([`vetoed::paired_prefill`]). The live decode profile stands on
+    ///   ([`vetoed::shadow_prefill`]). The live decode profile stands on
     ///   the other side.
     ///
     /// Where the default answers nothing, the run's own refusal stands: a
     /// shadow is compared by its outcome.
     ///
+    /// The default asks the live decode profile's hard filters behind the
+    /// decision they stood in. It is asked only where each of them reads a
+    /// row alone and holds no decision scope ([`Half::reads_rows_alone`]).
+    /// Another filter may answer otherwise there, and the side says `None`.
+    ///
     /// The mark on the prefill's buffer says a pair the default made.
     /// Beside such a pair the decode's shadow is the default's second step
     /// for the live pair's prefill ([`vetoed::paired_decode`]). It reads
     /// the decodes its own profile's hard filters keep in the pass that
-    /// paired. The prefill's shadow leaves the mark as it found it: the
-    /// decode's shadow runs behind it on one scratch.
+    /// paired. Where they keep no partner of that prefill, it sheds under
+    /// `partners`, as a decode side with no partner does.
+    ///
+    /// The prefill's shadow leaves the classes and the mark as it found
+    /// them, where it panics too. The decode's shadow runs behind it on
+    /// one scratch.
     ///
     /// A pair that a weighing prefill profile's lifted run placed
     /// ([`Self::weighing_lift`]) is a pair of the profiles. Each shadow
     /// runs beside it as beside any other. A prefill's shadow that does
-    /// not weigh takes the default's prefill there.
+    /// not weigh asks the default there.
     ///
     /// `None` where the binding names no shadow for the side, where the
     /// build did not find that profile free to run beside the live one
@@ -8999,6 +9018,10 @@ impl Engine {
     /// is put to neither, and its bare profile set beside a key's pin
     /// would say nothing true of the profile. A request with no key under
     /// a rule is its profiles', and its sides' shadows run.
+    ///
+    /// `None` too for a prefill's shadow whose default may not be asked,
+    /// as said above, and only where the default would be asked. Its own
+    /// pick stands, and so does its limit's shed.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair's entry and its inputs, beside the side and the live pick"
@@ -9053,12 +9076,14 @@ impl Engine {
             PairSide::Prefill => {
                 // The prefills the live prefill profile was shown: the
                 // classes with a partner stand in the scratch as the
-                // pair's decision left them ([`Self::decide_pair`]). No
-                // stage of a live profile is asked again. Its decision's
-                // scope closed with it, and a stage asked behind it
-                // answers by its fallback. The shadow's run is lifted by
-                // its own profile's word, as the live run is by the live
-                // profile's ([`Self::weighing_lift`]).
+                // pair's decision left them ([`Self::decide_pair`]). The
+                // shadow's own runs ask no stage of a live profile again.
+                // Its decision's scope closed with it, and a stage asked
+                // behind it answers by its fallback. The default below
+                // asks the live decode profile's hard filters, and only
+                // where each reads a row alone. The shadow's run is lifted
+                // by its own profile's word, as the live run is by the
+                // live profile's ([`Self::weighing_lift`]).
                 let lifted_run = self.weighing_lift(index, entry.vetoed, cx);
                 let run_cx = lifted_run.as_ref().unwrap_or(cx);
                 // A refusal the pair's decision goes on from: a shed that is
@@ -9071,7 +9096,17 @@ impl Engine {
                 // for its place behind its filter half ([`run_side_lent`]).
                 let own = |classes: &[u32], buf: &mut Buffers| {
                     let set = Set::side(prefills, None, Some(classes));
-                    run_side_lent(profile, index, &prefill_facts, pool, set, run_cx, buf, None, &lent)
+                    run_side_lent(
+                        profile,
+                        index,
+                        &prefill_facts,
+                        pool,
+                        set,
+                        run_cx,
+                        buf,
+                        None,
+                        &lent,
+                    )
                 };
                 let mut run = own(&scratch.classes, &mut scratch.single);
                 // A run that sheds goes the live decision's way. Among
@@ -9084,18 +9119,20 @@ impl Engine {
                 let firsts_shed = scratch.among_first && refused(&run);
                 let waits = firsts_shed && takes.waits_among(&scratch.classes);
                 if waits {
+                    // The limit's shed names the prefill side, as the live
+                    // decision's does.
                     let limit = HasCapacity.name();
-                    run = shed(reason_of(limit), limit, *run.trace());
+                    run = shed(reason_of(limit), limit, *run.trace()).of_side(PairSide::Prefill);
                 } else if firsts_shed {
                     run = own(&scratch.firsts, &mut scratch.single);
                 }
                 // A run that still sheds goes to the pair's default for
                 // its prefill, the live decode profile on the other side.
                 // The default reads every open class and the constraints
-                // as they are stated, and writes both buffers' marks. The
-                // decode side's facts are this run's, with no ring where
-                // the shadow is lent none: that step asks the decode
-                // profile's hard filters alone, and none reads a ring.
+                // as they are stated. The decode side's facts are this
+                // run's, with no ring where the shadow is lent none: that
+                // step asks the decode profile's hard filters alone, and
+                // none of the crate's own reads a ring.
                 if !waits && refused(&run) {
                     let live_decode = lives[PairSide::Decode.index()];
                     let live_decode_profile = self.profiles.get(usize::from(live_decode))?;
@@ -9109,20 +9146,21 @@ impl Engine {
                             decode_cx,
                         ),
                     ];
+                    // Those filters stood in the pair's decision, which is
+                    // over. One that reads more than a row, or that holds
+                    // a decision scope, may answer otherwise behind it:
+                    // the side says none.
+                    if !sides[1].reads_rows_alone() {
+                        return None;
+                    }
+                    // The step leaves the classes and the mark as it found
+                    // them: the decode's shadow reads both behind this one.
                     let words = (steers, self.weighs(index));
-                    if scratch.among_first {
-                        std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
-                    }
+                    let table = &pools.table;
                     let taken =
-                        vetoed::paired_prefill::<true>(sides, &pools.table, words, pool, scratch);
-                    if scratch.among_first {
-                        std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
-                    }
+                        vetoed::shadow_prefill(sides, table, words, pool, scratch, defaulted);
                     run = taken.unwrap_or(run);
                 }
-                // The decode's shadow runs behind this one on the same
-                // scratch and reads the live pair's mark there.
-                scratch.single.lifted = defaulted;
                 run
             }
             PairSide::Decode => {
@@ -9156,13 +9194,22 @@ impl Engine {
                     // every partner alike.
                     let half = Half::new(profile, index, &decode_facts, decodes, decode_cx);
                     half.usable(defaulted, steers, &mut scratch.decode);
-                    vetoed::paired_decode::<true>(
-                        &half,
-                        &pools.table,
-                        class,
-                        pool,
-                        &mut scratch.decode,
-                    )
+                    let (table, buf) = (&pools.table, &mut scratch.decode);
+                    match vetoed::paired_decode::<true>(&half, table, class, pool, buf) {
+                        // The shadow's filters kept no partner of the live
+                        // prefill in that pass, and the step's pick names
+                        // nobody. The shadow sheds as a decode side with
+                        // no partner does, and no veto was lifted for it.
+                        Decision::Pick(pick) if pick.targets.is_empty() => {
+                            let trace = Trace {
+                                lifted: LiftedVeto::None,
+                                ..pick.trace
+                            };
+                            shed(ShedReason::NoEndpoints, "partners", trace)
+                                .of_side(PairSide::Decode)
+                        }
+                        step => step,
+                    }
                 }
             }
         })
