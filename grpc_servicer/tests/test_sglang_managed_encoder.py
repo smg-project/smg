@@ -1149,3 +1149,25 @@ def test_configure_meta_registry_sweep_timeout_edge_cases(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "sglang.srt.disaggregation.encoder.server", None)
     assert epd_encoder._configure_meta_registry_sweep_timeout() is None
+
+
+def test_encoder_staging_bytes_prefers_loaded_encoder_dims_and_element_size():
+    hf_cfg = SimpleNamespace(vision_config={"deepstack_visual_indexes": [8, 16, 24]})
+    loaded = SimpleNamespace(
+        _embedding_dims={"image": 20480, "video": 12288},
+        _element_size=2,
+        _embedding_dtype="bfloat16",
+        model_config=SimpleNamespace(hidden_size=4096),
+    )
+    assert (
+        epd_launcher._encoder_staging_bytes(loaded, hf_cfg, "bfloat16", max_tokens=100)
+        == 100 * 20480 * 2
+    )
+    fallback = SimpleNamespace(
+        _embedding_dtype="float16",
+        model_config=SimpleNamespace(hidden_size=4096),
+    )
+    assert (
+        epd_launcher._encoder_staging_bytes(fallback, hf_cfg, "bfloat16", max_tokens=100)
+        == 100 * (4096 * 4) * 2
+    )
