@@ -19,9 +19,9 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::view::{Role, WorkerId},
     store::{
-        identity, GatewayId, HealthSink, Journal, LeasesStore, MembershipChange, MembershipTail,
-        MemoryStore, OutsideLists, Position, StoreCheckpoint, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        identity, GatewayId, HealthSink, Journal, LeasesStore, MembershipChange, MemoryStore,
+        OutsideLists, Position, StoreCheckpoint, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+        WorkersStore,
     },
 };
 
@@ -939,8 +939,6 @@ fn a_restore_leaves_nothing_of_the_tables_it_replaces() {
     assert!(WorkersStore::get(&store, gone).is_none());
     assert!(!store.vetoed(ASKER, kept, now), "the veto in the table");
     assert!(!held(&store), "the veto in the world");
-    // A watcher of the store that was reads no change across the restore.
-    assert_eq!(store.changes_since(0), MembershipTail::SnapshotRequired);
     // And the key that left is free: its next registration is a first one.
     assert_eq!(
         store.upsert(facts("http://gone:8000", 1)),

@@ -317,6 +317,29 @@ impl Targets {
     pub fn iter(&self) -> std::slice::Iter<'_, Target> {
         self.as_slice().iter()
     }
+
+    /// Numbers each target's rows anew where the target stands: its own
+    /// position by `position` and its pair's decode by `decode_position`,
+    /// each where one is handed. A decision that numbered a pool's rows
+    /// itself hands its pick back by its host's rows so. It moves positions
+    /// alone: the list keeps its targets in their order, its word of who
+    /// placed it and what it states of its first target, which are the
+    /// decision's whatever its rows were numbered by. A list built anew
+    /// would state neither.
+    pub(crate) fn renumber(
+        &mut self,
+        position: Option<impl Fn(u32) -> u32>,
+        decode_position: Option<impl Fn(u32) -> u32>,
+    ) {
+        for target in &mut self.items[..usize::from(self.len)] {
+            if let Some(position) = &position {
+                target.position = position(target.position);
+            }
+            if let (Some(pair), Some(position)) = (&mut target.pair, &decode_position) {
+                pair.decode_position = position(pair.decode_position);
+            }
+        }
+    }
 }
 
 /// Why a decision shed the request. The host maps each reason to its status

@@ -105,15 +105,95 @@ fn a_plain_page_stops_at_its_bytes_even_for_its_first_row() {
     assert!(too_large.rows.is_empty() && too_large.truncated);
 }
 
+/// A page's bytes count the block of demand facts by what each worker
+/// states. Where a worker states every fact at its longest, its row's
+/// measure grows by what its JSON grows. A page of short rows keeps its
+/// JSON inside the page's bytes, whether its workers state the facts or
+/// state none.
+#[test]
+fn a_page_counts_the_demand_facts_its_rows_tell() {
+    use crate::{
+        engine::{view::WorkerId, DemandFacts},
+        store::{WorkerFacts, WorkerStatus},
+    };
+
+    let now = Instant::now();
+    let longest = DemandFacts {
+        runtime: u32::MAX,
+        references: false,
+        host_pipeline: false,
+        window: u32::MAX,
+        decoding: u8::MAX,
+    };
+    let row = |n: u64, demand_facts| {
+        let address = format!("http://10.0.{}.{}:8000", n / 256, n % 256);
+        WorkerRow {
+            id: WorkerId(n),
+            facts: WorkerFacts {
+                key: address.clone(),
+                engine: address,
+                incarnation: 1,
+                dp_size: 1,
+                models: vec!["m".to_owned()],
+                demand_facts,
+                ..WorkerFacts::default()
+            },
+            status: WorkerStatus::Ready,
+            revision: 1,
+            admitted_at: now,
+            maker: Registrant::Control,
+        }
+    };
+    let json =
+        |row: &WorkerRow| serde_json::to_string(&RowJson::of(row, now)).expect("a row's JSON");
+
+    let (silent, stating) = (row(1, DemandFacts::default()), row(1, longest));
+    let (told_none, told) = (json(&silent), json(&stating));
+    assert!(
+        told_none.ends_with(r#","demand_facts":null}"#),
+        "{told_none}"
+    );
+    assert_eq!(r#","demand_facts":null"#.len(), NO_DEMAND_FACTS_BYTES);
+    assert_eq!(
+        told.len() - told_none.len(),
+        DEMAND_FACTS_BYTES - NO_DEMAND_FACTS_BYTES,
+        "{told}"
+    );
+    assert_eq!(
+        measure(&stating) - measure(&silent),
+        told.len() - told_none.len()
+    );
+
+    let asked = WorkerRowsQuery {
+        models: Vec::new(),
+        limit: usize::MAX,
+    };
+    for stated in [longest, DemandFacts::default()] {
+        let rows: Vec<WorkerRow> = (0..4_000).map(|n| row(n, stated)).collect();
+        let serving = rows.len();
+        let page = worker_rows_page(&asked, Rows::Told(rows, serving), now);
+        let bytes = serde_json::to_vec(&page).expect("a page's JSON").len();
+        assert!(
+            page.truncated && bytes <= PAGE_BYTES,
+            "{stated:?}: {bytes} bytes in {} rows",
+            page.rows.len()
+        );
+    }
+}
+
 /// A page's JSON, literally: a row that states every fact, a
 /// provider's among them with a credential in its key and in its own,
-/// and a row that states the least, admitted after the take.
+/// and a row that states the least, admitted after the take. The first
+/// tells what its worker states for a request's hard demands, each fact
+/// a value of its own, and the second tells none. A third states a
+/// window and a pipeline of its host's with no runtime, and tells its
+/// block all the same.
 #[test]
 fn a_page_writes_its_rows_as_an_operator_reads_them() {
     use std::time::Duration;
 
     use crate::{
-        engine::view::WorkerId,
+        engine::{view::WorkerId, DemandFacts},
         store::{
             pairing::PairingDescriptor, EncodeOffer, GatewayId, Overload, Signals, WorkerFacts,
             WorkerStatus,
@@ -168,6 +248,13 @@ fn a_page_writes_its_rows_as_an_operator_reads_them() {
                 kv_usage_permille: Some(900),
                 waiting_requests: Some(64),
             },
+            demand_facts: DemandFacts {
+                runtime: 7,
+                references: true,
+                host_pipeline: false,
+                window: 4_096,
+                decoding: 3,
+            },
             ..WorkerFacts::default()
         },
         status: WorkerStatus::Ready,
@@ -193,7 +280,21 @@ fn a_page_writes_its_rows_as_an_operator_reads_them() {
         models: Vec::new(),
         limit: usize::MAX,
     };
-    let page = worker_rows_page(&asked, Rows::Told(vec![full, least], 2), taken);
+    let windowed = WorkerRow {
+        id: WorkerId(2),
+        facts: WorkerFacts {
+            key: "http://c:1".to_owned(),
+            engine: "http://c:1".to_owned(),
+            demand_facts: DemandFacts {
+                host_pipeline: true,
+                window: 2_048,
+                ..DemandFacts::default()
+            },
+            ..least.facts.clone()
+        },
+        ..least.clone()
+    };
+    let page = worker_rows_page(&asked, Rows::Told(vec![full, least, windowed], 3), taken);
     let probes = serde_json::json!({
         "failure_threshold": 3,
         "success_threshold": 2,
@@ -201,7 +302,7 @@ fn a_page_writes_its_rows_as_an_operator_reads_them() {
         "timeout_ms": 5_000,
         "disabled": false
     });
-    let expected = serde_json::json!({
+    let mut expected = serde_json::json!({
         "rows": [
             {
                 "id": "00000000000000ab",
@@ -239,7 +340,14 @@ fn a_page_writes_its_rows_as_an_operator_reads_them() {
                 "signals": {"events": true, "loads": true, "scrape_interval_ms": 0},
                 "health_policy": probes,
                 "admitted_age_ms": 1500,
-                "maker": {"provider": "finder", "key": "http://host/x"}
+                "maker": {"provider": "finder", "key": "http://host/x"},
+                "demand_facts": {
+                    "runtime": 7,
+                    "references": true,
+                    "host_pipeline": false,
+                    "window": 4096,
+                    "decoding": 3
+                }
             },
             {
                 "id": "0000000000000001",
@@ -265,11 +373,29 @@ fn a_page_writes_its_rows_as_an_operator_reads_them() {
                 "signals": {"events": false, "loads": false, "scrape_interval_ms": 0},
                 "health_policy": probes,
                 "admitted_age_ms": 0,
-                "maker": null
+                "maker": null,
+                "demand_facts": null
             }
         ],
         "truncated": false
     });
+    // The third row reads as the second but for its id, its two addresses
+    // and its block.
+    let mut third = expected["rows"][1].clone();
+    third["id"] = "0000000000000002".into();
+    third["registration_key"] = "http://c:1".into();
+    third["engine"] = "http://c:1".into();
+    third["demand_facts"] = serde_json::json!({
+        "runtime": 0,
+        "references": false,
+        "host_pipeline": true,
+        "window": 2048,
+        "decoding": 0
+    });
+    expected["rows"]
+        .as_array_mut()
+        .expect("the rows")
+        .push(third);
     assert_eq!(
         serde_json::to_value(&page).expect("a page's JSON"),
         expected

@@ -9,7 +9,10 @@
 //! object of the row the event tells, hands the store the event
 //! ([`MemoryStore::follow_landed`]), and puts the object in the registry
 //! where the store took it. So the object stands when the applier goes on
-//! to its next event.
+//! to its next event. With a change that takes a row out, a removal or a
+//! key's next life, the holder hands the store that row as read back from
+//! its object, as at a leader's write: the standby's own log is told from
+//! it. Where no object stands under the row's id, the store tells its own.
 //!
 //! The order is the one of a leader's write. The store is told between the
 //! build and the registry's write, and a removal's object leaves the
@@ -20,7 +23,9 @@
 //!
 //! The wire tells a row's age, not the instant it was admitted at. A row
 //! an event changes in place keeps the instant its entry holds, as the
-//! store keeps its own row's.
+//! store keeps its own row's. A row of a watch's snapshot whose object
+//! stands keeps it too. The holder states it on the snapshot's row before
+//! the store takes the snapshot, and the store keeps none there.
 //!
 //! A told status is the leader's word. A status event is handed to the
 //! store, and the holder lays the status on the object in the same turn.
@@ -31,9 +36,9 @@
 //! table's status to an object's where the objects lead. The other is a
 //! tell the store refuses ([`mod@super::status`]).
 //!
-//! A restore is the store's restore and the read of its rows in one turn
-//! of the holder: nothing that takes the turn finds the objects of one
-//! history beside the rows of another.
+//! A restore is the store's restore and the lay of the cut's own rows in
+//! one turn of the holder. No row is read back. Nothing that takes the
+//! turn finds the objects of one history beside the rows of another.
 //!
 //! A gateway's watcher hands the holder the same two: each change of its
 //! watch's tail ([`Objects::follow_at`]), and the watch's snapshot at its
@@ -51,9 +56,7 @@
 use smg_worker::registry::Generation;
 
 use super::Objects;
-use crate::store::{
-    MembershipChange, MemoryStore, Position, StoreCheckpoint, WorkerRow, WorkersStore,
-};
+use crate::store::{MembershipChange, MemoryStore, Position, StoreCheckpoint, WorkerRow};
 
 #[cfg_attr(
     not(any(test, feature = "controller")),
@@ -79,10 +82,12 @@ impl<G: Generation> Objects<G> {
     ) -> bool {
         let _turn = self.turn.lock();
         match (change, row) {
-            // The object leaves the registry, then the store is told.
+            // The row is read back, the object leaves the registry, then
+            // the store is told and handed the row.
             (MembershipChange::Removed { id }, None) => {
+                let mut left = self.row(id);
                 self.end(id);
-                let landed = store.follow_landed(at, epoch, change, None);
+                let landed = store.follow_landed(at, epoch, change, None, left.as_mut());
                 if !landed {
                     self.settle(store, id);
                 }
@@ -93,13 +98,17 @@ impl<G: Generation> Objects<G> {
                     change,
                     MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. }
                 ) {
-                    let stood = self.object(row.id);
-                    if let Some(stood) = stood.and_then(|object| self.remainder(&object)) {
-                        row.admitted_at = stood.admitted_at;
-                    }
+                    self.keep_admitted(&mut row);
                 }
+                // A key's next life takes the old life's row out: the store
+                // is handed that row, read back from its object.
+                let mut left = match change {
+                    MembershipChange::Replaced { old, .. } => self.row(old),
+                    _ => None,
+                };
                 let built = self.build(&row);
-                let landed = store.follow_landed(at, epoch, change, Some(row.clone()));
+                let told = Some(row.clone());
+                let landed = store.follow_landed(at, epoch, change, told, left.as_mut());
                 if landed {
                     self.put(store, &row, built);
                     // The row's status is the leader's word too.
@@ -109,7 +118,7 @@ impl<G: Generation> Objects<G> {
             }
             // A told status: the table takes it, and the object behind it.
             (change, None) => {
-                let landed = store.follow_landed(at, epoch, change, None);
+                let landed = store.follow_landed(at, epoch, change, None, None);
                 if let (true, MembershipChange::StatusChanged { id, .. }) = (landed, change) {
                     self.copy_status(store, id);
                 }
@@ -118,45 +127,62 @@ impl<G: Generation> Objects<G> {
         }
     }
 
+    /// `row` takes the instant its object's entry holds, where an object
+    /// stands under its id. The wire tells a row's age, so a row told again
+    /// comes with an instant of its own.
+    fn keep_admitted(&self, row: &mut WorkerRow) {
+        let stood = self.object(row.id);
+        if let Some(stood) = stood.and_then(|object| self.remainder(&object)) {
+            row.admitted_at = stood.admitted_at;
+        }
+    }
+
     /// The leader's snapshot whole: the write of
     /// [`MemoryStore::restore_from`], laid here. The store is restored and
-    /// its rows are read in one turn, so the objects of the cut's rows
-    /// stand when this returns. `false`, with the store and the objects as
-    /// they were, where the store refuses the cut's place.
+    /// the cut's rows are laid in one turn, so their objects stand when
+    /// this returns. `false`, with the store and the objects as they were,
+    /// where the store refuses the cut's place.
     pub(crate) fn restore_from(&self, store: &MemoryStore, cut: StoreCheckpoint) -> bool {
+        let _turn = self.turn.lock();
         self.laid_whole(store, cut, MemoryStore::restore_from)
     }
 
     /// A watch's snapshot whole, at its last page: the write of
     /// [`MemoryStore::watch_from`], laid here as a restore is. The objects
     /// of the snapshot's rows stand when this returns, and a row the
-    /// snapshot drops has none. `false`, with the store and the objects as
-    /// they were, where the store refuses the snapshot's place.
+    /// snapshot drops has none. A row whose object stands keeps the instant
+    /// it was admitted at ([`Self::keep_admitted`]): a restore keeps none.
+    /// `false`, with the store and the objects as they were, where the
+    /// store refuses the snapshot's place.
     #[cfg_attr(
         not(any(test, feature = "client")),
         expect(dead_code, reason = "a gateway's watcher lays its snapshot here")
     )]
-    pub(crate) fn watch_from(&self, store: &MemoryStore, cut: StoreCheckpoint) -> bool {
+    pub(crate) fn watch_from(&self, store: &MemoryStore, mut cut: StoreCheckpoint) -> bool {
+        let _turn = self.turn.lock();
+        for row in &mut cut.rows {
+            self.keep_admitted(row);
+        }
         self.laid_whole(store, cut, MemoryStore::watch_from)
     }
 
-    /// One body for a cut the store takes whole: `door` is the store's own
-    /// entry for it. The store's write and the read of its rows are one
-    /// turn of the holder. The rows are read once, whole, and each is held
-    /// against the object that stands for it ([`Self::reconcile`]). The
-    /// keeper forgets the rows that left behind the read.
+    /// One body for a cut the store takes whole, under the holder's turn
+    /// its caller holds: `door` is the store's own entry for it. The
+    /// holder keeps the cut's own rows and reads none back. Each is held
+    /// against the object that stands for it ([`Self::reconcile`]), on its
+    /// own: the rows' order moves no object. The keeper forgets the rows
+    /// that left behind the store's write.
     fn laid_whole(
         &self,
         store: &MemoryStore,
         cut: StoreCheckpoint,
         door: impl FnOnce(&MemoryStore, StoreCheckpoint) -> bool,
     ) -> bool {
-        let _turn = self.turn.lock();
+        let rows = cut.rows.clone();
         if !door(store, cut) {
             return false;
         }
         let read = self.keeper_clock();
-        let (_, rows) = store.all_rows();
         self.reconcile(store, &rows);
         self.forget_left(read);
         // A cut's statuses are told ones, as a status event's is.

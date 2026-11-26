@@ -91,7 +91,7 @@ use crate::{
         view::Phase,
     },
     service::{
-        client::{wire, DecisionUnavailable, Error, Link},
+        client::{reads_demands, wire, DecisionUnavailable, Error, Link},
         proto,
     },
 };
@@ -910,11 +910,32 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// answer busy at its receipt. A request built for the door in process
     /// carries that budget unless its host states one.
     ///
-    /// A request that states a hard demand is answered
+    /// A single request that states a hard demand states it in its frame
+    /// (`DecideRequest.demands`), and the controller keeps the workers that
+    /// meet it. That takes a session whose welcome chose protocol 2, or a
+    /// later version the link's hello offered. Any other request that
+    /// states one is answered
     /// [`DecisionUnavailable::Unsent`] with [`Error::OutOfRange`] before
-    /// anything is sent. This protocol version states no demand, and a
-    /// controller that reads none would pick among workers the demand rules
-    /// out. Its host decides such a request itself.
+    /// anything is sent, and its host decides it itself:
+    ///
+    /// - a request over a session on protocol 1, whose controller may read no
+    ///   demand and would then pick among workers the demand rules out, or
+    ///   on a version the hello did not offer
+    /// - a request at a side's phase, an encode request and one that names
+    ///   its worker, which a controller holds to no demand yet
+    /// - a request that demands vision, by that part's name, since no
+    ///   registration over the wire states whether a worker takes images
+    ///
+    /// A shed keeps the stage of the demand that left nobody
+    /// (`Shed::emptied_by`), as the door in process names it. Any other
+    /// stage of a controller's shed reads `controller`.
+    ///
+    /// A request's places and its stalled and held rows are positions of
+    /// its host's own list. They cross with no request, with a demand or
+    /// without one (`Constraints::places`).
+    ///
+    /// Where the link's session changes under an ask, the link refuses the
+    /// frame itself, by the frame's field `demands`.
     pub async fn asked(
         link: &Link,
         request: &Request<'_>,
@@ -939,7 +960,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// available. The decision is held to the worker the number reaches,
     /// and the answer names that worker or sheds the request with no
     /// endpoint. The frame names `target-worker` for that shed, and this
-    /// handle reads it as `controller`, as it reads every shed's stage.
+    /// handle reads it as `controller`, as it reads every stage but a
+    /// demand's ([`Self::asked`]).
     /// Where this gateway can be sent to no worker of the list, the request
     /// is decided as one that names no worker, with neither its session
     /// key nor its client's key, and the answer is that decision's. A
@@ -980,7 +1002,7 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         now: Instant,
         budget: Duration,
     ) -> Result<Self, DecisionUnavailable> {
-        Self::sendable(request)?;
+        Self::sendable(link, request, named.is_some())?;
         Self::answered(link, wire::request(request, named), now, budget, |_, _| {
             Ok(())
         })
@@ -1020,7 +1042,7 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         budget: Duration,
     ) -> Result<Self, DecisionUnavailable> {
         placed.clear();
-        Self::sendable(request)?;
+        Self::sendable(link, request, false)?;
         if request.facts.phase != Phase::Prefill {
             return Err(DecisionUnavailable::Unsent(Error::OutOfRange(
                 "facts.phase",
@@ -1034,15 +1056,49 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     }
 
     /// What a handle refuses of a request before anything is sent: a
-    /// budget of 0, and a hard demand.
-    fn sendable(request: &Request<'_>) -> Result<(), DecisionUnavailable> {
+    /// budget of 0, and a hard demand its controller would not hold
+    /// ([`Self::demands_sendable`]). `named` is whether the request names
+    /// its worker.
+    fn sendable(
+        link: &Link,
+        request: &Request<'_>,
+        named: bool,
+    ) -> Result<(), DecisionUnavailable> {
         if request.facts.budget_micros == 0 {
             return Err(DecisionUnavailable::Late);
         }
-        if !request.constraints.demands.is_none() {
-            return Err(DecisionUnavailable::Unsent(Error::OutOfRange(
-                "constraints.demands",
-            )));
+        if request.constraints.demands.is_none() {
+            return Ok(());
+        }
+        Self::demands_sendable(link, request, named)
+    }
+
+    /// Whether a request's hard demands go out in its frame. They do for a
+    /// single request that names no worker, over a session whose welcome
+    /// chose a protocol that states them. The part that demands vision
+    /// never does. Out of line: a request that demands nothing reads none
+    /// of it.
+    #[cold]
+    #[inline(never)]
+    fn demands_sendable(
+        link: &Link,
+        request: &Request<'_>,
+        named: bool,
+    ) -> Result<(), DecisionUnavailable> {
+        let unsent = |field| Err(DecisionUnavailable::Unsent(Error::OutOfRange(field)));
+        // A controller on protocol 1 reads no demand, and a welcome on a
+        // version the hello did not offer says nothing of it. One on
+        // protocol 2 holds it on a single request's frame that names no
+        // worker. So no demand is dropped on the way.
+        if !reads_demands(link.welcome().protocol) || request.facts.phase != Phase::Single || named
+        {
+            return unsent("constraints.demands");
+        }
+        // No registration over the wire states whether a worker takes
+        // images, so a controller sheds a request that demands it unless
+        // its own host laid such a worker.
+        if request.constraints.demands.vision {
+            return unsent("constraints.demands.vision");
         }
         Ok(())
     }

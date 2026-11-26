@@ -2,6 +2,32 @@ use std::{sync::atomic::AtomicBool, thread};
 
 use super::*;
 
+#[cfg(feature = "controller")]
+impl SerialTurn {
+    /// Every place left, taken for a case.
+    pub(crate) fn fill(&self) -> Vec<impl Send + use<>> {
+        std::iter::from_fn(|| self.enter::<fn()>(None)).collect()
+    }
+
+    /// One place, taken for a case.
+    pub(crate) fn place(&self) -> Option<impl Send + use<>> {
+        self.enter::<fn()>(None)
+    }
+
+    /// The turn by itself, so a case can hold it while callers enter.
+    pub(crate) async fn hold(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.turn).lock_owned().await
+    }
+
+    pub(crate) fn available(&self) -> usize {
+        self.waiting + 1 - self.let_in()
+    }
+
+    pub(crate) fn is_held(&self) -> bool {
+        self.turn.try_lock().is_err()
+    }
+}
+
 /// Of calls that leave together one alone is the last out: a place
 /// goes back and the count is read in one step. Two places go back
 /// from two threads at one instant, round after round.

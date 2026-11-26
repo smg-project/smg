@@ -485,6 +485,13 @@ impl CacheIndex for KvIndex {
         }
     }
 
+    /// The index's own test, the one the classic policy asks before every
+    /// request ([`Self::is_empty`]): the engine asks it where a decision
+    /// takes its list's table.
+    fn holds_a_block(&self) -> bool {
+        !self.is_empty()
+    }
+
     fn worker_blocks(&self, number: u32) -> usize {
         self.worker_block_count(number)
     }

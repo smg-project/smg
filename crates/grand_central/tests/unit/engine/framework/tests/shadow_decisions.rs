@@ -66,7 +66,7 @@ fn commit(engine: &Engine, facts: &RequestFacts<'_>, live: &Decision, at: usize)
 fn a_shadow_beside_a_live_profile_that_reads_no_ring_keeps_the_lent_ring() {
     use crate::policies::{
         cache_aware::Gates,
-        consistent_hashing::{ConsistentHash, InOrder},
+        consistent_hashing::{tests::InOrder, ConsistentHash},
     };
 
     let mut rows = [candidate(0, 3), candidate(1, 5), candidate(2, 9)];
@@ -523,7 +523,7 @@ fn shadow_twin_decides_as_the_live_profile_on_every_path() {
                 // The key's pin, as an earlier dispatch left it.
                 let table = engine.sessions();
                 table.lookup(facts.session(), 10, &SESSIONS);
-                table.dispatched(facts.session(), SessionVerdict::Pinned, free[1].id);
+                table.dispatched(facts.session(), SessionVerdict::Pinned, free[1].id, 0);
             }
             engine
         };
@@ -844,7 +844,7 @@ fn shadow_fails_over_to_the_second_pin_the_live_decision_read() {
     for row in [&rows[1], &rows[0]] {
         engine
             .sessions()
-            .dispatched(key, SessionVerdict::Respill, row.id);
+            .dispatched(key, SessionVerdict::Respill, row.id, 0);
     }
     assert_eq!(engine.sessions().pins(key), Some([rows[0].id, rows[1].id]));
     rows[0].health.healthy = false;
@@ -905,7 +905,7 @@ fn shadow_follows_a_pin_the_live_filters_left_out() {
     let (pool, cx) = (PoolFacts::default(), Constraints::default());
     let table = engine.sessions();
     table.lookup(facts.session(), 10, &SESSIONS);
-    table.dispatched(facts.session(), SessionVerdict::Pinned, rows[0].id);
+    table.dispatched(facts.session(), SessionVerdict::Pinned, rows[0].id, 0);
     let mut scratch = Scratch::new();
     let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
     assert_eq!(commit(&engine, &facts, &live, 0), rows[1].id);
@@ -1009,8 +1009,8 @@ fn shadow_of_another_profile_keeps_its_pick_where_the_claim_found_no_new_pin() {
     let key = facts.session();
     let table = engine.sessions();
     table.lookup(key, 10, &SESSIONS);
-    table.dispatched(key, SessionVerdict::Pinned, rows[0].id);
-    table.dispatched(key, SessionVerdict::Pinned, rows[1].id);
+    table.dispatched(key, SessionVerdict::Pinned, rows[0].id, 0);
+    table.dispatched(key, SessionVerdict::Pinned, rows[1].id, 0);
     assert_eq!(table.pins(key), Some([rows[1].id, rows[0].id]));
     let turned = rows[0].id;
     let cx = Constraints::default();
@@ -1020,7 +1020,7 @@ fn shadow_of_another_profile_keeps_its_pick_where_the_claim_found_no_new_pin() {
             // Another request's respill, once the live decision has
             // read the key: both pins stay, turned.
             if went.recv_timeout(Duration::from_secs(10)).is_ok() {
-                table.dispatched(key, SessionVerdict::Respill, turned);
+                table.dispatched(key, SessionVerdict::Respill, turned, 0);
             }
             let _ = did.send(());
         });
@@ -1100,7 +1100,7 @@ fn shadow_follows_the_pin_that_came_in_where_the_claim_was_not_taken() {
         let key = facts.session();
         let table = engine.sessions();
         table.lookup(key, 10, &rule);
-        table.dispatched(key, SessionVerdict::Pinned, pinned);
+        table.dispatched(key, SessionVerdict::Pinned, pinned, 0);
         let cx = Constraints::default();
         let mut scratch = Scratch::new();
         let live = std::thread::scope(|scope| {
@@ -1108,7 +1108,7 @@ fn shadow_follows_the_pin_that_came_in_where_the_claim_was_not_taken() {
                 // Another request's dispatch, once the live decision
                 // has read the key: the newcomer joins behind the pin.
                 if went.recv_timeout(Duration::from_secs(10)).is_ok() {
-                    table.dispatched(key, SessionVerdict::Pinned, newcomer);
+                    table.dispatched(key, SessionVerdict::Pinned, newcomer, 0);
                 }
                 let _ = did.send(());
             });

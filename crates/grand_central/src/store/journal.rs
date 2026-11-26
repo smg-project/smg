@@ -8,11 +8,6 @@
 //! follow, and a store without one (a gateway deciding in its own process)
 //! pays one branch a write.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use crate::store::workers::{MembershipChange, WorkerRow};
 
 /// A place in a store's history: the number of a replicated write, and the
@@ -22,7 +17,11 @@ use crate::store::workers::{MembershipChange, WorkerRow};
 /// Two stores that agree on a position and its term share the history
 /// before it (the replication contract's rejoin rule): a term is led by one
 /// replica, and a follower writes a position only as its leader wrote it.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Position {
     /// The write's number, above that of the write before it: the next
     /// number under a leader's term, and under no term past every number
@@ -46,11 +45,12 @@ pub struct Position {
 pub trait Journal: Send + Sync {
     /// A membership or status write: the epoch it made, the change, the
     /// row it is about as the write leaves it (`None` for a removal) and
-    /// the row the write took out of the table (a removal's row, a
-    /// replacement's old incarnation). Where a write's writer handed the
-    /// store the row it leaves, that row is told and the table then takes
-    /// it. A write that hands none, a status among them, tells the row as
-    /// the table holds it. `at` is the place of the
+    /// the row the write took out (a removal's row, a replacement's old
+    /// incarnation). Where a write's writer handed the store the row it
+    /// leaves, that row is told and the table then takes it. Where it
+    /// handed the row the write takes out, that row is told with the
+    /// table's status. A write that hands none, a status among them,
+    /// tells the row as the table holds it. `at` is the place of the
     /// leader's event the write applies, on a store that follows
     /// ([`crate::store::MemoryStore::follow`]), and none for a write of the
     /// store's own: a journal keeps that place for the applier's write

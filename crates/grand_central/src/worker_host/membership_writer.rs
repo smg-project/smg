@@ -38,6 +38,18 @@ pub enum MembershipWriteOutcome {
     Removed(WorkerId),
 }
 
+impl MembershipWriteOutcome {
+    /// The row a registration's write stands on: the new one of a
+    /// replacement. A removal's answers name no such row.
+    pub(super) fn written_row(&self) -> Option<WorkerId> {
+        match *self {
+            Self::Registered(row) | Self::InPlace(row) | Self::Unmoved(row) => Some(row),
+            Self::Another { new, .. } => Some(new),
+            Self::Draining(_) | Self::Removed(_) => None,
+        }
+    }
+}
+
 /// A write the door refused. Nothing was written, with one exception: a
 /// registration's rows refused as [`MembershipWriteRefused::NotLeading`] behind
 /// their first write keep the rows written before the lead was lost.

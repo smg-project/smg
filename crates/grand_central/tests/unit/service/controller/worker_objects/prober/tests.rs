@@ -13,7 +13,7 @@ use tokio::{
     time,
 };
 
-use super::{super::lead::lasting, *};
+use super::{super::lead::tests::lasting, *};
 use crate::{
     engine::view::{WireModes, WorkerId},
     service::{

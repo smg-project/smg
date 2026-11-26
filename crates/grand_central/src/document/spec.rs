@@ -40,8 +40,6 @@ use sha2::{Digest as _, Sha256};
 
 // The crate's own paths through this module still name the type here.
 pub(crate) use crate::document::applied::AppliedSpec;
-#[cfg(test)]
-use crate::engine::view::HashKind;
 use crate::{
     engine::{
         framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, WeightedScorer},
@@ -589,7 +587,11 @@ pub struct IndexSpec {
     /// the engine's upkeep.
     #[schemars(range(min = 1))]
     pub max_size: u64,
-    /// The index's sweep cadence, in seconds.
+    /// The index's sweep cadence, in seconds. At each sweep the gateway trims
+    /// each tree of a model, by itself, toward `max_size`, and writes take a
+    /// tree past it until the next. At `4294967295` it starts no sweep: a
+    /// tree under such an entry is held to no size. The engine's record
+    /// keeps its bound at any cadence.
     #[schemars(range(min = 1))]
     pub sweep_s: u32,
 }
@@ -2133,15 +2135,14 @@ pub struct ProfileSpec {
     /// profile whose stages do not read its count of sends is refused if it
     /// sets a delay. The limit ends a send whatever the delay. The
     /// profiles of a document that set the same limit and the same delay
-    /// read one count, under the name of the first of them that reads it,
-    /// in the order of their names. A new document's count takes over the
-    /// sends of the standing count under the same limit and delay,
-    /// whichever profiles read that one. Where none stands under them, it
-    /// takes over those of the standing count under the same name, unless
-    /// a count of the new document took that one by its settings, or else
-    /// of a standing count that no count of the new document took. The
-    /// two counts share the sends: a read under the shorter of two delays
-    /// ends such a send for both. A count that finds none starts empty.
+    /// read one count. A new document's count takes over the sends of the
+    /// standing count under the same limit and delay, whichever profiles
+    /// read that one, and the two counts share them. Where none stands
+    /// under them, it takes a copy of the sends the standing counts hold,
+    /// for each rank of a worker those of the count that holds the most,
+    /// and counts each under its own limit and delay from there. A send
+    /// that every standing count has ended is in no copy. A count starts
+    /// empty where no count stands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_report_delay_ms: Option<u32>,
@@ -3786,7 +3787,6 @@ fn picker_of(
         in_key_order(&mut params);
         let picker = StageBuild::built(
             &params,
-            profile,
             settings,
             sent,
             from.reports,
@@ -3933,7 +3933,6 @@ fn filtered<'a>(
         in_key_order(&mut params);
         let filter = StageBuild::built(
             &params,
-            profile,
             settings,
             sent,
             from.reports,
@@ -4190,7 +4189,6 @@ fn scored(
             in_key_order(&mut params);
             let scorer = StageBuild::built(
                 &params,
-                profile,
                 settings,
                 sent,
                 from.reports,
@@ -4401,7 +4399,7 @@ fn check_profile(
             Filtered::Built(filter) => filter,
             Filtered::Typed(stage) => {
                 let stage_at = At::new(format!("{}.filter[{index}].{}", at.0, stage.name()));
-                let count = || profile_sent(&mut sent, name, settings);
+                let count = || profile_sent(&mut sent, settings);
                 filter_of(stage, view, from.signals, count, &stage_at)?
             }
         };
@@ -4468,7 +4466,7 @@ fn check_profile(
             });
         }
         check_prefix_depth(&stage, gates, view, &stage_at)?;
-        let count = || profile_sent(&mut sent, name, settings);
+        let count = || profile_sent(&mut sent, settings);
         match scorer_of(&stage, gates, view, from.signals, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
@@ -5131,18 +5129,18 @@ fn check_binding(
     check_matcher(&b.matcher, cx, &at, deferred)?;
     let shadow = check_binding_rules(b, cx, &at, deferred)?;
     let mut built = resolve_plan(b, cx, shadow)?;
-    // A picker that leaves the placement to a sessions rule, and a rule runs
-    // under the single plan and on the two sides of a pair: on a side of
-    // `epd` nothing would place its requests. The built picker answers, as
-    // it answers the engine.
+    // A picker that leaves the placement to a sessions rule places a side
+    // of a pair, under `pd-pair` and on the pair's two sides of `epd`: by
+    // the rule, or by its assignment where the binding names none. No rule
+    // places an item, so on the encode side nothing would place its
+    // requests. The built picker answers, as it answers the engine.
     if b.plan.unwrap_or_default() == PlanName::Epd {
-        for (side, name) in &b.profiles {
-            if cx.by_assignment.contains(&name.as_str()) {
-                deferred.note(
-                    at.sub("profiles").field(side),
-                    "a picker that places by the sessions rule under the epd plan",
-                );
-            }
+        let by_rule = |name: &String| cx.by_assignment.contains(&name.as_str());
+        if b.profiles.get("encode").is_some_and(by_rule) {
+            deferred.note(
+                at.sub("profiles").field("encode"),
+                "a picker that places by the sessions rule on the encode side",
+            );
         }
     }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
@@ -5174,6 +5172,14 @@ const UNTOLD_ON_FILE: &str =
 /// file keeps no word of a pair's side.
 /// Under a cap each side's records carry the count of its key's requests
 /// in flight, as a single's do.
+///
+/// Under the `epd` plan the rule runs on the pair's two sides, each by its
+/// own session, and places no item: an item goes to its encoder by its
+/// content. It is in the build of a host that makes the lifecycle's calls,
+/// under either word. The build of a host that makes some only refuses it
+/// by the plan's name, with a cap or with none: the rule is not in that
+/// build at all, and an encode request's frame names no count of a key's
+/// requests on its rows.
 fn session_rule(
     sessions: &SessionsSpec,
     index: usize,
@@ -5186,7 +5192,8 @@ fn session_rule(
             Some(("rule_placed", UNTOLD_ON_FILE))
         }
         Plan::PdPair => None,
-        Plan::Epd { .. } => Some(("plan", "`single` or `pd-pair`")),
+        Plan::Epd { .. } if !lifecycle => Some(("plan", "`single` or `pd-pair`")),
+        Plan::Epd { .. } => None,
     };
     if let Some((name, reason)) = refused {
         return Err(SpecError::BadSessions {

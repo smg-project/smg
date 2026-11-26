@@ -114,8 +114,8 @@ fn held(store: &MemoryStore) -> (u64, Vec<(WorkerId, WorkerFacts, WorkerStatus, 
     (epoch, rows)
 }
 
-/// A watcher of `store` over a holder of its own, which follows no
-/// status of the store's tail: it lays each status the watch tells.
+/// A watcher of `store` over a holder of its own, which copies no
+/// status from the store: it lays each status the watch tells.
 fn over(store: Arc<MemoryStore>) -> Watcher<Members> {
     let objects = Objects::new(Arc::new(WorkerRegistry::new()));
     Watcher::new(store, Arc::new(objects))

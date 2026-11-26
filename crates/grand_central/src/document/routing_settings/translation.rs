@@ -152,12 +152,10 @@ pub(super) fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSe
 ///
 /// `None` where the document plans one family: a regular configuration of
 /// one router, the encode mode of one router, a pair mode of one router
-/// over gRPC or ZMQ, and a regular configuration under the manual policy.
-/// Its picker leaves the placement to the binding's session rule, and this
-/// module does not plan its pairs beside its single requests yet: a pair
-/// mode whose two sides are manual is planned, under the one rule. A
-/// gateway of one router in the encode mode counts tokens with no worker,
-/// so its document binds no single request.
+/// over gRPC or ZMQ, and a regular configuration under the manual policy
+/// ([`manual_alone`]). A pair mode whose two sides are manual is planned,
+/// under the one rule. A gateway of one router in the encode mode counts
+/// tokens with no worker, so its document binds no single request.
 ///
 /// A gateway of many routers outside the encode mode plans its three sides
 /// ahead of this plan ([`three_sided`]), and this one stands where that
@@ -165,12 +163,11 @@ pub(super) fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSe
 pub(super) fn both_families(
     config: &RoutingSettings,
 ) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
-    let (mode, main) = (&config.mode, &config.policy);
+    let mode = &config.mode;
     let (both, encode) = match mode {
-        ModeSettings::Regular | ModeSettings::Provider(_) => (
-            config.enable_igw && !matches!(main, PolicySettings::Manual { .. }),
-            None,
-        ),
+        ModeSettings::Regular | ModeSettings::Provider(_) => {
+            (config.enable_igw && !manual_alone(config), None)
+        }
         ModeSettings::PrefillDecode {
             prefill_policy: _,
             decode_policy: _,
@@ -200,17 +197,35 @@ pub(super) fn both_families(
 ///
 /// `None` for a gateway of one router, which mounts that router under the
 /// encode mode alone, and for the encode mode, whose plan of two families
-/// is this one already. A setting with no document under three sides
-/// leaves the plan where it is written, as the manual policy on the pair's
-/// two sides does, a regular configuration's main policy among them.
+/// is this one already. `None` too for a regular configuration under the
+/// manual policy, which plans its single requests alone ([`manual_alone`]).
+/// A setting with no document under three sides leaves the plan where it
+/// is written, as one manual side of the pair's two does.
+///
+/// The manual policy on both sides of the pair is planned: its rule places
+/// the pair's two sides, each by its own session, and the encode side
+/// places an item by its content.
 pub(super) fn three_sided(
     config: &RoutingSettings,
 ) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
     let encode_mode = matches!(config.mode, ModeSettings::EncodePrefillDecode { .. });
-    if !config.enable_igw || encode_mode {
+    if !config.enable_igw || encode_mode || manual_alone(config) {
         return Ok(None);
     }
     families(config, Some(&ENCODE_DEFAULT)).map(Some)
+}
+
+/// Whether the settings are a regular configuration under the manual
+/// policy. Its picker leaves the placement to the binding's session rule,
+/// and this module does not plan its pairs beside its single requests yet:
+/// such a gateway of many routers plans its single requests alone, under
+/// the plan of two families as under the plan of three sides.
+fn manual_alone(config: &RoutingSettings) -> bool {
+    let regular = matches!(
+        config.mode,
+        ModeSettings::Regular | ModeSettings::Provider(_)
+    );
+    regular && matches!(config.policy, PolicySettings::Manual { .. })
 }
 
 /// The plan of two families: the pair's sides under one binding over their
@@ -293,12 +308,16 @@ pub(super) fn label_refused(
 /// settings in that profile and in the places the document's sides share,
 /// and what its one binding holds. Models that name one policy share its
 /// profile, which a second write leaves as the first left it.
+///
+/// The index its policy names is answered beside the side and shared with
+/// no other. The document's index is a map by model, so a label's stands
+/// under its own model's id. The settings' sides keep the one they share.
 fn label_side<'a>(
     policy: &'a PolicySettings,
     config: &RoutingSettings,
     document: &mut PolicySpec,
     shared: &mut Shared<'a>,
-) -> Result<Bound, RoutingSettingsError> {
+) -> Result<(Bound, Option<IndexNumbers>), RoutingSettingsError> {
     let name = policy.name();
     let profile = match document.profiles.entry(name.to_owned()) {
         Entry::Occupied(held) => held.into_mut(),
@@ -310,12 +329,15 @@ fn label_side<'a>(
             })?)
         }
     };
-    write_policy(policy, config, profile, shared)?;
+    let of_settings = shared.index.take();
+    let written = write_policy(policy, config, profile, shared);
+    let own = std::mem::replace(&mut shared.index, of_settings);
+    written?;
     if let Some(sources) = key_sources(policy, config)? {
         shared.bound.keys.push((name, sources));
     }
     shared.bound.overridden += usize::from(override_places(policy, config));
-    Ok(std::mem::take(&mut shared.bound))
+    Ok((std::mem::take(&mut shared.bound), own))
 }
 
 /// The binding of one label's model: its policy's preset binding, for that
@@ -364,13 +386,15 @@ fn label_binding(
     Ok(binding)
 }
 
-/// [`written`] with the labels' sides: each label is one more side of one,
-/// written by its policy as the main policy's side is, and bound for its
-/// model alone right ahead of the binding of every model's single requests.
-/// A plan with no such binding binds no label. The settings' own sides are
-/// written first and their bindings first, so a label changes none of them
-/// but the view's headers, which it adds to. A label's ring keeps its
-/// blocks under every gateway: no document of a label's stood before it.
+/// [`written`] with the labels' sides. Each label is one more side of one,
+/// written by its policy as the main policy's side is. It is bound for its
+/// model alone, right ahead of the binding of every model's single
+/// requests. A plan with no such binding binds no label.
+///
+/// The settings' own sides are written first and their bindings first, so
+/// a label changes none of them. It adds to the view's headers, and writes
+/// its model's own entry of the index. A label's ring keeps its blocks
+/// under every gateway: no document of a label's stood before it.
 pub(super) fn written_with<'a>(
     config: &'a RoutingSettings,
     (mut document, bindings): Planned<'a>,
@@ -392,9 +416,22 @@ pub(super) fn written_with<'a>(
                         policy: policy.name(),
                         part: "profile",
                     })?;
-            write_policy(policy, config, profile, &mut shared)?;
             // The encode side places an item by the item's content: it reads
-            // no key, and the override never places it.
+            // no key, the override never places it and no session rule does.
+            // So the manual policy is no encode side's, as the gateway's own
+            // check holds (`validate_encode_policy`,
+            // `model_gateway/src/config/validation.rs:319-328`).
+            if side == ENCODE_SIDE {
+                if matches!(policy, PolicySettings::Manual { .. }) {
+                    return Err(unsupported(
+                        "encode_policy",
+                        policy.name(),
+                        "a session rule places no item: an item goes to its encoder by its content",
+                    ));
+                }
+                shared.bound.encode_side = true;
+            }
+            write_policy(policy, config, profile, &mut shared)?;
             if side != ENCODE_SIDE {
                 if let Some(sources) = key_sources(policy, config)? {
                     shared.bound.keys.push((policy.name(), sources));
@@ -427,17 +464,33 @@ pub(super) fn written_with<'a>(
     // read.
     let single = bindings.iter().rposition(|sides| sides.len() == 1);
     let mut sides_of_labels = Vec::with_capacity(labels.len());
+    let mut indexes_of_labels = Vec::with_capacity(labels.len());
     if single.is_some() {
         for (model, policy) in labels {
             let refused = |refusal: RoutingSettingsError| label_refused(model, policy, refusal);
-            let side = label_side(policy, config, &mut document, &mut shared).map_err(refused)?;
+            let (side, index) =
+                label_side(policy, config, &mut document, &mut shared).map_err(refused)?;
             let side = (1, side);
             rings_keep_their_blocks(shared.block_size, std::slice::from_ref(&side))
                 .map_err(refused)?;
             sides_of_labels.push(side);
+            indexes_of_labels.push((*model, index));
         }
     }
     shared.write(&mut document)?;
+    // A label's index stands under its model's own id. It is written only
+    // where it says another thing than the document answers for that model
+    // without it. That answer is the settings' one entry, or the defaults
+    // where they wrote none.
+    for (model, index) in indexes_of_labels {
+        let Some(index) = index.map(index_spec) else {
+            continue;
+        };
+        let answered = document.index_for(model).map(|(_, held)| held.clone());
+        if answered.unwrap_or_default() != index {
+            document.index.insert(model.to_owned(), index);
+        }
+    }
     if document.bindings.is_empty() || document.bindings.len() != bound.len() {
         return Err(RoutingSettingsError::NoPart {
             policy: config.policy.name(),
@@ -812,15 +865,20 @@ fn pin_times(
     ))
 }
 
+/// An index as a side names it: its kind, entry lifetime, size and sweep
+/// interval.
+type IndexNumbers = (IndexKind, u32, u64, u32);
+
 /// What the sides of a document share. The document holds each once, so the
 /// first side to name one sets it, and a side that names another value is
-/// refused.
+/// refused. A label's side shares no index: its own stands under its model
+/// ([`label_side`]).
 #[derive(Default)]
 struct Shared<'a> {
     block_size: Option<usize>,
     boundaries: Option<&'a [usize]>,
-    /// The index's kind, entry lifetime, size and sweep interval.
-    index: Option<(IndexKind, u32, u64, u32)>,
+    /// The index of the settings' own sides.
+    index: Option<IndexNumbers>,
     /// What the sides of the binding being written share.
     bound: Bound,
 }
@@ -831,6 +889,9 @@ struct Bound {
     /// The manual policy's sweep interval, idle time and assignment.
     manual: Option<(u64, u64, Assignment)>,
     manual_sides: usize,
+    /// The plan has an encode side. No session rule places an item, so
+    /// the manual policy's rule places the plan's other sides alone.
+    encode_side: bool,
     /// The sides whose keyed requests the sticky override places
     /// ([`override_places`]).
     overridden: usize,
@@ -885,25 +946,7 @@ impl Shared<'_> {
                 .map(|at| narrow("cache_boundaries", *at))
                 .collect::<Result<_, _>>()?;
         }
-        let index = self.index.map(|(kind, ttl_s, max_size, sweep_s)| {
-            // The gateway's own policy trims its index at its sweep alone,
-            // and sweeps nothing at an interval of zero: that index is never
-            // trimmed.
-            // The document's cadence and size both start at one, so its
-            // longest cadence and its largest size say it. No sweep falls
-            // inside a process's life, and no write meets the bound.
-            let (max_size, sweep_s) = if sweep_s == 0 {
-                (u64::MAX, u32::MAX)
-            } else {
-                (max_size, sweep_s)
-            };
-            IndexSpec {
-                kind,
-                ttl_s,
-                max_size,
-                sweep_s,
-            }
-        });
+        let index = self.index.map(index_spec);
         if let Some(index) = index.and_then(|index| unless(index, IndexSpec::default())) {
             document.index.insert("*".to_string(), index);
         }
@@ -911,10 +954,35 @@ impl Shared<'_> {
     }
 }
 
+/// The index a side names, as the document says it.
+fn index_spec((kind, ttl_s, max_size, sweep_s): IndexNumbers) -> IndexSpec {
+    // The gateway's own policy trims its index at its sweep alone, and
+    // sweeps nothing at an interval of zero: that index is never trimmed.
+    // The document's cadence and size both start at one, so its longest
+    // cadence and its largest size say it. No sweep falls inside a
+    // process's life, and no write meets the bound.
+    let (max_size, sweep_s) = if sweep_s == 0 {
+        (u64::MAX, u32::MAX)
+    } else {
+        (max_size, sweep_s)
+    };
+    IndexSpec {
+        kind,
+        ttl_s,
+        max_size,
+        sweep_s,
+    }
+}
+
 impl Bound {
     /// Writes what the sides named into their binding, a plan of `sides`
     /// profiles. The headers the manual policy reads are the view's too,
     /// and so are the headers of a key the sticky override places.
+    ///
+    /// The manual policy's rule places every side of the plan but an
+    /// encode side: a single request's side, or the two sides of a pair,
+    /// with an encode side ahead of them or with none. One manual side of
+    /// the two is refused.
     fn write(
         self,
         config: &RoutingSettings,
@@ -946,7 +1014,7 @@ impl Bound {
             binding.routing_key = key;
             return Ok(());
         };
-        if self.manual_sides != sides {
+        if self.manual_sides + usize::from(self.encode_side) != sides {
             return Err(unsupported(
                 "policy",
                 "manual",

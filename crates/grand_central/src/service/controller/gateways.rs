@@ -175,6 +175,7 @@ struct Table {
     /// The next instant each row needs a sweep visit, ordered by instant.
     /// A row has at most one entry, kept in step with [`Row::deadline`].
     deadlines: BTreeSet<(Instant, GatewayId)>,
+    /// A case reads the sweep's visits, and the sweep itself counts them here.
     #[cfg(test)]
     sweep_visits: usize,
     /// The highest term the table was read under since this replica last
@@ -236,6 +237,7 @@ pub(crate) struct SessionPlace {
     gateway: GatewayId,
     session: u64,
     superseded: Arc<Replaced>,
+    /// A case arms this pause, and the place's own drop waits on it.
     #[cfg(test)]
     drop_pause: Option<Arc<DropPause>>,
 }
@@ -316,13 +318,6 @@ impl SessionPlace {
         self.gateways
             .restore(self.gateway, self.session, vetoes, now)
     }
-
-    /// The session ended at `now`, where a case names the instant.
-    #[cfg(test)]
-    pub(crate) fn end(self, now: Instant) {
-        self.gateways
-            .gone(self.gateway, self.session, &self.superseded, now);
-    }
 }
 
 impl Drop for SessionPlace {
@@ -371,28 +366,6 @@ impl Gateways {
             store,
             table: Mutex::new(Table::default()),
         }
-    }
-
-    /// The ceiling of rows.
-    #[cfg(test)]
-    pub(crate) fn ceiling(&self) -> usize {
-        self.ceiling
-    }
-
-    /// How many replaced sessions the row of `gateway` notes.
-    #[cfg(test)]
-    pub(crate) fn noted(&self, gateway: GatewayId) -> usize {
-        self.table
-            .lock()
-            .rows
-            .get(&gateway)
-            .map_or(0, |row| row.replaced.len())
-    }
-
-    /// How many rows the sweep has visited.
-    #[cfg(test)]
-    fn take_sweep_visits(&self) -> usize {
-        std::mem::take(&mut self.table.lock().sweep_visits)
     }
 
     /// The grace period, as a `Welcome` tells it.
@@ -799,23 +772,6 @@ impl Gateways {
         let deadline = self.deadline(row, now);
         Self::set_deadline(&mut table, gateway, deadline);
         held
-    }
-
-    /// How many ends the table keeps for the gateway: the row's count,
-    /// which every write keeps in step with the note.
-    #[cfg(test)]
-    pub(crate) fn kept(&self, gateway: GatewayId) -> usize {
-        let table = self.table.lock();
-        table.rows.get(&gateway).map_or(0, |row| {
-            let noted: usize = row.vetoes.values().map(Vec::len).sum();
-            assert_eq!(row.held, noted, "the count follows the note");
-            let earliest = row.vetoes.values().flatten().map(|&(_, end)| end).min();
-            assert!(
-                earliest.is_none_or(|end| row.next_end.is_some_and(|next| next <= end)),
-                "no end is earlier than the note says"
-            );
-            row.held
-        })
     }
 
     /// Whether `term`, a read of the fence at `now`, shows a leader, with

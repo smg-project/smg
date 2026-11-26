@@ -75,6 +75,7 @@ use crate::{
             attach_sized_body,
             attempt_ledger::{
                 closes_retry_window, is_upstream_answer, mark_upstream_answer, AttemptLedger,
+                WORKER_BODY_TOO_LARGE,
             },
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
@@ -131,11 +132,6 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// recording a circuit-breaker sample for one would let slow or oversized
 /// uploaders open a healthy worker's breaker.
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
-
-/// Error code of the 502 for a worker's body over the limit
-/// ([`worker_body_too_large`]): the worker answered, and the router refused
-/// what it gave ([`worker_answered`]).
-const WORKER_BODY_TOO_LARGE: &str = "upstream_response_too_large";
 
 /// How a worker response body is relayed to the client. Re-chunking exists
 /// on this regular HTTP relay only; the PD and gRPC relays do not apply it.
@@ -1852,7 +1848,7 @@ pub(super) fn worker_body_too_large(limit: usize, worker: &str) -> Response {
 /// carries the worker's mark, or it is the router's refusal of a body the
 /// worker gave over the limit, known by its own code. That refusal carries
 /// no mark: the mark's other readers take it as before.
-fn worker_answered(response: &Response) -> bool {
+pub(super) fn worker_answered(response: &Response) -> bool {
     is_upstream_answer(response)
         || extract_error_code_from_response(response) == WORKER_BODY_TOO_LARGE
 }

@@ -25,7 +25,7 @@ use crate::{
         warm_up::WarmUpRule,
     },
     load::signals::SignalCells,
-    policies::{prefix_hash::HeadRule, random::Random},
+    policies::{consistent_hashing::LentRing, prefix_hash::HeadRule, random::Random},
     stages::{
         filters::{HasCapacity, RowTests},
         lifecycle::Lifecycle,
@@ -87,6 +87,13 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
     /// [`Needs::text_hashes`], and one that declares neither may be handed
     /// none.
+    ///
+    /// A filter that reads the ring its request lends
+    /// ([`RequestFacts::ring`]) declares [`Needs::ring`], and a live
+    /// profile one of whose scorers places by the ring shows it the ring
+    /// and the request's place on it. A pair side's shadow that reads a
+    /// ring where neither live side does is lent that ring for its
+    /// scoring half alone: its filters are shown no ring and no place.
     ///
     /// Asked only while the stage's generation is built, perhaps more than
     /// once there. The answer stands for that generation: no decision and
@@ -465,7 +472,7 @@ pub trait Scorer: Lifecycle + Debug {
     /// How the stage cuts a request into the heads it places it by on a
     /// ring its caller lends ([`RequestFacts::ring`]): the prefix form of
     /// the hash ring, which reads where a head stands
-    /// ([`LentRing::head_position`](crate::policies::consistent_hashing::LentRing::head_position))
+    /// ([`crate::policies::consistent_hashing::LentRing::head_position`])
     /// and never where the routing value's own text does. What makes a
     /// request for its caller states a place for each head under such a
     /// stage ([`Engine::states_head_places`]). `None` from every other
@@ -1340,6 +1347,15 @@ impl Buffers {
         }
     }
 
+    /// Takes the word of whether nobody reads the best rows of a trace
+    /// made with these buffers, as the scratch states it
+    /// ([`Scratch::unread`]). [`Buffers::traced`] reads it.
+    #[cfg(feature = "in-process")]
+    #[inline(always)]
+    fn set_unread(&mut self, unread: bool) {
+        self.unread = unread;
+    }
+
     /// Room in every buffer for the whole pass over a pool of `rows`. A
     /// decision that draws first writes a few rows and asks for the room
     /// all the same: the pass it widens to may be many decisions away, and
@@ -1384,7 +1400,7 @@ impl Scratch {
     #[cfg(feature = "in-process")]
     #[inline(always)]
     pub(crate) fn unread(&mut self, unread: bool) {
-        self.single.unread = unread;
+        self.single.set_unread(unread);
     }
 
     /// The list the last pair's decision or encode decision made with
@@ -2543,10 +2559,11 @@ fn run_profile(
 
 /// The body of [`run_profile`], which hands no `first`. A pair's decode
 /// decided again enters here with the decode its first decision named,
-/// where its profile keeps such a decode ([`keeps_its_first`]), and so
-/// does that call's shadow ([`Engine::decide_decode`],
-/// [`Engine::shadow_decode_later`]): the scoring half keeps that decode
-/// where it is a survivor ([`score_survivors`]).
+/// where its profile keeps such a decode ([`keeps_its_first`],
+/// [`Engine::decide_decode`]): the scoring half keeps that decode where
+/// it is a survivor ([`score_survivors`]). That call's shadow hands the
+/// decode to its own run the same way ([`run_side_lent`],
+/// [`Engine::shadow_decode_later`]).
 /// Inlined into each, so a run that hands none is the code it was.
 #[inline(always)]
 #[expect(
@@ -2567,6 +2584,45 @@ fn run_side(
     if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
         return single_emptied(index, facts, pool, candidates, emptied_by, buf);
     }
+    score_survivors(profile, index, facts, pool, candidates, buf, first)
+}
+
+/// [`run_side`] for a pair side's shadow, which may be stated a place of
+/// its own on the ring its request lends ([`Engine::side_ring_profile`]):
+/// `lent` is asked between the two halves, behind the filter half. A set
+/// the filters emptied ends where every side's does ([`single_emptied`]),
+/// in the all-vetoed rule's pick or in a shed, and asks nothing: no stage
+/// would read the place. The filter half reads `facts` as they stand: a
+/// filter is shown no ring and no place here, one of the host's own that
+/// declares the ring need ([`Filter::needs`]) too, which a live profile
+/// shows both. The scoring half reads them with the ring and the places
+/// `lent` answers, where it answers any. Out of line: a shadow's run
+/// alone enters here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a side's run, beside what its shadow is lent"
+)]
+fn run_side_lent<'l>(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    set: Set<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+    first: Option<(WorkerId, u16)>,
+    lent: &dyn Fn() -> Option<(&'l dyn LentRing, &'l [u64])>,
+) -> Decision {
+    let candidates = set.candidates;
+    if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
+        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
+    }
+    let stated = lent().map(|(ring, places)| RequestFacts {
+        ring: Some(ring),
+        ring_positions: places,
+        ..*facts
+    });
+    let facts = stated.as_ref().unwrap_or(facts);
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
 
@@ -3849,10 +3905,9 @@ pub struct Engine {
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
     /// One tally for each two send settings a profile's stages read
-    /// under: a later engine finds one by its settings, then by the name
-    /// of the profile that made it, then takes one that is left
-    /// ([`Engine::succeed`]). A tally kept from an earlier engine bears
-    /// the name of the profile that made it there.
+    /// under: a later engine's tally under the same two shares its
+    /// entries, and one under two that no tally here has takes a copy of
+    /// the sends that stand ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
     /// Beside each profile, the place in `sent_credits` of the tally its
     /// stages read, where one asked for it at the build.
@@ -4443,13 +4498,19 @@ const _: () = {
     }
 };
 
-/// What a binding's sessions rule reads beyond its profile's stages: the
-/// key under the view's headers, and the per-key counts its assignment and
-/// cap compare; the validator's summary, per binding.
-fn session_needs(binding: &Binding) -> Needs {
+/// What a binding's sessions rule reads for a decision of `phase` beyond
+/// its profile's stages: the key under the view's headers, and the per-key
+/// counts its assignment and cap compare; the validator's summary, per
+/// binding. Nothing for the encode side of the `epd` plan: there a rule
+/// places the pair's two sides and no item, which goes by its content. A
+/// single binding's rule places a request of every phase it covers, an
+/// encode request among them.
+fn session_needs(binding: &Binding, phase: Phase) -> Needs {
+    let item = phase == Phase::Encode && matches!(binding.plan, Plan::Epd { .. });
     binding
         .sessions
         .as_ref()
+        .filter(|_| !item)
         .map_or_else(Needs::default, |rule| Needs {
             headers: true,
             active_sessions: rule.assignment == Assignment::MinGroup,
@@ -5266,7 +5327,7 @@ impl Engine {
                     phase_needs[slot(phase)] = phase_needs[slot(phase)]
                         .or(own)
                         .or(shadow)
-                        .or(session_needs(binding));
+                        .or(session_needs(binding, phase));
                 }
                 if binding.model == "*" {
                     break;
@@ -5496,58 +5557,59 @@ impl Engine {
         self.generation
     }
 
-    /// Takes over what the standing engine's counts of sends hold: each
+    /// Takes over what the standing engine's counts of sends hold. A
     /// count takes the rows' entries of the standing count under the same
-    /// two settings, whichever profile made that one. Where no standing
-    /// count has its settings, it takes the count that a profile of its
-    /// maker's name made, unless another count of this engine took that
-    /// one: two counts on one standing count would hold every send twice.
-    /// It then takes the first standing count that none took: the engine
-    /// records a send in every count, so any one of them carries the
-    /// sends. A count starts empty where none is left. The two engines share
-    /// those entries from here on: a decision still running under the
-    /// standing engine reads the sends a later one counts, and each count
-    /// reads them under its own time limit and report delay.
+    /// two settings, whichever profiles read that one, and the two
+    /// engines share those entries from here on: a decision still running
+    /// under the standing engine reads the sends a later one counts. A
+    /// count under two settings that no standing count has shares none: a
+    /// standing count has let go what its own settings ended. It takes a
+    /// copy of the sends that stand, of each rank those of the standing
+    /// count that holds the most there, each at its instant and its size,
+    /// and its own reads let go what its own settings end. The engine
+    /// records a send in every count and a count lets go a prefix by
+    /// time, so the fullest holds what the others hold, but for a send
+    /// that an earlier copy missed. A count starts empty where no count
+    /// stands.
     ///
-    /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) calls it
-    /// before it shows the new engine. A host with a store of its own
+    /// Three limits stand for a count that takes a copy. A send every
+    /// standing count has let go is gone for it too, though its own
+    /// settings would count it still. It shares no entry with the
+    /// standing engine: a decision still running there reads none of the
+    /// sends the later engine counts in it. And a send told to the
+    /// standing engine behind the copy's read of its rank is in no copy.
+    /// A thread that read the standing engine ahead of the swap may tell
+    /// it one: neither
+    /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) nor the
+    /// apply of an engine in its host's process holds a lock that a word
+    /// of a lease takes. The standing counts' rows of a rank are read one
+    /// after another, so a send told between two of those reads is in the
+    /// copy only where the longest read holds it. A count lacks a send
+    /// its copy missed for that send's life: where that count holds the
+    /// most at a later call, the copy made there lacks the send too,
+    /// though another standing count holds it.
+    ///
+    /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) has it
+    /// called under its workers lock and its load lock, where the
+    /// generation is put in place of the standing one and before the
+    /// store shows it: a copy takes as long as the sends it copies, and a
+    /// taker of either lock waits for it. A host with a store of its own
     /// calls it where it swaps engines, before this engine takes a
     /// decision or a dispatch: what this engine's counts held until then
-    /// is let go. A rank the standing count first hears of behind this
-    /// call is entered in the standing count alone.
+    /// is let go. A rank a standing count first hears of behind this call
+    /// is entered in the standing count alone. A copy reads every
+    /// standing count's row of a rank and takes the longest read. It
+    /// holds one standing row's locks at a time, for the read of its
+    /// sends: a send to that row and a release from it wait meanwhile.
     pub fn succeed(&self, standing: &Engine) {
         let prior = &standing.sent_credits;
-        // The standing count of each count. One rule at a time over every
-        // count that has none yet: by the settings, by the maker's name,
-        // then the first left. So no count's match by an earlier rule is
-        // taken by another count's later one.
-        let mut taken: Vec<Option<usize>> = vec![None; self.sent_credits.len()];
-        let mut free = vec![true; prior.len()];
-        // The third rule's place among the standing counts: it only moves on.
-        let mut left = 0..prior.len();
-        for rule in 0..3 {
-            for (at, credit) in self.sent_credits.iter().enumerate() {
-                if taken[at].is_some() {
-                    continue;
-                }
-                taken[at] = match rule {
-                    0 => prior
-                        .iter()
-                        .position(|count| count.settings == credit.settings),
-                    1 => (0..prior.len()).find(|&standing| {
-                        free[standing] && prior[standing].profile == credit.profile
-                    }),
-                    _ => left.find(|&standing| free[standing]),
-                };
-                if let Some(standing) = taken[at] {
-                    free[standing] = false;
-                }
-            }
-        }
-        for (credit, at) in self.sent_credits.iter().zip(taken) {
-            // A count this engine kept is the standing one itself.
-            if let Some(at) = at.filter(|&at| !Arc::ptr_eq(credit, &prior[at])) {
-                credit.succeed(&prior[at]);
+        for credit in &self.sent_credits {
+            let under = |count: &&Arc<DispatchCredit>| count.settings == credit.settings;
+            match prior.iter().find(under) {
+                // A count this engine kept is the standing one itself.
+                Some(stood) if Arc::ptr_eq(credit, stood) => {}
+                Some(stood) => credit.succeed(stood),
+                None => credit.copy_fullest(prior),
             }
         }
     }
@@ -5569,9 +5631,9 @@ impl Engine {
     /// made follows that one ([`DispatchCredit::follow`]), so a reader
     /// built new and a reader kept read one set of entries and a rank
     /// first heard behind this call stands once. A count none of whose
-    /// readers is kept is this engine's own, and takes a standing count
-    /// over ([`Self::succeed`]). A profile kept keeps the generation its
-    /// object was made under ([`Engine::hearing`]).
+    /// readers is kept is this engine's own, and takes over what the
+    /// standing counts hold ([`Self::succeed`]). A profile kept keeps the
+    /// generation its object was made under ([`Engine::hearing`]).
     ///
     /// Nothing is kept across two stage tables that may build another
     /// stage under one name: the stock table's number, or one table of a
@@ -5807,7 +5869,7 @@ impl Engine {
                 (
                     self.profile_needs[usize::from(index)]
                         .or(self.shadow_needs(&entry.binding, phase))
-                        .or(session_needs(&entry.binding)),
+                        .or(session_needs(&entry.binding, phase)),
                     self.marks[usize::from(index)],
                 )
             })
@@ -5977,6 +6039,40 @@ impl Engine {
         (placed && !reads(live)?).then_some(shadow)
     }
 
+    /// The shadow profile of `side` of the pair binding at `at` that is
+    /// stated a place of its own on a lent ring: one that reads a ring
+    /// where neither live side of the pair does. Such a pair's request
+    /// states no place when it is made, so the side's shadow is asked for
+    /// its own inside its run, as a single binding's is
+    /// ([`Self::shadow_ring_profile`]). A side's run asks behind its
+    /// filter half ([`run_side_lent`]): a shadow that says none ahead of
+    /// its profile ([`Self::shadow_side`]) and one whose set the filters
+    /// emptied are asked nothing. `None` under every other binding: beside
+    /// a live side that reads the ring, a side's shadow reads the place
+    /// the two live sides state, or none ([`Self::unlent`]). And `None`
+    /// for the decode's shadow that cuts a request by another rule than
+    /// the prefill's shadow does: a request states one list of heads a
+    /// call, so that shadow places on its own ring. A shadow that reads
+    /// the ring by the routing value's own text takes no head, and stands
+    /// beside one that cuts by a rule.
+    fn side_ring_profile(&self, at: u32, side: PairSide) -> Option<u16> {
+        let sides = self.shadow_sides.get(at as usize)?;
+        let shadow = sides[side.index()]?;
+        let lives = live_sides(&self.bindings.get(at as usize)?.binding);
+        let reads = |profile: u16| Some(self.profile_needs.get(usize::from(profile))?.ring);
+        if !reads(shadow)? || reads(lives[0])? || reads(lives[1])? {
+            return None;
+        }
+        let rule = |profile: u16| {
+            let places = self.head_places.get(usize::from(profile));
+            places.filter(|places| matches!(places, HeadPlaces::Rule(..)))
+        };
+        let first = sides[PairSide::Prefill.index()].filter(|_| matches!(side, PairSide::Decode));
+        let rules = (first.and_then(rule), rule(shadow));
+        let apart = matches!(rules, (Some(first), Some(own)) if first != own);
+        (!apart).then_some(shadow)
+    }
+
     /// [`Self::states_key_place`] by the two profiles of
     /// [`Self::ring_profiles`].
     pub(crate) fn key_place_of(&self, (own, decode): RingProfiles) -> bool {
@@ -6135,7 +6231,7 @@ impl Engine {
                 if let Some(own) = own(phase).filter(|_| covers(phase)) {
                     needs = own
                         .or(self.shadow_needs(binding, phase))
-                        .or(session_needs(binding));
+                        .or(session_needs(binding, phase));
                 }
                 // The decode side of every pair this binding's prefill
                 // lookup starts, and the encode side of an `epd` pair, each
@@ -6832,7 +6928,7 @@ impl Engine {
             return Some(decision);
         };
         pick.session_verdict = SessionVerdict::Pinned;
-        match self.sessions.claim(key, pins, first) {
+        match self.sessions.claim(key, pins, first, facts.now_micros) {
             Claim::Made(id) => pick.session_verdict = SessionVerdict::Claimed(id),
             // A full table records nothing of the key.
             Claim::NoRoom => {}
@@ -7206,7 +7302,9 @@ impl Engine {
     /// which places on its own ring. A profile that reads no ring is apart
     /// from none, and a live profile that reads none states no place: its
     /// shadow under a single binding is stated one of its own inside its
-    /// run ([`Self::shadow_ring_profile`]).
+    /// run ([`Self::shadow_ring_profile`]), and so is a side's shadow
+    /// under a pair neither side of which reads a ring
+    /// ([`Self::side_ring_profile`]).
     ///
     /// `None` where the facts stand: the request lends no ring, or the
     /// shadow is apart from no live profile.
@@ -7462,7 +7560,7 @@ impl Engine {
                     return decision;
                 }
                 let claim = if WRITE_SESSIONS {
-                    self.sessions.claim(key, pins, first)
+                    self.sessions.claim(key, pins, first, facts.now_micros)
                 } else if handed && found.stood {
                     // The live decision's claim was not taken: its shadow
                     // reads the pins the table held there against its own
@@ -8674,7 +8772,8 @@ impl Engine {
                     if let SessionVerdict::Claimed(claimed) = prefill_pick.session_verdict {
                         if claimed != prefill_target.id {
                             let (key, paired) = (prefill_facts.session(), prefill_target.id);
-                            *session_verdict = self.sessions.move_claim(key, claimed, paired);
+                            let at = prefill_facts.now_micros;
+                            *session_verdict = self.sessions.move_claim(key, claimed, paired, at);
                         }
                     }
                     // The prefill side's run met its key's pin at the cap
@@ -8707,8 +8806,8 @@ impl Engine {
         // No prefill paired: the claim the prefill side's run made is
         // withdrawn, and the key's next request is placed again.
         if let SessionVerdict::Claimed(claimed) = prefill_pick.session_verdict {
-            let key = prefill_facts.session();
-            self.sessions.move_claim(key, claimed, WorkerId(0));
+            let (key, at) = (prefill_facts.session(), prefill_facts.now_micros);
+            self.sessions.move_claim(key, claimed, WorkerId(0), at);
         }
         // A prefill was picked and no decode pairs with it: the decode side
         // is the one left with nobody.
@@ -8856,6 +8955,12 @@ impl Engine {
     /// side does is lent none. A shadow lent none places on its own ring
     /// ([`Self::unlent`]).
     ///
+    /// A shadow that reads a ring where neither live side does is stated
+    /// its own place on the ring the request lends
+    /// ([`Self::side_ring_profile`]), asked of `lends` behind the filter
+    /// half of its run ([`run_side_lent`]): a shadow whose set the filters
+    /// emptied, which the all-vetoed rule steers or sheds, asks nothing.
+    ///
     /// The decode's shadow is put to the binding's all-vetoed rule by the
     /// binding's word, as its live side is ([`Set::ruled`]): where a veto
     /// leaves the live prefill's partners nobody, the rule steers the
@@ -8890,7 +8995,7 @@ impl Engine {
             reason = "the one caller is the engine over worker lists, built under `in-process`"
         )
     )]
-    pub(crate) fn shadow_side(
+    pub(crate) fn shadow_side<'l>(
         &self,
         at: u32,
         side: PairSide,
@@ -8901,6 +9006,7 @@ impl Engine {
         decode_cx: &Constraints<'_>,
         live: &Pick,
         scratch: &mut Scratch,
+        lends: &dyn Fn(u16) -> Option<(&'l dyn LentRing, &'l [u64])>,
     ) -> Option<Decision> {
         let index = self.shadow_sides.get(at as usize)?[side.index()]?;
         // A pair the default made, or one the weighing lift alone placed:
@@ -8926,6 +9032,8 @@ impl Engine {
         let facts = unlent.as_ref().unwrap_or(facts);
         let (prefills, prefill_facts) = pools.side(PairSide::Prefill, facts)?;
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
+        // The shadow's own place, asked behind the filter half alone.
+        let lent = || self.side_ring_profile(at, side).and_then(lends);
         Some(match side {
             PairSide::Prefill => {
                 // The prefills the live prefill profile was shown: the
@@ -8937,7 +9045,7 @@ impl Engine {
                 // its own profile's word, as the live run is by the live
                 // profile's ([`Self::weighing_lift`]).
                 let lifted_run = self.weighing_lift(index, entry.vetoed, cx);
-                run_profile(
+                run_side_lent(
                     profile,
                     index,
                     &prefill_facts,
@@ -8945,6 +9053,8 @@ impl Engine {
                     Set::side(prefills, None, Some(&scratch.classes)),
                     lifted_run.as_ref().unwrap_or(cx),
                     &mut scratch.single,
+                    None,
+                    &lent,
                 )
             }
             PairSide::Decode => {
@@ -8956,7 +9066,7 @@ impl Engine {
                 let class = prefills.get(prefill.position as usize)?.pair_class;
                 let firsts = scratch.among_first;
                 let partners = Set::side(decodes, Some(pools.partners(&class, firsts)), None);
-                run_profile(
+                run_side_lent(
                     profile,
                     index,
                     &decode_facts,
@@ -8964,6 +9074,8 @@ impl Engine {
                     partners.ruled(entry.vetoed),
                     decode_cx,
                     &mut scratch.decode,
+                    None,
+                    &lent,
                 )
             }
         })
@@ -8981,7 +9093,8 @@ impl Engine {
     /// lends by the rule of a side's at the pair's decision
     /// ([`Self::shadow_side`]): held against both live sides, or against
     /// the decode's own alone where each side is stated its own places
-    /// ([`Self::unlent`]).
+    /// ([`Self::unlent`]). And it is asked its own place of `lends` as a
+    /// side's is there: behind the filter half of its run.
     ///
     /// `first_decode` is the decode the pair's first decision named, as
     /// that call is handed it. A shadow profile that keeps such a decode
@@ -9012,7 +9125,7 @@ impl Engine {
             reason = "the one caller is the engine over worker lists, built under `in-process`"
         )
     )]
-    pub(crate) fn shadow_decode_later(
+    pub(crate) fn shadow_decode_later<'l>(
         &self,
         at: u32,
         facts: &RequestFacts<'_>,
@@ -9022,6 +9135,7 @@ impl Engine {
         first_decode: Option<(WorkerId, u16)>,
         decode_cx: &Constraints<'_>,
         scratch: &mut Scratch,
+        lends: &dyn Fn(u16) -> Option<(&'l dyn LentRing, &'l [u64])>,
     ) -> Option<Decision> {
         let side = PairSide::Decode;
         let index = self.shadow_sides.get(at as usize)?[side.index()]?;
@@ -9049,7 +9163,7 @@ impl Engine {
         let class = prefill.pair_class;
         let firsts = scratch.among_first;
         let partners = Set::side(decodes, Some(pools.partners(&class, firsts)), None);
-        Some(run_side(
+        Some(run_side_lent(
             profile,
             index,
             &decode_facts,
@@ -9058,6 +9172,7 @@ impl Engine {
             decode_cx,
             &mut scratch.decode,
             first_decode.filter(|_| keeps_its_first(profile)),
+            &|| self.side_ring_profile(at, side).and_then(lends),
         ))
     }
 
@@ -9107,6 +9222,11 @@ impl Engine {
     /// answers the decode it reaches, is shed under `target-worker` where
     /// that decode cannot be named, and is declined under that name where
     /// the number stands beside no places.
+    ///
+    /// Under a sessions rule the call may claim its decode for the decode
+    /// side's key, at this call's `now_micros`. A host that asks this entry
+    /// itself tells the side it issues under a lease that states that
+    /// instant, or none ([`Lease::issued_micros`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the request and the pair's pools, beside the pair the call is held by"
@@ -9263,14 +9383,20 @@ impl Engine {
     /// table, then the stages ([`Self::dispatched_stages`]), so a stage's
     /// call that unwinds leaves the table's entry written. Every teller of
     /// a dispatch keeps that order, the trait's own entry among them.
+    ///
+    /// The table is handed the instant the lease was issued under
+    /// ([`Lease::issued_micros`]). A dispatch elsewhere withdraws the claim
+    /// that lease's decision made, and no later decision's claim on the
+    /// same worker.
     pub(crate) fn dispatched_table(&self, lease: &Lease, target: &Target, side: Side) {
         let dispatched = match (side, target.pair) {
             (Side::Decode, Some(pair)) => pair.decode_id,
             _ => target.id,
         };
         if lease.session_verdict != SessionVerdict::None {
+            let (verdict, at) = (lease.session_verdict, lease.issued_micros);
             self.sessions
-                .dispatched(lease.session, lease.session_verdict, dispatched);
+                .dispatched(lease.session, verdict, dispatched, at);
         }
     }
 
@@ -9282,13 +9408,30 @@ impl Engine {
     /// the table each side a pair's release ends ahead of any stage, a
     /// decode stated for later among them: no stage hears that side's end,
     /// and the pair's first decision made its claim.
+    ///
+    /// The table is handed the instant the lease was issued under
+    /// ([`Lease::issued_micros`]). The claim that goes is the one that
+    /// lease's decision made: a refusal told late leaves a later decision's
+    /// claim on the same worker.
     pub(crate) fn released_table(&self, lease: &Lease, reason: ReleaseReason) {
         if reason == ReleaseReason::CommitFailed {
             if let SessionVerdict::Claimed(claimed) = lease.session_verdict {
+                let at = lease.issued_micros;
                 self.sessions
-                    .move_claim(lease.session, claimed, WorkerId(0));
+                    .move_claim(lease.session, claimed, WorkerId(0), at);
             }
         }
+    }
+
+    /// The session table's part of a decode call that claimed
+    /// ([`SessionTable::date_claim`]). The call claimed `leased` for `key` at
+    /// `at`, its own instant, and that claim takes `issued`, the instant of
+    /// the lease its pair's first decision issued. The pair's decode
+    /// entries ask here, so they read no table of the engine's.
+    #[cfg(feature = "in-process")]
+    #[inline]
+    pub(crate) fn date_claim(&self, key: Session, leased: WorkerId, at: u64, issued: u64) {
+        self.sessions.date_claim(key, leased, at, issued);
     }
 
     /// The stages' part of a release, behind the table's

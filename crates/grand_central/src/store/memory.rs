@@ -39,14 +39,13 @@ use crate::{
             LeaseState, LeasesStore, Sides, WorkerSlot,
         },
         membership::same_worker,
-        reservations::{ReservationKind, ReservationStore},
         snapshot::{
             left_models, micros, OutsideLists, StaleGeneration, StoreSnapshot, Writer,
             PUBLISH_WINDOW,
         },
         workers::{
-            MembershipChange, MembershipTail, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
-            WorkerStatus, WorkersStore,
+            MembershipChange, Registrant, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+            WorkersStore,
         },
         GatewayId,
     },
@@ -60,10 +59,6 @@ mod turn;
 
 use blocks::{Blocks, Minted};
 pub use turn::{AtWork, Hand, LookOutcome};
-
-/// Membership changes kept for watchers; a watcher further behind snapshots
-/// again (the registry's broadcast is sized the same today).
-const CHANGE_LOG: usize = 1_024;
 
 /// The host's wake: what the store calls to have its host read
 /// [`MemoryStore::publish_due`] again. It is called under the writer's
@@ -99,7 +94,6 @@ pub struct MemoryStore {
     /// is the last lock a writer takes: the workers lock, then the health
     /// lock, then this one.
     loads: Mutex<Loads>,
-    reservations: Mutex<Reservations>,
     /// The files of leases behind their turns, one a decider ([`turn`]).
     files: turn::Files,
     /// The blocks of the leading term's counter, each block's file and the
@@ -208,7 +202,6 @@ impl MemoryStore {
             snapshot_pause: Mutex::default(),
             health: Mutex::default(),
             loads: Mutex::new(Loads { writer }),
-            reservations: Mutex::default(),
             files: turn::Files::one(leases),
             blocks: Blocks::default(),
             world,
@@ -338,7 +331,9 @@ impl MemoryStore {
     /// the worker it was, and another worker's pins leave. A key the cut
     /// drops is filed as gone by this store's own clock, as a followed
     /// removal files it. A worker still present keeps its count
-    /// slot, admission instant and gateway vetoes.
+    /// slot and gateway vetoes. Its row is the cut's, the admission instant
+    /// too: a holder of worker objects states the instant it keeps on the
+    /// cut's row before it hands the cut here (`Objects::watch_from`).
     ///
     /// Returns `false` with the store as it was if the journal refuses the
     /// snapshot's place.
@@ -385,11 +380,9 @@ impl MemoryStore {
                 drop(loads.writer.rebuild(std::iter::empty()));
             }
             workers.by_key.clear();
-            workers.log.clear();
             workers.epoch = cut.epoch;
-            workers.history += 1;
             workers.rows.reserve(cut.rows.len());
-            for mut row in cut.rows {
+            for row in cut.rows {
                 let id = row.id;
                 workers.by_key.insert(row.facts.key.clone(), id);
                 let kept = if keep_local {
@@ -398,7 +391,6 @@ impl MemoryStore {
                     None
                 };
                 let held = if let Some(kept) = kept {
-                    row.admitted_at = kept.row.admitted_at;
                     Row { row, ..kept }
                 } else {
                     Row {
@@ -478,25 +470,29 @@ impl MemoryStore {
         change: MembershipChange,
         row: Option<WorkerRow>,
     ) {
-        self.follow_landed(at, epoch, change, row);
+        self.follow_landed(at, epoch, change, row, None);
     }
 
     /// [`Self::follow`], and whether the change landed. A holder of worker
     /// objects asks it: the object of the row a change leaves is put in
-    /// its registry only where the store took the change.
+    /// its registry only where the store took the change. `left` is the
+    /// row the change takes out, as the holder read it back from its
+    /// object: a removal's row, a replacement's old life. The journal is
+    /// told it, as at a leader's write (`MemoryStore::follow_objects`).
     pub(crate) fn follow_landed(
         &self,
         at: Position,
         epoch: u64,
         change: MembershipChange,
         row: Option<WorkerRow>,
+        left: Option<&mut WorkerRow>,
     ) -> bool {
         let workers = self.writing_at(Some(at));
-        epoch == workers.epoch + 1 && self.decided(workers, Instant::now(), change, row)
+        epoch == workers.epoch + 1 && self.decided(workers, Instant::now(), change, row, left)
     }
 
     /// A decided membership change, written under the write's hold of the
-    /// membership lock: the tables, the epoch, the change log and the
+    /// membership lock: the tables, the epoch and the
     /// journal's telling, the member's count slot, the build
     /// the write owes or pays, the word to the stages and the session
     /// pins. One body for every writer that hands a change with the
@@ -512,15 +508,24 @@ impl MemoryStore {
     /// The journal is told the row its writer handed, with the admission
     /// instant of the row it is laid over, and the table takes that row
     /// behind the telling: the event of such a write tells no row read
-    /// from the table. Two things are the table's still. A status change
-    /// comes with no row, and its event tells the table's. The row a write
-    /// takes out is the one the table held.
+    /// from the table. The row a write takes out is told as its writer
+    /// handed it too, where one did: `left`, which a holder of worker
+    /// objects read back from the object, on a leader and on a standby.
+    /// The status the table held is laid over it here: the status the log
+    /// last told of a row is the log's own word, which the table holds for
+    /// it. A row changed in place is laid no status here: a standby's told
+    /// row comes in its leader's status, and a leader's holder lays the
+    /// table's in its own entry (`MemoryStore::follow_objects`). A writer
+    /// that hands none tells the row the table held: the store's own
+    /// entries, and a holder with no object under the row's id. A status
+    /// change comes with no row, and its event tells the table's.
     fn decided(
         &self,
         mut workers: Writing<'_>,
         now: Instant,
         change: MembershipChange,
         row: Option<WorkerRow>,
+        left: Option<&mut WorkerRow>,
     ) -> bool {
         use std::collections::hash_map::Entry;
 
@@ -532,8 +537,9 @@ impl MemoryStore {
         let mut follows = None;
         let mut ended = Vec::new();
         // The row the change leaves, as its writer handed it: the journal
-        // is told from it, and the table takes it behind the telling.
-        let (change, laid, left) = match (change, row) {
+        // is told from it, and the table takes it behind the telling. With
+        // it, the row the table held where the write takes one out.
+        let (change, laid, held) = match (change, row) {
             (MembershipChange::Registered { id }, Some(row))
                 if row.id == id
                     && !workers.rows.contains_key(&id)
@@ -569,16 +575,16 @@ impl MemoryStore {
                         .get(&old)
                         .is_some_and(|held| held.row.facts.key == row.facts.key) =>
             {
-                let left = workers.rows.remove(&old).map(|held| self.row_left(held));
-                let same = |left: &WorkerRow| same_worker(&left.facts, &row.facts);
-                if left.as_ref().is_some_and(same) {
+                let held = workers.rows.remove(&old).map(|held| self.row_left(held));
+                let same = |held: &WorkerRow| same_worker(&held.facts, &row.facts);
+                if held.as_ref().is_some_and(same) {
                     follows = Some((old, new));
                 } else {
                     ended.push(old);
                 }
                 workers.by_key.insert(row.facts.key.clone(), new);
                 self.forget_worker(old);
-                (change, Some(row), left)
+                (change, Some(row), held)
             }
             (MembershipChange::Removed { id }, None) => {
                 let Some(held) = workers.rows.remove(&id) else {
@@ -605,13 +611,45 @@ impl MemoryStore {
             // the row as the table holds it.
             workers.record(change);
         } else {
-            workers.record_over(change, laid.as_ref(), left.as_ref());
+            // The row the write took out is told as its writer handed it,
+            // in the status the table held, and as the table held it where
+            // the writer handed none.
+            let told = match (left, held.as_ref()) {
+                (Some(left), Some(held)) => {
+                    left.status = held.status;
+                    // While the table stands, a debug build holds a handed
+                    // row to the one the table held, where an entry is
+                    // told: the two are one row. A host with no journal
+                    // tells nothing, and a gateway's refresh of a worker's
+                    // models sets a fact of its object behind the build.
+                    debug_assert!(
+                        workers.journal.is_none() || *left == *held,
+                        "a row its holder read back is the row the table held"
+                    );
+                    Some(&*left)
+                }
+                (left, held) => {
+                    debug_assert!(
+                        left.is_none(),
+                        "a row is handed as taken out by a write that takes one out"
+                    );
+                    held
+                }
+            };
+            workers.record_over(change, laid.as_ref(), told);
         }
         // The table follows the row told: over the row that stood under
         // its id, or under a new id with a count slot of its own.
         if let Some(row) = laid {
             match workers.rows.entry(row.id) {
                 Entry::Occupied(mut held) => {
+                    debug_assert!(
+                        matches!(
+                            change,
+                            MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. }
+                        ),
+                        "a row laid over the one that stands under its id is a change in place"
+                    );
                     let old = mem::replace(&mut held.get_mut().row, row);
                     off = left_models(old.facts, &held.get().row.facts);
                 }
@@ -634,7 +672,7 @@ impl MemoryStore {
                 // A replacement that takes its worker off a model says so
                 // for the new id, behind the build it pays and behind its
                 // own word, as at the leader's own write.
-                let models = Self::replaced_models(left, workers.rows.get(&new));
+                let models = Self::replaced_models(held, workers.rows.get(&new));
                 self.pay_leave(&workers, now);
                 self.tell_membership(change);
                 self.tell_left(new, &models);
@@ -649,7 +687,7 @@ impl MemoryStore {
                 self.pay_leave(&workers, now);
                 self.tell_membership(change);
                 // The key is filed as gone, by this store's own clock.
-                if let Some(row) = left {
+                if let Some(row) = held {
                     ended = workers.file_gone(row.facts, id, now, self.pins_absence());
                 }
             }
@@ -719,10 +757,16 @@ impl MemoryStore {
     /// it came. Each membership write after it is told behind the same
     /// lock, in its order. A count of sends stands where a profile that
     /// reads it is kept. One thing built new does not start empty: a count
-    /// of sends none of whose readers is kept, which the engine takes over
-    /// from the standing generation's count under the same two settings,
-    /// or else by its profile's name, or else one that is left, before the
-    /// publication ([`Engine::succeed`](crate::engine::Engine::succeed)).
+    /// of sends none of whose readers is kept. It takes over the standing
+    /// generation's count under the same two settings, or else a copy of
+    /// the sends that generation's counts hold, before the publication
+    /// ([`Engine::succeed`](crate::engine::Engine::succeed)). The
+    /// take-over is a step of the call that puts the generation in place
+    /// of the standing one, under the workers lock and the load lock. A
+    /// copy takes as long as the sends it copies, and a taker of the load
+    /// lock alone waits for it too. A send told behind a copy and ahead of
+    /// the publication enters the standing generation's counts: it is in
+    /// no copy.
     ///
     /// A decision that read its world ahead of the apply ends under that
     /// world's generation: its list's value, its lease and the stages told
@@ -833,6 +877,10 @@ impl MemoryStore {
                     offered: generation,
                 });
             }
+            // The generation is put in place inside this call, and there a
+            // count of sends built new takes over what the standing counts
+            // hold. A copy of them is so made under both locks: a taker of
+            // the load lock alone waits for it.
             let writer = &mut loads.writer;
             let (world, before) = writer.apply(spec, workers.members())?;
             #[cfg(test)]
@@ -1180,8 +1228,9 @@ impl MemoryStore {
     /// each tried.
     #[cfg(test)]
     pub(crate) fn unlocked(&self) -> bool {
+        let free = |file: &turn::File| file.try_take().is_some();
         self.workers.try_lock().is_some()
-            && self.files.iter().all(turn::File::free)
+            && self.files.iter().all(free)
             && self.loads.try_lock().is_some()
     }
 
@@ -1307,10 +1356,6 @@ struct Workers {
     /// follows and at the rows a snapshot drops ([`Self::lay_gone`]).
     gone: HashMap<String, Gone>,
     epoch: u64,
-    /// How often the rows were replaced whole by another store's
-    /// ([`WorkersStore::history`]).
-    history: u64,
-    log: VecDeque<(u64, MembershipChange)>,
     /// The store's journal: every membership and status write passes
     /// [`Writing::record`] or [`Writing::record_over`], which tell it.
     journal: Option<Arc<dyn Journal>>,
@@ -1502,22 +1547,17 @@ impl DerefMut for Writing<'_> {
 /// the membership lock bare has no way to journal a write, so none is
 /// journaled whose release the journal does not hear.
 impl Writing<'_> {
-    /// The epoch `change` makes, with the change filed in the change log.
-    fn step(&mut self, change: MembershipChange) -> u64 {
-        let workers = &mut *self.workers;
-        workers.epoch += 1;
-        if workers.log.len() == CHANGE_LOG {
-            workers.log.pop_front();
-        }
-        workers.log.push_back((workers.epoch, change));
-        workers.epoch
+    /// The epoch the next change makes.
+    fn step(&mut self) -> u64 {
+        self.workers.epoch += 1;
+        self.workers.epoch
     }
 
     /// Record a change that comes with no row of its writer's: a status,
     /// which is the log's own word, and the store's own patch. The journal
     /// is told the row as the table holds it.
     fn record(&mut self, change: MembershipChange) -> MembershipChange {
-        let epoch = self.step(change);
+        let epoch = self.step();
         if let Some(journal) = &self.workers.journal {
             let row = self.workers.rows.get(&change.id()).map(|row| &row.row);
             journal.member(self.at, epoch, change, row, None);
@@ -1527,16 +1567,17 @@ impl Writing<'_> {
 
     /// Record a change whose writer handed the row it leaves. The journal
     /// is told `row`, that row (none for a removal), and `left`, the row
-    /// the write took out of the table (a removal's, a replacement's old
-    /// incarnation). No row of the table is read: the table takes `row`
-    /// behind the telling.
+    /// the write took out (a removal's, a replacement's old incarnation):
+    /// as its writer handed it, or as the table held it where the writer
+    /// handed none. No row of the table is read here: the table takes
+    /// `row` behind the telling.
     fn record_over(
         &mut self,
         change: MembershipChange,
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> MembershipChange {
-        let epoch = self.step(change);
+        let epoch = self.step();
         if let Some(journal) = &self.workers.journal {
             journal.member(self.at, epoch, change, row, left);
         }
@@ -1637,8 +1678,8 @@ impl MemoryStore {
     /// no status stands half told here. The hold copies a place and one
     /// status a row, and no row.
     ///
-    /// The told status is the log's own word, kept beside the epoch and
-    /// the tail: no copy of what a decision reads. A decision reads a
+    /// The told status is the log's own word, kept beside the epoch:
+    /// no copy of what a decision reads. A decision reads a
     /// worker's status on its object. The told status has five readers:
     ///
     /// - the next status event, which says the status its row moved from
@@ -1690,12 +1731,20 @@ impl MemoryStore {
     /// call: a caller of the store's own registration, patch or removal
     /// takes no turn of the holder.
     ///
+    /// `left` is the row the write takes out, as the holder read it back
+    /// in its turn: a removal's row, a replacement's old life, and none
+    /// for any other change. The journal is told it: of the rows such a
+    /// write tells, the table gives a status alone.
+    ///
     /// A worker object's status leads its row's. The holder read `row`'s
     /// off the object, and the rule every writer decides by handed it on
     /// to a key's next life ([`WorkerRow::hands_on`]): the store takes
     /// that. A row changed in place keeps the status the table holds: a
     /// status moves by its own event alone, and the holder tells the
-    /// object's behind the write ([`Self::status_told`]).
+    /// object's behind the write ([`Self::status_told`]). A row the write
+    /// takes out is told in the status the table held too, which the one
+    /// body lays over it for a leader and a standby alike
+    /// ([`Self::decided`]).
     ///
     /// Whether the store took the change. One it does not take writes
     /// nothing: another writer moved the row under the holder's turn, or
@@ -1705,6 +1754,7 @@ impl MemoryStore {
         change: MembershipChange,
         mut row: Option<WorkerRow>,
         seen: Option<u64>,
+        left: Option<&mut WorkerRow>,
     ) -> bool {
         let workers = self.writing();
         let table = |id: WorkerId| workers.rows.get(&id).map(|held| &held.row);
@@ -1726,7 +1776,7 @@ impl MemoryStore {
                 row.status = over.status;
             }
         }
-        self.decided(workers, Instant::now(), change, row)
+        self.decided(workers, Instant::now(), change, row, left)
     }
 
     /// The status this replica's worker object states for the row `id`,
@@ -1787,8 +1837,8 @@ impl WorkersStore for MemoryStore {
         let standing = standing.and_then(|id| workers.rows.get(id));
         let standing = standing.map(|held| &held.row);
         let now = Instant::now();
-        let (change, row) = facts.laid_over(standing, maker, now);
-        let fits = self.decided(workers, now, change, Some(row));
+        let (change, row) = WorkerRow::laid_over(facts, standing, maker, now);
+        let fits = self.decided(workers, now, change, Some(row), None);
         debug_assert!(fits, "a change decided under the membership lock fits");
         change
     }
@@ -1853,10 +1903,6 @@ impl WorkersStore for MemoryStore {
         self.workers.lock().epoch
     }
 
-    fn history(&self) -> u64 {
-        self.workers.lock().history
-    }
-
     /// Kept beside the cell of the row's slot in the counts, the one the
     /// leases' doors book. Under the workers lock, as the write that takes
     /// a row is: no count is kept for a row that left.
@@ -1878,28 +1924,6 @@ impl WorkersStore for MemoryStore {
         self.pause_snapshot();
         rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
         (epoch, rows)
-    }
-
-    fn changes_since(&self, epoch: u64) -> MembershipTail {
-        let workers = self.workers.lock();
-        if epoch > workers.epoch {
-            return MembershipTail::SnapshotRequired;
-        }
-        if epoch == workers.epoch {
-            return MembershipTail::Changes(Vec::new());
-        }
-        match workers.log.front() {
-            // The change after `epoch` is still in the log.
-            Some(&(first, _)) if first <= epoch + 1 => MembershipTail::Changes(
-                workers
-                    .log
-                    .iter()
-                    .filter(|(at, _)| *at > epoch)
-                    .copied()
-                    .collect(),
-            ),
-            _ => MembershipTail::SnapshotRequired,
-        }
     }
 }
 
@@ -2005,88 +2029,6 @@ impl HealthSink for MemoryStore {
 /// The world's write side, behind its lock.
 struct Loads {
     writer: Writer,
-}
-
-// ----------------------------------------------------------- reservations
-
-/// A gateway's lease: the key a claim is held under.
-type LeaseKey = (GatewayId, LeaseId);
-
-#[derive(Default)]
-struct Reservations {
-    held: FxHashMap<(WorkerId, ReservationKind), u32>,
-    by_lease: FxHashMap<LeaseKey, Vec<(WorkerId, ReservationKind, u32)>>,
-}
-
-impl ReservationStore for MemoryStore {
-    fn window(&self, id: WorkerId, _kind: ReservationKind) -> Option<u32> {
-        // Both kinds read the engine's admission window today; a configured
-        // per-side cap is the host's until the window moves into the store.
-        self.workers.lock().rows.get(&id)?.row.facts.max_running
-    }
-
-    fn try_reserve(
-        &self,
-        gateway: GatewayId,
-        id: WorkerId,
-        kind: ReservationKind,
-        count: u32,
-        lease: LeaseId,
-    ) -> bool {
-        // A worker the store does not know (never registered, or removed) is
-        // refused before its window is read: a missing row is no live worker
-        // without a bound, and a commit racing a removal gets nothing on it.
-        let window = {
-            let workers = self.workers.lock();
-            let Some(row) = workers.rows.get(&id) else {
-                return false;
-            };
-            // Both kinds read the engine's admission window today, as
-            // `window` does.
-            row.row.facts.max_running
-        };
-        let mut reservations = self.reservations.lock();
-        let holds_kind = reservations
-            .by_lease
-            .get(&(gateway, lease))
-            .is_some_and(|held| held.iter().any(|(_, k, _)| *k == kind));
-        if holds_kind {
-            return false;
-        }
-        let held = reservations.held.entry((id, kind)).or_insert(0);
-        let total = held.saturating_add(count);
-        if window.is_some_and(|window| total > window) {
-            return false;
-        }
-        *held = total;
-        reservations
-            .by_lease
-            .entry((gateway, lease))
-            .or_default()
-            .push((id, kind, count));
-        true
-    }
-
-    fn release(&self, gateway: GatewayId, lease: LeaseId) {
-        let mut reservations = self.reservations.lock();
-        let Some(held) = reservations.by_lease.remove(&(gateway, lease)) else {
-            return;
-        };
-        for (id, kind, count) in held {
-            if let Some(total) = reservations.held.get_mut(&(id, kind)) {
-                *total = total.saturating_sub(count);
-            }
-        }
-    }
-
-    fn held(&self, id: WorkerId, kind: ReservationKind) -> u32 {
-        self.reservations
-            .lock()
-            .held
-            .get(&(id, kind))
-            .copied()
-            .unwrap_or(0)
-    }
 }
 
 // ----------------------------------------------------------------- leases
@@ -2242,6 +2184,13 @@ pub(crate) struct DecodeIssue(u8);
 #[cfg(feature = "controller")]
 type Replaced = (DecodeSide, Instant);
 
+/// What a decode call reads of the lease it names
+/// ([`MemoryStore::held_pair`]). The held prefill's worker comes first,
+/// then the worker and the rank of the decode its first decision chose.
+/// Last comes the instant the lease was issued at.
+#[cfg(feature = "controller")]
+pub(crate) type HeldPair = (WorkerId, Option<(WorkerId, u16)>, u64);
+
 impl FiledDecode {
     /// `side` as a door files it with `booked`, the slot of its worker's
     /// count. Only a live side books a count at filing.
@@ -2345,6 +2294,27 @@ impl Decodes {
         if let Some(place) = self.replaced.get_mut(at) {
             *place = Some((key, replaced));
         }
+    }
+
+    /// Whether an issue ever kept a side here. A file no decode call issued
+    /// into keeps none.
+    #[cfg(feature = "controller")]
+    fn keeps_any(&self) -> bool {
+        !self.replaced.is_empty()
+    }
+
+    /// The chosen side an issue replaced in the place `at` of the lease
+    /// under `key`, while the side that issue laid is issued or dispatched.
+    /// It is read and stays kept. `None` for a side no call issued, and for
+    /// an issued side that ended: a place keeps what an issue replaced past
+    /// its lease's end, so the side's own count of issues says whether a
+    /// call laid it.
+    #[cfg(feature = "controller")]
+    fn replaced_side(&self, at: u32, key: &Key) -> Option<DecodeSide> {
+        let issued = self.get(at, key)?;
+        let kept = self.replaced.get(at as usize)?.as_ref();
+        let (_, (first, _)) = kept.filter(|(owner, _)| owner == key)?;
+        (issued.issues != 0 && issued.side.state.is_live()).then_some(*first)
     }
 
     /// Returns the issued, originally chosen decode at `at` and takes its saved side
@@ -2571,22 +2541,16 @@ impl Leases {
     }
 
     /// The chosen side a decode call's issue replaced on the lease under
-    /// `key`, as the pair's first decision filed it, while the side that
-    /// issue laid is issued or dispatched. It is read and stays kept. `None`
-    /// for a side no call issued, and for an issued side that ended: a
-    /// place keeps what an issue replaced past its lease's end, so the
-    /// side's own count of issues says whether a call laid it. A file no
-    /// decode call issued into looks no record up.
+    /// `key`, as the pair's first decision filed it
+    /// ([`Decodes::replaced_side`]). A file no decode call issued into
+    /// looks no record up.
     #[cfg(feature = "controller")]
     fn replaced_decode(&self, key: &Key) -> Option<DecodeSide> {
-        if self.decodes.replaced.is_empty() {
+        if !self.decodes.keeps_any() {
             return None;
         }
         let at = self.records.get(key)?.decode;
-        let issued = self.decodes.get(at, key)?;
-        let kept = self.decodes.replaced.get(at as usize)?.as_ref();
-        let (_, (first, _)) = kept.filter(|(owner, _)| owner == key)?;
-        (issued.issues != 0 && issued.side.state.is_live()).then_some(*first)
+        self.decodes.replaced_side(at, key)
     }
 
     /// Undoes the current decode issue if `issue` is `None` or matches, returning both prior sides.
@@ -3348,6 +3312,10 @@ impl MemoryStore {
     /// target, or the one that dispatch named. The call reads this before
     /// it decides, and its issue tests the same again under its own turn.
     ///
+    /// Last comes the instant the lease was issued at, as the record's own
+    /// lease states it (`Lease::issued_micros`). Every word of the lease is
+    /// told under that date, and a claim the call makes is dated by it.
+    ///
     /// # Errors
     ///
     /// Why the lease takes no decode side: the test of an issue
@@ -3357,10 +3325,13 @@ impl MemoryStore {
         &self,
         gateway: GatewayId,
         lease: LeaseId,
-    ) -> Result<(WorkerId, Option<(WorkerId, u16)>), DecodeRefused> {
+    ) -> Result<HeldPair, DecodeRefused> {
         self.turn_of(self.file_of(lease))
             .chosen_decode(&(gateway, lease))
-            .map(|(held, decode)| (held.record.target, decode.taken_decode()))
+            .map(|(held, decode)| {
+                let issued_micros = held.record.lease.issued_micros;
+                (held.record.target, decode.taken_decode(), issued_micros)
+            })
     }
 
     /// The one issue behind the doors: a single's lease with no `pair`,
@@ -3678,34 +3649,27 @@ impl MemoryStore {
     }
 
     /// Ends the leases past their dispatch deadline at `now`
-    /// ([`LeasesStore::expire`]): each file whose deadline hint is reached
-    /// or whose ring holds a frame takes its turn in the files' order, one
-    /// at a time, where the caller may act at the file. A decider at work
-    /// ends its own file's due leases at its issues. Each end is told under
-    /// the turn, as a frame's end is told. A file is passed too where
-    /// `settled` says no, asked under the file's turn behind everything
-    /// handed to it: a host that keeps what was said of a file's leases
-    /// beside its ring says no until it has handed that on, so no lease is
-    /// ended ahead of a dispatch said of it. The file's deadline is shown
-    /// ahead of both questions ([`Leases::show_due`]): a file passed at one
-    /// is asked again at that instant. Returns both parts of each lease as
-    /// the sweep left them.
+    /// ([`LeasesStore::expire`]). The files take their turns in their
+    /// order, one at a time. A file takes its turn where it may hold work
+    /// for a sweep and the caller may act there ([`Self::sweep_turn`]). A
+    /// decider at work ends its own file's due leases at its issues. Each
+    /// end is told under the turn, as a frame's end is told.
+    ///
+    /// A file is passed too where `settled` says no. That is asked under
+    /// the file's turn, behind everything handed to it. A host may keep
+    /// what was said of a file's leases beside its ring. It says no until
+    /// it has handed that on, so no lease is ended ahead of a dispatch
+    /// said of it. The file's deadline is shown ahead of that question
+    /// too: a file passed at it is asked again at that instant.
+    ///
+    /// Returns both parts of each lease as the sweep left them.
     pub(crate) fn expire_where(&self, now: Instant, settled: impl Fn(usize) -> bool) -> Vec<Sides> {
         let mut ended = Vec::new();
         for at in 0..self.files.len() {
-            if !self.files[at].sweep_needed(now) {
+            let Some(mut leases) = self.sweep_turn(at, now) else {
                 continue;
-            }
-            // A file whose decider works is passed with no wait for its
-            // turn; the same is read again under the turn.
-            if !self.may_act(at) {
-                continue;
-            }
-            let mut leases = self.files[at].take();
-            // Shown ahead of the questions: a file passed at one is asked
-            // again at its deadline, not at every pass.
-            leases.show_due();
-            if !self.applied(at, &mut leases) || !settled(at) {
+            };
+            if !settled(at) {
                 continue;
             }
             // The ends of one file's sweep are told under one load of

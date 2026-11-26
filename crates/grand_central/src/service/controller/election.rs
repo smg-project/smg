@@ -364,43 +364,6 @@ impl ElectionNotifier {
     }
 }
 
-/// A door no thread listens behind, for a case of the door's caller. It
-/// stands in for the handle too: the door says while this lives.
-#[cfg(test)]
-pub(crate) struct Said {
-    /// The handle's part: the door holds these weakly.
-    _words: Arc<mpsc::Sender<Word>>,
-    heard: mpsc::Receiver<Word>,
-}
-
-#[cfg(test)]
-impl Said {
-    /// The door, and what is said through it.
-    pub(crate) fn door() -> (ElectionNotifier, Self) {
-        let (words, heard) = mpsc::channel();
-        let words = Arc::new(words);
-        let door = ElectionNotifier {
-            words: Arc::downgrade(&words),
-        };
-        let said = Self {
-            _words: words,
-            heard,
-        };
-        (door, said)
-    }
-
-    /// The terms said since the last call, in order.
-    pub(crate) fn terms(&self) -> Vec<u64> {
-        self.heard
-            .try_iter()
-            .filter_map(|word| match word {
-                Word::StepDown(above) => above,
-                Word::HandOver(_) | Word::Stop => None,
-            })
-            .collect()
-    }
-}
-
 /// Starts the election thread over `elector`: the term goes to `store` at
 /// every take, each step's sight of the lease to `standing`.
 pub(crate) fn start(
@@ -640,19 +603,6 @@ fn publish_end(
     standing.send_replace(seen);
 }
 
-/// Runs the loop through its normal cleanup for cases that call it directly.
-#[cfg(test)]
-fn run(
-    mut elector: Elector,
-    store: &MemoryStore,
-    standing: &watch::Sender<ElectionObservation>,
-    words: &mpsc::Receiver<Word>,
-) {
-    let seen = run_loop(&mut elector, store, standing, words);
-    give_up(&mut elector);
-    publish_end(&elector, standing, seen);
-}
-
 /// The steps in a row that follow nobody for one reason: its line is written
 /// once a streak.
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -876,4 +826,4 @@ fn give_up(elector: &mut Elector) {
 
 #[cfg(test)]
 #[path = "../../../tests/unit/service/controller/election/tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -1,5 +1,6 @@
 use super::{
-    busy, credit, decided, Checked, Items, ItemsPlaced, Lists, Refusal, MAX_FRAME, MAX_ITEMS,
+    busy, credit, decided, Checked, Decided, Items, ItemsPlaced, Lists, Refusal, MAX_FRAME,
+    MAX_ITEMS,
 };
 use crate::{
     document::spec::{AppliedSpec, MAX_BLOCK_HASHES},
@@ -9,6 +10,7 @@ use crate::{
             Targets, Trace,
         },
         decision_engine::{Request, RequestMaker, WorkerLists},
+        demands::{Demands, References},
         view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
     },
     service::{
@@ -16,6 +18,32 @@ use crate::{
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     },
 };
+
+impl Checked {
+    /// The request's block hashes, in order from its first block. Its one
+    /// reader is a case of the client's wire.
+    #[cfg(feature = "client")]
+    pub(in crate::service) fn block_hashes(&self) -> &[u64] {
+        &self.facts.block_hashes
+    }
+}
+
+impl Decided {
+    /// The frame the wire carries, as a stream builds it that sends at its
+    /// decider's last read: what a case of the deciders reads.
+    pub(in crate::service) fn frame(self) -> proto::DecideAnswer {
+        match self {
+            Self::Decision {
+                id,
+                term,
+                decision,
+                lease,
+                encode,
+            } => decided(id, term, &decision, lease.as_ref(), encode),
+            Self::Frame(frame) => frame,
+        }
+    }
+}
 
 #[test]
 fn plain_spec_answers_keep_each_wire_field() {
@@ -158,7 +186,7 @@ fn plain_spec_answers_keep_each_wire_field() {
 
 use crate::{
     document::{
-        operator::{needs_rows, test_support::LEAST_LOAD},
+        operator::test_support::{needs_rows, LEAST_LOAD},
         spec::PolicySpec,
     },
     engine::{Candidate, Filter},
@@ -487,6 +515,136 @@ fn a_frame_keeps_the_number_its_request_names_its_worker_by() {
     assert_eq!(said(Some(7), proto::Phase::Prefill), (false, Some(7)));
     let widest = Some(u32::MAX);
     assert_eq!(said(widest, single), (false, widest));
+}
+
+/// A demand as a case's frame states it, each part a value of its own,
+/// and the engine's demand it reads as.
+fn demanded() -> (proto::Demands, Demands) {
+    let stated = proto::Demands {
+        runtime: 7,
+        vision: true,
+        references: proto::demands::References::Caller.into(),
+        input_window: 4_096,
+        output_window: 512,
+        decoding: 3,
+    };
+    let read = Demands {
+        runtime: 7,
+        vision: true,
+        references: References::Caller,
+        input_window: 4_096,
+        output_window: 512,
+        decoding: 3,
+    };
+    (stated, read)
+}
+
+/// A single request's frame states its hard demands, and the request
+/// its maker makes carries each part to the engine. A frame that states
+/// no message, or one with no part, demands nothing. Each place a
+/// request's media by reference may be processed crosses by its own
+/// number.
+#[test]
+fn a_single_requests_frame_states_its_demands_and_its_request_carries_them() {
+    let read = |stated: Option<proto::Demands>| {
+        let mut frame = with(|facts| facts.phase = proto::Phase::Single.into());
+        frame.demands = stated;
+        let frame = Checked::new(frame).expect("no word is a field out of its range");
+        let left = std::time::Duration::from_millis(5);
+        made(&frame, &mut Lists::default(), left, |_, constraints| {
+            constraints.demands
+        })
+    };
+    let (stated, demands) = demanded();
+    assert_eq!(read(Some(stated)), demands);
+    assert_eq!(read(None), Demands::default());
+    assert_eq!(read(Some(proto::Demands::default())), Demands::default());
+    let places = [
+        (proto::demands::References::None, References::None),
+        (proto::demands::References::Any, References::Any),
+        (proto::demands::References::Caller, References::Caller),
+        (proto::demands::References::Worker, References::Worker),
+    ];
+    for (told, place) in places {
+        let stated = proto::Demands {
+            references: told.into(),
+            ..proto::Demands::default()
+        };
+        assert_eq!(read(Some(stated)).references, place, "{told:?}");
+    }
+}
+
+/// No demand is dropped in silence: a frame of a kind whose decision
+/// holds none yet is refused by the field where it states one. The
+/// kinds are five: a prefill frame, a decode frame, a decode call, an
+/// encode request's frame and a frame that names its worker. A decode
+/// call is one whatever phase its facts state, the single phase too. A message
+/// with no part demands nothing, and passes on each of them. A part out
+/// of its own range is refused by its name, on a single request's frame
+/// too.
+#[test]
+fn a_demand_on_a_frame_whose_decision_holds_none_yet_is_refused_by_the_field() {
+    type Edit = fn(&mut proto::DecideRequest);
+    let (stated, _) = demanded();
+    let kinds: [(&str, proto::Phase, Edit); 6] = [
+        ("a prefill frame", proto::Phase::Prefill, |_| {}),
+        ("a decode frame", proto::Phase::Decode, |_| {}),
+        ("a decode call", proto::Phase::Decode, |frame| {
+            frame.decode_of = Some(1 << 32 | 7);
+        }),
+        (
+            "a decode call whose facts state the single phase",
+            proto::Phase::Single,
+            |frame| {
+                frame.decode_of = Some(1 << 32 | 7);
+            },
+        ),
+        ("an encode request's frame", proto::Phase::Encode, |frame| {
+            frame.encode = Some(proto::EncodeItems::default());
+        }),
+        (
+            "a frame that names its worker",
+            proto::Phase::Single,
+            |frame| {
+                frame.named_worker = Some(0);
+            },
+        ),
+    ];
+    for (kind, phase, edit) in kinds {
+        let refused = |demands: proto::Demands| {
+            let mut frame = with(|facts| facts.phase = phase.into());
+            edit(&mut frame);
+            frame.demands = Some(demands);
+            Checked::new(frame).err()
+        };
+        let field = Some(Refusal::OutOfRange("demands"));
+        assert_eq!(refused(stated), field, "{kind}");
+        // One part alone is a demand too.
+        let window = proto::Demands {
+            output_window: 1,
+            ..proto::Demands::default()
+        };
+        assert_eq!(refused(window), field, "{kind}: one part");
+        assert_eq!(refused(proto::Demands::default()), None, "{kind}: no part");
+    }
+
+    let single = |edit: fn(&mut proto::Demands)| {
+        let mut frame = with(|facts| facts.phase = proto::Phase::Single.into());
+        let mut demands = stated;
+        edit(&mut demands);
+        frame.demands = Some(demands);
+        Checked::new(frame).err()
+    };
+    assert_eq!(single(|_| {}), None);
+    assert_eq!(single(|demands| demands.decoding = 255), None);
+    assert_eq!(
+        single(|demands| demands.decoding = 256),
+        Some(Refusal::OutOfRange("demands.decoding"))
+    );
+    assert_eq!(
+        single(|demands| demands.references = 4),
+        Some(Refusal::OutOfRange("demands.references"))
+    );
 }
 
 /// No lease has the id 0: a frame that names it is refused by its

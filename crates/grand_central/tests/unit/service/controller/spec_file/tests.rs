@@ -14,20 +14,28 @@ use tokio::task::JoinSet;
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, Digest, PolicySpec, SpecError},
+    document::{
+        operator::test_support::Validate,
+        spec::{AppliedSpec, Digest, PolicySpec, SpecError},
+    },
     service::{
-        controller::generations::{
-            tests::{
-                bound_to, election, election_under, faulting, long_text_under_aliases, padded,
-                with_line, LEAST_LOAD, RANDOM,
-            },
-            Validate,
+        controller::generations::tests::{
+            bound_to, election, election_under, faulting, long_text_under_aliases, padded,
+            with_line, LEAST_LOAD, RANDOM,
         },
         elector::{Elector, Fence, TickOutcome},
     },
     stages::StageRegistry,
     store::MemoryStore,
 };
+
+impl SpecFile {
+    /// [`SpecFile::poll_looking`] with the file system's own look: a case's
+    /// step.
+    fn poll(&mut self) -> Look {
+        self.poll_looking(look)
+    }
+}
 
 /// A directory with a `policy.yaml`, and the generations of a store of
 /// its own.

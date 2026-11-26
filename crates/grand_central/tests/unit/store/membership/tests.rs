@@ -424,7 +424,7 @@ fn facts_laid_over_no_row_register_a_pending_row_by_their_maker() -> Result<(), 
         ..stated()
     };
     let id = identity("url", 7);
-    let (change, row) = facts.clone().laid_over(None, maker.clone(), now);
+    let (change, row) = WorkerRow::laid_over(facts.clone(), None, maker.clone(), now);
     assert_eq!(change, MembershipChange::Registered { id });
     let registered = WorkerRow {
         id,
@@ -450,9 +450,8 @@ fn facts_laid_over_their_own_incarnation_change_the_row_in_place() -> Result<(),
         let id = standing.id;
         let mut facts = standing.facts.clone();
         facts.labels.insert("zone".to_owned(), "b".to_owned());
-        let (change, row) = facts
-            .clone()
-            .laid_over(Some(&standing), Registrant::Control, now);
+        let (change, row) =
+            WorkerRow::laid_over(facts.clone(), Some(&standing), Registrant::Control, now);
         assert_eq!(change, MembershipChange::Relabelled { id });
         let relabelled = WorkerRow {
             facts: facts.clone(),
@@ -462,9 +461,8 @@ fn facts_laid_over_their_own_incarnation_change_the_row_in_place() -> Result<(),
         assert_eq!(row, relabelled, "over a row that is {status:?}");
         // A width that moved is told as a resize.
         facts.dp_size = 2;
-        let (change, row) = facts
-            .clone()
-            .laid_over(Some(&standing), Registrant::Control, now);
+        let (change, row) =
+            WorkerRow::laid_over(facts.clone(), Some(&standing), Registrant::Control, now);
         assert_eq!(change, MembershipChange::Resized { id });
         let resized = WorkerRow {
             facts,
@@ -507,9 +505,8 @@ fn facts_laid_over_another_incarnation_are_the_keys_next_life() -> Result<(), Pr
                 ..standing.facts.clone()
             };
             state(&mut facts);
-            let (change, row) = facts
-                .clone()
-                .laid_over(Some(&standing), Registrant::Control, now);
+            let (change, row) =
+                WorkerRow::laid_over(facts.clone(), Some(&standing), Registrant::Control, now);
             let old = standing.id;
             assert_eq!(change, MembershipChange::Replaced { old, new });
             let carried = same && stood != WorkerStatus::Draining;
@@ -559,7 +556,7 @@ fn facts_laid_over_any_row_hold_no_blank_of_a_descriptor_or_of_an_encode_offer(
             },
             ..stated()
         };
-        let (_, row) = facts.laid_over(standing, Registrant::Control, now);
+        let (_, row) = WorkerRow::laid_over(facts, standing, Registrant::Control, now);
         assert_eq!(row.facts.pairing.as_ref(), Some(&read));
         assert_eq!(row.facts.encode.connector, None);
         let facts = WorkerFacts {
@@ -567,7 +564,7 @@ fn facts_laid_over_any_row_hold_no_blank_of_a_descriptor_or_of_an_encode_offer(
             pairing: Some(Arc::clone(&read)),
             ..stated()
         };
-        let (_, row) = facts.laid_over(standing, Registrant::Control, now);
+        let (_, row) = WorkerRow::laid_over(facts, standing, Registrant::Control, now);
         let held = row.facts.pairing.expect("the descriptor stated");
         assert!(Arc::ptr_eq(&held, &read), "shared, not copied");
     }

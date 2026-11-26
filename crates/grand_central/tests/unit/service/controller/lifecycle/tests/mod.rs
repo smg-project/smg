@@ -1155,18 +1155,15 @@ fn a_lease_above_the_generation_in_force_tells_no_stage_and_its_send_is_counted(
     assert_eq!(store.lifecycle_faults(), 0);
 }
 
-/// A send said inside an apply, between the engine's turn and the
-/// publication of the generation's world, enters the count of the
-/// generation the standing world holds. The count built for the new
-/// generation took that count's entries over at the engine's turn and
-/// shares them: it reads a send to a rank that stood there, as it
-/// reads the sends said before the apply. A rank first heard in the
-/// window stands in the count before alone, which no decision reads
-/// behind the publication: the new count is one send short on it. No
+/// Two sends said inside an apply, between the engine's turn and the
+/// publication of the generation's world: each enters the count of the
+/// generation the standing world holds. `apply` puts the second
+/// generation in force and hands back its count. The answer is what
+/// that count reads, and then what the count before reads, on a worker
+/// sent to before the apply and on one first sent to inside it. No
 /// word of a lease takes a send out of a count, so the ends said
 /// behind the publication leave both counts as they stood.
-#[test]
-fn a_send_said_inside_an_apply_is_read_by_the_count_built_for_its_generation() {
+fn said_inside_an_apply(apply: impl FnOnce(&MemoryStore) -> Arc<DispatchCredit>) -> [[u32; 2]; 2] {
     let store = Arc::new(MemoryStore::new());
     let objects = holder(&store);
     let t0 = Instant::now();
@@ -1204,16 +1201,119 @@ fn a_send_said_inside_an_apply_is_read_by_the_count_built_for_its_generation() {
             said.expect("the frame reads");
         }
     });
-    let standing = counting_under(&store, 2, Some(60_000));
+    let standing = apply(&store);
     assert!(!Arc::ptr_eq(&first, &standing), "a count built new");
     let reads = |count: &DispatchCredit| [sends(count, known), sends(count, fresh)];
-    assert_eq!(reads(&standing), [2, 0]);
-    assert_eq!(reads(&first), [2, 1]);
+    let read = [reads(&standing), reads(&first)];
     for (id, served) in [(2, known), (3, fresh)] {
         completed(&store, &open(&store, A), &a_completed(id, served)).expect("the frame reads");
     }
-    assert_eq!(reads(&standing), [2, 0], "an end takes no send out");
-    assert_eq!(reads(&first), [2, 1]);
+    let behind_the_ends = [reads(&standing), reads(&first)];
+    assert_eq!(behind_the_ends, read, "an end takes no send out");
+    read
+}
+
+/// A count built new under the settings that stood took the entries of
+/// the count before over at the engine's turn and shares them: it
+/// reads a send said inside the apply to a rank that stood there, as
+/// it reads the sends said before the apply. A rank first heard in the
+/// window stands in the count before alone, which no decision reads
+/// behind the publication: the new count is one send short on it.
+#[test]
+fn a_send_said_inside_an_apply_is_read_by_the_count_built_for_its_generation() {
+    let read = said_inside_an_apply(|store| counting_and_hearing(store, 2).0);
+    assert_eq!(read, [[2, 0], [2, 1]]);
+}
+
+/// A count built new under settings no standing count has shares no
+/// entry with the count before: at the engine's turn it took a copy of
+/// the sends that count held. It holds the send said before the apply
+/// and neither of the two said inside it, on a rank that stood as on a
+/// rank first heard there: the count before holds those alone.
+#[test]
+fn a_send_said_inside_an_apply_is_in_no_copy_of_a_count_under_other_settings() {
+    let read = said_inside_an_apply(|store| counting_under(store, 2, Some(60_000)));
+    assert_eq!(read, [[1, 0], [2, 1]]);
+}
+
+/// [`counted`] with a second profile `late` of the same stages, bound
+/// to a model no case asks for. `limits` are the milliseconds a send
+/// counts for under the preset's profile and under `late`: two limits,
+/// so each profile reads a count of its own.
+fn counted_twice(generation: u64, limits: [u32; 2]) -> AppliedSpec {
+    let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
+    document.generation = generation;
+    let mut late = document.profiles["least_load"].clone();
+    late.sent_ttl_ms = Some(limits[1]);
+    document.profiles.insert("late".into(), late);
+    let stock = document.profiles.get_mut("least_load");
+    stock.expect("the preset's profile").sent_ttl_ms = Some(limits[0]);
+    let elsewhere = r#"{"match":{"model":"elsewhere"},"profile":"late"}"#;
+    let elsewhere = serde_json::from_str(elsewhere).expect("a binding");
+    document.bindings.insert(0, elsewhere);
+    let digest = document.digest().expect("the document digests");
+    AppliedSpec::validate_digested(&document, digest, &StageRegistry::builtin(), &[])
+        .expect("the document validates")
+}
+
+/// The sends the standing generation counts on the first rank of
+/// `worker` under the time limit `limit_ms`, as a decision at
+/// `now_micros` reads them.
+fn sends_under(store: &MemoryStore, limit_ms: u32, worker: WorkerId, now_micros: u64) -> u32 {
+    let row = Candidate {
+        id: worker,
+        ..Candidate::default()
+    };
+    let facts = RequestFacts {
+        now_micros,
+        ..RequestFacts::default()
+    };
+    store.deciding(|world| {
+        let mut counts = world.spec().engine().sent_credits.iter();
+        let count = counts.find(|count| count.settings.ttl_ms == Some(limit_ms));
+        let count = count.expect("a count under the limit");
+        count.read(&facts, &row).requests
+    })
+}
+
+/// A count of sends a generation builds new holds the sends its own
+/// time limit still counts, whichever standing count let them go. The
+/// first generation's two profiles count a send for one millisecond
+/// and for nine. Two milliseconds behind a send, the count under one
+/// has let it go and the count under nine holds it. The second
+/// generation writes nine for the one and a longer limit for the nine:
+/// the send is inside both, and both of its counts hold it.
+#[test]
+fn a_generation_under_other_limits_keeps_the_sends_those_limits_count() {
+    const ISSUED: u64 = 91_300;
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    let t0 = Instant::now();
+    let served = ready(
+        &store,
+        &objects,
+        "a",
+        COUNTED,
+        Role::Single,
+        WireModes::HTTP,
+    );
+    let applied = store.apply(counted_twice(1, [1, 9]));
+    applied.expect("a later generation");
+    let mut record = lease(A, 1, t0);
+    record.lease.generation = 1;
+    record.lease.issued_micros = ISSUED;
+    record.target = served;
+    store.issue(record).expect("a lease");
+    let frame = a_dispatched(1);
+    dispatched(&store, &open(&store, A), &frame, t0).expect("the frame reads");
+    let later = ISSUED + u64::from(frame.since_decision_micros) + 2_000;
+    assert_eq!(sends_under(&store, 1, served, later), 0, "past one");
+    assert_eq!(sends_under(&store, 9, served, later), 1, "inside nine");
+
+    let applied = store.apply(counted_twice(2, [9, 43]));
+    applied.expect("a later generation");
+    let held = [9, 43].map(|limit| sends_under(&store, limit, served, later));
+    assert_eq!(held, [1, 1], "under the limit that stood and a longer one");
 }
 
 /// The `random` picker, whose call at a dispatch panics.

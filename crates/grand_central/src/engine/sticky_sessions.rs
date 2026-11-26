@@ -241,6 +241,13 @@ struct Entry {
     /// ([`SessionTable::rename_worker`]) or between the decision's read
     /// of its rows and its claim ([`SessionTable::stands`]).
     leased: WorkerId,
+    /// The instant the claim's lease is issued under, by its low 32 bits,
+    /// read while a claim stands. The word of a lease reaches the claim
+    /// where the lease names the claim's id and this instant
+    /// ([`Entry::reached_by`]): a later decision's claim on the same worker
+    /// is dated later. Two claims of one key on one worker a whole 2^32
+    /// microseconds apart read as one, the answer by the worker alone.
+    claimed_at: u32,
 }
 
 impl Entry {
@@ -277,6 +284,37 @@ impl Entry {
     fn front(&mut self, target: WorkerId) {
         if self.pins[0] != target {
             self.pins = [target, self.pins[0]];
+        }
+    }
+
+    /// Writes the claim of record: `stands` is the pin a decision claimed,
+    /// `leased` the id its lease names, and `at` the instant that lease is
+    /// issued under.
+    fn claimed(&mut self, stands: WorkerId, leased: WorkerId, at: u64) {
+        self.claim = stands;
+        self.leased = leased;
+        // The low 32 bits: the map's slot keeps its size.
+        self.claimed_at = at as u32;
+    }
+
+    /// Whether the word of a lease reaches the claim of record: a claim
+    /// stands, its lease names `leased`, and that lease was issued at `at`.
+    /// A word that states no instant (`0`) reaches a claim by its worker
+    /// alone.
+    fn reached_by(&self, leased: WorkerId, at: u64) -> bool {
+        self.claim != WorkerId(0)
+            && self.leased == leased
+            && (at == 0 || self.claimed_at == at as u32)
+    }
+
+    /// Dates the claim of record by `issued`, the instant of the lease its
+    /// words are told under, where that claim is the one `leased` and `at`
+    /// name ([`Self::reached_by`]). A lease that states no instant (`0`)
+    /// dates nothing: the claim keeps its own date.
+    #[cfg(any(test, feature = "in-process"))]
+    fn dated(&mut self, leased: WorkerId, at: u64, issued: u64) {
+        if issued != 0 && self.reached_by(leased, at) {
+            self.claimed_at = issued as u32;
         }
     }
 
@@ -625,6 +663,13 @@ impl SessionTable {
     /// commit that refused every target withdraws its decision's
     /// ([`Self::move_claim`]).
     ///
+    /// The claim keeps `at`, the instant its decision's lease is issued
+    /// under. The table knows the claiming decision by it: a word of a
+    /// lease moves or withdraws the claim where the lease names the
+    /// claim's id and that instant ([`Entry::reached_by`]). A decode call
+    /// claims at its own instant, and its claim is dated again by its
+    /// pair's lease (`Self::date_claim`, with the in-process engine).
+    ///
     /// The pin and the claim of record take the id that stands for the
     /// worker ([`Self::stands`]): the decision read its rows ahead of this
     /// write, and the worker may have been registered again between the
@@ -651,7 +696,13 @@ impl SessionTable {
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
-    pub(crate) fn claim(&self, key: Session, seen: SessionPins, target: WorkerId) -> Claim {
+    pub(crate) fn claim(
+        &self,
+        key: Session,
+        seen: SessionPins,
+        target: WorkerId,
+        at: u64,
+    ) -> Claim {
         let key = key.get();
         if key == 0 || target == WorkerId(0) {
             return Claim::Standing(target, seen);
@@ -692,8 +743,7 @@ impl SessionTable {
             Recovery::Latest => entry.front(stands),
             Recovery::Original => entry.append(stands),
         }
-        entry.claim = stands;
-        entry.leased = target;
+        entry.claimed(stands, target, at);
         Claim::Made(target)
     }
 
@@ -747,11 +797,19 @@ impl SessionTable {
     /// The new claim is written as a first one is ([`Self::claim`]): the
     /// pin and the claim of record under the id that stands for `target`,
     /// the lease's id and the answer under the id the decision read.
+    ///
+    /// `at` is the instant the caller's lease is issued under. The claim of
+    /// record is the caller's where its lease names `claimed` and was
+    /// issued at `at` ([`Entry::reached_by`]). A later decision's claim on
+    /// the same worker is dated later, so a refusal told late leaves it.
+    /// The claim written for `target` keeps `at`. A caller that states no
+    /// instant (`0`) is known by its worker alone.
     pub(crate) fn move_claim(
         &self,
         key: Session,
         claimed: WorkerId,
         target: WorkerId,
+        at: u64,
     ) -> SessionVerdict {
         let key = key.get();
         let mut shard = self.shard(key).lock();
@@ -769,7 +827,7 @@ impl SessionTable {
         // and its withdrawal needs no step: it takes the claim's own pin
         // as written, or none where that pin is gone, and the mark goes.
         let stands = self.stands(entry, target);
-        if entry.claim == WorkerId(0) || entry.leased != claimed {
+        if !entry.reached_by(claimed, at) {
             return SessionVerdict::Pinned;
         }
         let pin = std::mem::replace(&mut entry.claim, WorkerId(0));
@@ -781,9 +839,22 @@ impl SessionTable {
             Recovery::Latest => entry.front(stands),
             Recovery::Original => entry.append(stands),
         }
-        entry.claim = stands;
-        entry.leased = target;
+        entry.claimed(stands, target, at);
         SessionVerdict::Claimed(target)
+    }
+
+    /// A decode call claimed `leased` for `key` at `at`, its own instant,
+    /// under the lease its pair's first decision issued at `issued`. Every
+    /// word of the side that call issues is told under that lease, so the
+    /// claim takes the lease's date here. Nothing is written where the
+    /// claim of record is no longer that call's, or where the lease states
+    /// no instant (`issued` is 0).
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) fn date_claim(&self, key: Session, leased: WorkerId, at: u64, issued: u64) {
+        let key = key.get();
+        if let Some(entry) = self.shard(key).lock().get_mut(&key) {
+            entry.dated(leased, at, issued);
+        }
     }
 
     /// The commit dispatched a decision for `key` to `target` under the
@@ -796,7 +867,19 @@ impl SessionTable {
     /// registered again is one on that worker, under the id that stands
     /// ([`Self::stands`]). A dispatch on a claim's lease asks by the
     /// claim of record.
-    pub(crate) fn dispatched(&self, key: Session, verdict: SessionVerdict, target: WorkerId) {
+    ///
+    /// `at` is the instant the dispatched lease is issued under. The
+    /// claiming decision is the one whose lease names the claim's id and
+    /// that instant ([`Entry::reached_by`]): the commit elsewhere of an
+    /// older decision that claimed the same worker withdraws nothing. A
+    /// lease that states no instant (`0`) is known by its worker alone.
+    pub(crate) fn dispatched(
+        &self,
+        key: Session,
+        verdict: SessionVerdict,
+        target: WorkerId,
+        at: u64,
+    ) {
         let key = key.get();
         if key == 0 || target == WorkerId(0) {
             return;
@@ -828,7 +911,7 @@ impl SessionTable {
             entry.claim = WorkerId(0);
         }
         if let SessionVerdict::Claimed(claimed) = verdict {
-            if claimed != WorkerId(0) && entry.claim != WorkerId(0) && entry.leased == claimed {
+            if claimed != WorkerId(0) && entry.reached_by(claimed, at) {
                 let pin = entry.claim;
                 entry.claim = WorkerId(0);
                 entry.withdraw(pin);

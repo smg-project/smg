@@ -31,7 +31,7 @@ use super::{
     issue_pair, Booked, FrameBuffers,
 };
 use crate::{
-    document::spec::{AppliedSpec, Assignment, PolicySpec},
+    document::spec::{AppliedSpec, Assignment, PolicySpec, SessionsSpec},
     engine::{
         decision::{Decision, ShedReason, Target, Targets, SUBSET_HINT, WIRES},
         decision_engine::{Request, RequestMaker, WorkerLists},
@@ -70,7 +70,7 @@ use crate::{
         WorkerFacts, WorkerStatus,
     },
     tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, DISPATCH_TTL},
-    worker_host::{stand, Members, Objects},
+    worker_host::{tests::stand, Members, Objects},
 };
 
 mod encode;
@@ -1555,6 +1555,8 @@ fn at_call(n: u8, lease: LeaseId, wires: WireModes, hint: Option<u32>) -> proto:
 /// answered for its lease. With it go the snapshot the load monitor
 /// published, and the decider's place at the files of leases where the
 /// case lends one.
+///
+/// The case states the pair and no date of its lease.
 fn served_call(
     store: &MemoryStore,
     objects: &Objects<Members>,
@@ -1566,6 +1568,7 @@ fn served_call(
     let request = Checked::new(frame).expect("a frame the record holds");
     let taken = taken_at(&request, gateway, (now, now), place);
     let (mut frames, own) = (FrameBuffers::default(), Part::default());
+    let held = (held.0, held.1, 0);
     let decided = store
         .deciding(|world| decide_decode(world, objects, &taken, held, &mut frames, loads, &own));
     decided.expect("the engine decides").0
@@ -1707,7 +1710,7 @@ fn a_decode_call_answers_no_decode_then_the_decodes_emptied_then_none_dialed() {
             };
             let decided = world
                 .front()
-                .decide_decode_without_lease(&maker, &held, now);
+                .decide_decode_without_lease(&maker, &held, 0, now);
             let decided = decided.expect("the engine decides");
             let trace = decided.trace();
             (shed_of(&decided), (trace.seed, trace.generation))
@@ -1889,7 +1892,7 @@ fn a_decode_call_starts_from_the_decode_of_the_target_its_prefills_dispatch_took
         let took = chosen[usize::from(index)].1;
         let held = store.held_pair(GATEWAY, prefill.id);
         assert_eq!(
-            held.map(|(prefill, decode)| (prefill, decode.map(|at| at.0))),
+            held.map(|(prefill, decode, _)| (prefill, decode.map(|at| at.0))),
             Ok((p, Some(took)))
         );
         let frame = at_call(n + 10, prefill.id, WireModes::NONE, None);
@@ -2442,6 +2445,11 @@ fn ruled_pair_plan_of(assignment: Assignment) -> AppliedSpec {
 
 /// [`ruled_pair_plan_of`] under the in-flight cap `cap`, 65535 for none.
 fn ruled_pair_plan_under(assignment: Assignment, cap: u16) -> AppliedSpec {
+    ruled_pair_plan_with(|rule| (rule.assignment, rule.inflight_cap) = (assignment, cap))
+}
+
+/// [`ruled_pair_plan`] with its sessions rule as `set` leaves it.
+fn ruled_pair_plan_with(set: impl FnOnce(&mut SessionsSpec)) -> AppliedSpec {
     let document = r#"{
       "apiVersion": "smg.policy/v1",
       "generation": 1,
@@ -2460,8 +2468,7 @@ fn ruled_pair_plan_under(assignment: Assignment, cap: u16) -> AppliedSpec {
     let mut document: PolicySpec =
         serde_json::from_str(document).expect("a document of this build");
     let rule = document.bindings[0].sessions.as_mut();
-    let rule = rule.expect("the pair's rule");
-    (rule.assignment, rule.inflight_cap) = (assignment, cap);
+    set(rule.expect("the pair's rule"));
     staged(&document, &StageRegistry::builtin().without_lifecycle())
 }
 
@@ -2712,6 +2719,123 @@ fn a_served_refused_pair_keeps_no_claim_behind_a_decode_call() {
         refused(&prefill, proto::Side::Unspecified);
         assert_eq!(pins(), [alone(p), none], "the first decision's claim goes");
     }
+}
+
+/// A refusal told late takes back no claim of a newer decision. A pair's
+/// first decision claims a worker for each side's key, and its decode is
+/// asked for later. Both keys idle out while the pair's lease lives, and a
+/// newer pair of the session claims the same two workers. The first pair's
+/// decode call follows the newer claim as the key's pin, and its commit
+/// then refuses every target. The newer pair's claims stand at that
+/// release, and the session's next pair follows them ahead of the newer
+/// pair's dispatch.
+#[test]
+fn a_served_pairs_late_refusal_leaves_a_newer_pairs_claims() {
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    // A key idles out inside the life of a pair's lease.
+    let idle = ruled_pair_plan_with(|rule| (rule.ttl_s, rule.sweep_s) = (1, 1));
+    store.apply(idle).expect("above the unbound start");
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    let d = side_member(&store, &objects, "d0", Role::Decode, None);
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    let hand = open(&store, GATEWAY);
+    let alone = |id| Some([id, WorkerId(0)]);
+    let claimed = (SessionVerdict::Claimed(p), SessionVerdict::Claimed(d));
+    let pinned = (SessionVerdict::Pinned, SessionVerdict::Pinned);
+    // The first pair, its decode asked for later: a claim a side.
+    let mut frame = keyed(at_prefill(1, WireModes::NONE, None), 7);
+    frame.decode_later = true;
+    let (_, first, _) = leased_pair(&store, &objects, frame, now);
+    let sides = LeasesStore::sides(&*store, GATEWAY, first.id).expect("on file");
+    let chosen = sides.decode.expect("a pair's lease");
+    assert_eq!((first.session_verdict, chosen.session_verdict), claimed);
+    let pins = || [first.session, chosen.session].map(|session| pins_of(&store, session));
+    assert_eq!(pins(), [alone(p), alone(d)], "a claim a side");
+    let own = sent(&first, proto::Side::Prefill, 0);
+    lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+    // Both keys idle out, and a newer pair of the session claims the same
+    // two workers. No dispatch of it is told yet.
+    let later = now + Duration::from_secs(3);
+    let newer = keyed(at_prefill(2, WireModes::NONE, None), 7);
+    let (_, prefill, decode) = leased_pair(&store, &objects, newer, later);
+    let decode = decode.expect("issued with its prefill");
+    assert_eq!((prefill.session_verdict, decode.session_verdict), claimed);
+    // The first pair's decode call follows the newer claim as a pin, and
+    // its commit then refuses every target.
+    let call = keyed(at_call(3, first.id, WireModes::NONE, None), 7);
+    let (_, issued) = leased_call(&store, &objects, call, later);
+    let (side, _) = issued.expect("a pick's issue");
+    assert_eq!(side.session_verdict, SessionVerdict::Pinned);
+    let word = proto::Released {
+        what: Some(proto::released::What::LeaseId(first.id.0)),
+        reason: proto::released::Reason::CommitFailed.into(),
+        side: proto::Side::Unspecified.into(),
+    };
+    lifecycle::released(&store, &hand, &word).expect("the frame reads");
+    assert_eq!(
+        pins(),
+        [alone(p), alone(d)],
+        "the newer pair's claims stand"
+    );
+    // The session's next pair follows them, with a second decode to draw.
+    let other = side_member(&store, &objects, "d1", Role::Decode, None);
+    let third = keyed(at_prefill(4, WireModes::NONE, None), 7);
+    let (decision, prefill, decode) = leased_pair(&store, &objects, third, later);
+    assert_eq!(pairs_of(&decision), [(p, d)], "no pair on {other:?}");
+    let decode = decode.expect("issued with its prefill");
+    assert_eq!((prefill.session_verdict, decode.session_verdict), pinned);
+}
+
+/// A decode call's claim leaves at its own release. The pair's first
+/// decision claims a decode for the key, and the gateway then holds a veto
+/// on that decode. The call, three seconds behind the pair's decision,
+/// finds no pin it can follow and claims the other decode. That claim is
+/// dated by the pair's lease, which the side's release is told under. So
+/// the pair's refusal takes the call's claim back.
+#[test]
+fn a_served_decode_calls_claim_leaves_at_its_own_release() {
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    store
+        .apply(ruled_pair_plan())
+        .expect("above the unbound start");
+    let p = side_member(&store, &objects, "p0", Role::Prefill, None);
+    for name in ["d0", "d1"] {
+        side_member(&store, &objects, name, Role::Decode, None);
+    }
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    let hand = open(&store, GATEWAY);
+    let mut frame = keyed(at_prefill(1, WireModes::NONE, None), 7);
+    frame.decode_later = true;
+    let (decision, prefill, _) = leased_pair(&store, &objects, frame, now);
+    let chosen = pairs_of(&decision);
+    assert!(chosen.len() > 1 && chosen[0].1 != chosen[1].1, "{chosen:?}");
+    let (first, second) = (chosen[0].1, chosen[1].1);
+    let sides = LeasesStore::sides(&*store, GATEWAY, prefill.id).expect("on file");
+    let decode = sides.decode.expect("a pair's lease");
+    let pins = || pins_of(&store, decode.session);
+    assert_eq!(pins(), Some([first, WorkerId(0)]), "the first claim");
+    let own = sent(&prefill, proto::Side::Prefill, 0);
+    lifecycle::dispatched(&store, &hand, &own, now).expect("the frame reads");
+    // The gateway's veto stands on the claimed decode at the call.
+    let later = now + Duration::from_secs(3);
+    store.gateway_veto(GATEWAY, first, Some(later + Duration::from_secs(60)));
+    let call = keyed(at_call(2, prefill.id, WireModes::NONE, None), 7);
+    let (again, issued) = leased_call(&store, &objects, call, later);
+    assert_eq!(pairs_of(&again), [(p, second)], "the other decode");
+    let (side, _) = issued.expect("a pick's issue");
+    assert_eq!(side.session_verdict, SessionVerdict::Claimed(second));
+    assert_eq!(pins(), Some([first, second]), "the call's claim");
+    let word = proto::Released {
+        what: Some(proto::released::What::LeaseId(prefill.id.0)),
+        reason: proto::released::Reason::CommitFailed.into(),
+        side: proto::Side::Unspecified.into(),
+    };
+    lifecycle::released(&store, &hand, &word).expect("the frame reads");
+    assert_eq!(pins(), Some([first, WorkerId(0)]), "the call's claim left");
 }
 
 /// The keys the worker objects of `names` count, in the names' order: a
@@ -3078,8 +3202,8 @@ fn a_served_pair_with_a_worker_of_unknown_runtime_goes_behind_every_other_pair()
     assert_eq!(calls, [BTreeSet::from([same]), either]);
 }
 
-/// No frame states a demand in this protocol version, so what a row states
-/// for one changes no decision. One worker stands in each role. Each states
+/// These frames state no demand, so what a row states for one changes no
+/// decision. One worker stands in each role. Each states
 /// a runtime, a pipeline for media by reference, a way to decide a
 /// constraint and a window of sixteen tokens, and every frame's prompt is
 /// 4,096 tokens long. A single request's frame, a pair's at its prefill, a

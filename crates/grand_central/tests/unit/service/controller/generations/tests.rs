@@ -20,8 +20,7 @@ pub(crate) use crate::document::operator::test_support::{
 };
 use crate::{
     document::operator::{
-        needs_rows,
-        test_support::{document_of, standing, stock},
+        test_support::{document_of, needs_rows, standing, stock, Validate},
         ApplyCounts, NotHeld, OnFile,
     },
     engine::view::WorkerId,
@@ -34,6 +33,43 @@ use crate::{
     },
     store::{Registrant, WorkerFacts, WorkerStatus, WorkersStore},
 };
+
+impl Generations {
+    /// A door with a controller's pass that states nothing on a holder, for
+    /// a case.
+    pub(in crate::service::controller) fn new(
+        store: Arc<MemoryStore>,
+        catalog: Arc<StageRegistry>,
+    ) -> Self {
+        Self::over(
+            DocumentManager::validating(store, catalog, Vec::new(), one_switch),
+            None,
+        )
+    }
+
+    /// [`Generations::new`] with the validator as its argument, and with
+    /// the fence its door is built under, as [`Generations::stating`]
+    /// takes it: a case hands in a validator that faults, or one that
+    /// stalls, and the fence of an election of its own where its replica
+    /// stands under a shared lease.
+    pub(in crate::service::controller) fn validating(
+        store: Arc<MemoryStore>,
+        catalog: Arc<StageRegistry>,
+        validate: Validate,
+        fence: Option<Arc<Fence>>,
+    ) -> Self {
+        let door = DocumentManager::validating(store, catalog, Vec::new(), validate);
+        Self::over(door, fence)
+    }
+
+    /// Whether the source writes now: always for a replica alone over its
+    /// lease, and while the fence shows a term for one under a shared lease
+    /// ([`Generations::stating`]). A case's question: the source takes its
+    /// lead ahead of a read ([`Generations::lead`]).
+    pub(in crate::service::controller) fn source_writes(&self) -> bool {
+        self.lead().is_some()
+    }
+}
 
 thread_local! {
     static REPLICA_NOTICES: Cell<Option<u32>> = const { Cell::new(None) };
@@ -1369,6 +1405,11 @@ fn a_deferred_document_that_does_not_run_refuses_the_start() {
     let unrun = LEAST_LOAD.replace("healthy", "no-such-stage");
     door.defer(unrun.into_bytes(), Format::Yaml)
         .expect_err("a stage this build lacks");
+    // A refused start waits for no document: the store takes no mark.
+    assert!(
+        !store.snapshot().spec().awaits_document(),
+        "a refused start marked the store"
+    );
     // Nothing is kept for a take, and the door has no source.
     assert!(!door.bound());
     door.at_take();

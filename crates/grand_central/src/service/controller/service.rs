@@ -62,10 +62,11 @@ use super::{
     membership::MembershipCalls,
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
-    session, snapshot,
+    session,
+    snapshot::{self, SnapshotQuery},
     standby::Lag,
-    watch_workers::{self, Feed, Readers, Source, Watching},
-    wire, PROTOCOL_VERSION,
+    watch_workers::{self, Feed, Readers, Source, Start, Watching},
+    wire, PROTOCOL_FLOOR, PROTOCOL_VERSION,
 };
 use crate::{
     document::{
@@ -407,6 +408,67 @@ impl Shared {
             is_leader,
         }
     }
+
+    /// Opens a watch of the worker rows for `by`, admitted under `term`,
+    /// from `start` and for `models`. The stream reads this state's store,
+    /// worker objects, feed and fence, and takes its place among the feed's
+    /// readers ([`watch_workers::open`]).
+    ///
+    /// # Errors
+    ///
+    /// The readers' refusal of a watch past one of their ceilings.
+    pub(crate) fn watch(
+        &self,
+        term: u64,
+        by: &Principal,
+        start: Start,
+        models: &[String],
+    ) -> Result<Watching, Status> {
+        // The role's word as it stands at the open is seen: the watch
+        // ends at a word told from here on, whatever the word before it.
+        let mut role = self.role.clone();
+        role.mark_unchanged();
+        let source = Source {
+            store: Arc::clone(&self.store),
+            objects: Arc::clone(&self.objects),
+            feed: self.feed.clone(),
+            fence: Arc::clone(&self.fence),
+            role,
+            term,
+        };
+        watch_workers::open(source, &self.readers, by, start, models.to_vec())
+    }
+
+    /// Takes the snapshot `asked` for, as this replica holds it under
+    /// `term` ([`snapshot::taken`]). The term is the one its caller read:
+    /// the act reads no lead, before the take or behind it. One snapshot is
+    /// taken at a time, off the runtime's workers, in the turn of the feed's
+    /// readers ([`snapshot::in_turn`]), and its rows come by one of the
+    /// roads of [`snapshot::read`]. The readers let the feed's kept cut go
+    /// at the last call out, where no watch is open to share it.
+    ///
+    /// # Errors
+    ///
+    /// As many calls wait their turn as may, the take did not end, or the
+    /// take's own refusal.
+    pub(crate) async fn snapshot(
+        self: &Arc<Self>,
+        asked: SnapshotQuery,
+        term: u64,
+    ) -> Result<proto::Snapshot, Status> {
+        let shared = Arc::clone(self);
+        let take = move || {
+            snapshot::taken(
+                &asked,
+                term,
+                &shared.controller_id,
+                || snapshot::read(&asked, &shared.readers, (&shared.objects, &shared.store)),
+                &shared.generations,
+                Instant::now(),
+            )
+        };
+        snapshot::in_turn(&self.readers, take).await?
+    }
 }
 
 /// A call of the service a scope owns. `Leader` is not one: every scope
@@ -430,25 +492,6 @@ pub(crate) enum Call {
 }
 
 impl Call {
-    /// Every call, in the contract's order.
-    #[cfg(test)]
-    pub(crate) const ALL: [Call; 14] = [
-        Call::Session,
-        Call::Decide,
-        Call::WatchWorkers,
-        Call::RegisterWorker,
-        Call::PatchWorker,
-        Call::DeregisterWorker,
-        Call::GetSnapshot,
-        Call::Explain,
-        Call::ApplyPolicySpec,
-        Call::GetPolicySpec,
-        Call::RollbackPolicySpec,
-        Call::StepDown,
-        Call::WatchRegime,
-        Call::Replicate,
-    ];
-
     /// The call's name in the contract.
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -695,7 +738,7 @@ impl Service {
             // One lease covers every model until a lease per model group
             // exists.
             groups: Vec::new(),
-            protocol_min: PROTOCOL_VERSION,
+            protocol_min: PROTOCOL_FLOOR,
             protocol_max: PROTOCOL_VERSION,
         }
     }
@@ -844,20 +887,7 @@ impl GrandCentral for Service {
         let term = self.watched(Instant::now())?;
         let asked = request.get_ref();
         let start = watch_workers::start(asked)?;
-        // The role's word as it stands at the open is seen: the watch
-        // ends at a word told from here on, whatever the word before it.
-        let mut role = self.shared.role.clone();
-        role.mark_unchanged();
-        let source = Source {
-            store: Arc::clone(&self.shared.store),
-            objects: Arc::clone(&self.shared.objects),
-            feed: self.shared.feed.clone(),
-            fence: Arc::clone(&self.shared.fence),
-            role,
-            term,
-        };
-        let readers = &self.shared.readers;
-        let watching = watch_workers::open(source, readers, by, start, asked.models.clone())?;
+        let watching = self.shared.watch(term, by, start, &asked.models)?;
         Ok(Response::new(watching))
     }
 
@@ -914,20 +944,7 @@ impl GrandCentral for Service {
         let term = self.watched(Instant::now())?;
         let asked = snapshot::asked(request.into_inner())?;
         asked.sourced(self.shared.generations.bound())?;
-        let shared = Arc::clone(&self.shared);
-        let take = move || {
-            snapshot::taken(
-                &asked,
-                term,
-                &shared.controller_id,
-                || snapshot::read(&asked, &shared.readers, (&shared.objects, &shared.store)),
-                &shared.generations,
-                Instant::now(),
-            )
-        };
-        // The feed's readers let its kept cut go at the last call out, where
-        // no watch is open to share it.
-        let taken = snapshot::in_turn(&self.shared.readers, take).await??;
+        let taken = self.shared.snapshot(asked, term).await?;
         if self.watched(Instant::now())? != term {
             return Err(Status::unavailable(TAKE_OVER));
         }

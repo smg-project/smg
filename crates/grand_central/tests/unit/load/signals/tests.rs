@@ -1,5 +1,13 @@
 use super::*;
 
+impl SignalCells {
+    /// The cells, row after row.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn cells(&self) -> &[SignalCell] {
+        &self.cells
+    }
+}
+
 const HELD: SignalCell = SignalCell {
     value: 7.0,
     sampled_at_micros: 0,

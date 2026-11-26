@@ -69,16 +69,14 @@ use super::{
     wire,
     worker_wire::{self, Refused as Unfollowed},
 };
-#[cfg(test)]
-pub(crate) use crate::document::operator::Validate;
 pub(crate) use crate::document::operator::{
-    ApplyOutcome, Format, SpecRejected, DRY_RUNS_WAITING, MAX_DOCUMENT_BYTES, WRITES_WAITING,
+    ApplyOutcome, Format, SpecRejected, MAX_DOCUMENT_BYTES,
 };
 use crate::{
     document::{
         operator::{
             above, over_bound, Checked, DocumentManager, DryRun, EnforceOutcome, EnforceRefused,
-            Entered, FollowerTurn, Held, Line,
+            Entered, FollowerTurn, Held, Line, SerialTurn,
         },
         spec::{AppliedSpec, Digest, OverloadSwitch, PolicySpec, SpecError},
     },
@@ -136,6 +134,22 @@ enum Handed {
 /// written longer, so a longer guard names none.
 const DIGEST_TEXT_LEN: usize = "sha256:".len() + 64;
 
+/// How many dry runs may wait their turn: a call past them is refused.
+/// The count bounds what waits. Bytes are bounded before the wait: a
+/// document over the size bound takes no turn, and neither does a guard
+/// longer than a digest's text.
+///
+/// The heaviest file the search finds passes in under 40 ms at the median
+/// by run, so 32 passes take under a second and a half. 32 documents of
+/// the size bound, with their guards, are 4 MiB. A waiting call that ends
+/// leaves the wait and frees its place.
+pub(crate) const DRY_RUNS_WAITING: usize = 32;
+
+/// How many write calls may wait for the door: a call past them is refused.
+/// A waiting call holds its document, so what waits is bounded as the dry
+/// runs are: 32 documents of the size bound are 4 MiB.
+pub(crate) const WRITES_WAITING: usize = 32;
+
 /// Why a spec call gave no answer of its own: a dry run or a write no
 /// verdict, a read no document.
 #[derive(Debug)]
@@ -168,6 +182,11 @@ impl From<EnforceRefused> for Unanswered {
 /// The controller's spec source, with its replica's admissions.
 pub(crate) struct Generations {
     door: DocumentManager,
+    /// One dry run at a time ([`Generations::dry_run_in_turn`]).
+    dry_turn: SerialTurn,
+    /// Enforce and rollback share one write turn
+    /// ([`Generations::in_turn`]).
+    write_turn: SerialTurn,
     /// The start's document of a replica under a shared lease, in its
     /// source's form, from the start that passed it until the replica's
     /// first lead applies it or refuses it, or a followed generation
@@ -309,35 +328,11 @@ impl Generations {
         Self::over(door.telling(entered), fence)
     }
 
-    /// A door with a controller's pass that states nothing on a holder, for
-    /// a case.
-    #[cfg(test)]
-    pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<StageRegistry>) -> Self {
-        Self::over(
-            DocumentManager::validating(store, catalog, Vec::new(), one_switch),
-            None,
-        )
-    }
-
-    /// [`Generations::new`] with the validator as its argument, and with
-    /// the fence its door is built under, as [`Generations::stating`]
-    /// takes it: a case hands in a validator that faults, or one that
-    /// stalls, and the fence of an election of its own where its replica
-    /// stands under a shared lease.
-    #[cfg(test)]
-    pub(crate) fn validating(
-        store: Arc<MemoryStore>,
-        catalog: Arc<StageRegistry>,
-        validate: Validate,
-        fence: Option<Arc<Fence>>,
-    ) -> Self {
-        let door = DocumentManager::validating(store, catalog, Vec::new(), validate);
-        Self::over(door, fence)
-    }
-
     fn over(door: DocumentManager, fence: Option<Arc<Fence>>) -> Self {
         Self {
             door,
+            dry_turn: SerialTurn::new(DRY_RUNS_WAITING),
+            write_turn: SerialTurn::new(WRITES_WAITING),
             deferred: Mutex::new(None),
             file_sourced: AtomicBool::new(false),
             fence,
@@ -404,6 +399,7 @@ impl Generations {
             |store, spec| store.apply_admitted(spec, || self.leads(lead)),
             |passed| {
                 if news {
+                    // A case counts a replica's notices, and this step itself tells each one.
                     #[cfg(test)]
                     tests::count_replica_notice(self, false);
                     match passed {
@@ -643,15 +639,6 @@ impl Generations {
             self.file_sourced.store(true, Ordering::Relaxed);
             Ok(())
         })
-    }
-
-    /// Whether the source writes now: always for a replica alone over its
-    /// lease, and while the fence shows a term for one under a shared lease
-    /// ([`Generations::stating`]). A case's question: the source takes its
-    /// lead ahead of a read ([`Generations::lead`]).
-    #[cfg(test)]
-    pub(crate) fn source_writes(&self) -> bool {
-        self.lead().is_some()
     }
 
     /// The lead this replica writes under now: a source takes it ahead of

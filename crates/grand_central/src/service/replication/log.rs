@@ -26,8 +26,8 @@ pub enum Event {
         /// The row the change is about, as the write leaves it; `None` for
         /// a removal.
         row: Option<Arc<WorkerRow>>,
-        /// The row the write took out of the table: a removal's row, a
-        /// replacement's old incarnation.
+        /// The row the write took out: a removal's row, a replacement's old
+        /// incarnation.
         left: Option<Arc<WorkerRow>>,
     },
     /// The store's term rose: the first position of a term, one of the
@@ -690,12 +690,6 @@ impl Log {
         if self.told_at.fetch_max(moves, Ordering::AcqRel) < moves {
             told();
         }
-    }
-
-    /// The log's lock, held: for a case that shows what waits for it.
-    #[cfg(test)]
-    pub(crate) fn held(&self) -> impl Sized + '_ {
-        self.ring.lock()
     }
 
     /// A standby's application of the leader's event at `at`: while the

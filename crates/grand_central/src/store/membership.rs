@@ -131,9 +131,9 @@ pub(super) fn same_worker(old: &WorkerFacts, new: &WorkerFacts) -> bool {
     old.role == new.role && old.same_models(new) && old.wire_modes == new.wire_modes
 }
 
-impl WorkerFacts {
-    /// What a registration of these facts by `maker` makes of `standing`,
-    /// the row that stands under their key, at `now`: the change, and the
+impl WorkerRow {
+    /// What a registration of `facts` by `maker` makes of `standing`, the
+    /// row that stands under their key, at `now`: the change, and the
     /// row the change leaves. One rule for every writer of a row, whatever
     /// the writer reads the standing row from.
     ///
@@ -151,24 +151,24 @@ impl WorkerFacts {
     /// the row holds what the two rules read. A descriptor that stands so
     /// is kept where it is, shared or not: a row written again copies none.
     pub(crate) fn laid_over(
-        mut self,
-        standing: Option<&WorkerRow>,
+        mut facts: WorkerFacts,
+        standing: Option<&Self>,
         maker: Registrant,
         now: Instant,
-    ) -> (MembershipChange, WorkerRow) {
-        if let Some(descriptor) = self
+    ) -> (MembershipChange, Self) {
+        if let Some(descriptor) = facts
             .pairing
             .as_mut()
             .filter(|descriptor| !descriptor.is_normalized())
         {
             Arc::make_mut(descriptor).normalize();
         }
-        self.encode = self.encode.normalized();
+        facts.encode = facts.encode.normalized();
         let Some(standing) = standing else {
-            let id = identity(&self.key, self.incarnation);
-            let row = WorkerRow {
+            let id = identity(&facts.key, facts.incarnation);
+            let row = Self {
                 id,
-                facts: self,
+                facts,
                 status: WorkerStatus::Pending,
                 revision: 1,
                 admitted_at: now,
@@ -176,16 +176,16 @@ impl WorkerFacts {
             };
             return (MembershipChange::Registered { id }, row);
         };
-        if standing.facts.incarnation == self.incarnation {
+        if standing.facts.incarnation == facts.incarnation {
             let id = standing.id;
-            let change = if standing.facts.dp_size == self.dp_size {
+            let change = if standing.facts.dp_size == facts.dp_size {
                 MembershipChange::Relabelled { id }
             } else {
                 MembershipChange::Resized { id }
             };
-            let row = WorkerRow {
+            let row = Self {
                 id,
-                facts: self,
+                facts,
                 status: standing.status,
                 revision: standing.revision + 1,
                 admitted_at: standing.admitted_at,
@@ -193,11 +193,11 @@ impl WorkerFacts {
             };
             return (change, row);
         }
-        let new = identity(&self.key, self.incarnation);
-        let row = WorkerRow {
+        let new = identity(&facts.key, facts.incarnation);
+        let row = Self {
             id: new,
-            status: standing.hands_on(&self),
-            facts: self,
+            status: standing.hands_on(&facts),
+            facts,
             revision: 1,
             admitted_at: now,
             maker: standing.maker.clone(),
@@ -205,9 +205,7 @@ impl WorkerFacts {
         let old = standing.id;
         (MembershipChange::Replaced { old, new }, row)
     }
-}
 
-impl WorkerRow {
     /// The status the key's next life starts in behind this row, where
     /// `facts` are that life's. The row's own carries over where the
     /// registration matches ([`same_worker`]), as the registry inherits a

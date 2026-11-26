@@ -2,15 +2,16 @@
 //! held to the `kv-index` crate's reference index over streams with
 //! holes, clears, restarts, gaps and snapshots.
 
-use std::{collections::BTreeMap, ops::Deref};
+use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
 use kv_index::{chain_prefix_hash, ApplyError, ContentHash, GroupKind, ReferenceIndexer};
+use rustc_hash::FxHashMap;
 use smg_worker::kv_events::port::{
     BatchFacts, BatchOutcome, KvCursor, ResyncReason, SnapshotChunk,
 };
 
 use super::{
-    admitted as by_cursor, indexed_under, Blocks, ChainBlockMap, KvTables, LaneWriter,
+    admitted as by_cursor, indexed_under, Blocks, ChainBlockMap, KvTables, LaneWriter, ModelIndex,
     SequenceHash, StoredBlock, INDEX_WORKERS,
 };
 use crate::{
@@ -20,6 +21,66 @@ use crate::{
 };
 
 const MODEL: &str = "m";
+
+impl KvTables {
+    /// How many rows hold a lane, for the cases: the rows that ask for
+    /// events less these are the rows an index had no place for.
+    pub(in crate::worker_host) fn lanes(&self) -> usize {
+        self.table.lock().lanes.len()
+    }
+
+    /// Whether the row of `id` holds a lane at `rank`, for the cases.
+    pub(in crate::worker_host) fn holds_lane(&self, id: WorkerId, rank: u16) -> bool {
+        self.lane(id, Some(rank)).is_some()
+    }
+
+    /// The rows holding a prefix of the request's blocks in `model`'s
+    /// index, each with the leading blocks it holds, by id: every holder
+    /// listed, for the cases.
+    pub(crate) fn overlaps(&self, model: &str, hashes: &[u64]) -> Vec<(WorkerId, u32)> {
+        let (index, rows) = {
+            let table = self.table.lock();
+            let Some(ModelIndex { index, .. }) = table.indexes.get(model) else {
+                return Vec::new();
+            };
+            let rows: FxHashMap<u32, WorkerId> = table
+                .lanes
+                .iter()
+                .filter(|(_, entry)| &*entry.model == model)
+                .filter_map(|(id, entry)| Some((entry.lane.lock().held.as_ref()?.worker, *id)))
+                .collect();
+            (Arc::clone(index), rows)
+        };
+        let mut held = Vec::new();
+        index.chain.score_into(
+            hashes,
+            |hash| *hash,
+            false,
+            |worker, blocks| {
+                if let Some(id) = rows.get(&worker) {
+                    held.push((*id, blocks));
+                }
+            },
+        );
+        held.sort_unstable();
+        held
+    }
+
+    /// How many models hold an index.
+    fn indexes(&self) -> usize {
+        self.table.lock().indexes.len()
+    }
+
+    /// Blocks `model`'s index holds across its workers (a block two hold
+    /// counts twice).
+    fn held_blocks(&self, model: &str) -> usize {
+        let table = self.table.lock();
+        table
+            .indexes
+            .get(model)
+            .map_or(0, |held| held.index.chain.current_size())
+    }
+}
 
 /// A store's rows with the KV tables beside them, as a holder of worker
 /// objects keeps the two: what a membership write changes is stated to the
@@ -704,7 +765,7 @@ fn a_rows_group_view_empties_with_its_rank_and_leaves_with_the_row() {
     view.group_stored(1, &[SequenceHash(7)]);
     let blocks = |view: &kv_index::WorkerGroups| view.pending_blocks() + view.retained_blocks();
     assert_eq!(blocks(&view), 1);
-    assert!(std::sync::Arc::ptr_eq(&view, &view_of(a, 2)));
+    assert!(Arc::ptr_eq(&view, &view_of(a, 2)));
 
     store.resync(a, Some(0), ResyncReason::DataLoss);
     assert_eq!(blocks(&view), 0, "the view empties with the rank");
@@ -718,7 +779,7 @@ fn a_rows_group_view_empties_with_its_rank_and_leaves_with_the_row() {
         .id();
     assert_ne!(successor, a);
     let next = view_of(successor, 1);
-    assert!(!std::sync::Arc::ptr_eq(&view, &next));
+    assert!(!Arc::ptr_eq(&view, &next));
     assert!(!next.knows(1), "the successor's view is its own");
 }
 

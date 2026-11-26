@@ -4,11 +4,15 @@
 //
 // Versioning: design appendix A (additive within v1). The package is
 // pre-release until the first shipped release that carries it; the rule
-// binds from then on. Hello carries the range of protocol versions the
-// gateway speaks and Welcome the one the controller picked; a range that
-// holds no version the controller speaks is refused with
-// FAILED_PRECONDITION, the status message naming the range and the
-// controller's version.
+// binds from then on.
+//
+// Hello carries the range of protocol versions the gateway speaks, and
+// Welcome the one the controller picked. The controller speaks two
+// versions, its own and the one before it, and picks the newest that the
+// range holds. A range that holds neither is refused with
+// FAILED_PRECONDITION, and the status message names the range and the
+// controller's own. Version 2 is the first whose frames state a request's
+// hard demands (DecideRequest.demands).
 //
 // Scopes and principals: design 5.2. Three credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
@@ -537,6 +541,66 @@ message DecideRequest {
   // such a pool, the decode goes by load and its number is not read. The
   // pair's decode_later stands as it is stated.
   optional uint32 named_worker = 8;
+  // The request's hard demands of the worker that takes it. Absent, or with
+  // no part stated, the request demands nothing and the frame is decided as
+  // it was.
+  //
+  // A stated demand is read on a single request's frame that names no
+  // worker. On every other frame it is out of range, by this field, in this
+  // protocol version:
+  // - a frame at a side's phase, a pair's or one that stands alone there
+  // - a decode call
+  // - an encode request's frame
+  // - a frame that states named_worker
+  //
+  // A host states a demand only on a session whose Welcome chose protocol 2
+  // or later. A controller of protocol 1 reads no such field, and would
+  // place the request among the workers its demand rules out. A controller
+  // that speaks protocol 2 reads a stated demand on a session of either
+  // version.
+  Demands demands = 9;
+}
+
+// What a request demands of the worker that takes it. A worker meets a
+// demand by what its registration states (DemandFacts). The two numbers
+// are the asking party's own: the controller compares each with a worker's
+// and reads no more of it.
+//
+// Whether a worker takes images is its row's own bit. No registration
+// over this contract states it yet, so a request that demands vision is
+// shed unless the controller's host laid a worker that takes images. A
+// list the demands leave nobody is shed with no endpoint, under the stage
+// of the demand that took its last worker.
+message Demands {
+  // Where a request's media by reference may be processed.
+  enum References {
+    // The request carries no media by reference.
+    REFERENCES_NONE = 0;
+    // By a worker that processes media by reference, whichever pipeline it
+    // runs.
+    REFERENCES_ANY = 1;
+    // By a worker that processes it by its registering party's pipeline.
+    REFERENCES_CALLER = 2;
+    // By a worker that processes it by a pipeline of its own.
+    REFERENCES_WORKER = 3;
+  }
+  // The runtime the request stays on, as a number: only a worker that
+  // states the same number takes it. 0 demands none.
+  uint32 runtime = 1;
+  // The request needs a worker that takes images.
+  bool vision = 2;
+  // A value this contract does not name is out of range, by this field.
+  References references = 3;
+  // The context window the request's input needs, in tokens: only a worker
+  // whose window is as wide, or that states none, takes it. 0 demands none.
+  uint32 input_window = 4;
+  // The context window the request's completion needs, in tokens, held
+  // against a worker's window alone as the input is. 0 demands none.
+  uint32 output_window = 5;
+  // How the request's constraint was decided, as a number of at most 255:
+  // out of range above, by this field. Only a worker that states the same
+  // number takes it. 0 demands none.
+  uint32 decoding = 6;
 }
 
 // The encode items of a request and what it asks for them.
@@ -898,15 +962,18 @@ message Signals {
 // and reads no more of them. A worker that states none meets no demand for
 // a runtime, for media by reference or for a way to decide a constraint,
 // and it takes a request of any size. Whether the worker takes images is
-// no field here. No frame states a demand in this protocol version, so a
-// frame's decision reads none of these facts yet.
+// no field here. A frame states the demands these facts are held against
+// (DecideRequest.demands).
 message DemandFacts {
   // The worker's runtime, as a number. 0 states none.
   uint32 runtime = 1;
   // The worker processes media by reference.
   bool references = 2;
   // It processes that media by its registering party's pipeline, and not
-  // by one of its own. Read only beside `references`.
+  // by one of its own. Read only beside `references`. The bit is carried
+  // and compared as stated. No decision reads it where the party states no
+  // references. A change of it alone changes the row, as a change of any
+  // other stated fact does.
   bool host_pipeline = 3;
   // The worker's context window, in tokens. 0 states none.
   uint32 window = 4;
@@ -1077,8 +1144,11 @@ message SnapshotRequest {
     SLICE_LOADS = 3;
     SLICE_SESSIONS = 4;
     SLICE_LEASES = 5;
-    // Its rows left the answer (Snapshot's number 9): no build serves it.
-    SLICE_PAIRS = 6;
+    // The pair rows' slice, which no build served: no later slice takes its
+    // number or its name. A request that still names it is refused as one
+    // that names no slice: INVALID_ARGUMENT by `slices`.
+    reserved 6;
+    reserved "SLICE_PAIRS";
     SLICE_SPEC = 7;
     SLICE_PLUGINS = 8;
     SLICE_KV_INDEX = 9;
@@ -1353,6 +1423,8 @@ message LeaderInfo {
   bool synced = 5;
   SyncState sync = 6;
   repeated GroupLeader groups = 7;
+  // The oldest and the newest protocol version the answering controller
+  // speaks.
   uint32 protocol_min = 8;
   uint32 protocol_max = 9;
 }

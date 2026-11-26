@@ -13,13 +13,26 @@ use crate::{
     service::{
         controller::{
             config::tests::valid,
-            worker_objects::{engine, WorkerObjects},
+            worker_objects::{tests::engine, WorkerObjects},
             Controller, Error as BindError,
         },
         elector::{ElectError, ElectionSettings, Elector},
     },
     store::{MemoryStore, Registrant, WorkerFacts, WorkerRow, WorkersStore},
 };
+
+impl Discovery {
+    /// A discovery over a host its case built, which hands that host a
+    /// queue of its own.
+    fn new(settings: RuntimeDiscoveryConfig, host: Arc<Host>, fence: Arc<Fence>) -> Self {
+        Self {
+            settings,
+            host,
+            fence,
+            _jobs: None,
+        }
+    }
+}
 
 const WORKER: &str = "http://worker:8000";
 const OTHER: &str = "http://other:8000";

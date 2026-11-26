@@ -69,7 +69,8 @@ impl InProcess {
     }
 
     /// [`Loaded::decide_decode_without_lease`] under the document in
-    /// force, for a case of an engine by itself.
+    /// force, for a case of an engine by itself. The case states no date
+    /// of the pair's lease.
     pub(crate) fn decide_decode_without_lease(
         &self,
         maker: &impl RequestMaker,
@@ -78,7 +79,7 @@ impl InProcess {
     ) -> Result<Decision, DecisionRefused> {
         let document = self.in_force();
         self.under(&document)
-            .decide_decode_without_lease(maker, held, now)
+            .decide_decode_without_lease(maker, held, 0, now)
     }
 
     /// [`Loaded::decide_encode_without_lease`] under the document in
@@ -286,6 +287,77 @@ fn a_send_to_a_worker_that_stands_no_more_is_not_taken_over_at_an_apply() {
         engine.follow_registry(&mut follow);
         assert_eq!(sends_to(&engine, &sent_to), 0, "behind the read owed");
     }
+}
+
+/// The stock document `least_load` under the generation `number`, with a
+/// second profile `late` of the same stages bound to a model no case asks
+/// for. `limits` are the milliseconds a send counts for under the stock
+/// profile and under `late`: two limits, so each profile reads a count of
+/// its own.
+fn two_limits(number: u64, limits: [u32; 2]) -> AppliedSpec {
+    let mut document = PolicySpec::preset("least_load").expect("a built-in preset");
+    document.generation = number;
+    let mut late = document.profiles["least_load"].clone();
+    late.sent_ttl_ms = Some(limits[1]);
+    document.profiles.insert("late".into(), late);
+    let stock = document.profiles.get_mut("least_load");
+    stock.expect("the preset's profile").sent_ttl_ms = Some(limits[0]);
+    let elsewhere = BindingSpec {
+        matcher: Match {
+            model: "elsewhere".into(),
+            ..Match::default()
+        },
+        profile: Some("late".into()),
+        ..BindingSpec::default()
+    };
+    document.bindings.insert(0, elsewhere);
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// The sends the document in force counts for the worker `to` names under
+/// the time limit `limit_ms`, as a decision at `now_micros` reads them.
+fn sends_under(engine: &InProcess, limit_ms: u32, to: &Target, now_micros: u64) -> u32 {
+    let row = Candidate {
+        id: to.id,
+        dp_rank: to.dp_rank,
+        ..Candidate::default()
+    };
+    let facts = RequestFacts {
+        now_micros,
+        ..RequestFacts::default()
+    };
+    let mut counts = engine.standing_spec().engine().sent_credits.iter();
+    let count = counts.find(|count| count.settings.ttl_ms == Some(limit_ms));
+    let count = count.expect("a count under the limit");
+    count.read(&facts, &row).requests
+}
+
+/// A count of sends built new at the call holds the sends its own time
+/// limit still counts, whichever standing count let them go. The first
+/// document's two profiles count a send for one millisecond and for nine.
+/// Two milliseconds behind a send, the count under one has let it go and
+/// the count under nine holds it. The second document writes nine for the
+/// one and a longer limit for the nine: the send is inside both, and both
+/// of its counts hold it.
+#[test]
+fn a_count_under_another_limit_keeps_the_sends_that_limit_counts_at_an_apply() {
+    let engine = InProcess::new(two_limits(1, [1, 9]));
+    engine.set_registry(handed(&registry(2)));
+    let members = PublishedList::new(pool(2));
+    let asks = Asks::of(request(), Some(&members));
+    let now = Instant::now();
+    let decided = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now);
+    let mut first = decided.expect("a decision");
+    let sent_to = first.take(0).expect("the first target");
+    first.dispatched(now);
+    let later = engine.clock().micros(now) + 2_000;
+    assert_eq!(sends_under(&engine, 1, &sent_to, later), 0, "past one");
+    assert_eq!(sends_under(&engine, 9, &sent_to, later), 1, "inside nine");
+
+    let applied = engine.apply(two_limits(2, [9, 43]));
+    applied.expect("a number above the standing one");
+    let held = [9, 43].map(|limit| sends_under(&engine, limit, &sent_to, later));
+    assert_eq!(held, [1, 1], "under the limit that stood and a longer one");
 }
 
 /// A document whose number is not above the standing one is refused, and
@@ -575,6 +647,39 @@ fn an_older_requests_words_reach_the_stages_that_stood_under_its_document() {
     for let_go in [2, 4, 5] {
         assert!(words(&built, let_go).is_empty(), "the picker at {let_go}");
     }
+}
+
+/// What a store reads for a lease on its file is the stages that stood
+/// under the lease's generation ([`Loaded::hearing`]), and none built
+/// since, though a later document kept that one too. The second document
+/// builds the profile `second` anew and the third keeps both profiles. A
+/// dispatch told for a lease of the first document reaches the stage kept
+/// since then alone, and one for a lease of the second reaches both.
+#[cfg(feature = "controller")]
+#[test]
+fn a_stage_built_since_a_leases_generation_and_kept_later_did_not_stand_at_it() {
+    let (stages, built) = hearing_stages();
+    let engine = InProcess::new(hearing_over(&stages, 1, second_profile));
+    for number in [2, 3] {
+        let applied = engine.apply(hearing_over(&stages, number, second_anew));
+        applied.expect("a number above the standing one");
+    }
+    for generation in [1, 2] {
+        let lease = crate::tracking::Lease {
+            generation,
+            ..Default::default()
+        };
+        let held = engine.spec();
+        let stood = held.under(&engine).hearing(generation);
+        let stood = stood.expect("a generation under the standing one");
+        let side = crate::tracking::Side::Single;
+        stood.on_dispatched(&lease, &Target::default(), side, 0);
+    }
+    // The pickers by the place the table built them at: `random` of the
+    // first document, kept by both later ones, and the second document's
+    // `second`, kept by the third.
+    assert_eq!(words(&built, 0), ["dispatched", "dispatched"]);
+    assert_eq!(words(&built, 3), ["dispatched"], "born under the second");
 }
 
 /// A send said behind a later document, for a decision the document before

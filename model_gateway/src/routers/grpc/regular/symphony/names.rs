@@ -409,8 +409,8 @@ fn checked_names(
                     if answering_to(other) != Some(selected) {
                         return Err(format!(
                             "{kind} parser '{name}' selects the Symphony table '{}' and is no \
-                             legacy parser's name, so the other parser must name the same \
-                             table or nothing, not '{other}'",
+                             legacy {kind} parser's name, so the other parser must name the \
+                             same table or nothing, not '{other}'",
                             selected.name()
                         ));
                     }
@@ -418,7 +418,8 @@ fn checked_names(
             }
             (true, None) => {
                 return Err(format!(
-                    "unknown {kind} parser '{name}': neither a legacy parser nor a Symphony table"
+                    "unknown {kind} parser '{name}': neither a legacy {kind} parser nor a \
+                     Symphony table"
                 ));
             }
             (false, Some(selected)) => {
@@ -879,13 +880,23 @@ mod tests {
         let why = check(symphony, &names(Some("ling"), Some("qwen3")));
         assert_eq!(
             why.expect_err("bound to the table"),
-            "tool-call parser 'ling' selects the Symphony table 'ling' and is no legacy parser's \
-             name, so the other parser must name the same table or nothing, not 'qwen3'"
+            "tool-call parser 'ling' selects the Symphony table 'ling' and is no legacy \
+             tool-call parser's name, so the other parser must name the same table or nothing, \
+             not 'qwen3'"
         );
         let why = check(symphony, &names(None, Some("nonsense")));
         assert_eq!(
             why.expect_err("unknown"),
-            "unknown reasoning parser 'nonsense': neither a legacy parser nor a Symphony table"
+            "unknown reasoning parser 'nonsense': neither a legacy reasoning parser nor a \
+             Symphony table"
+        );
+        // A legacy parser's name of the other kind that no table answers to is unknown too,
+        // and the refusal names the kind whose registry lacks it.
+        let why = check(symphony, &names(None, Some("pythonic")));
+        assert_eq!(
+            why.expect_err("unknown"),
+            "unknown reasoning parser 'pythonic': neither a legacy reasoning parser nor a \
+             Symphony table"
         );
         // A legacy name of the other kind that a table answers to selects that table: a tool
         // parser's given as the reasoning parser passes, one name passes in both flags where
@@ -896,12 +907,17 @@ mod tests {
             check(symphony, &names(Some("minimax"), Some("minimax"))),
             Ok(())
         );
+        // Beside a table's own name, a legacy parser's name the table answers to passes.
+        assert_eq!(
+            check(symphony, &names(Some("qwen_xml"), Some("qwen3_tagged"))),
+            Ok(())
+        );
         let why = check(symphony, &names(Some("pythonic"), Some("qwen_xml")));
         assert_eq!(
             why.expect_err("bound to the table"),
             "reasoning parser 'qwen_xml' selects the Symphony table 'qwen3_tagged' and is no \
-             legacy parser's name, so the other parser must name the same table or nothing, not \
-             'pythonic'"
+             legacy reasoning parser's name, so the other parser must name the same table or \
+             nothing, not 'pythonic'"
         );
         let why = check(legacy, &names(None, Some("qwen_xml")));
         assert_eq!(
@@ -915,12 +931,14 @@ mod tests {
         let why = check(symphony, &names(Some("QWEN_XML"), None));
         assert_eq!(
             why.expect_err("not as spelled"),
-            "unknown tool-call parser 'QWEN_XML': neither a legacy parser nor a Symphony table"
+            "unknown tool-call parser 'QWEN_XML': neither a legacy tool-call parser nor a \
+             Symphony table"
         );
         let why = check(symphony, &names(None, Some(" hy_v4 ")));
         assert_eq!(
             why.expect_err("not as spelled"),
-            "unknown reasoning parser ' hy_v4 ': neither a legacy parser nor a Symphony table"
+            "unknown reasoning parser ' hy_v4 ': neither a legacy reasoning parser nor a \
+             Symphony table"
         );
         // A launcher's name for a family whose table has no older parser (`muse`) passes in
         // either flag and binds the other name as the table's own name does; under `legacy` it
@@ -938,14 +956,15 @@ mod tests {
         assert_eq!(
             why.expect_err("bound to the table"),
             "tool-call parser 'muse' selects the Symphony table 'muse_spark' and is no legacy \
-             parser's name, so the other parser must name the same table or nothing, not 'qwen3'"
+             tool-call parser's name, so the other parser must name the same table or nothing, \
+             not 'qwen3'"
         );
         let why = check(symphony, &names(Some("muse"), Some("passthrough")));
         assert_eq!(
             why.expect_err("bound to the table"),
             "tool-call parser 'muse' selects the Symphony table 'muse_spark' and is no legacy \
-             parser's name, so the other parser must name the same table or nothing, not \
-             'passthrough'"
+             tool-call parser's name, so the other parser must name the same table or nothing, \
+             not 'passthrough'"
         );
         let why = check(legacy, &names(None, Some("muse")));
         assert_eq!(
@@ -1356,6 +1375,19 @@ mod tests {
         );
         assert_eq!(
             read(&ModelNames::flagged(&family), "MiniMaxAI/MiniMax-M2.7"),
+            table("minimax_m2")
+        );
+        // As the tool-call name it decides, as every tool-call name does: both flags naming
+        // the family read with the table of its current line, a model of the M2 line the
+        // registry lists among them, and the M2 line's own name in both reads with its table.
+        let both = pair(Some("minimax"), Some("minimax"));
+        assert_eq!(
+            read(&ModelNames::flagged(&both), "MiniMaxAI/MiniMax-M2.7"),
+            table("minimax_m3")
+        );
+        let own = pair(Some("minimax_m2"), Some("minimax_m2"));
+        assert_eq!(
+            read(&ModelNames::flagged(&own), "MiniMaxAI/MiniMax-M2.7"),
             table("minimax_m2")
         );
 

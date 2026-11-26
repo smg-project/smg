@@ -25,11 +25,6 @@
 //! ([`ReportSignals`]). It reads one by the column it holds
 //! ([`SignalColumn::told`]): the same index, and no age.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use crate::{
     document::spec::{AcrossRanks, MAX_SIGNALS},
     engine::view::{Candidate, RequestFacts},
@@ -59,7 +54,12 @@ pub(crate) fn in_range(value: f64) -> bool {
 /// lists takes no other where it reads a load report. A host that hands
 /// cells it built passes no such test, and holds its values to the same
 /// bound itself.
+///
+/// The record gains fields: code outside this crate makes a cell by
+/// [`SignalCell::of`] or starts from [`SignalCell::NONE`], and a pattern of
+/// it ends with `..`.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct SignalCell {
     pub value: f64,
     pub sampled_at_micros: u64,
@@ -76,6 +76,21 @@ impl SignalCell {
         value: f64::NAN,
         sampled_at_micros: 0,
     };
+
+    /// A cell of `value`, sampled at `sampled_at_micros`. It takes both
+    /// fields: a cell is a value and when it was sampled, and neither has a
+    /// neutral value beside the cell of no value ([`Self::NONE`]). It
+    /// checks nothing: a host holds its values to the record's bound. Code
+    /// outside this crate starts here: the record gains fields, so no
+    /// literal of it builds there.
+    #[inline]
+    #[must_use]
+    pub const fn of(value: f64, sampled_at_micros: u64) -> Self {
+        Self {
+            value,
+            sampled_at_micros,
+        }
+    }
 
     /// Whether the cell holds no value.
     pub fn is_none(&self) -> bool {
@@ -195,12 +210,6 @@ impl SignalCells {
     /// The cells a row: the document's count of signals.
     pub(crate) fn signals(&self) -> usize {
         self.signals as usize
-    }
-
-    /// The cells, row after row.
-    #[cfg(all(test, feature = "in-process"))]
-    pub(crate) fn cells(&self) -> &[SignalCell] {
-        &self.cells
     }
 
     /// The cells of the row at `position`, in the columns' order: `None`

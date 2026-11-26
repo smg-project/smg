@@ -638,12 +638,6 @@ impl DecisionSlots {
             .max_by_key(|record| record.at)
     }
 
-    /// What a decider's thread tells at its unwind, told by a case.
-    #[cfg(test)]
-    pub(crate) fn tell_unwound(&self) {
-        self.told.send_replace(true);
-    }
-
     /// The decider `model`'s decisions run on: every request for a model
     /// goes to one, whichever stream carries it.
     pub(crate) fn of(&self, model: &str) -> usize {

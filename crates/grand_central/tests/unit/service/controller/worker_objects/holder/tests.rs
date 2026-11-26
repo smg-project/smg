@@ -8,10 +8,24 @@ use super::*;
 use crate::{
     document::spec::{OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS},
     engine::view::WireModes,
+    service::controller::Config,
     store::{
         HealthPolicy, HealthWrite, Overload, Registrant, WorkerFacts, WorkerStatus, WorkersStore,
     },
 };
+
+impl WorkerObjects {
+    /// [`Self::stating`] the default thresholds of a start, for a case that
+    /// sets no others.
+    pub(in crate::service::controller) fn new(store: Arc<MemoryStore>) -> Self {
+        Self::stating(store, Config::DEFAULT_WORKER_OVERLOAD)
+    }
+
+    /// The holder, for a case that reads what stands.
+    pub(in crate::service::controller) fn objects(&self) -> &Objects<Members> {
+        &self.objects
+    }
+}
 
 const URL: &str = "http://w:8000";
 

@@ -367,10 +367,8 @@ impl Lists {
             let partners = prefills.iter().map(|_| every.as_slice());
             // What each worker states of the encode handoff: a rendezvous
             // under the one runtime.
-            let offer = EncodeOffer {
-                handoff: EncodeHandoff::Rendezvous,
-                ..EncodeOffer::default()
-            };
+            let mut offer = EncodeOffer::default();
+            offer.handoff = EncodeHandoff::Rendezvous;
             let member = EncodeMember::of(RUNTIME, &offer);
             let ends = EncodeClasses::derive(
                 encoders.iter().map(|_| member),

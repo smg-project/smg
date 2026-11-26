@@ -1,4 +1,12 @@
+use tokio::sync::watch;
+
 use super::*;
+
+/// A channel nobody publishes on, with an empty snapshot: a case's
+/// deciders read no load report.
+pub(in crate::service::controller) fn silent() -> LoadReceiver {
+    watch::channel(Arc::new(LoadSnapshot::default())).1
+}
 
 #[test]
 fn a_thread_holds_the_snapshot_the_monitor_last_published() {

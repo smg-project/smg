@@ -32,7 +32,10 @@ use super::{
     election::{self, ElectionObservation},
     following,
     principal::{tests::told, Layer},
-    readiness::{self, tests::fenced, Phase},
+    readiness::{
+        tests::{detached, fenced},
+        Phase,
+    },
     standby::Lag,
     tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, Error, NoFollow,
     Scope, Service,
@@ -768,8 +771,7 @@ async fn the_role_is_told_at_each_change_and_as_left_at_the_stop() {
     let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
         .expect("the default settings are in order");
     let (steps, stepped) = watch::channel(ElectionObservation::default());
-    let (phase, readiness) =
-        readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+    let (phase, readiness) = detached(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
     let (stop, stopped) = watch::channel(false);
     let (told, mut role) = watch::channel(None);
     let mut teller = JoinSet::new();
@@ -827,8 +829,7 @@ async fn the_role_is_told_where_the_clock_alone_closes_the_fence() {
     let mut elector =
         Elector::alone("controller-0@127.0.0.1:1", settings).expect("the settings are in order");
     let (steps, stepped) = watch::channel(ElectionObservation::default());
-    let (phase, readiness) =
-        readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+    let (phase, readiness) = detached(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
     let (_stop, stopped) = watch::channel(false);
     let (told, mut role) = watch::channel(None);
     let mut teller = JoinSet::new();
@@ -890,8 +891,7 @@ async fn a_step_under_a_standing_leader_tells_the_watches_nothing() {
     let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
         .expect("the default settings are in order");
     let (steps, stepped) = watch::channel(ElectionObservation::default());
-    let (phase, readiness) =
-        readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+    let (phase, readiness) = detached(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
     let (_stop, stopped) = watch::channel(false);
     let (told, mut role) = watch::channel(None);
     let mut teller = JoinSet::new();
@@ -936,8 +936,7 @@ async fn a_take_under_another_term_between_two_reads_is_another_word() {
     let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
         .expect("the default settings are in order");
     let (steps, stepped) = watch::channel(ElectionObservation::default());
-    let (phase, readiness) =
-        readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+    let (phase, readiness) = detached(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
     let (_stop, stopped) = watch::channel(false);
     let (told, mut role) = watch::channel(None);
     let mut teller = JoinSet::new();
@@ -994,7 +993,7 @@ impl Unstepped {
         .expect("the settings are in order");
         let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) =
-            readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+            detached(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (stop, stopped) = watch::channel(false);
         let (told, role) = watch::channel(None);
         let mut teller = JoinSet::new();
@@ -1252,7 +1251,7 @@ async fn a_standbys_word_follows_its_sync_with_no_step_of_the_election() {
     let lag = Arc::new(Lag::new(bound));
     lag.follow();
     let (_standing, stepped) = watch::channel(ElectionObservation::default());
-    let (phase, role) = readiness::channel(elector.fence(), stepped, Arc::clone(&lag));
+    let (phase, role) = detached(elector.fence(), stepped, Arc::clone(&lag));
     phase.send_replace(Phase::Serving);
     let (reporter, _server) = health_reporter();
     let service = HealthService::from_health_reporter(reporter.clone());

@@ -7,10 +7,26 @@ use std::{
 use tokio::sync::watch;
 
 use super::{channel, Phase, Readiness, Sample, State};
-use crate::service::{
-    controller::{election::ElectionObservation, standby::Lag},
-    elector::{ElectionSettings, Elector, MemoryLease, TickOutcome},
+use crate::{
+    engine::view::WorkerId,
+    service::{
+        controller::{election::ElectionObservation, standby::Lag},
+        elector::{ElectionSettings, Elector, Fence, MemoryLease, TickOutcome},
+        replication::{Event, Log, LogPositionLost},
+    },
+    store::{Journal, MembershipChange},
 };
+
+/// The run loop's writer and a reader over `fence`, as [`channel`]
+/// makes them, for a case that reads no log: the reader's log is its
+/// own and empty.
+pub(crate) fn detached(
+    fence: Arc<Fence>,
+    steps: watch::Receiver<ElectionObservation>,
+    lag: Arc<Lag>,
+) -> (watch::Sender<Phase>, Readiness) {
+    channel(fence, steps, lag, Arc::new(Log::new(1)))
+}
 
 /// A candidate alone over a lease of its own and a readiness that reads
 /// its fence: the run loop's writer, the election's writer, the reader.
@@ -36,7 +52,7 @@ fn over(
     Readiness,
 ) {
     let (steps, stepped) = watch::channel(ElectionObservation::default());
-    let (phase, readiness) = channel(elector.fence(), stepped, Arc::new(Lag::new(BOUND)));
+    let (phase, readiness) = detached(elector.fence(), stepped, Arc::new(Lag::new(BOUND)));
     (elector, phase, steps, readiness)
 }
 
@@ -298,7 +314,7 @@ async fn a_waiter_looks_again_when_a_frame_ends_a_silence_and_when_the_sync_laps
     let short = Arc::new(Lag::new(Duration::from_millis(300)));
     short.follow();
     let (_standing, stepped) = watch::channel(ElectionObservation::default());
-    let (phase, mut reader) = channel(elector.fence(), stepped, Arc::clone(&short));
+    let (phase, mut reader) = detached(elector.fence(), stepped, Arc::clone(&short));
     phase.send_replace(Phase::Serving);
     short.applied(Instant::now());
     assert_eq!(
@@ -353,4 +369,40 @@ fn a_sample_tells_the_restores_the_standby_asked_whatever_the_state() {
     );
     let sample = readiness.sample_at(Instant::now()).0;
     assert_eq!((sample.state, sample.restores), (State::Leader, 2));
+}
+
+/// A host reads the replica's membership log through the handle: where
+/// it stands, and the writes behind a mark in the order written. A place
+/// the log no longer holds is told as the log tells it.
+#[test]
+fn a_handle_reads_the_logs_head_and_the_writes_behind_a_mark() {
+    let log = Arc::new(Log::new(2));
+    let (_elector, _phase, _steps, handle) = fenced();
+    let readiness = Readiness {
+        log: Arc::clone(&log),
+        ..handle
+    };
+    let write = |epoch| {
+        let id = WorkerId(epoch);
+        log.member(None, epoch, MembershipChange::Relabelled { id }, None, None);
+    };
+    write(1);
+    let mark = readiness.log_head();
+    assert_eq!(mark, log.head());
+    write(2);
+    write(3);
+    let mut out = Vec::new();
+    assert_eq!(readiness.log_after(mark, Log::BATCH, &mut out), Ok(()));
+    let epochs = out.iter().filter_map(|entry| match entry.event {
+        Event::Member { epoch, .. } => Some(epoch),
+        Event::Term | Event::Generation { .. } => None,
+    });
+    assert_eq!(epochs.collect::<Vec<_>>(), [2, 3]);
+    assert_eq!(out.last().map(|entry| entry.at), Some(readiness.log_head()));
+    // A call reads no more than its caller asks.
+    assert_eq!(readiness.log_after(mark, 1, &mut out), Ok(()));
+    assert_eq!(out.len(), 1);
+    // A ring of two lets the mark go at the next write.
+    write(4);
+    assert_eq!(readiness.log_after(mark, 1, &mut out), Err(LogPositionLost));
 }

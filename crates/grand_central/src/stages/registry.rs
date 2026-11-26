@@ -91,7 +91,6 @@ pub struct StageBuild<'a> {
     // keep of a profile's stages across a new header list rests on that
     // (`AppliedSpec::keep_from`).
     written: &'a Map<String, Value>,
-    profile: &'a str,
     sent_settings: SentSettings,
     sent: &'a mut SentSlot,
     reports: LoadReportReader,
@@ -108,13 +107,8 @@ impl<'a> StageBuild<'a> {
     /// read no value, in silence. One that says so and kept none would
     /// have a host hand cells nothing reads. The one maker of a context: a
     /// stage of any kind a factory builds comes through here.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the context's parts, the factory and the stage's own word on its needs"
-    )]
     pub(crate) fn built<S: ?Sized>(
         written: &'a Map<String, Value>,
-        profile: &'a str,
         sent_settings: SentSettings,
         sent: &'a mut SentSlot,
         reports: LoadReportReader,
@@ -124,7 +118,6 @@ impl<'a> StageBuild<'a> {
     ) -> Result<Box<S>, StageError> {
         let mut context = Self {
             written,
-            profile,
             sent_settings,
             sent,
             reports,
@@ -189,7 +182,7 @@ impl StageBuild<'_> {
     /// of those profiles' decisions lets go the sends the row's report
     /// covers, for all of them.
     pub fn dispatch_credit(&mut self) -> Arc<DispatchCredit> {
-        profile_sent(self.sent, self.profile, self.sent_settings)
+        profile_sent(self.sent, self.sent_settings)
     }
 
     /// The view's reading of a row's load report, for a stage that reads
@@ -234,16 +227,12 @@ pub(crate) struct SentSlot {
 /// made at the first ask under the profile's `sent_ttl_ms` and its
 /// `sent_report_delay_ms`. A factory's context and a typed stage both ask
 /// here, so a profile holds one count.
-pub(crate) fn profile_sent(
-    slot: &mut SentSlot,
-    profile: &str,
-    settings: SentSettings,
-) -> Arc<DispatchCredit> {
+pub(crate) fn profile_sent(slot: &mut SentSlot, settings: SentSettings) -> Arc<DispatchCredit> {
     let SentSlot { asked, shared } = slot;
     Arc::clone(asked.get_or_insert_with(|| {
         shared
             .clone()
-            .unwrap_or_else(|| Arc::new(DispatchCredit::new(profile, settings)))
+            .unwrap_or_else(|| Arc::new(DispatchCredit::new(settings)))
     }))
 }
 

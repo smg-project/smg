@@ -1123,12 +1123,15 @@ impl CliArgs {
     /// The routing part of the configuration: what a policy document reads,
     /// the multi-router mode with it, and what the validator's routing rules
     /// read beside it (the workers' discovery and the data-parallel
-    /// setting). A start's assembly builds on it and `--print-policy-spec`
-    /// converts it alone, so the two read one routing part. No file is read
-    /// here.
+    /// setting). The connection mode belongs to it: the worker urls decide
+    /// it, and a pair's document follows it. A start's assembly builds on
+    /// the routing part and `--print-policy-spec` converts it alone, so the
+    /// two read one routing part. No file is read here.
     fn routing_part(&self, mode: RoutingMode) -> ConfigResult<RouterConfigBuilder> {
+        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
         Ok(RouterConfig::builder()
             .mode(mode)
+            .connection_mode(connection_mode)
             .policy(self.routing_policy())
             .cache_boundaries(self.routing.cache_boundaries.clone())
             .maybe_discovery(self.discovery_config()?)
@@ -1224,7 +1227,6 @@ impl CliArgs {
         let model_aliases = Self::model_aliases(&self.discovery.model_alias)?;
 
         let builder = routing
-            .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.routing.zmq_engine_count)
             .zmq_startup_timeout_secs(self.routing.zmq_startup_timeout_secs)

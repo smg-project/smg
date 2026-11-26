@@ -7,6 +7,12 @@ use tempfile::tempdir;
 use super::*;
 use crate::service::controller::{config::tests::valid, discovery::DiscoverySettings};
 
+impl Credential {
+    pub(in crate::service::controller::discovery) fn for_test(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
 #[derive(Parser)]
 struct Args {
     #[command(flatten)]

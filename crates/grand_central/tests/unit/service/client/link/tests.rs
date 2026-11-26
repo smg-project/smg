@@ -48,6 +48,18 @@ impl Peer {
         Self::over(window, Endpoint::from_static(NOWHERE))
     }
 
+    /// A peer whose welcome chose the protocol version `protocol`.
+    pub(crate) fn speaking(window: u32, protocol: u32) -> Self {
+        let link = Link {
+            shared: Shared::new(),
+        };
+        let told = Welcome {
+            protocol,
+            ..welcome(window, Duration::ZERO)
+        };
+        Self::session(link, Endpoint::from_static(NOWHERE), told)
+    }
+
     /// A peer whose welcome tells a grace period.
     pub(crate) fn patient(window: u32) -> Self {
         let link = Link {
@@ -501,6 +513,147 @@ async fn an_ask_out_of_the_items_ranges_sends_nothing_and_the_link_stands() {
     assert_eq!(within(peer.requests.next()).await, Some(whole));
 }
 
+/// An ask under the id 1 whose frame states `demands` at `phase`.
+fn demanding(phase: FramePhase, demands: Demands) -> DecideRequest {
+    DecideRequest {
+        facts: Some(RequestFacts {
+            phase: phase.into(),
+            ..RequestFacts::default()
+        }),
+        demands: Some(demands),
+        ..request(1)
+    }
+}
+
+/// A demand's ranges are the controller's check's too, and a demand
+/// goes to no controller that reads none. Over a session on protocol 2
+/// the link's door refuses, by its field, a demand on a frame whose
+/// decision holds none yet. It refuses a part out of its range the same
+/// way. Over a session on protocol 1, one whose welcome states none, or
+/// one on a version the hello did not offer, it refuses every stated
+/// demand by `demands`: each of the six parts, stated alone.
+///
+/// Each refusal sends nothing, spends no credit and leaves the link
+/// standing. A single request's demand is sent over protocol 2 as it
+/// is. A message with no part demands nothing, and is sent over any.
+#[tokio::test]
+async fn an_ask_whose_demand_is_out_of_range_or_unread_sends_nothing_and_the_link_stands() {
+    use crate::service::controller::PROTOCOL_VERSION;
+
+    let runtime = Demands {
+        runtime: 7,
+        ..Demands::default()
+    };
+    let mut peer = Peer::speaking(1, 2);
+    let wrong = [
+        ("demands", demanding(FramePhase::Prefill, runtime)),
+        ("demands", demanding(FramePhase::Decode, runtime)),
+        (
+            "demands",
+            DecideRequest {
+                decode_of: Some(7),
+                ..demanding(FramePhase::Single, runtime)
+            },
+        ),
+        (
+            "demands",
+            DecideRequest {
+                demands: Some(runtime),
+                ..with_items(FramePhase::Encode, 1)
+            },
+        ),
+        (
+            "demands",
+            DecideRequest {
+                named_worker: Some(0),
+                ..demanding(FramePhase::Single, runtime)
+            },
+        ),
+        (
+            "demands.decoding",
+            demanding(
+                FramePhase::Single,
+                Demands {
+                    decoding: 256,
+                    ..runtime
+                },
+            ),
+        ),
+        (
+            "demands.references",
+            demanding(
+                FramePhase::Single,
+                Demands {
+                    references: 4,
+                    ..runtime
+                },
+            ),
+        ),
+    ];
+    for (field, wrong) in wrong {
+        let refused = peer.link.ask(wrong.clone(), WAIT).await;
+        assert!(
+            matches!(refused, Err(DecisionUnavailable::Unsent(Error::OutOfRange(named))) if named == field),
+            "{field}: {wrong:?}: {refused:?}"
+        );
+    }
+    assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
+    assert!(peer.link.stands() && peer.link.ended().is_none());
+    // The window of one is whole: a single request's demand is sent.
+    let whole = demanding(FramePhase::Single, runtime);
+    let mut asked = Box::pin(peer.link.ask(whole.clone(), WAIT));
+    assert!(poll(asked.as_mut()).is_pending());
+    assert_eq!(within(peer.requests.next()).await, Some(whole));
+
+    // A welcome that states no version, one on 1, and one on a version
+    // the hello did not offer.
+    for protocol in [0, 1, PROTOCOL_VERSION + 1] {
+        let mut peer = Peer::speaking(1, protocol);
+        // Each part alone states a demand, and none goes out.
+        let none = Demands::default();
+        for part in [
+            runtime,
+            Demands {
+                vision: true,
+                ..none
+            },
+            Demands {
+                references: 1,
+                ..none
+            },
+            Demands {
+                input_window: 1,
+                ..none
+            },
+            Demands {
+                output_window: 1,
+                ..none
+            },
+            Demands {
+                decoding: 1,
+                ..none
+            },
+        ] {
+            let unread = demanding(FramePhase::Single, part);
+            let refused = peer.link.ask(unread, WAIT).await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(DecisionUnavailable::Unsent(Error::OutOfRange("demands")))
+                ),
+                "protocol {protocol}: {part:?}: {refused:?}"
+            );
+        }
+        assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
+        assert!(peer.link.stands() && peer.link.ended().is_none());
+        // A message with no part demands nothing: it is sent as it is.
+        let none = demanding(FramePhase::Single, Demands::default());
+        let mut asked = Box::pin(peer.link.ask(none.clone(), WAIT));
+        assert!(poll(asked.as_mut()).is_pending());
+        assert_eq!(within(peer.requests.next()).await, Some(none));
+    }
+}
+
 /// An encode request's answer says where its items go beside its
 /// decision: the ask hands both, the encoders in their order, and an
 /// ask of any other request hands nothing beside its decision. Such an
@@ -633,6 +786,37 @@ async fn the_budget_ends_the_wait_and_the_id_stays_taken_until_its_answer() {
         Poll::Ready(Err(DecisionUnavailable::Late))
     ));
     assert_eq!(within(peer.requests.next()).await, Some(request(2)));
+}
+
+/// A budget past the clock's range sets no deadline: the ask waits
+/// however far the clock moves, and takes its answer.
+#[tokio::test(start_paused = true)]
+async fn a_budget_past_the_clocks_range_waits_with_no_bound() {
+    let mut peer = Peer::new(1);
+    let mut asked = Box::pin(peer.link.ask(request(1), Duration::MAX));
+    assert!(poll(asked.as_mut()).is_pending());
+    assert_eq!(within(peer.requests.next()).await, Some(request(1)));
+    advance(Duration::from_secs(86_400)).await;
+    assert!(poll(asked.as_mut()).is_pending());
+    peer.answer(1, 5, decision(7, &[Side::Single]));
+    let (answer, _) = within(asked).await.expect("the ask's own answer");
+    assert_eq!(answer.leases[0].id, 7);
+}
+
+/// A wait with no deadline still ends where its session does: the ask
+/// answers that the session ended.
+#[tokio::test]
+async fn a_wait_with_no_bound_ends_where_its_session_does() {
+    let mut peer = Peer::new(1);
+    let link = peer.link.clone();
+    let mut asked = Box::pin(link.ask(request(1), Duration::MAX));
+    assert!(poll(asked.as_mut()).is_pending());
+    closes(&link, || drop(peer.decide.take())).await;
+    assert!(matches!(
+        within(asked).await,
+        Err(DecisionUnavailable::Ended)
+    ));
+    Peer::readers_end(peer.readers).await;
 }
 
 #[tokio::test]

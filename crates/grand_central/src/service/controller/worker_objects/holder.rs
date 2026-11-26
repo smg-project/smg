@@ -8,8 +8,6 @@ use smg_worker::{
     registry::WorkerRegistry,
 };
 
-#[cfg(test)]
-use crate::service::controller::Config;
 use crate::{
     engine::CacheIndexes,
     store::MemoryStore,
@@ -41,7 +39,7 @@ use crate::{
 /// on its object. While the replica leads, a probe's outcome, a connect
 /// signal and a drain are written on the object, and the store is told.
 /// While it follows, the holder lays each status its leader's log tells.
-/// So the holder follows no status of its store's own tail.
+/// So the holder follows no log of its own store.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
     objects: Arc<Objects<Members>>,
@@ -57,13 +55,6 @@ impl WorkerObjects {
     /// start's.
     pub(crate) fn stating(store: Arc<MemoryStore>, overload: OverloadThresholds) -> Self {
         Self::with_connector(store, Arc::new(GrpcConnector), overload)
-    }
-
-    /// [`Self::stating`] the default thresholds of a start, for a case that
-    /// sets no others.
-    #[cfg(test)]
-    pub(crate) fn new(store: Arc<MemoryStore>) -> Self {
-        Self::stating(store, Config::DEFAULT_WORKER_OVERLOAD)
     }
 
     /// [`Self::stating`] with `connector` making each object's engine
@@ -109,12 +100,6 @@ impl WorkerObjects {
     /// The holder shared with readers of the replica's worker objects.
     pub(crate) fn holder(&self) -> Arc<Objects<Members>> {
         Arc::clone(&self.objects)
-    }
-
-    /// The holder, for a case that reads what stands.
-    #[cfg(test)]
-    pub(crate) fn objects(&self) -> &Objects<Members> {
-        &self.objects
     }
 }
 

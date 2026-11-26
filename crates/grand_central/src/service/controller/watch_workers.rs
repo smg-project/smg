@@ -180,6 +180,15 @@ impl Feed {
         });
     }
 
+    /// A slot for one more stream among the feed's parked streams. The
+    /// stream parks its waker there ([`Slot::park`]), and the slot is the
+    /// next stream's once this one lets it go.
+    fn slot(&self) -> Slot {
+        let parked = Arc::clone(&self.parked);
+        let at = parked.lock().slot();
+        Slot { parked, at }
+    }
+
     /// Lets the kept cut go once a write has moved the log past its place:
     /// no watch that starts now shares it. The lock is tried and never
     /// waited on: a watch that holds it is taking or sharing a cut, and a
@@ -243,18 +252,6 @@ impl Feed {
         let kept = self.rows.lock();
         let head = self.log.head();
         kept.as_ref().filter(|cut| cut.at == head).cloned()
-    }
-
-    /// The cuts of every row this feed took, for a case.
-    #[cfg(test)]
-    pub(crate) fn cuts(&self) -> usize {
-        self.cuts.load(Ordering::Relaxed)
-    }
-
-    /// The kept cut, for a case.
-    #[cfg(test)]
-    pub(crate) fn kept(&self) -> Option<Arc<StoreCheckpoint>> {
-        self.rows.lock().clone()
     }
 
     /// A membership entry the wire has no form for: no watch is told it,
@@ -396,6 +393,27 @@ impl Parked {
     }
 }
 
+/// One stream's slot among a feed's parked streams ([`Feed::slot`]). It is
+/// given back once, when the stream that holds it is let go.
+#[derive(Debug)]
+struct Slot {
+    parked: Arc<Mutex<Parked>>,
+    at: usize,
+}
+
+impl Slot {
+    /// Parks `waker` here, for one wake of the feed's task.
+    fn park(&self, waker: &Waker) {
+        self.parked.lock().park(self.at, waker);
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.parked.lock().leave(self.at);
+    }
+}
+
 /// Where a stream stands.
 #[derive(Debug)]
 enum At {
@@ -418,14 +436,17 @@ enum At {
 /// then the stream's place of the log.
 #[derive(Debug)]
 pub(crate) struct Watching {
+    /// The stream's slot among the feed's parked streams, given back when
+    /// the transport lets the stream go. It is the first field, so it goes
+    /// back ahead of what the stream read: a stream that is going is woken
+    /// no more.
+    slot: Slot,
     source: Source,
     asked: Asked,
     at: At,
     /// One read of the log, and the first of its entries not looked at.
     entries: Vec<Entry>,
     seen: usize,
-    /// The stream's slot among the feed's parked streams.
-    slot: usize,
     /// When the transport took the stream's last event, until the stream
     /// parks: a watcher that takes nothing for [`STALL`] from then is ended.
     handed: Option<time::Instant>,
@@ -590,18 +611,6 @@ impl Readers {
     fn are_of(&self, feed: &Feed) -> bool {
         self.feed.shares_with(feed)
     }
-
-    /// The snapshots' turn, for a case that fills it or holds it.
-    #[cfg(test)]
-    pub(crate) fn snapshots(&self) -> &SerialTurn {
-        &self.snapshots
-    }
-
-    /// The watches `by` holds open.
-    #[cfg(test)]
-    fn open_of(&self, by: &Principal) -> usize {
-        self.held.lock().get(&by.gateway()).copied().unwrap_or(0)
-    }
 }
 
 impl Drop for WatchPlace {
@@ -652,7 +661,7 @@ pub(crate) fn open(
         term = source.term,
         "watch opened"
     );
-    let slot = source.feed.parked.lock().slot();
+    let slot = source.feed.slot();
     Ok(Watching {
         source,
         asked: Asked { models },
@@ -865,7 +874,7 @@ impl Watching {
     /// read and its park is found by that step, whether the feed's task
     /// took the parked wakers before the park or after it.
     fn park(&mut self, waker: &Waker, now: time::Instant) -> Poll<Option<Told>> {
-        self.source.feed.parked.lock().park(self.slot, waker);
+        self.slot.park(waker);
         match self.step(now) {
             Poll::Ready(told) => self.hand(told, now),
             Poll::Pending => {
@@ -881,12 +890,6 @@ impl Watching {
     fn hand(&mut self, told: Option<Told>, now: time::Instant) -> Poll<Option<Told>> {
         self.handed = matches!(told, Some(Ok(_))).then_some(now);
         Poll::Ready(told)
-    }
-}
-
-impl Drop for Watching {
-    fn drop(&mut self) {
-        self.source.feed.parked.lock().leave(self.slot);
     }
 }
 

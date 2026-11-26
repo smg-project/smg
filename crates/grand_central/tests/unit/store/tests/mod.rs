@@ -14,9 +14,9 @@ use super::{
     identity, identity_of,
     leases::{InFlightCounts, WorkerSlot},
     AtWork, DecodeMark, DecodeSide, GatewayId, Hand, HealthSink, Journal, LeaseRecord,
-    LeaseRefused, LeaseState, LeasesStore, LookOutcome, MembershipChange, MembershipTail,
-    MemoryStore, PickRecord, Position, ReservationKind, ReservationStore, Sides, StoreSnapshot,
-    VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    LeaseRefused, LeaseState, LeasesStore, LookOutcome, MembershipChange, MemoryStore, PickRecord,
+    Position, Sides, StoreSnapshot, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+    WorkersStore,
 };
 use crate::{
     document::spec,
@@ -194,7 +194,7 @@ fn a_write_under_a_moved_revision_is_refused_and_never_reaches_a_successor() {
 }
 
 #[test]
-fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log() {
+fn a_snapshot_holds_every_row_at_its_epoch_ordered_by_key() {
     let store = MemoryStore::new();
     let workers: &dyn WorkersStore = &store;
     let (epoch, rows) = workers.all_rows();
@@ -202,38 +202,10 @@ fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log(
     let a = workers.upsert(facts("http://a:8000", 1)).id();
     let (epoch, rows) = workers.all_rows();
     assert_eq!((epoch, rows.len()), (1, 1));
-    let b = workers.upsert(facts("http://b:8000", 1)).id();
-    assert_eq!(
-        workers.changes_since(epoch),
-        MembershipTail::Changes(vec![(2, MembershipChange::Registered { id: b })])
-    );
-    assert_eq!(
-        workers.changes_since(workers.epoch()),
-        MembershipTail::Changes(Vec::new()),
-        "a watcher at the head has nothing to read"
-    );
-    assert_eq!(
-        workers.changes_since(99),
-        MembershipTail::SnapshotRequired,
-        "an epoch from another era snapshots"
-    );
-    for i in 0..1_100u64 {
-        let mut facts = facts("http://a:8000", 1);
-        facts.priority = i32::try_from(i).expect("small");
-        workers.upsert(facts);
-    }
-    assert_eq!(
-        workers.changes_since(epoch),
-        MembershipTail::SnapshotRequired,
-        "a watcher past the log snapshots again"
-    );
-    let (head, rows) = workers.all_rows();
-    assert_eq!(rows.len(), 2);
+    workers.upsert(facts("http://b:8000", 1));
+    let (epoch, rows) = workers.all_rows();
+    assert_eq!((epoch, rows.len()), (2, 2));
     assert_eq!(rows[0].id, a, "the snapshot is ordered by key");
-    assert!(matches!(
-        workers.changes_since(head - 1),
-        MembershipTail::Changes(changes) if changes.len() == 1
-    ));
 }
 
 #[test]
@@ -495,97 +467,6 @@ fn the_store_formats_without_holding_a_table_twice() {
     assert!(shown.starts_with("MemoryStore"), "{shown}");
 }
 
-#[test]
-fn a_reservation_is_all_or_nothing_within_the_window_and_released_by_its_lease() {
-    let store = MemoryStore::new();
-    let id = ready(&store, "http://d:8000");
-    let rooms: &dyn ReservationStore = &store;
-    assert_eq!(rooms.window(id, ReservationKind::Room), Some(4));
-    let (a, b, c) = (LeaseId(1), LeaseId(2), LeaseId(3));
-    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 3, a));
-    assert!(
-        !rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 2, b),
-        "five rooms do not fit a window of four"
-    );
-    assert_eq!(
-        rooms.held(id, ReservationKind::Room),
-        3,
-        "nothing was claimed"
-    );
-    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, b));
-    assert!(
-        !rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, b),
-        "one reservation per kind per lease"
-    );
-    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Slot, 1, b));
-    rooms.release(GatewayId::LOCAL, a);
-    rooms.release(GatewayId::LOCAL, a);
-    assert_eq!(rooms.held(id, ReservationKind::Room), 1);
-    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 3, c));
-    rooms.release(GatewayId::LOCAL, b);
-    assert_eq!(rooms.held(id, ReservationKind::Room), 3);
-    assert_eq!(rooms.held(id, ReservationKind::Slot), 0);
-    // A live worker without a bound has no window and the gate abstains; a
-    // worker the store does not know, or dropped, is refused outright.
-    let unbounded = store
-        .upsert(WorkerFacts {
-            max_running: None,
-            ..facts("http://p:8000", 1)
-        })
-        .id();
-    assert_eq!(rooms.window(unbounded, ReservationKind::Room), None);
-    assert!(
-        rooms.try_reserve(
-            GatewayId::LOCAL,
-            unbounded,
-            ReservationKind::Room,
-            100,
-            LeaseId(9)
-        ),
-        "no window: the gate abstains"
-    );
-    let unknown = WorkerId(77);
-    assert_eq!(rooms.window(unknown, ReservationKind::Room), None);
-    assert!(
-        !rooms.try_reserve(
-            GatewayId::LOCAL,
-            unknown,
-            ReservationKind::Room,
-            1,
-            LeaseId(10)
-        ),
-        "a worker the store does not know is refused"
-    );
-    let revision = WorkersStore::get(&store, id).expect("the row").revision;
-    store.remove(id, revision).expect("removed");
-    assert!(
-        !rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, LeaseId(11)),
-        "a removed worker is refused whatever its window was"
-    );
-}
-
-#[test]
-fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
-    let store = MemoryStore::new();
-    let id = ready(&store, "http://d:8000");
-    let rooms: &dyn ReservationStore = &store;
-    let (g1, g2) = (GatewayId(1), GatewayId(2));
-    assert!(rooms.try_reserve(g1, id, ReservationKind::Room, 2, LeaseId(1)));
-    assert!(
-        rooms.try_reserve(g2, id, ReservationKind::Room, 2, LeaseId(1)),
-        "the other gateway's lease of the same number is its own"
-    );
-    assert_eq!(rooms.held(id, ReservationKind::Room), 4);
-    rooms.release(g1, LeaseId(1));
-    assert_eq!(
-        rooms.held(id, ReservationKind::Room),
-        2,
-        "one gateway's release frees its own claim alone"
-    );
-    rooms.release(g2, LeaseId(1));
-    assert_eq!(rooms.held(id, ReservationKind::Room), 0);
-}
-
 /// The manual preset as `generation`, its keys pinned for `ttl_s` and swept
 /// every `sweep_s`.
 fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> spec::AppliedSpec {
@@ -604,7 +485,7 @@ fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> spec::AppliedSpec 
 fn pinned(store: &MemoryStore, key: u64, worker: WorkerId) {
     let world = store.snapshot();
     let table = world.spec().engine().sessions();
-    table.dispatched(Session::from_raw(key), SessionVerdict::Pinned, worker);
+    table.dispatched(Session::from_raw(key), SessionVerdict::Pinned, worker, 0);
 }
 
 /// The worker `key`'s first pin names in that table.
@@ -2424,8 +2305,9 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     cut.rows[0].admitted_at += Duration::from_secs(1);
     cut.rows[0].revision += 1;
     cut.rows[0].facts.priority = 8;
-    let mut expected = cut.rows[0].clone();
-    expected.admitted_at = WorkersStore::get(&store, id).expect("the row").admitted_at;
+    // The row is the cut's, its later instant too: the store keeps none
+    // of its own.
+    let expected = cut.rows[0].clone();
     assert!(store.watch_from(cut));
 
     assert_eq!(leases.live(gateway), 1);
@@ -2542,7 +2424,6 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     store.apply(spec).expect("the generation is applied");
 
     let mut cut = store.checkpoint();
-    let earlier = cut.epoch;
     // The same revision can name other facts in another history.
     cut.rows[0]
         .facts
@@ -2561,11 +2442,6 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
         "a world of the cut stands at once"
     );
     assert_eq!(store.epoch(), epoch);
-    assert_eq!(store.history(), 1);
-    assert_eq!(
-        store.changes_since(earlier),
-        MembershipTail::SnapshotRequired
-    );
     assert_eq!(store.publish_due(), None);
     assert_eq!(store.filed_members(), 0);
     let (_, rows) = store.all_rows();
@@ -2688,7 +2564,6 @@ fn a_watch_snapshot_the_journal_refuses_changes_nothing() {
         (after.at, after.epoch, after.rows),
         (before.at, before.epoch, before.rows)
     );
-    assert_eq!(store.history(), 0);
     assert!(Arc::ptr_eq(&store.snapshot(), &world));
     assert_eq!(in_flight(&store), [(id, 0)]);
 }
@@ -3990,6 +3865,20 @@ fn a_decode_take_back_looks_up_the_lease_once() {
     assert_eq!(LEASE_HASHES.get(), 1);
 }
 
+/// A release on a file no decode call issued into looks the lease up once,
+/// for the release itself: the read of what an issue replaced, ahead of
+/// it, looks no record up there.
+#[cfg(feature = "controller")]
+#[test]
+fn a_release_on_a_file_no_call_issued_into_looks_up_the_lease_once() {
+    let now = Instant::now();
+    let (store, _, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    LEASE_HASHES.set(0);
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(LEASE_HASHES.get(), 1);
+}
+
 /// The pair a decode call reads ahead of its decision is the lease's own:
 /// its prefill's worker, then the worker and the rank of the decode its
 /// first decision chose for the target the prefill's dispatch took, the
@@ -3997,6 +3886,9 @@ fn a_decode_take_back_looks_up_the_lease_once() {
 /// take-back put back names the first decision's decode again. The read is
 /// refused under the name its issue is refused under, it gives the file's
 /// turn back with its answer, and it moves nothing.
+///
+/// Last in the answer comes the instant the record's own lease states it
+/// was issued at.
 #[cfg(feature = "controller")]
 #[test]
 fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_took() {
@@ -4029,6 +3921,8 @@ fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_too
         if later {
             decode.state = LeaseState::Chosen;
         }
+        // Each lease is dated by its id, a thousand microseconds an id.
+        record.lease.issued_micros = id * 1_000;
         issue_pair(&store, (record, decode)).expect("the key is free");
     };
     for id in 1..=3 {
@@ -4055,8 +3949,8 @@ fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_too
     assert!(store.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
     assert!(store.dispatched(gateway, LeaseId(2), on(Side::Prefill, 2), now));
     assert!(store.dispatched(gateway, LeaseId(4), on(Side::Prefill, 0), now));
-    assert_eq!(held(gateway, 1), Ok((p, Some((d0, 2)))));
-    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)))));
+    assert_eq!(held(gateway, 1), Ok((p, Some((d0, 2)), 1_000)));
+    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)), 2_000)));
     // Each refusal by its name: another gateway's id, a prefill not sent,
     // a pair filed whole and a single's lease.
     assert_eq!(held(GatewayId(2), 1), Err(NoLease));
@@ -4078,7 +3972,7 @@ fn the_held_pair_names_the_prefill_and_the_decode_of_the_target_its_dispatch_too
     // Taken back, the side names the first decision's decode again, at the
     // target the prefill's dispatch took.
     assert!(store.take_back_decode(gateway, LeaseId(2), ReleaseReason::Abandoned));
-    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)))));
+    assert_eq!(held(gateway, 2), Ok((p, Some((d2, 5)), 2_000)));
 }
 
 /// An undo takes back its own issue of a decode side and no other. Where a

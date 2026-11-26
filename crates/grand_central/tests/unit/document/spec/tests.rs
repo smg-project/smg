@@ -1,6 +1,8 @@
 use super::*;
 use crate::{
-    engine::{Candidate, Constraints, Filter, PoolFacts, RequestFacts, Targets, TieBand},
+    engine::{
+        view::HashKind, Candidate, Constraints, Filter, PoolFacts, RequestFacts, Targets, TieBand,
+    },
     stages::Lifecycle,
 };
 
@@ -1970,12 +1972,11 @@ fn profiles_under_one_sent_setting_read_one_count_of_sends() {
 }
 
 /// A later document's count takes over the standing count under its
-/// two settings, whichever profile made that one. Where none stands
-/// under them it takes the count its maker's name made, unless a
-/// count of the later document took that one, and then the first
-/// standing count that none took.
+/// two settings, whichever profile reads that one, and shares its
+/// entries. Where none stands under them it takes a copy of the sends
+/// the standing counts hold, and shares no entry.
 #[test]
-fn a_later_count_takes_the_standing_one_by_its_settings_then_by_its_name() {
+fn a_later_count_shares_the_standing_one_under_its_settings_or_takes_a_copy() {
     let both = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#;
     let q_alone = r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"*"},"profile":"q"}]}"#;
     let worker = crate::engine::WorkerId(7);
@@ -1993,23 +1994,31 @@ fn a_later_count_takes_the_standing_one_by_its_settings_then_by_its_name() {
         }
         spec.validate().expect("a valid document")
     };
+    // The entries a count holds: the map itself, told by its address.
+    let entries = |count: &Arc<DispatchCredit>| count.credits().tally.load_full();
     // The limits of the standing `p` and `q`, the later document and
-    // its limits, and the sends the later counts hold, in the order
-    // of their makers' names. The send is in every standing count.
+    // its limits, and of each later count, in the order its engine
+    // holds them, the sends it holds and whether it shares a standing
+    // count's entries. The send is in every standing count.
+    let (shared, copied) = ((1, true), (1, false));
     for (was, later, limits, want) in [
         // The same document again.
-        ([None, None], both, [None, None], vec![1]),
-        // `p` made the shared count and leaves: `q` keeps the send.
-        ([None, None], q_alone, [None, None], vec![1]),
-        // Both under a new limit: the name `p` carries the count.
-        ([None, None], both, [Some(43), Some(43)], vec![1]),
+        ([None, None], both, [None, None], vec![shared]),
+        // `p` read the shared count first and leaves: `q` keeps it.
+        ([None, None], q_alone, [None, None], vec![shared]),
+        // Both under a new limit: their one count takes a copy.
+        ([None, None], both, [Some(43), Some(43)], vec![copied]),
         // `p` leaves the shared count for a limit of its own: `q`
-        // keeps the send and `p` starts empty.
-        ([None, None], both, [Some(43), None], vec![0, 1]),
-        // `p` takes the limit `q` had and `q` a new one: `p` takes the
-        // count under its limit, and `q` does not take that count too
-        // by its name: it takes the count `p` made, which is left.
-        ([Some(1), Some(9)], both, [Some(9), Some(43)], vec![1, 1]),
+        // keeps the count, and `p` takes a copy of its send.
+        ([None, None], both, [Some(43), None], vec![copied, shared]),
+        // `p` takes the limit `q` had and `q` a new one: `p` shares
+        // the count under its limit, and `q` takes a copy.
+        (
+            [Some(1), Some(9)],
+            both,
+            [Some(9), Some(43)],
+            vec![shared, copied],
+        ),
     ] {
         let standing = built(both, was);
         standing.on_dispatched(
@@ -2020,13 +2029,75 @@ fn a_later_count_takes_the_standing_one_by_its_settings_then_by_its_name() {
         );
         let next = built(later, limits);
         next.succeed(&standing);
-        let held: Vec<_> = next
-            .sent_credits
-            .iter()
-            .map(|count| count.credits().held(worker))
-            .collect();
+        let stood: Vec<_> = standing.sent_credits.iter().map(entries).collect();
+        let of = |count: &Arc<DispatchCredit>| {
+            let own = entries(count);
+            let shares = stood.iter().any(|stood| Arc::ptr_eq(stood, &own));
+            (count.credits().held(worker), shares)
+        };
+        let held: Vec<_> = next.sent_credits.iter().map(of).collect();
         assert_eq!(held, want, "{was:?}, then {later} under {limits:?}");
     }
+}
+
+/// A later count holds the sends its own time limit still counts,
+/// whichever standing count let them go. A standing count under a
+/// shorter limit has let go what one under a longer limit still
+/// holds. So where `p` takes the limit `q` had and `q` a longer one,
+/// both later counts hold a send that is inside both limits, though
+/// the count `p` made has let it go.
+#[test]
+fn a_later_count_keeps_the_sends_its_own_limit_still_counts() {
+    const SENT: u64 = 91_300;
+    let both = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best"}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#;
+    let worker = crate::engine::WorkerId(7);
+    let target = crate::engine::Target {
+        id: worker,
+        ..Default::default()
+    };
+    let row = Candidate {
+        id: worker,
+        ..Default::default()
+    };
+    // The document with the limits its `p` and its `q` set.
+    let built = |limits: [Option<u32>; 2]| {
+        let mut spec = doc(both);
+        for (name, limit) in ["p", "q"].into_iter().zip(limits) {
+            let profile = spec.profiles.get_mut(name).expect("the profile");
+            profile.sent_ttl_ms = limit;
+        }
+        spec.validate().expect("a valid document")
+    };
+    // The sends the count under the time limit `limit` holds at `now`,
+    // as a decision under a profile of that limit reads them.
+    let read = |engine: &Engine, limit: u32, now_micros: u64| {
+        let facts = RequestFacts {
+            now_micros,
+            ..Default::default()
+        };
+        let mut counts = engine.sent_credits.iter();
+        let count = counts.find(|count| count.settings.ttl_ms == Some(limit));
+        let count = count.expect("a count under the limit");
+        count.read(&facts, &row).requests
+    };
+    // `p` counts a send for one millisecond, and `q` for nine.
+    let standing = built([Some(1), Some(9)]);
+    let lease = crate::tracking::Lease {
+        issued_micros: SENT,
+        ..Default::default()
+    };
+    standing.on_dispatched(&lease, &target, crate::tracking::Side::Single, 0);
+    // Two milliseconds on, a decision under each profile reads its
+    // count: the send is past `p`'s limit and inside `q`'s.
+    let now = SENT + 2_000;
+    assert_eq!(read(&standing, 1, now), 0, "past one millisecond");
+    assert_eq!(read(&standing, 9, now), 1, "inside nine");
+    // `p` takes the limit `q` had, and `q` a longer one: the send is
+    // inside both.
+    let next = built([Some(9), Some(43)]);
+    next.succeed(&standing);
+    let held = [9, 43].map(|limit| read(&next, limit, now));
+    assert_eq!(held, [1, 1], "under the limit `q` had and a longer one");
 }
 
 /// A later spec keeps the stage objects of each profile whose name and
@@ -2510,11 +2581,12 @@ fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
 
 /// A spec that keeps one count of sends and builds a second, under
 /// settings no standing count has, counts a send behind it once in
-/// each. The count kept is the standing object: it takes nothing over,
-/// and the count built beside it takes nothing of it.
+/// each. The count kept is the standing object: it takes nothing over.
+/// The count built beside it takes a copy of the send the kept one
+/// holds and shares none of its entries.
 #[cfg(feature = "in-process")]
 #[test]
-fn a_count_kept_is_taken_over_by_no_count_built_beside_it() {
+fn a_count_built_beside_a_count_kept_takes_a_copy_of_its_sends() {
     let one =
         r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"}}}"#;
     let two = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["least-load"],"pick":"best"},"q":{"score":["least-load"],"pick":"best","sent_ttl_ms":43}},"bindings":[{"match":{"model":"m"},"profile":"p"},{"match":{"model":"*"},"profile":"q"}]}"#;
@@ -2541,7 +2613,7 @@ fn a_count_kept_is_taken_over_by_no_count_built_beside_it() {
         .iter()
         .map(|count| count.credits().held(worker))
         .collect();
-    assert_eq!(held, [2, 1], "each send once in each count that stood");
+    assert_eq!(held, [2, 2], "each send once in each count");
 }
 
 /// A count built beside a reader kept follows the standing one. The
@@ -2630,14 +2702,14 @@ fn a_count_followed_across_three_specs_is_one_set_of_entries() {
     }
 }
 
-/// A count kept bears the name of the profile that made it under an
-/// earlier spec, so an engine's counts stand in no order of those
-/// names. A count built new under settings no standing count has still
-/// finds the count its profile's name made, past a count left free
-/// ahead of it.
+/// A count built new under settings no standing count has takes its
+/// copy from the counts that stand, kept from an earlier spec or built
+/// by the standing one, and shares the entries of none. A send said
+/// under the second spec is in each of its counts, and the third
+/// spec's new count holds it once.
 #[cfg(feature = "in-process")]
 #[test]
-fn a_count_built_new_finds_its_makers_count_among_counts_kept() {
+fn a_count_built_new_takes_its_copy_among_counts_kept_and_counts_built() {
     let spec = |profiles: &[(&str, u32)]| {
         let block = |&(name, ttl): &(&str, u32)| {
             let stages = r#""score":["least-load"],"pick":"best""#;
@@ -2654,30 +2726,33 @@ fn a_count_built_new_finds_its_makers_count_among_counts_kept() {
         );
         AppliedSpec::validate(&doc(&text)).expect("a valid document")
     };
-    let makers = |spec: &AppliedSpec| {
-        let counts = spec.engine().sent_credits.iter();
-        counts
-            .map(|count| count.profile.clone())
-            .collect::<Vec<_>>()
-    };
     let first = spec(&[("a", 40), ("b", 41), ("x", 42)]);
-    // `c` reads the count `x` made: the count kept stands at the place
-    // of `c`'s, under `x`'s name.
+    // `c` reads the count kept for `x`, and `m` a count built new.
     let mut second = spec(&[("a", 40), ("b", 41), ("c", 42), ("m", 43), ("x", 42)]);
     second.keep_from(&first);
     second.engine().succeed(first.engine());
-    assert_eq!(makers(&second), ["a", "b", "x", "m"], "in no order");
+    let worker = crate::engine::WorkerId(7);
+    let target = crate::engine::Target {
+        id: worker,
+        ..Default::default()
+    };
+    let lease = crate::tracking::Lease::default();
+    let standing = second.engine();
+    standing.on_dispatched(&lease, &target, crate::tracking::Side::Single, 0);
     // `b` goes, and `m` writes another limit: no standing count has
-    // its new count's settings, and `b`'s count is left free.
+    // its new count's settings.
     let mut third = spec(&[("a", 40), ("c", 42), ("m", 44), ("x", 42)]);
     third.keep_from(&second);
-    third.engine().succeed(second.engine());
-    let entries = |count: &DispatchCredit| count.credits().tally.load_full();
-    let new = &third.engine().sent_credits[2];
-    let made = &second.engine().sent_credits[3];
-    assert_eq!((new.profile.as_str(), made.profile.as_str()), ("m", "m"));
-    let taken = Arc::ptr_eq(&entries(new), &entries(made));
-    assert!(taken, "the entries of the count its maker's name made");
+    third.engine().succeed(standing);
+    let entries = |count: &Arc<DispatchCredit>| count.credits().tally.load_full();
+    let mut counts = third.engine().sent_credits.iter();
+    let new = counts.find(|count| count.settings.ttl_ms == Some(44));
+    let new = new.expect("the count under the new limit");
+    assert_eq!(new.credits().held(worker), 1, "a copy of the send");
+    let own = entries(new);
+    let stood = standing.sent_credits.iter().map(entries);
+    let shared = stood.filter(|stood| Arc::ptr_eq(stood, &own)).count();
+    assert_eq!(shared, 0, "the entries of no standing count");
 }
 
 #[test]
@@ -2941,22 +3016,26 @@ fn the_manual_preset_states_its_whole_rule() {
 }
 
 /// The manual picker places by a sessions rule, and a rule runs under
-/// the single plan and on the two sides of a pair: on a side of `epd`
-/// the profile is refused, with the side that names it. The built
-/// picker answers, so any picker that leaves the placement to the rule
-/// is refused the same way.
+/// the single plan and on the two sides of a pair, and places no item.
+/// So on the encode side of `epd` the profile is refused, with the side
+/// that names it, whatever the pair's two sides run. The built picker
+/// answers, so any picker that leaves the placement to the rule is
+/// refused the same way.
 #[test]
-fn the_manual_picker_under_the_epd_plan_is_not_in_this_build() {
-    let epd = doc(
-        r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"epd","profiles":{"encode":"sticky","prefill":"q","decode":"q"}}]}"#,
-    );
-    assert_eq!(
-        not_in_build(&epd),
-        (
-            "bindings[0].profiles.encode".to_string(),
-            "a picker that places by the sessions rule under the epd plan"
-        )
-    );
+fn the_manual_picker_on_the_encode_side_of_epd_is_not_in_this_build() {
+    for (prefill, decode) in [("q", "q"), ("sticky", "sticky")] {
+        let epd = doc(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","profiles":{{"q":{{"pick":"random"}},"sticky":{{"pick":"manual"}}}},"bindings":[{{"plan":"epd","profiles":{{"encode":"sticky","prefill":"{prefill}","decode":"{decode}"}}}}]}}"#
+        ));
+        assert_eq!(
+            not_in_build(&epd),
+            (
+                "bindings[0].profiles.encode".to_string(),
+                "a picker that places by the sessions rule on the encode side"
+            ),
+            "{prefill} and {decode}"
+        );
+    }
     // On a side of a pair the same profile validates, and so it does
     // under the single plan, here with no rule; the preset is the
     // profile with one.
@@ -2968,6 +3047,49 @@ fn the_manual_picker_under_the_epd_plan_is_not_in_this_build() {
         r#"{"apiVersion":"smg.policy/v1","profiles":{"sticky":{"pick":"manual"}},"bindings":[{"profile":"sticky"}]}"#,
     );
     assert!(single.validate().is_ok());
+}
+
+/// The manual picker runs on the prefill and the decode side of `epd`,
+/// as on the two sides of a pair: on both, and on either one beside a
+/// picker of its own. With no rule on its binding such a side is placed
+/// by its assignment, in the build of a host that makes the
+/// lifecycle's calls and in the build of one that makes some only.
+/// Under a rule it follows its key in the first build. The second
+/// refuses a rule under `epd` by the plan's name, whatever its sides'
+/// pickers.
+///
+/// A gateway's own check takes any policy on the prefill and the
+/// decode side of its encode mode, `manual` among them
+/// (`model_gateway/src/config/validation.rs:1005-1010`).
+#[test]
+fn the_manual_picker_runs_on_the_pairs_two_sides_of_epd() {
+    let rule = r#","sessions":{"sticky_header":"x-session-id","inflight_cap":65535}"#;
+    let epd = |prefill: &str, decode: &str, rule: &str| {
+        doc(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"q":{{"pick":"random"}},"sticky":{{"pick":"manual"}}}},"bindings":[{{"plan":"epd","profiles":{{"encode":"q","prefill":"{prefill}","decode":"{decode}"}}{rule}}}]}}"#
+        ))
+    };
+    let some = StageRegistry::builtin().without_lifecycle();
+    for (prefill, decode) in [("sticky", "sticky"), ("sticky", "q"), ("q", "sticky")] {
+        let sides = format!("{prefill} and {decode}");
+        let bare = epd(prefill, decode, "");
+        assert!(bare.validate().is_ok(), "{sides}");
+        assert!(bare.validate_in(&some, &[]).is_ok(), "{sides}");
+        let ruled = epd(prefill, decode, rule);
+        assert!(ruled.validate().is_ok(), "{sides}");
+        let refused = ruled.validate_in(&some, &[]).err();
+        assert!(
+            matches!(
+                refused,
+                Some(SpecError::BadSessions {
+                    index: 0,
+                    name: "plan",
+                    ..
+                })
+            ),
+            "{sides}: {refused:?}"
+        );
+    }
 }
 
 /// A sessions rule under the pair plan is in the build of a host that
@@ -2995,13 +3117,19 @@ fn a_pairs_sessions_rule_is_in_the_build_of_a_host_that_makes_some_lifecycle_cal
 /// its own word. In the build of a host that makes some only it is
 /// refused by that field's name, and the refusal says why: that host
 /// tells a lease's words off a file, which keeps no word of a pair's
-/// side. A rule under `epd` is refused by the plan's name.
+/// side.
+///
+/// Under `epd` the rule runs on the pair's two sides in the build of a
+/// host that makes the lifecycle's calls, under either word, and a cap
+/// makes the document's engine read a key's count as under a pair. The
+/// build of a host that makes some only refuses the rule by the plan's
+/// name, whatever its word.
 ///
 /// A gateway's sticky map places each role of a pair under that role's
 /// own key, and hands its policy no request it placed
 /// (`model_gateway/src/policies/registry.rs:762-769`, `:794-797`).
 #[test]
-fn a_sessions_rule_runs_under_a_pair_by_its_hosts_calls_and_not_under_epd() {
+fn a_sessions_rule_runs_under_a_pair_and_under_epd_by_its_hosts_calls() {
     let built = |plan: &str, profiles: &str, sessions: &str| {
         spec_with_binding(&format!(
             r#"{{"plan":"{plan}","profiles":{profiles},"sessions":{sessions}}}"#
@@ -3056,19 +3184,56 @@ fn a_sessions_rule_runs_under_a_pair_by_its_hosts_calls_and_not_under_epd() {
         assert_eq!(single.validate_in(&some, &[]).err(), None, "{rule}");
     }
     let epd = r#"{"encode":"q","prefill":"q","decode":"q"}"#;
-    let refused = under("epd", epd, uncapped);
-    assert_eq!(
-        refused,
-        Some(SpecError::BadSessions {
-            index: 0,
-            name: "plan",
-            reason: "`single` or `pd-pair`",
-        })
-    );
-    assert_eq!(
-        refused.map(|err| err.to_string()),
-        Some("binding 0: sessions plan is not `single` or `pd-pair`".to_string())
-    );
+    let capped = r#"{"sticky_header":"x-session-id"}"#;
+    for rule in [uncapped, untold, capped] {
+        assert_eq!(under("epd", epd, rule), None, "{rule}");
+        let refused = spec_with_binding(&format!(
+            r#"{{"plan":"epd","profiles":{epd},"sessions":{rule}}}"#
+        ))
+        .validate_in(&some, &[])
+        .err();
+        assert_eq!(
+            refused,
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "plan",
+                reason: "`single` or `pd-pair`",
+            }),
+            "{rule}"
+        );
+        assert_eq!(
+            refused.map(|err| err.to_string()),
+            Some("binding 0: sessions plan is not `single` or `pd-pair`".to_string()),
+            "{rule}"
+        );
+    }
+    let counts =
+        |sessions: &str| built("epd", epd, sessions).map(|built| built.needs().session_in_flight);
+    assert_eq!((counts(uncapped), counts(capped)), (Ok(false), Ok(true)));
+    // The rule's needs are the pair's two sides': the encode phase
+    // takes none of them, by any of the engine's three answers.
+    let ruled = built("epd", epd, capped).expect("a rule under epd");
+    let bare = spec_with_binding(&format!(r#"{{"plan":"epd","profiles":{epd}}}"#))
+        .validate()
+        .expect("the plan alone");
+    for side in [Phase::Prefill, Phase::Decode] {
+        assert!(ruled.needs_for_phase(side).session_in_flight, "{side:?}");
+        assert!(!bare.needs_for_phase(side).session_in_flight, "{side:?}");
+    }
+    let of_encode = |engine: &Engine| {
+        let rows: Vec<Needs> = engine
+            .needs_rows()
+            .into_iter()
+            .filter(|row| row.1 == Phase::Encode)
+            .map(|row| row.2)
+            .collect();
+        (
+            engine.needs_for_phase(Phase::Encode),
+            engine.reads_for("m", Phase::Encode),
+            rows,
+        )
+    };
+    assert_eq!(of_encode(&ruled), of_encode(&bare));
 }
 
 #[test]

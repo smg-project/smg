@@ -3,7 +3,10 @@
 //! the dispatch span. The controller supplies the view used to decide and
 //! writes the reports it receives.
 
-use std::time::{Duration, Instant};
+use std::{
+    iter::successors,
+    time::{Duration, Instant},
+};
 
 use crate::{
     engine::{
@@ -12,6 +15,7 @@ use crate::{
             Trace, MAX_TARGETS, TRACE_TOP,
         },
         decision_engine::{DecideOutcome, Leased, Request},
+        demands::{Demands, References, UnmetDemand},
         framework::{EncodeItems, EncodePlaced},
         view::{HashKind, Identity, Phase, RequestFacts, Session, WorkerId},
     },
@@ -113,8 +117,39 @@ pub(crate) fn request(
         // An encode request's frame states its items ([`encode_request`]).
         encode: None,
         named_worker: named.map(|number| number.unwrap_or(u32::MAX)),
+        demands: stated_demands(constraints.demands),
     };
     (asked, facts.block_hashes.len() - held)
+}
+
+/// A request's hard demands as its frame states them
+/// (`DecideRequest.demands`). A request that demands nothing states no
+/// message, as the frame of a host older than the field does.
+fn stated_demands(demands: Demands) -> Option<proto::Demands> {
+    // Every part by its name: one the engine's type gains stops the build
+    // here, so no demand stays behind unsent.
+    let Demands {
+        runtime,
+        vision,
+        references,
+        input_window,
+        output_window,
+        decoding,
+    } = demands;
+    (!demands.is_none()).then(|| proto::Demands {
+        runtime,
+        vision,
+        references: match references {
+            References::None => proto::demands::References::None,
+            References::Any => proto::demands::References::Any,
+            References::Caller => proto::demands::References::Caller,
+            References::Worker => proto::demands::References::Worker,
+        }
+        .into(),
+        input_window,
+        output_window,
+        decoding: u32::from(decoding),
+    })
 }
 
 /// An encode request as the wire carries it: its pair's one request, with
@@ -201,6 +236,32 @@ fn narrow<T: TryFrom<u32>>(number: u32, path: &'static str) -> Result<T, Unread>
     T::try_from(number).map_err(|_| unread(path, "out of range"))
 }
 
+/// The stage a shed keeps off the wire. A demand's stage stays by its
+/// name, as the door in process names it, since a host answers by it: a
+/// window that holds too little is the request's fault and none of the
+/// pool's. Any other stage is named by the controller's own document, and
+/// reads `controller`.
+fn emptied_by(stage: &str) -> &'static str {
+    successors(Some(UnmetDemand::Runtime), |demand| behind(*demand))
+        .map(UnmetDemand::stage)
+        .find(|kept| *kept == stage)
+        .unwrap_or("controller")
+}
+
+/// The demand a host answers for behind `demand`, and none behind the
+/// last. Every demand by its name: one the engine's type gains stops the
+/// build here, so its stage is kept too.
+const fn behind(demand: UnmetDemand) -> Option<UnmetDemand> {
+    match demand {
+        UnmetDemand::Runtime => Some(UnmetDemand::Vision),
+        UnmetDemand::Vision => Some(UnmetDemand::References),
+        UnmetDemand::References => Some(UnmetDemand::Pipeline),
+        UnmetDemand::Pipeline => Some(UnmetDemand::Window),
+        UnmetDemand::Window => Some(UnmetDemand::Decoding),
+        UnmetDemand::Decoding => None,
+    }
+}
+
 /// The controller's decision as the door's own record, told at `now`.
 /// A pair gives the handle a prefill and a decode to report, under the
 /// one id and dispatch span the door keeps in its prefill lease.
@@ -223,7 +284,7 @@ pub(crate) fn decided(told: &proto::Decision, now: Instant) -> Result<DecideOutc
         }),
         Outcome::Shed(shed) => Decision::Shed(Shed {
             reason: shed_reason(shed.reason)?,
-            emptied_by: "controller",
+            emptied_by: emptied_by(&shed.emptied_by),
             retry_after_secs: narrow(shed.retry_after_secs, "shed.retry_after_secs")?,
             wait_allowed: shed.wait_allowed,
             // The message has no field for the side of a pair.
