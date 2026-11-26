@@ -218,8 +218,9 @@ fn registration_line<H: WorkflowHost>(
 }
 
 /// Build a removal that selects workers, marks their rows draining, waits
-/// for them to settle and removes their rows. The holder drops the objects
-/// when it follows the store. The drain is the door's write. A door with
+/// for them to settle and removes their rows. A door that writes through
+/// the holder drops each object with its row.
+/// The drain is the door's write. A door with
 /// a holder marks the worker object draining and tells its row, so a
 /// decision that reads the object's status picks it no more. Where a door
 /// marks the row alone, the held object's status does not move.
@@ -788,6 +789,7 @@ mod tests {
         worker_host::{
             facts,
             membership_writer::tests::{HolderDoor, StoreDoor},
+            objects::lay_standing,
             Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects,
             Over, Precondition, Remover, RowRevision,
         },
@@ -953,10 +955,10 @@ mod tests {
             written.expect("the store takes the write");
         }
 
-        /// The fixture of a host whose door writes the store alone and
-        /// whose holder follows it by hand: for the cases of what stands
-        /// between a door's write and that follow.
-        fn following() -> Self {
+        /// The fixture of a host whose door writes the store alone. The
+        /// registry holds a row's object only where a case lays it. For
+        /// the cases of a door's answer under an object that lags its row.
+        fn around() -> Self {
             let mut fixture = Self::new();
             fixture.door = Arc::new(StoreDoor::new(Arc::clone(&fixture.store)));
             fixture
@@ -1179,7 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_registration_writes_one_row_a_worker_under_its_askers_maker() {
-        let f = Fixture::following();
+        let f = Fixture::new();
         let urls = ["http://worker:8000@0", "http://worker:8000@1"];
         let workers = ranked_workers(2);
         let mut cx = f.registration(WorkerJobAsker::Discovery, workers.clone());
@@ -1197,7 +1199,10 @@ mod tests {
             };
             assert_eq!(row.facts, expected);
             assert_eq!(row.maker, maker);
-            assert!(f.host.registry.get_by_url(url).is_none());
+            assert!(
+                f.host.registry.get_by_url(url).is_some(),
+                "laid by the write"
+            );
         }
         assert_eq!(f.store.epoch(), 2);
         assert_eq!(cx.data.workers.expect("the written URLs").worker_urls, urls);
@@ -1306,14 +1311,14 @@ mod tests {
     /// The door answers that the row left, under an object the holder has
     /// not dropped yet: the worker stays the job's at either step.
     #[tokio::test]
-    async fn a_removal_keeps_a_worker_whose_row_left_before_the_holder_followed() {
-        let f = Fixture::following();
+    async fn a_removal_keeps_a_worker_whose_row_left_under_its_object() {
+        let f = Fixture::around();
         let built = worker(URL, "model");
         let maker = Registrant::Control;
         let by = Remover::Registrant(&maker);
         for at_the_drain in [true, false] {
             f.seed(&maker, built.as_ref()).expect("registered");
-            f.objects.follow(&*f.store);
+            lay_standing(&f.objects, &f.store);
             let live = f.host.registry.get_by_url(URL).expect("the held worker");
             let id = f.host.registry.get_id_by_url(URL).expect("its id");
             let seen = f.objects.standing_of(&id, &live).expect("its row");
@@ -1331,7 +1336,6 @@ mod tests {
                 assert!(removal.data.removed_workers.is_empty());
             }
             assert_eq!(removal.data.worker_urls, [URL]);
-            f.objects.follow(&*f.store);
         }
     }
 
@@ -2094,7 +2098,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_removal_marks_its_rows_draining_and_takes_them_behind_the_workers_own_window() {
-        let f = Fixture::following();
+        let f = Fixture::new();
         // The registration states a drain window of thirty seconds: the row
         // carries it, and the object the holder builds settles by it.
         let checks = HealthCheckConfig {
@@ -2106,7 +2110,6 @@ mod tests {
             .build();
         let mut cx = f.registration(WorkerJobAsker::Api, vec![Arc::new(built)]);
         f.write().execute(&mut cx).await.expect("registered");
-        f.objects.follow(&*f.store);
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let workflow =
             removal_from_store::<Host>(Arc::clone(&f.door), Arc::clone(&f.objects), SCOPE);
@@ -2142,9 +2145,10 @@ mod tests {
             assert!(Arc::ptr_eq(&workers[0], &live));
         }
         assert!(f.store.by_key(URL).is_none());
-        assert!(f.host.registry.get_by_url(URL).is_some());
-        f.objects.follow(&*f.store);
-        assert!(f.host.registry.get_by_url(URL).is_none());
+        assert!(
+            f.host.registry.get_by_url(URL).is_none(),
+            "gone with its row"
+        );
     }
 
     #[tokio::test]
@@ -2293,11 +2297,11 @@ mod tests {
     /// the job at either step.
     #[tokio::test]
     async fn a_removal_leaves_a_row_that_moved_and_drops_its_worker_from_the_job() {
-        let f = Fixture::following();
+        let f = Fixture::around();
         let built = worker(URL, "model");
         f.seed(&Registrant::Control, built.as_ref())
             .expect("registered");
-        f.objects.follow(&*f.store);
+        lay_standing(&f.objects, &f.store);
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         f.door
             .found(&Registrant::Control, Precondition::Any, URL, &|old| {

@@ -1646,8 +1646,8 @@ impl MemoryStore {
     ///   the status the log told of its row (`Objects::copy_status`).
     ///
     /// What else reads a row's status reads the table's whole row and
-    /// goes with the table: the holder's follow, for a row a writer left
-    /// outside the holder's turn, and the store's own reads of a row.
+    /// goes with the table: the holder's read of a row a writer left
+    /// outside its turn, and the store's own reads of a row.
     pub(crate) fn told(&self) -> Told {
         let workers = self.workers.lock();
         let at = self

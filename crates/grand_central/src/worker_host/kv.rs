@@ -909,7 +909,7 @@ mod tests {
     use super::*;
     use crate::{
         store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkersStore},
-        worker_host::Members,
+        worker_host::{objects::lay_standing, Members},
     };
 
     const MODEL: &str = "m";
@@ -995,19 +995,8 @@ mod tests {
                 Objects::new(Arc::new(WorkerRegistry::new()))
                     .with_kv_tables(Arc::clone(&self.tables)),
             );
-            laid(&objects, &self.store);
+            lay_standing(&objects, &self.store);
             KvHost::new(objects)
-        }
-    }
-
-    /// Have `objects` lay the rows `store` holds already. Each row is
-    /// written again through the holder: the store refuses a write over a
-    /// row it holds, and the holder lays the record that stands there.
-    fn laid(objects: &Objects<Members>, store: &MemoryStore) {
-        let (_, rows) = store.all_rows();
-        for row in rows {
-            let written = objects.upsert(store, row.facts, Registrant::Control);
-            assert_eq!(written, None, "the row stood in the store already");
         }
     }
 
@@ -2364,7 +2353,7 @@ mod tests {
     fn a_host_over_a_holder_handed_no_tables_indexes_nothing() {
         let f = Fixture::single(Some(BLOCK_SIZE));
         let objects = Arc::new(Objects::new(Arc::new(WorkerRegistry::new())));
-        laid(&objects, &f.store);
+        lay_standing(&objects, &f.store);
         assert!(objects.kv_tables().is_none());
         let host: KvHost<Members> = KvHost::new(objects);
         let worker = host

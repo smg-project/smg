@@ -1033,7 +1033,7 @@ pub(super) mod tests {
     /// election and no log: each call runs the door's rules, reads a row
     /// off the worker objects and writes through the holder, as a
     /// controller's door does. So the object of a row it wrote stands when
-    /// it answers, with no follow.
+    /// it answers.
     pub(crate) struct HolderDoor {
         store: Arc<MemoryStore>,
         objects: Arc<Objects<Members>>,
@@ -2987,7 +2987,7 @@ pub(super) mod tests {
 
     /// The cases in which a decision reads what the door wrote. The engine
     /// over worker lists decides over the lists a holder lends, once the
-    /// holder has followed the door's writes.
+    /// holder has laid the rows the door wrote.
     #[cfg(feature = "in-process")]
     mod decided {
         use std::{sync::Arc, time::Instant};
@@ -3008,10 +3008,10 @@ pub(super) mod tests {
                 Phase, Request, RequestFacts, RequestMaker, Role, ShedReason, WorkerId,
                 WorkerLists,
             },
-            store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+            store::{Registrant, WorkerFacts, WorkerStatus, WorkersStore},
             worker_host::{
-                facts, pairing_descriptor, Members, MembershipWriteOutcome, MembershipWriter,
-                Objects, OpenAdmission, Precondition,
+                facts, objects::lay_standing, pairing_descriptor, Members, MembershipWriteOutcome,
+                MembershipWriter, Objects, OpenAdmission, Precondition,
             },
         };
 
@@ -3048,8 +3048,9 @@ pub(super) mod tests {
             }
         }
 
-        /// A holder with a registry of its own. It reads `store` where a
-        /// case has it follow, and builds each object in its row's status.
+        /// A holder with a registry of its own. It lays the rows of a store
+        /// where a case has it lay them, as a refused write does, and builds
+        /// each object in its row's status.
         fn holder() -> Objects<Members> {
             Objects::new(Arc::new(WorkerRegistry::new()))
         }
@@ -3130,11 +3131,11 @@ pub(super) mod tests {
             assert_eq!(again, Ok(MembershipWriteOutcome::Unmoved(row.id)));
             let holder = holder();
             // A pair's request, decided over the two lists the holder lends
-            // once it has followed the store, under the classes it hands
+            // once it has laid the store's rows, under the classes it hands
             // beside them: whether the prefill and the decode pair, and the
             // pair the decision picked or what it was shed under.
             let placed = || {
-                holder.follow::<MemoryStore>(&store);
+                lay_standing(&holder, &store);
                 let registry = holder.registry();
                 let generation = registry.model_generation(MODEL).expect("a generation");
                 let lent = |role: Role| holder.lent(&generation, role);
@@ -3261,7 +3262,7 @@ pub(super) mod tests {
                     rows.push(laid.id);
                 }
                 let holder = holder();
-                holder.follow::<MemoryStore>(&store);
+                lay_standing(&holder, &store);
                 let registry = holder.registry();
                 let generation = registry.model_generation(MODEL).expect("a generation");
                 let classes = holder.pair_classes(&generation, Pairing::Lenient);
@@ -3298,7 +3299,7 @@ pub(super) mod tests {
         /// A refresh that turns a worker's vision off starts another life,
         /// as one that changes a demand fact does: the door reads the bit
         /// as a hard demand. The row that took images is gone when the
-        /// write is answered. Once the holder has followed the write, a
+        /// write is answered. Once the holder has laid the new row, a
         /// request that needs vision is decided over nobody, and one that
         /// needs none is placed on the new life, which is handed the old
         /// one's status.
@@ -3325,9 +3326,9 @@ pub(super) mod tests {
             let engine = InProcess::new(applied);
             let holder = holder();
             // A request that states whether it needs vision, decided over
-            // the list the holder lends once it has followed the store.
+            // the list the holder lends once it has laid the store's rows.
             let decide = |vision: bool| {
-                holder.follow::<MemoryStore>(&store);
+                lay_standing(&holder, &store);
                 let registry = holder.registry();
                 let generation = registry.model_generation(MODEL).expect("a generation");
                 let list = holder.lent(&generation, Role::Single);

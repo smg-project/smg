@@ -93,14 +93,14 @@ mod tests {
             WorkerFacts, WorkerPatch,
         },
         tracking::lease::{Lease, LeaseId, Outcome, TransportClass},
-        worker_host::Members,
+        worker_host::{objects::lay_standing, Members},
     };
 
     const A: &str = "http://a:8000";
     const B: &str = "http://b:8000";
     const GATEWAY: GatewayId = GatewayId(1);
 
-    /// A holder with the store it follows, under the term its leases state.
+    /// A holder with the store it writes, under the term its leases state.
     struct Replica {
         store: Arc<MemoryStore>,
         objects: Objects<Members>,
@@ -114,9 +114,10 @@ mod tests {
             Self { store, objects }
         }
 
-        /// Have the holder read the store.
-        fn follow(&self) {
-            self.objects.follow(self.store.as_ref());
+        /// Have the holder lay each row written around it, by the read of
+        /// a refused write.
+        fn lay_standing(&self) {
+            lay_standing(&self.objects, &self.store);
         }
 
         /// Write the first life of the row at `url` through the holder: the
@@ -279,7 +280,7 @@ mod tests {
         replica.file_of(1, a, ONE);
         replica.file_of(2, a, ONE);
         replica.file_of(3, a, TWO);
-        replica.follow();
+        replica.lay_standing();
         let before = replica.at(A);
         assert_eq!(keyed(&before), (2, 1, 2), "the leases that stood");
 
@@ -351,7 +352,7 @@ mod tests {
         let replica = Replica::new();
         let a = replica.row(A, 1);
         replica.file(1, a);
-        replica.follow();
+        replica.lay_standing();
         assert_eq!(replica.at(A).load(), 1, "the lease that stood");
         replica.end(1);
         assert_eq!(replica.at(A).load(), 0);
@@ -394,9 +395,9 @@ mod tests {
         replica.file(2, a);
         assert_eq!(object.load(), 2);
         let row = replica.store.by_key(A).expect("a row");
-        assert!(replica.store.remove(row.id, row.revision).is_some());
+        let (store, objects) = (&replica.store, &replica.objects);
+        assert!(objects.remove(store, row.id, row.revision).is_some());
         assert_eq!(object.load(), 0, "at the store's write");
-        replica.follow();
         assert!(replica.objects.registry().get_by_url(A).is_none());
         assert_eq!(Arc::strong_count(&object), 1, "the store lets it go");
 
@@ -436,7 +437,7 @@ mod tests {
         replica.file(1, old);
         let new = replica.row(A, 2);
         replica.file(2, new);
-        replica.follow();
+        replica.lay_standing();
         assert_eq!(replica.at(A).load(), 1, "the new life's lease");
         replica.end(2);
         assert_eq!(replica.at(A).load(), 0);
@@ -451,17 +452,16 @@ mod tests {
         let a = leader.write(A);
         let follower = Replica::new();
         let cut = || leader.store.checkpoint();
-        assert!(follower.store.restore_from(cut()));
-        follower.follow();
+        assert!(follower.objects.restore_from(&follower.store, cut()));
         let before = follower.at(A);
 
-        // The leader's row moves and the follower takes its rows again:
-        // the row stands at a new place, with another object to lay.
+        // The leader's row moves and the follower's store takes its rows
+        // again: the row stands at a new place, with another object to lay.
         leader.relabel(A);
         assert!(follower.store.restore_from(cut()));
         follower.store.set_term(1);
         follower.file(1, a);
-        follower.follow();
+        follower.lay_standing();
         let after = follower.at(A);
         assert!(!Arc::ptr_eq(&before, &after), "another object");
         assert_eq!(after.load(), 1, "the lease filed ahead of it");
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(first.load(), 2);
 
         let other = Objects::<Members>::new(Arc::new(WorkerRegistry::new()));
-        other.follow(replica.store.as_ref());
+        lay_standing(&other, &replica.store);
         let second = other.registry().get_by_url(A).expect("an object");
         assert_eq!((second.load(), first.load()), (2, 0));
         replica.end(1);
@@ -490,7 +490,7 @@ mod tests {
     }
 
     /// A store that took another's rows gives each row a new place in its
-    /// counts: the holder's next whole read hands each object again, so a
+    /// counts: the cut's read hands each standing object again, so a
     /// lease filed at the new place counts on it.
     #[test]
     fn a_whole_read_hands_each_standing_object_again() {
@@ -498,20 +498,18 @@ mod tests {
         let a = leader.write(A);
         let follower = Replica::new();
         let cut = || leader.store.checkpoint();
-        assert!(follower.store.restore_from(cut()));
-        follower.follow();
+        assert!(follower.objects.restore_from(&follower.store, cut()));
         let object = follower.at(A);
         let held = Arc::strong_count(&object);
 
-        // The same rows again: every row takes a new place.
-        assert!(follower.store.restore_from(cut()));
+        // The same rows again: every row takes a new place, and the cut's
+        // read hands the standing object to it.
+        assert!(follower.objects.restore_from(&follower.store, cut()));
+        assert!(Arc::ptr_eq(&object, &follower.at(A)), "the object stands");
         let kept = Arc::strong_count(&object);
-        assert_eq!(kept, held - 1, "the old place lets the object go");
+        assert_eq!(kept, held, "the old place let it go, the new one holds it");
         follower.store.set_term(1);
         follower.file(1, a);
-        assert_eq!(object.load(), 0, "no count stands at the new place yet");
-        follower.follow();
-        assert!(Arc::ptr_eq(&object, &follower.at(A)), "the object stands");
         assert_eq!(object.load(), 1, "the lease filed at the new place");
         follower.file(2, a);
         assert_eq!(object.load(), 2);

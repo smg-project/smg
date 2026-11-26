@@ -2075,7 +2075,7 @@ pub(crate) mod tests {
     }
 
     /// The worker the in-process front names first for `frame`, over the
-    /// list `objects` lends as it stands. No follow is made here: the
+    /// list `objects` lends as it stands: the
     /// answer reads what the holder held when it was asked. `None` where
     /// the front names no worker.
     pub(crate) fn lent_pick(

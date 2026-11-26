@@ -32,13 +32,13 @@
 //! status its log has not told yet between a driver's move and the tell,
 //! and a copy holds the log's word at the copy's place. A cut takes no
 //! object's mutation lock. A row a writer left with no turn of the holder
-//! is in no cut until its host has the holder follow the store
-//! ([`Objects::follow`]).
+//! is in no cut until the holder reads it: where the store refuses its
+//! key's next write, or where a cut is laid whole.
 
 use parking_lot::MutexGuard;
 use smg_worker::registry::Generation;
 
-use super::{Laid, Objects, Place};
+use super::{Laid, Objects};
 use crate::{
     engine::view::WorkerId,
     store::{memory::Told, MemoryStore, StoreCheckpoint, WorkerRow},
@@ -61,14 +61,14 @@ impl<G: Generation> Objects<G> {
     /// holder's turn, off the object. `None` where no object stands for
     /// the row.
     pub(crate) fn record(&self, id: WorkerId) -> Option<WorkerRow> {
-        let _turn = self.read_to.lock();
+        let _turn = self.turn.lock();
         self.row(id)
     }
 
     /// The record under the registration key `key`, as [`Self::record`]
     /// reads one.
     pub(crate) fn record_under(&self, key: &str) -> Option<WorkerRow> {
-        let _turn = self.read_to.lock();
+        let _turn = self.turn.lock();
         self.row_under(key)
     }
 
@@ -76,7 +76,7 @@ impl<G: Generation> Objects<G> {
     /// one: its plain row, or each rank that stands. In no order. Asked
     /// once a registration at a door: no decision reads it.
     pub(crate) fn records_of(&self, engine: &str) -> Vec<WorkerRow> {
-        let _turn = self.read_to.lock();
+        let _turn = self.turn.lock();
         let dialing: Vec<WorkerId> = {
             let held = self.held.read();
             let ranked = held.ranks.get(engine).into_iter().flatten();
@@ -173,10 +173,10 @@ impl<G: Generation> Objects<G> {
     /// take no turn: none changes a row's facts, and the told read takes
     /// the place in the hold that takes the statuses. A caller of the
     /// store's own entries for a row takes none either: no product code
-    /// calls them, and a row written so is in no copy until its host has
-    /// the holder follow the store ([`Self::follow`]).
-    fn told_turn(&self, store: &MemoryStore) -> (MutexGuard<'_, Place>, Told) {
-        let turn = self.read_to.lock();
+    /// calls them, and a row written so is in no copy until the holder
+    /// reads it.
+    fn told_turn(&self, store: &MemoryStore) -> (MutexGuard<'_, ()>, Told) {
+        let turn = self.turn.lock();
         let told = store.told();
         (turn, told)
     }
@@ -205,7 +205,7 @@ mod tests {
     use smg_worker::{registry::WorkerRegistry, worker::WorkerStatus as ObjectStatus};
 
     use super::{
-        super::write::tests::{facts, Replica, A},
+        super::write::tests::{facts, lay_standing, Replica, A},
         *,
     };
     use crate::{
@@ -250,11 +250,12 @@ mod tests {
     }
 
     /// No read starts with a read of the store. A row a writer outside the
-    /// holder left in the table is in no read until its host has the holder
-    /// follow the store, and in each read behind that: by id, by key, among
+    /// holder left in the table is in no read until the holder lays it,
+    /// here behind a refused write of its key.
+    /// It is in each read behind that: by id, by key, among
     /// its engine's rows, in a first copy and in a lone read.
     #[test]
-    fn a_row_written_around_the_holder_is_read_once_its_host_follows() {
+    fn a_row_written_around_the_holder_is_read_once_the_holder_lays_it() {
         type Read = fn(&Replica) -> Option<WorkerRow>;
         let reads: [(&str, Read); 5] = [
             ("a first copy", |replica| {
@@ -275,8 +276,9 @@ mod tests {
                 .store
                 .upsert_by(facts(1, "gold"), Registrant::Control);
             assert_eq!(read(&replica), None, "{name}: no object, so no row");
-            // The host's own follow, as a host that writes its store calls it.
-            replica.objects.follow(&replica.store);
+            // The key's next write through the holder is refused, and its
+            // read lays the row.
+            lay_standing(&replica.objects, &replica.store);
             let row = read(&replica);
             assert!(row.is_some(), "{name}");
             assert_eq!(row, replica.store.by_key(A), "{name}");
