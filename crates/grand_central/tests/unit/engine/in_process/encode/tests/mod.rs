@@ -360,6 +360,7 @@ impl Host {
                     placed,
                     |_| true,
                     noted,
+                    Some(SessionCountedUnder::default),
                 )
             }
         };
@@ -2422,6 +2423,194 @@ impl RequestMaker for Asks<'_> {
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads
     }
+}
+
+/// [`Asks`] under a session key, of a host that counts the key's requests
+/// on a worker's object under the name it states.
+struct Keyed<'a>(Asks<'a>, SessionCountedUnder);
+
+/// The key of [`Keyed`]'s request, in the clear.
+const TALK: &str = "talk-1";
+
+impl RequestMaker for Keyed<'_> {
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+
+    fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+        let mut request = self.0.make(spec);
+        request.facts.session_key = Identity::plain(TALK);
+        request
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        self.0.workers()
+    }
+
+    fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+        self.0.loads()
+    }
+
+    fn session_counted_under(&self) -> SessionCountedUnder {
+        self.1
+    }
+}
+
+/// The count of its key's requests each row carried into a stage, with the
+/// phase the stage decided for.
+type Counts = Arc<Mutex<Vec<(Phase, u16)>>>;
+
+/// A filter of a host's own build that keeps every row and notes the count
+/// of the request's key it carries.
+#[derive(Debug)]
+struct ReadsCounts(Counts);
+
+impl Filter for ReadsCounts {
+    fn name(&self) -> &'static str {
+        "reads-counts"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+        self.0.lock().push((facts.phase, row.session_in_flight));
+        true
+    }
+}
+
+/// Under a capped sessions rule each side of an encode request's pair reads
+/// the count of its key's requests on a worker's object under the name the
+/// request's maker states for that side's session, as a pair's own decision
+/// does. A maker that says nothing is of a host whose own guard counts: the
+/// key's text names both sides. A maker of a host that counts by the
+/// decisions it holds says the session's number, and each side keeps a
+/// session of its own. An encoder's row carries no count under any of those
+/// names: an item goes by its content, whatever the request's key.
+///
+/// The entry of a host that files a pick's lease itself names no count
+/// ([`Loaded::decide_encode_without_lease`]): a controller refuses a rule
+/// under `epd`, and each row of its encode request carries none, as it did.
+///
+/// The classic gateway's sticky map reads the count for the role it pins,
+/// under the key's own text, and never for an encoder
+/// (`model_gateway/src/policies/registry.rs:796`, `:810`; an item's policy
+/// is asked directly,
+/// `model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2780`).
+/// The lines are main's at `9b72a221d`.
+#[test]
+fn an_encode_requests_sides_read_their_keys_count_and_its_encoders_none() {
+    let counts = Counts::default();
+    let kept = Arc::clone(&counts);
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .filter("reads-counts", move || {
+            Box::new(ReadsCounts(Arc::clone(&kept)))
+        })
+        .expect("a free filter name");
+    let mut document = stock();
+    for profile in document.profiles.values_mut() {
+        profile.filter.push("reads-counts".into());
+    }
+    let ruled = PolicySpec::preset("manual").expect("a built-in preset");
+    let mut rule = ruled.bindings[0].sessions.clone();
+    rule.as_mut().expect("the stock rule").inflight_cap = 2;
+    document.bindings[0].sessions = rule;
+    document.view.headers.push("x-smg-routing-key".to_owned());
+    let spec = || {
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        spec.expect("a rule under the three-sided plan")
+    };
+
+    // The name of each side's session under each word of a maker.
+    let name = |word: SessionCountedUnder, phase| {
+        let facts = RequestFacts {
+            session_key: Identity::plain(TALK),
+            model: "model-a",
+            phase,
+            ..RequestFacts::default()
+        };
+        let mut digits = [0; Session::TEXT_LEN];
+        let name = word.name(&facts, &mut digits);
+        name.expect("a keyed request has a name").to_owned()
+    };
+    let by_number = SessionCountedUnder::SessionNumber;
+    let numbers = [Phase::Prefill, Phase::Decode].map(|side| name(by_number, side));
+    assert_ne!(numbers[0], numbers[1], "each side keeps its own session");
+    assert_eq!(name(SessionCountedUnder::KeyText, Phase::Decode), TALK);
+
+    let said = (&[of(1), of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let items = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    // The first prefill holds two requests under the first name of `held`
+    // and the first decode two under the second. The first encoder holds
+    // two under each of them and under the key's own text. What each
+    // side's stage then read on its rows, the largest. `leased` names the
+    // entry: the one that issues the pick's lease, or the one of a host
+    // that files it itself.
+    let read = |word: SessionCountedUnder, held: [&str; 2], leased: bool| {
+        let host = Host::under(spec(), 2, 2, 2);
+        let counted = |list: usize, name: &str| {
+            for _ in 0..2 {
+                host.worker(list, 0).increment_routing_key_load(name);
+            }
+        };
+        counted(0, held[0]);
+        counted(1, held[1]);
+        for name in [held[0], held[1], TALK] {
+            counted(2, name);
+        }
+        let asks = Keyed(host.asks(said), word);
+        let mut placed = EncodePlaced::new();
+        let now = Instant::now();
+        counts.lock().clear();
+        let picked = if leased {
+            let decided = (host.engine).decide_encode_at(&asks, items, &mut placed, || now);
+            decided.expect("a decision").0.decision.pick().is_some()
+        } else {
+            let decided = (host.engine).decide_encode_without_lease(&asks, items, &mut placed, now);
+            decided.expect("a decision").pick().is_some()
+        };
+        assert!(picked, "{word:?}, leased {leased}");
+        let most = |phase: Phase| {
+            let seen = counts.lock();
+            let of_phase = seen.iter().filter(|row| row.0 == phase).map(|row| row.1);
+            of_phase.max()
+        };
+        [Phase::Prefill, Phase::Decode, Phase::Encode].map(most)
+    };
+    let (text, number) = (SessionCountedUnder::KeyText, by_number);
+    let [prefill, decode] = [numbers[0].as_str(), numbers[1].as_str()];
+    let both = [Some(2), Some(2), Some(0)];
+    assert_eq!(read(text, [TALK; 2], true), both, "a guard's count");
+    assert_eq!(
+        read(number, [prefill, decode], true),
+        both,
+        "the held decisions'"
+    );
+    let neither = [Some(0), Some(0), Some(0)];
+    assert_eq!(
+        read(text, [prefill, decode], true),
+        neither,
+        "no count of a guard's"
+    );
+    assert_eq!(
+        read(number, [TALK; 2], true),
+        neither,
+        "no held decision's count"
+    );
+    // Each side under its own session's number: the other side's is no
+    // count of its key.
+    assert_eq!(read(number, [decode, prefill], true), neither, "crossed");
+    // The entry of a host that files a pick's lease itself names no count:
+    // its rows carry none under either word, whatever is counted there.
+    assert_eq!(read(text, [TALK; 2], false), neither, "unleased, a guard's");
+    assert_eq!(
+        read(number, [prefill, decode], false),
+        neither,
+        "unleased, the held decisions'"
+    );
 }
 
 /// The side of each issue a stage heard.

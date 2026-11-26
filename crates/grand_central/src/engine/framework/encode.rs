@@ -51,11 +51,12 @@ use super::{
 };
 use crate::{
     engine::{
-        decision::{Decision, ShedReason, Target, Targets, Trace, PLACES, TARGET_WORKER},
+        decision::{Decision, Pick, ShedReason, Target, Trace, PLACES, TARGET_WORKER},
         demands::{DemandFacts, Demands, References, UnmetDemand},
+        sticky_sessions::SessionVerdict,
         view::{
             AffinityFacts, Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts,
-            WireModes,
+            WireModes, WorkerId,
         },
     },
     load::signals::{SignalCell, SignalCells},
@@ -795,6 +796,15 @@ impl Engine {
     /// row admitted the pools are handed on as they are. A shed of the pair
     /// is returned as the pair gave it.
     ///
+    /// Under the binding's sessions rule each side of the pair is decided
+    /// by its own session, as the pair entry decides it. The pick states
+    /// each side's word of who placed it beside a list this side numbered
+    /// anew as beside the host's own. Where an item's answer turns the
+    /// request away behind its pair, the claims that pair's decision made
+    /// for the request's key are taken back, each side's under its own
+    /// session: the key's next request is placed again. A pin the decision
+    /// followed stands, and so does one it moved at the rule's cap.
+    ///
     /// An encoder takes a request on a wire its host states
     /// ([`Constraints::wire_modes`] of `encode_cx`): one dialed on none of
     /// them is left out, as one that takes none of the media is, and a
@@ -1346,18 +1356,16 @@ impl Engine {
             return pair;
         };
         if !every_prefill || !every_decode {
-            let mut targets = Targets::new();
-            for target in pick.targets.iter() {
-                let mut target = *target;
-                if !every_prefill {
-                    target.position = side.prefills.origin(target.position);
-                }
-                if let Some(decode) = target.pair.as_mut().filter(|_| !every_decode) {
-                    decode.decode_position = side.decodes.origin(decode.decode_position);
-                }
-                targets.push(target);
-            }
-            pick.targets = targets;
+            // The pick names the rows this pass numbered. It is handed back
+            // by the host's rows where it stands, each side that was cut
+            // by where its rows stood, so the list keeps the prefill
+            // side's word of who placed it: a sessions rule's pick stays
+            // the rule's, told or untold, beside a pool that was cut.
+            let (prefills, decodes) = (&side.prefills, &side.decodes);
+            pick.targets.renumber(
+                (!every_prefill).then_some(|at| prefills.origin(at)),
+                (!every_decode).then_some(|at| decodes.origin(at)),
+            );
         }
         if !needs {
             return pair;
@@ -1449,21 +1457,67 @@ impl Engine {
                 encode_cx,
                 &mut side.run,
             );
-            match of_key {
-                // A key's pick is read where its decision stands.
-                Decision::Pick(ref of_key) => {
-                    let Some(target) = of_key.targets.first() else {
-                        return gap(ENCODERS);
-                    };
-                    placed.encoders.push(Target {
-                        position: side.offered.origin(target.position),
-                        pair: None,
-                        ..*target
-                    });
-                }
-                Decision::Shed(_) | Decision::Queue(_) => return of_key,
-            }
+            // A key's pick is read where its decision stands.
+            let target = match &of_key {
+                Decision::Pick(of_key) => of_key.targets.first(),
+                Decision::Shed(_) | Decision::Queue(_) => None,
+            };
+            let Some(target) = target else {
+                // The item's answer is the request's, and the pair goes
+                // with it: the claims its two sides made go too, at the
+                // one place this pass turns a request away behind its
+                // pair. The pair routine's own queue is its decode side's
+                // and keeps the prefill's claim for the pair it waits on
+                // ([`Self::decide_pair`]). An item's queue names no pair
+                // to wait on, so its claims are taken back as at a shed.
+                self.withdraw(facts, pick);
+                return match of_key {
+                    Decision::Pick(_) => gap(ENCODERS),
+                    answered => answered,
+                };
+            };
+            placed.encoders.push(Target {
+                position: side.offered.origin(target.position),
+                pair: None,
+                ..*target
+            });
         }
         pair
+    }
+
+    /// Takes back the claims a pair's pick made for the request's key, each
+    /// side's under that side's own session. The pick is this pass's own
+    /// ([`Self::decide_pair`]) and the pass returns without it, so the
+    /// request goes to no worker of it. A claim is a pin ahead of its
+    /// dispatch: left standing, it would lead the key's next requests to a
+    /// pair this request never reached. The table takes back a claim this
+    /// decision made where it still stands unconfirmed, as the pair's
+    /// decision takes back its prefill side's where no prefill pairs. A
+    /// verdict that is no claim writes nothing: a pin the decision
+    /// followed stands, and so does one it moved at the rule's cap. The
+    /// key's next request is then placed again.
+    ///
+    /// The table knows a claim of this decision by the request's instant:
+    /// both sides claimed under it, each side's facts being the request's
+    /// with the side's phase. A later decision's claim on the same worker
+    /// is dated later and stands.
+    ///
+    /// Cold and out of line: an item's answer that turns its request away
+    /// is the rare end of a key's run, and the keys' loop holds one call.
+    #[cold]
+    #[inline(never)]
+    fn withdraw(&self, facts: &RequestFacts<'_>, pick: &Pick) {
+        let session = |phase| RequestFacts { phase, ..*facts }.session();
+        let at = facts.now_micros;
+        if let SessionVerdict::Claimed(claimed) = pick.session_verdict {
+            self.sessions
+                .move_claim(session(Phase::Prefill), claimed, WorkerId(0), at);
+        }
+        let decode = pick.targets.first().and_then(|target| target.pair);
+        let decode = decode.map(|pair| pair.decode_verdict.on(pair.decode_id));
+        if let Some(SessionVerdict::Claimed(claimed)) = decode {
+            self.sessions
+                .move_claim(session(Phase::Decode), claimed, WorkerId(0), at);
+        }
     }
 }

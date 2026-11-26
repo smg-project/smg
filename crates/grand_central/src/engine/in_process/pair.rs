@@ -499,19 +499,12 @@ impl<'a> PairLists<'a> {
         // is counted under, as the request's maker states it. One text
         // names both sides where the key's own text is the name, and a
         // session's number is each side's own. Named under a document that
-        // reads the count and under no other.
+        // reads the count and under no other, by the one function that
+        // names an encode request's sides too.
         let mut names;
         let [prefill_key, decode_key] = if spec.engine().needs().session_in_flight {
             names = [[0; Session::TEXT_LEN]; 2];
-            let (counted, [prefill, decode]) = (counted(), &mut names);
-            let side = |phase| RequestFacts {
-                phase,
-                ..request.facts
-            };
-            [
-                counted.name(&side(Phase::Prefill), prefill),
-                counted.name(&side(Phase::Decode), decode),
-            ]
+            counted().sides(&request.facts, &mut names)
         } else {
             [None; 2]
         };

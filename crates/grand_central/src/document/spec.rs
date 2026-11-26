@@ -5174,6 +5174,14 @@ const UNTOLD_ON_FILE: &str =
 /// file keeps no word of a pair's side.
 /// Under a cap each side's records carry the count of its key's requests
 /// in flight, as a single's do.
+///
+/// Under the `epd` plan the rule runs on the pair's two sides, each by its
+/// own session, and places no item: an item goes to its encoder by its
+/// content. It is in the build of a host that makes the lifecycle's calls,
+/// under either word. The build of a host that makes some only refuses it
+/// by the plan's name, with a cap or with none: the rule is not in that
+/// build at all, and an encode request's frame names no count of a key's
+/// requests on its rows.
 fn session_rule(
     sessions: &SessionsSpec,
     index: usize,
@@ -5186,7 +5194,8 @@ fn session_rule(
             Some(("rule_placed", UNTOLD_ON_FILE))
         }
         Plan::PdPair => None,
-        Plan::Epd { .. } => Some(("plan", "`single` or `pd-pair`")),
+        Plan::Epd { .. } if !lifecycle => Some(("plan", "`single` or `pd-pair`")),
+        Plan::Epd { .. } => None,
     };
     if let Some((name, reason)) = refused {
         return Err(SpecError::BadSessions {

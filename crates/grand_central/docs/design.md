@@ -1669,6 +1669,19 @@ issue are handed the pick ahead of that word. A controller's file keeps one word
 single's, so a controller refuses a document whose rule states `untold` under `pd-pair`, by that
 field's name.
 
+Under the `epd` plan a rule runs on the pair's two sides the same way and places no item. An item
+goes to its encoder by its content, and the encode phase takes none of the rule's needs. A host
+that decides in its own process names each side's count of the key's requests for an encode
+request as for a pair. A controller refuses every rule under `epd` by the plan's name, with a cap
+or with none. The rule is not in that build at all, and an encode frame's rows name no count of a
+key's requests.
+
+An encode request's pick states each side's word as a pair's does, also where the encode pass
+numbered a side's rows anew. An item that is shed, queued or finds no encoder turns the request away
+behind its pair. The encode pass then takes back the claims that pair's decision made for the key,
+each side's under its own session (`Engine::decide_encode_pair` in `engine/framework/encode.rs`).
+The key's next request is placed again. Decision 13 records how classic differs there.
+
 The session table takes no new key once it holds 4,194,304 keys. A request of such a key is
 placed with no pin, until keys leave the table.
 
@@ -3417,7 +3430,7 @@ All seventeen at a glance. An answer can be as short as the numbers with their l
 | 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped; the other worker facts are kept beside the object; recommended: one set of overload thresholds for each worker | stage 4 |
 | 11 | The crate in CI and in the published set | closed inside the crate: the feature `controller` takes the engine's feature; (a) out of the published set until stage 3, and as it went (b): the crate stayed in it | CI's run of the kept engine's tests; stage 0 |
 | 12 | The last report of a worker whose load call fails | (a) the engine alone reads it, about 40 seconds at most at the default poll | rule 6, for the documents whose stages read load reports |
-| 13 | Where a capped sessions rule moves a pair's prefill pin | (a) where the pair forms | rule 6, for a pair under a sessions rule that states a cap |
+| 13 | Where a capped sessions rule moves a pair's prefill pin | (a) where the pair forms | rule 6, for a pair under a sessions rule that states a cap, and for an encode request under a sessions rule |
 | 14 | Round robin's order across deciding threads | recorded, the answer is open: (b) every pick takes one step of the counter | rule 6, for `round_robin` where several threads decide |
 | 15 | The workers a session's first request reads | recorded, the answer is open: (a) the workers its turn asks about | rule 6, for a sessions rule that leaves a new key to round robin |
 | 16 | `least_load`'s count of a request that is never sent | decided 2026-11-24: (a) the engine counts a send at its dispatch | rule 6, for `least_load` where a route refuses a request behind its selection |
@@ -3692,7 +3705,8 @@ it, and classic's reads are as they were.
 
 ### Decision 13: where a capped sessions rule moves a pair's prefill pin
 
-*Needed for:* rule 6 (section 1), for a pair under a sessions rule that states a cap.
+*Needed for:* rule 6 (section 1), for a pair under a sessions rule that states a cap, and for an
+encode request under a sessions rule.
 
 A key whose pin is at its rule's cap is placed again, and the pin moves where the request lands on
 another worker under the cap. For a single request and for a pair's decode side, classic and the
@@ -3711,16 +3725,29 @@ no pair moves none.
 So behind a pair that fails past its prefill's selection, the key's next request finds the pin
 moved under classic and where it stood under the engine.
 
+Under the `epd` plan the same holds one step later, for a rule with a cap or with none. Classic
+assigns a request's encoders behind its pair's selection, and a failed assignment leaves both roles'
+pins where that selection wrote them (`placed_encode_prefill_decode_workers` in
+`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`). The engine's encode pass takes
+back the claims its pair's decision made where an item is shed, queued or finds no encoder
+(`Engine::decide_encode_pair` in `engine/framework/encode.rs`).
+
+A claim is the pin a decision writes for a key that had no pin to follow. So behind an encode
+request that fails past its pair's selection, such a key's next request finds both pins written
+under classic and none under the engine. A pin that was moved at the rule's cap stays moved under
+both.
+
 | Option | Cost |
 |---|---|
-| (a) The engine moves the pin where the pair forms. | Behind a pair that fails past its prefill's selection the engine differs from classic on the key's next request, by this decision. Classic's answers do not move. |
+| (a) The engine moves the pin where the pair forms. | Behind a pair that fails past its prefill's selection, and behind an encode request that fails past its pair's selection, the engine differs from classic on the key's next request, by this decision. Classic's answers do not move. |
 | (b) The engine moves the pin at its prefill side's run, as classic does. | The key's next request finds the pin as classic's does. A prefill that is passed over then holds the pin while the decision runs. A request of the key decided in that time follows it there, and the pin is taken back from under that request or stays on a prefill the pair never formed on. |
 
 **Recommendation: (a).** A pin says where a session's requests went. A move for a pair that never
 formed names a prefill that took none.
 
 **As taken.** (a) is on main: the prefill side's run moves no pin, and the pair's decision moves it
-where the pair forms.
+where the pair forms. Under `epd` the encode pass takes back its pair's claims behind an item that
+turns the request away.
 
 ### Decision 14: round robin's order across deciding threads
 

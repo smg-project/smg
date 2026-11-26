@@ -2995,13 +2995,19 @@ fn a_pairs_sessions_rule_is_in_the_build_of_a_host_that_makes_some_lifecycle_cal
 /// its own word. In the build of a host that makes some only it is
 /// refused by that field's name, and the refusal says why: that host
 /// tells a lease's words off a file, which keeps no word of a pair's
-/// side. A rule under `epd` is refused by the plan's name.
+/// side.
+///
+/// Under `epd` the rule runs on the pair's two sides in the build of a
+/// host that makes the lifecycle's calls, under either word, and a cap
+/// makes the document's engine read a key's count as under a pair. The
+/// build of a host that makes some only refuses the rule by the plan's
+/// name, whatever its word.
 ///
 /// A gateway's sticky map places each role of a pair under that role's
 /// own key, and hands its policy no request it placed
 /// (`model_gateway/src/policies/registry.rs:762-769`, `:794-797`).
 #[test]
-fn a_sessions_rule_runs_under_a_pair_by_its_hosts_calls_and_not_under_epd() {
+fn a_sessions_rule_runs_under_a_pair_and_under_epd_by_its_hosts_calls() {
     let built = |plan: &str, profiles: &str, sessions: &str| {
         spec_with_binding(&format!(
             r#"{{"plan":"{plan}","profiles":{profiles},"sessions":{sessions}}}"#
@@ -3056,19 +3062,56 @@ fn a_sessions_rule_runs_under_a_pair_by_its_hosts_calls_and_not_under_epd() {
         assert_eq!(single.validate_in(&some, &[]).err(), None, "{rule}");
     }
     let epd = r#"{"encode":"q","prefill":"q","decode":"q"}"#;
-    let refused = under("epd", epd, uncapped);
-    assert_eq!(
-        refused,
-        Some(SpecError::BadSessions {
-            index: 0,
-            name: "plan",
-            reason: "`single` or `pd-pair`",
-        })
-    );
-    assert_eq!(
-        refused.map(|err| err.to_string()),
-        Some("binding 0: sessions plan is not `single` or `pd-pair`".to_string())
-    );
+    let capped = r#"{"sticky_header":"x-session-id"}"#;
+    for rule in [uncapped, untold, capped] {
+        assert_eq!(under("epd", epd, rule), None, "{rule}");
+        let refused = spec_with_binding(&format!(
+            r#"{{"plan":"epd","profiles":{epd},"sessions":{rule}}}"#
+        ))
+        .validate_in(&some, &[])
+        .err();
+        assert_eq!(
+            refused,
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "plan",
+                reason: "`single` or `pd-pair`",
+            }),
+            "{rule}"
+        );
+        assert_eq!(
+            refused.map(|err| err.to_string()),
+            Some("binding 0: sessions plan is not `single` or `pd-pair`".to_string()),
+            "{rule}"
+        );
+    }
+    let counts =
+        |sessions: &str| built("epd", epd, sessions).map(|built| built.needs().session_in_flight);
+    assert_eq!((counts(uncapped), counts(capped)), (Ok(false), Ok(true)));
+    // The rule's needs are the pair's two sides': the encode phase
+    // takes none of them, by any of the engine's three answers.
+    let ruled = built("epd", epd, capped).expect("a rule under epd");
+    let bare = spec_with_binding(&format!(r#"{{"plan":"epd","profiles":{epd}}}"#))
+        .validate()
+        .expect("the plan alone");
+    for side in [Phase::Prefill, Phase::Decode] {
+        assert!(ruled.needs_for_phase(side).session_in_flight, "{side:?}");
+        assert!(!bare.needs_for_phase(side).session_in_flight, "{side:?}");
+    }
+    let of_encode = |engine: &Engine| {
+        let rows: Vec<Needs> = engine
+            .needs_rows()
+            .into_iter()
+            .filter(|row| row.1 == Phase::Encode)
+            .map(|row| row.2)
+            .collect();
+        (
+            engine.needs_for_phase(Phase::Encode),
+            engine.reads_for("m", Phase::Encode),
+            rows,
+        )
+    };
+    assert_eq!(of_encode(&ruled), of_encode(&bare));
 }
 
 #[test]

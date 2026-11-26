@@ -24,8 +24,8 @@ use std::{
 use http::{HeaderMap, HeaderValue};
 use smg_grand_central::{
     document::{
-        AppliedSpec, DecodePick, LoadMetricSetting, ModeSettings, PolicySettings, RoutingSettings,
-        ScoreSpec,
+        AppliedSpec, Assignment, DecodePick, LoadMetricSetting, ModeSettings, PolicySettings,
+        PolicySpec, RoutingSettings, ScoreSpec,
     },
     engine::{Identity, ShedReason, Unplaced},
     stages::StageRegistry,
@@ -135,6 +135,150 @@ fn a_request_with_no_item_is_placed_as_its_pair() {
             "over {encoders} encoders"
         );
     }
+}
+
+/// The header a keyed request of the cases below states its key under.
+const KEY_HEADER: &str = "x-smg-routing-key";
+
+/// The headers of a request that states `key`.
+fn keyed(key: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let value = HeaderValue::from_str(key).expect("a header's value");
+    headers.insert(KEY_HEADER, value);
+    headers
+}
+
+/// A document of three sides whose binding keeps a sessions rule: the
+/// encode side places an item on the plain ring, and the rule pins a key
+/// by its header and hands the key on where `cap` of its requests run on
+/// the pinned worker. Each side of the pair takes its workers in turn, or,
+/// with `fewest`, the worker that holds the fewest requests. The rule is
+/// the stock `manual` preset's, and the view lists the key's header.
+fn pinned(cap: u16, fewest: bool) -> AppliedSpec {
+    let sides = if fewest {
+        "power_of_two"
+    } else {
+        "round_robin"
+    };
+    let document = PolicySpec::epd_presets("consistent_hashing", sides, sides);
+    let mut document = document.expect("the presets");
+    if fewest {
+        for side in ["prefill", "decode"] {
+            let profile = document.profiles.get_mut(side).expect("the side's profile");
+            profile.pick = "count-first".into();
+        }
+    }
+    let stock = PolicySpec::preset("manual").expect("a built-in preset");
+    let mut rule = stock.bindings[0].sessions.clone();
+    let ruled = rule.as_mut().expect("the stock rule");
+    (ruled.inflight_cap, ruled.assignment) = (cap, Assignment::MinLoad);
+    document.bindings[0].sessions = rule;
+    document.view.headers.push(KEY_HEADER.to_owned());
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// Under a sessions rule the pair of an encode request is its key's: the
+/// key's requests keep the prefill and the decode its first request took,
+/// with an item and with none, while each side of the pair would else take
+/// its workers in turn. A request with no key takes those turns.
+///
+/// The classic gateway's sticky map pins a key within its model and its
+/// role, prefill or decode, and its three-sided selection places the pair
+/// through that same call, with items and without
+/// (`model_gateway/src/policies/registry.rs:783`, `:801-806`,
+/// `model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2532`).
+/// The lines are main's at `9b72a221d`.
+#[test]
+fn a_key_keeps_its_pair_with_an_item_and_with_none() {
+    let fleet = fleet(3, 3, 2);
+    let spec = pinned(u16::MAX, false);
+    let (program, _loads, _task) = started_as(Plan::Encode, spec, &fleet, served);
+    let headers = keyed("session-7");
+    let keys = [Identity::plain("item-a")];
+    let with_item = Asked {
+        headers: Some(&headers),
+        ..carrying(&keys)
+    };
+    let bare = Asked {
+        headers: Some(&headers),
+        ..PLAIN
+    };
+    let first = program.serve(&with_item);
+    assert_eq!((first.status, first.sent.len()), (200, 3), "{first:?}");
+    let pair = &first.sent[1..];
+    for _ in 0..4 {
+        assert_eq!(&program.serve(&with_item).sent[1..], pair, "with an item");
+        assert_eq!(program.serve(&bare).sent, pair, "with no item");
+    }
+    let turns: BTreeSet<Vec<String>> = (0..6).map(|_| program.serve(&PLAIN).sent).collect();
+    assert!(turns.len() > 1, "a request with no key takes its turn");
+}
+
+/// Under a cap of two the third request of a key leaves the pinned worker:
+/// with two of the key's requests running on its prefill, the key's next
+/// request takes another prefill, and its decode, which runs none, stays.
+/// Each side takes the worker that holds the fewest requests, so the
+/// request handed on never lands on the pinned prefill again.
+///
+/// The classic gateway's sticky map hands a key on where two of its
+/// requests run on the pinned worker, counted under the key's own text
+/// (`model_gateway/src/policies/registry.rs:394`, `:810`).
+#[test]
+fn the_third_request_of_a_key_leaves_its_pinned_prefill_under_a_cap_of_two() {
+    const KEY: &str = "session-7";
+    let fleet = fleet(3, 3, 2);
+    let (program, _loads, _task) = started_as(Plan::Encode, pinned(2, true), &fleet, served);
+    let headers = keyed(KEY);
+    let keys = [Identity::plain("item-a")];
+    let asked = Asked {
+        headers: Some(&headers),
+        ..carrying(&keys)
+    };
+    let first = program.serve(&asked);
+    assert_eq!((first.status, first.sent.len()), (200, 3), "{first:?}");
+    assert_eq!(program.serve(&asked).sent, first.sent, "under the cap");
+    let held = fleet.iter().find(|worker| worker.url() == first.sent[1]);
+    let held = held.expect("the key's prefill");
+    for _ in 0..2 {
+        held.increment_load();
+        held.increment_routing_key_load(KEY);
+    }
+    let third = program.serve(&asked);
+    assert_eq!((third.status, third.sent.len()), (200, 3), "{third:?}");
+    assert_ne!(third.sent[1], first.sent[1], "another prefill");
+    assert_eq!(third.sent[2], first.sent[2], "the key's decode");
+}
+
+/// An item goes by its content whatever the request's key: one content
+/// keeps one encoder under each key and under none, and the contents of
+/// one key spread over the encoders.
+///
+/// The classic gateway asks the encode policy for an item under the hash
+/// of its content alone, and its sticky map never sees an item
+/// (`assign_encode_workers`, `worker_selection.rs:2780-2796`, `:2823-2829`).
+/// The lines are main's at `9b72a221d`.
+#[test]
+fn an_item_goes_by_its_content_whatever_the_requests_key() {
+    let fleet = fleet(2, 2, 3);
+    let (program, _loads, _task) = started_as(Plan::Encode, pinned(2, false), &fleet, served);
+    let encoder_of = |headers: Option<&HeaderMap>, content: &str| {
+        let keys = [Identity::plain(content)];
+        let answer = program.serve(&Asked {
+            headers,
+            ..carrying(&keys)
+        });
+        assert_eq!((answer.status, answer.sent.len()), (200, 3), "{answer:?}");
+        answer.sent[0].clone()
+    };
+    let kept = encoder_of(None, "item-a");
+    for key in ["session-7", "session-8", "session-9"] {
+        assert_eq!(encoder_of(Some(&keyed(key)), "item-a"), kept, "{key}");
+    }
+    let session = keyed("session-7");
+    let spread: BTreeSet<String> = (0..16)
+        .map(|content| encoder_of(Some(&session), &format!("content-{content}")))
+        .collect();
+    assert!(spread.len() > 1, "sixteen contents on one encoder");
 }
 
 /// A gateway of many routers mounts its three-sided router in every mode,
