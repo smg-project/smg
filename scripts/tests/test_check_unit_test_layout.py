@@ -4,6 +4,7 @@ Each case builds a small package in a scratch folder and asks the check for its
 faults. The last cases hold the repository's own tree and the hook's entry.
 """
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -43,6 +44,15 @@ VIEW = {
 
 def test_a_pointer_at_the_rules_place_passes(tmp_path):
     assert faults(tmp_path, VIEW) == []
+
+
+def test_a_folder_named_like_a_source_file_is_no_source_file(tmp_path):
+    files = dict(VIEW)
+    files["src/shape.rs/note.txt"] = ""
+    files["tests/unit/view/tests.rs/note.txt"] = ""
+    del files["tests/unit/view/tests.rs"]
+    files["src/view.rs"] = "pub fn width() -> usize {\n    4\n}\n"
+    assert faults(tmp_path, files) == []
 
 
 def test_a_package_without_the_unit_folder_is_not_bound(tmp_path):
@@ -315,23 +325,55 @@ def test_a_main_file_under_the_unit_folder_is_a_test_program_of_its_own(tmp_path
     files = dict(VIEW)
     files["tests/unit/main.rs"] = ""
     found = faults(tmp_path, files)
-    assert "tests/unit/main.rs: cargo reads this file as a test program of its own" in found, found
+    assert found == ["tests/unit/main.rs: cargo reads this file as a test program of its own"]
 
 
 def test_the_script_prints_each_fault_and_ends_with_one(tmp_path, capsys):
     files = dict(VIEW)
     files["tests/unit/lost.rs"] = ""
+    files["tests/unit/lost_too.rs"] = ""
     faults(tmp_path, files)
     assert layout.main([str(tmp_path)]) == 1
     out = capsys.readouterr().out.splitlines()
     assert out[0].startswith("pkg/tests/unit/lost.rs: no pointer under src"), out
-    assert out[-1].startswith("1 fault of the unit-test layout"), out
+    assert out[1].startswith("pkg/tests/unit/lost_too.rs: no pointer under src"), out
+    assert out[2].startswith("2 faults of the unit-test layout") and len(out) == 3, out
+    (tmp_path / "pkg" / "tests" / "unit" / "lost_too.rs").unlink()
+    assert layout.main([str(tmp_path)]) == 1
+    assert capsys.readouterr().out.splitlines()[-1].startswith("1 fault of the unit-test layout")
     (tmp_path / "pkg" / "tests" / "unit" / "lost.rs").unlink()
     assert layout.main([str(tmp_path)]) == 0
     assert capsys.readouterr().out == ""
 
 
+def test_the_script_with_no_argument_reads_the_folder_that_holds_its_folder(tmp_path):
+    # The hook hands the script no argument.
+    files = dict(VIEW)
+    files["tests/unit/lost.rs"] = ""
+    faults(tmp_path, files)
+    copy = tmp_path / "scripts" / "check_unit_test_layout.py"
+    copy.parent.mkdir()
+    copy.write_text(Path(layout.__file__).read_text())
+    run = subprocess.run(
+        [sys.executable, str(copy)],
+        cwd=tmp_path.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 1, run
+    assert run.stdout.startswith("pkg/tests/unit/lost.rs: no pointer under src"), run.stdout
+
+
 def test_the_repositorys_own_tree_holds_the_layout():
+    # A walk that binds no package finds no fault either: the package that
+    # holds the rule today is bound.
+    bound = [
+        package
+        for package in layout.packages(ROOT)
+        if (package / layout.UNIT).is_dir() and (package / "src").is_dir()
+    ]
+    assert ROOT / "crates" / "grand_central" in bound, bound
     assert layout.check(ROOT) == []
 
 

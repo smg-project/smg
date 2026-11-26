@@ -332,6 +332,8 @@ def check_package(package, label):
     shared = None
     pointers = []
     for path in sorted((package / "src").rglob("*.rs")):
+        if not path.is_file():
+            continue
         rel = path.relative_to(package).as_posix()
         if rel not in sources:
             sources[rel] = Source(path.read_text(encoding="utf-8"))
@@ -406,10 +408,12 @@ def check_package(package, label):
             )
     named = loaded(package, pointers, sources)
     for path in sorted((package / UNIT).rglob("*.rs")):
+        if not path.is_file():
+            continue
         rel = path.relative_to(package).as_posix()
         if rel == f"{UNIT}/main.rs":
             faults.append(f"{label}/{rel}: cargo reads this file as a test program of its own")
-        if rel not in named:
+        elif rel not in named:
             faults.append(
                 f"{label}/{rel}: no pointer under src and no module of a named file names it: "
                 "its cases run nowhere"

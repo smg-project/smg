@@ -82,7 +82,7 @@ repos:
 
       - id: unit-test-layout
         name: Unit tests under tests/unit
-        description: In a package that holds a tests/unit folder, no unit test stands under src and a pointer names each file under tests/unit
+        description: In a package that holds a tests/unit folder, no unit test stands under src and each file under tests/unit is named by a pointer or by a module of a named file
         entry: python3 scripts/check_unit_test_layout.py
         language: system
         types: [rust]
