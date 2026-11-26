@@ -2,11 +2,12 @@
 //!
 //! The program keeps a hash ring of a model's workers for each generation
 //! ([`Ring`]) and lends it with every request. Under `consistent_hashing` a
-//! request's routing key then goes to the worker that ring's walk reaches
-//! from where the key stands. Each case reads the ring the program holds.
-//! All but two expect the sends its walk says: one holds the ring's two
-//! walks to one order, and one holds the ring to the order of its workers'
-//! places.
+//! request's routing key then goes to the worker that ring's walk reaches from
+//! where the key stands.
+//!
+//! Each case reads the ring the program holds. All but two expect the sends
+//! its walk says. One holds the ring's two walks to one order, and one holds
+//! the ring to the order of its workers' places.
 //!
 //! [`Ring`]: crate::ring::Ring
 
@@ -58,18 +59,16 @@ fn served_under(program: &Program, key: &str) -> Answer {
 
 /// Under `consistent_hashing` a routing key goes to the worker the program's
 /// ring puts it on: the first worker of the ring's walk from where the key
-/// stands. Sixteen keys over four workers each go there, every time, and
-/// they reach every worker: keys that differ in their last letters alone
-/// stand far apart on this ring.
+/// stands. Sixteen keys over four workers each go there, every time. They
+/// reach every worker: keys that differ in their last letters alone stand far
+/// apart on this ring.
 ///
-/// The gateway lends the ring its own ring policy walks
-/// (`impl LentRing for HashRing`,
-/// `model_gateway/src/policies/hash_ring.rs:343-359`), read for each request
-/// whose phases the document places by a ring (`ModelRing`,
-/// `model_gateway/src/routers/common/placement.rs:1143-1241`), so a key
-/// keeps the worker that policy sends it to: its case
-/// `the_engine_places_a_keyed_request_where_the_classic_ring_does`
-/// (`:8259-8288`).
+/// The gateway lends the ring its own ring policy walks:
+/// `impl LentRing for HashRing` (`model_gateway/src/policies/hash_ring.rs`).
+/// The ring is read for each request whose phases the document places by a
+/// ring: `ModelRing` (`model_gateway/src/routers/common/placement.rs`). So a
+/// key keeps the worker that policy sends it to. Its case there is
+/// `the_engine_places_a_keyed_request_where_the_classic_ring_does`.
 #[test]
 fn a_routing_key_goes_to_the_worker_the_programs_ring_puts_it_on() {
     let fleet = workers(4);
@@ -87,13 +86,14 @@ fn a_routing_key_goes_to_the_worker_the_programs_ring_puts_it_on() {
 }
 
 /// The ring is in the order of its workers' places, whatever order the
-/// registry holds them in. The walk from where a worker's own address
-/// stands starts at that worker, for each of four workers, and two programs
-/// whose workers joined in opposite orders walk every key alike.
+/// registry holds them in. The walk from where a worker's own address stands
+/// starts at that worker, for each of four workers. Two programs whose workers
+/// joined in opposite orders walk every key alike.
 ///
-/// The gateway's ring is ordered by its entries' places and walked from
-/// the first entry at a position or past it
-/// (`model_gateway/src/policies/hash_ring.rs:134`, `:297`).
+/// The gateway's ring is ordered by its entries' places: `HashRing::new` sorts
+/// them. It is walked from the first entry at a position or past it: the
+/// `partition_point` of `HashRing::walk_from`
+/// (`model_gateway/src/policies/hash_ring.rs`).
 #[test]
 fn a_ring_is_in_the_order_of_its_workers_places() {
     let fleet = workers(4);
@@ -111,12 +111,12 @@ fn a_ring_is_in_the_order_of_its_workers_places() {
 }
 
 /// A worker that leaves hands its keys to the next worker of the ring, and
-/// every other key stays where it was: the next generation's ring is the
-/// old one without the worker.
+/// every other key stays where it was. The next generation's ring is the old
+/// one without the worker.
 ///
-/// The gateway's ring is one of a generation too: a request is lent the ring
-/// of the generation its list is read from (`ModelRing::of`,
-/// `model_gateway/src/routers/common/placement.rs:1194-1208`).
+/// The gateway's ring is one of a generation too. A request is lent the ring
+/// of the generation its list is read from: `ModelRing::of`
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_worker_that_leaves_hands_its_keys_to_the_next_on_the_ring() {
     let fleet = workers(4);
@@ -145,11 +145,11 @@ fn a_worker_that_leaves_hands_its_keys_to_the_next_on_the_ring() {
 /// A retry walks on from the worker it tried: a key whose worker answers a
 /// server error is asked again at the next worker of the ring's walk.
 ///
-/// The gateway's ring policy falls through so, and the engine behind the
-/// lent ring with it: its cases
-/// `a_retry_under_consistent_hashing_falls_through_to_the_next_ring_node`
-/// and `the_engine_places_a_keyed_request_where_the_classic_ring_does`
-/// (`model_gateway/src/routers/common/placement.rs:5503-5565`, `:8259-8288`).
+/// The gateway's ring policy falls through so, and the engine behind the lent
+/// ring with it. Its cases are
+/// `a_retry_under_consistent_hashing_falls_through_to_the_next_ring_node` and
+/// `the_engine_places_a_keyed_request_where_the_classic_ring_does`
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_retry_walks_on_from_the_worker_it_tried() {
     let fleet = workers(4);
@@ -179,12 +179,13 @@ fn a_retry_walks_on_from_the_worker_it_tried() {
     }
 }
 
-/// The ring's two walks agree: from where each key stands, the ids its walk
-/// by ids hands are the ids of the addresses its walk by address hands, in
-/// that order, each worker once. The engine asks a lent ring the walk by
-/// ids alone, and this ring answers it from the ids it kept, so no request
-/// reads the walk by address: the trait holds the two to one order
-/// (`LentRing::walk_ids`).
+/// The ring's two walks agree. From where each key stands, the ids its walk by
+/// ids hands are the ids of the addresses its walk by address hands, in that
+/// order, each worker once.
+///
+/// The engine asks a lent ring the walk by ids alone, and this ring answers it
+/// from the ids it kept. So no request reads the walk by address: the trait
+/// holds the two to one order (`LentRing::walk_ids`).
 #[test]
 fn the_rings_two_walks_name_the_same_workers() {
     let fleet = workers(4);
@@ -207,16 +208,15 @@ fn the_rings_two_walks_name_the_same_workers() {
     }
 }
 
-/// One ring serves a pair's two lists: the prefill is the first prefill of
-/// the key's walk and the decode the first decode of it. A worker of the
-/// other kind that stands on the way is passed over.
+/// One ring serves a pair's two lists: the prefill is the first prefill of the
+/// key's walk and the decode the first decode of it. A worker of the other
+/// kind that stands on the way is passed over.
 ///
-/// The gateway reads the model's one ring once for a pair and hands it to
-/// both sides' policies
-/// (`model_gateway/src/routers/common/placement.rs:3109-3123`), and lends the
-/// engine that ring: its case
-/// `the_engine_places_a_pair_of_two_ring_words_where_its_classic_policies_do`
-/// (`:8781-8892`).
+/// The gateway reads the model's one ring once for a pair and hands it to both
+/// sides' policies: the `hash_ring` of `pair_pass`
+/// (`model_gateway/src/routers/common/placement.rs`). It lends the engine that
+/// ring: its case there is
+/// `the_engine_places_a_pair_of_two_ring_words_where_its_classic_policies_do`.
 #[test]
 fn a_pairs_two_sides_are_walked_on_the_one_ring() {
     let fleet = pair::fleet(3, 3);
@@ -233,16 +233,16 @@ fn a_pairs_two_sides_are_walked_on_the_one_ring() {
     }
 }
 
-/// A pair sent in turn lends the ring at its second ask too. One prefill
-/// and three decodes under `consistent_hashing`, in a document that picks
-/// the decode behind the prefill: the decode a key's request is sent to is
-/// the first decode of the key's walk, which the second ask takes, and the
-/// sixteen keys spread over the decodes.
+/// A pair sent in turn lends the ring at its second ask too. One prefill and
+/// three decodes stand under `consistent_hashing`, in a document that picks
+/// the decode behind the prefill. The decode a key's request is sent to is the
+/// first decode of the key's walk, which the second ask takes. The sixteen
+/// keys spread over the decodes.
 ///
-/// The gateway states a pair's second ask by the request maker of its
-/// first, which lends the model's ring (`with_pair_request`,
-/// `model_gateway/src/routers/common/placement.rs:2615-2669`, the ring at
-/// `:2665`, the second ask at `:1098-1114`).
+/// The gateway states a pair's second ask by the request maker of its first,
+/// which lends the model's ring: `with_pair_request` sets the request's
+/// `ring`, and `ByEngine::decode_again` calls it
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_decode_asked_again_is_walked_on_the_ring_its_second_ask_lends() {
     let fleet = pair::fleet(1, 3);
@@ -267,8 +267,8 @@ fn a_decode_asked_again_is_walked_on_the_ring_its_second_ask_lends() {
 /// policy reads no ring, and the items are lent one all the same.
 ///
 /// The gateway hands each item's selection the model's ring, with the item's
-/// content hash as its routing key (`assign_encode_workers`,
-/// `model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2791-2811`).
+/// content hash as its routing key: `assign_encode_workers`
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs`).
 #[test]
 fn an_item_goes_to_the_encoder_the_ring_reaches_from_its_text() {
     let encoders = (0..3).map(|at| {
