@@ -1333,7 +1333,7 @@ jobs:
               ("crates/radix_tree/**",                           NONE),
               # the Grand Central crate: linked by no binary yet (its gateway host is
               # a later change, which moves this row to the core)
-              ("crates/grand_central/**",                    NONE),
+              ("crates/grand_central/**",                        NONE),
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
               # parser, read on every lane's chat, messages and responses path
