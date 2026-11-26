@@ -80,6 +80,13 @@ impl KvTables {
             .get(model)
             .map_or(0, |held| held.index.chain.current_size())
     }
+
+    /// Run `body` with the table's lock held, for the adapter's cases: a
+    /// call that takes the lock waits until `body` ends.
+    pub(in crate::worker_host) fn locked<T>(&self, body: impl FnOnce() -> T) -> T {
+        let _table = self.table.lock();
+        body()
+    }
 }
 
 /// A store's rows with the KV tables beside them, as a holder of worker
