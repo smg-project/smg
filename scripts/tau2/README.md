@@ -338,11 +338,14 @@ identities are fatal (exit 2), including sequential `--diff` with
 `--allow-incomplete`; legacy score files cannot invent missing seed provenance.
 
 
-Guarded sequential `--score-arm` writes the failed invocation into its score file
-and returns 0; the subsequent `--diff` command returns 2 for unscored
-infrastructure, guarded-child failures, absent invocation provenance, or missing
-expected-task manifests, including with `--allow-incomplete`. This flag waives
-quality-only incompleteness; it cannot waive safety or result-identity failures.
+Guarded sequential `--score-arm` writes the invocation outcome into its score file.
+Hard budget, process and provenance failures return 2 immediately so the sequential
+parent cannot start the paired arm; quality-only diagnostics may return 0 for the
+subsequent `--diff` decision. Saved comparisons reject malformed domain score
+shapes and return 2 for unscored infrastructure, guarded-child failures, absent
+invocation provenance or missing expected-task manifests, including with
+`--allow-incomplete`. This flag waives quality-only incompleteness; it cannot waive
+safety or result-identity failures.
 Saved comparisons retain the invocation UUID, configured seed, result SHA256,
 and original invocation result file as well as the task/trial manifest. The original
 `results.json` must remain accessible at its recorded `results_path`. Each completed

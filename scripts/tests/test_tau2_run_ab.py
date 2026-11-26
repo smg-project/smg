@@ -2452,3 +2452,128 @@ def test_unified_ablation_of_cli_handoff_rejects_the_parent_oracle(tmp_path):
     child, records = _unified_real_parent(tmp_path, "hard", ablate=True)
     assert child.returncode == 2
     assert records == ["vllm", "smg"]  # removing only handoff gate really launches B
+
+
+def _saved_shape_pair_and_cli(tmp_path, mode="clean", allow_incomplete=True):
+    import os
+
+    arms = []
+    files = []
+    for name in ("vllm", "smg"):
+        rows = _rows(reward=0.0 if mode == "regression" and name == "smg" else 1.0)
+        arm = run_ab.Arm(name, "", scores={"retail": run_ab.domain_scores(rows, 2)})
+        _attach_provenance(tmp_path, arm, rows)
+        arms.append(arm)
+        path = tmp_path / (name + "-saved.json")
+        run_ab.save_scores(arm, path)
+        files.append(path)
+    assert (
+        arms[0].invocations["retail"]["invocation_id"]
+        != arms[1].invocations["retail"]["invocation_id"]
+    )
+    assert run_ab.final_budget(*arms) == {
+        **run_ab.final_budget(*arms),
+        "pending": 0,
+        "unknown": 0,
+        "halted": False,
+    }
+    root = Path(run_ab.__file__).resolve().parents[2]
+    cli = [
+        sys.executable,
+        "-I",
+        "-B",
+        str(Path(run_ab.__file__).resolve()),
+        "--diff-baseline",
+        str(files[0]),
+        "--diff-candidate",
+        str(files[1]),
+        "--domains",
+        "retail",
+        "--num-trials",
+        "2",
+        "--seed",
+        "300",
+        "--expected-tasks",
+        str(_expected_manifest(tmp_path, ["task"])),
+        "--json-out",
+        str(tmp_path / "comparison.json"),
+    ]
+    if allow_incomplete:
+        cli.append("--allow-incomplete")
+    return arms, files, root, cli, os.environ.copy()
+
+
+def _actual_nightly_saved_gate(root, cli, env):
+    import subprocess
+
+    workflow = (root / ".github/workflows/nightly-tau2.yml").read_text()
+    start = workflow.index("          AB_RC=0\n          gate() {")
+    end = workflow.index('          if [ "$ARM_MODE" = sequential ]; then', start)
+    gate = "\n".join(line[10:] for line in workflow[start:end].splitlines())
+    finish = '          [ "$AB_RC" -eq 0 ] || exit "$AB_RC"'
+    assert workflow.count(finish) == 1
+    # Execute the original gate and final status check. No replacement function.
+    script = "set -euo pipefail\n" + gate + '\ngate "$@"\n' + finish[10:] + "\n"
+    return subprocess.run(
+        ["/usr/bin/bash", "-e", "-c", script, "owned-real-nightly-gate", *cli],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("bad", [None, [], 17], ids=["null", "list", "number"])
+@pytest.mark.parametrize("arm_index", [0, 1], ids=["baseline", "candidate"])
+@pytest.mark.parametrize("allow_incomplete", [False, True])
+def test_saved_domain_shape_is_hard_in_actual_cli_and_nightly_gate(
+    tmp_path, bad, arm_index, allow_incomplete
+):
+    import subprocess
+
+    arms, files, root, cli, env = _saved_shape_pair_and_cli(
+        tmp_path, allow_incomplete=allow_incomplete
+    )
+    healthy = run_ab.final_budget(*arms)
+    assert healthy["pending"] == healthy["unknown"] == 0 and healthy["halted"] is False
+    # Prove the complete paired files are accepted before changing only one domain value.
+    control = subprocess.run(
+        cli, cwd=root, env=env, capture_output=True, text=True, timeout=10, check=False
+    )
+    assert control.returncode == 0, control.stderr
+    original = json.loads(files[arm_index].read_text())
+    mutated = dict(original, scores={**original["scores"], "retail": bad})
+    files[arm_index].write_text(json.dumps(mutated))
+    direct = subprocess.run(
+        cli, cwd=root, env=env, capture_output=True, text=True, timeout=10, check=False
+    )
+    parent = _actual_nightly_saved_gate(root, cli, env)
+    assert run_ab.final_budget(*arms) == healthy
+    assert (direct.returncode, parent.returncode) == (2, 2), (
+        direct.returncode,
+        direct.stderr,
+        parent.returncode,
+        parent.stdout,
+        parent.stderr,
+    )
+    assert "invalid saved comparison evidence" in direct.stderr
+    assert "::error::" in parent.stdout and "::warning::" not in parent.stdout
+
+
+@pytest.mark.parametrize("mode,expected", [("clean", 0), ("regression", 1)])
+def test_saved_real_nightly_gate_keeps_clean_and_quality_regression_policy(
+    tmp_path, mode, expected
+):
+    import subprocess
+
+    arms, files, root, cli, env = _saved_shape_pair_and_cli(tmp_path, mode=mode)
+    direct = subprocess.run(
+        cli, cwd=root, env=env, capture_output=True, text=True, timeout=10, check=False
+    )
+    parent = _actual_nightly_saved_gate(root, cli, env)
+    assert direct.returncode == expected, direct.stderr
+    assert parent.returncode == 0, (parent.stdout, parent.stderr)
+    assert ("::warning::" in parent.stdout) is (expected == 1)
+    assert run_ab.final_budget(*arms)["halted"] is False

@@ -974,6 +974,7 @@ def load_scores(path: Path) -> Arm:
         isinstance(data, dict)
         and isinstance(data.get("name"), str)
         and isinstance(data.get("scores"), dict)
+        and all(isinstance(score, dict) for score in data["scores"].values())
         and isinstance(data.get("invocations", {}), dict)
         and isinstance(data.get("timed_out", []), list)
     ):
