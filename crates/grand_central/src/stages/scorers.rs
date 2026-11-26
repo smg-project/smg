@@ -1604,6 +1604,34 @@ impl LeastCost {
         }
     }
 
+    /// Whether a term prices the sends by their tokens: a stage that holds
+    /// such a term asks for each request's size
+    /// ([`Coefficients::sizes_sends`]).
+    fn sizes_sends(&self) -> bool {
+        self.terms.sizes_sends()
+    }
+
+    /// Closes a row's sum by the profile's sends, in name order
+    /// ([`Coefficients::add_sent`]). A pass reads the count first, so it
+    /// holds no sum across that read.
+    #[inline(always)]
+    fn add_sent(&self, sum: &mut f64, sent: DispatchCounts) {
+        self.terms.add_sent(sum, sent);
+    }
+
+    /// The cost of a row that lacks a value a term names: its report, a
+    /// field of it, or a signal's fresh value. Under `over-least` the row
+    /// is left open: `sum` is dropped, and the row's requests in flight
+    /// price it over the least kept sum ([`Self::price_and_score`]). Under
+    /// `missing-as-zero` the term adds nothing and `sum` stands. The count
+    /// is read only where it prices the row.
+    #[inline(always)]
+    fn incomplete(&self, sum: f64, in_flight: impl FnOnce() -> u32) -> RowCost {
+        self.request_cost.map_or(RowCost::Sum(sum), |price| {
+            RowCost::OverLeast(f64::from(in_flight()) * price)
+        })
+    }
+
     /// Prices the rows left open over the least kept sum, then scores the
     /// costs between their ends.
     #[inline(always)]
@@ -1639,11 +1667,7 @@ impl LeastCost {
         in_flight: u32,
     ) -> RowCost {
         let sum = 0.0 + f64::from(in_flight) * self.terms.in_flight;
-        let missing = || {
-            self.request_cost.map_or(RowCost::Sum(sum), |price| {
-                RowCost::OverLeast(f64::from(in_flight) * price)
-            })
-        };
+        let missing = || self.incomplete(sum, || in_flight);
         match load {
             Some(report) => self
                 .terms
@@ -1815,7 +1839,7 @@ impl Scorer for LeastCostWithDispatches {
     fn needs(&self) -> Needs {
         Needs {
             loads: true,
-            prompt_size: self.cost.terms.sizes_sends(),
+            prompt_size: self.cost.sizes_sends(),
             ..Needs::default()
         }
     }
@@ -1848,13 +1872,12 @@ impl ReadsLoad for LeastCostWithDispatches {
             // the walk adds. A row priced over the least kept no sum and
             // takes none. The sends move the ends of the sums, so the ends
             // are taken here and the walk's are dropped.
-            let terms = &self.cost.terms;
             let sends = self.sent.pass(facts);
             let mut bounds = CostBounds::EMPTY;
             for (&row, cost) in kept.iter().zip(costs.iter_mut()) {
                 if let RowCost::Sum(sum) = cost {
                     let sent = sends.counts(&candidates[row as usize]);
-                    terms.add_sent(sum, sent);
+                    self.cost.add_sent(sum, sent);
                     bounds.include(*sum);
                 }
             }
@@ -1914,8 +1937,8 @@ impl Scorer for LeastCostSignals {
     // rows of a profile whose stage says it reads a signal.
     fn needs(&self) -> Needs {
         Needs {
-            loads: self.cost.loads || self.sent.is_some(),
-            prompt_size: self.cost.terms.sizes_sends(),
+            loads: self.cost.needs().loads || self.sent.is_some(),
+            prompt_size: self.cost.sizes_sends(),
             signal_cells: true,
             ..Needs::default()
         }
@@ -1950,7 +1973,6 @@ impl ReadsLoad for LeastCostSignals {
             // over the least kept no sum and takes none. Both move the ends
             // of the sums, so the ends are taken here and the walk's are
             // dropped.
-            let terms = &self.cost.terms;
             let sends = self.sent.as_ref().map(|sent| sent.pass(facts));
             // Once a pass: the facts' cells and each signal's oldest
             // instant still read. Once a row: the row's cells.
@@ -1963,19 +1985,20 @@ impl ReadsLoad for LeastCostSignals {
                 let row = &candidates[i as usize];
                 if let Some(sends) = &sends {
                     let sent = sends.counts(row);
-                    terms.add_sent(sum, sent);
+                    self.cost.add_sent(sum, sent);
                 }
                 let (priced, whole) = signals.add(*sum, signals.row(row));
                 *sum = priced;
-                // A signal with no fresh value leaves the row open under
-                // `over-least`, as no report does in the walk: its sum
-                // is dropped and its requests in flight price it.
-                match self.cost.request_cost.filter(|_| !whole) {
-                    Some(price) => {
-                        *cost = RowCost::OverLeast(f64::from(facts.in_flight(row)) * price);
-                        pending = true;
-                    }
-                    None => bounds.include(priced),
+                if whole {
+                    bounds.include(priced);
+                    continue;
+                }
+                // A signal with no fresh value leaves the row incomplete,
+                // as no report does in the walk.
+                *cost = self.cost.incomplete(priced, || facts.in_flight(row));
+                match *cost {
+                    RowCost::Sum(sum) => bounds.include(sum),
+                    RowCost::OverLeast(_) => pending = true,
                 }
             }
             self.cost.price_and_score(out, costs, bounds, pending)
