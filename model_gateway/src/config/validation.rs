@@ -459,7 +459,9 @@ impl ConfigValidator {
                         prefill_urls,
                         decode_urls,
                         ..
-                    } if encode_urls.iter().any(|(url, _)| url.starts_with("ipc://"))
+                    } if encode_urls
+                        .iter()
+                        .any(|(url, _)| url.starts_with("ipc://") || url.starts_with("tcp://"))
                         || encode_urls
                             .iter()
                             .map(|(url, _)| url.as_str())
@@ -469,7 +471,7 @@ impl ConfigValidator {
                 ))
         {
             return Err(ConfigError::ValidationFailed {
-                reason: "SGLang prepared-input EPD requires plain gRPC/HTTP E/P/D routing (no https://, ipc:// encoder, or IGW)".into(),
+                reason: "SGLang prepared-input EPD requires plain gRPC/HTTP E/P/D routing (no https://, ipc:// or tcp:// encoder, or IGW)".into(),
             });
         }
         bounds::validate(config)?;
@@ -5706,5 +5708,33 @@ mod tests {
             matches!(built, Err(ConfigError::InvalidValue { ref field, .. }) if field == "cors_allowed_origins"),
             "{built:?}"
         );
+    }
+
+    #[test]
+    fn sglang_epd_rejects_tcp_and_ipc_encoder_urls() {
+        use smg_worker::identity::basic::RuntimeType;
+
+        for bad_encode in ["tcp://127.0.0.1:5555", "ipc:///tmp/encoder.sock"] {
+            let cfg = RouterConfig::builder()
+                .mode(RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![(bad_encode.to_string(), None)],
+                    prefill_urls: vec![("grpc://127.0.0.1:30001".to_string(), None)],
+                    decode_urls: vec!["grpc://127.0.0.1:30002".to_string()],
+                    encode_policy: None,
+                    prefill_policy: None,
+                    decode_policy: None,
+                })
+                .connection_mode(ConnectionMode::Grpc)
+                .startup_worker_runtime_type(Some(RuntimeType::Sglang))
+                .round_robin_policy()
+                .build_unchecked();
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&cfg),
+                    Err(ConfigError::ValidationFailed { .. })
+                ),
+                "expected ValidationFailed for encoder url {bad_encode}"
+            );
+        }
     }
 }

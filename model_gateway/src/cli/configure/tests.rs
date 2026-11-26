@@ -913,3 +913,35 @@ fn the_print_reads_the_connection_mode_off_the_addresses_as_a_start_does() {
         assert_eq!(Ok(document), start, "{prefill}");
     }
 }
+
+#[test]
+fn sglang_epd_routing_part_pins_grpc_and_sglang_runtime_even_with_http_urls() {
+    use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
+
+    let argv: Vec<String> = [
+        "smg",
+        "--backend",
+        "sglang",
+        "--epd-disaggregation",
+        "--encode",
+        "http://encode-a:30000",
+        "--prefill",
+        "http://prefill-a:30001",
+        "--decode",
+        "http://decode-a:30002",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let (args, prefill_urls, encode_urls) = parsed(&argv).expect("CLI flags parse");
+    let routing = args
+        .routing_config(prefill_urls.clone(), encode_urls.clone())
+        .expect("routing_config accepts native SGLang EPD with http:// URLs");
+    let full = args
+        .to_router_config(prefill_urls, encode_urls)
+        .expect("to_router_config accepts native SGLang EPD with http:// URLs");
+    for cfg in [&routing, &full] {
+        assert_eq!(cfg.connection_mode, ConnectionMode::Grpc);
+        assert_eq!(cfg.startup_worker_runtime_type, Some(RuntimeType::Sglang));
+    }
+}

@@ -240,10 +240,9 @@ impl CliArgs {
     /// Discovery turns IGW on unless the operator selected the native SGLang EPD pipeline.
     /// Returns whether this call turned it on.
     pub(crate) fn enable_igw_for_discovery(&mut self) -> bool {
-        let native_epd =
-            self.workers.epd_disaggregation && matches!(self.model.backend, Some(Backend::Sglang));
-        let enable =
-            self.selected_discovery_provider().is_some() && !self.routing.enable_igw && !native_epd;
+        let enable = self.selected_discovery_provider().is_some()
+            && !self.routing.enable_igw
+            && !self.is_sglang_epd();
         self.routing.enable_igw |= enable;
         enable
     }
@@ -1120,10 +1119,13 @@ impl CliArgs {
         Ok(model_aliases)
     }
 
+    /// Whether the flags select native SGLang prepared-input EPD routing.
     fn is_sglang_epd(&self) -> bool {
         self.workers.epd_disaggregation && matches!(self.model.backend, Some(Backend::Sglang))
     }
 
+    /// Effective transport connection mode: native SGLang EPD always runs over gRPC,
+    /// while other modes infer transport from their startup worker URLs.
     fn effective_connection_mode(&self, mode: &RoutingMode) -> ConnectionMode {
         if self.is_sglang_epd() {
             ConnectionMode::Grpc
@@ -1132,18 +1134,36 @@ impl CliArgs {
         }
     }
 
+    /// Effective startup worker runtime type: native SGLang EPD pins `RuntimeType::Sglang`,
+    /// while other modes delegate to `startup_worker_runtime_type`.
+    fn effective_startup_worker_runtime_type(
+        &self,
+        connection_mode: ConnectionMode,
+    ) -> Option<RuntimeType> {
+        if self.is_sglang_epd() {
+            Some(RuntimeType::Sglang)
+        } else {
+            self.startup_worker_runtime_type(connection_mode)
+        }
+    }
+
     /// The routing part of the configuration: what a policy document reads,
     /// the multi-router mode with it, and what the validator's routing rules
     /// read beside it (the workers' discovery and the data-parallel
-    /// setting). The connection mode belongs to it: the worker urls decide
-    /// it, and a pair's document follows it. A start's assembly builds on
-    /// the routing part and `--print-policy-spec` converts it alone, so the
-    /// two read one routing part. No file is read here.
+    /// setting). The connection mode and startup worker runtime belong to it:
+    /// worker URLs normally decide the transport, while native SGLang EPD pins
+    /// gRPC and `RuntimeType::Sglang`, and a pair's document follows it. A
+    /// start's assembly builds on the routing part and `--print-policy-spec`
+    /// converts it alone, so the two read one routing part. No file is read
+    /// here.
     fn routing_part(&self, mode: RoutingMode) -> ConfigResult<RouterConfigBuilder> {
         let connection_mode = self.effective_connection_mode(&mode);
+        let startup_worker_runtime_type =
+            self.effective_startup_worker_runtime_type(connection_mode);
         Ok(RouterConfig::builder()
             .mode(mode)
             .connection_mode(connection_mode)
+            .startup_worker_runtime_type(startup_worker_runtime_type)
             .policy(self.routing_policy())
             .cache_boundaries(self.routing.cache_boundaries.clone())
             .maybe_discovery(self.discovery_config()?)
@@ -1195,8 +1215,6 @@ impl CliArgs {
         self.warn_ignored_companions(&prefill_urls, &encode_urls);
 
         let mode = self.routing_mode(prefill_urls, encode_urls);
-        let sglang_epd = self.is_sglang_epd();
-        let connection_mode = self.effective_connection_mode(&mode);
         let routing = self.routing_part(mode)?;
         let metrics = Some(MetricsConfig {
             port: self.serving.prometheus_port,
@@ -1206,11 +1224,6 @@ impl CliArgs {
             enable_trace: self.integrations.enable_trace,
             otlp_traces_endpoint: self.integrations.otlp_traces_endpoint.clone(),
         });
-        let startup_worker_runtime_type = if sglang_epd {
-            Some(RuntimeType::Sglang)
-        } else {
-            self.startup_worker_runtime_type(connection_mode)
-        };
         let history_backend = match self.model.history_backend.as_str() {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
@@ -1234,7 +1247,6 @@ impl CliArgs {
         let model_aliases = Self::model_aliases(&self.discovery.model_alias)?;
 
         let builder = routing
-            .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.routing.zmq_engine_count)
             .zmq_startup_timeout_secs(self.routing.zmq_startup_timeout_secs)
             .host(&self.routing.host)

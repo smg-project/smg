@@ -528,6 +528,7 @@ impl PreparedInput {
         Ok(NativeEncode {
             parts,
             timeout: remaining,
+            deadline: tokio::time::Instant::from_std(self.deadline),
         })
     }
 }
@@ -545,6 +546,7 @@ pub(crate) struct NativeEncodePart {
 pub(crate) struct NativeEncode {
     parts: Vec<NativeEncodePart>,
     timeout: Duration,
+    deadline: tokio::time::Instant,
 }
 
 /// Dispatch one native encode part to its assigned SGLang encoder worker while holding its load guard.
@@ -564,6 +566,11 @@ async fn dispatch_encode_part(part: NativeEncodePart, timeout: Duration) -> Resu
 }
 
 impl NativeEncode {
+    /// Return the absolute handoff deadline anchored when this prepared request was built.
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
     /// Send all modality/chunk encode parts concurrently to their assigned SGLang encoders.
     pub(crate) async fn dispatch(mut self) -> Result<(), String> {
         let timeout = self.timeout;
