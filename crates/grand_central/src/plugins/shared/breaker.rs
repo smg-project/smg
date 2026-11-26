@@ -179,17 +179,19 @@ impl Latency {
     /// The frame a decision's sample is taken over, in microseconds: the
     /// frames the plugin was given in the decision, `frames_micros` in all,
     /// at most the decision's budget as it began, `seed_micros`. A charged
-    /// call is given its plugin's own frame under that budget, and the frame
-    /// counts whole whatever the decision had left for the call: a plugin
-    /// that others' draws starved is not read against the little it was
-    /// left. A call is cut at its frame, so under a budget wider than a
+    /// call adds its plugin's frame whole, whatever the decision had left
+    /// for the call: a plugin that others' draws starved is not read
+    /// against the little it was left. A frame may be wider than the
+    /// budget, and the frames are cut at it here, once. Every kind of
+    /// plugin asks here.
+    ///
+    /// A call is cut at its frame, so under a budget wider than a
     /// decision's frames a plugin's charge would pass no mark of the budget:
     /// a request in process may state none, and a stage is then shown the
     /// widest. So a plugin that answers in time reads slow too where its
     /// median takes over half of its own frames: a budget of twice its usual
     /// time keeps it under the mark. A guest's constructor is a call and adds
     /// its frame, so a guest bound as one stage is read over two frames.
-    /// Every kind of plugin asks here.
     pub(crate) fn frame(seed_micros: u64, frames_micros: u64) -> u32 {
         u32::try_from(seed_micros.min(frames_micros)).unwrap_or(u32::MAX)
     }

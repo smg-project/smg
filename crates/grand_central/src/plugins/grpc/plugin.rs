@@ -758,11 +758,12 @@ impl PluginBinding {
         shown: Option<&[u32]>,
     ) {
         let inner = &self.plugin.inner;
-        // The round trip's frame in the decision's sample: the plugin's own
-        // under the decision's budget, whatever the decision had left at
-        // the send. A frame that others' draws starved is not read against
-        // the little it was left.
-        let frame = u64::from(budget.whole_frame(inner.frame));
+        // The round trip's frame in the decision's sample: the plugin's
+        // own, whatever the decision had left at the send. A frame that
+        // others' draws starved is not read against the little it was
+        // left. The frames of a decision are cut at its budget once, at
+        // the plugin's last close (`Budget::sample_frame`).
+        let frame = u64::from(inner.frame.frame_micros(u32::MAX));
         match wait {
             Wait::Answered(arrived, decision) => {
                 budget.draw(micros(arrived.saturating_duration_since(started)));
@@ -824,9 +825,11 @@ impl PluginBinding {
                     .witness()
                     .stalled_between(ticket.at, Instant::now());
                 // Whose bound the frame ran out under, asked where every
-                // kind asks: the plugin's own where the frame had its whole
-                // budget, or where the plugin's spend in the decision so
-                // far and this grant reach the decision's budget.
+                // kind asks: the plugin's own where the frame was given the
+                // plugin's own frame whole, or where the plugin's spend in
+                // the decision so far and this grant reach the decision's
+                // budget. A frame given the whole of a budget narrower than
+                // the plugin's own frame is the second.
                 let whole = given == frame;
                 let spent = inner.unit.charged(open.stamp);
                 let own = budget.own_bound(whole, spent, given);

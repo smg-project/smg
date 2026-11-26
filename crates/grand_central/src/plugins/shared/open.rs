@@ -141,16 +141,6 @@ impl Budget {
         (frame.frame_micros(left), left)
     }
 
-    /// The whole frame of a plugin whose frame budget is `frame`: its own
-    /// frame under the budget as seeded, whatever is left. A round trip's
-    /// sample is read against it, so a frame that others' draws starved
-    /// is not read against the little it was sent with. A kind asks where
-    /// it takes a frame's answer or its miss.
-    #[cfg(feature = "controller")]
-    pub(crate) fn whole_frame(&self, frame: FrameBudget) -> u32 {
-        frame.frame_micros(self.seed_micros_u32())
-    }
-
     /// How long a wait for a frame's answer may last. The wait began at
     /// `started` and the frame's own deadline is `deadline`: the wait ends
     /// at the deadline, or where what is left runs out if that is sooner.
@@ -189,6 +179,11 @@ impl Budget {
     /// the host held a call of this one): its run-out is the decision's
     /// budget spent and no failure. Every kind asks here whose bound a
     /// run-out was, and nowhere else.
+    ///
+    /// The WebAssembly kind reads `whole_frame` against its frame under the
+    /// request's budget and the gRPC kind against its plugin's own frame,
+    /// with the same verdicts. A grant of the whole budget under a wider
+    /// frame reaches the budget by itself.
     pub(crate) fn own_bound(
         &self,
         whole_frame: bool,
@@ -204,12 +199,6 @@ impl Budget {
     /// asks at its last close of the decision.
     pub(crate) fn sample_frame(&self, frames_micros: u64) -> u32 {
         Latency::frame(self.seed_micros, frames_micros)
-    }
-
-    /// The budget as seeded, in the width a frame carries it.
-    #[cfg(feature = "controller")]
-    fn seed_micros_u32(&self) -> u32 {
-        u32::try_from(self.seed_micros).unwrap_or(u32::MAX)
     }
 }
 
