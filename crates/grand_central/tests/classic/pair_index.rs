@@ -85,12 +85,12 @@ fn descriptors(pool: &[Worker]) -> Option<Vec<PairingDescriptor>> {
                 let at = LAYOUT_FACTS.iter().position(|&(_, fact)| fact == name)?;
                 kv_layout[at] = Some(value.clone());
             }
-            Some(PairingDescriptor {
-                protocol: worker.protocol.clone(),
-                transport: worker.transport.clone(),
-                version: worker.version.clone(),
-                kv_layout,
-            })
+            let mut descriptor = PairingDescriptor::default();
+            descriptor.protocol.clone_from(&worker.protocol);
+            descriptor.transport.clone_from(&worker.transport);
+            descriptor.version.clone_from(&worker.version);
+            descriptor.kv_layout = kv_layout;
+            Some(descriptor)
         })
         .collect()
 }

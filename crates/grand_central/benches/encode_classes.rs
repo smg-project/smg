@@ -50,19 +50,21 @@ const FLEETS: [&str; 5] = ["none", "silent", "meeting", "connectors", "apart"];
 /// What worker `index` of `role` states in `fleet`, a fleet of `stage`
 /// encoders.
 fn offer(fleet: &str, role: Role, index: usize, stage: usize) -> EncodeOffer {
-    let push = |connector: usize| EncodeOffer {
-        handoff: EncodeHandoff::Push,
-        producer: role == Role::Encode,
-        consumer: role == Role::Prefill,
-        connector: Some(format!("c{connector}")),
-        ..EncodeOffer::default()
+    let push = |connector: usize| {
+        let mut offer = EncodeOffer::default();
+        offer.handoff = EncodeHandoff::Push;
+        offer.producer = role == Role::Encode;
+        offer.consumer = role == Role::Prefill;
+        offer.connector = Some(format!("c{connector}"));
+        offer
     };
     match (fleet, role) {
         ("none" | "silent", _) | (_, Role::Decode | Role::Single) => EncodeOffer::default(),
-        ("meeting", _) => EncodeOffer {
-            handoff: EncodeHandoff::Rendezvous,
-            ..EncodeOffer::default()
-        },
+        ("meeting", _) => {
+            let mut offer = EncodeOffer::default();
+            offer.handoff = EncodeHandoff::Rendezvous;
+            offer
+        }
         ("connectors", _) => push(index % 8),
         _ => push(index % stage),
     }
