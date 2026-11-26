@@ -64,6 +64,7 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/framework/encode/tests.rs"]
 mod tests;
 
 /// The stage named when no encoder is open for the request though one that

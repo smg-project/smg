@@ -287,4 +287,5 @@ impl JobHost for Jobs {
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/unit/service/controller/discovery/jobs/tests.rs"]
 mod tests;

@@ -2688,4 +2688,5 @@ impl Table {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/overlap/tests.rs"]
 mod tests;

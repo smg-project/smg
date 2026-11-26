@@ -157,4 +157,5 @@ impl DecisionRecord {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/explain/json/tests.rs"]
 mod tests;

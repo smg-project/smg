@@ -376,4 +376,5 @@ pub(crate) fn pair<L: Fn(WorkerId, u16) -> bool + Copy>(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/engine/lease_events/tests.rs"]
 mod tests;

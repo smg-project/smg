@@ -165,4 +165,5 @@ pub use encode::EncodeColumns;
 pub use pairs::OpenAdmission;
 
 #[cfg(test)]
+#[path = "../../tests/unit/worker_host/members/tests/mod.rs"]
 mod tests;

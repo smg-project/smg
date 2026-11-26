@@ -1135,7 +1135,8 @@ fn command_faults(command: &str) -> Vec<String> {
             _ => None,
         };
         if let Some(name) = name {
-            let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+            // The library's unit tests stand under `tests/unit`.
+            let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/unit");
             if !held_under(&source, &format!("fn {name}(")) {
                 faults.push(format!(
                     "`{command}`: the library's source holds no test {name}"
