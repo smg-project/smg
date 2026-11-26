@@ -247,7 +247,8 @@ fn said_behind(
     let own = host.engine.loaded();
     let sides = (own.members_of(lists.prefill), own.members_of(lists.decode));
     let (mut said, now): (SidesSaid, _) = ([None; 2], Instant::now());
-    let (counted, room) = (SessionCountedUnder::default, Some(&mut said));
+    let lends: Lends<'_> = &|_| None;
+    let (counted, room) = (SessionCountedUnder::default, Some((&mut said, lends)));
     let decision = lists.decide_sides(
         own,
         sides,
@@ -1054,7 +1055,8 @@ fn taken_by_the_call(host: &Host) -> Vec<(usize, Option<WorkerId>)> {
         let made = Made::new(&host.engine, &stated, &[]);
         let mut request = made.make(host.engine.standing_spec());
         let (mut said, now): (SidesSaid, _) = ([None; 2], Instant::now());
-        let (counted, room) = (SessionCountedUnder::default, Some(&mut said));
+        let lends: Lends<'_> = &|_| None;
+        let (counted, room) = (SessionCountedUnder::default, Some((&mut said, lends)));
         let decision = lists.decide_sides(
             own,
             sides,

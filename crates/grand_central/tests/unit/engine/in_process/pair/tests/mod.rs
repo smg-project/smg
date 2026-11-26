@@ -2333,6 +2333,7 @@ fn a_pairs_decision_alone_is_its_leasing_forms_and_takes_no_id_and_tells_no_stag
             now,
             |_| true,
             SessionCountedUnder::default,
+            &|_| None,
         );
         assert!(outcome.lease.is_some(), "the leasing form issues its pick");
         assert_eq!(alone.picked(&decision), leasing.picked(&outcome.decision));
@@ -2360,6 +2361,7 @@ fn a_pairs_decision_alone_is_its_leasing_forms_and_takes_no_id_and_tells_no_stag
         now,
         |_| true,
         SessionCountedUnder::default,
+        &|_| None,
     );
     assert_eq!(alone.picked(&first), leasing.picked(&outcome.decision));
     let (ours, theirs) = (target_at(&first, 0), target_at(&outcome.decision, 0));
@@ -2397,6 +2399,7 @@ fn a_pairs_decision_alone_is_its_leasing_forms_and_takes_no_id_and_tells_no_stag
         call,
         |_| true,
         SessionCountedUnder::default,
+        &|_| None,
     );
     assert!(issued.lease.is_some(), "the leasing form issues the decode");
     assert_eq!(alone.picked(&again), leasing.picked(&issued.decision));
@@ -2434,6 +2437,7 @@ fn a_pairs_decision_alone_is_its_leasing_forms_and_takes_no_id_and_tells_no_stag
             call,
             |_| true,
             SessionCountedUnder::default,
+            &|_| None,
         );
         assert!(matches!(&declined.decision, Decision::Shed(shed) if shed.emptied_by == WIRES));
         assert!(declined.lease.is_none());

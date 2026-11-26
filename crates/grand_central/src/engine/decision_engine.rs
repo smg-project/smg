@@ -87,9 +87,12 @@ pub trait RequestMaker {
     /// An engine that runs a shadow asks this inside the shadow's own
     /// run, behind the live decision of that ask, and only where the
     /// shadow profile reads a ring, the profile that decides the request
-    /// reads none and a worker stands to be placed. A panic here is the
-    /// shadow's fault, and the time it takes is the shadow's: spent, like
-    /// the rest of a shadow's run, ahead of a later ask of the same call.
+    /// reads none and a worker stands to be placed. Under a pair's binding
+    /// it asks this for a side's shadow profile, inside that side's run,
+    /// where neither side's profile reads a ring and the shadow's filters
+    /// kept a worker. A panic here is the shadow's fault, and the time it
+    /// takes is the shadow's: spent, like the rest of a shadow's run,
+    /// ahead of a later ask of the same call.
     fn shadow_ring<'w>(
         &'w self,
         spec: &'w AppliedSpec,

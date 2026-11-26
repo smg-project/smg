@@ -998,8 +998,18 @@ fn a_decode_side_under_a_rule_leaves_the_prefills_buffer_to_the_prefill() {
         assert_eq!(pick.trace.lifted, LiftedVeto::Overload, "{key:?}");
         assert_eq!(scratch.single.lifted, LiftedVeto::None, "{key:?}");
         let side = PairSide::Prefill;
-        let shadow =
-            engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+        let shadow = engine.shadow_side(
+            0,
+            side,
+            &facts,
+            &pool,
+            pools,
+            &cx,
+            &cx,
+            pick,
+            &mut scratch,
+            &|_| None,
+        );
         let speaks = shadow.is_some_and(|shadow| shadow.pick().is_some());
         assert_eq!(speaks, key.is_none(), "{key:?}");
     }
@@ -1032,12 +1042,31 @@ fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
         let pick = live.pick().expect("a pair");
         let held = pick.targets.first().expect("the pair's first target").id;
         let sides = PairSide::BOTH.map(|side| {
-            let shadow =
-                engine.shadow_side(0, side, &facts, &pool, pools, &cx, &cx, pick, &mut scratch);
+            let shadow = engine.shadow_side(
+                0,
+                side,
+                &facts,
+                &pool,
+                pools,
+                &cx,
+                &cx,
+                pick,
+                &mut scratch,
+                &|_| None,
+            );
             shadow.is_some()
         });
-        let later =
-            engine.shadow_decode_later(0, &facts, &pool, pools, held, None, &cx, &mut scratch);
+        let later = engine.shadow_decode_later(
+            0,
+            &facts,
+            &pool,
+            pools,
+            held,
+            None,
+            &cx,
+            &mut scratch,
+            &|_| None,
+        );
         (sides, later.is_some())
     };
     let rule = SessionRule {

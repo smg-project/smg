@@ -68,7 +68,11 @@
 //! list's claim, which is tried and never waited for
 //! ([`PoolRecords::write`](crate::engine::records::PoolRecords::write)). A
 //! stage takes what it takes of its own state, where it scores a record by
-//! its report and where it hears a word.
+//! its report and where it hears a word. So does a request's maker, where
+//! a side's shadow asks it for a place of its own inside the decision
+//! ([`RequestMaker::shadow_ring`](crate::engine::RequestMaker::shadow_ring)):
+//! the stock maker keeps eight places of a list in the list itself and a
+//! longer list on the heap.
 //!
 //! **Who holds the prompt.** A side whose phase reads affinity is handed
 //! its own list's column for the decision ([`overlap::column`]): what
@@ -101,8 +105,9 @@
 //! ([`later_shadow`]). What each said is counted by its side, a decode
 //! decided again apart, ahead of the issue
 //! ([`InProcess::shadow_counts`]). A document that names no shadow pays
-//! the test of that word at the entry and one test of the room in the
-//! decision, and no call. No other entry asks a side's shadow yet: not
+//! the test of that word at the entry, the hand-on of what the request
+//! lends a side's shadow, and one test of the room in the decision, and
+//! no call. No other entry asks a side's shadow yet: not
 //! the decision alone ([`decide`]), nor an encode request's first
 //! decision. An encode request's decode decided again comes through this
 //! entry: its decode side is asked as a pair's is and counted under
@@ -133,7 +138,7 @@ use crate::{
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
-        records::{vetoes, HeldCells, Live, PoolRecords},
+        records::{vetoes, with_shadow::Lends, HeldCells, Live, PoolRecords},
         shadow::{budget_left, ShadowSide, Shadowed, SHADOW_FLOOR},
         sticky_sessions::DecodeVerdict,
         view::{
@@ -488,7 +493,7 @@ impl<'a> PairLists<'a> {
         held: Option<&Target>,
         sends_to: impl Fn(&Target) -> bool,
         counted: impl FnOnce() -> SessionCountedUnder,
-        said: Option<&mut SidesSaid>,
+        said: Option<Room<'_, '_>>,
     ) -> Decision {
         let (spec, clock) = (&engine.document.spec, &engine.clock);
         // The engine as the fill of a side's column takes it: the name
@@ -1072,6 +1077,14 @@ fn decide_records(
 /// shadow lends none, and its decision asks none.
 type SidesSaid = [Option<Shadowed>; 2];
 
+/// The room an entry lends its decision for its sides' shadows
+/// ([`SidesSaid`]), with what the request lends a side's shadow profile
+/// alone ([`RequestMaker::shadow_ring`](crate::engine::RequestMaker::shadow_ring)).
+/// A side's shadow asks it inside its run, under its catch, so a lender
+/// that panics is the shadow's fault, and behind the run's filters, so a
+/// shadow whose set they emptied asks nothing ([`Engine::shadow_side`]).
+type Room<'s, 'l> = (&'s mut SidesSaid, Lends<'l>);
+
 /// A pair's first decision by `own` over the records of its two lists
 /// ([`decide_records`]), with what each side's shadow said beside it left
 /// in `said` ([`side_shadows`]): the shadows run on the scratch as that
@@ -1089,11 +1102,11 @@ fn decide_shadowed(
     pool: &PoolFacts<'_>,
     pools: PairPools<'_>,
     scratch: &mut Scratch,
-    said: &mut SidesSaid,
+    (said, lends): Room<'_, '_>,
 ) -> Decision {
     let engine = own.document.spec.engine();
     let decision = decide_records(engine, facts, sides, pool, pools, scratch);
-    *said = side_shadows(own, facts, sides, pool, pools, &decision, scratch);
+    *said = side_shadows(own, (facts, lends), sides, pool, pools, &decision, scratch);
     decision
 }
 
@@ -1109,9 +1122,12 @@ fn decide_shadowed(
 ///
 /// A side that is due is decided once more by its shadow profile
 /// ([`Engine::shadow_side`]): over the records the live decision read and
-/// the scratch it left, under that side's own places and mask. The run
-/// writes the scratch and the shadow profile's stages. It writes no record
-/// of sent prefixes, issues nothing and tells no stage.
+/// the scratch it left, under that side's own places and mask. A shadow
+/// profile that reads a ring where neither live side does is stated its
+/// own place on the ring the request lends, asked of `lends` inside the
+/// run, behind its filters. The run writes the scratch and the shadow
+/// profile's stages. It writes no record of sent prefixes, issues nothing
+/// and tells no stage.
 ///
 /// A side that is due and not asked is said as skipped
 /// ([`ShadowKind::Skipped`]): beside a pair that was shed, under less than
@@ -1132,7 +1148,7 @@ fn decide_shadowed(
 /// other side is asked all the same.
 fn side_shadows(
     own: Loaded<'_, '_>,
-    facts: &RequestFacts<'_>,
+    (facts, lends): (&RequestFacts<'_>, Lends<'_>),
     (cx, sides): (&Constraints<'_>, [Beside<'_>; 2]),
     pool: &PoolFacts<'_>,
     pools: PairPools<'_>,
@@ -1166,7 +1182,9 @@ fn side_shadows(
         };
         let ran = own.caught(|| {
             let (cx, decode_cx) = (&prefill_cx, &decode_cx);
-            Ok(engine.shadow_side(at, side, facts, pool, pools, cx, decode_cx, pick, scratch))
+            Ok(engine.shadow_side(
+                at, side, facts, pool, pools, cx, decode_cx, pick, scratch, lends,
+            ))
         });
         match ran {
             Ok(Some(shadow)) => {
@@ -1223,11 +1241,11 @@ fn decide_decode_shadowed(
     pools: PairPools<'_>,
     held: &Target,
     scratch: &mut Scratch,
-    said: &mut SidesSaid,
+    (said, lends): Room<'_, '_>,
 ) -> Decision {
     let engine = own.document.spec.engine();
     let decision = decide_decode_records(engine, facts, side, pool, pools, held, scratch);
-    let again = (held, &decision);
+    let (again, facts) = ((held, &decision), (facts, lends));
     said[PairSide::Decode.index()] = later_shadow(own, facts, side, pool, pools, again, scratch);
     decision
 }
@@ -1248,7 +1266,9 @@ fn decide_decode_shadowed(
 /// decode list's places and mask, on the call's own draw sequence. It is
 /// handed the decode the pair's first decision named, as the live call is
 /// ([`first_decode`]): a shadow whose picker takes turns keeps that decode
-/// and takes no turn, as its live side takes none. It is
+/// and takes no turn, as its live side takes none. One that reads a ring
+/// where neither live side does is stated its own place on the ring the
+/// request lends, as beside a first decision ([`side_shadows`]). It is
 /// said as skipped ([`ShadowKind::Skipped`]) beside a call that picked no
 /// decode, under less than [`SHADOW_FLOOR`] of the request's stated
 /// budget, and where the engine's run says none, as a side's is beside a
@@ -1257,7 +1277,7 @@ fn decide_decode_shadowed(
 /// its call nothing and is counted with the engine's faults.
 fn later_shadow(
     own: Loaded<'_, '_>,
-    facts: &RequestFacts<'_>,
+    (facts, lends): (&RequestFacts<'_>, Lends<'_>),
     (cx, side): (&Constraints<'_>, Beside<'_>),
     pool: &PoolFacts<'_>,
     pools: PairPools<'_>,
@@ -1289,7 +1309,7 @@ fn later_shadow(
     let first = first_decode(held);
     let ran = own.caught(|| {
         let cx = &decode_cx;
-        Ok(engine.shadow_decode_later(at, facts, pool, pools, held.id, first, cx, scratch))
+        Ok(engine.shadow_decode_later(at, facts, pool, pools, held.id, first, cx, scratch, lends))
     });
     match ran {
         Ok(Some(shadow)) => {
@@ -1610,7 +1630,7 @@ fn decide_with(
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
     counted: impl FnOnce() -> SessionCountedUnder,
-    said: Option<&mut SidesSaid>,
+    said: Option<Room<'_, '_>>,
 ) -> Decision {
     // The engine's own value of each list, asked of the list's cell once.
     let sides = (own.members_of(lists.prefill), own.members_of(lists.decode));
@@ -1658,7 +1678,9 @@ pub(super) fn date_decode_claim(
 /// again behind the prefill that view names. The decision reads the
 /// reports in `loads`: the snapshot the request gives for this call, or
 /// the newest the engine's own task keeps at hand. `sends_to` and `counted`
-/// are handed to [`decide`] as they stand.
+/// are handed to [`decide`] as they stand. `lends` is what the request
+/// lends a side's shadow profile alone, asked inside a shadow's run
+/// ([`Room`]): a document that names no shadow never asks it.
 ///
 /// Under a document that names a shadow, a pair's decision is lent room
 /// for what its shadows say: a first decision's two sides
@@ -1669,11 +1691,11 @@ pub(super) fn date_decode_claim(
 /// that panics at that issue is held ([`issue_caught`],
 /// [`issue_decode_caught`]), so the decision stands and its shadows are
 /// counted in either order. The decision and the issue are the ones of a
-/// document that names no shadow, which pays the test of that word here
-/// and one test of the room in the decision.
+/// document that names no shadow, which pays the test of that word here,
+/// the hand-on of `lends` and one test of the room in the decision.
 #[expect(
     clippy::too_many_arguments,
-    reason = "a pair's decision as its host takes it, and its maker's two words"
+    reason = "a pair's decision as its host takes it, and its maker's three words"
 )]
 pub(super) fn decided(
     own: Loaded<'_, '_>,
@@ -1684,11 +1706,12 @@ pub(super) fn decided(
     now: Instant,
     sends_to: impl Fn(&Target) -> bool,
     counted: impl FnOnce() -> SessionCountedUnder,
+    lends: Lends<'_>,
 ) -> DecideOutcome {
     let target = held.map(|held| held.target);
     let shadowed = own.document.any_shadow;
     let mut said: SidesSaid = [None; 2];
-    let room = shadowed.then_some(&mut said);
+    let room = shadowed.then_some((&mut said, lends));
     let decision = decide_with(
         own, lists, request, target, loads, now, sends_to, counted, room,
     );
