@@ -66,7 +66,7 @@ fn commit(engine: &Engine, facts: &RequestFacts<'_>, live: &Decision, at: usize)
 fn a_shadow_beside_a_live_profile_that_reads_no_ring_keeps_the_lent_ring() {
     use crate::policies::{
         cache_aware::Gates,
-        consistent_hashing::{ConsistentHash, InOrder},
+        consistent_hashing::{tests::InOrder, ConsistentHash},
     };
 
     let mut rows = [candidate(0, 3), candidate(1, 5), candidate(2, 9)];

@@ -17,7 +17,7 @@ use crate::{
         LiftedVeto, Pick, PlacedBy,
     },
     load::signals::{SignalCell, SignalCells, SignalColumn},
-    policies::consistent_hashing::InOrder,
+    policies::consistent_hashing::tests::InOrder,
     tracking::lease::{Lease, Side},
 };
 

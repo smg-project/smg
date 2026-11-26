@@ -1,5 +1,6 @@
 use std::sync::atomic::{self, AtomicU32};
 
+pub(crate) use super::lent_ring::tests::InOrder;
 use super::*;
 use crate::{
     engine::{

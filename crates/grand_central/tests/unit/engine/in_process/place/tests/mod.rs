@@ -42,7 +42,7 @@ use crate::{
         CacheIndex, CacheIndexes, EncodeLists, PairAdmission, PairLists, PartnerClasses,
     },
     policies::{
-        consistent_hashing::{Head, InOrder as Lent},
+        consistent_hashing::{tests::InOrder as Lent, Head},
         prefix_hash::HeadRule,
     },
     stages::{pickers::push_drawn, registry::StageRegistry, Lifecycle},

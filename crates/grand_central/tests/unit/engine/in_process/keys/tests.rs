@@ -27,7 +27,7 @@ use crate::{
         sticky_sessions::{shards_for_this_host, SessionVerdict},
         view::{Constraints, Identity, Phase, RequestFacts, Session, WorkerId},
     },
-    policies::consistent_hashing::{InOrder, LentRing},
+    policies::consistent_hashing::{tests::InOrder, LentRing},
     store::GatewayId,
     tracking::{
         lease::{Outcome, ReleaseReason, Side, TransportClass},

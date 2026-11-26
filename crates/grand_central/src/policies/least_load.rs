@@ -10,8 +10,6 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
-use crate::stages::scorers::HeldCredit;
 use crate::{
     document::spec::{Needs, ProfileSpec},
     engine::{
@@ -103,34 +101,6 @@ impl LeastLoad {
     /// Dispatches no report reflects yet on one rank of `worker`.
     pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
         self.sent.credits().held_at(worker, dp_rank)
-    }
-
-    /// One rank's held work as a decision reads it: token-work, a send of
-    /// no stated size at the mean prefill, and requests.
-    #[cfg(test)]
-    fn held_word_at(&self, worker: WorkerId, dp_rank: u16) -> (u64, u64) {
-        self.sent
-            .credits()
-            .tally
-            .load()
-            .get(&(worker, dp_rank))
-            .map_or((0, 0), |since| {
-                let (HeldCredit { tokens, requests }, unsized_held) = since.held_for_test();
-                let unsized_held = u64::from(unsized_held);
-                (
-                    tokens + unsized_held * u64::from(self.mean_prefill_tokens),
-                    requests,
-                )
-            })
-    }
-
-    /// A retirement for the rank row, as a dispatch that found the row at
-    /// its bound runs it.
-    #[cfg(test)]
-    fn retire_oldest_of(&self, worker: WorkerId, dp_rank: u16) {
-        if let Some(since) = self.sent.credits().tally.load().get(&(worker, dp_rank)) {
-            since.retire_for_test();
-        }
     }
 
     /// A reporting candidate's dispatch credit as token-work: the since-report

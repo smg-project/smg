@@ -22,7 +22,7 @@ use crate::{
         },
         Scratch, DRAW_BOUND,
     },
-    policies::consistent_hashing::{ConsistentHash, InOrder},
+    policies::consistent_hashing::{tests::InOrder, ConsistentHash},
     stages::{filters::Healthy, lifecycle::Lifecycle, pickers::Best},
     tracking::lease::{Lease, Side},
     Draw,

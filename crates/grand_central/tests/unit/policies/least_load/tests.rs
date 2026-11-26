@@ -9,10 +9,38 @@ use crate::{
         scorers::{
             take_lane,
             tests::{candidate, kept, report},
-            SessionAffinity, RANK_CREDIT_KEPT,
+            HeldCredit, SessionAffinity, RANK_CREDIT_KEPT,
         },
     },
 };
+
+impl LeastLoad {
+    /// One rank's held work as a decision reads it: token-work, a send of
+    /// no stated size at the mean prefill, and requests.
+    fn held_word_at(&self, worker: WorkerId, dp_rank: u16) -> (u64, u64) {
+        self.sent
+            .credits()
+            .tally
+            .load()
+            .get(&(worker, dp_rank))
+            .map_or((0, 0), |since| {
+                let (HeldCredit { tokens, requests }, unsized_held) = since.held_for_test();
+                let unsized_held = u64::from(unsized_held);
+                (
+                    tokens + unsized_held * u64::from(self.mean_prefill_tokens),
+                    requests,
+                )
+            })
+    }
+
+    /// A retirement for the rank row, as a dispatch that found the row at
+    /// its bound runs it.
+    fn retire_oldest_of(&self, worker: WorkerId, dp_rank: u16) {
+        if let Some(since) = self.sent.credits().tally.load().get(&(worker, dp_rank)) {
+            since.retire_for_test();
+        }
+    }
+}
 
 #[test]
 fn least_load_prices_work_over_drain_and_credits_a_dispatch_until_its_report() {

@@ -71,8 +71,6 @@ use crate::{
 
 mod lent_ring;
 
-#[cfg(test)]
-pub(crate) use lent_ring::InOrder;
 pub use lent_ring::LentRing;
 
 pub use crate::policies::prefix_hash::Head;
@@ -1326,4 +1324,4 @@ impl Scorer for ConsistentHash {
 
 #[cfg(test)]
 #[path = "../../tests/unit/policies/consistent_hashing/tests.rs"]
-mod tests;
+pub(crate) mod tests;
