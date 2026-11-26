@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use engine_zmq_adapter::{
     fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
-    VllmGenerateStream, ZmqEngineClient,
+    validate_cache_salt, VllmGenerateStream, ZmqEngineClient,
 };
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
@@ -302,6 +302,11 @@ async fn submit(
         .flatten();
     if let Some(params) = ec_params.as_ref() {
         encoder_cache::check_consumer_handoff(&req, &state.model, params)?;
+    }
+    // Refuse a bad salt before the media stage fetches anything. The adapter
+    // checks it again for its direct-ZMQ lane.
+    if let Some(salt) = req.cache_salt.as_deref() {
+        validate_cache_salt(salt).map_err(Status::invalid_argument)?;
     }
     let ec_producer_side = ec_params.is_some() && encoder_cache::is_producer(&state.model);
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());

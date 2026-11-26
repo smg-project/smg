@@ -25,7 +25,7 @@ pub(crate) fn engine_cache_salt(
     identity_hashes: &[String],
 ) -> Result<Option<String>, String> {
     if let Some(salt) = &request_salt {
-        validate(salt)?;
+        validate_cache_salt(salt)?;
     }
     if identity_hashes.is_empty() {
         return Ok(request_salt);
@@ -49,8 +49,9 @@ pub(crate) fn engine_cache_salt(
     Ok(Some(engine_salt))
 }
 
+/// Refuse a request salt outside vLLM's limits or with the reserved prefix.
 /// The error texts do not contain the salt. A salt can be a secret.
-fn validate(salt: &str) -> Result<(), String> {
+pub fn validate_cache_salt(salt: &str) -> Result<(), String> {
     if salt.is_empty() {
         return Err("cache_salt must not be empty".to_string());
     }

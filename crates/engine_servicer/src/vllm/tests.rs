@@ -1451,11 +1451,12 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
 }
 
 /// The request salt reaches the engine on each choice. It replaces the salt a
-/// media processor gave. A bad salt does not reach the engine.
+/// media processor gave. A bad salt reaches neither the media stage nor the
+/// engine.
 #[tokio::test]
 async fn the_request_salt_reaches_the_engine_or_is_refused() {
     let processor = MockMediaProcessor::answering(Ok(processed_media()));
-    let mut h = harness_with(model_info(), None, Some(processor)).await;
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
     let salted = |id: &str, salt: &str| vllm::GenerateRequest {
         cache_salt: Some(salt.to_string()),
         ..generate_request(id, false, Vec::new())
@@ -1476,11 +1477,14 @@ async fn the_request_salt_reaches_the_engine_or_is_refused() {
     let engine_request: EngineCoreRequest = decode_msgpack(&frames[1]).expect("add payload");
     assert_eq!(engine_request.cache_salt.as_deref(), Some("tenant-a"));
 
-    let bad = h.client.generate(salted("bad", "mm:secret")).await;
-    let status = bad.expect_err("refused");
+    let mut bad = salted("bad", "mm:secret");
+    bad.media_refs = Some(media_refs(&["https://example.com/y.png"]));
+    let status = h.client.generate(bad).await.expect_err("refused");
     assert_eq!(status.code(), Code::InvalidArgument);
     assert!(status.message().contains("cache_salt"), "{status}");
     assert!(!status.message().contains("secret"), "{status}");
+    // The media stage never sees the refused request.
+    assert_eq!(processor.requests().len(), 1);
     assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

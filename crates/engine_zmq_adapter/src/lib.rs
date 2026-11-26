@@ -80,3 +80,4 @@ pub use tokenspeed::{
 };
 pub use trtllm::{to_trtllm_response, TrtllmGenerateStream};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};
+pub use vllm_cache_salt::validate_cache_salt;
