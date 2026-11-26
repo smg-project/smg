@@ -158,11 +158,16 @@ def verify_extension_payload(root, folder, names):
         "Extension contains ELF payload",
     )
     direct = json.loads((folder / "direct_url.json").read_text())
+    require(isinstance(direct, dict), "Malformed extension archive metadata")
+    archive = direct.get("archive_info")
+    require(isinstance(archive, dict), "Malformed extension archive_info")
+    hashes = archive.get("hashes")
+    require(isinstance(hashes, dict), "Malformed extension archive hashes")
     require(
         direct.get("url") == SDIST_URL
-        and direct.get("archive_info", {}).get("hashes", {}).get("sha256") == SDIST_SHA
-        and not direct.get("dir_info")
-        and not direct.get("vcs_info"),
+        and hashes.get("sha256") == SDIST_SHA
+        and "dir_info" not in direct
+        and "vcs_info" not in direct,
         "Extension is not the official sdist build",
     )
     wheel = Parser().parsestr((folder / "WHEEL").read_text())
@@ -238,11 +243,7 @@ def verify(report):
         ("tilelang", "0.1.15", "tilelang"),
         ("torch-c-dlpack-ext", "0.1.5", "torch_c_dlpack_ext"),
     ):
-        matches = [
-            dist
-            for dist in md.distributions()
-            if re.sub(r"[-_.]+", "-", dist.metadata["Name"]).lower() == name
-        ]
+        matches = find_native_distributions(md.distributions(), name)
         require(len(matches) == 1, "Ambiguous distribution: " + name)
         dist = matches[0]
         folder = root / (name.replace("-", "_") + "-" + version + ".dist-info")
@@ -407,7 +408,16 @@ def validate_uninstall_record(root, folder, package, consoles=()):
                 and str(relative) == name
                 and (
                     relative.parts[0] in (package, folder.name)
-                    or (package == "torch_c_dlpack_ext" and name == "build_backend.py")
+                    or (
+                        package == "torch_c_dlpack_ext"
+                        and (
+                            name == "build_backend.py"
+                            or (
+                                installed_cache_source(name) == "build_backend.py"
+                                and "build_backend.py" in names
+                            )
+                        )
+                    )
                 )
                 and path.resolve().is_relative_to(root),
                 "Unsafe uninstall RECORD path: " + name,
@@ -454,6 +464,34 @@ def validate_repair_script_metadata(folder):
         )
 
 
+def find_native_distributions(distributions, name):
+    """Match both pip directory identity and declared Name before absence is inferred."""
+    matches = []
+    for dist in distributions:
+        raw_name = dist.metadata.get("Name")
+        declared = re.sub(r"[-_.]+", "-", raw_name).lower() if isinstance(raw_name, str) else None
+        try:
+            path = Path(dist._path)
+        except (AttributeError, TypeError):
+            require(declared != name, "Unsafe native distribution location")
+            continue
+        directory_name = None
+        if path.name.endswith(".dist-info"):
+            prefix, separator, _ = path.name[:-10].partition("-")
+            if separator:
+                directory_name = re.sub(r"[-_.]+", "-", prefix).lower()
+        elif path.name.endswith(".egg-info"):
+            directory_name = re.sub(r"[-_.]+", "-", path.name[:-9].split("-", 1)[0]).lower()
+        if name not in (declared, directory_name):
+            continue
+        require(
+            declared == directory_name == name and path.name.endswith(".dist-info"),
+            "Unsafe native distribution identity: directory and METADATA Name disagree",
+        )
+        matches.append(dist)
+    return matches
+
+
 def native_repair_packages():
     """Select only version/RECORD/official-anchor mismatches; never install here."""
     require(
@@ -469,11 +507,7 @@ def native_repair_packages():
         ("tilelang", "0.1.15", "tilelang"),
         ("torch-c-dlpack-ext", "0.1.5", "torch_c_dlpack_ext"),
     ):
-        matches = [
-            dist
-            for dist in md.distributions()
-            if re.sub(r"[-_.]+", "-", dist.metadata["Name"]).lower() == name
-        ]
+        matches = find_native_distributions(md.distributions(), name)
         if not matches:
             # Nothing is installed for pip to uninstall. Do not infer a healthy payload.
             require(

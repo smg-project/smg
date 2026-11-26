@@ -70,7 +70,7 @@ RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
 # Verification owns source-only imports and always writes its failure report.
 # Do not import Torch or inspect install-only companions before this dispatch.
 if [ "$verify_only" -eq 1 ]; then
-    exec python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" "${verify_output[@]}"
+    exec python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" -- "${verify_output[@]}"
 fi
 
 # Preserve this image's companions instead of the generic protobuf-6 fallback.
