@@ -265,6 +265,34 @@ fn a_pairs_first_decision_is_kept_and_found_by_its_request() {
     assert_eq!(engine.explained(b"pair-2"), None);
 }
 
+/// A kept decision is kept under the binding its request matches at its own
+/// phase. A binding of the single phase alone stands ahead of the pair's,
+/// for the same model. A pair's first decision, made at its prefill, is
+/// kept under the pair's binding and names the pair's plan.
+#[test]
+fn a_kept_pair_is_kept_under_the_binding_its_prefill_matches() {
+    let mut document = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+    document.generation = 1;
+    document.explain.sample = 1;
+    let single = PolicySpec::preset("round_robin").expect("a built-in preset");
+    document.profiles.extend(single.profiles);
+    let mut ahead = single.bindings[0].clone();
+    ahead.matcher.phase = vec![Phase::Single];
+    document.bindings.insert(0, ahead);
+    let engine = hosted(engine_of(&document));
+    let lists = Lists::of(2, 2);
+    let classes = lists.every();
+    let request = PlaceRequest {
+        request_id: Some("pair-1"),
+        ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+    };
+    let _ = engine.place(&request).expect("a placement");
+    let record = engine.explained(b"pair-1").expect("the decision is kept");
+    assert_eq!(record.binding, Some(1), "the pair's binding");
+    let names = record.names(engine.standing_spec().engine());
+    assert_eq!(names.expect("its names").plan, "pd-pair");
+}
+
 /// A side that cannot be sent to is left out of the next ask by its own
 /// id, and the side that held stays a candidate of it. A pair's targets
 /// share one prefill, so a prefill that cannot be sent to fails every
