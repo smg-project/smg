@@ -116,7 +116,7 @@ target/release/smg-grand-central --controller-id controller-0 --spec-file policy
   --identity-as-told gateway,control
 ```
 
-Register workers with `RegisterWorker` on the control listener. Use `Session` and `Decide` on the gateway listener to ask for a worker. The service returns targets and leases for the caller to dispatch and report. For a complete local example of registration and the decision stream, see [the controller's wire test](tests/controller.rs). The deployment chart can mount `grandCentral.spec` as a file or `grandCentral.specStoreClaim` as a store. [Deployment chart](../../deploy/helm/smg/README.md#grand-central)
+Register workers with `RegisterWorker` on the control listener. Use `Session` and `Decide` on the gateway listener to ask for a worker. The service returns targets and leases for the caller to dispatch and report. For a complete local example of registration and the decision stream, see [the controller's wire test](tests/controller_cases/decisions.rs). The deployment chart can mount `grandCentral.spec` as a file or `grandCentral.specStoreClaim` as a store. [Deployment chart](../../deploy/helm/smg/README.md#grand-central)
 
 | Flags | Default and effect |
 |---|---|
