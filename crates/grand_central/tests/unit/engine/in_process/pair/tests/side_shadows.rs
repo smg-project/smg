@@ -706,6 +706,37 @@ fn a_decode_shadow_beside_a_decode_the_rule_steered_is_put_to_the_rule() {
     assert_eq!(seen.asks(), [1, 0]);
 }
 
+/// Beside a pair the pair's default made, each side's shadow follows the
+/// default as its live side does and is compared: it is not counted as
+/// skipped. The default's picks are no stage's, so neither shadow's picker
+/// is asked.
+#[test]
+fn a_sides_shadow_beside_the_pairs_default_is_compared() {
+    let next = [Some(Rule::Place(1)); 2];
+    let (host, seen) = shadowing((2, 2), [Rule::Place(0); 2], next, |document| {
+        for name in ["prefill", "prefill-next"] {
+            let profile = document.profiles.get_mut(name);
+            let profile = profile.expect("a prefill profile");
+            profile.filter = ["healthy", "not-overloaded"]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+        }
+    });
+    for prefill in host.prefills.iter() {
+        prefill.set_overloaded(true);
+    }
+    let decided = paired(&host);
+    let live = decided.decision.pick().expect("a pair");
+    assert_eq!(live.trace.lifted, LiftedVeto::Overload);
+    let kinds = side_kinds(&host);
+    for side in kinds {
+        let (said, skipped) = (side.iter().sum::<u64>(), side[3]);
+        assert_eq!((said, skipped), (1, 0), "{kinds:?}");
+    }
+    assert_eq!(seen.asks(), [0, 0]);
+}
+
 /// A sessions rule on the pair's binding, with no cap, that leaves a new
 /// session to each side's profile.
 fn sticky(document: &mut PolicySpec) {
@@ -717,12 +748,12 @@ fn sticky(document: &mut PolicySpec) {
 }
 
 /// Beside a side its binding's sessions rule placed, the side's shadow is
-/// not asked: a shadow's run is put to no rule, and its bare profile
-/// beside a key's pin would say nothing true of the profile. So a keyed
-/// pair under a rule counts each named side as skipped: the key's first
-/// pair, and the next behind it. The host's request states a key. Its
-/// decode decided again is the rule's too, and counts its shadow as
-/// skipped.
+/// not asked: a shadow's run is put to no sessions rule and to no picker's
+/// assignment, and its bare profile beside a key's pin would say nothing
+/// true of the profile. So a keyed pair under a rule counts each named
+/// side as skipped: the key's first pair, and the next behind it. The
+/// host's request states a key. Its decode decided again is the rule's
+/// too, and counts its shadow as skipped.
 #[test]
 fn a_keyed_pair_under_a_sessions_rule_counts_each_side_as_skipped() {
     let next = [Some(Rule::Place(1)); 2];
