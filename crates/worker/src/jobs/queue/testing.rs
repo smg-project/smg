@@ -6,7 +6,7 @@ use dashmap::{DashMap, DashSet};
 use tokio::sync::{mpsc, Semaphore};
 
 pub use super::slots::{Kept, Outcomes, Waiter, WaiterSlot};
-use super::{JobHost, JobQueue, Queued};
+use super::{Holders, JobHost, JobQueue, Queued};
 use crate::{registry::WorkerId, worker::JobStatus};
 
 /// The queue's slots, records and limits, borrowed by a host's tests.
@@ -38,6 +38,7 @@ impl<'a, H: JobHost> QueueTest<'a, H> {
             tx,
             host: Arc::downgrade(host),
             status_map: Arc::default(),
+            holders: Arc::default(),
             concurrency_limit: Arc::new(Semaphore::new(config.max_concurrent_jobs)),
             outcomes: Arc::default(),
             next_waiter_id: 1.into(),
@@ -76,7 +77,7 @@ impl<'a, H: JobHost> QueueTest<'a, H> {
         url: &str,
         job_type: &'static str,
     ) -> bool {
-        JobQueue::<H>::claim(status_map, url, job_type)
+        JobQueue::<H>::claim(status_map, &Holders::default(), url, job_type)
     }
 
     /// Claims a key if no job at all is in flight.
@@ -85,7 +86,7 @@ impl<'a, H: JobHost> QueueTest<'a, H> {
         url: &str,
         job_type: &'static str,
     ) -> bool {
-        JobQueue::<H>::claim_unless_in_flight(status_map, url, job_type)
+        JobQueue::<H>::claim_unless_in_flight(status_map, &Holders::default(), url, job_type)
     }
 
     /// Keeps a job behind a holder.
@@ -115,7 +116,7 @@ impl<'a, H: JobHost> QueueTest<'a, H> {
         kept: &DashMap<String, Kept<H::Job>>,
         marks: &DashSet<WorkerId>,
     ) {
-        JobQueue::<H>::run_kept(url, host, status_map, kept, marks).await;
+        JobQueue::<H>::run_kept(url, host, status_map, kept, marks, &Arc::default()).await;
     }
 
     /// Delivers an outcome to its own waiter.
