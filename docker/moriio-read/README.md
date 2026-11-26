@@ -5,9 +5,11 @@ This directory preserves the successful A11 full ROCm build recipe for
 The recipe and provenance records are distinct from the candidate image produced
 by the normal-main publisher described below.
 
-`Dockerfile.rocm` is byte-identical to the successful recipe: the engine's
-original Dockerfile plus `ENV MAX_JOBS=16 CMAKE_BUILD_PARALLEL_LEVEL=16` in its
-`dev` stage. `upstream-bake.hcl` is the engine's original bake file.
+`Dockerfile.rocm` preserves the successful recipe's executable instructions:
+the engine's original Dockerfile plus
+`ENV MAX_JOBS=16 CMAKE_BUILD_PARALLEL_LEVEL=16` in its `dev` stage. Comments
+expand the explanation of `HSA_NO_SCRATCH_RECLAIM`; the file is not a
+byte-identical copy of the original build input. `upstream-bake.hcl` is the engine's original bake file.
 `bake.hcl` binds the three official immutable stack/runtime/test-deps images
 and the actual gfx942 build arguments. It preserves the full own-source Csrc,
 Rust and wheel build, installation, `test` and `test-smoke` targets. It does
@@ -82,7 +84,9 @@ identify an actual registry candidate; a merge alone does not prove delivery.
 runs its publisher only for a normal `smg-project/smg` push to `main` that changes
 an actual build input, the publisher or its workflow. Documentation and receipt
 changes alone do not publish. Same-repository PRs retain the broader recipe
-integrity check and 13 stdlib publisher controls without Docker or publication.
+integrity check and the complete stdlib publisher control module without Docker
+or publication. These CPU controls exercise owned client lifecycles and injected
+receipt failures; they do not qualify an actual BuildKit daemon or image.
 
 The publisher builds both full targets, then exports the cached `test` target as
 `ghcr.io/smg-project/smg:ci-moriio-read-<identity>-<run>-<attempt>`.
@@ -97,7 +101,10 @@ files record the immutable dependency image metadata.
 This runs on the existing Docker CPU route only after actual capacity, disk,
 cgroup limits and no-GPU build-sandbox checks pass. Insufficient capacity,
 registry permission, private-package visibility, anonymous metadata access or
-owned-cleanup failure makes the operation fail. A failed operation may already
+owned-cleanup failure makes the operation fail. Receipt persistence failure
+stops productive work; exact-owned cleanup still runs using in-memory intent
+and metadata pipes, with a best-effort stderr receipt. If ownership or cleanup
+cannot be established, the operation retains an unresolved failure. A failed operation may already
 have pushed a candidate: inspect its result and registry receipt rather than
 assuming failure means nothing was published. Main merge is not a guarantee
 that a public pullable image exists.

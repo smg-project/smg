@@ -17,11 +17,14 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 
 ENGINE = "f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9"
@@ -52,13 +55,21 @@ def digest(data):
 
 
 def write_json(path, value):
-    temporary = path.with_suffix(".new")
-    with temporary.open("x") as stream:
-        json.dump(value, stream, indent=2)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    temporary.replace(path)
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".new", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass  # Keep the original write failure; no owned resource is hidden here.
+        raise
 
 
 def check_recipe():
@@ -368,9 +379,20 @@ def publish(engine_checkout, output):
 
     client_control = {"pending_signal": None, "cleaning": False, "critical": False}
 
+    def persist():
+        try:
+            write_json(record, state)
+        except BaseException as error:
+            client_control["receipt_failed"] = True
+            client_control.setdefault("receipt_error", error)
+            state["status"] = "failed_or_published_incomplete_requires_readback"
+            state.setdefault("receipt_failures", []).append(type(error).__name__)
+            if not client_control["cleaning"]:
+                raise
+
     def event(phase, **extra):
         state["events"].append({"phase": phase, **extra})
-        write_json(record, state)
+        persist()
 
     def command(phase, argv, until=None, capture=False, cwd=None):
         until = deadline if until is None else until
@@ -390,8 +412,11 @@ def publish(engine_checkout, output):
         log = output / (phase + ".log")
 
         def admitted():
-            if client_control["pending_signal"] is not None and not client_control["cleaning"]:
-                raise RuntimeError("publisher cancellation pending")
+            if not client_control["cleaning"]:
+                if client_control.get("receipt_failed"):
+                    raise RuntimeError("publisher receipt failure prevents productive work")
+                if client_control["pending_signal"] is not None:
+                    raise RuntimeError("publisher cancellation pending")
             assert until - time.monotonic() > 3, "engineering deadline expired"
 
         def group_gone():
@@ -417,7 +442,11 @@ def publish(engine_checkout, output):
             client_control["critical"] = True
             admitted()
             event(phase + "_submitted", argv=argv)
-            with log.open("xb") as stream:
+            # Teardown must survive an unwritable output filesystem. Its exact
+            # intent/handle stay in state; only cleanup uses bounded metadata pipes.
+            cleaning = client_control["cleaning"]
+            client["log_sink"] = "cleanup_metadata_pipes" if cleaning else str(log)
+            with nullcontext(None) if cleaning else log.open("xb") as stream:
                 # Admission linearizes here. Signals only set pending state; no signal
                 # mask is inherited across exec. Once admitted, bind the handle before
                 # delivering cancellation, and cover event/durable-write errors too.
@@ -427,8 +456,8 @@ def publish(engine_checkout, output):
                     argv,
                     cwd=cwd,
                     env=env,
-                    stdout=subprocess.PIPE if capture else stream,
-                    stderr=stream,
+                    stdout=subprocess.PIPE if capture or cleaning else stream,
+                    stderr=subprocess.PIPE if cleaning else stream,
                     start_new_session=True,
                 )
                 handle = {"pid": proc.pid, "process_group": proc.pid}
@@ -443,15 +472,19 @@ def publish(engine_checkout, output):
                 while True:
                     admitted()
                     try:
-                        stdout, _ = proc.communicate(
+                        stdout, stderr = proc.communicate(
                             timeout=min(0.25, until - time.monotonic() - 3)
                         )
                         break
                     except subprocess.TimeoutExpired:
                         continue
                 assert proc.returncode == 0, phase + " failed (see owned log)"
-                if capture:
+                if capture or cleaning:
                     assert len(stdout) <= 4 * 1024**2, "metadata output too large"
+                if cleaning:
+                    assert len(stderr) <= 4 * 1024**2, "cleanup stderr too large"
+                    client["stdout_sha256"] = digest(stdout)
+                    client["stderr_sha256"] = digest(stderr)
         except BaseException as exc:
             error = exc
         finally:
@@ -504,7 +537,11 @@ def publish(engine_checkout, output):
                 event(
                     phase + "_returned",
                     returncode=client["returncode"],
-                    log_sha256=digest(log.read_bytes()) if log.exists() else None,
+                    log_sha256=(
+                        digest(log.read_bytes())
+                        if not client_control["cleaning"] and log.exists()
+                        else None
+                    ),
                     client=client,
                 )
             except BaseException as exc:
@@ -640,7 +677,7 @@ def publish(engine_checkout, output):
         assert container["Config"]["Image"] == BUILDKIT
         owned_id = container["Id"]
         state["owned_builder_container_id"] = owned_id
-        write_json(record, state)
+        persist()
         actual = container["HostConfig"]
         assert (
             actual["CpuQuota"],
@@ -777,7 +814,7 @@ def publish(engine_checkout, output):
         pin = publication["containerimage.digest"]
         assert re.fullmatch(r"sha256:[0-9a-f]{64}", pin)
         state.update(published_candidate=image, candidate_digest=pin, actual_metadata=publication)
-        write_json(record, state)
+        persist()
         event("candidate_metadata_read_submitted", image=image, digest=pin)
         candidate = image_identity(
             "ghcr.io/smg-project/smg",
@@ -864,9 +901,43 @@ def publish(engine_checkout, output):
             or client_control["pending_signal"] is not None
         ):
             state["status"] = "failed_or_published_incomplete_requires_readback"
-        write_json(record, state)
+        persist()
+        if client_control.get("receipt_failed"):
+            # If durable output failed, retain a bounded fallback on the caller's
+            # existing stderr. Failure of that channel cannot cancel owned teardown.
+            try:
+                print(
+                    json.dumps(
+                        {
+                            "receipt_failures": state.get("receipt_failures", []),
+                            "error_type": state.get("error_type"),
+                            "cleanup_failure": state.get("cleanup_failure"),
+                            "cleanup_verified_stopped_PID0": state.get(
+                                "cleanup_verified_stopped_PID0"
+                            ),
+                            "cleanup_verified_absent": state.get("cleanup_verified_absent"),
+                            "cleanup_clients": [
+                                c
+                                for c in state.get("clients", [])
+                                if c["phase"].startswith("cleanup_")
+                            ],
+                            "cleanup_intents": [
+                                e
+                                for e in state["events"]
+                                if e["phase"].startswith("cleanup_") and "argv" in e
+                            ],
+                        }
+                    ),
+                    file=sys.stderr,
+                )
+            except OSError:
+                state["fallback_receipt_unavailable"] = True
+    if failure is None:
+        failure = client_control.get("receipt_error")
+    if failure is not None:
+        raise failure
     assert (
-        failure is None
+        not client_control.get("receipt_failed")
         and state.get("public_pull_verified")
         and state.get("cleanup_verified_stopped_PID0")
         and state.get("cleanup_verified_absent")

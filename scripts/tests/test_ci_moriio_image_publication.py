@@ -1,4 +1,6 @@
 import ast
+import copy
+import errno
 import importlib.util
 import inspect
 import io
@@ -288,7 +290,10 @@ def actual_client_namespace(directory, hook=None):
     nodes = [
         node
         for node in publish.body
-        if (isinstance(node, ast.FunctionDef) and node.name in {"event", "command", "interrupted"})
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name in {"persist", "event", "command", "interrupted"}
+        )
         or (
             isinstance(node, ast.Assign)
             and any(isinstance(t, ast.Name) and t.id == "client_control" for t in node.targets)
@@ -301,7 +306,15 @@ def actual_client_namespace(directory, hook=None):
         output=output,
         record=output / "result.json",
         state={"events": []},
-        env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            **(
+                {"LD_LIBRARY_PATH": os.environ["LD_LIBRARY_PATH"]}
+                if "LD_LIBRARY_PATH" in os.environ
+                else {}
+            ),
+        },
     )
     exec(
         compile(
@@ -587,6 +600,232 @@ class OwnedClientLifecycle(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "returned receipt"):
                 self.run_owned(directory, ns, "print('finite')")
             self.assert_closed(ns)
+
+
+def exercise_owned_cleanup_fault(directory, fault, *, foreign=False):
+    """Run actual publisher teardown and real harmless clients, never Docker.
+
+    Only the productive try-body is replaced by a fault after exact ownership
+    binding. Command/identity/except/finally and final outcome stay production.
+    """
+    publish = ast.parse(textwrap.dedent(inspect.getsource(p.publish))).body[0]
+    nodes = [
+        copy.deepcopy(node)
+        for node in publish.body
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name
+            in {"persist", "event", "command", "inspect", "verify_owned", "interrupted"}
+        )
+        or (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "client_control" for t in node.targets)
+        )
+    ]
+    operation = next(node for node in publish.body if isinstance(node, ast.Try))
+    operation = copy.deepcopy(operation)
+    operation.body = ast.parse("write_json(record, state)").body
+    tail = publish.body[
+        publish.body.index(next(n for n in publish.body if isinstance(n, ast.Try))) + 1 :
+    ]
+    output = Path(directory)
+    state = {"events": [], "public_pull_verified": True, "owned_builder_container_id": "a" * 64}
+    namespace = dict(
+        p.__dict__,
+        output=output,
+        record=output / "result.json",
+        state=state,
+        start=time.monotonic(),
+        deadline=time.monotonic() + 15,
+        builder="smg-moriio-123-1",
+        name="buildx_buildkit_smg-moriio-123-10",
+        owned_id="a" * 64,
+        creation_submitted=True,
+        docker=["docker"],
+        failure=None,
+        env={
+            "PATH": "/usr/bin:/bin",
+            **(
+                {"LD_LIBRARY_PATH": os.environ["LD_LIBRARY_PATH"]}
+                if "LD_LIBRARY_PATH" in os.environ
+                else {}
+            ),
+        },
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
+            "<exact publisher cleanup closures>",
+            "exec",
+        ),
+        namespace,
+    )
+    actual_write = p.write_json
+    calls, children = [], []
+    interrupted = False
+    actual_open = Path.open
+
+    def record_write(path, value):
+        nonlocal interrupted
+        if path == namespace["record"]:
+            if fault == "persistent":
+                raise OSError(errno.ENOSPC, "original persistent receipt fault")
+            if fault == "interrupt" and not interrupted:
+                interrupted = True
+
+                def partial(value, stream, **kwargs):
+                    stream.write('{"partial":')
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    raise AssertionError("SIGTERM handler did not stop the direct write")
+
+                with mock.patch.object(p.json, "dump", side_effect=partial):
+                    return actual_write(path, value)
+        return actual_write(path, value)
+
+    def open_with_failed_log(path, *args, **kwargs):
+        if fault == "persistent" and path.suffix == ".log":
+            raise OSError(errno.ENOSPC, "persistent owned log fault")
+        return actual_open(path, *args, **kwargs)
+
+    actual_popen = subprocess.Popen
+
+    def harmless_client(argv, **kwargs):
+        calls.append(list(argv))
+        assert argv[0] == "docker"
+        if argv[1] == "inspect":
+            stopped = any(a[1] == "stop" for a in calls)
+            payload = json.dumps(
+                [
+                    {
+                        "Id": "a" * 64,
+                        "Name": "/" + namespace["name"],
+                        "Config": {"Image": "foreign" if foreign else p.BUILDKIT},
+                        "State": {"Running": not stopped, "Pid": 0 if stopped else 123},
+                    }
+                ]
+            )
+        elif argv[1] == "stop":
+            assert argv == ["docker", "stop", "--time", "5", "a" * 64]
+            payload = "stopped"
+        elif argv[1:3] == ["buildx", "rm"]:
+            assert argv == ["docker", "buildx", "rm", namespace["builder"]]
+            payload = "removed"
+        elif argv[1] == "ps":
+            assert "id=" + "a" * 64 in argv
+            payload = ""
+        else:
+            raise AssertionError("No productive or unknown Docker command is allowed")
+        child = actual_popen(
+            [sys.executable, "-I", "-S", "-B", "-c", "print(" + repr(payload) + ")"], **kwargs
+        )
+        children.append(child)
+        return child
+
+    error = None
+    handlers = {
+        sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)
+    }
+    for sig in handlers:
+        signal.signal(sig, namespace["interrupted"])
+    try:
+        with (
+            mock.patch.object(p, "write_json", side_effect=record_write),
+            mock.patch.object(Path, "open", open_with_failed_log),
+            mock.patch.object(p.subprocess, "Popen", side_effect=harmless_client),
+        ):
+            namespace["write_json"] = p.write_json
+            exec(
+                compile(
+                    ast.fix_missing_locations(ast.Module(body=[operation, *tail], type_ignores=[])),
+                    "<exact publisher finally and outcome>",
+                    "exec",
+                ),
+                namespace,
+            )
+    except BaseException as exc:
+        error = exc
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for sig, previous in handlers.items():
+            signal.signal(sig, previous)
+        for child in children:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=3)
+            try:
+                os.killpg(child.pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError("test-owned client group survived")
+    print(
+        json.dumps(
+            {
+                "cleanup_fault": fault,
+                "foreign": foreign,
+                "actual_Docker_argv_mapped_to_harmless_clients": calls,
+                "children_reaped": all(c.returncode is not None for c in children),
+                "error": type(error).__name__ if error else None,
+                "message": str(error),
+                "state": state,
+            }
+        )
+    )
+    return namespace, calls, error
+
+
+class ReceiptFaultCleanup(unittest.TestCase):
+    def test_interrupted_record_retains_original_error_and_cleans_exact_builder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "interrupt")
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIn("publisher interrupted " + str(signal.SIGTERM), str(error))
+            self.assertTrue(ns["state"].get("cleanup_verified_absent"))
+            self.assertIn(["docker", "stop", "--time", "5", "a" * 64], calls)
+            self.assertFalse(list(Path(directory).glob("result*.new")))
+
+    def test_persistent_receipt_and_log_fault_still_stops_and_removes_owned_builder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "persistent")
+            self.assertIsInstance(error, OSError)
+            self.assertIn("original persistent receipt fault", str(error))
+            self.assertTrue(ns["state"].get("cleanup_verified_absent"))
+            self.assertIn(["docker", "buildx", "rm", "smg-moriio-123-1"], calls)
+            self.assertTrue(ns["state"].get("receipt_failures"))
+            self.assertTrue(
+                all(c["reaped"] and c["PG_gone"] is True for c in ns["state"]["clients"])
+            )
+
+    def test_failed_receipt_does_not_authorize_foreign_builder_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "persistent", foreign=True)
+            self.assertIsInstance(error, OSError)
+            self.assertTrue(ns["state"].get("cleanup_failure"))
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertTrue(any(a[1] == "inspect" for a in calls))
+            self.assertFalse(any(a[1] in {"stop", "buildx"} for a in calls))
+
+    def test_receipt_failure_refuses_later_productive_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with mock.patch.object(p, "write_json", side_effect=OSError("writer fault")):
+                ns["write_json"] = p.write_json
+                with self.assertRaises(OSError):
+                    ns["event"]("prior_receipt")
+            with mock.patch.object(p.subprocess, "Popen") as spawn:
+                with self.assertRaisesRegex(RuntimeError, "receipt"):
+                    ns["command"]("full_build", ["not-executed"])
+                spawn.assert_not_called()
+
+    def test_healthy_cleanup_and_old_unrelated_temp_are_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stale = Path(directory) / "result.new"
+            stale.write_text("unrelated old file")
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "healthy")
+            self.assertIsNone(error)
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
+            self.assertEqual(stale.read_text(), "unrelated old file")
+            self.assertTrue(calls)
 
 
 if __name__ == "__main__":
