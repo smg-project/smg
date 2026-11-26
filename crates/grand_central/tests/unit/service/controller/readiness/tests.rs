@@ -126,6 +126,62 @@ fn the_role_is_the_fences_at_the_instant_of_the_read() {
     assert_eq!(readiness.state(), State::Draining);
 }
 
+/// The teller's read names the term the fence holds from the first take
+/// on: a take lands ahead of the serve's turn to serving, and the fence
+/// admits a watch from the take. A serve that drains leads none under
+/// the same open fence: a leader that leaves says so before its fence
+/// closes. The candidate is alone over its lease, so its take leads at
+/// once.
+#[test]
+fn the_tellers_read_names_the_fences_term_from_the_take_until_the_drain() {
+    // A take, and renewals ahead of the clock, each just short of the
+    // deadline the one before it stamped: the fence stays open seconds
+    // past the take, so a thread held on a loaded host reads the term.
+    fn take(elector: &mut Elector, term: u64) {
+        let deadline = ElectionSettings::default().renew_deadline;
+        let mut renewed = Instant::now();
+        assert_eq!(
+            elector.tick(renewed).expect("the take"),
+            TickOutcome::Acquired { term }
+        );
+        for _ in 0..10 {
+            renewed += deadline - Duration::from_millis(10);
+            assert_eq!(
+                elector.tick(renewed).expect("the renewal"),
+                TickOutcome::Renewed { term }
+            );
+        }
+    }
+    let (mut elector, phase, _steps, readiness) = fenced();
+    assert_eq!(readiness.led().0, None, "no lease is held");
+
+    take(&mut elector, 1);
+    assert_eq!(readiness.state(), State::Starting);
+    assert_eq!(
+        readiness.led().0,
+        Some(1),
+        "a serve still starting leads the term its fence holds"
+    );
+    // A second take under the same start: the read names that term.
+    assert!(elector.release().expect("a release"));
+    assert_eq!(readiness.led().0, None, "a lease let go leads none");
+    take(&mut elector, 2);
+    assert_eq!(readiness.state(), State::Starting);
+    assert_eq!(readiness.led().0, Some(2));
+
+    phase.send_replace(Phase::Serving);
+    assert_eq!(readiness.state(), State::Leader);
+    assert_eq!(readiness.led().0, Some(2));
+
+    phase.send_replace(Phase::Draining);
+    assert_eq!(
+        elector.fence().leader_term(Instant::now()),
+        Some(2),
+        "the fence is still open"
+    );
+    assert_eq!(readiness.led().0, None, "a serve that drains leads none");
+}
+
 #[test]
 fn a_fence_past_its_deadline_reads_as_a_follower_though_no_step_said_so() {
     let (mut elector, phase, _steps, readiness) = fenced();

@@ -1234,6 +1234,11 @@ impl Controller {
 /// included; told at the change alone, the drain would leave that watch
 /// open to the end of the grace period.
 ///
+/// The word is the fence's from the first take on ([`Readiness::led`]). A
+/// take lands ahead of the serve's turn to serving, and a move in between
+/// tells the term: told once more that nobody leads here, a watch the
+/// fence admitted in that moment would end under a lead that stands.
+///
 /// The word names the term led, and a term is told once. A release and the
 /// take behind it can both fall between two reads of this loop: the replica
 /// leads at each read, under another term at the second. That term is
