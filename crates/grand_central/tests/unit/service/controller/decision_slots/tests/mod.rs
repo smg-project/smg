@@ -59,7 +59,7 @@ use crate::{
         MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
-    worker_host::{stand, Members, Objects},
+    worker_host::{tests::stand, Members, Objects},
 };
 
 pub(crate) mod encode;

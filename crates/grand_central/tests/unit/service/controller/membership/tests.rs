@@ -31,10 +31,13 @@ use crate::{
         WorkerStatus, WorkersStore,
     },
     worker_host::{
-        check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-        check_one_row, check_provider, check_rank_rows, check_refresh, FindOne,
+        tests::{
+            check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
+            check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows,
+            StoreDoor,
+        },
         MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Precondition, Remover,
-        RowRevision, Rows, Stated, StoreDoor,
+        RowRevision, Stated,
     },
 };
 

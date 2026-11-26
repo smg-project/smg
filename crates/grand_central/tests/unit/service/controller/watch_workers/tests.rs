@@ -40,7 +40,7 @@ use crate::{
         Journal, LeasesStore, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts,
         WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
-    worker_host::{stand, Members, Objects},
+    worker_host::{tests::stand, Members, Objects},
 };
 
 /// A replica that leads under term 1, its store standing in that term.

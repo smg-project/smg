@@ -12,7 +12,7 @@ use crate::{
         Affinity, PoolAffinity,
     },
     store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkersStore},
-    worker_host::{objects::stored_chain, Members},
+    worker_host::{objects::tests::stored_chain, Members},
 };
 
 const MODEL: &str = "m";

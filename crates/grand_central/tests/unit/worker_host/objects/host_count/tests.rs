@@ -10,7 +10,7 @@ use crate::{
         WorkerFacts, WorkerPatch,
     },
     tracking::lease::{Lease, LeaseId, Outcome, TransportClass},
-    worker_host::{objects::lay_standing, Members},
+    worker_host::{objects::tests::lay_standing, Members},
 };
 
 const A: &str = "http://a:8000";

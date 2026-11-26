@@ -14,6 +14,7 @@ use smg_worker::{
 use tokio::sync::broadcast::Receiver;
 
 use super::*;
+pub(crate) use super::{status::tests::stand, write::tests::lay_standing};
 use crate::{
     store::{
         GatewayId, MembershipChange, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch,
