@@ -3075,6 +3075,38 @@ fn a_models_first_block_decides_the_next_request_by_the_index() {
     assert_eq!(by_index.tree, None, "no tree's match under the index");
 }
 
+/// A model's first block names a single request its young worker. The
+/// host lends its index while it holds no block, as a gateway lends its
+/// own from a model's first enrolment, and a worker admitted beside older
+/// ones is named no warming row: the warm-up catches a worker up to what
+/// the index of cache events holds. Once another worker's events store a
+/// block, the next decision finds the index's word moved, reads the table
+/// again inside its second and names the young worker by its age. The
+/// classic policy calls its warm-up slice on its road of cache events
+/// alone, which it takes once the index holds a block
+/// (`model_gateway/src/policies/cache_aware.rs:1802-1808`).
+#[test]
+fn a_models_first_block_names_a_single_request_its_young_worker() {
+    let (affinity, index, _tree) = lending_whenever();
+    let mut bed = Bed::new(affinity, warming_by(1), 7);
+    // Seven workers are older than the window of one second, and the
+    // eighth is admitted now.
+    thread::sleep(Duration::from_millis(1_100));
+    bed.workers.push(ready_worker(&address(7), MODEL));
+    bed.ids.push(WorkerId(8));
+    let asked = prompt(50_000, 2);
+    let warming = || {
+        let named = bed.decide(&request(&asked, 7, NOW), None);
+        named.map_or_else(Vec::new, |rows| rows.warming)
+    };
+    assert!(warming().is_empty(), "under an index that holds no block");
+    // The events of a worker outside the list store a prompt: the model's
+    // index holds a block and no worker of the list holds one. The next
+    // decision, at the same instant, names the young worker.
+    store(&index, 9, &hashes_of(&prompt(1_000, 8)));
+    assert_eq!(warming(), [7], "from the model's first block");
+}
+
 /// The last block's leaving returns the next request to the tree. While
 /// the index holds a block it decides alone, and a pick is written to no
 /// tree. Once its last block left, the next decision finds the word moved,

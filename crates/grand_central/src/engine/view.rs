@@ -552,7 +552,8 @@ pub struct AffinityRows<'a> {
     pub holders: &'a [AffinityHolder],
     /// The pool's warming rows, ascending, by the warm-up stage's rule as
     /// the host applied it: the thin whatever the fleet's age, else the
-    /// young unless every row is young.
+    /// young unless every row is young. The in-process engine names none
+    /// while the model's index of cache events holds no block.
     pub warming: &'a [u32],
     /// The warming rows are the thin.
     pub thin: bool,

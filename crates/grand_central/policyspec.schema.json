@@ -816,7 +816,7 @@
       "additionalProperties": false
     },
     "WarmupSliceParams": {
-      "description": "The warm-up slice: the share of misses offered to workers whose index is\nstill thin.",
+      "description": "The warm-up slice: the share of misses offered to workers whose index is\nstill thin. A single request warms nobody while the model's index of\ncache events holds no block.",
       "type": "object",
       "properties": {
         "weight": {

@@ -2723,6 +2723,56 @@ fn a_long_conversation_of_text_goes_back_to_its_worker_by_the_string_tree() {
     assert!(moved, "a worker out of the tree holds no prompt");
 }
 
+/// A worker admitted beside older ones takes no turn of a conversation
+/// where its model's workers send no cache events: the warm-up catches a
+/// worker up to what the index of cache events holds, so under an index
+/// that holds no block a single request warms nobody, whatever warm-up
+/// window the settings name, and a turn is placed where the turn before it
+/// was sent.
+#[test]
+fn a_conversation_stays_with_its_worker_beside_a_new_one_where_no_cache_event_came() {
+    use crate::document::routing_settings::{PolicySettings, RoutingSettings};
+    // A window of one second, so that seven workers are older than it
+    // within the case's own time.
+    let settings = RoutingSettings {
+        policy: PolicySettings::of_label("cache_aware").expect("a policy of that name"),
+        worker_warmup_secs: 1,
+        ..RoutingSettings::default()
+    };
+    let mut document = settings.policy_document().expect("the settings translate");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = InProcess::new(spec);
+    let sent = |members: &PublishedList, tokens: &[u32], seed: u64| {
+        let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+        let mut asked = request();
+        asked.facts.seed = seed;
+        hashes.write_to(&mut asked.facts);
+        let decision = decided(&engine, &Asks::of(asked, Some(members))).decision;
+        let pick = decision.pick().expect("a pick");
+        pick.targets.first().expect("a target").position
+    };
+    let mut list: Vec<Arc<dyn Worker>> = (0..7)
+        .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
+        .collect();
+    std::thread::sleep(Duration::from_millis(1_100));
+    let older = PublishedList::new(Arc::from(list.clone()));
+    let mut said: Vec<u32> = (0..4_096).collect();
+    let first = sent(&older, &said, 0);
+    // The eighth worker is admitted now, beside seven older than the window.
+    list.push(ready_worker("http://worker-7:8000", MODEL));
+    let members = PublishedList::new(Arc::from(list));
+    let mut back = 0;
+    for turn in 1..32 {
+        said.extend(turn * 1_000_000..turn * 1_000_000 + 16);
+        back += u32::from(sent(&members, &said, u64::from(turn)) == first);
+    }
+    assert_eq!(
+        back, 31,
+        "the turns that went back beside a worker admitted now"
+    );
+}
+
 /// A pin followed under a host that lends its string tree. The
 /// hand-over of the pin's made answer asks the request's maker for its
 /// text entry, once, and the tree then holds the whole text of a prompt

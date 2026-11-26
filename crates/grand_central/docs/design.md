@@ -4007,9 +4007,10 @@ taken over all of them.
 The engine's profile for `cache_aware` picks with `best` over a sample of 16 (section 7). With its
 `kv-pressure` gate off, the picker draws first over a list of more than 32 workers: at most 32
 draws, until 16 workers are kept (`draw_first` in `stages/pickers.rs`). The host names the
-request's holders and the list's workers in warm-up, at most 16 of each, and they join the drawn
-ones (`join_named` in `engine/framework.rs`). The stages score those workers alone, and the mean
-load is the drawn workers'.
+request's holders and, while the model's index of cache events holds a block, the list's workers
+in warm-up, at most 16 of each, and they join the drawn ones (`join_named` in
+`engine/framework.rs`). The stages score those workers alone, and the mean load is the drawn
+workers'.
 
 So over more than 32 workers a request that follows no holder goes to the best of the drawn and
 the named workers, where classic places it among all.

@@ -959,7 +959,7 @@ bindings:
 
 ### `cache_aware`
 
-Blends warm-up, prefix reuse and least-load. The default KV gate is off. The stock controller reads cache events from each gRPC worker whose row asks for them and names a model, and its decisions read them. There the preset works from the cached prefixes of each worker the index holds a block for, and from worker age and its load monitor's reports. It works from the prefixes sent to every worker for a text request and while the model's index holds no block, and on a pair's side from the prefixes sent to each worker the index holds no block for.
+Blends warm-up, prefix reuse and least-load. The default KV gate is off. The stock controller reads cache events from each gRPC worker whose row asks for them and names a model, and its decisions read them. There the preset works from the cached prefixes of each worker the index holds a block for, and from worker age and its load monitor's reports. It works from the prefixes sent to every worker for a text request and while the model's index holds no block, and on a pair's side from the prefixes sent to each worker the index holds no block for. While the model's index holds no block, a single request warms no worker; a pair's side still warms a young one.
 
 The preset's prefix stage names no source, so it reads `merged`. Set `source: index` to read cache events alone, or `source: predictor` to read sent prefixes alone. A standalone controller's decision reads the cache events of its own workers' streams, as a gateway's does.
 
