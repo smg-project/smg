@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::response::Response;
 use futures::future::try_join_all;
 use llm_multimodal::{ImageDetail, MediaContentPart};
 use prost::Message;
@@ -23,16 +24,17 @@ use uuid::Uuid;
 use crate::{
     config::types::PdPairingMode,
     routers::{
-        common::snapshot::RoutingPool,
+        common::{overload, snapshot::RoutingPool},
         grpc::{
             backend_client::{get_backend_client, BackendClient},
             client::GrpcClient,
             context::{RequestContext, RequestType, WorkerSelection},
             multimodal::{
                 assemble_media_refs, check_forwarded_references, media_plan_chat,
-                media_plan_messages,
+                media_plan_messages, MmRefsError,
             },
             proto_wrapper::ProtoGenerateResponse,
+            utils::tonic_ext::TonicStatusExt,
         },
     },
 };
@@ -43,6 +45,31 @@ pub const CAPABILITY: &str = "sglang_prepared";
 /// Bounded handoff budget for E encode, P layout export, and D admission; once D is
 /// submitted, total decode duration (streaming or buffered) follows `--grpc-request-timeout-secs`.
 const PREPARED_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Maximum total media reference bytes accepted ahead of encoder dispatch (256 MiB encoder
+/// control budget minus 1 MiB protobuf/JSON framing headroom).
+const MAX_MEDIA_REF_BYTES: usize = 255 * 1024 * 1024;
+
+/// Failure preparing a request for SGLang managed EPD, preserving [`MmRefsError`] codes.
+#[derive(Debug)]
+pub(crate) enum PrepareError {
+    /// Media reference validation or assembly refusal with its own stable error code.
+    MediaRefs(MmRefsError),
+    /// SGLang EPD capability or payload-budget refusal.
+    Capability(Status),
+}
+
+impl PrepareError {
+    /// Convert into an HTTP response while preserving `MmRefsError` error codes.
+    pub(crate) fn into_response(self) -> Response {
+        match self {
+            Self::MediaRefs(err) => err.into_response(),
+            Self::Capability(status) => {
+                status.to_http_error("sglang_epd_capability", status.message().to_owned())
+            }
+        }
+    }
+}
 
 /// Tonic URIs use HTTP schemes; SMG registration uses a plain `grpc://` hint.
 pub(crate) fn worker_registration_url(url: &str) -> String {
@@ -93,11 +120,18 @@ fn compatible_pair(
         && p.kv_backend == d.kv_backend
 }
 
-/// Use the same contracts and pairing rules for readiness and request placement.
-pub(crate) fn pipeline_ready(workers: &[Arc<dyn Worker>], mode: PdPairingMode) -> bool {
+/// Use the same contracts, pairing rules, and overload-fallback semantics for readiness
+/// and request placement.
+pub(crate) fn pipeline_ready(
+    workers: &[Arc<dyn Worker>],
+    mode: PdPairingMode,
+    overload_shed: bool,
+) -> bool {
     let workers: Vec<_> = workers
         .iter()
-        .filter(|w| w.is_available())
+        .filter(|w| {
+            w.is_available() || (!overload_shed && overload::vetoed_by_overload_alone(w.as_ref()))
+        })
         .filter_map(|w| capability(w.as_ref()).map(|c| (w, c)))
         .collect();
     let available = |pool: RoutingPool| {
@@ -126,7 +160,7 @@ pub(crate) struct PreparedInput {
 }
 
 /// Only media enters prepared-input; text keeps ordinary Generate semantics.
-pub(crate) fn prepare(ctx: &RequestContext) -> Result<Option<PreparedInput>, Status> {
+pub(crate) fn prepare(ctx: &RequestContext) -> Result<Option<PreparedInput>, PrepareError> {
     let (plan, unsupported_flags) = match &ctx.input.request_type {
         RequestType::Chat(body) => (
             media_plan_chat(&body.messages),
@@ -146,30 +180,29 @@ pub(crate) fn prepare(ctx: &RequestContext) -> Result<Option<PreparedInput>, Sta
             MediaContentPart::AudioUrl { .. }
             | MediaContentPart::AudioBase64 { .. }
             | MediaContentPart::AudioData { .. } => {
-                return Err(Status::invalid_argument(
+                return Err(PrepareError::Capability(Status::invalid_argument(
                     "backend sglang does not support audio inputs",
-                ))
+                )))
             }
             _ => details.push(None),
         }
     }
     let max_items = Limits::default().images;
     if unsupported_flags || details.len() > max_items {
-        return Err(Status::invalid_argument(format!(
+        return Err(PrepareError::Capability(Status::invalid_argument(format!(
             "prepared-input requires at most {max_items} media items without session params or hidden states"
-        )));
+        ))));
     }
-    check_forwarded_references(&plan).map_err(|e| Status::invalid_argument(e.to_string()))?;
-    let refs = assemble_media_refs(&plan).map_err(|e| Status::invalid_argument(e.to_string()))?;
+    check_forwarded_references(&plan).map_err(PrepareError::MediaRefs)?;
+    let refs = assemble_media_refs(&plan).map_err(PrepareError::MediaRefs)?;
     let mut total_bytes: usize = 0;
     for item in &refs.items {
         total_bytes = total_bytes.saturating_add(item.url.len());
     }
-    const MAX_MEDIA_REF_BYTES: usize = 255 * 1024 * 1024;
     if total_bytes > MAX_MEDIA_REF_BYTES {
-        return Err(Status::invalid_argument(
-            "managed media references exceed the 256 MiB encoder control budget",
-        ));
+        return Err(PrepareError::Capability(Status::invalid_argument(
+            "managed media references exceed the 255 MiB control payload limit",
+        )));
     }
     // Hash media references and detail options into a single prompt routing key.
     let mut hasher = Sha256::new();
@@ -255,25 +288,28 @@ impl PreparedInput {
             processor_contract: p.processor_contract,
             layout_contract: LAYOUT.into(),
         };
-        let (mut images, mut image_details, mut videos) = (Vec::new(), Vec::new(), Vec::new());
-        for (item, detail) in self.refs.items.iter().zip(&self.details) {
+        let (mut image_urls, mut image_details, mut video_urls) =
+            (Vec::new(), Vec::new(), Vec::new());
+        for (item, detail) in self.refs.items.into_iter().zip(self.details) {
             if item.modality == common::Modality::Video as i32 {
-                videos.push(item);
+                video_urls.push(item.url);
             } else {
-                images.push(item);
-                image_details.push(*detail);
+                image_urls.push(item.url);
+                image_details.push(detail);
             }
         }
-        let num_parts = u32::from(!images.is_empty()) + u32::from(!videos.is_empty());
+        let image_count = image_urls.len() as u32;
+        let video_count = video_urls.len() as u32;
+        let num_parts = u32::from(!image_urls.is_empty()) + u32::from(!video_urls.is_empty());
         let mut requests = Vec::with_capacity(num_parts as usize);
         let push_part = |requests: &mut Vec<EncodeRequest>,
                          modality: &str,
-                         items: &[&vllm::MediaRef],
+                         mm_items: Vec<String>,
                          item_options: Vec<ImageOption>| {
             let part_idx = requests.len() as u32;
             requests.push(EncodeRequest {
                 req_id: format!("{prefill_rid}_local_part_{part_idx}"),
-                mm_items: items.iter().map(|item| item.url.clone()).collect(),
+                mm_items,
                 num_parts,
                 part_idx,
                 prefill_host: p.bootstrap_host.clone(),
@@ -282,7 +318,7 @@ impl PreparedInput {
                 modality: modality.into(),
             });
         };
-        if !images.is_empty() {
+        if !image_urls.is_empty() {
             let has_options = image_details
                 .iter()
                 .any(|detail| matches!(detail, Some(ImageDetail::Low | ImageDetail::High)));
@@ -302,10 +338,10 @@ impl PreparedInput {
             } else {
                 Vec::new()
             };
-            push_part(&mut requests, "image", &images, item_options);
+            push_part(&mut requests, "image", image_urls, item_options);
         }
-        if !videos.is_empty() {
-            push_part(&mut requests, "video", &videos, Vec::new());
+        if !video_urls.is_empty() {
+            push_part(&mut requests, "video", video_urls, Vec::new());
         }
         tracing::debug!(
             logical_request_id = %generation.request_id,
@@ -320,8 +356,8 @@ impl PreparedInput {
             timeout_ms: remaining.as_millis() as u64,
             binding: Some(binding),
             encoder_receive_endpoint: e.receive_endpoint,
-            image_count: images.len() as u32,
-            video_count: videos.len() as u32,
+            image_count,
+            video_count,
         }
         .encode_to_vec();
         generation.mm_inputs = None;
@@ -598,8 +634,18 @@ mod tests {
     #[test]
     fn pipeline_ready_and_build_enforce_contract_and_pairing_compatibility() {
         let ok = ready_workers(|role| worker_with_contract(role, RuntimeType::Sglang, |_| {}));
-        assert!(pipeline_ready(&ok, PdPairingMode::Lenient));
-        assert!(pipeline_ready(&ok, PdPairingMode::Off));
+        assert!(pipeline_ready(&ok, PdPairingMode::Lenient, false));
+        assert!(pipeline_ready(&ok, PdPairingMode::Off, false));
+
+        // Overloaded encoders remain ready when `--worker-overload-shed` is off (steering-only),
+        // matching selection's overload fallback, and report not-ready when shedding is enabled.
+        let overloaded_registry = crate::routers::common::snapshot::WorkerRegistry::new();
+        for w in &ok {
+            overloaded_registry.register(Arc::clone(w)).unwrap();
+        }
+        overloaded_registry.set_worker_overloaded(&ok[0], true);
+        assert!(pipeline_ready(&ok, PdPairingMode::Lenient, false));
+        assert!(!pipeline_ready(&ok, PdPairingMode::Lenient, true));
 
         let mismatched_kv = ready_workers(|role| {
             worker_with_contract(role, RuntimeType::Sglang, |cap| {
@@ -608,7 +654,7 @@ mod tests {
                 }
             })
         });
-        assert!(!pipeline_ready(&mismatched_kv, PdPairingMode::Off));
+        assert!(!pipeline_ready(&mismatched_kv, PdPairingMode::Off, false));
         assert_eq!(
             prepared()
                 .build(&mut base_gen_request(), &selection(mismatched_kv))
@@ -627,7 +673,8 @@ mod tests {
         });
         assert!(!pipeline_ready(
             &mismatched_embedding,
-            PdPairingMode::Lenient
+            PdPairingMode::Lenient,
+            false
         ));
     }
 
@@ -688,13 +735,15 @@ mod tests {
         assert_eq!(encoder.load(), 0);
     }
 
-    fn prepare_chat_json(value: serde_json::Value) -> Result<Option<PreparedInput>, Status> {
+    fn prepare_chat_json(value: serde_json::Value) -> Result<Option<PreparedInput>, PrepareError> {
         let req = Arc::new(serde_json::from_value(value).unwrap());
         let ctx = RequestContext::for_chat(req, None, "qwen3-vl".into(), test_components());
         prepare(&ctx)
     }
 
-    fn prepare_messages_json(value: serde_json::Value) -> Result<Option<PreparedInput>, Status> {
+    fn prepare_messages_json(
+        value: serde_json::Value,
+    ) -> Result<Option<PreparedInput>, PrepareError> {
         let req = Arc::new(serde_json::from_value(value).unwrap());
         let ctx = RequestContext::for_messages_carrying_its_tools(
             req,
@@ -867,14 +916,33 @@ mod tests {
             ("video", 1, 2, 0)
         );
 
-        for bad in [
-            serde_json::json!({"model": "qwen3-vl", "return_hidden_states": true, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}]}]}),
-            serde_json::json!({"model": "qwen3-vl", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": " https://example.test/a.png"}}]}]}),
-            serde_json::json!({"model": "qwen3-vl", "messages": [{"role": "user", "content": [{"type": "video_url", "video_url": {"url": "https://example.test/a.mp4", "fps": 2.0}}]}]}),
-            serde_json::json!({"model": "qwen3-vl", "messages": [{"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": "https://example.test/a.wav"}}]}]}),
+        for (bad, expect_capability) in [
+            (
+                serde_json::json!({"model": "qwen3-vl", "return_hidden_states": true, "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}]}]}),
+                true,
+            ),
+            (
+                serde_json::json!({"model": "qwen3-vl", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": " https://example.test/a.png"}}]}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"model": "qwen3-vl", "messages": [{"role": "user", "content": [{"type": "video_url", "video_url": {"url": "https://example.test/a.mp4", "fps": 2.0}}]}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"model": "qwen3-vl", "messages": [{"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": "https://example.test/a.wav"}}]}]}),
+                true,
+            ),
         ] {
             let err = prepare_chat_json(bad).err().unwrap();
-            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            let resp = err.into_response();
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+            let code = crate::routers::error::extract_error_code_from_response(&resp);
+            if expect_capability {
+                assert_eq!(code, "sglang_epd_capability");
+            } else {
+                assert_ne!(code, "sglang_epd_capability");
+            }
         }
     }
 }
