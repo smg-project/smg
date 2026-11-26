@@ -1841,7 +1841,7 @@ def test_current_staging_copies_marker_after_policy_copy_error(tmp_path, monkeyp
         check=False,
         timeout=10,
     )
-    assert (tmp_path / "tau2_artifact" / sidecar.name).read_bytes() == b"owned marker"
+    assert (tmp_path / "tau2_artifact" / sidecar.name).read_bytes() == b""
     assert child.returncode != 0
 
 
@@ -1946,3 +1946,143 @@ def test_startup_quality_controls_remain_diagnostic(tmp_path, monkeypatch, mode)
         seed=300,
     )
     assert run_ab.write_report_and_gate(baseline, candidate, ["retail"], 2, args) == run_ab.EXIT_OK
+
+
+@pytest.mark.parametrize("budget_fault", ["descriptor", "audit"])
+def test_material_postchild_budget_io_is_not_quality_waivable(tmp_path, monkeypatch, budget_fault):
+    descriptor = run_ab.prepare_budget()
+    original = run_ab.budget_guard.read_descriptor
+    launched = []
+
+    def child(cmd, **kwargs):
+        launched.append(cmd)
+        if budget_fault == "descriptor":
+            Path(descriptor["contexts_path"]).unlink()
+        else:
+
+            def refuse_audit(*args):
+                raise OSError("owned postchild audit IO fault")
+
+            monkeypatch.setattr(ledger_class, "audit", refuse_audit)
+        return types.SimpleNamespace(returncode=0)
+
+    # guarded_cli imports Ledger from its private budget module.
+    ledger_class = type(original(descriptor))
+    monkeypatch.setattr(run_ab.subprocess, "run", child)
+    arm = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(arm, tmp_path, budget_descriptor=descriptor)
+    assert len(launched) == 1
+    assert arm.invocations["airline"]["failure_kind"] == "budget_unavailable"
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids={"airline": ["task"]},
+        seed=300,
+    )
+    assert run_ab.write_report_and_gate(arm, run_ab.Arm("smg", ""), ["airline"], 1, args) == 2
+
+
+def test_material_unconfirmed_halt_quarantines_later_domain_and_paired_arm(tmp_path, monkeypatch):
+    descriptor = run_ab.prepare_budget()
+    ledger = run_ab.budget_guard.read_descriptor(descriptor)
+    ledger_class = type(ledger)
+    calls = []
+
+    def child(cmd, **kwargs):
+        calls.append(cmd)
+        ledger.reserve(
+            "owned-pending",
+            "vllm",
+            "openai/gpt-5.2",
+            1,
+            1,
+            num_retries=0,
+            output_limit_verified=True,
+            metadata={"invocation_id": cmd[cmd.index("--invocation") + 1]},
+        )
+        return types.SimpleNamespace(returncode=9)
+
+    def cannot_halt(self):
+        raise OSError("both halt stores unavailable")
+
+    monkeypatch.setattr(run_ab.subprocess, "run", child)
+    monkeypatch.setattr(ledger_class, "halt", cannot_halt)
+    arm = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(arm, tmp_path, budget_descriptor=descriptor)
+    assert arm.invocations["airline"]["scope_quarantined"] is True
+    _run_tau2(arm, tmp_path, domain="retail", budget_descriptor=descriptor)
+    sibling = run_ab.Arm("smg", "http://unused.invalid")
+    _run_tau2(sibling, tmp_path, budget_descriptor=descriptor)
+    assert len(calls) == 1
+    assert arm.invocations["retail"]["failure_kind"] == "scope_quarantined"
+    assert sibling.invocations["airline"]["failure_kind"] == "scope_quarantined"
+    assert ledger.summary()["halted"] is False  # no cross-process halt claim
+
+
+@pytest.mark.parametrize("dangling", [True, False])
+def test_material_staging_records_lexical_stop_without_target_contents(
+    tmp_path, monkeypatch, dangling
+):
+    import os
+    import subprocess
+
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/nightly-tau2.yml"
+    lines = workflow.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if "- name: Stage results for upload" in line)
+    run = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "run: |")
+    end = next(i for i in range(run + 1, len(lines)) if lines[i].startswith("      - name:"))
+    script = "\n".join(line[10:] for line in lines[run + 1 : end])
+    target = tmp_path / "private-target"
+    if not dangling:
+        target.write_bytes(b"must not be uploaded")
+    marker = tmp_path / "ledger.db.fail-stop"
+    marker.symlink_to(target)
+    monkeypatch.setenv("TAU2_BUDGET_LEDGER", str(tmp_path / "ledger.db"))
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    child = subprocess.run(
+        ["/usr/bin/bash", "-e", "-c", script],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        check=False,
+        timeout=10,
+    )
+    captured = tmp_path / "tau2_artifact" / marker.name
+    assert child.returncode == 0
+    assert captured.is_file() and not captured.is_symlink()
+    assert captured.read_bytes() == b""
+
+
+def test_material_healthy_foreign_work_does_not_quarantine_pair(tmp_path, monkeypatch):
+    descriptor = run_ab.prepare_budget()
+    ledger = run_ab.budget_guard.read_descriptor(descriptor)
+    ledger.reserve(
+        "foreign",
+        "smg",
+        "openai/gpt-5.2",
+        1,
+        1,
+        num_retries=0,
+        output_limit_verified=True,
+        metadata={"invocation_id": "foreign"},
+    )
+    calls = []
+
+    def child(cmd, **kwargs):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=9)
+
+    def forbidden_halt(self):
+        pytest.fail("healthy foreign-only work must not halt or quarantine")
+
+    monkeypatch.setattr(run_ab.subprocess, "run", child)
+    monkeypatch.setattr(type(ledger), "halt", forbidden_halt)
+    for name in ("vllm", "smg"):
+        arm = run_ab.Arm(name, "http://unused.invalid")
+        _run_tau2(arm, tmp_path, budget_descriptor=descriptor)
+        assert arm.invocations["airline"]["failure_kind"] == "nonzero_exit"
+        assert "scope_quarantined" not in arm.invocations["airline"]
+    assert len(calls) == 2
+    assert ledger.summary()["halted"] is False

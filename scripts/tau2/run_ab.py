@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
 from dataclasses import dataclass, field
 from math import comb, isfinite
@@ -34,6 +35,16 @@ import guarded_cli as budget_guard
 EXIT_OK = 0
 EXIT_REGRESSION = 1
 EXIT_INCOMPLETE = 2
+
+# Process-local admission latch shared by both arms, never a durable halt proof.
+# Already admitted children can remain in flight. No new scope admissions follow
+# an unconfirmed halt; restarting/reconciliation is an external owner decision.
+_SCOPE_ADMISSION = threading.Lock()
+_QUARANTINED_SCOPES: set[tuple[str, str]] = set()
+
+
+def _scope_identity(descriptor: dict) -> tuple[str, str]:
+    return (os.path.realpath(descriptor["ledger_path"]), descriptor["scope_id"])
 
 
 @dataclass
@@ -385,6 +396,11 @@ def run_tau2(
         return
     arm.budget = budget_descriptor
     try:
+        scope = _scope_identity(budget_descriptor)
+        with _SCOPE_ADMISSION:
+            if scope in _QUARANTINED_SCOPES:
+                fail("scope_quarantined", "budget")
+                return
         ledger = budget_guard.read_descriptor(budget_descriptor)
         if ledger.summary()["halted"]:
             raise budget_guard.BudgetError("Shared paid budget is halted")
@@ -473,7 +489,17 @@ def run_tau2(
                 ledger.halt()
             except (OSError, ValueError) as halt_error:
                 invocation["halt_error"] = type(halt_error).__name__
+                with _SCOPE_ADMISSION:
+                    _QUARANTINED_SCOPES.add(scope)
+                invocation["scope_quarantined"] = True
 
+    # Linearize process-local launch admission, without serializing healthy
+    # subprocess runtimes. This does not revoke already admitted sibling work.
+    with _SCOPE_ADMISSION:
+        if scope in _QUARANTINED_SCOPES:
+            fail("scope_quarantined", "budget")
+            return
+        invocation["launch_admitted"] = True
     try:
         proc = subprocess.run(cmd, env=env, check=False, timeout=(run_timeout or None))
     except subprocess.TimeoutExpired as error:
@@ -493,14 +519,21 @@ def run_tau2(
         # accept partial files the failed command happened to write.
         fail("nonzero_exit", "cli")
         return
+    # Budget provenance IO is an admission/safety failure, not a waivable
+    # missing result or quality diagnostic. Use the retained ledger to stop own
+    # uncertain work even if the descriptor has disappeared since launch.
     try:
-        # B may legitimately be in flight while A returns; only A's requests are
-        # required settled here. The GLOBAL pending/halt gate runs after join/diff.
         own = budget_guard.read_descriptor(budget_descriptor).audit(invocation_id)
-        if own["pending"] or own["unknown"]:
-            stop_unsettled_own_work()
-            fail("invocation_budget_incomplete", "budget")
-            return
+        unsettled = bool(own["pending"] or own["unknown"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        stop_unsettled_own_work()
+        fail("budget_unavailable", "budget", error)
+        return
+    if unsettled:
+        stop_unsettled_own_work()
+        fail("invocation_budget_incomplete", "budget")
+        return
+    try:
         if results_json.is_symlink() or results_json.parent.is_symlink():
             raise ValueError("results must belong to the fresh invocation directory")
         body = results_json.read_bytes()
@@ -932,6 +965,8 @@ def write_report_and_gate(
                 "invocation_budget_incomplete",
                 "invalid_budget",
                 "missing_budget",
+                "scope_quarantined",
+                "budget_unavailable",
             }
             for arm in (baseline, candidate)
             for invocation in arm.invocations.values()

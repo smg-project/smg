@@ -453,3 +453,33 @@ def test_current_halt_fallback_does_not_publish_ahead_of_writer(tmp_path):
                 child.join(8)
         result.close()
         halt_result.close()
+
+
+def test_material_fallback_update_fault_still_publishes_ordered_marker(tmp_path, monkeypatch):
+    import contextlib
+    import sqlite3
+
+    ledger = budget.Ledger(tmp_path / "ledger.db", POLICY)
+    # A real SQLite trigger aborts only the policy UPDATE; acquiring BEGIN
+    # IMMEDIATE and policy validation still succeed as the fallback fence.
+    with ledger._transaction() as db:
+        db.execute(
+            "CREATE TRIGGER refuse_halt BEFORE UPDATE OF halted ON policy "
+            "BEGIN SELECT RAISE(ABORT, 'owned update fault'); END"
+        )
+
+    @contextlib.contextmanager
+    def failed_admission():
+        raise OSError("owned admission fault")
+        yield
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ledger, "_admission", failed_admission)
+        with pytest.raises(budget.BudgetError):
+            ledger.halt()
+    assert Path(str(ledger.path) + ".fail-stop").is_file()
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT halted FROM policy").fetchone() == (0,)
+        db.execute("DROP TRIGGER refuse_halt")
+    with pytest.raises(budget.BudgetError):
+        reserve(ledger, "after-fault")

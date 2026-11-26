@@ -344,8 +344,11 @@ class Ledger:
                 try:
                     with self._transaction() as db:
                         self._halted(db)
-                        db.execute("UPDATE policy SET halted=1 WHERE id=1")
+                        # The writer fence already ordered prior reservations.
+                        # Publish the independent marker even if UPDATE fails;
+                        # a marker failure is collected and still attempts DB.
                         publish_sidecar()
+                        db.execute("UPDATE policy SET halted=1 WHERE id=1")
                 except (OSError, BudgetError) as fallback_error:
                     failures.append(fallback_error)
         if failures:

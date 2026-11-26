@@ -383,3 +383,14 @@ from that failed scope without reconciling its retained evidence. Failure while
 closing the marker is still reported, and does not skip the database stop attempt.
 Evidence staging attempts each available copy, including the fail-stop marker,
 before returning a failure for any unsuccessful copy.
+
+
+An unconfirmed shared halt also quarantines that ledger/scope's subsequent
+launch admissions in the current driver process, across domains and both arms.
+Already admitted children are not revoked by this latch. It is not evidence of
+persistent cross-process shutdown when both ordering/storage paths are unavailable;
+that paid-admission boundary remains unconfirmed until owner reconciliation.
+Post-child budget descriptor/audit IO errors are hard failures even when quality
+diagnostics are allowed. Upload staging records lexical stop-marker presence
+(including dangling links) as an empty regular marker, without reading its target
+or contents; inability to record the marker fails staging.

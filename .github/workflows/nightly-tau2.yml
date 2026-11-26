@@ -528,8 +528,11 @@ jobs:
               cp -- "$source" "$OUT/" || copy_failed=1
             fi
           done
-          if [ -n "${TAU2_BUDGET_LEDGER:-}" ] && [ -f "${TAU2_BUDGET_LEDGER}.fail-stop" ]; then
-            cp -- "${TAU2_BUDGET_LEDGER}.fail-stop" "$OUT/" || copy_failed=1
+          marker="${TAU2_BUDGET_LEDGER:-}.fail-stop"
+          if [ -n "${TAU2_BUDGET_LEDGER:-}" ] && { [ -e "$marker" ] || [ -L "$marker" ]; }; then
+            # Preserve lexical stop presence, including dangling links, without
+            # reading a symlink target or any marker contents into the artifact.
+            : > "$OUT/$(basename -- "$marker")" || copy_failed=1
           fi
           exit "$copy_failed"
       - name: Upload results (summary + scores + transcripts)
