@@ -1033,6 +1033,17 @@ class CurrentBoundaryControls(unittest.TestCase):
             self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
             self.assertFalse(any(a[1:3] == ["buildx", "rm"] for a in calls))
 
+    def test_closed_fallback_stderr_preserves_first_receipt_error(self):
+        closed = io.StringIO()
+        closed.close()
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("sys.stderr", closed):
+                ns, calls, error = exercise_owned_cleanup_fault(directory, "persistent")
+            self.assertIsInstance(error, OSError)
+            self.assertIn("original persistent receipt fault", str(error))
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
+            self.assertTrue(ns["state"]["fallback_receipt_unavailable"])
+
 
 if __name__ == "__main__":
     unittest.main()

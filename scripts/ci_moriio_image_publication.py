@@ -1078,7 +1078,7 @@ def publish(engine_checkout, output):
                     ),
                     file=sys.stderr,
                 )
-            except OSError:
+            except (OSError, ValueError):
                 state["fallback_receipt_unavailable"] = True
     if failure is None:
         failure = client_control.get("receipt_error")
