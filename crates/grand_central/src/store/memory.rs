@@ -39,7 +39,6 @@ use crate::{
             LeaseState, LeasesStore, Sides, WorkerSlot,
         },
         membership::same_worker,
-        reservations::{ReservationKind, ReservationStore},
         snapshot::{
             left_models, micros, OutsideLists, StaleGeneration, StoreSnapshot, Writer,
             PUBLISH_WINDOW,
@@ -95,7 +94,6 @@ pub struct MemoryStore {
     /// is the last lock a writer takes: the workers lock, then the health
     /// lock, then this one.
     loads: Mutex<Loads>,
-    reservations: Mutex<Reservations>,
     /// The files of leases behind their turns, one a decider ([`turn`]).
     files: turn::Files,
     /// The blocks of the leading term's counter, each block's file and the
@@ -204,7 +202,6 @@ impl MemoryStore {
             snapshot_pause: Mutex::default(),
             health: Mutex::default(),
             loads: Mutex::new(Loads { writer }),
-            reservations: Mutex::default(),
             files: turn::Files::one(leases),
             blocks: Blocks::default(),
             world,
@@ -2031,88 +2028,6 @@ impl HealthSink for MemoryStore {
 /// The world's write side, behind its lock.
 struct Loads {
     writer: Writer,
-}
-
-// ----------------------------------------------------------- reservations
-
-/// A gateway's lease: the key a claim is held under.
-type LeaseKey = (GatewayId, LeaseId);
-
-#[derive(Default)]
-struct Reservations {
-    held: FxHashMap<(WorkerId, ReservationKind), u32>,
-    by_lease: FxHashMap<LeaseKey, Vec<(WorkerId, ReservationKind, u32)>>,
-}
-
-impl ReservationStore for MemoryStore {
-    fn window(&self, id: WorkerId, _kind: ReservationKind) -> Option<u32> {
-        // Both kinds read the engine's admission window today; a configured
-        // per-side cap is the host's until the window moves into the store.
-        self.workers.lock().rows.get(&id)?.row.facts.max_running
-    }
-
-    fn try_reserve(
-        &self,
-        gateway: GatewayId,
-        id: WorkerId,
-        kind: ReservationKind,
-        count: u32,
-        lease: LeaseId,
-    ) -> bool {
-        // A worker the store does not know (never registered, or removed) is
-        // refused before its window is read: a missing row is no live worker
-        // without a bound, and a commit racing a removal gets nothing on it.
-        let window = {
-            let workers = self.workers.lock();
-            let Some(row) = workers.rows.get(&id) else {
-                return false;
-            };
-            // Both kinds read the engine's admission window today, as
-            // `window` does.
-            row.row.facts.max_running
-        };
-        let mut reservations = self.reservations.lock();
-        let holds_kind = reservations
-            .by_lease
-            .get(&(gateway, lease))
-            .is_some_and(|held| held.iter().any(|(_, k, _)| *k == kind));
-        if holds_kind {
-            return false;
-        }
-        let held = reservations.held.entry((id, kind)).or_insert(0);
-        let total = held.saturating_add(count);
-        if window.is_some_and(|window| total > window) {
-            return false;
-        }
-        *held = total;
-        reservations
-            .by_lease
-            .entry((gateway, lease))
-            .or_default()
-            .push((id, kind, count));
-        true
-    }
-
-    fn release(&self, gateway: GatewayId, lease: LeaseId) {
-        let mut reservations = self.reservations.lock();
-        let Some(held) = reservations.by_lease.remove(&(gateway, lease)) else {
-            return;
-        };
-        for (id, kind, count) in held {
-            if let Some(total) = reservations.held.get_mut(&(id, kind)) {
-                *total = total.saturating_sub(count);
-            }
-        }
-    }
-
-    fn held(&self, id: WorkerId, kind: ReservationKind) -> u32 {
-        self.reservations
-            .lock()
-            .held
-            .get(&(id, kind))
-            .copied()
-            .unwrap_or(0)
-    }
 }
 
 // ----------------------------------------------------------------- leases

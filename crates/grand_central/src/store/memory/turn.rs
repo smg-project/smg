@@ -128,8 +128,8 @@
 //! waits, and at each other file that shows a watch. A stage that says
 //! nothing is taken as one: a plugin's, whose rule is its own, and a
 //! host's own stage. Each stage of this crate says it is none. The day
-//! the reservations' `try_reserve` gets a caller, or a stage of this
-//! crate sheds on a count or on its book, it takes the same entry.
+//! a stage of this crate sheds on a count or on its book, it takes the
+//! same entry.
 //!
 //! The lock order, written here once: a file's turn is taken first or not
 //! at all, and one turn at a time. The term's rise holds every turn, in
