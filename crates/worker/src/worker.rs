@@ -2168,12 +2168,33 @@ impl WorkerLoadResponse {
     /// Resident context tokens summed across all DP ranks; `None` unless
     /// every rank reports them. A report that lists fewer entries than the
     /// ranks it states answers `None` too, ahead of any sum: the ranks it
-    /// leaves out are in none.
+    /// leaves out are in none. The sum is exact in any order of the ranks,
+    /// in a count wider than a rank's: a sum past either end of what the
+    /// answer holds reads as that end, and nothing wraps.
     pub fn total_resident_tokens(&self) -> Option<i64> {
         if !self.lists_every_rank() {
             return None;
         }
-        self.loads.iter().map(|l| l.num_resident_tokens).sum()
+        // In the ranks' own width while the running sum fits: one add a rank.
+        let mut total = 0i64;
+        for load in &self.loads {
+            match total.checked_add(load.num_resident_tokens?) {
+                Some(sum) => total = sum,
+                None => return self.wide_total_resident_tokens(),
+            }
+        }
+        Some(total)
+    }
+
+    /// [`Self::total_resident_tokens`] for a report whose running sum left
+    /// the ranks' width: the whole sum in a wider count, held at the nearer
+    /// end of what the answer holds.
+    #[cold]
+    fn wide_total_resident_tokens(&self) -> Option<i64> {
+        let total = self.loads.iter().try_fold(0i128, |sum, load| {
+            Some(sum + i128::from(load.num_resident_tokens?))
+        })?;
+        Some(i64::try_from(total).unwrap_or(if total < 0 { i64::MIN } else { i64::MAX }))
     }
 
     /// Total running requests summed across all DP ranks.
