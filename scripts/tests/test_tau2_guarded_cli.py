@@ -1261,3 +1261,78 @@ def test_unified_nested_policy_shapes_raise_budget_error(configured, location, b
     digest = hashlib.sha256(contexts_path.read_bytes()).hexdigest()
     with pytest.raises(gc.BudgetError):
         gc.load_policy(policy_path, contexts_path, digest)
+
+
+@pytest.mark.parametrize(
+    "interrupt", [KeyboardInterrupt, SystemExit], ids=["keyboard_interrupt", "system_exit"]
+)
+def test_interrupted_paid_send_halts_independent_sibling(installed, tmp_path, interrupt):
+    import httpx
+
+    guard, sent = installed
+
+    def interrupted(request):
+        sent.append(json.loads(request.content))
+        raise interrupt("offline interrupted paid send")
+
+    guard.transport_factory = lambda: httpx.MockTransport(interrupted)
+    token = gc.TASK.set(("task0", 0))
+    try:
+        with pytest.raises(interrupt):
+            user_turn()
+    finally:
+        gc.TASK.reset(token)
+    before = {"summary": guard.ledger.summary(), "audit": guard.ledger.audit()}
+    config = tmp_path / "interrupted-policy.json"
+    config.write_text(guard.ledger.config)
+    script = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from budget import Ledger, RunPolicy, Policy, BudgetError
+record=json.loads(open(sys.argv[2]).read())
+config=record['policy']
+config['models']={k:Policy(**v) for k,v in config['models'].items()}
+ledger=Ledger(sys.argv[3], RunPolicy(**config), create=False)
+try:
+ ledger.reserve('interrupted-sibling','smg','openai/gpt-5.2',10,2,
+                num_retries=0,output_limit_verified=True)
+except BudgetError as error:
+ print(json.dumps({'admitted':False,'error':str(error)}))
+else:
+ print(json.dumps({'admitted':True}))
+"""
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(Path(gc.__file__).parent),
+            str(config),
+            str(guard.ledger.path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert child.returncode == 0, child.stderr
+    sibling = json.loads(child.stdout)
+    (tmp_path / "interrupt-witness.json").write_text(
+        json.dumps(
+            {
+                "interrupt": interrupt.__name__,
+                "before_sibling": before,
+                "sibling": sibling,
+                "after_sibling": guard.ledger.summary(),
+            },
+            indent=2,
+        )
+    )
+    assert not sibling["admitted"], sibling
+    assert "halted" in sibling["error"]
+    assert guard.failed and guard.ledger.fail_stop_path.exists()
+    assert len(sent) == 1
+    assert before["audit"]["unknown"] == 1 and before["audit"]["pending"] == 0
+    assert before["summary"]["calls"] == 1 and before["summary"]["halted"]
+    assert guard.ledger.summary()["allocated_nusd"] == before["summary"]["allocated_nusd"]

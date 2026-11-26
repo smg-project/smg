@@ -411,15 +411,18 @@ class Guard:
                         or total != prompt + completion
                     ):
                         raise BudgetError("Unknown total paid usage")
-                except Exception as error:
+                except BaseException as error:
                     outcome["error_type"] = type(error).__name__
                     try:
-                        guard.ledger.finish(request_id, outcome=outcome)
+                        try:
+                            guard.ledger.finish(request_id, outcome=outcome)
+                        finally:
+                            guard.failed = True
+                            # Publish fail-stop even if SQLite cannot record the outcome.
+                            guard.ledger.halt()
                     finally:
-                        guard.failed = True
-                        # Publish the filesystem fail-stop even when SQLite
-                        # cannot record this unknown paid outcome.
-                        guard.ledger.halt()
+                        if not isinstance(error, Exception):
+                            raise error
                     raise
                 guard.ledger.finish(request_id, prompt, completion, outcome=outcome)
                 return response

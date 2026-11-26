@@ -158,28 +158,28 @@ Before invoking the isolated entry, supply these reviewed values using its
 The dependent C change owns the driver environment and `--budget-*` flags.
 No real prices, provider limits or spending approval are supplied here:
 
-- `TAU2_BUDGET_POLICY`: JSON containing `scope_id`, integer `cap_nusd`, `calls`,
+- `--policy`: JSON containing `scope_id`, integer `cap_nusd`, `calls`,
   `calls_per_arm`, and `models` with exactly `openai/gpt-5.2` and
   `openai/gpt-4.1-2025-04-14`. Each model has explicit decimal-string
   `input_per_million` / `output_per_million`, positive integer `input_limit` /
   `output_limit`, and `service_tier: "default"`. `cap_nusd` is billionths of USD.
-- `TAU2_BUDGET_CONTEXTS`: a separately verified provider-contract JSON with
+- `--contexts`: a separately verified provider-contract JSON with
   `schema_version: 1` and `models` keyed by those two model names without the
   `openai/` prefix. Each entry has the complete provider `context_tokens` bound,
   the official `source_url`, and the explicitly reviewed resolved
   `response_models` IDs covered by the same pricing/context contract.
-- `TAU2_BUDGET_CONTEXTS_SHA256`: the independently reviewed SHA256 of the exact
+- `--contexts-sha256`: the independently reviewed SHA256 of the exact
   context file bytes. A URL plus an invented number is not provider evidence.
   The tool does not discover/attest provider limits: real values must be verified
   outside the policy before execution. No real bound is supplied here; fixtures
   use synthetic contracts only. An estimate of the last message's tokens or the
   policy's `input_limit` itself is not a complete input bound.
-- `TAU2_BUDGET_LEDGER`: one absolute SQLite file shared by both arms, every domain
+- `--ledger`: one absolute SQLite file shared by both arms, every domain
   and both sequential score processes. The explicit guarded `--initialize` entry creates it once using an exclusive
   new file before either arm; live scoring, guarded children and saved-score
   acceptance open an existing file only. Do not rerun initialization after loss of a live ledger; restore its state or
   obtain a new scope/approval. An old or missing/incompatible ledger is not reset or silently recreated at acceptance.
-- `TAU2_BUDGET_SCOPE`: the exact approved comparison scope matching the policy.
+- `--scope`: the exact approved comparison scope matching the policy.
   In CI it is `<run_id>:<run_attempt>:<matrix.name>`. Approval is either for
   that exact job or an explicit standing per-job allowance resolved by the guard;
   C owns the nightly configuration and run-identity wiring.
