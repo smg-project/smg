@@ -9,6 +9,13 @@
 //! A bench target of its own: no pull-request gate reads it, and a row
 //! added to the gated `decision` binary would move that binary
 //! (`.github/bench-gates/grand-central-engine.toml`).
+//!
+//! Under the feature `in-process`, one apply of the routing settings'
+//! document with labelled models, each a profile of its own. Ids:
+//! `engine/spec/apply_labelled/<models>` at ten, a hundred and a thousand
+//! models. A row is the check of the document and its apply on a running
+//! engine, which builds each profile's stages and compares them with the
+//! standing ones.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a document that fails to parse is a bug the unit tests catch"
@@ -62,5 +69,50 @@ fn spec_validate_index(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, spec_validate_index);
+/// The routing settings' document with `models` labelled models, each
+/// under round robin, beside a main policy of `random`.
+#[cfg(feature = "in-process")]
+fn labelled(models: usize) -> PolicySpec {
+    use smg_grand_central::document::RoutingSettings;
+    let labels = (0..models)
+        .map(|n| (format!("model-{n:04}"), "round_robin".to_owned()))
+        .collect();
+    RoutingSettings::default()
+        .policy_document_with_labels(&labels)
+        .expect("the labelled document builds")
+}
+
+/// One apply of a labelled document on an engine that runs the same
+/// labels. The check builds every profile's stages. The apply compares
+/// each with the standing one and keeps it.
+#[cfg(feature = "in-process")]
+fn spec_apply_labelled(c: &mut Criterion) {
+    use smg_grand_central::{document::AppliedSpec, engine::InProcess};
+    let mut group = c.benchmark_group("engine/spec");
+    group.sample_size(20);
+    for models in [10, 100, 1_000] {
+        let mut document = labelled(models);
+        let standing = AppliedSpec::validate(&document).expect("the document validates");
+        let engine = InProcess::new(standing);
+        group.bench_with_input(
+            BenchmarkId::new("apply_labelled", models),
+            &models,
+            |b, _| {
+                b.iter(|| {
+                    document.generation += 1;
+                    let next = AppliedSpec::validate(black_box(&document));
+                    engine
+                        .apply(next.expect("the document validates"))
+                        .expect("a later generation");
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "in-process"))]
+fn spec_apply_labelled(_: &mut Criterion) {}
+
+criterion_group!(benches, spec_validate_index, spec_apply_labelled);
 criterion_main!(benches);

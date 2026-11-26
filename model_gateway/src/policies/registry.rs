@@ -1305,8 +1305,7 @@ impl PolicyRegistry {
         let Some(engine) = self.label_engine() else {
             return;
         };
-        let own = self.default_policy_config.name();
-        if self.labels.registered(engine, model_id, hint, own) {
+        if self.labels.registered(engine, model_id, hint) {
             self.read_spec_again(engine);
         }
     }

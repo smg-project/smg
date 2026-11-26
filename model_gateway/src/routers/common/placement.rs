@@ -21,7 +21,7 @@ use axum::{
 use parking_lot::Mutex;
 use rand::RngExt;
 use smg_grand_central::{
-    document::DecodePick,
+    document::{DecodePick, RoutingSettings},
     engine::{
         DecisionEngine, InProcess, LentList, PairAdmission, PairLists, PairSide, Phase,
         PlaceRequest, ShedReason, Unplaced, WorkerLists,
@@ -1394,6 +1394,22 @@ fn row_name(policies: &PolicyRegistry, side: Option<RowSide>, label: &'static st
     )
 }
 
+/// The label a single request's pick is counted and traced under: `label`,
+/// the label of the profile that picked.
+///
+/// A labelled model runs a profile of its own, named for the label's policy
+/// and the model. The crate reads the policy off that name
+/// ([`RoutingSettings::label_policy`]), and the pick is under the policy:
+/// what a classic selection counts it under. So a label adds no value to
+/// the selection metric's `policy` label. Under a supplied document the
+/// label stands as the engine gives it.
+fn counted_label(policies: &PolicyRegistry, label: &'static str, model_id: &str) -> &'static str {
+    if policies.runs_supplied_document() {
+        return label;
+    }
+    RoutingSettings::label_policy(label, model_id).unwrap_or(label)
+}
+
 /// Observes the match ratio a classic cache-aware selection observes of the
 /// worker it chose ([`Metrics::record_cache_aware_match_ratio`]): the share
 /// of the request's blocks a placement states its worker holds
@@ -1485,10 +1501,11 @@ fn placed_by_engine(
             return None;
         }
     };
-    let counted_under = if placement.profile.is_empty() {
+    let label = counted_label(policies, placement.profile, model_id);
+    let counted_under = if label.is_empty() {
         policies.policy_name()
     } else {
-        placement.profile
+        label
     };
     Metrics::record_worker_selection(
         metrics_labels::WORKER_REGULAR,
@@ -1497,7 +1514,7 @@ fn placed_by_engine(
         counted_under,
     );
     observe_match_ratio(placement.overlap.blocks, placement.overlap.of);
-    let named = || row_name(policies, None, placement.profile);
+    let named = || row_name(policies, None, label);
     engine_row(seen, named, Some(&placement.worker));
     // A placement is moved whole only where the engine is owed the request's
     // events and keeps its side: of every other the worker is taken in place.

@@ -687,32 +687,43 @@ impl RoutingSettings {
     /// preset. Its host resolves a label's spelling to that name, and says
     /// which registration's label stands for a model and until when.
     ///
-    /// A label's binding is one, of its model alone, right ahead of the
-    /// binding of every model's single requests and behind a pair's or an
-    /// encode's, in the order of the models' ids. The binding is the one
-    /// these settings would say for single requests under that policy, at
-    /// the settings a label builds it with ([`PolicySettings::of_label`]):
-    /// the policy's own key sources and session rule, the sticky override's
-    /// rule where the override places the policy, the warm-up settings in
-    /// its profile, and the settings' overload block. The settings' own
-    /// profiles are named for a side or for the main policy, and a label's
-    /// for its policy. So one profile serves every model that names one
-    /// policy, and no name holds two.
+    /// A label's binding is one, of its model alone. It stands right ahead
+    /// of the binding of every model's single requests and behind a pair's
+    /// or an encode's, in the order of the models' ids.
     ///
-    /// Models that share a profile run the same stages, so a stage that
-    /// keeps a history of its own keeps one for all of them. Two stock
-    /// stages keep one: round robin draws the start of a list it sees first
-    /// from a count of its own, and the cache-aware warm-up counts its
-    /// misses and its hits and marks a shallow hit. A model whose label
-    /// names the main policy shares the main profile's the same way. A
-    /// gateway's own registry builds a policy for each labelled model, so
-    /// there each model keeps its own. That difference stays while one
-    /// profile serves every model of a policy.
+    /// The binding is the one these settings would say for single requests
+    /// under that policy, at the settings a label builds it with
+    /// ([`PolicySettings::of_label`]). It holds the policy's own key sources
+    /// and session rule, and the sticky override's rule where the override
+    /// places the policy. The warm-up settings stand in its profile, and
+    /// the settings' overload block on the binding.
+    ///
+    /// The settings' own profiles are named for a side or for the main
+    /// policy. A label's is named for its policy and its model
+    /// ([`Self::label_profile`]), so each labelled model has a profile of
+    /// its own.
+    ///
+    /// A profile's stages are its own. So a stage that keeps a history
+    /// keeps one for each labelled model, as a gateway's own registry
+    /// builds a policy for each. Models with no label share the main
+    /// policy's profile, as they share the registry's default policy.
+    ///
+    /// Two stock stages keep a history. Round robin draws the start of a
+    /// list it sees first from a count of its own. The cache-aware warm-up
+    /// counts its misses and its hits and marks a shallow hit.
+    ///
+    /// A label that names the main policy is a label too. Its model gets a
+    /// profile of its own with the settings' options: the main profile's
+    /// text under the label's name. Its binding is the one of every model's
+    /// single requests, for that model alone. One exception stands: where
+    /// no binding can name the model's id alone, that label adds nothing,
+    /// and the model runs the main policy's profile.
+    ///
+    /// The spec holds 65,535 profiles at most. A label whose profile would
+    /// be one more is refused by its model and its policy.
     ///
     /// Some labels add nothing. With no label this is
-    /// [`Self::policy_document`]. A label that names the main policy leaves
-    /// its model under the main policy's profile, with the settings'
-    /// options, whatever the model's id. And where the settings' document
+    /// [`Self::policy_document`]. And where the settings' document
     /// binds no single request, no label is bound: a model's own binding
     /// would place the requests that document refuses. A label's id and its
     /// name are checked there as everywhere. What its binding would cost
@@ -776,6 +787,34 @@ impl RoutingSettings {
             },
         };
         written_with(self, plan, &labels)
+    }
+
+    /// The name of the profile a labelled model runs: the label's policy, a
+    /// colon, and the model's id.
+    ///
+    /// No policy's name holds a colon, so the first colon parts the two,
+    /// whatever the id holds. So no two labelled models share a name. None
+    /// takes a name of the settings' own profiles either: those are named
+    /// for a side or for the main policy, and hold no colon.
+    ///
+    /// A host that needs the name asks here and spells the rule nowhere
+    /// itself.
+    #[must_use]
+    pub fn label_profile(policy: &str, model: &str) -> String {
+        format!("{policy}:{model}")
+    }
+
+    /// The policy a labelled model's profile is named for. It is read off
+    /// the name by the rule of [`Self::label_profile`]: the text ahead of
+    /// the first colon, where `model`'s id stands behind it.
+    ///
+    /// `None` for a name with no colon, as the settings' own profiles
+    /// bear, and for the profile of another model. A host counts a
+    /// labelled model's requests under its label's policy this way.
+    #[must_use]
+    pub fn label_policy<'a>(profile: &'a str, model: &str) -> Option<&'a str> {
+        let (policy, id) = profile.split_once(':')?;
+        (id == model).then_some(policy)
     }
 
     /// The document a gateway of these settings runs. Without a supplied
@@ -947,42 +986,50 @@ fn refuse_unsupported(config: &RoutingSettings) -> Result<(), RoutingSettingsErr
     Ok(())
 }
 
-/// A model whose worker's `policy` label names a policy, with that policy
+/// A model whose worker's `policy` label names a policy, with the policy
+/// its profile is written from. A label that names the main policy takes
+/// the settings' own, with their options. Any other name takes its policy
 /// as a label builds it ([`PolicySettings::of_label`]).
 type Labelled<'a> = (&'a str, PolicySettings);
 
-/// The labels a document binds, in the order of their models' ids. A label
-/// that names the main policy is none of them, whatever its model: that
-/// model runs the main policy's profile already, with the settings'
-/// options. Of the others, a model's id no binding can name alone is
-/// refused, and so is a name with no preset.
+/// The labels a document binds, in the order of their models' ids. A
+/// model's id no binding can name alone is refused, and so is a name with
+/// no preset.
+///
+/// One label is left out and refuses nothing: the main policy's own name
+/// on such an id. Its model runs the main policy's profile already, with
+/// the settings' options.
 fn labelled<'a>(
     config: &RoutingSettings,
     labels: &'a BTreeMap<String, String>,
 ) -> Result<Vec<Labelled<'a>>, RoutingSettingsError> {
     let mut bound = Vec::with_capacity(labels.len());
     for (model, name) in labels {
-        let refused = |reason: String| RoutingSettingsError::Label {
+        let refused = |reason: &str| RoutingSettingsError::Label {
             model: model.clone(),
             policy: name.clone(),
-            reason,
+            reason: reason.to_owned(),
         };
-        if name == config.policy.name() {
-            continue;
+        let main = name == config.policy.name();
+        let unnamed = if model.is_empty() {
+            Some("a binding names its model by the model's id, and this id is empty")
+        } else if model.contains('*') {
+            Some("a binding reads a `*` at the start or the end of a model's name as a pattern and the document refuses one anywhere else, so no binding names this model alone")
+        } else {
+            None
+        };
+        if let Some(reason) = unnamed {
+            if main {
+                continue;
+            }
+            return Err(refused(reason));
         }
-        if model.is_empty() {
-            return Err(refused(
-                "a binding names its model by the model's id, and this id is empty".to_owned(),
-            ));
-        }
-        if model.contains('*') {
-            return Err(refused(
-                "a binding reads a `*` at the start or the end of a model's name as a pattern and the document refuses one anywhere else, so no binding names this model alone"
-                    .to_owned(),
-            ));
-        }
-        let policy = PolicySettings::of_label(name)
-            .ok_or_else(|| refused(SpecError::UnknownPreset(name.clone()).to_string()))?;
+        let policy = if main {
+            config.policy.clone()
+        } else {
+            PolicySettings::of_label(name)
+                .ok_or_else(|| refused(&SpecError::UnknownPreset(name.clone()).to_string()))?
+        };
         bound.push((model.as_str(), policy));
     }
     Ok(bound)

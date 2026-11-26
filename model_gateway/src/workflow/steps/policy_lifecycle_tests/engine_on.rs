@@ -53,18 +53,16 @@ pub(super) fn app_context(mut config: RouterConfig) -> Arc<AppContext> {
     Arc::new(context)
 }
 
-/// The policy a label gave `model`: the policy of the profile that places
-/// the model's single requests under the spec in force, by its preset's
-/// name. `None` where the settings' own profile places them, as before the
+/// The policy a label gave `model`: the policy that the profile which
+/// places the model's single requests is named for, read by the crate's
+/// rule. `None` where the settings' own profile places them, as before the
 /// model's first label and behind its last worker.
 pub(super) fn policy_of(app_context: &AppContext, model: &str) -> Option<&'static str> {
     let policies = &app_context.policy_registry;
     assert_eq!(policies.classic_made_or_asked(), 0, "no policy object");
     let placing = policies.placing_profile(model)?;
-    let own = app_context.router_config.policy.name();
-    PRESETS
-        .into_iter()
-        .find(|name| *name == placing && *name != own)
+    let policy = smg_grand_central::document::RoutingSettings::label_policy(&placing, model)?;
+    PRESETS.into_iter().find(|name| *name == policy)
 }
 
 /// Runs `case`, a case of the parent, with the engine on. The case must
