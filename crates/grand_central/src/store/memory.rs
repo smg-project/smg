@@ -331,7 +331,9 @@ impl MemoryStore {
     /// the worker it was, and another worker's pins leave. A key the cut
     /// drops is filed as gone by this store's own clock, as a followed
     /// removal files it. A worker still present keeps its count
-    /// slot, admission instant and gateway vetoes.
+    /// slot and gateway vetoes. Its row is the cut's, the admission instant
+    /// too: a holder of worker objects states the instant it keeps on the
+    /// cut's row before it hands the cut here (`Objects::watch_from`).
     ///
     /// Returns `false` with the store as it was if the journal refuses the
     /// snapshot's place.
@@ -380,7 +382,7 @@ impl MemoryStore {
             workers.by_key.clear();
             workers.epoch = cut.epoch;
             workers.rows.reserve(cut.rows.len());
-            for mut row in cut.rows {
+            for row in cut.rows {
                 let id = row.id;
                 workers.by_key.insert(row.facts.key.clone(), id);
                 let kept = if keep_local {
@@ -389,7 +391,6 @@ impl MemoryStore {
                     None
                 };
                 let held = if let Some(kept) = kept {
-                    row.admitted_at = kept.row.admitted_at;
                     Row { row, ..kept }
                 } else {
                     Row {

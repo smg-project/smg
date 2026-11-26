@@ -188,15 +188,14 @@ impl Held {
 /// which carries the standing object's running state over. An entry's
 /// revision never moves under an object that stands.
 ///
-/// With a keeper ([`Self::with_credentials`]), each read of the store has
-/// the keeper forget the rows that left, whoever wrote the removal, and an
-/// entry goes with its last row. The holder reads the store in two
-/// places. A
-/// cut laid whole reads the store's rows once, then the status the table
+/// With a keeper ([`Self::with_credentials`]), two passes have the keeper
+/// forget the rows that left, whoever wrote the removal: a cut laid whole
+/// and a write the store refuses. An entry goes with its last row. A cut
+/// laid whole lays the cut's own rows, then reads the status the table
 /// holds for each. A write
 /// the store refuses reads the write's own record, and
 /// the keeper forgets that one row where it left. The
-/// keeper's clock is read ahead of the store: a row bound behind that read
+/// keeper's clock is read ahead of each pass: a row bound behind that read
 /// stays, and a later pass forgets it where it left.
 /// Two turns forget with no read. A write call that takes a row
 /// out has the keeper forget that row. [`Self::lay_again`] has it forget
@@ -803,7 +802,7 @@ impl<G: Generation> Objects<G> {
         credentials.forget_left(read, |row| row != left || held.facts.contains_key(&row));
     }
 
-    /// The store's rows, whole: the objects of rows that went are dropped
+    /// A cut's rows, whole: the objects of rows that went are dropped
     /// first, each leaving its URL to a later incarnation's, then every row
     /// that does not stand as its object was built is laid again. No
     /// revision held is trusted alone here: in another history, a row

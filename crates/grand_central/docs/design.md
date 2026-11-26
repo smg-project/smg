@@ -2898,7 +2898,7 @@ tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
-| the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: the one record behind a write the store refuses, every record where a cut is laid whole, a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
+| the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: the one record behind a write the store refuses, a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a single request's frame that states a demand is held to it. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
@@ -3023,7 +3023,7 @@ A fact leaves the remainder when the worker object gets a field that holds it as
 4. The table of records is taken apart in removals. The second copy of the facts, the two
    conversions between a record and an object, and the task that follows the table are
    deleted. The removals come in this order. First the store's log of its changes
-   **[built]**, then a cut's read back and the store's own write entries. Then its read
+   **[built]**, then a cut's read back **[built]** and the store's own write entries. Then its read
    entries with its own cut, and last the store's reads of the record before a write. The
    records themselves stay for the published copy's membership build, and go with that copy.
    The task is deleted
@@ -3035,7 +3035,7 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    a read of its table **[built]**: a write call decides over the object that stands, a call's read
    and a first copy read the objects, and a standby's applier lays its leader's event. A
    turn of the keeper's own reads no log of the store's changes **[built]**: a refused write
-   reads its own record, a cut laid whole reads the store's records once, then the status the
+   reads its own record, a cut laid whole lays the cut's own records, then reads the status the
    table holds for each, and the call that lays a kept credential again reads the objects. No
    host follows the store **[built]**.
 
@@ -3053,8 +3053,10 @@ objects (the first part of step 2). For an event with a record that code builds 
 hands the store the event at its place in the log, and puts the object in the registry where
 the store took the event. A removal's object leaves the registry first. A record changed in
 place keeps the instant it was admitted at. A status the leader tells is written to the table and
-laid on the object in the same turn. A restore is the store's restore and the read of its
-records in one turn of that code. A first copy is cut from the objects, by the last
+laid on the object in the same turn. A restore is the store's restore and the lay of the cut's own
+records in one turn of that code. No record is read back. A record of a watch's snapshot whose
+object stands keeps the instant it was admitted at: that code states it before the store takes
+the snapshot. A first copy is cut from the objects, by the last
 part of step 2.
 
 **A call reads the worker objects [built].** A registration call reads the record that stands

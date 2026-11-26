@@ -2305,8 +2305,9 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     cut.rows[0].admitted_at += Duration::from_secs(1);
     cut.rows[0].revision += 1;
     cut.rows[0].facts.priority = 8;
-    let mut expected = cut.rows[0].clone();
-    expected.admitted_at = WorkersStore::get(&store, id).expect("the row").admitted_at;
+    // The row is the cut's, its later instant too: the store keeps none
+    // of its own.
+    let expected = cut.rows[0].clone();
     assert!(store.watch_from(cut));
 
     assert_eq!(leases.live(gateway), 1);
