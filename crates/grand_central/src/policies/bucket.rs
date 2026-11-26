@@ -297,22 +297,30 @@ impl Bucket {
         });
     }
 
+    /// Retire a partition that lists nobody, in one step under its guard:
+    /// it is marked as one that left ([`Pool::leave_if_empty`]) and taken
+    /// out of the table ([`Self::forget`]). A partition that lists a worker
+    /// stays as it is. `pool` is the partition's own, which the caller
+    /// holds by that guard.
+    fn retire_if_empty(&self, model: &str, partition: &Partition, pool: &mut Pool) {
+        if pool.leave_if_empty() {
+            self.forget(model, partition);
+        }
+    }
+
     /// Write a partition's listing into the workers' index: the partition
-    /// under each worker `members` names and under no other. The caller
-    /// holds the partition's guard, so no booking falls between a listing
-    /// and its entry here.
-    fn relist(&self, partition: &Partition, members: &[Member]) {
+    /// under each worker it lists and under no other. `pool` is the
+    /// partition's own, which the caller holds by its guard, so no booking
+    /// falls between a listing and its entry here.
+    fn relist(&self, partition: &Partition, pool: &Pool) {
         let _one = self.relisting.lock();
         let mut listed = FxHashMap::clone(&self.listed.load());
         listed.retain(|_, partitions| {
             partitions.retain(|other| !Arc::ptr_eq(other, partition));
             !partitions.is_empty()
         });
-        for member in members {
-            listed
-                .entry(member.id)
-                .or_default()
-                .push(Arc::clone(partition));
+        for id in pool.workers() {
+            listed.entry(id).or_default().push(Arc::clone(partition));
         }
         self.listed.store(Arc::new(listed));
     }
@@ -333,6 +341,33 @@ impl Pool {
             fenced: Vec::new(),
             sizes: Vec::new(),
         }
+    }
+
+    /// The listed workers, in the order they were listed.
+    fn workers(&self) -> impl Iterator<Item = WorkerId> + '_ {
+        self.members.iter().map(|member| member.id)
+    }
+
+    /// The worker a member is, by the member's place in the listing.
+    fn worker(&self, member: usize) -> Option<WorkerId> {
+        self.members.get(member).map(|member| member.id)
+    }
+
+    /// Whether the partition left the table. The decision that still holds
+    /// it takes the model's next one.
+    fn has_left(&self) -> bool {
+        self.left
+    }
+
+    /// Mark the partition as one that left the table, where it lists
+    /// nobody. Whether it did: its caller takes it out of the table under
+    /// the same guard ([`Bucket::retire_if_empty`]).
+    fn leave_if_empty(&mut self) -> bool {
+        let empty = self.members.is_empty();
+        if empty {
+            self.left = true;
+        }
+        empty
     }
 
     /// The member a worker is: the one at its row's position where the
@@ -418,7 +453,9 @@ impl Pool {
     /// splits the span evenly among all of it. The rows `fenced` names are
     /// kept for the seating, each with its place in the view: a row behind
     /// them is looked for that many places nearer the listing's head.
-    fn list(&mut self, candidates: &[Candidate], fenced: impl Fn(WorkerId) -> bool) {
+    /// Whether a row joined: the workers' index then follows the listing
+    /// ([`Bucket::relist`]).
+    fn list(&mut self, candidates: &[Candidate], fenced: impl Fn(WorkerId) -> bool) -> bool {
         let listed = self.members.len();
         self.fenced.clear();
         for candidate in candidates {
@@ -437,9 +474,11 @@ impl Pool {
                 });
             }
         }
-        if self.members.len() != listed {
+        let joined = self.members.len() != listed;
+        if joined {
             self.split_evenly();
         }
+        joined
     }
 
     /// [`SPAN`] in equal ranges, one a member in the listing's order, the
@@ -469,10 +508,11 @@ impl Pool {
     /// Forget a worker: its place, its load and its range, which the range
     /// below takes over (the one above when it was the first). Its bookings
     /// stay in the window: they count toward the next cut and toward no
-    /// worker's load. The next cut is made whatever the share.
-    fn remove(&mut self, id: WorkerId) {
+    /// worker's load. The next cut is made whatever the share. Whether the
+    /// worker was listed, and so left the listing.
+    fn remove(&mut self, id: WorkerId) -> bool {
         let Some(at) = self.by_id.get(&id).map(|&at| at as usize) else {
-            return;
+            return false;
         };
         self.members.remove(at);
         self.place_members();
@@ -498,19 +538,19 @@ impl Pool {
             }
         }
         self.cut_for = 0;
+        true
     }
 
     /// The same worker under a new handle keeps its place, range and load.
     /// Where a view listed the new handle before this word came, the worker
     /// stands once, at the place that view gave it and with the load booked
     /// under both handles: the old handle's bookings move first, then its
-    /// member leaves as a removed worker's does. Whether a member took the
-    /// new handle.
+    /// member leaves as a removed worker's does. Whether the listing
+    /// changed: a member took the new handle, or the old handle's left.
     fn rename(&mut self, old: WorkerId, new: WorkerId) -> bool {
         if old != new && self.by_id.contains_key(&new) {
             self.rebook(old, new);
-            self.remove(old);
-            return false;
+            return self.remove(old);
         }
         let Some(at) = self.by_id.remove(&old) else {
             return false;
@@ -541,11 +581,7 @@ impl Pool {
 
     /// The listed workers `stays`, a snapshot's names, leaves out.
     fn unnamed(&self, stays: &FxHashSet<WorkerId>) -> Vec<WorkerId> {
-        self.members
-            .iter()
-            .map(|member| member.id)
-            .filter(|id| !stays.contains(id))
-            .collect()
+        self.workers().filter(|id| !stays.contains(id)).collect()
     }
 
     /// The instant a dispatch's booking takes: `since_micros` after the
@@ -871,12 +907,9 @@ impl Lifecycle for Bucket {
         }
         for (model, partition) in self.partitions.load().iter() {
             let mut pool = partition.lock();
-            let listed = pool.members.len();
-            let renamed = match *change {
-                Membership::Removed(id) => {
-                    pool.remove(id);
-                    false
-                }
+            // Whether the word changed this partition's listing.
+            let changed = match *change {
+                Membership::Removed(id) => pool.remove(id),
                 Membership::Replaced { old, new } => pool.rename(old, new),
                 Membership::Snapshot(_) => {
                     // The workers the snapshot does not name leave. The
@@ -890,32 +923,27 @@ impl Lifecycle for Bucket {
                             fence.retire(id, now);
                         }
                     }
+                    let mut changed = false;
                     for id in gone {
-                        pool.remove(id);
+                        changed |= pool.remove(id);
                     }
-                    false
+                    changed
                 }
                 // A worker a registration took off this partition's model
                 // leaves its listing. The partitions of the models the word
                 // does not name keep its place, its range and its load.
                 Membership::Left { id, models } => {
-                    if models.iter().any(|left| **left == **model) {
-                        pool.remove(id);
-                    }
-                    false
+                    models.iter().any(|left| **left == **model) && pool.remove(id)
                 }
                 // A worker joins from a view of its pool: the feed names an
                 // id and not the pool it serves.
                 Membership::Added(_) | Membership::Relabelled(_) | Membership::Resized(_) => false,
             };
-            // The index follows a listing that changed, under its guard.
-            if renamed || pool.members.len() != listed {
-                self.relist(partition, &pool.members);
-            }
-            // A model whose last worker left takes its partition with it.
-            if listed != 0 && pool.members.is_empty() {
-                pool.left = true;
-                self.forget(model, partition);
+            if changed {
+                // The index follows a listing that changed, under its guard.
+                self.relist(partition, &pool);
+                // A model whose last worker left takes its partition with it.
+                self.retire_if_empty(model, partition, &mut pool);
             }
         }
     }
@@ -973,7 +1001,7 @@ impl Scorer for Bucket {
             let mut pool = partition.lock();
             // A partition that left the table between the two reads takes no
             // decision: the model's next one does.
-            if pool.left {
+            if pool.has_left() {
                 continue;
             }
             let loads = match pool.seat::<false>(candidates, kept) {
@@ -991,19 +1019,18 @@ impl Scorer for Bucket {
                     // before the pass. The partition's guard, which the
                     // feed's walk needs, is what keeps a leave behind this
                     // decision.
-                    let listed = pool.members.len();
-                    {
+                    let joined = {
                         let mut fence = self.fence.lock();
                         fence.expire(Instant::now());
                         if fence.is_empty() {
                             drop(fence);
-                            pool.list(candidates, |_| false);
+                            pool.list(candidates, |_| false)
                         } else {
-                            pool.list(candidates, |id| fence.holds(id));
+                            pool.list(candidates, |id| fence.holds(id))
                         }
-                    }
-                    if pool.members.len() != listed {
-                        self.relist(&partition, &pool.members);
+                    };
+                    if joined {
+                        self.relist(&partition, &pool);
                     }
                     match pool.seat::<true>(candidates, kept) {
                         Some(loads) => loads,
@@ -1012,10 +1039,7 @@ impl Scorer for Bucket {
                             // partition this decision made for it leaves
                             // the table again: the feed's walk takes only
                             // an entry whose last worker left.
-                            if pool.members.is_empty() {
-                                pool.left = true;
-                                self.forget(facts.model, &partition);
-                            }
+                            self.retire_if_empty(facts.model, &partition, &mut pool);
                             return TieBand::NORMALIZED;
                         }
                     }
@@ -1029,9 +1053,7 @@ impl Scorer for Bucket {
             } else {
                 pool.owner(sized_by(facts.prompt_tokens, facts.prompt_chars))
             };
-            if let Some(id) =
-                leads.and_then(|member| pool.members.get(member).map(|member| member.id))
-            {
+            if let Some(id) = leads.and_then(|member| pool.worker(member)) {
                 for (&row, score) in kept.iter().zip(out) {
                     if candidates[row as usize].id == id {
                         *score = 1.0;

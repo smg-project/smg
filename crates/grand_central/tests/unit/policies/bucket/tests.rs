@@ -1,3 +1,5 @@
+use std::sync::mpsc;
+
 use super::*;
 use crate::{
     document::{PolicySpec, SpecError},
@@ -665,6 +667,33 @@ fn a_model_whose_last_worker_left_takes_its_partition_with_it() {
     assert_eq!(loads(&scorer), (vec![0, 0, 0], 0));
 }
 
+/// The feed's walk takes a partition out where its word emptied the
+/// listing, and nowhere else. An entry a decision made and has listed
+/// nobody in yet stays, whatever the word, and that decision lists in
+/// it.
+#[test]
+fn a_word_of_the_feed_leaves_an_entry_that_lists_nobody_yet() {
+    let scorer = scorer(NEVER, 1.5, 5);
+    let pool = pool(2);
+    let made = scorer.partition("m");
+    let (gone, new) = (WorkerId(7), WorkerId(8));
+    for word in [
+        Membership::Removed(gone),
+        Membership::Replaced { old: gone, new },
+        Membership::Left {
+            id: gone,
+            models: &["m".into()],
+        },
+        Membership::Snapshot(&[pool[0].id, pool[1].id]),
+    ] {
+        scorer.on_membership(&word);
+    }
+    assert!(!made.lock().left, "the entry's own decision lists in it");
+    assert_eq!(led(&scorer, &pool, 0, SECOND), Some(0));
+    assert!(Arc::ptr_eq(&of(&scorer, "m"), &made));
+    assert_eq!(loads(&scorer), (vec![0, 0], 0));
+}
+
 /// A worker a registration took off a model is unlisted under that
 /// model alone and keeps its place, its range and its load under the
 /// models the word does not name, where its next booking alone lands.
@@ -946,6 +975,7 @@ fn a_replaced_handle_keeps_its_place_and_a_snapshot_keeps_the_workers_it_names()
     ]));
     assert_eq!(ranges(&scorer), [(0, 0, 400), (1, 401, u32::MAX)]);
     assert_eq!(loads(&scorer), (vec![1_000, 3_000], 6_005));
+    assert_eq!(scorer.listed.load().len(), 2, "the index names the two");
 }
 
 /// A lease's first dispatch as a served host tells it: the lease names
@@ -1705,6 +1735,7 @@ fn a_handle_a_view_listed_before_the_word_of_its_replacement_stands_once() {
     });
     assert_eq!(loads(&scorer), (vec![100, 40], 140));
     assert_eq!(ranges(&scorer), [(0, 0, 2_729), (1, 2_730, u32::MAX)]);
+    assert_eq!(scorer.listed.load().len(), 2, "the index names the two");
     // One lease of the worker is one booking.
     book(&scorer, &view, 1, 70, 2 * SECOND);
     assert_eq!(loads(&scorer), (vec![100, 110], 210));
@@ -1803,6 +1834,44 @@ fn forgetting_a_partition_leaves_an_entry_made_since_under_its_model() {
     assert!(Arc::ptr_eq(&of(&scorer, "m"), &made));
     scorer.forget("m", &made);
     assert!(scorer.partitions.load().is_empty());
+}
+
+/// A decider that took a partition from the table before it left finds
+/// it marked behind its guard and takes the model's next one: nobody is
+/// listed in a partition the table no longer holds.
+#[test]
+fn a_decider_that_took_a_partition_before_it_left_takes_the_next() {
+    let scorer = Arc::new(scorer(NEVER, 1.5, 5));
+    let pool = pool(2);
+    // An entry that lists nobody, under the guard of the one that
+    // retires it.
+    let left = scorer.partition("m");
+    let mut held = left.lock();
+    let hands = Arc::strong_count(&left);
+    let (tell, decided) = mpsc::channel();
+    {
+        let (scorer, pool) = (Arc::clone(&scorer), pool.clone());
+        std::thread::spawn(move || tell.send(led(&scorer, &pool, 0, SECOND)));
+    }
+    // The decider has the entry once one more hand holds it: it waits
+    // for the guard, or is about to ask for it.
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while Arc::strong_count(&left) == hands && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        Arc::strong_count(&left) > hands,
+        "the decider took no entry"
+    );
+    scorer.retire_if_empty("m", &left, &mut held);
+    drop(held);
+    // A decider that met a marked entry in the table again would ask
+    // for ever: its answer is waited for under a deadline.
+    let answer = decided.recv_timeout(std::time::Duration::from_secs(5));
+    assert_eq!(answer, Ok(Some(0)), "the decider's answer");
+    assert!(left.lock().by_id.is_empty(), "listed in an entry that left");
+    assert!(!Arc::ptr_eq(&of(&scorer, "m"), &left));
+    assert_eq!(loads(&scorer), (vec![0, 0], 0));
 }
 
 /// The fence takes a leave's word before the leaver's partition forgets
