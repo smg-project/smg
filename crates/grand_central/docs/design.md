@@ -378,9 +378,18 @@ Section 5.1 keeps every profile across a view that differs in its header list al
 that comes or goes resets no stage of another model's profile, wherever its headers stand in the
 list.
 
-A `cache_aware` label also writes the document's `index` block where the settings wrote none. Where
-the new document cannot be built, the document in force stays and the registration is answered with
-a warning.
+A `cache_aware` label writes its model's own entry of the document's `index` block, where it differs
+from what the document answers for that model without it. The block size and the cache boundaries
+stay one for the document, and a label that names another one is refused.
+
+The engine reads one entry and keeps one record of sent prefixes for a model, whatever the phase.
+Classic keeps a tree for each policy object, and the gateway lends a tree for a single request's
+model alone. So where one model id is served by labelled regular workers and by a pair at once, the
+pair's side of that model reads the label's entry. It reads the entry's kind, and its bound of the
+engine's record.
+
+Where the new document cannot be built, the document in force stays and the registration is
+answered with a warning.
 
 That holds where the document is built from the routing settings. Where the operator supplies a
 document, and on a controller, the document decides, and a registration whose label names

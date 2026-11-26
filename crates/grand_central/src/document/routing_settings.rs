@@ -721,15 +721,20 @@ impl RoutingSettings {
     ///
     /// The document's view is one for every binding. The headers a label's
     /// side lists there join the list behind the ones that stand in it, in
-    /// the labels' order, each once: the key headers of a `manual` label,
-    /// and the sticky override's where the override places the label's
-    /// policy. The builder writes one block size, one list of cache
-    /// boundaries and one index for the document, so a label whose policy
-    /// names another value than a side of the settings is refused, as two
-    /// sides of the settings are. A label's prefix ring counts its key in
-    /// that block size under every gateway: in a gateway of many routers
-    /// the rings of the settings' own sides stand as they stood, and a
-    /// label's is new.
+    /// the labels' order, each once. They are the key headers of a `manual`
+    /// label, and the sticky override's where the override places the
+    /// label's policy.
+    ///
+    /// The builder writes one block size and one list of cache boundaries
+    /// for the document. So a label whose policy names another value than a
+    /// side of the settings is refused, as two sides of the settings are. A
+    /// label's prefix ring counts its key in that block size under every
+    /// gateway. In a gateway of many routers the rings of the settings' own
+    /// sides stand as they stood, and a label's is new.
+    ///
+    /// A label's index is not shared. It stands under the label's own model
+    /// id, where it differs from what the document answers for that model
+    /// without it: the settings' one entry, or the defaults.
     ///
     /// A label the document has no binding for is refused by its model and
     /// its policy ([`RoutingSettingsError::Label`]): a model's id that is

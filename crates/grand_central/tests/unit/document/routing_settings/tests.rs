@@ -2388,6 +2388,13 @@ fn single_profile(document: &PolicySpec, model: &str) -> String {
     engine.profiles()[usize::from(binding.profile)].name.clone()
 }
 
+/// The index the document answers for `model`: its most specific entry,
+/// or the defaults where no entry names the model.
+fn index_of(document: &PolicySpec, model: &str) -> IndexSpec {
+    let entry = document.index_for(model);
+    entry.map_or_else(IndexSpec::default, |(_, index)| index.clone())
+}
+
 /// A label builds each policy as the gateway's registry builds it from
 /// a name alone. Eight of the ten are the policy at its flags' defaults,
 /// the preset. `cache_aware` and `bucket` are not: seven numbers are the
@@ -2535,7 +2542,12 @@ fn a_labels_binding_is_the_one_its_policy_gets_as_the_main_policy() {
                 "{name}, {way}"
             );
             assert_eq!(document.profiles[main], own.profiles[main], "{name}, {way}");
-            assert_eq!(document.index, as_main.index, "{name}, {way}");
+            // The label's model reads the index its policy gets as the
+            // main policy, and every other model the settings' own.
+            let index = index_of(&document, "m");
+            assert_eq!(index, index_of(&as_main, "m"), "{name}, {way}");
+            let index = index_of(&document, "another");
+            assert_eq!(index, index_of(&own, "another"), "{name}, {way}");
             // The view's headers: the main binding's, then the label's.
             let mut headers = own.view.headers.clone();
             for header in &as_main.view.headers {
@@ -2830,14 +2842,16 @@ fn a_label_is_refused_by_its_model_and_its_policy() {
 
 /// A label's policy that cannot stand beside the settings' own is
 /// refused as two sides of the settings are, by the builder's own
-/// sentence, and the settings' document keeps its families: the refusal
-/// is the label's, and no family is left out for it. A prefix ring keeps
-/// the blocks of its own document, and the builder holds one index and
-/// one list of cache boundaries for the document. A label's ring is
-/// held to the document's block size in a gateway of many routers too,
-/// where the settings' own document stands as it stood: unrefused, that
-/// label's ring would have no whole block, and the controller's check
-/// would refuse the document of every model with no label named.
+/// sentence. The settings' document keeps its families: the refusal is
+/// the label's, and no family is left out for it. A prefix ring keeps
+/// the blocks of its own document, and the builder holds one list of
+/// cache boundaries for the document.
+///
+/// A label's ring is held to the document's block size in a gateway of
+/// many routers too, where the settings' own document stands as it
+/// stood. Unrefused, that label's ring would have no whole block. The
+/// controller's check would then refuse the document of every model,
+/// with no label named.
 #[test]
 fn a_label_that_cannot_stand_beside_the_settings_is_refused_by_name() {
     let blocks = config(cache_aware_over(32));
@@ -2885,22 +2899,80 @@ fn a_label_that_cannot_stand_beside_the_settings_is_refused_by_name() {
         }
         other => panic!("expected the label refused by its boundaries, got {other:?}"),
     }
+}
 
-    let indexed = |decode: Option<PolicySettings>| RoutingSettings {
-        mode: pair_mode(Some(at_flag_defaults("cache_aware")), decode),
-        ..config(at_flag_defaults("round_robin"))
+/// A label's index stands under its model's own id, where it says
+/// another thing than the document answers for that model without it.
+/// So a `cache_aware` label builds beside a pair's `cache_aware` side
+/// that names another index, and each model reads its own. Two sides of
+/// the settings that name two indexes are refused, as before.
+///
+/// A label whose index is the one the settings wrote adds no entry, and
+/// neither does a label of a policy that names no index. Under settings
+/// that write none, each `cache_aware` label writes its model's entry.
+#[test]
+fn a_labels_index_stands_under_its_models_id() {
+    let of_label = IndexSpec {
+        max_size: 10_000,
+        sweep_s: 30,
+        ..IndexSpec::default()
     };
-    let two_sides = indexed(PolicySettings::of_label("cache_aware"))
-        .policy_document()
-        .expect_err("two sides of two indexes");
-    let settings = indexed(None);
-    assert_eq!(
-        settings.policy_document().map(|own| own.bindings.len()),
-        Ok(2)
+    let indexed =
+        |prefill: Option<PolicySettings>, decode: Option<PolicySettings>| RoutingSettings {
+            mode: pair_mode(prefill, decode),
+            ..config(at_flag_defaults("round_robin"))
+        };
+    let at_flags = || Some(at_flag_defaults("cache_aware"));
+    let as_a_label = || PolicySettings::of_label("cache_aware");
+    let two_sides = indexed(at_flags(), as_a_label()).policy_document();
+    assert!(two_sides.is_err(), "two sides of two indexes");
+
+    let settings = indexed(at_flags(), None);
+    let own = settings.policy_document().expect("the settings' document");
+    assert_ne!(
+        index_of(&own, "m"),
+        of_label,
+        "the pair's side names another"
     );
+    let labels = [("m", "cache_aware"), ("n", "random")];
+    let document = with_labels(&settings, &labels).expect("each model its own index");
+    assert_eq!(document.index.get("m"), Some(&of_label));
+    assert_eq!(document.index.get("n"), None, "`random` names no index");
+    assert_eq!(document.index.get("*"), own.index.get("*"));
+    assert_eq!(document.index.len(), own.index.len() + 1);
+    assert_eq!(index_of(&document, "m"), of_label);
+    assert_eq!(index_of(&document, "n"), index_of(&own, "n"));
+
+    // A pair's side at a size of its own writes a `*` of another value.
+    // The label's entry stands beside it, and each model reads its own.
+    let sized = indexed(Some(cache_aware(0.3, 64, 1.5, 60, 1024)), None);
+    let own = sized.policy_document().expect("the settings' document");
+    let star = own.index.get("*").cloned().expect("a `*` of the settings");
+    assert_ne!(star, of_label, "the pair's side names another");
+    let document = with_labels(&sized, &[("m", "cache_aware")]).expect("beside a `*`");
+    assert_eq!(document.index.get("*"), Some(&star));
+    assert_eq!(document.index.get("m"), Some(&of_label));
+    assert_eq!(index_of(&document, "n"), star);
+
+    let same = indexed(as_a_label(), None);
+    let own = same.policy_document().expect("the settings' document");
     assert_eq!(
-        with_labels(&settings, &[("m", "cache_aware")]),
-        Err(label_error("m", "cache_aware", &two_sides.to_string())),
+        index_of(&own, "m"),
+        of_label,
+        "the settings wrote the label's"
+    );
+    let document = with_labels(&same, &[("m", "cache_aware")]).expect("a labelled one");
+    assert_eq!(document.index, own.index);
+
+    let none = config(at_flag_defaults("round_robin"));
+    let labels = [("m", "cache_aware"), ("n", "cache_aware")];
+    let document = with_labels(&none, &labels).expect("two labelled ones");
+    assert_eq!(
+        document.index.into_iter().collect::<Vec<_>>(),
+        [
+            ("m".to_owned(), of_label.clone()),
+            ("n".to_owned(), of_label)
+        ]
     );
 }
 
@@ -3066,7 +3138,13 @@ fn labelled_models_stand_in_id_order_and_share_a_policys_profile() {
         assert_eq!(twice.bindings.len(), 3, "{name}");
         assert_eq!(twice.profiles, once.profiles, "{name}");
         assert_eq!(twice.view, once.view, "{name}");
-        assert_eq!(twice.index, once.index, "{name}");
+        // Each labelled model reads the same index, and no other model
+        // reads another than it read.
+        for model in ["a", "b"] {
+            assert_eq!(index_of(&twice, model), index_of(&once, "a"), "{name}");
+        }
+        let index = index_of(&twice, "another");
+        assert_eq!(index, index_of(&once, "another"), "{name}");
         // The second model's binding is the first's but for its model:
         // its key sources and its session rule are written again.
         assert_eq!(twice.bindings[0], once.bindings[0], "{name}");
@@ -3165,11 +3243,11 @@ fn a_labels_profile_stands_beside_a_side_of_the_same_policy() {
 
 /// What a label changes outside its own profile and binding. Under
 /// settings that set nothing, `manual` alone changes the view, by its
-/// header, and `cache_aware` alone writes the index block, at the size
-/// and sweep a label builds it with. No label writes a signal. Under
-/// the sticky override beside a main policy of the hash ring, whose
-/// binding lists no header, a label the override places adds the
-/// override's headers to the view.
+/// header. `cache_aware` alone writes the index block: its model's own
+/// entry, at the size and sweep a label builds it with. No label writes
+/// a signal. Under the sticky override beside a main policy of the hash
+/// ring, whose binding lists no header, a label the override places adds
+/// the override's headers to the view.
 #[test]
 fn a_label_changes_the_view_for_its_headers_alone() {
     let mut changed = Vec::new();
@@ -3202,7 +3280,7 @@ fn a_label_changes_the_view_for_its_headers_alone() {
     };
     assert_eq!(
         labelled.index.into_iter().collect::<Vec<_>>(),
-        [("*".to_owned(), index)]
+        [("m".to_owned(), index)]
     );
 
     let mut ring = config(at_flag_defaults("consistent_hashing"));
