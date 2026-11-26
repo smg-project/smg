@@ -451,6 +451,28 @@ def reap_strict(
                         report_unresolved(process.pid, error)
                         unresolved_observation = True
                         continue
+                    try:
+                        current = _strict_owned(
+                            proc_root,
+                            process.pid,
+                            owner_uid,
+                            entry,
+                            group_exited=lambda _pid: exited(fd),
+                        )
+                    except (OSError, ValueError) as error:
+                        close(fd)
+                        report_unresolved(process.pid, error)
+                        unresolved_observation = True
+                        continue
+                    if current is None or (current.uid, current.starttime) != (
+                        process.uid,
+                        process.starttime,
+                    ):
+                        # The fd may name a replacement; never adopt it or erase
+                        # the old obligation before a verified identity handoff.
+                        close(fd)
+                        unresolved_observation = True
+                        continue
                     handles[process.pid] = (process, fd)
                     del unbound[process.pid]  # The bound fd now carries this obligation.
                     # The pidfd and the post-open proc observation must bind the
