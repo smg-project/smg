@@ -23,7 +23,7 @@ use crate::{
         sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{FixedFacts, Identity, WireModes},
     },
-    policies::consistent_hashing::InOrder,
+    policies::consistent_hashing::tests::InOrder,
     stages::{Best, HasCapacity, StageRegistry},
     store::GatewayId,
     tracking::{
