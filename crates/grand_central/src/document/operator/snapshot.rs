@@ -19,7 +19,10 @@ use serde::{Serialize, Serializer};
 
 use crate::{
     address::{split, Address, UNPARSABLE},
-    engine::view::{Role, WireModes},
+    engine::{
+        view::{Role, WireModes},
+        DemandFacts,
+    },
     store::{
         membership::blank, pairing::LAYOUT_FACTS, EncodeHandoff, Reachability, Registrant,
         StoreCheckpoint, WorkerFacts, WorkerRow, WorkerStatus,
@@ -31,6 +34,14 @@ pub(crate) const PAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// The most model ids a snapshot or a watch names.
 pub(crate) const MODELS: usize = 128;
+
+/// The bytes a row's `demand_facts` takes in a page's JSON where its worker
+/// states none: the key, `null` and the comma.
+const NO_DEMAND_FACTS_BYTES: usize = 20;
+
+/// The bytes it takes at most where the worker states a fact: the key, the
+/// comma and the block with each value at its longest.
+const DEMAND_FACTS_BYTES: usize = 114;
 
 /// What a snapshot caller asks of the worker rows.
 #[derive(Debug)]
@@ -112,7 +123,10 @@ pub struct WorkerRowsPage {
 /// a status and a handoff are names, and the wires a list of names. The age
 /// is in milliseconds at the take. A fact the row does not state is `null`,
 /// and `pairing` is `null` for a row that states nothing of a pair or of an
-/// encode handoff.
+/// encode handoff. `demand_facts` is `null` for a row whose worker states
+/// nothing for a request's hard demands. Inside that block a fact the
+/// worker does not state reads `0` or `false`, as the contract's block
+/// tells it.
 impl Serialize for WorkerRowsPage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
@@ -156,6 +170,7 @@ struct RowJson<'a> {
     health_policy: HealthPolicyJson,
     admitted_age_ms: u64,
     maker: Option<RegistrantJson<'a>>,
+    demand_facts: Option<DemandFactsJson>,
 }
 
 /// From where a row is reachable: every gateway, or the one that holds its
@@ -212,6 +227,17 @@ struct HealthPolicyJson {
 struct RegistrantJson<'a> {
     provider: &'a str,
     key: &'a str,
+}
+
+/// What a row's worker states for a request's hard demands, under the
+/// names of the contract's block (`WorkerRow.demand_facts`).
+#[derive(Serialize)]
+struct DemandFactsJson {
+    runtime: u32,
+    references: bool,
+    host_pipeline: bool,
+    window: u32,
+    decoding: u8,
 }
 
 impl<'a> RowJson<'a> {
@@ -287,7 +313,31 @@ impl<'a> RowJson<'a> {
                     key: maker.key(),
                 }),
             },
+            demand_facts: DemandFactsJson::of(facts.demand_facts),
         }
+    }
+}
+
+impl DemandFactsJson {
+    /// What a row's worker states for a request's hard demands: none for a
+    /// worker that states no fact, as the contract's row tells no block.
+    fn of(stated: DemandFacts) -> Option<Self> {
+        // Every fact by its name: one the engine's type gains stops the
+        // build here, so no fact stays off the page.
+        let DemandFacts {
+            runtime,
+            references,
+            host_pipeline,
+            window,
+            decoding,
+        } = stated;
+        (stated != DemandFacts::default()).then_some(Self {
+            runtime,
+            references,
+            host_pipeline,
+            window,
+            decoding,
+        })
     }
 }
 
@@ -481,11 +531,19 @@ pub(crate) fn without_userinfo(address: &str) -> Option<String> {
 
 /// Count each text with room for its framing and allow 512 bytes for
 /// fixed fields and the row envelope. Count the addresses and facts that
-/// can be told twice and include the pairing and encode descriptors.
+/// can be told twice and include the pairing and encode descriptors. Count
+/// the block of demand facts at its longest for a worker that states one,
+/// and as `null` for a worker that states none.
 fn measure(row: &WorkerRow) -> usize {
     let facts = &row.facts;
     let text = |text: &str| text.len().saturating_add(16);
+    let demand_facts = if DemandFactsJson::of(facts.demand_facts).is_some() {
+        DEMAND_FACTS_BYTES
+    } else {
+        NO_DEMAND_FACTS_BYTES
+    };
     let mut bytes = 512usize
+        .saturating_add(demand_facts)
         .saturating_add(text(&facts.key).saturating_mul(2))
         .saturating_add(text(&facts.engine))
         .saturating_add(text(&facts.engine_kind).saturating_mul(2));
