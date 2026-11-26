@@ -43,6 +43,7 @@ mod test_support;
 mod tokenspeed;
 mod trtllm;
 mod vllm;
+mod vllm_cache_salt;
 
 pub use client::{
     connect_for_worker, connect_with_eos, kv_transfer_rejection_params, ZmqDialect,

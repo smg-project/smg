@@ -67,8 +67,9 @@ from smg_grpc_servicer.vllm.mm_processor import (
 )
 from smg_grpc_servicer.vllm.mm_salt import (
     engine_accepts_mm_inputs,
+    engine_cache_salt,
     has_preprocessed_mm_payload,
-    mm_identity_cache_salt,
+    request_cache_salt,
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
@@ -400,6 +401,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         try:
             arrival_time = time.time()
             kv_transfer_params = params_from_request(request)
+            cache_salt = request_cache_salt(request)
             ec_json = getattr(request, "ec_transfer_params_json", "")
             ec_transfer_params = json.loads(ec_json) if ec_json else None
             if ec_json and not isinstance(ec_transfer_params, dict):
@@ -539,9 +541,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # alias. Grid-carrying sides took the preprocessed path above.
                 batches = mm_batches(request)
                 if batches:
-                    cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
-                    if cache_salt is not None:
-                        prompt["cache_salt"] = cache_salt
+                    cache_salt = engine_cache_salt(cache_salt, mm_identity_hashes(batches))
                     if uses_mrope(getattr(self.engine, "model_config", None)):
                         logger.warning(
                             "Request %s carries mm identity but no grid tensors on an "
@@ -551,6 +551,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 prompt = self.engine.renderer.process_for_engine(prompt, arrival_time=arrival_time)
             else:
                 prompt = request.text
+
+            # Every prompt shape carries the salt; text takes it in its dict form.
+            if cache_salt is not None:
+                if isinstance(prompt, str):
+                    prompt = {"prompt": prompt}
+                prompt["cache_salt"] = cache_salt
 
             # Build sampling params with detokenize=False
             sampling_params = self._sampling_params_from_proto(
@@ -1057,6 +1063,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
             info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
+        # The cache partition fields Generate reads; likewise absent from an
+        # older package.
+        if "cache_partition_fields" in info.DESCRIPTOR.fields_by_name:
+            info.cache_partition_fields = "cache_salt"
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
         if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
             info.supports_ec_transfer = ec_config is not None
