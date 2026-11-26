@@ -28,7 +28,7 @@ use super::{
         view::{self as marshal, TooLong},
     },
     bump, thread_cpu_micros, Call, Exports, Fault, Frame, Instance, LoadError, OwnTime, Plugin,
-    DESTRUCTOR_BOUND_MICROS, DESTRUCTOR_FRAME_MICROS,
+    DESTRUCTOR_BOUND_MICROS, DESTRUCTOR_FRAME_MICROS, INIT_FRAME_MICROS,
 };
 use crate::{
     document::spec::Needs,
@@ -330,8 +330,10 @@ impl PluginBinding {
             // an armed thread reads its clock around it, which makes the two
             // one: a held `init` is no slow sample there.
             let fuel_per_micro = frame.fuel_per_micro.max(1);
-            let left = budget.fuel(fuel_per_micro);
             let init_fuel = plugin.init_fuel();
+            // The grant's part on the clock is not read: nothing watches
+            // an `init`.
+            let (granted, _) = budget.grant_call(init_fuel, INIT_FRAME_MICROS, fuel_per_micro);
             let watched = plugin.runtime.thread_clock;
             let start = if watched && plugin.armed() {
                 thread_cpu_micros()
@@ -339,7 +341,7 @@ impl PluginBinding {
                 None
             };
             let started = Instant::now();
-            let (made, used) = plugin.instantiate_metered(init_fuel.min(left));
+            let (made, used) = plugin.instantiate_metered(granted);
             let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
             let fuel_micros = used.div_ceil(fuel_per_micro);
             let charged = fuel_micros.max(elapsed);
@@ -348,22 +350,22 @@ impl PluginBinding {
                 Some(had) => OwnTime::read(fuel_micros, had, charged),
                 None => OwnTime::unread(watched, fuel_micros, charged),
             };
+            // The charge is the decision's, however `init` ended: drawn
+            // here, ahead of the three ends, which ask what it left.
+            budget.draw(charged);
             match made {
                 Ok(instance) => {
                     bump(&plugin.tally.lazy_instantiations);
-                    budget.draw(charged);
                     plugin.note_init(decision, own);
                     plugin.seat(&mut guard, instance);
                 }
-                Err(LoadError::Trap { .. })
-                    if left < init_fuel && charged >= budget.remaining_micros() =>
-                {
+                Err(LoadError::Trap { .. }) if granted < init_fuel && budget.is_spent() => {
                     // The remainder clamped `init` below its own frame and
-                    // the clamp ended it: the charge reached what was left
+                    // the clamp ended it: the charge took all that was left
                     // (out of fuel uses the whole grant, and the deadline
                     // never fires before the remainder has passed). The
-                    // decision's budget is spent (the whole remainder is
-                    // drawn, so no later open of the decision runs on it
+                    // decision's budget is spent (the charge drew the whole
+                    // remainder, so no later open of the decision runs on it
                     // again), the slot stays cold for the close to rebuild
                     // under the full frame, and the breaker, which judges
                     // `init` under its own frame, is untouched. The plugin's
@@ -371,8 +373,6 @@ impl PluginBinding {
                     // a charge that reached the remainder, so one long on the
                     // clock reads as long here too, unless a reading says
                     // its thread did not have that time.
-                    let init_micros = left.div_ceil(fuel_per_micro).max(charged);
-                    budget.draw(init_micros);
                     plugin.note_init(decision, own);
                     bump(&plugin.tally.budget_spent);
                     plugin.emptied.get_or_default().set(true);
@@ -385,7 +385,6 @@ impl PluginBinding {
                     // have ended the same under the full frame). The failure
                     // is the breaker's, the charge the decision's and part
                     // of the plugin's sample.
-                    budget.draw(charged);
                     plugin.note_init(decision, own);
                     plugin.fail(now);
                     open.bypass = true;
@@ -546,7 +545,7 @@ impl PluginBinding {
             }
             decision = open.decision;
             open.reset();
-            last = plugin.note_close(decision, on_thread.budget().seed_micros());
+            last = plugin.note_close(decision, on_thread.budget());
         }
         walk.returned = true;
         drop(on_thread);

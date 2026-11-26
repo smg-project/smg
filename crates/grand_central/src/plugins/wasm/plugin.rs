@@ -45,10 +45,7 @@ use crate::plugins::shared::OpenDecisions;
 use crate::{
     document::spec::Needs,
     engine::{decision_slot::DecisionSlot, view::WorkerId},
-    plugins::shared::{
-        breaker::{Breaker, Latency},
-        intern, own_bound, Budget, Counters, Part,
-    },
+    plugins::shared::{breaker::Breaker, intern, Budget, Counters, Part},
     tracking::lease::Membership,
     Draw,
 };
@@ -538,7 +535,7 @@ pub struct Plugin {
     spent: ThreadLocal<Cell<(u64, OwnTime, u64, bool)>>,
     /// Per thread: the latency ring, one sample per decision (the plugin's
     /// own charged time in it and a lazy `init` the decision paid, over the
-    /// decision's frame: [`Latency::frame`]), kept across rebuilds so a
+    /// decision's frame: [`Budget::sample_frame`]), kept across rebuilds so a
     /// plugin dropped every decision still completes a window, and the
     /// ring's arm.
     latency: ThreadLocal<RefCell<ThreadRing>>,
@@ -1175,7 +1172,9 @@ impl Plugin {
             return Call::Failed;
         };
         let fuel_per_micro = frame.fuel_per_micro.max(1);
-        let grant = frame.cap.min(frame.budget.fuel(fuel_per_micro));
+        let (grant, bound) = frame
+            .budget
+            .grant_call(frame.cap, frame.frame_micros, fuel_per_micro);
         if grant == 0 {
             // The decision's earlier calls spent its remainder: no call is
             // made, the stage falls back, the instance stands; nothing counts
@@ -1192,7 +1191,6 @@ impl Plugin {
         // whose ring is armed, the reading the call's end is judged on;
         // otherwise the first tick the call meets. Elsewhere the call ends at
         // its deadline on the wall clock.
-        let bound = frame.frame_micros.min(frame.budget.remaining_micros_u32());
         let watched = self.runtime.thread_clock;
         let start = if watched && self.armed() {
             thread_cpu_micros()
@@ -1306,15 +1304,14 @@ impl Plugin {
                 // clock has no low end: there the spend is the time they took.
                 let granted = grant.div_ceil(fuel_per_micro);
                 let whole = grant == frame.cap;
-                let seed_micros = frame.budget.seed_micros();
-                let under_its_own = own_bound(whole, before.spend, granted, seed_micros);
+                let under_its_own = frame.budget.own_bound(whole, before.spend, granted);
                 if frame_ran_out && frame.decision != 0 && !under_its_own {
                     tracing::debug!(
                         plugin = self.name,
                         "a call ran out under the decision's remainder"
                     );
                     bump(&self.tally.budget_spent);
-                    if own_bound(whole, before.sample, granted, seed_micros) {
+                    if frame.budget.own_bound(whole, before.sample, granted) {
                         // The two ends part: the time the plugin's unread
                         // calls took reaches the budget, their fuel does
                         // not, and nothing says whether a hold or their own
@@ -1435,10 +1432,10 @@ impl Plugin {
     /// decision (its constructor and stage calls, whatever ended them) plus
     /// the time of a lazy `init` the decision paid, over the decision's
     /// budget or over the frames of those where they are the lesser
-    /// ([`Latency::frame`]). A decision that charged the plugin nothing
-    /// records nothing. Says whether this close was the plugin's last of the
-    /// decision.
-    fn note_close(&self, decision: u64, seed_micros: u64) -> bool {
+    /// ([`Budget::sample_frame`] of `budget`, the decision's). A decision
+    /// that charged the plugin nothing records nothing. Says whether this
+    /// close was the plugin's last of the decision.
+    fn note_close(&self, decision: u64, budget: &Budget) -> bool {
         let opens = self.decision_opens.get_or_default();
         let (mut part, init, init_frames) = opens.get();
         let last = part.close(decision);
@@ -1453,7 +1450,7 @@ impl Plugin {
             (init, init_frames, false)
         };
         if own.sample > 0 {
-            self.sample(own, Latency::frame(seed_micros, frames), ended);
+            self.sample(own, budget.sample_frame(frames), ended);
         }
         true
     }

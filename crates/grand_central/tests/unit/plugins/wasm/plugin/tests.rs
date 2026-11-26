@@ -4,8 +4,9 @@ use wasmtime::{Trap, UpdateDeadline};
 
 use super::{
     clock::EPOCH_TICK_MICROS, deadline_ticks, first_deadline, import_version, judge,
-    thread_cpu_micros, tick, End, Latency, ThreadRing, Verdict, Watch,
+    thread_cpu_micros, tick, End, ThreadRing, Verdict, Watch,
 };
+use crate::plugins::shared::breaker::Latency;
 
 /// Whether a tick ended the call; a tick that lets it run asks for the
 /// next one.
