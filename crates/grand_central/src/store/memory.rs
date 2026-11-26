@@ -1180,8 +1180,9 @@ impl MemoryStore {
     /// each tried.
     #[cfg(test)]
     pub(crate) fn unlocked(&self) -> bool {
+        let free = |file: &turn::File| file.try_take().is_some();
         self.workers.try_lock().is_some()
-            && self.files.iter().all(turn::File::free)
+            && self.files.iter().all(free)
             && self.loads.try_lock().is_some()
     }
 
@@ -3678,34 +3679,27 @@ impl MemoryStore {
     }
 
     /// Ends the leases past their dispatch deadline at `now`
-    /// ([`LeasesStore::expire`]): each file whose deadline hint is reached
-    /// or whose ring holds a frame takes its turn in the files' order, one
-    /// at a time, where the caller may act at the file. A decider at work
-    /// ends its own file's due leases at its issues. Each end is told under
-    /// the turn, as a frame's end is told. A file is passed too where
-    /// `settled` says no, asked under the file's turn behind everything
-    /// handed to it: a host that keeps what was said of a file's leases
-    /// beside its ring says no until it has handed that on, so no lease is
-    /// ended ahead of a dispatch said of it. The file's deadline is shown
-    /// ahead of both questions ([`Leases::show_due`]): a file passed at one
-    /// is asked again at that instant. Returns both parts of each lease as
-    /// the sweep left them.
+    /// ([`LeasesStore::expire`]). The files take their turns in their
+    /// order, one at a time. A file takes its turn where it may hold work
+    /// for a sweep and the caller may act there ([`Self::sweep_turn`]). A
+    /// decider at work ends its own file's due leases at its issues. Each
+    /// end is told under the turn, as a frame's end is told.
+    ///
+    /// A file is passed too where `settled` says no. That is asked under
+    /// the file's turn, behind everything handed to it. A host may keep
+    /// what was said of a file's leases beside its ring. It says no until
+    /// it has handed that on, so no lease is ended ahead of a dispatch
+    /// said of it. The file's deadline is shown ahead of that question
+    /// too: a file passed at it is asked again at that instant.
+    ///
+    /// Returns both parts of each lease as the sweep left them.
     pub(crate) fn expire_where(&self, now: Instant, settled: impl Fn(usize) -> bool) -> Vec<Sides> {
         let mut ended = Vec::new();
         for at in 0..self.files.len() {
-            if !self.files[at].sweep_needed(now) {
+            let Some(mut leases) = self.sweep_turn(at, now) else {
                 continue;
-            }
-            // A file whose decider works is passed with no wait for its
-            // turn; the same is read again under the turn.
-            if !self.may_act(at) {
-                continue;
-            }
-            let mut leases = self.files[at].take();
-            // Shown ahead of the questions: a file passed at one is asked
-            // again at its deadline, not at every pass.
-            leases.show_due();
-            if !self.applied(at, &mut leases) || !settled(at) {
+            };
+            if !settled(at) {
                 continue;
             }
             // The ends of one file's sweep are told under one load of
