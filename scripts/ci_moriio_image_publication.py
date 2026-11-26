@@ -13,9 +13,11 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -377,6 +379,19 @@ def publish(engine_checkout, output):
         BUILDX_BAKE_ENTITLEMENTS_FS="1",
     )
 
+    # Buildx registration lives in this invocation's fresh private directory.
+    # Docker authentication stays in the existing Docker config; no auth is copied.
+    buildx_config = output / "buildx-config"
+    buildx_config.mkdir(mode=0o700)
+    config_stat = buildx_config.lstat()
+    builder_config_identity = (config_stat.st_dev, config_stat.st_ino, config_stat.st_uid)
+    env["BUILDX_CONFIG"] = str(buildx_config)
+    state["builder_config_identity"] = {
+        "path": str(buildx_config),
+        "device": config_stat.st_dev,
+        "inode": config_stat.st_ino,
+        "UID": config_stat.st_uid,
+    }
     client_control = {"pending_signal": None, "cleaning": False, "critical": False}
 
     def persist():
@@ -409,6 +424,13 @@ def publish(engine_checkout, output):
         proc = None
         stdout = None
         error = None
+        selector = None
+        captured = {"stdout": bytearray(), "stderr": bytearray()}
+        observed = {tag: 0 for tag in captured}
+        hashes = {tag: hashlib.sha256() for tag in captured}
+        truncated = {tag: False for tag in captured}
+        complete = {tag: False for tag in captured}
+        stderr_tail = b""
         log = output / (phase + ".log")
 
         def admitted():
@@ -469,22 +491,35 @@ def publish(engine_checkout, output):
                 except FileNotFoundError:
                     handle["exited_before_identity_read"] = True
                 event(phase + "_running", client_handle=handle)
-                while True:
+                selector = selectors.DefaultSelector()
+                for tag, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+                    if pipe is not None:
+                        os.set_blocking(pipe.fileno(), False)
+                        selector.register(pipe, selectors.EVENT_READ, tag)
+                while selector.get_map():
+                    admitted()
+                    for key, _ in selector.select(min(0.25, max(0, until - time.monotonic() - 3))):
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            complete[key.data] = True
+                            selector.unregister(key.fileobj)
+                            continue
+                        tag = key.data
+                        observed[tag] += len(chunk)
+                        hashes[tag].update(chunk)
+                        if tag == "stderr":
+                            stderr_tail = (stderr_tail + chunk)[-4096:]
+                        left = max(0, 4 * 1024**2 - len(captured[tag]))
+                        captured[tag].extend(chunk[:left])
+                        truncated[tag] = len(chunk) > left
+                        assert not truncated[tag], tag + " metadata output too large"
+                while proc.returncode is None:
                     admitted()
                     try:
-                        stdout, stderr = proc.communicate(
-                            timeout=min(0.25, until - time.monotonic() - 3)
-                        )
-                        break
+                        proc.wait(timeout=min(0.25, until - time.monotonic() - 3))
                     except subprocess.TimeoutExpired:
                         continue
-                if cleaning:
-                    client["stdout_sha256"] = digest(stdout)
-                    client["stderr_sha256"] = digest(stderr)
-                    # Preserve diagnostics before a nonzero exit raises. Bound the
-                    # UTF-8 representation too, including replacement characters.
-                    tail = stderr[-4096:].decode("utf-8", errors="replace").encode("utf-8")
-                    client["stderr_tail"] = tail[-4096:].decode("utf-8", errors="ignore")
+                stdout = bytes(captured["stdout"]) if capture or cleaning else None
                 assert proc.returncode == 0, phase + (
                     " failed (see cleanup client stderr_tail)"
                     if cleaning
@@ -492,11 +527,33 @@ def publish(engine_checkout, output):
                 )
                 if capture or cleaning:
                     assert len(stdout) <= 4 * 1024**2, "metadata output too large"
-                if cleaning:
-                    assert len(stderr) <= 4 * 1024**2, "cleanup stderr too large"
         except BaseException as exc:
             error = exc
         finally:
+            if selector is not None:
+                try:
+                    selector.close()
+                except BaseException as exc:
+                    client["selector_close_error"] = type(exc).__name__
+                    if error is None:
+                        error = exc
+            if capture or client_control["cleaning"]:
+                for tag in captured:
+                    client[tag + "_bytes_observed"] = observed[tag]
+                    client[tag + "_bytes_retained"] = len(captured[tag])
+                    client[tag + "_truncated"] = truncated[tag]
+                    client[tag + "_sha256"] = hashes[tag].hexdigest()
+                    client[tag + "_sha256_scope"] = (
+                        "complete_stream"
+                        if complete[tag]
+                        else (
+                            "observed_prefix"
+                            if (tag == "stdout" or client_control["cleaning"])
+                            else "not_captured_owned_log"
+                        )
+                    )
+                tail = stderr_tail.decode("utf-8", errors="replace").encode("utf-8")
+                client["stderr_tail"] = tail[-4096:].decode("utf-8", errors="ignore")
             if proc is not None:
                 try:
                     if proc.returncode is None:
@@ -590,7 +647,11 @@ def publish(engine_checkout, output):
 
     def interrupted(signum, _frame):
         client_control["pending_signal"] = signum
-        if not client_control["critical"] and not client_control["cleaning"]:
+        if (
+            not client_control["critical"]
+            and not client_control["cleaning"]
+            and client_control.get("primary_error") is None
+        ):
             raise RuntimeError("publisher interrupted " + str(signum))
 
     signal.signal(signal.SIGTERM, interrupted)
@@ -857,50 +918,128 @@ def publish(engine_checkout, output):
             if creation_submitted:
                 # A failed create/bootstrap may still have made our exact container.
                 if owned_id is None:
-                    container = inspect("cleanup_discover", cleanup_deadline - 10)
-                    assert (
-                        container["Config"]["Image"] == BUILDKIT and container["Name"] == "/" + name
+                    remaining = command(
+                        "cleanup_named_containers",
+                        docker
+                        + [
+                            "ps",
+                            "-a",
+                            "--no-trunc",
+                            "--filter",
+                            "name=^/" + name + "$",
+                            "--format",
+                            "{{.ID}}",
+                        ],
+                        cleanup_deadline - 10,
+                        capture=True,
                     )
-                    owned_id = container["Id"]
-                container = inspect("cleanup_identity", cleanup_deadline - 10)
-                verify_owned(container)
-                command(
-                    "cleanup_stop",
-                    docker + ["stop", "--time", "5", owned_id],
-                    cleanup_deadline - 10,
-                )
-                container = inspect("cleanup_stopped", cleanup_deadline - 5)
-                verify_owned(container)
-                assert not container["State"]["Running"] and container["State"]["Pid"] == 0
-                state["cleanup_verified_stopped_PID0"] = True
-                # Only this newly created builder; no --all/prune/foreign removal.
-                command(
-                    "cleanup_remove_builder",
-                    docker + ["buildx", "rm", builder],
-                    cleanup_deadline - 3,
-                )
-                remaining = command(
-                    "cleanup_final_absence",
-                    docker
-                    + [
-                        "ps",
-                        "-a",
-                        "--no-trunc",
-                        "--filter",
-                        "id=" + owned_id,
-                        "--format",
-                        "{{.ID}}",
-                    ],
-                    cleanup_deadline,
-                    capture=True,
-                )
-                assert not remaining.strip()
-                state["cleanup_verified_absent"] = True
+                    if not remaining.strip():
+                        current = buildx_config.lstat()
+                        assert not buildx_config.is_symlink() and stat.S_ISDIR(current.st_mode)
+                        assert (
+                            current.st_dev,
+                            current.st_ino,
+                            current.st_uid,
+                        ) == builder_config_identity
+                        assert (
+                            current.st_uid == os.getuid() and stat.S_IMODE(current.st_mode) == 0o700
+                        )
+                        assert env["BUILDX_CONFIG"] == str(buildx_config)
+                        registration = json.loads(
+                            command(
+                                "cleanup_registration_identity",
+                                docker + ["buildx", "inspect", builder, "--format", "{{json .}}"],
+                                cleanup_deadline - 10,
+                                capture=True,
+                            )
+                        )
+                        assert registration["Name"] == builder
+                        assert registration["Driver"] == "docker-container"
+                        nodes = registration["Nodes"]
+                        assert len(nodes) == 1 and nodes[0]["Name"] == builder + "0"
+                        assert nodes[0]["Endpoint"] == "unix:///var/run/docker.sock"
+                        assert nodes[0]["DriverOpts"]["image"] == BUILDKIT
+                        command(
+                            "cleanup_remove_registration",
+                            docker + ["buildx", "rm", "--keep-daemon", builder],
+                            cleanup_deadline - 5,
+                        )
+                        after = command(
+                            "cleanup_registration_absence",
+                            docker + ["buildx", "ls", "--format", "{{.Name}}"],
+                            cleanup_deadline - 3,
+                            capture=True,
+                        )
+                        assert builder not in after.decode().splitlines()
+                        after = command(
+                            "cleanup_container_absence",
+                            docker
+                            + [
+                                "ps",
+                                "-a",
+                                "--no-trunc",
+                                "--filter",
+                                "name=^/" + name + "$",
+                                "--format",
+                                "{{.ID}}",
+                            ],
+                            cleanup_deadline,
+                            capture=True,
+                        )
+                        assert not after.strip()
+                        state["cleanup_verified_no_container"] = True
+                        state["registration_cleanup_verified"] = True
+                        state["cleanup_verified_absent"] = True
+                    else:
+                        container = inspect("cleanup_discover", cleanup_deadline - 10)
+                        assert (
+                            container["Config"]["Image"] == BUILDKIT
+                            and container["Name"] == "/" + name
+                        )
+                        owned_id = container["Id"]
+                if owned_id is not None:
+                    container = inspect("cleanup_identity", cleanup_deadline - 10)
+                    verify_owned(container)
+                    command(
+                        "cleanup_stop",
+                        docker + ["stop", "--time", "5", owned_id],
+                        cleanup_deadline - 10,
+                    )
+                    container = inspect("cleanup_stopped", cleanup_deadline - 5)
+                    verify_owned(container)
+                    assert not container["State"]["Running"] and container["State"]["Pid"] == 0
+                    state["cleanup_verified_stopped_PID0"] = True
+                    # Only this newly created builder; no --all/prune/foreign removal.
+                    command(
+                        "cleanup_remove_builder",
+                        docker + ["buildx", "rm", builder],
+                        cleanup_deadline - 3,
+                    )
+                    remaining = command(
+                        "cleanup_final_absence",
+                        docker
+                        + [
+                            "ps",
+                            "-a",
+                            "--no-trunc",
+                            "--filter",
+                            "id=" + owned_id,
+                            "--format",
+                            "{{.ID}}",
+                        ],
+                        cleanup_deadline,
+                        capture=True,
+                    )
+                    assert not remaining.strip()
+                    state["cleanup_verified_absent"] = True
             else:
                 state["cleanup_verified_stopped_PID0"] = True
                 state["cleanup_verified_absent"] = True
         except BaseException as error:
             state["cleanup_failure"] = type(error).__name__
+            if failure is None:
+                failure = error
+        client_control["primary_error"] = failure
         signal.setitimer(signal.ITIMER_REAL, 0)
         state["pending_signal"] = client_control["pending_signal"]
         state["elapsed_seconds"] = time.monotonic() - start
@@ -943,16 +1082,27 @@ def publish(engine_checkout, output):
                 state["fallback_receipt_unavailable"] = True
     if failure is None:
         failure = client_control.get("receipt_error")
+    client_control["primary_error"] = failure
+    # Final cancellation point: no cached pre-persist snapshot can certify success.
+    client_control["cleaning"] = False
+    client_control["critical"] = False
+    if client_control["pending_signal"] is not None:
+        state["pending_signal"] = client_control["pending_signal"]
+        state["status"] = "failed_or_published_incomplete_requires_readback"
+        if failure is None:
+            failure = RuntimeError("publisher cancellation pending at finalization")
     if failure is not None:
         raise failure
     assert (
         not client_control.get("receipt_failed")
         and state.get("public_pull_verified")
-        and state.get("cleanup_verified_stopped_PID0")
+        and (
+            state.get("cleanup_verified_stopped_PID0") or state.get("cleanup_verified_no_container")
+        )
         and state.get("cleanup_verified_absent")
         and "cleanup_failure" not in state
         and not state.get("owned_client_cleanup_unknown")
-        and state.get("pending_signal") is None
+        and client_control["pending_signal"] is None
     ), "Candidate operation incomplete; inspect private result/logs"
 
 

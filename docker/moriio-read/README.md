@@ -119,3 +119,20 @@ Only its actual complete results can support a qualified SMG PD claim. The
 historical four DUMMY/xGMI passes above do not qualify a newly built digest or
 replace this full READ/RDMA operation. No variable or deployment changes are
 performed by the publisher.
+
+### Publisher cleanup evidence
+
+Publisher metadata pipes are read incrementally with a 4-MiB retained limit per
+stream. Crossing a limit fails and reaps the owned client; hashes explicitly
+identify a complete stream or only its observed prefix, and stderr tails retain
+at most 4,096 UTF-8 bytes. Build logs written directly to files have a separate
+disk-retention scope.
+
+Buildx registration uses a fresh invocation-private configuration directory.
+Registration-only cleanup requires its unchanged directory identity, the exact
+builder/driver/node/image/endpoint, and successful empty-container observations;
+it uses `--keep-daemon` and verifies registration absence. Unknown or foreign
+identity remains incomplete. Final cancellation and the first productive or
+cleanup exception remain failures even if the final receipt cannot be written.
+CPU protocol controls do not attest real BuildKit versions, daemon recovery,
+hardkill/host loss, future container appearance, or physical resource release.

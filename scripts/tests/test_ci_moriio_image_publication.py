@@ -61,6 +61,8 @@ def exercise_bake_processes(source, directory):
     context.mkdir()
     observed = []
 
+    actual_popen = subprocess.Popen
+
     def fake_popen(argv, **kwargs):
         if "bake" in argv:
             grants = {
@@ -80,9 +82,7 @@ def exercise_bake_processes(source, directory):
         else:
             assert kwargs.get("cwd") is None, "Preflight/cleanup cannot require the exported source"
         observed.append((argv, kwargs.get("cwd")))
-        process = mock.Mock(pid=2**30, returncode=0, stdin=None, stdout=None, stderr=None)
-        process.communicate.return_value = (b"{}", None)
-        return process
+        return actual_popen([sys.executable, "-I", "-S", "-B", "-c", "print('{}')"], **kwargs)
 
     namespace = dict(
         p.__dict__,
@@ -360,6 +360,18 @@ class OwnedClientLifecycle(unittest.TestCase):
                     return result
 
                 child.communicate = completed
+                actual_wait = child.wait
+                delivered = False
+
+                def waited(*args, **kwargs):
+                    nonlocal delivered
+                    result = actual_wait(*args, **kwargs)
+                    if not delivered:
+                        delivered = True
+                        after_communicate()
+                    return result
+
+                child.wait = waited
             if during_popen:
                 during_popen()
             return child
@@ -630,8 +642,13 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
     ]
     output = Path(directory)
     state = {"events": [], "public_pull_verified": True, "owned_builder_container_id": "a" * 64}
+    buildx_config = output / "buildx-config"
+    buildx_config.mkdir(mode=0o700)
+    config_stat = buildx_config.lstat()
     namespace = dict(
         p.__dict__,
+        buildx_config=buildx_config,
+        builder_config_identity=(config_stat.st_dev, config_stat.st_ino, config_stat.st_uid),
         output=output,
         record=output / "result.json",
         state=state,
@@ -639,12 +656,13 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
         deadline=time.monotonic() + 15,
         builder="smg-moriio-123-1",
         name="buildx_buildkit_smg-moriio-123-10",
-        owned_id="a" * 64,
+        owned_id=None if fault.startswith("registration") else "a" * 64,
         creation_submitted=True,
         docker=["docker"],
         failure=None,
         env={
             "PATH": "/usr/bin:/bin",
+            "BUILDX_CONFIG": str(buildx_config),
             **(
                 {"LD_LIBRARY_PATH": os.environ["LD_LIBRARY_PATH"]}
                 if "LD_LIBRARY_PATH" in os.environ
@@ -668,6 +686,13 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
     def record_write(path, value):
         nonlocal interrupted
         if path == namespace["record"]:
+            if fault == "cleanup_first_then_receipt" and any(
+                c.get("error_type") for c in state.get("clients", [])
+            ):
+                raise OSError("later final receipt fault")
+            if fault == "late_signal" and "pending_signal" in state and not interrupted:
+                interrupted = True
+                namespace["interrupted"](signal.SIGTERM, None)
             if fault == "persistent":
                 raise OSError(errno.ENOSPC, "original persistent receipt fault")
             if fault == "interrupt" and not interrupted:
@@ -687,6 +712,12 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
             raise OSError(errno.ENOSPC, "persistent owned log fault")
         return actual_open(path, *args, **kwargs)
 
+    if fault == "registration_replaced_config":
+        namespace["builder_config_identity"] = (
+            config_stat.st_dev,
+            config_stat.st_ino + 1,
+            config_stat.st_uid,
+        )
     actual_popen = subprocess.Popen
 
     def harmless_client(argv, **kwargs):
@@ -707,15 +738,38 @@ def exercise_owned_cleanup_fault(directory, fault, *, foreign=False, cleanup_sto
         elif argv[1] == "stop":
             assert argv == ["docker", "stop", "--time", "5", "a" * 64]
             payload = "stopped"
+        elif argv[1:3] == ["buildx", "inspect"]:
+            payload = json.dumps(
+                {
+                    "Name": namespace["builder"],
+                    "Driver": "docker-container",
+                    "Nodes": [
+                        {
+                            "Name": namespace["builder"] + "0",
+                            "Endpoint": "unix:///var/run/docker.sock",
+                            "DriverOpts": {"image": "foreign" if foreign else p.BUILDKIT},
+                        }
+                    ],
+                }
+            )
+        elif argv[1:3] == ["buildx", "ls"]:
+            payload = ""
         elif argv[1:3] == ["buildx", "rm"]:
-            assert argv == ["docker", "buildx", "rm", namespace["builder"]]
+            expected = (
+                ["docker", "buildx", "rm"]
+                + (["--keep-daemon"] if fault.startswith("registration") else [])
+                + [namespace["builder"]]
+            )
+            assert argv == expected
             payload = "removed"
         elif argv[1] == "ps":
-            assert "id=" + "a" * 64 in argv
+            assert "id=" + "a" * 64 in argv or "name=^/" + namespace["name"] + "$" in argv
             payload = ""
         else:
             raise AssertionError("No productive or unknown Docker command is allowed")
         code = "print(" + repr(payload) + ")"
+        if argv[1] == "inspect" and fault.startswith("registration"):
+            code = "import sys; print('No such container',file=sys.stderr); raise SystemExit(1)"
         if argv[1] == "stop" and cleanup_stop_stderr is not None:
             code = "import os; os.write(2, " + repr(cleanup_stop_stderr) + "); raise SystemExit(17)"
         child = actual_popen([sys.executable, "-I", "-S", "-B", "-c", code], **kwargs)
@@ -908,6 +962,73 @@ class CleanupStderrDiagnostics(unittest.TestCase):
             self.assertIn(["docker", "buildx", "rm", "smg-moriio-123-1"], calls)
             self.assertTrue(all("stderr_tail" in c for c in payload["cleanup_clients"]))
             self.assertTrue(all(c["reaped"] and c["PG_gone"] for c in ns["state"]["clients"]))
+
+
+class CurrentBoundaryControls(unittest.TestCase):
+    run_owned = OwnedClientLifecycle.run_owned
+    assert_closed = OwnedClientLifecycle.assert_closed
+
+    def test_streaming_limit_stops_actual_child_before_its_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            ns["client_control"]["cleaning"] = True
+            before = time.monotonic()
+            with self.assertRaisesRegex(AssertionError, "output too large"):
+                self.run_owned(
+                    directory,
+                    ns,
+                    "import os,time; os.write(1,b'x'*(5*1024**2)); time.sleep(30)",
+                    until=before + 3.4,
+                )
+            self.assertLess(time.monotonic() - before, 2)
+            self.assert_closed(ns)
+            client = ns["state"]["clients"][-1]
+            self.assertTrue(client["stdout_truncated"])
+            self.assertLessEqual(client["stdout_bytes_retained"], 4 * 1024**2)
+            self.assertEqual(client["stdout_sha256_scope"], "observed_prefix")
+
+    def test_late_signal_at_final_receipt_cannot_report_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "late_signal")
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIn("cancel", str(error))
+            self.assertTrue(ns["state"]["cleanup_verified_absent"])
+
+    def test_cleanup_first_error_survives_later_receipt_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(
+                directory, "cleanup_first_then_receipt", cleanup_stop_stderr=b"first stop error"
+            )
+            self.assertIsInstance(error, AssertionError)
+            self.assertIn("cleanup_stop", str(error))
+            self.assertTrue(ns["state"].get("receipt_failures"))
+            self.assertEqual(ns["state"]["cleanup_failure"], "AssertionError")
+
+    def test_private_registration_without_bootstrap_is_removed_only_after_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "registration")
+            self.assertIsNone(error)
+            self.assertTrue(ns["state"]["registration_cleanup_verified"])
+            self.assertTrue(ns["state"]["cleanup_verified_no_container"])
+            self.assertNotIn("cleanup_verified_stopped_PID0", ns["state"])
+            self.assertIn(["docker", "buildx", "rm", "--keep-daemon", ns["builder"]], calls)
+            self.assertFalse(any(a[1] == "stop" for a in calls))
+
+    def test_foreign_registration_remains_hold_without_remove(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(directory, "registration", foreign=True)
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(ns["state"].get("registration_cleanup_verified", False))
+            self.assertFalse(any(a[1:3] == ["buildx", "rm"] for a in calls))
+
+    def test_unmatched_private_config_identity_keeps_registration_hold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, calls, error = exercise_owned_cleanup_fault(
+                directory, "registration_replaced_config"
+            )
+            self.assertIsInstance(error, AssertionError)
+            self.assertFalse(ns["state"].get("cleanup_verified_absent", False))
+            self.assertFalse(any(a[1:3] == ["buildx", "rm"] for a in calls))
 
 
 if __name__ == "__main__":
