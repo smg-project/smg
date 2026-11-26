@@ -1324,4 +1324,5 @@ pub(crate) fn issue_decode(
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/service/controller/frame_decision/tests/mod.rs"]
 mod tests;

@@ -20,6 +20,7 @@ pub(crate) mod spec_store;
 #[path = "no_spec_store.rs"]
 pub(crate) mod spec_store;
 #[cfg(test)]
+#[path = "../../../tests/unit/document/operator/test_support.rs"]
 pub(crate) mod test_support;
 mod turn;
 

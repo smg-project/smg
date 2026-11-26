@@ -78,4 +78,5 @@ pub(super) fn decide(
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/keys/tests.rs"]
 mod tests;
