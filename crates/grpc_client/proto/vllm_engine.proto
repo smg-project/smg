@@ -54,6 +54,9 @@ service VllmEngine {
 
 // Sampling parameters for text generation
 message SamplingParams {
+  // Per-request reasoning token limit. Presence distinguishes zero from the engine default.
+  optional uint32 thinking_token_budget = 29;
+
   optional float temperature = 1;
   float top_p = 2;
   uint32 top_k = 3;
@@ -548,6 +551,8 @@ message GetServerInfoResponse {
   // comma-separated: "cache_salt". "" when the servicer reads none. Flattened
   // into the `cache_partition_fields` worker label.
   string cache_partition_fields = 31;
+  // This servicer and its running engine can enforce a per-request reasoning budget.
+  bool supports_thinking_token_budget = 32;
 }
 
 // =====================

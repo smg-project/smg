@@ -236,6 +236,11 @@ pub trait GenerationRequest: Send + Sync {
         None
     }
 
+    /// Per-request reasoning token cap, when the endpoint carries one.
+    fn thinking_token_budget(&self) -> Option<u32> {
+        None
+    }
+
     /// The fields that partition the backend's prefix cache for this request.
     /// Protocols without such fields are unpartitioned.
     fn cache_partition(&self) -> CachePartition<'_> {

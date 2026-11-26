@@ -2600,6 +2600,18 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn conflicting_thinking_token_budgets_return_400_before_routing() {
+        for stream in [true, false] {
+            let input = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}],
+                "stream":stream, "thinking_token_budget":0, "custom_params":{"thinking_budget":1}});
+            let (status, body) = chat_request(&input.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "conflicting_thinking_token_budget");
+            assert_eq!(body["error"]["param"], "thinking_token_budget");
+        }
+    }
+
     /// The Chat Completions extractor applies the Flash budget to model names
     /// and registered aliases, preserving both wire fields and their precedence.
     #[tokio::test]

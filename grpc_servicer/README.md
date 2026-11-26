@@ -38,6 +38,36 @@ SGLang with `pyzmq>=25.0.0` and `msgspec>=0.18.0`).
 
 ## Usage
 
+### Reasoning token budgets in Chat Completions
+
+Set `thinking_token_budget` on each `POST /v1/chat/completions` request to cap
+the tokens generated inside a reasoning block. For example, the same model
+can serve requests with different budgets:
+
+```json
+{
+  "model": "Qwen/Qwen3-8B",
+  "messages": [{"role": "user", "content": "Explain why a prime greater than 2 is odd."}],
+  "thinking_token_budget": 64
+}
+```
+
+SMG also accepts `"custom_params": {"thinking_budget": 64}`. If both spellings
+carry integers they must agree, otherwise SMG returns HTTP 400. Zero is an
+explicit budget. Omission, null, and -1 leave the worker default in effect.
+A budget does not turn on reasoning or change the output token limit.
+Engines can count each reasoning block separately, including TensorRT-LLM.
+
+| Worker | HTTP | gRPC |
+| --- | --- | --- |
+| SGLang | Strict-thinking worker with a tokenizer and a supported reasoning parser. SMG infers support for the Qwen3 parsers using xgrammar. | A matching SMG servicer must advertise an active reasoning token filter. |
+| vLLM | SMG recognizes releases from 0.28.0, which implement budgets on both GPU model runners. The engine needs a configured reasoning parser or reasoning token IDs. | A matching SMG servicer must advertise support from the engine configuration. |
+| TensorRT-LLM | Register the worker with `runtime_type: "trtllm"`. The native server supports budgets from 1.3.0rc17 with a reasoning parser and tokenizer. GPT-OSS/Harmony rejects finite budgets. | Returns HTTP 400. The current NVIDIA gRPC service and ZMQ shim do not carry a thinking budget to the engine. |
+
+For an HTTP deployment with verified SGLang or vLLM budget support that discovery
+cannot detect, register the worker with the label `supports_thinking_token_budget=true`.
+A mixed fleet can reject a budgeted request if the selected worker lacks support.
+
 ### vLLM
 
 ```bash

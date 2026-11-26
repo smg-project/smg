@@ -46,6 +46,19 @@ pub(super) async fn generate(
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
+    if req
+        .sampling_params
+        .as_ref()
+        .is_some_and(|params| params.thinking_token_budget.is_some())
+        && !state
+            .shared
+            .ready()
+            .is_some_and(|r| r.supports_thinking_token_budget)
+    {
+        return Err(Status::invalid_argument(
+            "thinking_token_budget requires an active SGLang reasoning token filter",
+        ));
+    }
     req.lora_id = state.loras.resolve(&req.lora_id)?;
     if req.return_hidden_states {
         refuse_hidden_states_above_cap(&state.model)?;

@@ -103,3 +103,15 @@ def test_seed_reaches_the_engine_as_the_unsigned_word(convert, seed, engine_seed
 def test_no_seed_stays_none(convert):
     result = convert(sampling(None, n=1))
     assert result["seed"] is None
+
+
+@pytest.mark.parametrize("budget", [None, 0, 7])
+def test_thinking_token_budget_preserves_presence(convert, budget):
+    params = sampling(None, n=1)
+    if budget is not None:
+        params.thinking_token_budget = budget
+    args = convert(params)
+    if budget is None:
+        assert "thinking_token_budget" not in args
+    else:
+        assert args["thinking_token_budget"] == budget

@@ -4351,6 +4351,7 @@ async fn server_info_advertises_the_engines_encoder_budget() {
 async fn server_info_advertises_where_the_engine_starts_a_grammar() {
     let mut model = model_info();
     model.engine_reasoning_parser = "glm45".to_string();
+    model.supports_thinking_token_budget = true;
     model.constrained_decoding_start = "after_reasoning".to_string();
     let mut h = harness_with(model, None, None).await;
     let info = h
@@ -4360,6 +4361,7 @@ async fn server_info_advertises_where_the_engine_starts_a_grammar() {
         .unwrap()
         .into_inner();
     assert_eq!(info.engine_reasoning_parser, "glm45");
+    assert!(info.supports_thinking_token_budget);
     assert_eq!(info.constrained_decoding_start, "after_reasoning");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
@@ -4371,6 +4373,7 @@ async fn server_info_advertises_where_the_engine_starts_a_grammar() {
         .unwrap()
         .into_inner();
     assert_eq!(info.engine_reasoning_parser, "");
+    assert!(!info.supports_thinking_token_budget);
     assert_eq!(info.constrained_decoding_start, "");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

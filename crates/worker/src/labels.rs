@@ -3,6 +3,9 @@
 
 use std::collections::HashMap;
 
+/// The selected worker can enforce the chat request's reasoning-token budget.
+pub const SUPPORTS_THINKING_TOKEN_BUDGET_LABEL: &str = "supports_thinking_token_budget";
+
 /// Which discovery provider owns the worker: `kubernetes`, `file`, `slurm` or
 /// `consul`. A provider's registration carries it, and the health checker
 /// reads it to tell a worker that discovery registers again from one that

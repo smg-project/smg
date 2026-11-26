@@ -955,14 +955,12 @@ pub(crate) fn aggregate_control(results: &[(bool, String)], ok_message: &str) ->
 
 /// A proto `Struct` (SGLang's `custom_params`) as the msgpack value the
 /// scheduler's `SamplingParams.custom_params` dict decodes from.
-fn struct_to_opaque(value: prost_types::Struct) -> OpaqueValue {
-    OpaqueValue::Map(
-        value
-            .fields
-            .into_iter()
-            .map(|(key, value)| (OpaqueValue::from(key), value_to_opaque(value)))
-            .collect(),
-    )
+fn opaque_fields(value: prost_types::Struct) -> Vec<(OpaqueValue, OpaqueValue)> {
+    value
+        .fields
+        .into_iter()
+        .map(|(key, value)| (OpaqueValue::from(key), value_to_opaque(value)))
+        .collect()
 }
 
 fn value_to_opaque(value: prost_types::Value) -> OpaqueValue {
@@ -972,7 +970,7 @@ fn value_to_opaque(value: prost_types::Value) -> OpaqueValue {
         Some(Kind::NumberValue(number)) => OpaqueValue::F64(number),
         Some(Kind::StringValue(text)) => OpaqueValue::from(text),
         Some(Kind::BoolValue(flag)) => OpaqueValue::Boolean(flag),
-        Some(Kind::StructValue(fields)) => struct_to_opaque(fields),
+        Some(Kind::StructValue(fields)) => OpaqueValue::Map(opaque_fields(fields)),
         Some(Kind::ListValue(list)) => {
             OpaqueValue::Array(list.values.into_iter().map(value_to_opaque).collect())
         }
@@ -987,6 +985,14 @@ fn value_to_opaque(value: prost_types::Value) -> OpaqueValue {
 pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> SglangSamplingParams {
     use sglang_proto::sampling_params::Constraint;
 
+    let mut custom_params = sp.custom_params.map(opaque_fields);
+    if let Some(budget) = sp.thinking_token_budget {
+        // A Struct number is a double; SGLang only acts on a Python int here.
+        let fields = custom_params.get_or_insert_with(Vec::new);
+        let key = OpaqueValue::from("thinking_budget");
+        fields.retain(|(k, _)| k != &key);
+        fields.push((key, OpaqueValue::from(budget)));
+    }
     let mut params = SglangSamplingParams {
         max_new_tokens: sp.max_new_tokens,
         stop: (!sp.stop.is_empty()).then_some(sp.stop),
@@ -1025,7 +1031,7 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
                 .map(|(token, bias)| (token, f64::from(bias)))
                 .collect()
         }),
-        custom_params: sp.custom_params.map(struct_to_opaque),
+        custom_params: custom_params.map(OpaqueValue::Map),
         ..SglangSamplingParams::default()
     };
     match sp.constraint {
@@ -1091,6 +1097,62 @@ mod tests {
 
     use super::*;
     use crate::{sglang_encode::EncodeTransport, test_support::connected_pair};
+
+    #[test]
+    fn chat_thinking_token_budget_reaches_scheduler_as_an_integer() {
+        use openai_protocol::chat::ChatCompletionRequest;
+        use smg_grpc_client::sglang_scheduler::{
+            SglangGenerateRequestOptions, SglangSchedulerClient,
+        };
+
+        for fields in [
+            serde_json::json!({"thinking_token_budget": 0}),
+            serde_json::json!({"custom_params": {"thinking_budget": 0}}),
+        ] {
+            let mut body = serde_json::json!({"model": "test", "messages": [{"role": "user", "content": "hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let chat: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+            let mut request = SglangSchedulerClient::build_generate_request_from_chat_parts(
+                "budget".into(),
+                &chat,
+                "hi".into(),
+                vec![1],
+                SglangGenerateRequestOptions {
+                    require_reasoning: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let params = request.sampling_params.as_mut().unwrap();
+            // Other callers (including PD) may already use this map.
+            params.custom_params = Some(prost_types::Struct {
+                fields: [(
+                    "another".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::BoolValue(true)),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            });
+
+            let wire = translate(request).unwrap();
+            let decoded: WireRequest = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
+            assert!(decoded.require_reasoning);
+            assert_eq!(
+                decoded.sampling_params.custom_params,
+                Some(OpaqueValue::Map(vec![
+                    (OpaqueValue::from("another"), OpaqueValue::from(true)),
+                    (
+                        OpaqueValue::from("thinking_budget"),
+                        OpaqueValue::from(0_u32)
+                    ),
+                ]))
+            );
+        }
+    }
 
     /// The translation under the mock scheduler's context window, one rank.
     fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {

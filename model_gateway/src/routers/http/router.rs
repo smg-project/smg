@@ -946,7 +946,7 @@ impl Router {
     /// worker takes one, the typed request with its backend fields kept on the
     /// routes whose extensions have no shared defaults, the typed request
     /// otherwise; a serialization or preparation failure is the 400 it was.
-    fn serialize_attempt_body<T: serde::Serialize>(
+    fn serialize_attempt_body<T: GenerationRequest + serde::Serialize>(
         attempt: &TypedAttempt<'_, T>,
         decision_adapter: Option<&SglangDecisionAdapter>,
         worker: &dyn Worker,
@@ -967,7 +967,16 @@ impl Router {
                         raw_body_len,
                     )
                 } else {
-                    serialize_request_body(view.request, canonical_model, worker, raw_body_len)
+                    let bytes = serialize_request_body(
+                        view.request,
+                        canonical_model,
+                        worker,
+                        raw_body_len,
+                    )?;
+                    let Some(budget) = view.request.thinking_token_budget() else {
+                        return Ok(bytes);
+                    };
+                    super::thinking_budget::prepare(bytes, worker, budget, raw_body_len)
                 }
             })
             .map_err(|failure| match failure {
@@ -975,6 +984,9 @@ impl Router {
                     "serialization_failed",
                     format!("Failed to serialize request body: {e}"),
                 ),
+                RequestBodyError::ThinkingBudget(e) => {
+                    error::bad_request("unsupported_thinking_token_budget", e)
+                }
                 RequestBodyError::Prepare(e) => error::bad_request(
                     "request_preparation_failed",
                     format!("Failed to prepare request: {e}"),
@@ -2764,10 +2776,14 @@ impl RouterTrait for Router {
         body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
+        let body = match super::chat_for_upstream(Arc::unwrap_or_clone(body)) {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
         self.route_typed_request(
             headers,
             Some(tenant_meta),
-            super::chat_for_upstream(Arc::unwrap_or_clone(body)),
+            body,
             "/v1/chat/completions",
             model_id,
         )

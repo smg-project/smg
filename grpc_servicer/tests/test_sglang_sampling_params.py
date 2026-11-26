@@ -20,8 +20,10 @@ def convert(monkeypatch, servicer_mod):
     # The scheduler's SamplingParams is a stand-in in these engine-free tests:
     # it keeps the keywords the conversion hands it.
     monkeypatch.setattr(servicer_mod, "SGLSamplingParams", lambda **kw: SimpleNamespace(**kw))
-    servicer = servicer_mod.SGLangSchedulerServicer
-    return lambda params: servicer._convert_sampling_params(None, params)
+    implementation = servicer_mod.SGLangSchedulerServicer
+    servicer = implementation.__new__(implementation)
+    servicer._supports_thinking_token_budget = True
+    return servicer._convert_sampling_params
 
 
 @pytest.mark.parametrize(
@@ -64,3 +66,19 @@ def test_the_other_sampling_scalars_pass_through_as_sent(convert):
     )
     assert (params.temperature, params.min_p) == (0.0, 0.0)
     assert (params.frequency_penalty, params.presence_penalty) == (0.0, 0.5)
+
+
+@pytest.mark.parametrize("budget", [0, 13])
+def test_thinking_token_budget_reaches_scheduler_as_an_integer(convert, budget):
+    params = pb.SamplingParams(thinking_token_budget=budget)
+    params.custom_params.update({"another": True})
+    result = convert(pb.SamplingParams.FromString(params.SerializeToString())).custom_params
+    assert result == {"another": True, "thinking_budget": budget}
+    assert type(result["thinking_budget"]) is int
+    assert convert(pb.SamplingParams()).custom_params is None
+
+
+def test_thinking_token_budget_is_refused_on_an_unconfigured_worker(convert):
+    convert.__self__._supports_thinking_token_budget = False
+    with pytest.raises(ValueError, match="thinking_token_budget"):
+        convert(pb.SamplingParams(thinking_token_budget=0))

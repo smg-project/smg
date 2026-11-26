@@ -10,6 +10,7 @@ pub(crate) mod stream_relay;
 pub(crate) mod tenant_rate_limit;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod thinking_budget;
 
 use axum::response::Response;
 use openai_protocol::{chat::ChatCompletionRequest, profile::ProviderProfile};
@@ -25,9 +26,13 @@ use crate::routers::error;
 /// `high` there) is applied once, where the request is committed to an HTTP
 /// upstream. The profile is the one request validation selected, from the
 /// model the client asked for.
-pub(crate) fn chat_for_upstream(mut body: ChatCompletionRequest) -> ChatCompletionRequest {
+pub(crate) fn chat_for_upstream(
+    mut body: ChatCompletionRequest,
+) -> Result<ChatCompletionRequest, Response> {
+    body.normalize_thinking_token_budget()
+        .map_err(|e| error::bad_request("invalid_thinking_token_budget", e.to_string()))?;
     ProviderProfile::for_model(&body.model).normalize_chat_for_upstream(&mut body);
-    body
+    Ok(body)
 }
 
 /// Rewrite the `model` field of an outbound request body.

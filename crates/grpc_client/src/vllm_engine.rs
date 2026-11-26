@@ -198,6 +198,9 @@ impl VllmEngineClient {
         };
 
         Ok(proto::SamplingParams {
+            thinking_token_budget: request
+                .resolved_thinking_token_budget()
+                .map_err(|e| e.to_string())?,
             temperature: request.temperature,
             top_p: request.top_p.unwrap_or(1.0),
             top_k: request.top_k.map(|v| v.max(0) as u32).unwrap_or(0), // 0 means disabled in vLLM

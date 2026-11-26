@@ -14,6 +14,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from datetime import datetime, timezone
+from functools import cached_property
 from traceback import format_exc as get_exception_traceback
 
 import grpc
@@ -79,6 +80,7 @@ from ..constrained_decoding import (
     grammar_start_labels,
     sglang_constrained_decoding_start,
     sglang_grammar_backend,
+    sglang_supports_thinking_budget,
 )
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
@@ -757,6 +759,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         )
         # The grammar backend the scheduler runs, resolved (the raw argument
         # is None unless set), under the same key the Rust servicer reads.
+        if (
+            "thinking_token_budget" in sglang_scheduler_pb2.SamplingParams.DESCRIPTOR.fields_by_name
+            and self._supports_thinking_token_budget
+        ):
+            serializable_args["supports_thinking_token_budget"] = True
         grammar_backend_entry(serializable_args, sglang_grammar_backend(self.server_args))
         # The gateway reads this worker's running window (its PD admission
         # bound, its share of the fleet's capacity) from `max_running_requests`
@@ -1293,6 +1300,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             sampling_params=sampling_params,
         )
 
+    @cached_property
+    def _supports_thinking_token_budget(self) -> bool:
+        return sglang_supports_thinking_budget(self.server_args, getattr(self, "tokenizer", None))
+
     def _convert_sampling_params(
         self, grpc_params: sglang_scheduler_pb2.SamplingParams
     ) -> SGLSamplingParams:
@@ -1319,6 +1330,17 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             if grpc_params.HasField("custom_params")
             else None
         )
+        if getattr(grpc_params, "thinking_token_budget", None) is not None and grpc_params.HasField(
+            "thinking_token_budget"
+        ):
+            if not self._supports_thinking_token_budget:
+                raise ValueError(
+                    "thinking_token_budget requires an active SGLang reasoning token filter"
+                )
+            # A protobuf Struct represents all numbers as doubles. The scheduler
+            # requires an int for this grammar parameter.
+            custom_params = custom_params or {}
+            custom_params["thinking_budget"] = grpc_params.thinking_token_budget
         max_new_tokens = (
             grpc_params.max_new_tokens if grpc_params.HasField("max_new_tokens") else None
         )

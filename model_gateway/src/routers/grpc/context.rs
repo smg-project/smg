@@ -378,6 +378,8 @@ pub(crate) struct ProcessingState {
 /// ([`ExecutionPlan::routing_token_ids`]).
 #[derive(Default)]
 pub(crate) struct RoutingSnapshot {
+    /// Every selected worker must enforce the retained request's reasoning token limit.
+    pub needs_thinking_budget: bool,
     /// Exact context checks retained for initial selection and retries.
     pub context_requirements: super::common::stages::ContextRequirements,
     /// Captured when the prompt has no token ids, or when a configured policy

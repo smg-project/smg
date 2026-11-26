@@ -238,6 +238,20 @@ impl SglangSchedulerClient {
             },
         )?;
 
+        if sampling_params.thinking_token_budget.is_some() && !options.require_reasoning {
+            // A disabled template already keeps reasoning closed. Otherwise a
+            // first-token grammar may bypass the engine's reasoning filter.
+            let enable_thinking = body
+                .chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.get("enable_thinking"))
+                .and_then(serde_json::Value::as_bool)
+                .or_else(|| body.template_thinking());
+            if enable_thinking != Some(false) {
+                return Err("thinking_token_budget requires an active reasoning grammar on this SGLang request".into());
+            }
+        }
+
         let grpc_request = proto::GenerateRequest {
             request_id,
             tokenized: Some(proto::TokenizedInput {
@@ -383,6 +397,9 @@ impl SglangSchedulerClient {
         let skip_special_tokens = true;
 
         Ok(proto::SamplingParams {
+            thinking_token_budget: request
+                .resolved_thinking_token_budget()
+                .map_err(|e| e.to_string())?,
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
             top_k: request.top_k.unwrap_or(-1),
@@ -1308,6 +1325,31 @@ mod tests {
         .expect("build request");
 
         assert!(proto.require_reasoning);
+    }
+
+    #[test]
+    fn thinking_token_budget_preserves_an_explicitly_disabled_template() {
+        let build = |kwargs: serde_json::Value| {
+            let chat = serde_json::from_value(json!({"model": "test-model", "messages": [],
+                "chat_template_kwargs": kwargs, "thinking_token_budget": 0}))
+            .unwrap();
+            SglangSchedulerClient::build_generate_request_from_chat_parts(
+                "budget".into(),
+                &chat,
+                "hello".into(),
+                vec![1],
+                Default::default(),
+            )
+        };
+        assert!(build(json!({}))
+            .unwrap_err()
+            .contains("active reasoning grammar"));
+        let request = build(json!({"enable_thinking": false})).unwrap();
+        assert!(!request.require_reasoning);
+        assert_eq!(
+            request.sampling_params.unwrap().thinking_token_budget,
+            Some(0)
+        );
     }
 
     #[test]

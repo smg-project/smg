@@ -13,9 +13,12 @@ use axum::{
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
 use parking_lot::Mutex;
-use smg_worker::identity::{
-    basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
-    sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
+use smg_worker::{
+    identity::{
+        basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+        sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
+    },
+    labels::SUPPORTS_THINKING_TOKEN_BUDGET_LABEL,
 };
 use tracing::{debug, error, warn};
 
@@ -192,6 +195,30 @@ pub(crate) enum WorkerSelectionMode {
     PrefillDecode,
     /// EPD mode: select encode + prefill + decode workers
     EncodePrefillDecode,
+}
+
+fn supports_thinking_budget(worker: &dyn Worker) -> bool {
+    let spec = &worker.metadata().spec;
+    matches!(spec.runtime_type, RuntimeType::Sglang | RuntimeType::Vllm)
+        && spec
+            .labels
+            .get(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL)
+            .is_some_and(|v| v == "true")
+}
+
+fn require_thinking_budget(workers: &WorkerSelection) -> Result<(), Response> {
+    for worker in workers.workers() {
+        if !supports_thinking_budget(worker.as_ref()) {
+            return Err(error::bad_request(
+                "unsupported_thinking_token_budget",
+                format!(
+                    "the selected {} worker does not advertise support for thinking_token_budget",
+                    worker.metadata().spec.runtime_type
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl WorkerSelectionStage {
@@ -397,6 +424,7 @@ struct SelectionInputs<'a> {
     /// and the disaggregated sides their shares of it (see `PairDemands`).
     needs_vision: bool,
     context_requirements: ContextRequirements,
+    needs_thinking_budget: bool,
     demand: PairDemands,
     text: Option<&'a str>,
     /// The prepared request's token ids, for PrefixHash policy support.
@@ -500,6 +528,7 @@ impl<'a> SelectionInputs<'a> {
             media_refs,
             needs_vision,
             context_requirements,
+            needs_thinking_budget: matches!(&input.request_type, RequestType::Chat(chat) if chat.resolved_thinking_token_budget().ok().flatten().is_some()),
             demand,
             text,
             ids,
@@ -529,6 +558,7 @@ impl<'a> SelectionInputs<'a> {
     fn snapshot(&self) -> RoutingSnapshot {
         RoutingSnapshot {
             context_requirements: self.context_requirements,
+            needs_thinking_budget: self.needs_thinking_budget,
             routing_text: self
                 .keep_text
                 .then(|| self.text.map(str::to_string))
@@ -761,6 +791,9 @@ impl WorkerSelectionStage {
             }
         }
 
+        if inputs.needs_thinking_budget {
+            require_thinking_budget(&workers)?;
+        }
         ctx.state.workers = Some(workers);
         Ok(())
     }
@@ -920,6 +953,9 @@ impl WorkerSelectionStage {
             }
         };
 
+        if ctx.routing.needs_thinking_budget {
+            require_thinking_budget(&workers)?;
+        }
         ctx.workers = Some(workers);
         Ok(())
     }
@@ -973,7 +1009,13 @@ impl WorkerSelectionStage {
         let takes_the_request = |worker: &dyn Worker| {
             let mut brought = brought.lock();
             *brought = None;
-            let alike = takes_the_built_request(&**first, worker, model_id, request.wire);
+            let alike = takes_the_built_request(
+                &**first,
+                worker,
+                model_id,
+                request.wire,
+                request.routing.needs_thinking_budget,
+            );
             if !alike || !request.ledger.admits(worker) {
                 return false;
             }
@@ -1278,8 +1320,10 @@ fn takes_the_built_request(
     worker: &dyn Worker,
     model: &str,
     wire: WireConstraint,
+    needs_thinking_budget: bool,
 ) -> bool {
     reads_the_request_alike(first, worker)
+        && (!needs_thinking_budget || supports_thinking_budget(worker))
         && holds_what_the_first_holds(first, worker, model)
         && MediaDemands::NONE
             .with_wire(Some(wire))
@@ -4496,6 +4540,7 @@ mod tests {
             rate_limit_cell: None,
             routing: RoutingSnapshot {
                 context_requirements: ContextRequirements::default(),
+                needs_thinking_budget: false,
                 routing_text: None,
                 rid: None,
                 cache_namespace: None,
@@ -8081,6 +8126,34 @@ mod tests {
     const VISION_ENCODER: &[(&str, &str)] = &[(smg_worker::labels::SUPPORTS_VISION_LABEL, "true")];
     const UNLABELED: &[(&str, &str)] = &[];
 
+    #[test]
+    fn thinking_token_budget_checks_the_selected_worker_capability() {
+        for (labels, expected) in [
+            (UNLABELED, false),
+            (&[(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, "true")][..], true),
+        ] {
+            let selection = WorkerSelection::Single {
+                worker: labeled_worker(
+                    "grpc://localhost:5000",
+                    "model",
+                    WorkerType::Regular,
+                    labels,
+                )
+                .into(),
+            };
+            assert_eq!(
+                require_thinking_budget(&selection)
+                    .err()
+                    .map(|r| r.status()),
+                if expected {
+                    None
+                } else {
+                    Some(StatusCode::BAD_REQUEST)
+                }
+            );
+        }
+    }
+
     /// A gRPC worker of `worker_type`, with `labels`.
     fn labeled_worker(
         url: &str,
@@ -9261,6 +9334,31 @@ mod tests {
         assert!(!holds(None, Some(4_096)), "the first stated none");
     }
 
+    #[test]
+    fn a_moved_grpc_decode_must_enforce_the_built_thinking_budget() {
+        for runtime in [RuntimeType::Sglang, RuntimeType::Vllm] {
+            let decode = |advertised| {
+                let worker = BasicWorkerBuilder::new("grpc://decode:30000")
+                    .worker_type(WorkerType::Decode)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(runtime);
+                if advertised {
+                    worker
+                        .label(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL, "true")
+                        .build()
+                } else {
+                    worker.build()
+                }
+            };
+            let first = decode(true);
+            let legacy = decode(false);
+            let wire = grpc_wire(runtime);
+            assert!(takes_the_built_request(&first, &first, "m", wire, true));
+            assert!(!takes_the_built_request(&first, &legacy, "m", wire, true));
+            assert!(takes_the_built_request(&first, &legacy, "m", wire, false));
+        }
+    }
+
     /// A decode request can keep the media references its plan forwards. A
     /// decode the pair moves to takes them as every selection asks of a
     /// candidate: it processes references, on the side of the wire's
@@ -9286,7 +9384,7 @@ mod tests {
         let takes = |processor: Option<&str>, wire: WireConstraint| {
             let other = decode(processor);
             assert!(reads_the_request_alike(&first, &other));
-            takes_the_built_request(&first, &other, "m", wire)
+            takes_the_built_request(&first, &other, "m", wire, false)
         };
         let gateways = Some(multimodal::GATEWAY_PIPELINE_PROCESSOR);
 

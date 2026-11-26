@@ -115,3 +115,58 @@ class TestEnableThinking:
             "The reasoning content should not be included in the stream response"
         )
         assert has_content, "The stream response does not contain normal content"
+
+
+@pytest.mark.gpu(1)
+@pytest.mark.model("Qwen/Qwen3-30B-A3B")
+@pytest.mark.gateway(extra_args=["--reasoning-parser", "qwen3"])
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+class _ThinkingTokenBudget:
+    @pytest.mark.parametrize(
+        "budget",
+        [None, {"thinking_token_budget": 0}, {"custom_params": {"thinking_budget": 0}}],
+        ids=["worker-default", "canonical-zero", "sglang-alias-zero"],
+    )
+    def test_thinking_budget_limits_only_reasoning(self, model, api_client, budget):
+        options = {"chat_template_kwargs": {"enable_thinking": True}}
+        if budget is not None:
+            options.update(budget)
+        response = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "What is 17 times 23?"}],
+            temperature=0,
+            max_tokens=256,
+            extra_body=options,
+        )
+        message = response.choices[0].message
+        reasoning = (getattr(message, "reasoning_content", None) or "").strip()
+        if budget is None:
+            assert reasoning, "The control request should produce reasoning on this model."
+        else:
+            assert not reasoning
+            assert (message.content or "").strip(), "The final answer still has its token budget."
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.workers(
+    extra_engine_args=[
+        "--reasoning-config",
+        '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}',
+    ]
+)
+class TestVllmThinkingTokenBudget(_ThinkingTokenBudget):
+    """The worker's sampler enforces the budget between Qwen3's reasoning markers."""
+
+
+@pytest.mark.engine("sglang")
+@pytest.mark.workers(
+    extra_engine_args=[
+        "--enable-strict-thinking",
+        "--reasoning-parser",
+        "qwen3",
+        "--grammar-backend",
+        "xgrammar",
+    ]
+)
+class TestSglangThinkingTokenBudget(_ThinkingTokenBudget):
+    """The worker's strict reasoning grammar enforces the budget."""

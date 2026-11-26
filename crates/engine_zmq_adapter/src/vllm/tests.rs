@@ -1952,6 +1952,41 @@ fn a_chat_requests_min_tokens_survive_the_wire() {
     );
 }
 
+#[test]
+fn chat_thinking_token_budget_reaches_engine_core() {
+    use engine_zmq_client::codec::{decode_msgpack, encode_msgpack};
+    use openai_protocol::chat::ChatCompletionRequest;
+    use serde_json::json;
+    use smg_grpc_client::VllmEngineClient;
+
+    for (fields, budget) in [
+        (json!({"thinking_token_budget": 0}), Some(0)),
+        (json!({"custom_params": {"thinking_budget": 7}}), Some(7)),
+        (json!({"thinking_token_budget": -1}), None),
+        (json!({}), None),
+    ] {
+        let mut body = json!({"model": "m", "messages": [{"role":"user", "content":"hi"}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let chat: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let proto = VllmEngineClient::build_generate_request_from_chat(
+            "r1".into(),
+            &chat,
+            "hi".into(),
+            vec![1],
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let translated =
+            translate_request(proto, 1024, ModelDtype::Float32, &EosTokenIds::default()).unwrap();
+        let wire: EngineCoreRequest =
+            decode_msgpack(&encode_msgpack(&translated).unwrap()).unwrap();
+        assert_eq!(wire.sampling_params.unwrap().thinking_token_budget, budget);
+    }
+}
+
 /// vLLM's parameter checks run before submit: a request the engine would
 /// reject on its input thread (killing it) is an invalid-argument error.
 #[test]

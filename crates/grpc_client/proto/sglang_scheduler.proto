@@ -107,6 +107,9 @@ message SamplingParams {
 
   // Custom parameters for extensibility
   google.protobuf.Struct custom_params = 23;
+
+  // Per-request reasoning token limit. Presence distinguishes zero from the engine default.
+  optional uint32 thinking_token_budget = 24;
 }
 
 

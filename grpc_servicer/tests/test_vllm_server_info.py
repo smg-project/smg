@@ -35,6 +35,7 @@ def _server_info_method(response_type):
         "managed_ranks": managed_ranks,
         "mm_device_do_normalize": model_info.mm_device_do_normalize,
         "mm_item_limits": model_info.mm_item_limits,
+        "supports_thinking_token_budget": model_info.supports_thinking_token_budget,
         "engine_reasoning_parser": model_info.engine_reasoning_parser,
         "constrained_decoding_start": model_info.constrained_decoding_start,
     }
@@ -116,6 +117,26 @@ def _response_type_without(*names):
     return message_factory.GetMessageClass(
         pool.FindMessageTypeByName("vllm.grpc.engine.GetServerInfoResponse")
     )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_get_server_info_reports_thinking_token_budget(enabled, legacy):
+    response_type = _response_type_without(*(["supports_thinking_token_budget"] if legacy else []))
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype="torch.bfloat16", is_multimodal_model=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        reasoning_config=SimpleNamespace(enabled=enabled),
+        use_v2_model_runner=False,
+    )
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+    )
+    info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
+    if legacy:
+        assert "supports_thinking_token_budget" not in info.DESCRIPTOR.fields_by_name
+    else:
+        assert info.supports_thinking_token_budget == enabled
 
 
 @pytest.mark.parametrize("legacy", [False, True])

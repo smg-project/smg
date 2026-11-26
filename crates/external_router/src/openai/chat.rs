@@ -150,7 +150,14 @@ pub(super) async fn route_chat(
     let start = Instant::now();
     let model = model_id;
     let streaming = body.stream;
-    let body = chat_for_upstream(body);
+    let mut body = chat_for_upstream(body);
+    if let Err(e) = body.normalize_thinking_token_budget() {
+        return error::bad_request("invalid_thinking_token_budget", e.to_string());
+    }
+    if body.thinking_token_budget.is_some() {
+        return error::bad_request("unsupported_thinking_token_budget",
+            "thinking_token_budget requires a local inference worker that supports reasoning budgets");
+    }
 
     Metrics::record_router_request(
         metrics_labels::ROUTER_OPENAI,
