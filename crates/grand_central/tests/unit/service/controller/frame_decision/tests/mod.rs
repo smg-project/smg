@@ -73,6 +73,7 @@ use crate::{
     worker_host::{tests::stand, Members, Objects},
 };
 
+mod demands;
 mod encode;
 mod named;
 
@@ -135,6 +136,12 @@ fn staged(document: &PolicySpec, catalog: &StageRegistry) -> AppliedSpec {
     let digest = document.digest().expect("the document digests");
     AppliedSpec::validate_digested(document, digest, catalog, &[])
         .expect("the catalog holds every stage the document names")
+}
+
+/// `frame` with its request's hard demands stated.
+fn demanding(mut frame: proto::DecideRequest, demands: proto::Demands) -> proto::DecideRequest {
+    frame.demands = Some(demands);
+    frame
 }
 
 /// `frame` with a session key that hashes to `key`.

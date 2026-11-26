@@ -43,6 +43,12 @@
 //! decode's side reads it ([`names_decode`]): the decode its request named
 //! stands.
 //!
+//! A frame states its request's hard demands (`DecideRequest.demands`). The
+//! engine holds each list of its decision to the workers that meet them,
+//! each side of a pair by its role's part. The count of a frame that names
+//! its worker passes over the rest. An encode request's frame states none:
+//! its reader refuses one that does.
+//!
 //! An encode request is its pair's one request, read at the prefill phase
 //! ([`Checked::carries_items`]): [`decide_encode`] decides it over its
 //! model's three lists, the pair's two and the encoders', by the engine's
@@ -84,6 +90,7 @@ use crate::{
             Loaded,
         },
         lease_events,
+        records::PoolRecords,
         shadow::Shadowed,
         view::{fingerprint, Identity, Phase, RequestFacts, Role, Session},
         EncodeLists, PairLists,
@@ -188,13 +195,16 @@ pub(crate) fn decide(
     decide_at(Phase::Single, world, objects, taken, buffers, loads, own)
 }
 
-/// The decision of a frame that stands alone at a side's phase: a prefill
-/// frame, or a decode frame that names no lease, whose plan pairs no side
-/// of its phase. It is decided as a single request's frame is ([`decide`]),
-/// by the binding of its own phase, over the list the registry holds for
-/// the model at that phase's role. The reach and the asking gateway's
-/// vetoes are that role's. Such a frame states no demand yet: one that
-/// states one is refused by the field. So no list is held to one here.
+/// The decision of a frame that stands alone at a side's phase. Such a
+/// frame is a prefill frame, or a decode frame that names no lease, whose
+/// plan pairs no side of its phase. It is decided as a single request's
+/// frame is ([`decide`]), by the binding of its own phase, over the list
+/// the registry holds for the model at that phase's role. The reach and
+/// the asking gateway's vetoes are that role's.
+///
+/// A hard demand the frame states holds the list as that role is held to
+/// it ([`Demands::held_by`](crate::engine::demands::Demands::held_by)): a
+/// prefill worker holds the input alone.
 ///
 /// Out of line: a single request's decision holds no part of it.
 ///
@@ -279,6 +289,7 @@ fn decide_at(
                                 number,
                                 phase,
                                 workers: &lent.workers[..],
+                                records,
                                 held,
                                 read: &read,
                             };
@@ -360,6 +371,9 @@ struct Named<'a> {
     /// The workers of the one list the frame is decided over, in the
     /// list's order.
     workers: &'a [Arc<dyn Worker>],
+    /// That list's records: a hard demand the frame states is judged by
+    /// them.
+    records: &'a PoolRecords,
     /// What the asking gateway may take of that list.
     held: Held<'a>,
     /// The frame's lists as its decider read them: a pick's lease is read
@@ -382,6 +396,13 @@ struct Named<'a> {
 /// asked here. The widest number is a text that was no number
 /// ([`Checked::named_worker`]): no list holds that many workers, so it
 /// reaches none.
+///
+/// A worker that fails a hard demand the frame states takes no number
+/// either, as in a host's own process: the request cannot be sent to it.
+/// The list is judged as its decision judges it, by what the role of the
+/// frame's phase is held to
+/// ([`Demands::held_by`](crate::engine::demands::Demands::held_by)). A
+/// frame that states no demand reads no record for it.
 ///
 /// - **A worker reached.** The frame's one decision is held to that
 ///   worker's place ([`FrameRequest::held_to`]), and answers as the
@@ -420,6 +441,7 @@ fn decide_named(
         number,
         phase,
         workers,
+        records,
         held,
         read,
     } = named;
@@ -428,9 +450,22 @@ fn decide_named(
         let (decision, said) = front.decide_without_lease(&maker, now)?;
         return Ok(booked(decision, said, frame, read, true));
     }
+    // The places the gateway may take whose worker meets the frame's hard
+    // demands, where a demand leaves a worker out: the count reads those.
+    let mut meeting = Vec::new();
+    let demands = frame.demands().held_by(phase.role());
+    let narrowed = !demands.is_none()
+        && records
+            .meeting(demands, held.places, &mut meeting)
+            .is_some();
+    let counted = if narrowed {
+        Some(&meeting[..])
+    } else {
+        held.places
+    };
     // Both run ascending, as the count walks the list: each is read in
     // step with it.
-    let mut may = held.places.map(|places| places.iter().copied().peekable());
+    let mut may = counted.map(|places| places.iter().copied().peekable());
     let mut stalls = held.stalled.iter().copied().peekable();
     let reached = named_worker::reached(workers, Some(number), |place, worker| {
         let taken = may
@@ -498,6 +533,11 @@ fn hands_reports(spec: &AppliedSpec) -> bool {
 /// of leases, where the decider lent its place. The engine keeps that word
 /// by phase, and the decode phase's also carries a decode binding of the
 /// model's own: such a binding asks the apply too.
+///
+/// A hard demand the frame states holds each side's list as that side's
+/// role is held to it
+/// ([`Demands::held_by`](crate::engine::demands::Demands::held_by)): the
+/// engine's pair decision judges them, a side at a time.
 ///
 /// A frame whose request names its worker is decided for the workers its
 /// number reaches ([`decide_named_pair`]). A frame that names none pays one
@@ -698,7 +738,7 @@ fn decide_sides(
                                     front,
                                     spec,
                                     maker,
-                                    pair,
+                                    (pair, [prefill_records, decode_records]),
                                     (frame, number),
                                     now,
                                 ),
@@ -762,6 +802,13 @@ fn decide_sides(
 /// them ([`decide_named`]), and with no route's rule. The widest number
 /// is a text that was no number: it reaches no worker.
 ///
+/// A worker that fails a hard demand the frame states is counted on
+/// neither side, as in a host's own process. Each side is judged by its
+/// own records (`records`, the prefills' and then the decodes'), by what
+/// its role is held to
+/// ([`Demands::held_by`](crate::engine::demands::Demands::held_by)). A
+/// frame that states no demand reads no record for it.
+///
 /// The sides that read the number are the binding's ([`sides_named`]):
 ///
 /// - **The prefill's side.** The frame's one decision is held to the place
@@ -803,15 +850,38 @@ fn decide_named_pair(
     front: Loaded<'_, '_>,
     spec: &AppliedSpec,
     maker: FrameRequest<'_>,
-    pair: PairLists<'_>,
+    (pair, records): (PairLists<'_>, [&PoolRecords; 2]),
     (frame, number): (&Checked, u32),
     now: Instant,
 ) -> Result<(Decision, Option<Shadowed>), DecisionRefused> {
     let model = frame.model();
     let unnamed = || front.decide_without_lease(&maker, now);
+    // The places of each side the gateway may take whose worker meets the
+    // frame's hard demands, where a demand leaves a worker out: the count
+    // reads those.
+    let mut meeting = [Vec::new(), Vec::new()];
+    let mut stated = [pair.prefill_places, pair.decode_places];
+    let demands = frame.demands();
+    if !demands.is_none() {
+        let [prefills, decodes] = &mut meeting;
+        let [prefill_records, decode_records] = records;
+        let judged = [
+            (prefill_records, Role::Prefill, stated[0], prefills),
+            (decode_records, Role::Decode, stated[1], decodes),
+        ];
+        let narrowed = judged.map(|(records, role, among, kept)| {
+            let demands = demands.held_by(role);
+            records.meeting(demands, among, kept).is_some()
+        });
+        for (side, narrowed) in narrowed.into_iter().enumerate() {
+            if narrowed {
+                stated[side] = Some(&meeting[side]);
+            }
+        }
+    }
     let counted = [
-        (pair.prefill_places, pair.prefill_stalled),
-        (pair.decode_places, pair.decode_stalled),
+        (stated[0], pair.prefill_stalled),
+        (stated[1], pair.decode_stalled),
     ];
     let reached = match sides_named(spec, model) {
         [true, decode_named] => {
@@ -1137,6 +1207,10 @@ pub(crate) fn issue_pair(
 /// decider lent its place. The word asked is the decode phase's, which
 /// holds the pair's decode profile's: no stage of the prefill's profile
 /// runs at the call, so none of its can refuse.
+///
+/// A hard demand the call's frame states holds the decodes, whole: the
+/// engine's decision judges them, and no prefill. The lease keeps no
+/// demand, so a call states its request's again.
 ///
 /// `Ok` is the decision with what its side's lease takes of the frame: the
 /// request's session of the decode phase and the prompt's tokens.

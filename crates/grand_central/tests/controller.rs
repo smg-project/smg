@@ -115,6 +115,8 @@ fn stating<T>(name: Option<&'static str>, message: T) -> Request<T> {
 /// through the served controller's holder ([`Controller::workers`]), with
 /// its connect signal behind the write. `None` where `store` took no
 /// write.
+///
+/// [`Controller::workers`]: smg_grand_central::service::controller::Controller::workers
 fn ready(holder: &Objects<Members>, store: &MemoryStore, stated: WorkerFacts) -> Option<WorkerId> {
     let id = holder.upsert(store, stated, Registrant::Control)?.id();
     let revision = WorkersStore::get(store, id)?.revision;
