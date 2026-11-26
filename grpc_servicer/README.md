@@ -101,6 +101,13 @@ documented setting and logs nothing. The startup
 line `VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and
 the `mm_processor_source` label name where the value came from.
 
+A worker that prepares media itself (`inprocess` or the sidecar) hands a
+fetched image to the engine's processor unchanged, so the image costs the
+visual tokens the installed engine release counts. The router's own pipeline
+sizes an image by the rule of the newest release it follows; a worker on an
+older release whose processor sizes a small image by another rule counts that
+image differently.
+
 The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards
 `media_refs` only to workers that advertise, and a router without it ignores the

@@ -357,6 +357,37 @@ class TestNativeAudio:
         assert result.prompt_token_ids == [258881]
 
 
+class TestNativeImage:
+    def test_a_fetched_image_reaches_the_sidecar_renderer_as_fetched(self):
+        s = sidecar(FakeRedis())
+        image = object()
+        fetched, rendered = [], []
+
+        async def fetch_image(actual_url):
+            fetched.append(actual_url)
+            return image
+
+        async def render(prompt, **kwargs):
+            rendered.append(prompt)
+            return {
+                "prompt_token_ids": [258881],
+                "mm_kwargs": {},
+                "mm_hashes": {},
+                "mm_placeholders": {},
+            }
+
+        s._connector = types.SimpleNamespace(fetch_image_async=fetch_image)
+        s._tokens_prompt = lambda **kwargs: kwargs
+        s._renderer = types.SimpleNamespace(process_for_engine_async=render)
+        s._encoder = None  # The fake renderer produces no tensor payloads.
+        result = run(s.handle(job()))
+        assert result.ok, result
+        assert fetched == ["https://a/1.png"]
+        (prompt,) = rendered
+        (handed,) = prompt["multi_modal_data"]["image"]
+        assert handed is image
+
+
 class TestConnector:
     def test_the_connector_reads_the_allow_list_as_the_guard_does(self, monkeypatch):
         """vLLM's own first-URL check is handed the list the guarded
