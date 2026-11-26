@@ -840,7 +840,8 @@ impl Default for KvPressureParams {
 }
 
 /// The warm-up slice: the share of misses offered to workers whose index is
-/// still thin.
+/// still thin. A single request warms nobody while the model's index of
+/// cache events holds no block.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
