@@ -1087,8 +1087,11 @@ impl Loaded<'_, '_> {
             // A claim the call made takes the date of the pair's lease. The
             // decision is read where the answer stands, as a guard's call
             // reads it ([`pair::issued`]).
+            // No side is issued here, so the key is made from the request.
             if let Ok(decision) = &decided {
-                pair::date_decode_claim(own, &request.facts, decision, issued_micros);
+                let facts = &request.facts;
+                let key = || pair::decode_session(facts);
+                pair::date_decode_claim(own, decision, key, facts.now_micros, issued_micros);
             }
             decided
         })
