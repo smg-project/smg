@@ -111,6 +111,7 @@ use parking_lot::RwLock;
 use rand::RngExt;
 use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
+use smg_grand_central::engine::CacheIndex;
 use smg_worker::{
     health::liveness,
     identity::{basic::Worker, endpoint::Endpoint},
@@ -163,7 +164,8 @@ const FLEET_SAMPLE: usize = 16;
 
 /// How long a pool table serves before a decision rebuilds it: a worker the
 /// index interned after the build gains affinity within this, and a worker
-/// that entered the warm-up window is sliced to within this.
+/// that entered the warm-up window is sliced to within this. An index id
+/// that changed hands has the table rebuilt sooner ([`Rows::numbered`]).
 const POOL_TABLE_REFRESH_MS: u64 = 1_000;
 
 /// Pool tables kept at once for the lists no caller named: one per list of
@@ -256,7 +258,8 @@ pub struct CacheAwarePolicy {
     pool_tables: ArcSwap<Vec<Arc<WorkersTable>>>,
     /// The tables of the lists their callers named, ascending by
     /// [`NamedTable::key`]: one a live list and index, built once a refresh
-    /// period whatever part of the list each request may use.
+    /// period, and again once an index id changed hands, whatever part of
+    /// the list each request may use.
     named_tables: ArcSwap<Vec<Arc<NamedTable>>>,
     /// Holders dropped since a named table was last published because a
     /// named list's candidate was not the list's worker at the position its
@@ -1040,7 +1043,9 @@ struct OverlapCandidate {
 /// own space. An overlap lookup's `index id -> blocks` result maps to
 /// candidates through them instead of a string lookup per healthy worker
 /// per request, and the warm-up slice reads the workers inside its window
-/// from them instead of scanning the pool on every thin miss.
+/// from them instead of scanning the pool on every thin miss. They are read
+/// again inside the period once the index hands a removed worker's id to
+/// another: a kept id may then be the new worker's.
 #[derive(Debug)]
 struct Rows {
     /// Gateway clock at the build, for the refresh.
@@ -1049,6 +1054,10 @@ struct Rows {
     /// alive, and it keeps the index's allocation, so the address is never
     /// another index's while the rows live.
     index: Weak<KvIndex>,
+    /// The index's count of ids handed out a second time, read ahead of the
+    /// ids below: they are the index's while it reads the same
+    /// ([`Self::numbered`]).
+    reused: u64,
     /// The index id of the worker at each row; `None` while it is not
     /// interned.
     id_at: Vec<Option<u32>>,
@@ -1073,6 +1082,9 @@ impl Rows {
     /// once per list and refresh, not per request.
     fn read(workers: &[Arc<dyn Worker>], indexer: &Arc<KvIndex>, now_ms: u64) -> Self {
         let warmup = liveness::warmup();
+        // Ahead of the ids: one that changes hands under this pass leaves
+        // the rows a count the index has moved past.
+        let reused = indexer.numbers_reused();
         let mut id_at = Vec::with_capacity(workers.len());
         let mut row_of = HashMap::with_capacity(workers.len());
         let mut sized: Vec<Option<(usize, usize)>> = Vec::with_capacity(workers.len());
@@ -1129,6 +1141,7 @@ impl Rows {
         Self {
             built_ms: now_ms,
             index: Arc::downgrade(indexer),
+            reused,
             id_at,
             row_of,
             fleet_level,
@@ -1145,6 +1158,16 @@ impl Rows {
     /// Whether the rows are within their refresh period.
     fn fresh(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.built_ms) < POOL_TABLE_REFRESH_MS
+    }
+
+    /// Whether the ids the rows read are still `indexer`'s: it handed none
+    /// out a second time since. The count does not say which id it handed
+    /// on: once it moved, any id of the rows may be another worker's, and
+    /// every list's rows over that index are read again. The holder lookup
+    /// tests it ([`CacheAwarePolicy::overlap_holders`]). The warm-up's
+    /// reads of a row's block count do not.
+    fn numbered(&self, indexer: &KvIndex) -> bool {
+        indexer.numbers_reused() == self.reused
     }
 }
 
@@ -1652,7 +1675,8 @@ impl CacheAwarePolicy {
             let tables = self.named_tables.load();
             if let Ok(at) = tables.binary_search_by_key(&key, |table| table.key()) {
                 let table = &tables[at];
-                if table.rows.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel)
+                if (table.rows.fresh(now_ms) && table.rows.numbered(indexer))
+                    || self.pool_table_building.swap(true, Ordering::AcqRel)
                 {
                     return Arc::clone(table);
                 }
@@ -1688,7 +1712,8 @@ impl CacheAwarePolicy {
     }
 
     /// The table of a list nobody named under `indexer`: the one kept when
-    /// it is fresh, a stale one while another decision rebuilds it, else
+    /// it is fresh and its ids are still the index's ([`Rows::numbered`]),
+    /// a stale one while another decision rebuilds it, else
     /// built here and published, the oldest leaving past
     /// [`POOL_TABLES_KEPT`].
     fn workers_table(
@@ -1704,7 +1729,8 @@ impl CacheAwarePolicy {
                 .iter()
                 .find(|table| table.describes(workers, indexer))
             {
-                if table.rows.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel)
+                if (table.rows.fresh(now_ms) && table.rows.numbered(indexer))
+                    || self.pool_table_building.swap(true, Ordering::AcqRel)
                 {
                     return Arc::clone(table);
                 }
@@ -2020,7 +2046,8 @@ impl CacheAwarePolicy {
     /// soaks a worker whose index a publisher-restart resync had emptied never
     /// saw a request again, every prompt holding an overlap elsewhere). The
     /// candidates are the pool table's, chosen at its build (refreshed every
-    /// second): workers thinner than the fleet (see
+    /// second, sooner once an index id changed hands): workers thinner than
+    /// the fleet (see
     /// [`liveness::Warmup::is_thin`]) whatever the fleet's age, else the
     /// workers inside the warm-up window unless every worker is (a young
     /// fleet slices nothing, a miss getting a load-balanced pick anyway); a
@@ -2769,7 +2796,8 @@ impl CacheAwarePolicy {
     /// at temperature zero; a softmax-sampled group otherwise), and
     /// `select_final_from_affinity` uses LeastLoad to choose and credit one
     /// final worker from that group. An empty result means no full-block
-    /// overlap. The tests name the eligible set themselves.
+    /// overlap, or rows read before an index id changed hands. The tests
+    /// name the eligible set themselves.
     #[cfg(test)]
     fn overlap_candidates(
         workers: &[Arc<dyn Worker>],
@@ -2873,7 +2901,10 @@ impl CacheAwarePolicy {
             return Vec::new();
         }
         let caps = indexer.cap_by_groups(content_hashes, block_size, &mut overlap);
-        if overlap.scores.is_empty() {
+        // An id handed on since the rows were read holds its new worker's
+        // blocks and group view: such a lookup names nobody. The count is
+        // read behind both reads of the index by id.
+        if overlap.scores.is_empty() || !table.rows().numbered(indexer) {
             return Vec::new();
         }
 
