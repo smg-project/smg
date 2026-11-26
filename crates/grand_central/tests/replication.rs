@@ -652,6 +652,16 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
             assert_eq!((beat.first_seq, beat.term), (nth(7), term));
         }
 
+        // A second hello ends the stream.
+        joined
+            .frames
+            .send(proto::ReplicaFrame {
+                frame: Some(Frame::Hello(place(nth(6), term))),
+            })
+            .await
+            .expect("the stream's own channel");
+        assert_eq!(joined.ended().await, Some(Code::FailedPrecondition));
+
         // A standby that saw a later term than this replica leads under.
         let later = proto::ReplicaHello {
             term_seen: term + 1,
@@ -676,8 +686,13 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
         let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
         assert_eq!(named.leader_address, "", "this replica knows no leader");
 
+        // The hello's term went to the election, and the leader left its
+        // lease: a stream that stood open under its term ends at its next
+        // look.
+        assert_eq!(fresh.ended().await, Some(Code::Aborted));
+
         // So is one whose place stands under a later term, whatever floor
-        // it states: a deposed leader restores no standby.
+        // it states: a replica that left its lease restores no standby.
         let ahead = proto::ReplicaHello {
             term_seen: term,
             ..place(nth(5), term + 1)
@@ -686,16 +701,6 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
             panic!("a standby ahead of this replica's term is not served");
         };
         assert_eq!(deposed.code(), Code::FailedPrecondition);
-
-        // A second hello ends the stream.
-        joined
-            .frames
-            .send(proto::ReplicaFrame {
-                frame: Some(Frame::Hello(place(nth(6), term))),
-            })
-            .await
-            .expect("the stream's own channel");
-        assert_eq!(joined.ended().await, Some(Code::FailedPrecondition));
     })
     .await;
 }

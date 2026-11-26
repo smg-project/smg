@@ -670,7 +670,8 @@ impl Service {
     /// leader's control listener by the health service's word. The lease is
     /// taken before the store is told its term: in between the answer is
     /// `UNAVAILABLE`. A take at or below a term the log followed starts no
-    /// term: the answer is `UNAVAILABLE` for that whole lead. A call
+    /// term. The answer is `UNAVAILABLE` while that lead lasts: the election
+    /// leaves it in the take's own step. A call
     /// admitted under a take the store has since passed is told to retry.
     /// So a call that reads this guard is not served under a term the store
     /// does not lead: a membership write, a spec write, its dry run and a

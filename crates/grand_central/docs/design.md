@@ -2675,7 +2675,7 @@ listeners (gateways, operators, standbys) and HTTP
 on an admin listener (probes, version, metrics). It elects a leader by a leader lease, held in the
 process, in a file, or in a Kubernetes Lease object. That lease is not the lease of section 6.
 
-A take of the lease stands above every term its replica saw. Three witnesses can show a leader a
+A take of the lease stands above every term its election read or was told. Three witnesses can show a leader a
 term its lease's record never did: a gateway's term floor, a standby's hello and the leader's own
 log. The leader then leaves the lease, and the next take stands above that term. A floor or a
 hello's term is believed within a range, and the terms one process moves this way have a budget.
