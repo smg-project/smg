@@ -64,34 +64,6 @@ impl SerialTurn {
     pub(crate) fn let_in(&self) -> usize {
         self.let_in.load(Ordering::Acquire)
     }
-
-    /// Every place left, taken for a case.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn fill(&self) -> Vec<impl Send + use<>> {
-        std::iter::from_fn(|| self.enter::<fn()>(None)).collect()
-    }
-
-    /// One place, taken for a case.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn place(&self) -> Option<impl Send + use<>> {
-        self.enter::<fn()>(None)
-    }
-
-    /// The turn by itself, so a case can hold it while callers enter.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) async fn hold(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        Arc::clone(&self.turn).lock_owned().await
-    }
-
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn available(&self) -> usize {
-        self.waiting + 1 - self.let_in()
-    }
-
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn is_held(&self) -> bool {
-        self.turn.try_lock().is_err()
-    }
 }
 
 /// A call's place in the turn. It goes back when the call ends, or

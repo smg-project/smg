@@ -13,8 +13,6 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-#[cfg(test)]
-use self::translation::label_refused;
 use self::translation::{both_families, presets, three_sided, written, written_from, written_with};
 // The metric is named only by a doc link of this module and by its cases.
 #[cfg(any(test, doc))]
@@ -28,12 +26,6 @@ use crate::{
         DEFAULT_WARMUP_BLOCKS, DEFAULT_WARMUP_DIVERT_EVERY, DEFAULT_WARMUP_SECS,
         DEFAULT_WARMUP_SHARE, DEFAULT_WARMUP_THIN_RATIO,
     },
-};
-#[cfg(test)]
-use crate::{
-    document::spec::{BindingSpec, IndexSpec, OverloadSpec, Recovery},
-    engine::view::Phase,
-    policies::cache_aware::Gates,
 };
 
 /// A gateway's routing settings, and the policy document they mean.

@@ -1,6 +1,8 @@
 use super::*;
 use crate::{
-    engine::{Candidate, Constraints, Filter, PoolFacts, RequestFacts, Targets, TieBand},
+    engine::{
+        view::HashKind, Candidate, Constraints, Filter, PoolFacts, RequestFacts, Targets, TieBand,
+    },
     stages::Lifecycle,
 };
 

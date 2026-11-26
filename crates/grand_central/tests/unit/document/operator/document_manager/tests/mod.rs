@@ -24,6 +24,24 @@ use crate::{
 #[cfg(target_os = "linux")]
 mod search;
 
+impl DocumentManager {
+    fn bound(&self) -> bool {
+        self.writable() || self.held.lock().is_some()
+    }
+}
+
+/// The door's two locks, for a case in another module.
+#[cfg(feature = "controller")]
+impl DocumentManager {
+    pub(crate) fn applying_lock(&self) -> &Mutex<Option<SpecStore>> {
+        &self.applying
+    }
+
+    pub(crate) fn held_lock(&self) -> &Mutex<Option<Held>> {
+        &self.held
+    }
+}
+
 const PAST_BUILT: &str = "builds more than 80 bytes for each byte of the size bound (131072)";
 const PAST_TEXT: &str =
     "reads as more than 2 bytes of text for each byte of the size bound (131072)";

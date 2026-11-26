@@ -7,6 +7,25 @@ use super::*;
 use crate::document::operator::test_support::pipe_at;
 use crate::document::operator::test_support::Logged;
 
+impl SpecStore {
+    /// [`SpecStore::open_within`] as the cases open theirs: a start that
+    /// waits a case's room, as the controller's waits its grace period. A
+    /// directory whose store a case dropped is free a moment later where
+    /// another case's child process holds a copy of the lock file.
+    pub(crate) fn open(dir: PathBuf) -> Result<Self, StoreRefused> {
+        Self::open_within(dir, Duration::from_secs(30))
+    }
+
+    /// A second store on a directory another holds, its lock file open and
+    /// not locked, as a file system whose locks do not hold between two
+    /// hosts lets one in: the cases of two writers open theirs so.
+    pub(in crate::document::operator) fn open_beside(dir: PathBuf) -> Result<Self, StoreRefused> {
+        let (dir, root) = Self::rooted(&dir)?;
+        let unheld = Self::lock_file(&root)?;
+        Self::read_under(dir, root, unheld)
+    }
+}
+
 const YAML: Format = Format::Yaml;
 
 fn at(generation: u64, format: Format) -> Persisted {
