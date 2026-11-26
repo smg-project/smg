@@ -331,6 +331,54 @@ task opens the worker's place in the sink, and `model_left` when a model's
 last events subscription is gone. A subscription for the pushed load records
 alone (`SubscriptionKind::Loads`) calls none of the three.
 
+## The constrained decoding labels
+
+A gateway that shapes a request's grammar itself reads three labels of a
+worker, parsed once when the worker is built (`WorkerMetadata::decoding`). An
+engine's servicer reports them in its server info, and a label set on the
+worker's spec wins over the report.
+
+| Label | Values | A worker without it |
+|---|---|---|
+| `constrained_decoding` | `requested`, `always` | Reads as `requested`: a grammar only when the request asks for one. Another value fails the registration. |
+| `constrained_decoding_start` | `first_token`, `after_reasoning` | Names no start. Another value reads the same. |
+| `structural_tag_vocabulary` | `older` | Takes the current vocabulary. |
+
+`constrained_decoding_start` says where the engine starts a grammar on a
+prompt that leaves the model inside its thought. A forced tool call or a JSON
+answer on such a prompt is shaped by it:
+
+| The label | A forced tool call | A JSON answer |
+|---|---|---|
+| `first_token` | The thought, its close, then the calls. | The closed thought, then the schema. |
+| `after_reasoning` | The bare calls. | The schema alone. |
+| none | The call's JSON schema alone. | The schema alone. |
+
+The shapes of a worker that names no start fit an engine of either kind. They
+cost an engine that starts at the first token the thought: it is held to the
+JSON at once. A forced call is shaped before a worker is selected, by the
+start the model's workers name together, so one worker without the label
+holds every forced call of its model to the schema on such a prompt. On a
+prompt that ends outside a thought, a worker without the label is sent the
+grammar a worker labelled `first_token` is sent, except for a JSON answer on a
+table whose thought is a message of its own: there it is sent the grammar of a
+worker labelled `after_reasoning`, whose way into the answer is optional.
+
+A registration warns once of a worker that names no start, where a
+gateway-shaped grammar reaches it: a worker on the gRPC pipeline, of a role
+that generates tokens, on a runtime whose request carries a constraint. It
+says nothing where the read of a gRPC engine found nothing (its connection or
+its model info failed): the engine has named nothing yet, and the label
+refresh of the worker's first transition into service reads it again. A read
+whose server info alone failed keeps the model info and still warns. A ZMQ
+engine names no start at its handshake: its host writes what it knows ahead
+of the handshake, and a gateway writes `first_token`. To set the label by
+hand, put it among the labels of the worker's spec:
+
+```json
+{"url": "grpc://worker:9000", "labels": {"constrained_decoding_start": "first_token"}}
+```
+
 ## Versioning
 
 A change to `proto/common.proto` asks more of a release than any other change
