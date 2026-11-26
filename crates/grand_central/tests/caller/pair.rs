@@ -1,15 +1,16 @@
 //! A pair, served by the program over its two lists.
 //!
 //! The program routes to pairs of a prefill worker and a decode worker
-//! ([`Plan::Pair`]): a request lends the two lists its generation holds, and
-//! the one call names both of its workers. Each case serves requests as a
-//! route would ([`Program::serve`]) and reads what the client was answered
-//! and what the workers saw. Where the classic router has a case of its own
-//! for the answer, the case here names it and its lines.
+//! ([`Plan::Pair`]). A request lends the two lists its generation holds, and
+//! the one call names both of its workers.
+//!
+//! Each case serves requests as a route would ([`Program::serve`]) and reads
+//! what the client was answered and what the workers saw. Where the classic
+//! router has a case of its own for the answer, the case here names it.
 //!
 //! A route sends a pair's decode at once, or behind its prefill's answer
-//! ([`Program::in_turn`]). The last cases serve in turn: the program asks
-//! the engine for the decode again behind that answer.
+//! ([`Program::in_turn`]). The last cases serve in turn: the program asks the
+//! engine for the decode again behind that answer.
 //!
 //! [`Program::in_turn`]: crate::program::Program::in_turn
 //!
@@ -92,15 +93,14 @@ pub(crate) fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeM
     times
 }
 
-/// A pair's request is answered by one call that names a prefill and a
-/// decode: one attempt is two sends, the prefill's first. Under
-/// `round_robin` each side takes the workers of its own list in turn: six
-/// requests over two prefills and three decodes, three a prefill and two a
-/// decode.
+/// A pair's request is answered by one call that names a prefill and a decode:
+/// one attempt is two sends, the prefill's first. Under `round_robin` each
+/// side takes the workers of its own list in turn. Six requests over two
+/// prefills and three decodes make three a prefill and two a decode.
 ///
-/// The classic router names both sides of a pair with their places: its
-/// case `a_pair_placement_names_both_sides_with_their_positions`
-/// (`model_gateway/src/routers/common/placement.rs:3598-3645`).
+/// The classic router names both sides of a pair with their places: its case
+/// `a_pair_placement_names_both_sides_with_their_positions`
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_pair_names_a_prefill_and_a_decode_and_each_side_takes_its_turn() {
     let fleet = fleet(2, 3);
@@ -120,17 +120,17 @@ fn a_pair_names_a_prefill_and_a_decode_and_each_side_takes_its_turn() {
 }
 
 /// An attempt that a worker answers with a server error is asked again, and
-/// the next attempt names both of its workers as tried: each side steps
-/// aside from its own tried worker while another is left. A pair that
-/// stands alone keeps its two workers for the retries, up to the program's
-/// bound of attempts. A prefill's failure is the attempt's answer whatever
-/// its decode answered.
+/// the next attempt names both of its workers as tried. Each side steps aside
+/// from its own tried worker while another is left. A pair that stands alone
+/// keeps its two workers for the retries, up to the program's bound of
+/// attempts. A prefill's failure is the attempt's answer whatever its decode
+/// answered.
 ///
-/// The classic router lets a pair's tried workers step aside a side at a
-/// time, and goes back to a tried worker that is the only one open: its
-/// cases `a_pairs_retry_steps_aside_from_the_tried_engines_a_side_at_a_time`
-/// and `a_pairs_retry_goes_back_to_a_tried_worker_that_is_the_only_one_open`
-/// (`model_gateway/src/routers/common/placement.rs:3829-3877`, `:3883-3915`).
+/// The classic router lets a pair's tried workers step aside a side at a time,
+/// and goes back to a tried worker that is the only one open. Its cases are
+/// `a_pairs_retry_steps_aside_from_the_tried_engines_a_side_at_a_time` and
+/// `a_pairs_retry_goes_back_to_a_tried_worker_that_is_the_only_one_open`
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
     let fleet = fleet(2, 2);
@@ -188,12 +188,13 @@ fn a_pairs_retry_names_both_workers_it_tried_and_steps_aside_from_each() {
     );
 }
 
-/// A worker that cannot be sent to takes no request on its side: a decode
-/// that is not ready, and a prefill whose circuit breaker is open. Where no
-/// decode can be sent to, the engine names no pair under the `healthy`
-/// filter's name, and the program answers a 503. So it does for a model
-/// that has prefills and no decode at all, where no filter emptied a list
-/// and the engine names none. Each refusal names the decode side, which
+/// A worker that cannot be sent to takes no request on its side: a decode that
+/// is not ready, and a prefill whose circuit breaker is open.
+///
+/// Where no decode can be sent to, the engine names no pair under the
+/// `healthy` filter's name, and the program answers a 503. So it does for a
+/// model that has prefills and no decode at all, where no filter emptied a
+/// list and the engine names none. Each refusal names the decode side, which
 /// was left with nobody.
 ///
 /// The classic router answers a pair whose only decode is not ready as the
@@ -258,18 +259,21 @@ fn a_side_that_cannot_be_sent_to_takes_no_request() {
     );
 }
 
-/// The engine hears both sides of a pair from the placement its program
-/// keeps: a served pair is issued once, each side is dispatched before a
-/// send goes out, and each side's end is said as its worker answered. An
-/// attempt whose decode answers a server error ends so on that side, and
-/// its retry is a request of its own to the stages. A program that sends
-/// both sides at once says of no request that its decode is asked again,
-/// so the engine books both sides at the one call under either word of the
-/// document on when a pair's decode is picked.
+/// The engine hears both sides of a pair from the placement its program keeps:
+///
+/// - A served pair is issued once.
+/// - Each side is dispatched before a send goes out.
+/// - Each side's end is said as its worker answered.
+/// - An attempt whose decode answers a server error ends so on that side, and
+///   its retry is a request of its own to the stages.
+///
+/// A program that sends both sides at once says of no request that its decode
+/// is asked again. So the engine books both sides at the one call, under
+/// either word of the document on when a pair's decode is picked.
 ///
 /// The classic router's engine arm says each side by that side's guard: its
 /// case `the_engine_hears_each_side_of_a_placed_pair_by_that_sides_guard`
-/// (`model_gateway/src/routers/common/placement.rs:9718-9753`).
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[tokio::test(start_paused = true)]
 async fn the_engine_hears_both_sides_of_a_pair() {
     for when in [DecodePick::WithPrefill, DecodePick::AfterPrefill] {
@@ -336,9 +340,9 @@ async fn the_engine_hears_both_sides_of_a_pair() {
     }
 }
 
-/// A worker that left takes no later request on its side, and one that
-/// joined takes them: each membership change publishes the next generation,
-/// whose two lists the program cuts anew.
+/// A worker that left takes no later request on its side, and one that joined
+/// takes them. Each membership change publishes the next generation, whose two
+/// lists the program cuts anew.
 #[test]
 fn a_pair_is_placed_over_the_generation_that_stands() {
     let fleet = fleet(1, 2);
@@ -403,27 +407,31 @@ pub(crate) fn in_turn(
 }
 
 /// A decode asked again is picked as the decodes stand behind the prefill's
-/// answer, and the request's count follows it. The first decision names the
-/// decode that holds no request, and the program counts the request there
-/// from the placement, under the request's routing key. While the prefill
-/// runs that decode takes three more requests, and the second ask names the
-/// other one: at the decode's send the request is counted on that one,
-/// under its key still, and on the first no more. Under a document that
-/// books both sides at once the decode never stands chosen: the program
-/// makes no second ask, and the first decision's decode is sent, under the
-/// guard it has.
+/// answer, and the request's count follows it.
 ///
-/// The gateway asks so where the engine placed the pair: its cases
+/// The first decision names the decode that holds no request. The program
+/// counts the request there from the placement, under the request's routing
+/// key. While the prefill runs that decode takes three more requests, and the
+/// second ask names the other one. At the decode's send the request is counted
+/// on that one, under its key still, and on the first no more.
+///
+/// Under a document that books both sides at once the decode never stands
+/// chosen. So the program makes no second ask, and the first decision's decode
+/// is sent, under the guard it has.
+///
+/// The gateway asks so where the engine placed the pair. Its cases are
 /// `a_decode_asked_again_moves_the_request_and_its_guard_to_the_decode_the_engine_takes`
-/// and `a_decode_asked_again_that_takes_no_other_worker_leaves_the_first_standing`
-/// (`model_gateway/src/routers/common/placement.rs:10288-10314`, `:10323-10379`).
-/// It makes no ask for a decode booked with its prefill either
-/// (`:1090-1096`): its case
-/// `a_decode_booked_with_its_prefill_answers_the_ask_as_the_first_decode_standing`
-/// (`:10529-10575`).
+/// and
+/// `a_decode_asked_again_that_takes_no_other_worker_leaves_the_first_standing`
+/// (`model_gateway/src/routers/common/placement.rs`).
+///
+/// It makes no ask for a decode booked with its prefill either: the test of
+/// `decode_chosen` in `ByEngine::decode_again` there. Its case is
+/// `a_decode_booked_with_its_prefill_answers_the_ask_as_the_first_decode_standing`.
+///
 /// A pair the classic policies picked is sent the decode its one selection
-/// named, and no decode is picked again (`DecodeBehindPrefill`,
-/// `model_gateway/src/routers/grpc/sequential_pd.rs:595-603`).
+/// named, and no decode is picked again: `DecodeBehindPrefill`
+/// (`model_gateway/src/routers/grpc/sequential_pd.rs`).
 #[test]
 fn a_decode_asked_again_is_picked_as_the_decodes_stand_behind_the_prefills_answer() {
     const KEY: &str = "session-7";
@@ -488,17 +496,19 @@ fn a_decode_asked_again_is_picked_as_the_decodes_stand_behind_the_prefills_answe
     }
 }
 
-/// The request a second ask states says that its first decode counts it,
-/// since the program's guard stands there across the ask: the engine then
-/// reads that decode without the request. Under a rule that lets a worker
-/// hold two requests of one key, one other request of the key on the first
-/// decode leaves the request there. Read with the request's own count, that
-/// decode would stand at the rule's bound and the request would move.
+/// The request a second ask states says that its first decode counts it, since
+/// the program's guard stands there across the ask. The engine then reads that
+/// decode without the request.
+///
+/// Under a rule that lets a worker hold two requests of one key, one other
+/// request of the key on the first decode leaves the request there. Read with
+/// the request's own count, that decode would stand at the rule's bound and
+/// the request would move.
 ///
 /// The gateway states the same word behind the guard it makes ahead of the
-/// decode's send (`model_gateway/src/routers/common/placement.rs:1108-1112`,
-/// over `LoadGuards::behind_prefill`,
-/// `model_gateway/src/routers/grpc/context.rs:1116-1130`).
+/// decode's send. `ByEngine::decode_again` sets `counted_on_decode`
+/// (`model_gateway/src/routers/common/placement.rs`), over
+/// `LoadGuards::behind_prefill` (`model_gateway/src/routers/grpc/context.rs`).
 #[test]
 fn a_decode_asked_again_is_read_without_the_request_its_guard_counts_there() {
     const KEY: &str = "session-7";
@@ -548,13 +558,13 @@ fn a_decode_asked_again_is_read_without_the_request_its_guard_counts_there() {
 }
 
 /// A pair served in turn under the document the settings mean, which books
-/// both sides at once, is served as a pair sent at once is: two sends a
-/// request, the prefill's first, and each side takes its turn. Its decode
+/// both sides at once, is served as a pair sent at once is. That is two sends
+/// a request, the prefill's first, and each side takes its turn. Its decode
 /// never stands chosen, so the program asks for none again.
 ///
 /// The classic router names both sides of a pair in its one selection: its
 /// case `a_pair_placement_names_both_sides_with_their_positions`
-/// (`model_gateway/src/routers/common/placement.rs:3598-3645`).
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn a_pair_in_turn_under_a_document_that_books_both_sides_takes_its_turns() {
     let fleet = fleet(2, 3);
@@ -574,15 +584,15 @@ fn a_pair_in_turn_under_a_document_that_books_both_sides_takes_its_turns() {
     assert_eq!(sends(&answers), expected);
 }
 
-/// A prefill that answered in turn holds the request no more: the program
-/// lets its load guard go where it says the prefill's end, so the prefill
-/// counts the request at its own send and no more at the decode's, whether
-/// the decode was asked again or booked with it. A pair sent at once is
-/// counted on its prefill through both sends.
+/// A prefill that answered in turn holds the request no more. The program lets
+/// its load guard go where it says the prefill's end. So the prefill counts
+/// the request at its own send and no more at the decode's, whether the decode
+/// was asked again or booked with it. A pair sent at once is counted on its
+/// prefill through both sends.
 ///
 /// The gateway's sequential dispatch frees the prefill once it is drained,
-/// ahead of its decode
-/// (`model_gateway/src/routers/grpc/sequential_pd.rs:919-921`).
+/// ahead of its decode: `sequential_prefill_side` drops `prefill_guard`
+/// (`model_gateway/src/routers/grpc/sequential_pd.rs`).
 #[test]
 fn a_prefill_that_answered_in_turn_holds_the_request_no_more() {
     let turns = PolicySettings::RoundRobin;
@@ -617,20 +627,21 @@ fn a_prefill_that_answered_in_turn_holds_the_request_no_more() {
     }
 }
 
-/// A prefill that fails in turn sends no decode: its attempt is one send.
-/// The failure here is a 429: any status from 400 up is a prefill's
-/// failure, and a decode goes out behind none of them.
-/// The decode is counted from the placement, so it holds the request while
-/// the prefill runs, and no more once the attempt is over. The retry states
-/// both workers of the failed attempt as tried, so the prefill steps aside
-/// and the one decode stays.
+/// A prefill that fails in turn sends no decode: its attempt is one send. The
+/// failure here is a 429. Any status from 400 up is a prefill's failure, and a
+/// decode goes out behind none of them.
 ///
-/// The gateway's retry names the engines of both sides of the failed
-/// attempt's selection, whichever side failed and whether or not its
-/// decode was sent: it reads the selection, and not what went out
-/// (`WorkerSelection::engines`,
-/// `model_gateway/src/routers/grpc/context.rs:1717-1721`, read at
-/// `model_gateway/src/routers/grpc/pipeline.rs:849-861`).
+/// The decode is counted from the placement, so it holds the request while the
+/// prefill runs, and no more once the attempt is over. The retry states both
+/// workers of the failed attempt as tried, so the prefill steps aside and the
+/// one decode stays.
+///
+/// The gateway's retry names the engines of both sides of the failed attempt's
+/// selection, whichever side failed and whether or not its decode was sent. It
+/// reads the selection, and not what went out: `WorkerSelection::engines`
+/// (`model_gateway/src/routers/grpc/context.rs`), read in
+/// `RequestPipeline::run_inner`
+/// (`model_gateway/src/routers/grpc/pipeline.rs`).
 #[test]
 fn a_prefill_that_fails_in_turn_sends_no_decode() {
     let fleet = fleet(2, 1);
@@ -666,16 +677,17 @@ fn a_prefill_that_fails_in_turn_sends_no_decode() {
     assert_eq!(fleet[2].load(), 0, "every guard ended with its attempt");
 }
 
-/// A retry in turn states its tried workers at its second ask too. One
-/// prefill and two decodes under the policy that takes the lighter worker:
-/// the first decode is idle and the second holds a request, so the first
-/// attempt goes to the first decode, which fails. The retry's second ask
-/// names the second decode, since the first was tried: an ask that stated
-/// no tried worker would take the lighter first one again.
+/// A retry in turn states its tried workers at its second ask too. One prefill
+/// and two decodes stand under the policy that takes the lighter worker. The
+/// first decode is idle and the second holds a request, so the first attempt
+/// goes to the first decode, which fails.
 ///
-/// The gateway states a request's tried workers again at its second ask
-/// (`RequestAgain`,
-/// `model_gateway/src/routers/grpc/sequential_pd.rs:702-710`).
+/// The retry's second ask names the second decode, since the first was tried.
+/// An ask that stated no tried worker would take the lighter first one again.
+///
+/// The gateway states a request's tried workers again at its second ask:
+/// `RequestAgain`, as `execute_sequential_pd` builds it
+/// (`model_gateway/src/routers/grpc/sequential_pd.rs`).
 #[test]
 fn a_retry_in_turn_names_the_decode_it_did_not_try_at_its_second_ask() {
     let fewest = PolicySettings::PowerOfTwo {
@@ -699,19 +711,24 @@ fn a_retry_in_turn_names_the_decode_it_did_not_try_at_its_second_ask() {
 }
 
 /// The engine hears a decode asked again at its ask, its send and its end:
-/// the prefill is issued alone and dispatched, the decode is issued at the
-/// second ask, ahead of the prefill's end, and dispatched where its send is
-/// said, behind that end. The guard the program made at the placement told
-/// the engine nothing. An ask whose own decision places nobody, since the
-/// one decode is not ready then, is answered that decision's shed and
-/// issues nothing: the first decision's decode is sent, and the engine
-/// hears its send ahead of the prefill's end. Under a document that books
-/// both sides at once, a prefill that fails leaves a decode that was never
-/// sent: the engine hears it given up.
 ///
-/// The gateway's stages hear a pair sent prefill first in this order: its
-/// case `a_decode_decided_behind_its_prefill_is_heard_behind_the_prefills_answer`
-/// (`model_gateway/src/routers/http/pd_router/tests/grand_central.rs:460-543`).
+/// - The prefill is issued alone and dispatched.
+/// - The decode is issued at the second ask, ahead of the prefill's end.
+/// - The decode is dispatched where its send is said, behind that end.
+///
+/// The guard the program made at the placement told the engine nothing.
+///
+/// An ask whose own decision places nobody, since the one decode is not ready
+/// then, is answered that decision's shed and issues nothing. So the first
+/// decision's decode is sent, and the engine hears its send ahead of the
+/// prefill's end.
+///
+/// Under a document that books both sides at once, a prefill that fails leaves
+/// a decode that was never sent: the engine hears it given up.
+///
+/// The gateway's stages hear a pair sent prefill first in this order: its case
+/// `a_decode_decided_behind_its_prefill_is_heard_behind_the_prefills_answer`
+/// (`model_gateway/src/routers/http/pd_router/tests/grand_central.rs`).
 #[tokio::test(start_paused = true)]
 async fn the_engine_hears_a_decode_asked_again_at_its_ask_its_send_and_its_end() {
     for when in [DecodePick::AfterPrefill, DecodePick::WithPrefill] {

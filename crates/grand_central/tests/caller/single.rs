@@ -2,8 +2,8 @@
 //!
 //! Each case serves requests as a route would ([`Program::serve`]) and reads
 //! what the client was answered and what the workers saw. Where the classic
-//! router has an answer of its own for the case, the case names the lines
-//! that give it.
+//! router has an answer of its own for the case, the case names the function
+//! or the case that gives it.
 //!
 //! [`Program::serve`]: crate::program::Program::serve
 
@@ -64,12 +64,12 @@ fn sends<'a>(answers: impl IntoIterator<Item = &'a Answer>) -> BTreeMap<&'a str,
     times
 }
 
-/// Plain requests under `round_robin` take the workers of their list in
-/// turn: nine requests over three workers, three each, one send a request.
+/// Plain requests under `round_robin` take the workers of their list in turn:
+/// nine requests over three workers, three each, one send a request.
 ///
 /// The classic router rotates the list it is given the same way: its case
 /// `a_pinned_wire_under_round_robin_rotates_the_workers_on_it`
-/// (`model_gateway/src/routers/common/placement.rs:5713-5741`).
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn plain_requests_take_each_worker_in_turn() {
     let fleet = workers(3);
@@ -82,13 +82,13 @@ fn plain_requests_take_each_worker_in_turn() {
     assert_eq!(times.into_values().collect::<Vec<_>>(), [3, 3, 3]);
 }
 
-/// A program whose route sends a pair in turn sends a single request once,
-/// as a program that sends at once does: the route's word is of a pair's
-/// decode, and a single request has none. Nine requests over three workers,
-/// three each, one send a request.
+/// A program whose route sends a pair in turn sends a single request once, as
+/// a program that sends at once does. The route's word is of a pair's decode,
+/// and a single request has none. Nine requests over three workers, three
+/// each, one send a request.
 ///
-/// The gateway's sequential dispatch is of a pair's two sides
-/// (`model_gateway/src/routers/grpc/sequential_pd.rs:1-8`).
+/// The gateway's sequential dispatch is of a pair's two sides, as the opening
+/// comment of `model_gateway/src/routers/grpc/sequential_pd.rs` says.
 #[test]
 fn a_single_request_of_a_program_in_turn_is_sent_once() {
     let fleet = workers(3);
@@ -102,13 +102,13 @@ fn a_single_request_of_a_program_in_turn_is_sent_once() {
     assert_eq!(times.into_values().collect::<Vec<_>>(), [3, 3, 3]);
 }
 
-/// Callers that ask at the same moment do not pile on one worker: four
-/// callers ask together, a barrier a round, over 256 idle workers, 64
-/// rounds, and every worker takes exactly one request.
+/// Callers that ask at the same moment do not pile on one worker. Four callers
+/// ask together, a barrier a round, over 256 idle workers and 64 rounds. Every
+/// worker takes exactly one request.
 ///
 /// The classic router answers so: its case
 /// `callers_that_pick_at_once_take_each_idle_worker_once`
-/// (`model_gateway/src/routers/common/placement.rs:5966-6003`).
+/// (`model_gateway/src/routers/common/placement.rs`).
 #[test]
 fn callers_that_ask_at_once_take_each_idle_worker_once() {
     const CALLERS: usize = 4;
@@ -140,16 +140,17 @@ fn callers_that_ask_at_once_take_each_idle_worker_once() {
 }
 
 /// A send that a worker answers with a server error is asked again, and the
-/// next attempt names that worker as tried: it goes to the other worker,
-/// every time, and the rotation of first attempts goes on behind it. A list
-/// of one worker keeps its worker for the retry, up to the program's bound
-/// of sends. A send answered with a client error is the client's answer and
-/// is not asked again.
+/// next attempt names that worker as tried. It goes to the other worker, every
+/// time, and the rotation of first attempts goes on behind it. A list of one
+/// worker keeps its worker for the retry, up to the program's bound of sends.
+/// A send answered with a client error is the client's answer and is not asked
+/// again.
 ///
 /// The classic router lets the workers a request tried step aside while
-/// another is left, and uses the list whole otherwise
-/// (`model_gateway/src/routers/common/placement.rs:1728-1748`, its case
-/// `:5890-5924`).
+/// another is left, and uses the list whole otherwise: the `untried` list of
+/// `select_pass` (`model_gateway/src/routers/common/placement.rs`). Its case
+/// is
+/// `a_retry_under_round_robin_skips_the_tried_worker_and_a_lone_worker_is_kept`.
 #[test]
 fn a_retry_names_the_worker_it_tried_and_goes_to_another() {
     let fleet = workers(2);
@@ -182,15 +183,16 @@ fn a_retry_names_the_worker_it_tried_and_goes_to_another() {
     assert_eq!((answer.status, answer.sent.len()), (404, 1));
 }
 
-/// A send is asked again for the statuses a gateway's retry layer asks
-/// again for, a 408 and a 429 among them, and for no other: a 501 or a 505
-/// is the client's answer after one send. A 500 is asked again at a worker
-/// that did not give it: a worker's own answer is its last word on the
-/// request (`caller/rule.rs`), so two workers that both answer it take one
-/// send each.
+/// A send is asked again for the statuses a gateway's retry layer asks again
+/// for, a 408 and a 429 among them, and for no other. A 501 or a 505 is the
+/// client's answer after one send.
+///
+/// A 500 is asked again at a worker that did not give it. A worker's own
+/// answer is its last word on the request (`caller/rule.rs`), so two workers
+/// that both answer it take one send each.
 ///
 /// The gateway's set is `is_retryable_status`
-/// (`crates/external_router/src/retry.rs:10-19`).
+/// (`crates/external_router/src/retry.rs`).
 #[test]
 fn a_send_is_asked_again_for_the_statuses_a_gateway_asks_again_for() {
     let again = [408, 429, 502, 503, 504].map(|status| (status, ATTEMPTS));
@@ -209,14 +211,16 @@ fn a_send_is_asked_again_for_the_statuses_a_gateway_asks_again_for() {
 }
 
 /// A worker that cannot be sent to takes no request: one that is not ready,
-/// and one whose circuit breaker is open. Where no worker of the list can
-/// be sent to, the engine names none: it says the `healthy` filter left
-/// nobody, with a hint to come back in a second, and the program answers a
-/// 503.
+/// and one whose circuit breaker is open.
 ///
-/// The classic router keeps a worker that is available
-/// (`model_gateway/src/routers/common/placement.rs:1708-1711`), and answers a
-/// list with none a 503 with the same hint (`:1749-1752`, `:1854`, `:1875`).
+/// Where no worker of the list can be sent to, the engine names none. It says
+/// the `healthy` filter left nobody, with a hint to come back in a second, and
+/// the program answers a 503.
+///
+/// The classic router keeps a worker that is available: the `eligible` test of
+/// `select_pass` (`model_gateway/src/routers/common/placement.rs`). It answers
+/// a list with none a 503 with the same hint: `Miss::NobodyAvailable` there,
+/// `no_available_workers` and `NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS`.
 #[test]
 fn a_worker_that_cannot_be_sent_to_takes_no_request() {
     let fleet = workers(4);
@@ -257,14 +261,15 @@ fn a_worker_that_cannot_be_sent_to_takes_no_request() {
     );
 }
 
-/// Under `manual` the requests of one routing key stay on the worker the
-/// key's first request took, while a lighter worker stands beside it, and
-/// another key's first request goes to a lighter worker. The placement
-/// names the key, so the worker counts a running request under it.
+/// Under `manual` the requests of one routing key stay on the worker the key's
+/// first request took, while a lighter worker stands beside it. Another key's
+/// first request goes to a lighter worker. The placement names the key, so the
+/// worker counts a running request under it.
 ///
 /// The classic router's `manual` policy pins a key to the worker its first
-/// request took, and places a key it has not seen by the configured
-/// assignment (`model_gateway/src/policies/manual.rs:322-368`, `:228-236`).
+/// request took: `ManualPolicy::select_by_routing_id`
+/// (`model_gateway/src/policies/manual.rs`). It places a key it has not seen
+/// by the configured assignment: `ManualPolicy::select_new_worker`.
 #[test]
 fn the_requests_of_one_key_stay_on_its_worker() {
     const KEY: &str = "session-7";
@@ -400,13 +405,14 @@ impl Scorer for Hears {
 
 /// A program under `round_robin` with [`Hears`] among its scorers, over two
 /// workers: the program, what that stage heard, and the word that makes the
-/// next send fail. A send is answered a 200, and a 502 once where the word
-/// is set, and says `went out` among the stage's words as it goes.
+/// next send fail. A send is answered a 200, and a 502 once where the word is
+/// set, and says `went out` among the stage's words as it goes.
 ///
 /// The engine's task is spawned, and its handle is the last of the four.
-/// The program told the engine of no worker: at its first step the task
-/// read the program's registry, and the stage heard each of the two
-/// workers join, under the id every decision names that worker by: the
+///
+/// The program told the engine of no worker. At its first step the task read
+/// the program's registry, and the stage heard each of the two workers join.
+/// It heard each under the id every decision names that worker by: the
 /// fingerprint of the address the worker states.
 async fn hearing() -> (Program, Heard, Arc<AtomicBool>, JoinHandle<()>) {
     let heard = Heard::default();
@@ -453,16 +459,19 @@ pub(crate) fn taken(heard: &Heard) -> Vec<String> {
     std::mem::take(&mut *heard.lock().expect("no case panicked"))
 }
 
-/// The engine hears each request's end from the placement its program
-/// keeps: a served request is issued, dispatched and completed, once each
-/// and in that order, and the program says the dispatch before the send
-/// goes out; a send answered a server error completes so, and its retry is
-/// a request of its own to the stages. A send answered a client error
-/// completes as one, and a 408 or a 504 as a timeout. A send no worker
-/// answered completes as one that reached no worker, under the status the
-/// client reads for it. A placement dropped before its send is a release,
-/// one dropped behind it an end of class cancelled, and a placement kept
-/// ends on another thread than the one that placed it.
+/// The engine hears each request's end from the placement its program keeps:
+///
+/// - A served request is issued, dispatched and completed, once each and in
+///   that order. The program says the dispatch before the send goes out.
+/// - A send answered a server error completes so, and its retry is a request
+///   of its own to the stages.
+/// - A send answered a client error completes as one, and a 408 or a 504 as a
+///   timeout.
+/// - A send no worker answered completes as one that reached no worker, under
+///   the status the client reads for it.
+/// - A placement dropped before its send is a release, and one dropped behind
+///   it an end of class cancelled.
+/// - A placement kept ends on another thread than the one that placed it.
 #[tokio::test(start_paused = true)]
 async fn the_engine_hears_each_requests_end() {
     let (program, heard, fails, task) = hearing().await;
@@ -516,15 +525,17 @@ async fn the_engine_hears_each_requests_end() {
     task.abort();
 }
 
-/// A worker that leaves is forgotten under the address it states. The
-/// registry finds a worker by an address written without its scheme, and
-/// the stages know the worker by the whole address. The program tells the
-/// engine nothing: the engine's task hears the removal from the registry
-/// with the worker's own object, and tells the stages the worker under the
-/// address that object states. A leave that finds no worker tells nothing.
+/// A worker that leaves is forgotten under the address it states. The registry
+/// finds a worker by an address written without its scheme, and the stages
+/// know the worker by the whole address.
 ///
-/// The classic router's registry resolves such an address the same way
-/// (`resolve_url_to_id`, `crates/worker/src/registry.rs:543-569`).
+/// The program tells the engine nothing. The engine's task hears the removal
+/// from the registry with the worker's own object, and tells the stages the
+/// worker under the address that object states. A leave that finds no worker
+/// tells nothing.
+///
+/// The classic router's registry resolves such an address the same way:
+/// `WorkerRegistry::resolve_url_to_id` (`crates/worker/src/registry.rs`).
 #[tokio::test(start_paused = true)]
 async fn a_worker_that_leaves_is_forgotten_under_the_address_it_states() {
     let (program, heard, _fails, task) = hearing().await;
@@ -571,12 +582,12 @@ fn reports(workers: usize, short: usize) -> HashMap<String, WorkerLoadResponse> 
 
 /// A program lends no load snapshot with a request: it hands its load
 /// monitor's channel at its start and spawns the engine's task. Under
-/// `least_load` a request then goes to the worker the newest report shows
-/// with no queue, and to another worker once the monitor publishes that
-/// one so.
+/// `least_load` a request then goes to the worker the newest report shows with
+/// no queue, and to another worker once the monitor publishes that one so.
 ///
-/// The classic router's `least_load` reads its load monitor's snapshot at
-/// each decision too (`model_gateway/src/policies/least_load.rs:918`).
+/// The classic router's `least_load` reads its load monitor's snapshot at each
+/// decision too: `LeastLoadPolicy::decide`
+/// (`model_gateway/src/policies/least_load.rs`).
 #[tokio::test(start_paused = true)]
 async fn a_request_goes_by_the_newest_load_report() {
     let least_load = PolicySettings::LeastLoad {
@@ -606,10 +617,10 @@ async fn a_request_goes_by_the_newest_load_report() {
     task.abort();
 }
 
-/// A worker that left takes no later request, and a worker that joined
-/// takes its turn: each request is placed over the list of the generation
-/// that stands, lent with that generation's own cell. A request under way
-/// on a worker that leaves ends as any other.
+/// A worker that left takes no later request, and a worker that joined takes
+/// its turn. Each request is placed over the list of the generation that
+/// stands, lent with that generation's own cell. A request under way on a
+/// worker that leaves ends as any other.
 #[test]
 fn a_request_is_placed_over_the_generation_that_stands() {
     let fleet = workers(3);
