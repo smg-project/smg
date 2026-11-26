@@ -485,7 +485,8 @@ def test_strict_live_empty_environment_is_not_a_negative_marker_observation(mod,
     runtime = _Pidfds(strict_tree)
     (strict_tree / "100" / "environ").write_bytes(b"")
     assert not runtime.run(mod)
-    assert runtime.sent == []
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
 
 
 def test_strict_survivors_are_failure_after_bounded_term_and_kill(mod, strict_tree):
@@ -525,7 +526,11 @@ def test_strict_incomplete_owned_observation_is_failure_without_signal(mod, stri
     else:
         path.write_text("malformed\n")
     assert not runtime.run(mod)
-    assert runtime.sent == []
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    if file != "stat":
+        assert (101, signal.SIGTERM) in runtime.sent
+    else:
+        assert runtime.sent == []  # The incomplete birth census still fails closed.
     assert runtime.closed == set(runtime.opened)
 
 
@@ -616,7 +621,8 @@ def test_strict_esrch_for_a_still_live_ownership_file_fails_closed(mod, strict_t
     monkeypatch.setattr(builtins, "open", opened)
     runtime = _Pidfds(strict_tree)
     assert not runtime.run(mod)
-    assert runtime.sent == []
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
 
 
 def test_strict_raw_comm_bytes_do_not_prevent_uid_and_marker_checks(mod, strict_tree):
@@ -828,8 +834,11 @@ def test_strict_same_uid_unmarked_unreadable_process_holds_without_signal(
     monkeypatch.setattr("builtins.open", deny_unmarked_environment)
     lines = []
     assert not runtime.run(mod, log=lines.append)
-    assert denied == [str(unreadable)]
-    assert runtime.sent == [] and runtime.opened == {} and runtime.closed == set()
+    assert denied and set(denied) == {str(unreadable)}
+    assert all(pid != 400 for pid, _ in runtime.sent)
+    assert {(100, signal.SIGTERM), (101, signal.SIGTERM)} <= set(runtime.sent)
+    assert runtime.closed == set(runtime.opened)
+    assert runtime.now <= 20.4 + 1e-9
     assert any("PermissionError" in line and str(unreadable) in line for line in lines)
 
 
@@ -871,4 +880,38 @@ def test_strict_stalled_clock_still_stops_without_unverified_success(mod, strict
     assert 0 < len(sleeps) <= 200
     assert runtime.now == 0.0
     assert not any(sig == signal.SIGKILL for _pid, sig in runtime.sent)
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("unknown_pid", [99, 102])
+def test_strict_initial_unobservable_pid_does_not_abandon_healthy_peers(
+    mod, strict_tree, unknown_pid
+):
+    runtime = _Pidfds(strict_tree)
+    _strict_process(strict_tree, unknown_pid, birth=2000 + unknown_pid)
+    (strict_tree / str(unknown_pid) / "environ").unlink()
+    timed = []
+
+    def on_signal(pid, sig):
+        timed.append((pid, sig, runtime.now))
+        if pid == 100 or sig == signal.SIGKILL:
+            runtime.remove(pid)
+
+    runtime.on_signal = on_signal
+    assert not runtime.run(mod)  # The unknown identity still prevents clean.
+    assert all(pid != unknown_pid for pid, _, _ in timed)
+    assert (100, signal.SIGTERM) in runtime.sent
+    assert any(pid == 101 and sig == signal.SIGKILL and t >= 0.4 for pid, sig, t in timed)
+    assert runtime.now <= 20.4 + 1e-9
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("environment", [b"\0", b"\0" * 32])
+def test_strict_nul_only_environment_never_establishes_quiet_cleanup(mod, strict_tree, environment):
+    runtime = _Pidfds(strict_tree)
+    runtime.remove(101)
+    (strict_tree / "100" / "environ").write_bytes(environment)
+    assert not runtime.run(mod)
+    assert runtime.sent == []
+    assert runtime.now <= 20.4 + 1e-9
     assert runtime.closed == set(runtime.opened)
