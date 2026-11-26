@@ -3,6 +3,7 @@
 //! answers with `BatchTokenIDSlimOutput` batches, as the SMG plugin inside a
 //! headless scheduler does.
 
+mod cache_partition;
 mod lora;
 
 use std::{

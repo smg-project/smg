@@ -545,6 +545,7 @@ pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Stat
         extra_mm_inputs,
         prepared_control,
         prepared_input,
+        cache_partition,
     } = req;
     // Fields 1-2, moved.
     sg::GenerateRequest {
@@ -580,14 +581,16 @@ pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Stat
         ..Default::default()
     }
     .encode_raw(&mut out.scratch);
-    // Field 21, every element in order; prepared metadata follows.
+    // Field 21, every element in order.
     for inputs in extra_mm_inputs {
         out.length_delimited(21, inputs.encoded_len());
         sglang_inputs_frames(inputs, &mut out);
     }
+    // Fields 22-24.
     sg::GenerateRequest {
         prepared_control,
         prepared_input,
+        cache_partition,
         ..Default::default()
     }
     .encode_raw(&mut out.scratch);
@@ -1639,6 +1642,10 @@ mod tests {
                 extra_mm_inputs: vec![inputs_with_every_field(2), sg::MultimodalInputs::default()],
                 prepared_control: vec![7, 8],
                 prepared_input: vec![9, 10],
+                cache_partition: Some(Box::new(sg::CachePartition {
+                    cache_salt: Some("salt".into()),
+                    extra_key: Some("key".into()),
+                })),
             }
         }
 

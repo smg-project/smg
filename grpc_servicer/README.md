@@ -1335,6 +1335,17 @@ KV events; use adapter names for cache-aware placement.
 Media-bearing gateway EPD requests remain unsupported for SGLang and are
 refused rather than falling back to another runtime's base model.
 
+#### Cache partition
+
+Both SGLang gRPC servicers give `GenerateRequest.cache_partition` to the
+scheduler as its two separate fields, `cache_salt` and `extra_key`. Two
+requests share prefix-cache blocks only when both values are equal. An empty
+string is unset. Send the same two values to both sides of a prefill/decode
+pair. The servicers advertise the fields they read as the
+`cache_partition_fields` key of `server_args` (`cache_salt,extra_key`). The
+Python servicer does not write the key when the installed `smg-grpc-proto` does
+not have the field.
+
 #### KV-event recovery
 
 To retain cache knowledge across a recoverable event gap, configure SGLang's

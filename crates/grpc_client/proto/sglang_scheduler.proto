@@ -180,6 +180,17 @@ message GenerateRequest {
   // D requires that layout and never falls back to preprocessing references.
   bytes prepared_control = 22;
   bytes prepared_input = 23;
+
+  // The request's partition of the engine's prefix cache. Unset is the
+  // partition that requests without a value share.
+  CachePartition cache_partition = 24;
+}
+
+// The engine keeps the two values as two separate fields. An empty string is
+// unset. A value can be a secret: do not log it.
+message CachePartition {
+  optional string cache_salt = 1;
+  optional string extra_key = 2;
 }
 
 // The gateway codec writes this message by hand around its field numbers and

@@ -45,8 +45,8 @@ use crate::{
     eos::EosTokenIds,
     pin_yield::PinYieldNote,
     sglang::{
-        aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
-        encode_media_refs, fan_out_sglang_requests, room_residue_rank,
+        aggregate_control, cache_partition_fields_arg, constraint_ref as sglang_constraint_ref,
+        control_outcome, encode_media_refs, fan_out_sglang_requests, room_residue_rank,
         translate_embed_request_sglang, translate_request_sglang, RankPlacement, SglangConnection,
         SglangGenerateStream, SglangProfileStart,
     },
@@ -2166,10 +2166,13 @@ impl ZmqEngineClient {
                 ZmqServerInfo::TokenSpeed(Box::<tokenspeed_proto::GetServerInfoResponse>::default())
             }
             // The handshake carries the version (as `vllm_version`) and the KV
-            // capacity; `server_args` has no source on this wire.
+            // capacity. `server_args` holds only the adapter's own fact.
             ZmqBackend::Sglang(_) => {
                 let ready = self.ready_response();
                 ZmqServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+                    server_args: Some(prost_types::Struct {
+                        fields: BTreeMap::from([cache_partition_fields_arg()]),
+                    }),
                     // The plugin reports `sglang-<version>` in the shared
                     // field; the gRPC servicer reports the bare version.
                     sglang_version: ready
