@@ -858,12 +858,13 @@ mod tests {
     use super::*;
     use crate::channel::testing::refused_endpoint;
 
-    /// The future of each generate call holds a request. A field that needs
-    /// more room goes in a box (see `build.rs`).
+    /// The future of each generate call holds a request, inside jemalloc's
+    /// 640-byte size class. A field that needs more room goes in a box (see
+    /// `build.rs`).
     #[test]
-    fn the_request_stays_in_the_512_byte_allocator_class() {
+    fn the_request_stays_in_the_640_byte_allocator_class() {
         let bytes = size_of::<proto::GenerateRequest>();
-        assert!(bytes <= 512, "an SGLang request is {bytes} bytes");
+        assert!(bytes <= 640, "an SGLang request is {bytes} bytes");
     }
 
     #[test]

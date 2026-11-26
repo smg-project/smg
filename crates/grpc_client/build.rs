@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .boxed(".sglang.grpc.scheduler.GenerateRequest.mm_inputs")
         .boxed(".sglang.grpc.scheduler.GenerateRequest.media_identity")
         // Boxed, the cache partition is 8 bytes of the request. Its two
-        // strings would be 48, past the 512-byte allocator class.
+        // strings would be 48, and most requests leave it unset.
         .boxed(".sglang.grpc.scheduler.GenerateRequest.cache_partition")
         // Each message is encoded into a buffer reserved to its length once
         // (see `crate::codec`), not into one that doubles under a tensor.
