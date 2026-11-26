@@ -606,51 +606,9 @@ A decline takes the configured stage fallback and leaves a healthy instance or s
 
 ## Policy document reference
 
-Use `apiVersion: smg.policy/v1` and at least one profile. Both YAML and JSON use the same types. Quote strings that look like numbers or booleans in YAML. A key without a value is null. Use `[]` or `{}` for an empty list or map. The [JSON schema](policyspec.schema.json) includes reserved fields and stock stage names. Use validation in the intended host to check which fields and stages can run.
-
-| Document field | Meaning and limits |
-|---|---|
-| `apiVersion` | Required. Only `smg.policy/v1` is accepted. |
-| `generation` | Unsigned 64-bit number, default 0. Zero asks the service to number it. See [Updating a document](#updating-a-document). |
-| `profiles.<name>` | One to 65535 profiles. `filter` and `score` default to empty. `pick` is required. Stage mappings have one name. `sent_ttl_ms` is optional and positive. It sets how many milliseconds a send counts for in the profile's tally of sends (`StageBuild::dispatch_credit`). Left unset, a send ends at a report of the row sampled at or after it (at least `sent_report_delay_ms` after it, where the profile sets one), or at the row's removal. The 8,192 sends a row holds bound the tally either way. A profile whose stages ask for no tally refuses it. Of the built-in stages, `least-load` asks for it, and so do a `least-cost` and a `has-room` rule with a `sent.` term. `resident-work` keeps a tally of its own, which the limit does not reach. See [Built-in stages](#built-in-stages). |
-| `view.headers` | Up to 256 unique lowercase HTTP header names, in wire position order. Default empty. Denied names are `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key` and `x-goog-api-key`. Embedded validation can deny more. |
-| `view.block_size` | Positive fallback block size, in tokens, when a token request gives none. The prefix stages fall back to 16 if omitted. A text request states its own window and never reads this. |
-| `view.boundaries` | Positive, strictly ascending token positions, default empty. Used by prefix keying and required for a `hash` index entry. With a prefix-keyed scorer every boundary and `prefix_tokens` must cover at least one whole configured block and fit the hash cap. |
-| `view.max_block_hashes` | 1–8190, default 256. The generation can read fewer, down to zero when no stage needs hashes. It reads zero of a kind no stage declares: a text request is hashed only where a stage reads text windows, and a host asks `AppliedSpec::block_hashes_read` with the request's kind before it hashes. |
-| `view.max_report_age_ms` | 1–3599999 ms, default unset. `least-load`, `resident-work`, `least-cost`, `has-room` with a rule and the load gates of `prefix-affinity` and `warmup-slice` use their unreported paths for older reports. A host-registered stage reads a report under the limit through `build.load_report_reader()`. One that reads `row.load` itself sees it at any age. Overload verdicts can still reflect older reports, and plugins interpret report age themselves. A report at the limit still counts. |
-| `view.labels`, `view.zones`, `view.engines` | Unique names, default empty. At most 64, 256 and 64 respectively. Labels are `key` or `key=value` with nonempty sides. |
-| `index.<model glob>` | Defaults to an empty map. An entry has `kind` (`tree` by default, or `hash`), `ttl_s` (180 seconds for a hash placement), `max_size` (67108864 for a tree: for text its characters plus 1024 for each node a worker stands on, tokens otherwise), and `sweep_s` (120 seconds). Numbers are positive. These are settings a host can read for its index. The crate's own store reads `kind` and `max_size` for a pool whose profile reads sent prefixes, and none of the others. Under `tree` it bounds the model's record of sent prefixes at `max_size` over the block size, one placement a block a worker sent it: 4,194,304 placements at the defaults, about 277 MB a model. Under `hash` the pool keeps no record. In the engine's own decisions, the entry read for a record is the one of the id the model's workers registered as their first model, and a model they registered after it shares that record and its settings; the store keeps a record for each model a worker lists, under that model's entry. Exact keys win, then the longest literal prefix or suffix, then `*`. Equal-length prefix and suffix globs are refused. |
-| `signals.<name>` | Defaults to an empty map. Up to 64 names. A name is a lowercase letter followed by lowercase letters, digits or underscores, at most 63 bytes. An entry has `unit` (required, 1 to 31 ASCII characters with no space, compared byte for byte with the unit a report states) and `max_age_ms` (optional, 1 to 3,599,999: a value older than this reads as no value). `across_ranks` is optional: `sum` (the default), `max`, `min` or `mean`. It says how one row's value is made where the row's report holds several ranks. A document with no signals is unchanged, and so is its digest. |
-| `plans.pd-pair.pairing` | `off`, `lenient` (default), or `strict`. Used for prefill/decode compatibility, including the pair in `epd`. |
-| `bindings` | Ordered, first match wins. Empty works with one profile. |
-| `explain.sample` | 0–4294967295. Zero is the default and disables sampling. |
+The document's fields, its bindings and its plans stand on a page of their own: [The policy spec](docs/policy-spec.md).
 
 ### Bindings and plans
-
-`match.model` defaults to `*`. It takes an exact ID, `prefix*`, `*suffix`, or `*`. `match.phase` can list `single`, `prefill`, `decode`, and `encode`. An empty list matches all phases. A multi-sided plan with a nonempty phase list must include each of its sides.
-
-```yaml
-apiVersion: smg.policy/v1
-profiles:
-  chat:
-    filter: [healthy, not-overloaded, not-tried]
-    score: [least-load]
-    pick: best
-  batch:
-    filter: [healthy]
-    pick: round-robin
-bindings:
-  - match: { model: "batch-*" }
-    profile: batch
-  - match: { model: "*" }
-    profile: chat
-```
-
-| `bindings[].plan` | Profiles the binding names | What the engine picks |
-|---|---|---|
-| `single` (default) | `profile` or `profiles.single`. | One worker in the requested role, with optional alternates. |
-| `pd-pair` | `profiles.prefill` and `profiles.decode`. | A prefill worker and a compatible decode worker, in one decision. The decode hard filters first constrain which prefills have a partner. The decode profile then sees compatible workers for the selected prefill. If it yields no target the engine can try another prefill from the pick. |
-| `epd` | `profiles.encode`, `profiles.prefill` and `profiles.decode`. | A pair with a prefill that can accept the encoders' output, then an encoder for each item over that prefill's compatible encoders. A request with no encode items needs no encoder. |
 
 `bindings[].overload` defaults to `enabled: true`. The block names no threshold. A document that names a number there, under `waiting_requests` or `token_usage`, is refused when it is applied, by the field's path. A worker's registration states its thresholds, over the default its program builds its workers with: 8 queued requests and 0.8 usage in a gateway or a standalone controller that sets no others. A host's load monitor judges the sum of queued requests and the mean active KV usage over a worker's ranks. A rank whose report carries no such split counts its total usage there. Reaching either limit sets the veto. A standalone controller's decision reads the verdict its load monitor writes on the worker. The monitor judges each worker by its registration's thresholds over the two defaults its start states, and a worker of the `external` runtime by its registration's alone. A gateway that runs the document in its own process reads the block's switch from the document it starts with. With `enabled: false` it builds its workers with no default threshold, whatever its two threshold options say, and a worker's own registered thresholds still veto. The gateway reads one switch and one shed word for its process, so its start refuses a document whose bindings differ on either. A binding with no block says the defaults. A gateway whose two thresholds are both set to none has no default threshold: its start refuses a supplied document whose block is on, which would switch nothing on, and takes one whose bindings switch the block off. A standalone controller's overload series count its load monitor's verdicts. A standalone controller reads the switch on its worker objects, at each document that takes force. Where every binding says `enabled: false` its workers take no default threshold, and a worker's own still veto. A controller refuses a document whose bindings differ on the switch, by the path of the first binding that differs from the first: at its start, at an apply, a dry run and a rollback, and where a standby is told one by its leader. A worker whose default moves reads not overloaded until its next load report. `shed_when_all_vetoed` defaults to false and controls the single-plan fallback, the fallback of a pair's decode pool and plain ring behavior. For a decode pool used by a pair, the binding selected at prefill supplies its overload policy. It supplies an encode pool's shed word too, where its plan is `epd`.
 
@@ -680,57 +638,6 @@ Use native stages and a profile that no binding uses live. A served controller a
 A host that drives the engine itself runs the shadow's stages through `Engine::shadow`. It makes the request's live decision through `Engine::decide_keeping`, and calls `Engine::shadow` with that decision's scratch. Under a sessions rule the shadow then starts from the session pins that decision read, whether or not the decision is committed first. Behind `Engine::decide`, or with any other scratch, it reads the pins as they stand. A host that shadows a request decides it through `Engine::decide_keeping`, each time it decides it. A debug build stops on a mix of the two entries on one request.
 
 The validator checks reserved fields for shape and refuses their active use. This includes `match.tenant`, `match.priority`, `match.header`, `match.prompt_tokens`, a nonempty `match.labels`, `canary`, `override: allowed`, `admission.enabled: true`, and `sessions.issue_session_id: true`. The bounds use `min` and `max`. A header matcher uses `name` and `values`. A canary would name a `profile` and exactly one of `percent` (1–100), `tenants` or `header`. Use `override: locked` (the default) and leave admission and session ID issuance off.
-
-### Prefill and decode
-
-```yaml
-apiVersion: smg.policy/v1
-profiles:
-  prefill:
-    filter: [healthy, not-overloaded, not-tried]
-    score: [least-load]
-    pick: best
-  decode:
-    filter: [healthy, not-overloaded, not-tried]
-    score: [least-load]
-    pick: best
-plans:
-  pd-pair:
-    pairing: lenient
-bindings:
-  - match: { model: "*" }
-    plan: pd-pair
-    profiles: { prefill: prefill, decode: decode }
-```
-
-An embedded host using the store can supply the runtime and a KV handoff descriptor. `lenient` rejects known differences. `strict` also rejects missing runtime or transport, a value missing on one side for a hard fact, and different versions when both are provided. Both sides may omit a KV layout fact. A shared explicit protocol settles the handoff after the runtime check. `off` skips descriptor checks. In every mode, HTTP-only workers pair within their wire class and workers on the other side of that division cannot pair if their known runtimes differ. The store derives no compatibility: whoever holds the worker objects derives it from them (`PairClasses::derive`), under the pairing mode of the document in force.
-
-Over the standalone registration RPC, the pairing descriptor accepts only a bootstrap port, and the runtime comes from `spec.runtime`. A worker registered this way, or found by the controller's own discovery, pairs by what its labels report, as a gateway reads them: its transfer backend or `kv_connector`, its version, its KV layout facts and its operator's `pairing_protocol`. The controller's discovery writes a found worker's pairing protocol and KV connector among the row's labels. Use `lenient` or `off` for workers whose labels report no transport. A host supplying its own admission facts can also add `has-capacity` and `has-room` to the profiles.
-
-### Encode with a pair
-
-```yaml
-apiVersion: smg.policy/v1
-profiles:
-  encode:
-    filter: [healthy, not-overloaded, not-tried]
-    score: [consistent-hash]
-    pick: best
-  prefill:
-    filter: [healthy, not-overloaded, not-tried]
-    score: [least-load]
-    pick: best
-  decode:
-    filter: [healthy, not-overloaded, not-tried]
-    score: [least-load]
-    pick: best
-bindings:
-  - match: { model: "*" }
-    plan: epd
-    profiles: { encode: encode, prefill: prefill, decode: decode }
-```
-
-Use this document with `InProcess::decide_encode_at`. Pass the request's `EncodeItems` and an `EncodePlaced`. A host that decides over its own rows calls `Engine::decide_encode_pair` and supplies the worker offers and the compatibility tables as well. The encode profile can key each item by content hash. A push handoff can place by one supplied key. Images and videos require a vision-capable encoder, and a request can require a vision-capable decode worker. The decision writes encoder choices to `EncodePlaced`. All choices are made before dispatch. [Encode entry and refusal names](src/engine/framework/encode.rs)
 
 ### Session keys
 
