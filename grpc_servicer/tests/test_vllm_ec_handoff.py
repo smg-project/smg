@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -271,3 +272,64 @@ async def test_reasoning_template_kwargs_reach_engine_or_fail_before_submission(
         assert len(seen) == 1
         expected = {"chat_template_kwargs": {"thinking_mode": mode}} if mode else None
         assert seen[0].get("reasoning_parser_kwargs") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_token", "constrained", "engine_takes", "handed"),
+    [
+        (True, True, True, True),
+        (True, False, True, False),
+        (False, True, True, False),
+        (True, True, False, False),
+    ],
+)
+async def test_grammar_from_first_token_reaches_engine_as_reasoning_ended(
+    first_token, constrained, engine_takes, handed
+):
+    """A shaped grammar's start reaches an engine whose generate() takes it."""
+    params = pb.SamplingParams(grammar_from_first_token=first_token)
+    if constrained:
+        params.json_schema = "{}"
+    request = pb.GenerateRequest(
+        request_id="start-test",
+        tokenized=pb.TokenizedInput(input_ids=[1, 2]),
+        sampling_params=params,
+    )
+    seen = []
+
+    async def generate(*, reasoning_ended="unsaid", **kwargs):
+        """Record the switch an engine that names the keyword is handed."""
+        seen.append(reasoning_ended)
+        if False:
+            yield
+
+    async def older_generate(**kwargs):
+        """Record the switch an engine that does not name the keyword is handed."""
+        seen.append(kwargs.get("reasoning_ended", "unsaid"))
+        if False:
+            yield
+
+    async def abort(code, message):
+        """Make gRPC validation failures observable to the test."""
+        raise _Aborted(code, message)
+
+    engine_generate = generate if engine_takes else older_generate
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(
+            generate=engine_generate,
+            renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
+            vllm_config=SimpleNamespace(ec_transfer_config=None),
+        ),
+        # As the constructor reads it, once, off the engine's signature.
+        _takes_reasoning_ended="reasoning_ended" in inspect.signature(engine_generate).parameters,
+        _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
+            extra_args=None, logprobs=None, prompt_logprobs=None
+        ),
+        _tokenization_kwargs_from_proto=lambda _: {},
+        _loads=Mock(),
+        _notify_kv_transfer_rejected=AsyncMock(),
+    )
+    context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
+    assert [reply async for reply in _generate()(servicer, request, context)] == []
+    assert seen == [True if handed else "unsaid"]
