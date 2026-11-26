@@ -161,7 +161,11 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     let ready = state.shared.ready();
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let mut server_args = struct_from_json(&model.server_args_json);
-    if ready.is_some_and(|r| r.supports_thinking_token_budget) {
+    if state
+        .shared
+        .engine()
+        .is_ok_and(generate::supports_thinking_token_budget)
+    {
         server_args.fields.insert(
             "supports_thinking_token_budget".into(),
             prost_types::Value {
