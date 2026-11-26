@@ -220,7 +220,7 @@ impl Replica {
         let monitor = LoadMonitor::new(&workers, EVERY);
         let loads = monitor.loads();
         let counts = Box::new(monitor.counts());
-        let pushed = Arc::clone(monitor.pushed());
+        let pushed = Arc::clone(&monitor.pushed);
         let (role, led) = watch::channel(None);
         let (stop, stopped) = watch::channel(false);
         let mut task = JoinSet::new();

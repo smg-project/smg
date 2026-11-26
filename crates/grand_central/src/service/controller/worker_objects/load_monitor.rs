@@ -18,7 +18,7 @@ use tokio::sync::watch;
 use super::WorkerObjects;
 use crate::{
     service::controller::metrics::LoadTotals,
-    worker_host::{load_monitor, Members},
+    worker_host::{load_monitor, KvFeed, Members},
 };
 
 /// The load reports of the replica's workers while it leads: the worker
@@ -30,7 +30,7 @@ use crate::{
 /// replica dials and publishes the reports as one snapshot. It takes the
 /// load records on the workers' streams as polls ([`PushedRecords`]): a
 /// worker's cache-event stream carries them, and a gRPC worker that is not
-/// indexed streams them alone ([`Self::wanted`]). Its own sink writes the
+/// indexed streams them alone ([`Self::fed_by`]). Its own sink writes the
 /// overload verdict on each object by the thresholds the object states. It
 /// writes no row: a report is read where the monitor publishes it. A row
 /// that one gateway alone reaches is asked for no load, and has no stream
@@ -44,8 +44,8 @@ pub(crate) struct LoadMonitor {
     /// The holder's registry, which writes the monitor's overload verdicts
     /// on the objects and counts each one that changes.
     registry: Arc<WorkerRegistry<Members>>,
-    /// Where the load records on the workers' streams go: the serve hands
-    /// it to its feed of those streams.
+    /// Where the load records on the workers' streams go: the serve's feed
+    /// of those streams takes it ([`Self::fed_by`]).
     pushed: Arc<PushedRecords>,
 }
 
@@ -106,21 +106,23 @@ impl LoadMonitor {
         }
     }
 
-    /// The sink of the load records on the workers' streams, for the
-    /// serve's feed of those streams: one for the replica's life, as the
-    /// monitor is.
-    pub(crate) fn pushed(&self) -> &Arc<PushedRecords> {
-        &self.pushed
-    }
-
-    /// The monitor itself, which says whose loads are wanted
+    /// Hands `feed`, the serve's feed of the workers' streams, the monitor's
+    /// two parts in one act, ahead of the feed's first stream.
+    ///
+    /// The first is the sink of the load records on those streams
+    /// ([`PushedRecords`]): one for the replica's life, as the monitor is.
+    /// The second is the monitor's word of whose loads are wanted
     /// ([`WorkerMonitor::loads_wanted`]): those of every worker the replica
-    /// dials. The serve hands it to its feed of the workers' streams, which
-    /// then opens a stream for the load records alone of a gRPC worker that
-    /// is not indexed. The answer does not follow the role, so a standby
-    /// opens that stream too, and [`PushedRecords`] drops its records.
-    pub(crate) fn wanted(&self) -> &Arc<WorkerMonitor<Members>> {
-        &self.monitor
+    /// dials. By it the feed opens a stream for the load records alone of a
+    /// gRPC worker that is not indexed. The answer does not follow the
+    /// role, so a standby opens that stream too, and [`PushedRecords`]
+    /// drops its records.
+    ///
+    /// The feed holds both weakly, and it starts and stops nothing: the
+    /// monitor's start and stop stay with [`Self::run`].
+    pub(crate) fn fed_by(&self, feed: &KvFeed<Members>) {
+        feed.set_load_sink(&self.pushed);
+        feed.set_loads_wanted(&self.monitor);
     }
 
     /// The monitor's channel, for the reader of its snapshots: one channel

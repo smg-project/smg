@@ -484,14 +484,12 @@ impl Controller {
         // The load monitor is built stopped, ahead of the deciding threads:
         // each takes its channel at its start, and the serve runs its task.
         let monitor = worker_objects::LoadMonitor::new(&workers, config.load_poll_interval);
+        // The feed takes the monitor's two parts ahead of its first stream.
         // The load records on the workers' streams go to the monitor while
-        // this replica leads: the feed takes their sink ahead of its first
-        // stream.
-        kv_feed.set_load_sink(monitor.pushed());
-        // The monitor says whose loads are wanted, so a gRPC worker that is
-        // not indexed streams its load records alone. Every replica opens
-        // that stream: a take finds it open.
-        kv_feed.set_loads_wanted(monitor.wanted());
+        // this replica leads. The monitor says whose loads are wanted, so a
+        // gRPC worker that is not indexed streams its load records alone.
+        // Every replica opens that stream: a take finds it open.
+        monitor.fed_by(&kv_feed);
         // The serve's two words, each said by one task of it: `Shared` holds
         // their receivers, as every listener's instance hears them.
         let (stop, stopped) = watch::channel(false);
