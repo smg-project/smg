@@ -1983,3 +1983,122 @@ else:
     assert ledger.summary()["calls"] == 1
     assert ledger.summary()["allocated_nusd"] == 12000
     assert ledger.audit()["pending"] == 1
+
+
+@pytest.mark.parametrize("failure", ["before-ignore", "Event-after-ignore"])
+def test_hard_exit_setup_failure_exits_once_and_restores_handler(
+    configured, monkeypatch, capsys, failure
+):
+    import signal
+
+    from tau2.runner import batch
+
+    _, _, _, ledger, contexts = configured
+    exits = []
+    actual_signal, actual_getsignal = signal.signal, signal.getsignal
+    previous = actual_getsignal(signal.SIGINT)
+    global_exit = os._exit
+    fake_os = types.SimpleNamespace(_exit=exits.append)
+    monkeypatch.setattr(batch, "os", fake_os)
+    guard = gc.Guard(
+        ledger,
+        contexts,
+        arm="vllm",
+        domain="retail",
+        invocation_id="offline-setup-failure",
+        local_model="local-model",
+        local_url="http://127.0.0.1:8000",
+    )
+    ledger.reserve(
+        "pending-setup", "vllm", "openai/gpt-5.2", 10, 2, num_retries=0, output_limit_verified=True
+    )
+    guard.install()
+
+    def transition(signum, handler):
+        if failure == "before-ignore" and handler == signal.SIG_IGN:
+            raise KeyboardInterrupt("offline signal setup interruption")
+        return actual_signal(signum, handler)
+
+    monkeypatch.setattr(gc.signal, "signal", transition)
+    if failure == "Event-after-ignore":
+
+        def unavailable():
+            raise MemoryError("offline Event setup allocation")
+
+        monkeypatch.setattr(gc.threading, "Event", unavailable)
+    observed = None
+    try:
+        try:
+            batch.os._exit(130)
+        except BaseException as error:
+            observed = error
+        after = actual_getsignal(signal.SIGINT)
+    finally:
+        actual_signal(signal.SIGINT, previous)
+        guard.close()
+    assert exits == [130], "setup fault bypassed the original hard-exit finally"
+    assert observed is None
+    assert after is previous, "controlled exit return left SIGINT ignored"
+    assert os._exit is global_exit and batch.os is fake_os
+    assert "NOT_ATTESTED" in capsys.readouterr().err
+    assert not ledger.summary()["halted"] and ledger.audit()["pending"] == 1
+    assert ledger.summary()["calls"] == 1 and ledger.summary()["allocated_nusd"] == 12000
+
+
+@pytest.mark.parametrize("exit_raises", [False, True])
+def test_hard_exit_atomic_handler_transition_and_exact_once_control(
+    configured, monkeypatch, exit_raises
+):
+    import signal
+
+    from tau2.runner import batch
+
+    _, _, _, ledger, contexts = configured
+    actual_signal, actual_getsignal = signal.signal, signal.getsignal
+    previous = actual_getsignal(signal.SIGINT)
+    exits, transitions = [], []
+
+    def original_exit(code):
+        assert actual_getsignal(signal.SIGINT) == signal.SIG_IGN, (
+            "restored SIGINT before original exit attempt"
+        )
+        exits.append(code)
+        if exit_raises:
+            raise SystemExit(code)
+
+    fake_os = types.SimpleNamespace(_exit=original_exit)
+    monkeypatch.setattr(batch, "os", fake_os)
+    guard = gc.Guard(
+        ledger,
+        contexts,
+        arm="vllm",
+        domain="retail",
+        invocation_id="offline-setup-control",
+        local_model="local-model",
+        local_url="http://127.0.0.1:8000",
+    )
+    guard.install()
+
+    def transition(signum, handler):
+        transitions.append(handler)
+        return actual_signal(signum, handler)
+
+    monkeypatch.setattr(gc.signal, "signal", transition)
+
+    def forbidden_getsignal(*args):
+        raise AssertionError("separate get-handler/install-ignore handoff must not exist")
+
+    monkeypatch.setattr(gc.signal, "getsignal", forbidden_getsignal)
+    try:
+        if exit_raises:
+            with pytest.raises(SystemExit, match="130"):
+                batch.os._exit(130)
+        else:
+            batch.os._exit(130)
+        after = actual_getsignal(signal.SIGINT)
+    finally:
+        actual_signal(signal.SIGINT, previous)
+        guard.close()
+    assert exits == [130] and transitions == [signal.SIG_IGN, previous]
+    assert after is previous and batch.os is fake_os
+    assert guard.failed and ledger.summary()["halted"]

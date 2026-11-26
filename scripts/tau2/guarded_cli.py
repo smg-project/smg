@@ -619,24 +619,21 @@ class Guard:
         original_exit = batch.os._exit
 
         def stop_before_hard_exit(code):
-            # Only the pinned batch main-thread Ctrl+C boundary. Keep the stop
-            # worker independent of later Python KeyboardInterrupts in the main
-            # thread, and wait for its actual completion event, not Thread.join
-            # (which can report a stopped thread after an interrupted join).
-            previous_sigint = signal.getsignal(signal.SIGINT)
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-            done = threading.Event()
-            failures = []
-
-            def ordered_stop():
-                try:
-                    self.stop_paid()
-                except BaseException as error:
-                    failures.append(error)
-                finally:
-                    done.set()
-
+            # Every setup operation is inside the original-exit guarantee.
+            # signal.signal atomically installs ignore and returns the old handler.
             try:
+                previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                done = threading.Event()
+                failures = []
+
+                def ordered_stop():
+                    try:
+                        self.stop_paid()
+                    except BaseException as error:
+                        failures.append(error)
+                    finally:
+                        done.set()
+
                 worker = threading.Thread(
                     target=ordered_stop, daemon=True, name="tau2-ordered-stop"
                 )
@@ -659,8 +656,10 @@ class Guard:
                 try:
                     original_exit(code)
                 finally:
-                    # Only reached by controlled tests when their exit hook returns.
-                    signal.signal(signal.SIGINT, previous_sigint)
+                    # Only a controlled return/raise from original_exit reaches
+                    # here. Setup may fail before signal.signal returned a value.
+                    if "previous_sigint" in locals():
+                        signal.signal(signal.SIGINT, previous_sigint)
 
         # Only this qualified module's exit call is adapted; global os._exit,
         # on-disk SDK source and legacy/opt-out execution remain unchanged.
