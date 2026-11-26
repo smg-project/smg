@@ -35,6 +35,21 @@ use crate::{
     ServerThread, ServicerConfig, ServicerError, Shutdown, STOP_MARGIN,
 };
 
+/// Close remaining listener connections once the lifecycle owner's drain grace expires.
+pub(crate) async fn serve_with_grace<E: std::fmt::Display>(
+    serving: impl Future<Output = Result<(), E>>,
+    shutdown: Shutdown,
+) -> Result<(), String> {
+    let forced = async { tokio::time::sleep(shutdown.await).await };
+    tokio::select! {
+        result = serving => result.map_err(|error| error.to_string()),
+        () = forced => {
+            warn!("gRPC servicer closed its remaining connections after the drain grace");
+            Ok(())
+        }
+    }
+}
+
 /// The proto integers a handshake figure is read into, each with the value
 /// it saturates at.
 pub(crate) trait ProtoInt: Copy + Default + PartialEq + TryFrom<u64> {
@@ -498,17 +513,7 @@ impl Server {
                         }),
                         shutdown.clone().map(|_| ()),
                     );
-                let forced = async move {
-                    let grace = shutdown.await;
-                    tokio::time::sleep(grace).await;
-                };
-                let result = tokio::select! {
-                    result = graceful => result.map_err(|error| error.to_string()),
-                    () = forced => {
-                        warn!("gRPC servicer closed its remaining connections after the drain grace");
-                        Ok(())
-                    }
-                };
+                let result = serve_with_grace(graceful, shutdown).await;
                 // The handshake endpoint goes with the server, not with the
                 // runtime: a connect still waiting for its engine is ended
                 // here, so its socket drops while the runtime can still run

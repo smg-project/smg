@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from smg_grpc_servicer.rust_lifecycle import (
     ServicerConfigError,
     holds_tokenizer,
+    resolve_model_metadata_dir,
     resolve_tokenizer_dir,
 )
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
@@ -72,3 +73,22 @@ def tokenizer_dir_for(server_args: Any) -> str | None:
         logger.warning("Object storage metadata for %r holds no tokenizer in %s", source, directory)
         return None
     return directory
+
+
+def encoder_artifact_dirs(server_args: Any) -> tuple[str, str]:
+    """Resolve Rust E model metadata and tokenizer against the native revision."""
+    args = EngineConfigView(server_args).server_args
+    prepare_model_metadata(server_args)
+    model_source = local_metadata_source(str(args.model_path))
+    tokenizer_source = local_metadata_source(str(args.tokenizer_path or args.model_path))
+    model_dir = resolve_model_metadata_dir(model_source, args.revision)
+    tokenizer_dir = (
+        model_dir
+        if model_dir and tokenizer_source == model_source and holds_tokenizer(model_dir)
+        else resolve_model_metadata_dir(tokenizer_source, args.revision, require_tokenizer=True)
+    )
+    if model_dir is None or tokenizer_dir is None:
+        raise ServicerConfigError(
+            "Managed encoder could not resolve model/tokenizer metadata at the native revision"
+        )
+    return model_dir, tokenizer_dir

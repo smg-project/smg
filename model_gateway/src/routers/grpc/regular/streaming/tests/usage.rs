@@ -104,6 +104,7 @@ fn scheduler_choice_frames(
             scheduler::GenerateResponse {
                 media_identity: None,
                 request_id: String::new(),
+                prepared_input: Vec::new(),
                 response: Some(SchedulerEvent::Chunk(scheduler::GenerateStreamChunk {
                     index,
                     completion_tokens: generated,
@@ -116,6 +117,7 @@ fn scheduler_choice_frames(
     frames.push(scheduler::GenerateResponse {
         media_identity: None,
         request_id: String::new(),
+        prepared_input: Vec::new(),
         response: Some(SchedulerEvent::Complete(scheduler::GenerateComplete {
             index,
             finish_reason: "stop".to_string(),

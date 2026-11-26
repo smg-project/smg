@@ -541,6 +541,8 @@ pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Stat
         return_media_identity,
         media_identity,
         extra_mm_inputs,
+        prepared_control,
+        prepared_input,
     } = req;
     // Fields 1-2, moved.
     sg::GenerateRequest {
@@ -576,11 +578,17 @@ pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Stat
         ..Default::default()
     }
     .encode_raw(&mut out.scratch);
-    // Field 21, every element in order; the message's last field.
+    // Field 21, every element in order; prepared metadata follows.
     for inputs in extra_mm_inputs {
         out.length_delimited(21, inputs.encoded_len());
         sglang_inputs_frames(inputs, &mut out);
     }
+    sg::GenerateRequest {
+        prepared_control,
+        prepared_input,
+        ..Default::default()
+    }
+    .encode_raw(&mut out.scratch);
     Ok(out.finish())
 }
 
@@ -703,6 +711,7 @@ pub(crate) async fn call_with_frames<R>(
     path: &'static str,
     headers: http::HeaderMap,
     frames: Vec<Bytes>,
+    max_decoding_message_size: Option<usize>,
 ) -> Result<Streaming<R>, Status>
 where
     R: Message + Default + Send + 'static,
@@ -720,7 +729,7 @@ where
     let response = GrpcService::<tonic::body::Body>::call(&mut channel, request)
         .await
         .map_err(Status::from_error)?;
-    response_stream(response)
+    response_stream(response, max_decoding_message_size)
 }
 
 /// The request of a framed call: a POST of `body` to the method's `path`
@@ -758,7 +767,10 @@ fn call_request<B>(
 /// client reads it: a status in the headers (a trailers-only response) is the
 /// error it names, or an empty stream when it is OK; otherwise the body
 /// streams its messages and ends on its trailers.
-fn response_stream<B, R>(response: http::Response<B>) -> Result<Streaming<R>, Status>
+fn response_stream<B, R>(
+    response: http::Response<B>,
+    max_decoding_message_size: Option<usize>,
+) -> Result<Streaming<R>, Status>
 where
     B: http_body::Body + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -777,7 +789,7 @@ where
         response.into_body(),
         status_code,
         None,
-        None,
+        max_decoding_message_size,
     ))
 }
 
@@ -1059,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_trailers_only_ok_response_is_an_empty_stream() {
-        let mut stream = response_stream::<_, ts::GenerateResponse>(trailers_only("0", None))
+        let mut stream = response_stream::<_, ts::GenerateResponse>(trailers_only("0", None), None)
             .expect("an OK status in the headers is not an error");
         assert!(
             stream.message().await.expect("a clean end").is_none(),
@@ -1069,11 +1081,60 @@ mod tests {
 
     #[tokio::test]
     async fn a_trailers_only_error_is_the_status_it_names() {
-        let error =
-            response_stream::<_, ts::GenerateResponse>(trailers_only("14", Some("engine away")))
-                .expect_err("the status in the headers");
+        let error = response_stream::<_, ts::GenerateResponse>(
+            trailers_only("14", Some("engine away")),
+            None,
+        )
+        .expect_err("the status in the headers");
         assert_eq!(error.code(), tonic::Code::Unavailable);
         assert_eq!(error.message(), "engine away");
+    }
+
+    #[tokio::test]
+    async fn response_stream_decodes_oversized_sglang_prepared_input_with_limit() {
+        use crate::sglang_proto;
+
+        let prepared_input = vec![7u8; 5 * 1024 * 1024];
+        let payload = sglang_proto::GenerateResponse {
+            request_id: "req-oversized-manifest".to_string(),
+            prepared_input: prepared_input.clone(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut framed = Vec::with_capacity(5 + payload.len());
+        framed.push(0);
+        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&payload);
+
+        let build_response = |body_bytes: Vec<u8>| {
+            let body = tonic::body::Body::new(http_body_util::Full::new(Bytes::from(body_bytes)));
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc")
+                .body(body)
+                .unwrap()
+        };
+
+        let mut unlimited = response_stream::<_, Box<sglang_proto::GenerateResponse>>(
+            build_response(framed.clone()),
+            Some(36 * 1024 * 1024),
+        )
+        .expect("stream builds");
+        let item = unlimited
+            .message()
+            .await
+            .expect("decodes above 4 MiB")
+            .expect("one response");
+        assert_eq!(item.prepared_input.len(), prepared_input.len());
+
+        let mut capped =
+            response_stream::<_, Box<sglang_proto::GenerateResponse>>(build_response(framed), None)
+                .expect("stream builds");
+        let err = capped
+            .message()
+            .await
+            .expect_err("default 4 MiB limit rejects >4 MiB message");
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
     }
 
     #[test]
@@ -1573,6 +1634,8 @@ mod tests {
                     ..Default::default()
                 })),
                 extra_mm_inputs: vec![inputs_with_every_field(2), sg::MultimodalInputs::default()],
+                prepared_control: vec![7, 8],
+                prepared_input: vec![9, 10],
             }
         }
 

@@ -16,7 +16,7 @@ use tonic::{metadata::MetadataMap, Code, Request, Status};
 use tracing::warn;
 
 use super::State;
-use crate::admin::flush_timeout;
+use crate::{admin::flush_timeout, grpc_timeout};
 
 /// Bounds the single attempt of `timeout_s == 0`, so an engine that never
 /// answers cannot hang the RPC.
@@ -172,26 +172,6 @@ fn timed_out() -> Status {
     Status::deadline_exceeded(
         "Flush cache timed out; the engine may still complete an issued reset",
     )
-}
-
-/// The client's `grpc-timeout` header (`<1-8 digits><H|M|S|m|u|n>`), if any.
-fn grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
-    let value = metadata.get("grpc-timeout")?.to_str().ok()?;
-    let unit = value.chars().last()?;
-    let digits = &value[..value.len() - unit.len_utf8()];
-    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let amount: u64 = digits.parse().ok()?;
-    Some(match unit {
-        'H' => Duration::from_secs(amount * 3600),
-        'M' => Duration::from_secs(amount * 60),
-        'S' => Duration::from_secs(amount),
-        'm' => Duration::from_millis(amount),
-        'u' => Duration::from_micros(amount),
-        'n' => Duration::from_nanos(amount),
-        _ => return None,
-    })
 }
 
 #[cfg(test)]

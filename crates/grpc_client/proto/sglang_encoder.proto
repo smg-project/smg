@@ -19,6 +19,11 @@ service SglangEncoder {
 // Encode Request/Response
 // =====================
 
+message ImageOption {
+  // OpenAI detail hint ("auto", "low", "high", or empty for default).
+  string detail = 1;
+}
+
 message EncodeRequest {
   // List of multimodal item URLs (images, videos, audio)
   repeated string mm_items = 1;
@@ -37,6 +42,12 @@ message EncodeRequest {
 
   // Embedding ports for ZMQ transfer (multiple for distributed)
   repeated uint32 embedding_port = 6;
+
+  // Optional per-item image overrides matching `mm_items` positionally.
+  repeated ImageOption item_options = 7;
+
+  // Modality of `mm_items` ("image" or "video"; empty defaults to "image").
+  string modality = 8;
 }
 
 message EncodeResponse {
