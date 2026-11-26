@@ -5,8 +5,38 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{Blocks, Minted, BLOCK, BLOCKS, BLOCK_BITS};
+use super::{Blocks, Minted, BLOCK, BLOCKS, BLOCK_BITS, KEPT};
 use crate::tracking::lease::LeaseId;
+
+impl Blocks {
+    /// The terms whose tables are kept, the newest first.
+    pub(in crate::store::memory) fn kept_terms(&self) -> Vec<u64> {
+        self.kept.load().iter().map(|table| table.term).collect()
+    }
+
+    /// Spends `term`'s counter but for its last `left` ids, all for
+    /// `file`: every block before the one that holds the next id is
+    /// claimed, and what is returned holds that one from the next id on.
+    /// A test's door: no run reaches a term's last ids in under 2^32
+    /// issues.
+    pub(in crate::store::memory) fn spend(&self, term: u64, left: u32, file: u8) -> Minted {
+        let next = u64::from(u32::MAX - left) + 1;
+        let block = next >> BLOCK_BITS;
+        let claimed = (block + 1).min(u64::from(BLOCKS));
+        let kept = self.claimed.load(Ordering::Acquire) & KEPT;
+        let word = Self::word(term) | kept | claimed;
+        self.claimed.store(word, Ordering::Release);
+        for named in self.files.iter().take(claimed as usize) {
+            named.store(file, Ordering::Release);
+        }
+        let within = next as u32 & (BLOCK - 1);
+        Minted {
+            term,
+            next: next as u32,
+            left: if left == 0 { 0 } else { BLOCK - within },
+        }
+    }
+}
 
 /// The id of `term` and `counter`, as the mint lays an id out.
 fn id(term: u64, counter: u32) -> LeaseId {

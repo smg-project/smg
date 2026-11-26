@@ -382,6 +382,7 @@ impl File {
     /// Takes the turn and applies nothing: for the term's read, which no
     /// handed frame changes.
     pub(super) fn take(&self) -> Turn<'_> {
+        // A case's count of takes, made ahead of the wait for the turn.
         #[cfg(test)]
         self.takes.fetch_add(1, SeqCst);
         #[cfg(debug_assertions)]
@@ -398,18 +399,6 @@ impl File {
             #[cfg(debug_assertions)]
             file: self,
         }
-    }
-
-    /// Takes of this file's turn since the test last cleared them.
-    #[cfg(test)]
-    pub(super) fn takes(&self) -> usize {
-        self.takes.load(SeqCst)
-    }
-
-    /// Starts this test's count of turn takes again.
-    #[cfg(test)]
-    pub(super) fn clear_takes(&self) {
-        self.takes.store(0, SeqCst);
     }
 
     /// The turn where it is free, with nothing applied. `None` where a
@@ -895,22 +884,6 @@ impl MemoryStore {
         }
     }
 
-    /// How many files show a watch, for the cases: no door of the store
-    /// tells it.
-    #[cfg(test)]
-    pub(crate) fn watches(&self) -> usize {
-        let files = self.files.iter();
-        files.filter(|file| file.shown.watched.load(SeqCst)).count()
-    }
-
-    /// How many files show a thread at work, for the deciders' cases: no
-    /// door of the store tells it.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn working(&self) -> usize {
-        let files = self.files.iter();
-        files.filter(|file| file.has_worker()).count()
-    }
-
     /// The calling thread's place at its file, at work: a decider's, from
     /// a job at hand to an empty queue. The file is the one of the
     /// decider the thread acts as ([`DecisionSlot::acting`]), and one thread
@@ -1234,3 +1207,7 @@ impl MemoryStore {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/store/memory/turn/tests.rs"]
+mod tests;
