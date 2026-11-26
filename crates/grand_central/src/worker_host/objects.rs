@@ -36,9 +36,9 @@ use super::members::{EncodeColumns, Members, Stated};
 #[cfg(feature = "in-process")]
 use super::reach::{ListReach, Reach};
 use super::{
-    credentials::Credentials,
+    credentials::{Credentials, RegistrationInFlight},
     kv_tables::KvTables,
-    membership_writer::MembershipWriteRefused,
+    membership_writer::{MembershipWriteOutcome, MembershipWriteRefused},
     object::{builder, dial_address, external, status, takes_default, thresholds, unchecked},
     remainder::RowRemainder,
 };
@@ -403,11 +403,18 @@ impl<G: Generation> Objects<G> {
     }
 
     /// The keeper the holder reads at an object's build, where the host
-    /// handed one ([`Self::with_credentials`]). A registration line that
-    /// keeps reads it here, so the line's write and the build read one
-    /// keeper.
+    /// handed one ([`Self::with_credentials`]). The registration line that
+    /// keeps is handed no keeper: the holder keeps for it in this one, so
+    /// the line's write and the build read one keeper.
     pub fn credentials(&self) -> Option<&Arc<Credentials>> {
         self.credentials.as_ref()
+    }
+
+    /// Whether the host handed the holder a keeper
+    /// ([`Self::with_credentials`]). A registration line that keeps is
+    /// built over such a holder alone.
+    pub(super) fn keeps_credentials(&self) -> bool {
+        self.credentials.is_some()
     }
 
     /// Hand the holder the KV tables its rows' lanes are made in. The
@@ -563,7 +570,7 @@ impl<G: Generation> Objects<G> {
     /// alone moves no row and lays another object, so an object changes
     /// while its row's revision stands. The call refuses the write as
     /// moved, ahead of it, where another object stands under `url` by then.
-    pub(super) fn keeping<T>(
+    fn keeping<T>(
         &self,
         url: &str,
         over: Option<&Arc<dyn Worker>>,
@@ -577,6 +584,61 @@ impl<G: Generation> Objects<G> {
             }
         }
         Ok(write())
+    }
+
+    /// One registration that keeps its credential, whole, in a turn of its
+    /// own ([`Self::keeping`]). The holder keeps what `stated` holds, the
+    /// facts and the credential of the registration's first worker, ahead
+    /// of `write`: a row's object may be built inside the door's turn.
+    /// `write` writes the rows at the door, as a guarded write over `over`
+    /// under `url` where it names one. The holder answers its keeper with
+    /// the door's answer, with no await between the two: the rows the door
+    /// wrote are accepted, and a refusal puts back what stood. Where the
+    /// keeper says an object may hold another credential than its row
+    /// takes, the holder lays the address again and hands `store` each
+    /// row's count ([`Self::lay_again`]).
+    ///
+    /// One registration is in flight at an address: a second is refused
+    /// ahead of `write` ([`RegistrationInFlight`]), and its caller tries
+    /// again. A registration that states no worker keeps nothing and
+    /// writes all the same, and so does one over a holder with no keeper.
+    pub(super) fn register_keeping<S: WorkersStore + ?Sized>(
+        &self,
+        store: &S,
+        stated: Option<(&WorkerFacts, Option<String>)>,
+        (url, over): (&str, Option<&Arc<dyn Worker>>),
+        write: impl FnOnce() -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused>,
+    ) -> Result<Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused>, RegistrationInFlight>
+    {
+        let whole = || {
+            let kept = match (&self.credentials, stated) {
+                (Some(credentials), Some((facts, credential))) => {
+                    Some((credentials.keep(facts, credential)?, facts))
+                }
+                _ => None,
+            };
+            let answer = write();
+            if let Some((kept, facts)) = kept {
+                let rows: Vec<WorkerId> = answer
+                    .iter()
+                    .flatten()
+                    .filter_map(MembershipWriteOutcome::written_row)
+                    .collect();
+                let again = if rows.is_empty() {
+                    kept.put_back()
+                } else {
+                    kept.accepted_rows(&rows)
+                };
+                if again {
+                    self.lay_again(store, facts);
+                }
+            }
+            Ok(answer)
+        };
+        match self.keeping(url, over, whole) {
+            Ok(answer) => answer,
+            Err(moved) => Ok(Err(moved)),
+        }
     }
 
     /// The registry the objects stand in.
