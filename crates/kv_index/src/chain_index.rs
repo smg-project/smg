@@ -568,19 +568,27 @@ impl ChainIndex {
         total.max(0) as usize
     }
 
+    /// How many blocks the index holds under `worker`. The load is ordered behind the
+    /// credit it reads, and an id's first credit comes behind the count of ids handed out
+    /// again ([`Self::ids_reused`]): a caller that reads here what an id's next worker
+    /// stored reads that count moved behind it.
     pub fn worker_block_count(&self, worker: u32) -> usize {
         self.worker_blocks
             .get(worker as usize)
-            .map_or(0, |count| count.load(Ordering::Relaxed))
+            .map_or(0, |count| count.load(Ordering::Acquire))
     }
 
+    /// Published to [`Self::worker_block_count`]: a load that reads this add is ordered
+    /// behind it, and so behind the hand-out of `worker`'s id.
     fn credit(&self, worker: u32, blocks: usize) {
         if blocks == 0 {
             return;
         }
-        self.worker_blocks[worker as usize].fetch_add(blocks, Ordering::Relaxed);
+        self.worker_blocks[worker as usize].fetch_add(blocks, Ordering::Release);
     }
 
+    /// `Relaxed` is enough: every write of the count is an add or a take, so a load that reads
+    /// a take made behind a credit is ordered behind that credit as well.
     fn debit(&self, worker: u32, blocks: usize) {
         if blocks == 0 {
             return;
