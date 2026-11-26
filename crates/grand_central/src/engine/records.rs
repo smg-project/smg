@@ -580,6 +580,14 @@ impl Reported {
     fn is_of(&self, loads: &Arc<LoadSnapshot>) -> bool {
         ptr::eq(self.snapshot.as_ptr(), Arc::as_ptr(loads))
     }
+
+    /// Whether a decision that began at `now_micros` leaves the rows in
+    /// place: it began no later than the decision that converted them, so
+    /// it holds a snapshot no newer than theirs.
+    #[inline]
+    fn outlasts(&self, now_micros: u64) -> bool {
+        now_micros <= self.since_micros
+    }
 }
 
 /// The rows a list holds, as one decision read the slot: held for the
@@ -1258,7 +1266,7 @@ impl PoolRecords {
     ) -> Option<Arc<Reported>> {
         if held
             .as_deref()
-            .is_some_and(|reported| live.now_micros <= reported.since_micros)
+            .is_some_and(|reported| reported.outlasts(live.now_micros))
         {
             return None;
         }
@@ -1271,7 +1279,7 @@ impl PoolRecords {
         // was read.
         if again
             .as_deref()
-            .is_some_and(|reported| live.now_micros <= reported.since_micros)
+            .is_some_and(|reported| reported.outlasts(live.now_micros))
         {
             return None;
         }

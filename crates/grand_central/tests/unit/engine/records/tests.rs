@@ -1153,6 +1153,55 @@ fn a_decision_that_waited_ahead_of_the_claim_leaves_the_rows_of_a_later_decision
 }
 
 #[test]
+fn a_decision_that_waited_ahead_of_the_claim_leaves_the_lists_count_of_look_ups() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let workers = fleet(2);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let mut rows = Vec::new();
+    let begun = Instant::now();
+    let at = |millis: u64| begun + Duration::from_millis(millis);
+    let (first, _) = reports(&[100, 200], Duration::from_millis(40));
+    let (older, _) = reports(&[300, 400], Duration::from_millis(30));
+    let (newer, _) = reports(&[900, 950], Duration::from_millis(10));
+    let (fresh, _) = reports(&[500, 600], Duration::from_millis(5));
+
+    // The list holds the first snapshot's rows. A decision under the older
+    // snapshot has read the slot and waits ahead of the list's claim, and a
+    // decision that began later converts the newer snapshot.
+    let live = Live::at(spec.engine(), &clock, at(1), Some(&first), None);
+    let _ = pool.write(&workers, &live, &mut rows);
+    let waiting = Live::at(spec.engine(), &clock, at(2), Some(&older), None);
+    let read_first = pool.reported.load();
+    let live = Live::at(spec.engine(), &clock, at(3), Some(&newer), None);
+    let _ = pool.write(&workers, &live, &mut rows);
+    assert_eq!(pool.conversions(), 2);
+
+    // A draw under a fourth snapshot pays one of the list's two look-ups.
+    let drawn = Live::at(spec.engine(), &clock, at(4), Some(&fresh), None);
+    assert!(pool
+        .convert(&workers, &fresh, &drawn, &pool.reported.load(), 1)
+        .is_none());
+
+    // The decision that waited pays one under its older snapshot. Under the
+    // claim it finds the rows of a decision that began later, so the list's
+    // count of look-ups stays that of the fourth snapshot.
+    assert!(pool
+        .convert(&workers, &older, &waiting, &read_first, 1)
+        .is_none());
+    assert_eq!(pool.conversions(), 2);
+
+    // So a second draw under the fourth snapshot pays the last of the
+    // list's length and converts.
+    let second = Live::at(spec.engine(), &clock, at(5), Some(&fresh), None);
+    let converted = pool
+        .convert(&workers, &fresh, &second, &pool.reported.load(), 1)
+        .expect("the second look-up of the fourth snapshot converts");
+    assert!(converted.is_of(&fresh));
+    assert_eq!(pool.conversions(), 3);
+}
+
+#[test]
 fn a_decision_that_meets_a_conversion_under_way_converts_nothing_and_waits_for_nothing() {
     let spec = applied("least_load");
     let clock = DecisionClock::new();
