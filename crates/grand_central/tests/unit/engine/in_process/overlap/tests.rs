@@ -1999,6 +1999,45 @@ fn a_column_reads_the_write_its_thread_keeps_and_the_next_turn_is_kept() {
     assert_eq!(prefills.affinity.left_out(), 0);
 }
 
+/// A write whose naming a leave made stale takes no kept write of its
+/// thread with it. The thread fills a column for one request, a worker
+/// leaves, and the thread fills and writes for a second request, the first
+/// one's leading part, for the same worker: that write meets a held record
+/// and is kept, named on the record's count as it stands. The first
+/// request's write then stops at the record, and the kept one is written on
+/// behind it. So the worker holds the second request's blocks for a reader
+/// on another thread, and nothing is left out.
+#[test]
+fn a_write_a_leave_made_stale_takes_no_kept_write_with_it() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let (whole, leading) = (prompt(1_000, 4), prompt(1_000, 2));
+    let (first, second) = (request(&whole, 7, NOW), request(&leading, 7, NOW));
+    let (list, id) = (&bed.pool, bed.ids[1]);
+    let (column_of, read) = bed.column(&first, Phase::Single);
+    let read = read.expect("the record speaks for the list");
+    bed.affinity.forget(bed.ids[3]);
+    let record = {
+        let records = bed.affinity.records.lock();
+        Arc::clone(records.get(MODEL).expect("the model's record"))
+    };
+    {
+        let (column_of, read) = bed.column(&second, Phase::Single);
+        let read = read.expect("the record speaks for the list");
+        let _reader = record.predictor.read();
+        record_by_column(list, Phase::Single, &second, read, &column_of, id);
+    }
+    assert!(record.predictor.read().is_empty(), "the write waits");
+    record_by_column(list, Phase::Single, &first, read, &column_of, id);
+    // What a thread that keeps no write reads.
+    let elsewhere = thread::scope(|scope| {
+        let reader = scope.spawn(|| held(&bed.column(&second, Phase::Single).0));
+        reader.join().expect("a reader")
+    });
+    assert_eq!(elsewhere, [(0, 0), (0, 2), (0, 0), (0, 0)]);
+    assert_eq!(bed.affinity.left_out(), 0);
+}
+
 /// A pick of a worker the record holds the whole request for leaves nothing
 /// out, however many workers hold it: a read keeps eight of them, and the
 /// pick's own entry of the column says it of the others. At the tick of the
@@ -3559,7 +3598,8 @@ fn a_profile_named_no_row_reads_the_record_alone_for_a_worker_the_index_holds_bl
 /// row and reads cache events too, its pick of a worker the index holds
 /// blocks for writes nothing, as a pick over named rows writes nothing
 /// there. So the same list, read next by a profile that reads sent prefixes
-/// alone, is handed no send for that worker.
+/// alone, is handed no send for that worker. Its pick of a worker the index
+/// holds nothing for is written, and the first profile reads that send next.
 #[test]
 fn a_decode_request_asked_alone_writes_nothing_for_a_worker_the_index_holds_blocks_for() {
     let (affinity, _, index) = hosted(true);
@@ -3602,6 +3642,15 @@ fn a_decode_request_asked_alone_writes_nothing_for_a_worker_the_index_holds_bloc
         ..merged
     };
     assert_eq!(handed(&alone), by_index);
+    // A pick of a worker the index holds nothing for is written: the index
+    // does not decide a decode request alone.
+    let merged = Bed {
+        pool: PoolAffinity::default(),
+        spec: handed_whole(),
+        ..alone
+    };
+    assert!(merged.decide(&decode(), Some(3)).is_none());
+    assert_eq!(handed(&merged), [(0, 0), (2, 0), (0, 0), (0, 4)]);
 }
 
 /// A pick states what its first target holds of the request, read from the
