@@ -12,10 +12,12 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import uuid
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from budget import BudgetError, Ledger, Policy, RunPolicy
@@ -268,11 +270,21 @@ class Guard:
         self.local_model, self.local_url = local_model, local_url.rstrip("/")
         self.transport_factory = transport_factory
         self.clients, self.patches = [], []
+        self._admission_lock = threading.Lock()
         self.failed = False
 
-    def deny(self, reason):
-        self.failed = True
+    def mark_failed(self):
+        # Linearize local STOP_PENDING before any fallible settlement/halt IO.
+        # A reservation already committed under this lock may still settle.
+        with self._admission_lock:
+            self.failed = True
+
+    def stop_paid(self):
+        self.mark_failed()
         self.ledger.halt()
+
+    def deny(self, reason):
+        self.stop_paid()
         raise BudgetError(reason)
 
     def patch(self, obj, name, value):
@@ -367,18 +379,23 @@ class Guard:
                     provider="openai",
                 )
                 try:
-                    guard.ledger.reserve(
-                        request_id,
-                        guard.arm,
-                        "openai/" + model,
-                        guard.contexts["models"][model]["context_tokens"],
-                        data["max_completion_tokens"],
-                        num_retries=0,
-                        output_limit_verified=True,
-                        metadata=metadata,
-                    )
+                    # The SDK precheck can precede a concurrent failed request.
+                    # Order the actual reservation commit with local stop publication.
+                    with guard._admission_lock:
+                        if guard.failed:
+                            raise BudgetError("This process has stopped paid admission")
+                        guard.ledger.reserve(
+                            request_id,
+                            guard.arm,
+                            "openai/" + model,
+                            guard.contexts["models"][model]["context_tokens"],
+                            data["max_completion_tokens"],
+                            num_retries=0,
+                            output_limit_verified=True,
+                            metadata=metadata,
+                        )
                 except BudgetError:
-                    guard.ledger.halt()  # budget refusal must not become a valid zero reward
+                    guard.stop_paid()  # budget refusal must not become a valid zero reward
                     raise
                 outcome = {}
                 try:
@@ -411,15 +428,18 @@ class Guard:
                         or total != prompt + completion
                     ):
                         raise BudgetError("Unknown total paid usage")
-                except Exception as error:
+                except BaseException as error:
+                    guard.mark_failed()
                     outcome["error_type"] = type(error).__name__
                     try:
-                        guard.ledger.finish(request_id, outcome=outcome)
+                        try:
+                            guard.ledger.finish(request_id, outcome=outcome)
+                        finally:
+                            # Publish fail-stop even if SQLite cannot record the outcome.
+                            guard.ledger.halt()
                     finally:
-                        guard.failed = True
-                        # Publish the filesystem fail-stop even when SQLite
-                        # cannot record this unknown paid outcome.
-                        guard.ledger.halt()
+                        if not isinstance(error, Exception):
+                            raise error
                     raise
                 guard.ledger.finish(request_id, prompt, completion, outcome=outcome)
                 return response
@@ -533,7 +553,7 @@ class Guard:
                     else:
                         http_client.close()
                 except Exception:
-                    self.ledger.halt()
+                    self.stop_paid()
                     raise
                 finally:
                     self.clients.remove(http_client)
@@ -553,8 +573,7 @@ class Guard:
                 # tau2 can convert an exception into a zero-reward simulation.
                 # Keep an independent process-level failure even if DB reporting
                 # itself is unavailable, so that CLI0 cannot become budget success.
-                self.failed = True
-                self.ledger.halt()
+                self.stop_paid()
                 raise
 
         self.patch(llm_utils, "completion", completion)
@@ -576,6 +595,25 @@ class Guard:
             "generate",
             role_wrapper(evaluator_nl_assertions.generate, "nl_judge"),
         )
+        original_exit = batch.os._exit
+
+        def stop_before_hard_exit(code):
+            # The pinned runner uses this only for Ctrl+C. Its worker threads
+            # cannot unwind after os._exit, so publish from the main exit boundary.
+            try:
+                self.stop_paid()
+            except BaseException as error:
+                print(
+                    "Shared paid halt before hard exit NOT_ATTESTED: " + type(error).__name__,
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                original_exit(code)
+
+        # Only this qualified module's exit call is adapted; global os._exit,
+        # on-disk SDK source and legacy/opt-out execution remain unchanged.
+        self.patch(batch, "os", SimpleNamespace(_exit=stop_before_hard_exit))
         original_unit = batch.run_unit
         signature = inspect.signature(original_unit)
 

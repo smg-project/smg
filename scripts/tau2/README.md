@@ -178,30 +178,40 @@ separate; this change does not add a paid or AMD execution authorization.
 Before live scoring with `run_ab.py`, supply these reviewed environment values
 or their corresponding `--budget-*` arguments. The standalone `guarded_cli.py`
 entry uses `--policy`, `--contexts`, `--contexts-sha256`, `--ledger` and `--scope`.
-No real prices, provider limits or spending approval are supplied here:
+No real prices, provider limits or spending approval are supplied here.
+The value definitions below use the standalone flag names; the driver accepts
+these corresponding arguments or environment variables:
 
-- `TAU2_BUDGET_POLICY`: JSON containing `scope_id`, integer `cap_nusd`, `calls`,
+| `guarded_cli.py` | `run_ab.py` | Driver environment |
+| --- | --- | --- |
+| `--policy` | `--budget-policy` | `TAU2_BUDGET_POLICY` |
+| `--contexts` | `--budget-contexts` | `TAU2_BUDGET_CONTEXTS` |
+| `--contexts-sha256` | `--budget-contexts-sha256` | `TAU2_BUDGET_CONTEXTS_SHA256` |
+| `--ledger` | `--budget-ledger` | `TAU2_BUDGET_LEDGER` |
+| `--scope` | `--budget-scope` | `TAU2_BUDGET_SCOPE` |
+
+- `--policy`: JSON containing `scope_id`, integer `cap_nusd`, `calls`,
   `calls_per_arm`, and `models` with exactly `openai/gpt-5.2` and
   `openai/gpt-4.1-2025-04-14`. Each model has explicit decimal-string
   `input_per_million` / `output_per_million`, positive integer `input_limit` /
   `output_limit`, and `service_tier: "default"`. `cap_nusd` is billionths of USD.
-- `TAU2_BUDGET_CONTEXTS`: a separately verified provider-contract JSON with
+- `--contexts`: a separately verified provider-contract JSON with
   `schema_version: 1` and `models` keyed by those two model names without the
   `openai/` prefix. Each entry has the complete provider `context_tokens` bound,
   the official `source_url`, and the explicitly reviewed resolved
   `response_models` IDs covered by the same pricing/context contract.
-- `TAU2_BUDGET_CONTEXTS_SHA256`: the independently reviewed SHA256 of the exact
+- `--contexts-sha256`: the independently reviewed SHA256 of the exact
   context file bytes. A URL plus an invented number is not provider evidence.
   The tool does not discover/attest provider limits: real values must be verified
   outside the policy before execution. No real bound is supplied here; fixtures
   use synthetic contracts only. An estimate of the last message's tokens or the
   policy's `input_limit` itself is not a complete input bound.
-- `TAU2_BUDGET_LEDGER`: one absolute SQLite file shared by both arms, every domain
+- `--ledger`: one absolute SQLite file shared by both arms, every domain
   and both sequential score processes. The explicit guarded `--initialize` entry creates it once using an exclusive
   new file before either arm; live scoring, guarded children and saved-score
   acceptance open an existing file only. Do not rerun initialization after loss of a live ledger; restore its state or
   obtain a new scope/approval. An old or missing/incompatible ledger is not reset or silently recreated at acceptance.
-- `TAU2_BUDGET_SCOPE`: the exact approved comparison scope matching the policy.
+- `--scope`: the exact approved comparison scope matching the policy.
   In CI it is `<run_id>:<run_attempt>:<matrix.name>`. Approval is either for
   that exact job or an explicit standing per-job allowance described below.
   This is a per-comparison-job cap, not an aggregate monthly/multi-host billing
@@ -241,6 +251,16 @@ global pending/unknown/halted after both arms join. Sequential saved-score diffs
 reopen the same policy/scope/ledger and recheck current state, so an earlier clean
 summary cannot hide a later halt or deletion. Legacy score files without budget
 provenance remain readable but cannot pass the normal budgeted CLI gate.
+
+Within the guarded process, a failure publishes local STOP_PENDING before
+settlement or halt I/O. The final reservation commit and that stop publication
+use the same lock; an earlier SDK precheck cannot admit a later request after
+that local stop. Already admitted requests may still settle without refunds.
+The pinned batch runner's Ctrl+C hard-exit call is adapted only in that module:
+it attempts the ordered shared halt before preserving exit 130. Global
+`os._exit`, SDK files and legacy opt-out callers are unchanged. If both durable
+halt paths fail, cross-process stop remains NOT_ATTESTED and paid admission
+remains on hold; hard kill and host loss are not made safe by this adapter.
 
 CPU tests execute the pinned UserSimulator, NL evaluator, task wrapper and
 LiteLLM/OpenAI request chain through fake HTTP transports with socket connections
@@ -415,9 +435,9 @@ or contents; inability to record the marker fails staging.
 
 ### Consumer handoff and explicit outcomes
 
-Every requested arm/domain must retain a terminal invocation identity. A missing
-record, an unavailable budget, or a safety failure is not an incomplete-quality
-waiver. The same outcome predicates guard saved comparisons and `--score-arm`:
+Every admitted arm/domain must retain a terminal invocation identity. Unlaunched
+domains remain unscored and the comparison remains incomplete. A missing record,
+an unavailable budget, or a safety failure is not an incomplete-quality waiver. The same outcome predicates guard saved comparisons and `--score-arm`:
 that command saves truthful evidence, then exits 2 on safety/provenance failure
 so the strict sequential parent stops before starting the other arm. Explicit
 quality-only failures may return 0 for handoff and are gated in the final diff.
@@ -438,5 +458,5 @@ A hard domain outcome stops new domain launches in both owned arms. A sibling
 already admitted before that stop may finish and settle its paid work while the
 shared ledger remains healthy; independent paid-budget failures still fail
 closed. The domain stop does not erase reservations or claim that in-flight
-work was cancelled. Partial
-quality diagnostics alone do not trigger this admission stop.
+work was cancelled. Partial quality diagnostics alone do not trigger this
+admission stop.
