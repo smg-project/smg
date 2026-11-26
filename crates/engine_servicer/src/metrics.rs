@@ -12,7 +12,8 @@
 //! What the request path does, and nothing else: one clock read at arrival,
 //! one clock read plus one histogram push and two atomic adds at the first
 //! output, one atomic add (and, with the inter-token histogram on, one clock
-//! read and one push) per output chunk, and one clock read plus a handful of
+//! read and one push of the chunk's tokens) per output chunk, and one clock
+//! read plus a handful of
 //! pushes when the stream ends. Counters are plain atomics the scrape maps
 //! onto Prometheus counters; the one per-chunk histogram sits behind a
 //! pressure sampler that drops observations above a bound and counts the
@@ -61,8 +62,9 @@ const CONTENT_TYPE_PROMETHEUS: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// the rendered distributions (and resets the pressure sampler) between
 /// scrapes.
 pub(crate) const UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
-/// Pending inter-token observations above which the sampler drops the next
-/// one and counts it: about 8 MB at the measured cost per pending sample,
+/// Pending inter-token samples (one for each token) above which the sampler
+/// drops the next chunk's and counts them: about 8 MB at the measured cost per
+/// pending sample,
 /// reached only by a servicer nobody scrapes for minutes at tens of thousands
 /// of tokens per second, or whose listener thread died.
 pub(crate) const ITL_PENDING_BOUND: u32 = 512 * 1024;
@@ -75,7 +77,7 @@ pub(crate) const TTFT_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
     20.0, 40.0, 80.0, 160.0, 640.0, 2560.0,
 ];
-/// vLLM's inter-token latency buckets (seconds), for the per-chunk latency
+/// vLLM's inter-token latency buckets (seconds), for the per-token latency
 /// and the per-request mean.
 pub(crate) const INTER_TOKEN_BUCKETS: &[f64] = &[
     0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0,
@@ -710,19 +712,28 @@ impl ServicerMetrics {
         }
     }
 
-    /// One inter-token observation, under the pressure sampler: above the
-    /// bound of pending samples the observation is dropped and counted.
-    fn inter_token(&self, slot: usize, latency: Duration) {
+    /// The inter-token samples of one chunk, one for each of its `tokens`
+    /// tokens, as SGLang's tokenizer records them: the histogram's count is
+    /// the tokens and its sum the seconds between them. Under the pressure
+    /// sampler: above the bound of pending samples the chunk's samples are
+    /// dropped and counted.
+    fn inter_token(&self, slot: usize, latency: Duration, tokens: u32) {
         let Some(handles) = self.rank_handles(slot) else {
             return;
         };
-        let pending = self.inter_token_pending.fetch_add(1, Ordering::Relaxed);
+        let pending = self
+            .inter_token_pending
+            .fetch_add(tokens, Ordering::Relaxed);
         if pending >= ITL_PENDING_BOUND {
-            self.inter_token_pending.fetch_sub(1, Ordering::Relaxed);
-            self.inter_token_dropped.fetch_add(1, Ordering::Relaxed);
+            self.inter_token_pending
+                .fetch_sub(tokens, Ordering::Relaxed);
+            self.inter_token_dropped
+                .fetch_add(u64::from(tokens), Ordering::Relaxed);
             return;
         }
-        handles.inter_token_latency.record(latency);
+        handles
+            .inter_token_latency
+            .record_many(latency, tokens as usize);
     }
 
     /// Drain pending histogram samples into the rendered distributions and
@@ -1211,6 +1222,7 @@ impl ChoiceMetrics {
                 metrics.inter_token(
                     self.request.slot,
                     now.saturating_duration_since(last) / tokens,
+                    tokens,
                 );
             }
             self.last_chunk = Some(now);
@@ -1491,13 +1503,14 @@ mod tests {
             ),
             Some(1.0)
         );
+        // The second chunk's two tokens are two inter-token samples.
         assert_eq!(
             sample(
                 &body,
                 &format!("{}_count", names::INTER_TOKEN_LATENCY_SECONDS),
                 "rank=\"0\""
             ),
-            Some(1.0)
+            Some(2.0)
         );
         assert_eq!(
             sample(
@@ -1731,7 +1744,7 @@ mod tests {
     fn the_inter_token_sampler_drops_and_counts_above_the_bound() {
         let metrics = ServicerMetrics::new(&identity(1), true).unwrap();
         for _ in 0..(ITL_PENDING_BOUND + 10) {
-            metrics.inter_token(0, Duration::from_millis(1));
+            metrics.inter_token(0, Duration::from_millis(1), 1);
         }
         assert_eq!(metrics.inter_token_dropped.load(Ordering::Relaxed), 10);
         assert_eq!(
@@ -1757,8 +1770,36 @@ mod tests {
         );
         // The scrape drained the samples: the sampler starts over.
         assert_eq!(metrics.inter_token_pending.load(Ordering::Relaxed), 0);
-        metrics.inter_token(0, Duration::from_millis(1));
+        metrics.inter_token(0, Duration::from_millis(1), 1);
         assert_eq!(metrics.inter_token_dropped.load(Ordering::Relaxed), 10);
+    }
+
+    /// A chunk of k tokens that took d seconds is k samples of d / k, as
+    /// SGLang's tokenizer records it: the count is the tokens and the sum
+    /// the seconds, so count / sum is the tokens per second a stream got.
+    /// One sample of d / k for the chunk read a stream whose chunk sizes
+    /// vary (speculative decoding) slower than it ran: 1 token in 50 ms
+    /// then 4 in 80 ms read 2 / 0.07 = 28.6 tokens/s for 5 / 0.13 = 38.5.
+    #[test]
+    fn a_chunk_is_one_inter_token_sample_for_each_token() {
+        let metrics = ServicerMetrics::new(&identity(1), true).unwrap();
+        metrics.inter_token(0, Duration::from_millis(50), 1);
+        metrics.inter_token(0, Duration::from_millis(20), 4);
+        let body = metrics.render(snapshot());
+        let count = sample(
+            &body,
+            &format!("{}_count", names::INTER_TOKEN_LATENCY_SECONDS),
+            "rank=\"0\"",
+        );
+        let sum = sample(
+            &body,
+            &format!("{}_sum", names::INTER_TOKEN_LATENCY_SECONDS),
+            "rank=\"0\"",
+        )
+        .unwrap();
+        assert_eq!(count, Some(5.0));
+        assert!((sum - 0.13).abs() < 1e-9, "sum {sum}, want 0.13");
+        assert_eq!(metrics.inter_token_pending.load(Ordering::Relaxed), 0);
     }
 
     /// The render time of a scrape at one rank and at eight (the handle
