@@ -394,6 +394,8 @@ def reap_strict(
         protected = _strict_ancestors(proc_root, me)
         quiet = 0
         for _ in range(max_scans):
+            if clock() >= deadline:
+                raise TimeoutError("strict cleanup deadline before observation pass")
             if _strict_ancestors(proc_root, me) != protected:
                 raise ValueError("cleanup process ancestor chain changed")
             census_before, before_complete = _strict_census(proc_root, report_unresolved)
@@ -429,6 +431,10 @@ def reap_strict(
                         fd = opener(process.pid, 0)
                     except ProcessLookupError:
                         continue
+                    except OSError as error:
+                        report_unresolved(process.pid, error)
+                        unresolved_observation = True
+                        continue
                     handles[process.pid] = (process, fd)
                     # The pidfd and the post-open proc observation must bind the
                     # same identity. No signal is sent if the numeric PID changed.
@@ -462,14 +468,18 @@ def reap_strict(
                     except ProcessLookupError:
                         retire(pid)
                         break
+                    except PermissionError as error:
+                        report_unresolved(pid, error)
+                        unresolved_observation = True
+                        break
                     sent.add(key)
                     if sig == signal.SIGTERM:
                         term_sent_at[identity] = clock()
                     log(f"strict signal {sig} pid {pid} uid {owner_uid} birth {process.starttime}")
-            if clock() > deadline:
+            if clock() >= deadline:
                 raise TimeoutError("strict cleanup observation deadline reached")
             census_after, after_complete = _strict_census(proc_root, report_unresolved)
-            if clock() > deadline:
+            if clock() >= deadline:
                 raise TimeoutError("strict cleanup final census exceeded deadline")
             stable = before_complete and after_complete and census_before == census_after
             quiet = (
@@ -478,6 +488,8 @@ def reap_strict(
                 else 0
             )
             if quiet == 2:
+                if clock() >= deadline:
+                    raise TimeoutError("strict cleanup deadline before clean acceptance")
                 clean = True
                 break
             remaining = deadline - clock()
