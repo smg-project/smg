@@ -3014,7 +3014,6 @@ tells the data once more:
 | Copy | Where | Read by |
 |---|---|---|
 | the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
-| a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
 | the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a frame that states a demand is held to it, every frame but an encode request's. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
 | the published copy: of a record its id alone, beside its slot in the counts and in a gateway's vetoes by pool; with them each pool's index by model and role, the generation and the clock | the store | a pick's booking and a gateway's vetoes; every other loader reads the generation; no row of a record stands in it and no request is decided over it |
@@ -3024,8 +3023,10 @@ A leader's write of a record is decided over the worker object since step 1 belo
 table follows it. The object leads a status too since step 3, and the table is told it. The
 object leads a first copy's facts since the last part of step 2, and the log its statuses. After the switch the object leads: a worker's data
 stands once, as its worker object with its remainder beside it, and the log still tells it. The
-remainder is the copy that stays. Step 4 below takes the table of records apart and ends the
-second copy of the facts. The records themselves end later, with the published copy, whose
+remainder is the copy that stays.
+
+Step 4 below takes the table of records apart. It has ended the
+second copy of the facts **[built]**. The records themselves end later, with the published copy, whose
 membership build reads them.
 The published copy holds no row of a record, and a status change makes no
 publication. It ends when the two readers of what it holds of a worker, a pick's booking and
@@ -3122,7 +3123,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
 
    A change the store refuses lays nothing new: a refused write reads no record of the store, and a refused removal lays its record again as it was read. A
    record with no object waits for a cut laid whole, and its key's registration through the keeper is
-   refused until then. It is one a store took as a decided change around the keeper, or one the store took and the registry did not get. A change that moves a fact the object holds builds the object again: the
+   refused until then. It is one a store took as a decided change around the keeper, or one the store took and the registry did not get.
+   A standby and a watcher also lay it at the next event that tells its record and that the store takes.
+
+   A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects **[built]**. A call reads the
@@ -3137,22 +3141,32 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    request's does on main.
 4. The table of records is taken apart in removals. The second copy of the facts, the two
    conversions between a record and an object, and the task that follows the table are
-   deleted. The removals come in this order. First the store's log of its changes
+   deleted. The removals come in this order.
+
+   First the store's log of its changes
    **[built]**, then a cut's read back **[built]** and the store's own write entries **[built]**. Then its read
    entries with its own cut, and last the store's reads of the record before a write. The
    records themselves stay for the published copy's membership build, and go with that copy.
+
    The task is deleted
    **[built]**: the calls a record is written by are public, a host of the worker objects
    writes through them, and a served controller hands the code that keeps its objects. A
-   record a store took as a decided change around the keeper gets its object in one place: where a cut
-   is laid whole.
-   No task lays it. No turn that takes the controller's own store starts with
+   record a store took as a decided change around the keeper gets its object where a cut
+   is laid whole. A standby and a watcher also lay it at the next event that tells it.
+   No task lays it.
+
+   No turn that takes the controller's own store starts with
    a read of its table **[built]**: a write call decides over the object that stands, a call's read
    and a first copy read the objects, and a standby's applier lays its leader's event. A
    turn of the keeper's own reads no log of the store's changes **[built]**: a refused write
    reads no record, a cut laid whole lays the cut's own records, then reads the status the
    table holds for each, and the call that lays a kept credential again reads the objects. No
    host follows the store **[built]**.
+
+   The second copy of the facts is deleted **[built]**. The code that keeps the objects holds a
+   cut's record against the record read back off its object and its remainder. Models set on
+   an object since its build read back as set, so a cut whose record states others builds the
+   object again.
 
 **One rule for a registration's write [built].** What a registration makes of the record under
 its address is one function beside the other membership rules (`WorkerRow::laid_over`,
@@ -3169,7 +3183,7 @@ hands the store the event at its place in the log, and puts the object in the re
 the store took the event. A removal's object leaves the registry first. A record changed in
 place keeps the instant it was admitted at. A status the leader tells is written to the table and
 laid on the object in the same turn. A restore is the store's restore and the lay of the cut's own
-records in one turn of that code. No record is read back to lay an object: each record's status is read off the table. A record of a watch's snapshot whose
+records in one turn of that code. No record of the table is read back to lay an object: each record's status alone is read off it. A record of a watch's snapshot whose
 object stands keeps the instant it was admitted at: that code states it before the store takes
 the snapshot. A first copy is cut from the objects, by the last
 part of step 2.
@@ -3196,7 +3210,9 @@ hold, and no record of the table. So a copy holds
 each record the log told at the copy's place, and none it did not, beside every writer that holds the turn. A
 record the store took and the registry did not get is in no copy until it is laid (step 1).
 One a store took as a decided change around that code is laid
-where a cut is laid whole. A copy's statuses are the
+where a cut is laid whole. A standby and a watcher also lay it at the next event that tells it.
+
+A copy's statuses are the
 ones the log last told at its place, and not the objects': an object can stand one tell
 ahead of the log. The store keeps what the log last told of each record's status, beside its
 epoch. A copy reads the log's place, the epoch and those statuses in one hold
