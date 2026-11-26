@@ -451,11 +451,12 @@ pub(crate) struct SequentialPlan {
 
 impl SequentialPlan {
     /// Decide the plan from the pair and the request; a pairing this pipeline
-    /// cannot serve (a MoRI-IO decode, a language-model-only decode the
-    /// request's multimodal payload needs more of) is refused here, before
-    /// either side is sent. The dispatch decides it ahead of
+    /// cannot serve (a MoRI-IO decode or prefill, a language-model-only
+    /// decode the request's multimodal payload needs more of) is refused
+    /// here, before either side is sent. The dispatch decides it ahead of
     /// [`execute_sequential_pd`], so a refused request's prefill was never
-    /// said to be sent.
+    /// said to be sent. [`Self::refuses`] makes the same refusals without
+    /// the plan: a refusal added here is added there.
     pub(crate) fn decide(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
@@ -540,10 +541,11 @@ impl SequentialPlan {
     }
 
     /// What [`Self::decide`] refuses of the pair and the request, asked
-    /// without the plan: no connector mode is read off the prefill, no line
-    /// is logged and no transfer id is minted. For a caller that asks ahead
-    /// of the dispatch that decides the plan. `decide` makes the same two
-    /// refusals in its own lines, which every sequential request runs.
+    /// without the plan: of each side's connector it asks one thing,
+    /// whether it is MoRI-IO, and it logs no line and mints no transfer id.
+    /// For a caller that asks ahead of the dispatch that decides the plan.
+    /// `decide` makes the same two refusals in its own lines, which every
+    /// sequential request runs.
     pub(crate) fn refuses(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
@@ -649,6 +651,11 @@ pub(crate) struct PrefillHarvest {
 /// another decode, and the send said on the decode the request goes to. A
 /// decode the classic policies picked is owed neither, and its dispatch
 /// holds nothing for it.
+///
+/// A batch's dispatch is handed the same for its decode guards, which were
+/// made ahead of their send too: it asks no decode again, and says the send
+/// once, behind what refuses a sub-request. A dispatch that refuses its
+/// request drops this as it is, and the guards are dropped unsent.
 pub(crate) struct DecodeBehindPrefill<'a> {
     /// The selection stage, which states the request again.
     pub stage: &'a WorkerSelectionStage,
@@ -684,8 +691,8 @@ pub(crate) struct DecodeBehindPrefill<'a> {
 /// ([`DecodeBehindPrefill`]): once the prefill has answered the decode is
 /// asked again, and its send is said where it goes out. `None` for a
 /// dispatch that owes its decode neither: a batch's sub-request, whose
-/// decode guard said the send where it was made, and a pair the classic
-/// policies picked.
+/// decode's send the batch or the guard's making said, and a pair the
+/// classic policies picked.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn execute_sequential_pd(
     plan: SequentialPlan,
@@ -1771,8 +1778,10 @@ mod tests {
         };
         req.mm_inputs = None;
         req.extra_mm_inputs.clear();
-        let mut fanout = vllm_pd_mm_request();
-        let ProtoGenerateRequest::Vllm(req) = &mut fanout else {
+        // Pixels alone in one sample, which such a decode takes: the same
+        // pixels in two samples are the third form it is refused.
+        let mut pixels = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut pixels else {
             panic!("expected vLLM request");
         };
         req.media_refs = None;
@@ -1781,6 +1790,11 @@ mod tests {
             .unwrap()
             .model_specific_tensors
             .clear();
+        req.sampling_params.get_or_insert_with(Default::default).n = 1;
+        let mut fanout = pixels.clone();
+        let ProtoGenerateRequest::Vllm(req) = &mut fanout else {
+            panic!("expected vLLM request");
+        };
         req.sampling_params.get_or_insert_with(Default::default).n = 2;
         let text = recorded_request(1);
 
@@ -1819,6 +1833,12 @@ mod tests {
                 Some("pd_decode_language_model_only_n_samples"),
             ),
             (
+                "one sample of a multimodal prompt for a language-model-only decode",
+                pair(nixl, None, Some("false")),
+                &pixels,
+                None,
+            ),
+            (
                 "text for a language-model-only decode",
                 pair(nixl, None, Some("false")),
                 &text,
@@ -1832,14 +1852,13 @@ mod tests {
             ),
         ];
         for (name, workers, request, refused) in rows {
-            let checked = SequentialPlan::refuses(request, &workers)
-                .err()
-                .and_then(code);
-            let decided = SequentialPlan::decide(request, &workers)
-                .err()
-                .and_then(code);
-            assert_eq!(checked.as_deref(), refused, "{name}: the check");
-            assert_eq!(decided.as_deref(), refused, "{name}: the plan's decision");
+            // A refusal is read as one whatever it bears: a refusal with no
+            // code is not a row's `None`.
+            let refused = refused.map(|code| Some(code.to_owned()));
+            let checked = SequentialPlan::refuses(request, &workers).err().map(code);
+            let decided = SequentialPlan::decide(request, &workers).err().map(code);
+            assert_eq!(checked, refused, "{name}: the check");
+            assert_eq!(decided, refused, "{name}: the plan's decision");
         }
     }
 

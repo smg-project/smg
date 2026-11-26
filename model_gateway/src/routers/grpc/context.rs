@@ -1113,19 +1113,33 @@ impl LoadGuards {
         }
     }
 
-    /// [`Self::new`] for a pair whose decode is owed its ask and its send
-    /// behind its prefill ([`Placed::owed_behind_prefill`]): one request of
-    /// a sequential dispatch that Grand Central placed. A classic
-    /// pair's takes [`Self::new`]. The decode's guard is made
-    /// ahead of its send ([`Placed::ahead`]): the decode is counted from
-    /// here, and the dispatch says its send where the decode goes out
-    /// ([`Self::map_decode`], in `execute_sequential_pd`).
-    pub fn behind_prefill(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
-        match selection {
+    /// [`Self::scaled`] for a pair whose dispatch says the decode's send
+    /// apart from its guards' making: a pair Grand Central placed
+    /// ([`Placed::owed_behind_prefill`]) whose dispatch may refuse the
+    /// request, or wait for the prefill, ahead of that send. A classic
+    /// pair's takes [`Self::scaled`]. Each decode guard is made ahead of
+    /// its send ([`Placed::ahead`]): the decode is counted from here, once
+    /// for each of the `count` sub-requests, and the dispatch says the send
+    /// where the decode goes out ([`Self::map_decode`]: in
+    /// `execute_sequential_pd` for one request, in `execute_batch_dispatch`
+    /// for a batch).
+    pub fn behind_prefill(
+        selection: &WorkerSelection,
+        routing_key: Option<&str>,
+        count: usize,
+    ) -> Self {
+        let ahead = || match selection {
             WorkerSelection::Disaggregated { decode, .. } => LoadGuards::Disaggregated {
                 _decode: decode.ahead(routing_key),
             },
             single @ WorkerSelection::Single { .. } => Self::new(single, routing_key),
+        };
+        if count <= 1 {
+            ahead()
+        } else {
+            Self::Batch {
+                _guards: (0..count).map(|_| ahead()).collect(),
+            }
         }
     }
 
