@@ -357,7 +357,7 @@ fn staged(parts: &[proto::ReplicationBatch], at: Instant) -> StoreCheckpoint {
         assert!(cut.is_none(), "a part after the last");
         cut = staged.take(part, at).expect("the snapshot's next part");
     }
-    cut.expect("the last part")
+    cut.expect("the last part").0
 }
 
 /// A load row as an older leader's stream told it: a leader of this
@@ -1369,6 +1369,50 @@ async fn a_resync_is_the_leaders_snapshot_in_parts_on_the_stream_it_holds() {
     assert_eq!(standby.shared.lag.asks(), 0);
 }
 
+/// The generation a snapshot's first part states rides the stream to the
+/// restore: once the last part is in, the standby's door holds its
+/// leader's document beside its leader's rows.
+#[tokio::test]
+async fn a_resync_lands_the_generation_its_snapshots_first_part_states() {
+    use crate::service::controller::{
+        generations::{tests::LEAST_LOAD, Format},
+        wire::spec_document,
+    };
+
+    let mut bed = Bed::new().await;
+    let (_elector, standing, standby) = standing_by(&bed, FIVE);
+    let leader = led();
+    let leading = door(&leader);
+    leading
+        .apply(LEAST_LOAD.into(), Format::Yaml)
+        .expect("a valid document");
+    a_page_and_one(&leader.0);
+    let mut parts = snapshot(&leader, Instant::now());
+    assert_eq!(parts.len(), 2, "two parts of rows");
+    let told = leading.standing_sent().map(Box::new);
+    parts[0].snapshot.as_mut().expect("a part").generation = told;
+    standing.send_replace(bed.holds("leader-1", 1));
+    let named = standby.shared.leader(None);
+    let applied = AtomicBool::new(false);
+    let script = async {
+        let mut opened = bed.opened().await;
+        assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+        opened.says(resync()).await;
+        for part in &parts {
+            opened.says(part.clone()).await;
+        }
+        opened.refuses(Status::aborted("deposed")).await;
+    };
+    let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+    assert_eq!((ended.next, ended.applied), (Next::Lease, true));
+    assert_eq!(held(&standby.shared.store), held(&leader.0));
+    let following = &standby.shared.generations;
+    assert_eq!(
+        spec_document(following.document(0).expect("held")),
+        spec_document(leading.document(0).expect("held"))
+    );
+}
+
 #[tokio::test]
 async fn a_stream_that_ends_inside_a_snapshot_leaves_the_store_as_it_was() {
     let mut bed = Bed::new().await;
@@ -2179,20 +2223,23 @@ fn a_snapshot_restores_its_leaders_standing_generation_or_nothing() {
     let follower = through(&standby, &following);
     let at = Instant::now();
     first(&leader.0);
+    a_page_and_one(&leader.0);
     leading
         .apply(LEAST_LOAD.into(), Format::Yaml)
         .expect("a valid document");
     let told = leading.standing_sent();
-    // The first part states the generation, and the staging keeps it.
+    // The first of two parts states the generation, and the last hands it
+    // on with the cut.
     let mut parts = snapshot(&leader, at);
+    assert_eq!(parts.len(), 2, "two parts of rows");
     parts[0].snapshot.as_mut().expect("a part").generation = told.clone().map(Box::new);
     let stage = || {
         let mut staging = Staged::default();
-        let mut cut = None;
+        let mut whole = None;
         for part in &parts {
-            cut = staging.take(part, at).expect("the snapshot's next part");
+            whole = staging.take(part, at).expect("the snapshot's next part");
         }
-        (cut.expect("the last part"), staging.generation)
+        whole.expect("the last part")
     };
     let (cut, stated) = stage();
     assert_eq!(stated, told);
