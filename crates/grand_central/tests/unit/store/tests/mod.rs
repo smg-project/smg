@@ -3990,6 +3990,20 @@ fn a_decode_take_back_looks_up_the_lease_once() {
     assert_eq!(LEASE_HASHES.get(), 1);
 }
 
+/// A release on a file no decode call issued into looks the lease up once,
+/// for the release itself: the read of what an issue replaced, ahead of
+/// it, looks no record up there.
+#[cfg(feature = "controller")]
+#[test]
+fn a_release_on_a_file_no_call_issued_into_looks_up_the_lease_once() {
+    let now = Instant::now();
+    let (store, _, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    LEASE_HASHES.set(0);
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(LEASE_HASHES.get(), 1);
+}
+
 /// The pair a decode call reads ahead of its decision is the lease's own:
 /// its prefill's worker, then the worker and the rank of the decode its
 /// first decision chose for the target the prefill's dispatch took, the
