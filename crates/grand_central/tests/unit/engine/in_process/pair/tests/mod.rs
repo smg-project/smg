@@ -3939,7 +3939,8 @@ fn ranked(
 /// the gateway's classic answer for a pair: each side steps aside from
 /// the engines the request tried
 /// (`model_gateway/src/routers/common/placement.rs:1486-1493` and
-/// `:1562-1569` at main `75d279287`).
+/// `:1562-1569` at main `75d279287`). The list such a retry is decided by
+/// adds each side's ranks in the order of the pair's lists.
 #[test]
 fn a_pairs_retry_leaves_every_rank_of_the_engines_it_tried() {
     use std::collections::BTreeSet;
@@ -3985,6 +3986,23 @@ fn a_pairs_retry_leaves_every_rank_of_the_engines_it_tried() {
         landed(&[tried_prefill, tried_decode]),
         (second.clone(), second),
         "a tried pair moves on both sides"
+    );
+
+    // The list such a retry is decided by, in the order a stage reads it:
+    // the tried workers as the host named them, the prefills' other ranks
+    // behind them, and the decodes' behind those.
+    let prefill = host.engine.pool_members(&host.prefills);
+    let decode = host.engine.pool_members(&host.decodes);
+    let tried = [tried_prefill, tried_decode];
+    let whole = tried_engines(host.engine.loaded(), &tried, &[&prefill, &decode]);
+    assert_eq!(
+        whole.expect("each list holds ranks"),
+        [
+            tried_prefill,
+            tried_decode,
+            worker_id(host.prefills[0].as_ref()),
+            worker_id(host.decodes[1].as_ref()),
+        ]
     );
 }
 
