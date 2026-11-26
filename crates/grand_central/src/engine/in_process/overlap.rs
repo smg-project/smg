@@ -1813,6 +1813,11 @@ impl Waiting {
     /// the request of `keys`, which that request's own write continues, and
     /// returns how many of its blocks stand. A write named before a leave
     /// told since (`left`) hands on no progress: the worker may be a new one.
+    ///
+    /// Where the two counts differ and the kept write's is its record's
+    /// still, the request's own naming is the older one. Its write stops
+    /// at the record ([`PrefixRecord::write`]), so the kept write is not
+    /// taken out: it stays for its own turn ([`Self::write_on`]).
     fn take_leading(
         &mut self,
         record: &PrefixRecord,
@@ -1820,12 +1825,16 @@ impl Waiting {
         target: WorkerId,
         left: u64,
     ) -> Option<usize> {
-        let at = self.writes.iter().position(|write| {
+        let found = self.writes.iter().enumerate().find(|(_, write)| {
             // A key folds every block up to its own: the last one says all.
             let last = write.keys.last();
             let leads = last.is_some_and(|key| keys.get(write.keys.len() - 1) == Some(key));
             leads && write.target == target && std::ptr::eq(&*write.record, record)
-        })?;
+        });
+        let (at, kept) = found?;
+        if kept.left != left && kept.left == record.left.load(Ordering::Relaxed) {
+            return None;
+        }
         let write = self.writes.remove(at);
         self.spare.push(write.keys);
         (write.left == left).then_some(write.done)
