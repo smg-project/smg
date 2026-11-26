@@ -9952,6 +9952,9 @@ mod tests {
 
         use Shape::{Parallel, Sequential};
         const SHORT: Option<Duration> = Some(Duration::from_millis(300));
+        // Long enough for the other side's answer to come first on a loaded
+        // machine.
+        const AMPLE: Option<Duration> = Some(Duration::from_secs(3));
         const SILENT: Duration = Duration::from_secs(30);
         const AT_ONCE: (Duration, Option<Duration>) = (Duration::ZERO, None);
         const TIMED_OUT: &str = "completed Decode Timeout 504";
@@ -9977,7 +9980,7 @@ mod tests {
             (
                 Parallel,
                 AT_ONCE,
-                (SILENT, SHORT),
+                (SILENT, AMPLE),
                 TIMED_OUT,
                 "completed Prefill Ok 200",
             ),
@@ -10232,13 +10235,89 @@ mod tests {
         }
     }
 
+    /// A MoRI-IO pair written concurrently whose decode's call fails behind
+    /// a prefill that had answered. The engine hears the prefill's own good
+    /// answer, told where its load was let go, and then the decode's failed
+    /// connection, as the route answers it.
+    #[tokio::test]
+    async fn the_engine_hears_a_concurrent_writes_prefill_ahead_of_its_decodes_failed_call() {
+        let (prefill, _) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decode = format!("http://{}", listener.local_addr().unwrap());
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        register_moriio_pair_with(
+            &router,
+            (prefill, Some("write")),
+            (decode, "write"),
+            &[CONCURRENT_WRITE],
+        );
+
+        let decode_hangs_up = async {
+            // The decode's call is taken and left without an answer.
+            let held = listener.accept().await.unwrap();
+            assert_eq!(ends_heard_at(&heard, 1).await, ["completed Prefill Ok 200"]);
+            drop(held);
+            // The route sends the call once more: it is hung up on too.
+            drop(listener.accept().await.unwrap());
+        };
+        let no_fields = json!({});
+        let call = moriio_call(&router, "/v1/chat/completions", None, &no_fields);
+        let (response, ()) = served_beside(call, decode_hangs_up).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        drop(response);
+
+        assert_eq!(
+            ends_heard(&heard),
+            [
+                "completed Decode ConnectFailed 502",
+                "completed Prefill Ok 200"
+            ]
+        );
+    }
+
+    /// The last word the engine hears of one count request. The router
+    /// makes one attempt on its one prefill worker at `url`, under a payload
+    /// `limit` and the call's own `timeout` where one is given.
+    async fn count_heard(
+        url: String,
+        limit: Option<usize>,
+        timeout: Option<std::time::Duration>,
+    ) -> Option<String> {
+        let mut router = single_attempt_router();
+        if let Some(limit) = limit {
+            router.max_payload_size = limit;
+        }
+        let heard = hearing_engine_on(&router.policy_registry);
+        let worker = pair_worker(Shape::Parallel, PdSide::Prefill, url, timeout);
+        router.worker_registry.register_or_replace(worker);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body = serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant, body, UNKNOWN_MODEL_ID)
+            .await;
+        drop(response);
+        let heard = heard.lock().expect("the stage heard");
+        heard.last().cloned()
+    }
+
     /// The count route places one prefill worker and keeps its answer to
     /// its end. The engine hears the count's outcome beside each record on
     /// the worker. It hears the worker's own status where it answered, and
     /// a failed connection where its call failed below HTTP. It hears the
     /// server's error where its answer was over the payload limit.
+    ///
+    /// It hears the request's own timeout where the call met it, ahead of
+    /// the answer's head or in its body. It hears a failed connection where
+    /// the body broke off.
     #[tokio::test]
     async fn the_engine_hears_a_count_requests_outcome() {
+        use std::time::Duration;
+
+        const SHORT: Option<Duration> = Some(Duration::from_millis(300));
+        const TIMED_OUT: &str = "completed Timeout 504";
+
         // (the worker's fault, a payload limit under its answer, the end)
         let rows = [
             (None, None, "completed Ok 200"),
@@ -10259,26 +10338,33 @@ mod tests {
                 None => (spawn_recording_stub(r#"{"input_tokens":3}"#).await.0, None),
                 Some(fault) => faulty_stub(fault).await,
             };
-            let mut router = single_attempt_router();
-            if let Some(limit) = limit {
-                router.max_payload_size = limit;
-            }
-            let heard = hearing_engine_on(&router.policy_registry);
-            let worker = pair_worker(Shape::Parallel, PdSide::Prefill, url, None);
-            router.worker_registry.register_or_replace(worker);
-            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
-            let body = serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+            let heard = count_heard(url, limit, None).await;
+            assert_eq!(heard.as_deref(), Some(end), "{fault:?} {limit:?}");
+        }
 
-            let response = router
-                .route_messages_count_tokens(None, &tenant, body, UNKNOWN_MODEL_ID)
-                .await;
-            drop(response);
-            let heard = heard.lock().expect("the stage heard");
-            assert_eq!(
-                heard.last().map(String::as_str),
-                Some(end),
-                "{fault:?} {limit:?}"
-            );
+        // (what the worker's server does, the call's own timeout, the end)
+        // A loaded machine may meet the timeout ahead of the stalled body's
+        // head: the word is the same.
+        let (silent, _) =
+            spawn_delayed_stub(StatusCode::OK, json!({}), Duration::from_secs(30)).await;
+        let rows = [
+            ("sends no head", silent, SHORT, TIMED_OUT),
+            (
+                "stalls in its body",
+                spawn_stalled_body_stub().await,
+                SHORT,
+                TIMED_OUT,
+            ),
+            (
+                "breaks its body off",
+                spawn_cut_body_stub().await,
+                None,
+                "completed ConnectFailed 502",
+            ),
+        ];
+        for (serves, url, timeout, end) in rows {
+            let heard = count_heard(url, None, timeout).await;
+            assert_eq!(heard.as_deref(), Some(end), "{serves}");
         }
     }
 
