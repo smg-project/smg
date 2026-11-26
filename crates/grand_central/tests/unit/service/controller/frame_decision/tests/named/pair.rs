@@ -26,8 +26,8 @@ use super::{
 use crate::{
     document::spec::{OverloadSpec, PolicySpec},
     engine::{
-        decision::{Decision, ShedReason},
-        framework::{Filter, PairSide},
+        decision::{Decision, PairSide, ShedReason},
+        framework::Filter,
         view::{Candidate, Constraints, RequestFacts, Role, WireModes, WorkerId},
     },
     service::{
