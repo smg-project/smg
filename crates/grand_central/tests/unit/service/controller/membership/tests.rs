@@ -33,8 +33,8 @@ use crate::{
     worker_host::{
         tests::{
             check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-            check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows,
-            StoreDoor,
+            check_one_row, check_provider, check_rank_rows, check_refresh, lay_standing, FindOne,
+            Rows, StoreDoor,
         },
         MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Precondition, Remover,
         RowRevision, Stated,
@@ -390,11 +390,12 @@ fn a_second_add_is_refused_and_writes_nothing() {
 /// A call reads the row that stands off the worker objects, and no
 /// row of the table. An add over a row that a writer outside the
 /// holder left in the table is decided over no object. The store
-/// refuses it, the holder reads the store before it answers, and the
-/// call is answered as a row that moved. The add again is refused as
-/// an add over any row that stands. Neither writes.
+/// refuses it, the holder lays nothing, and the call is answered as a
+/// row that moved, the add again too. A cut laid whole lays the row,
+/// and the add is then refused as an add over any row that stands.
+/// None writes.
 #[test]
-fn an_add_over_a_row_written_around_the_holder_is_refused_and_lays_it() {
+fn an_add_over_a_row_written_around_the_holder_is_refused_and_lays_nothing() {
     // A row that names its engine, as every writer of the crate lays
     // one, and a row that names none: its ranks are asked under its
     // key, and it has none.
@@ -410,18 +411,22 @@ fn an_add_over_a_row_written_around_the_holder_is_refused_and_lays_it() {
         };
         store.upsert_by(facts, Registrant::Control);
         let stood = (store.epoch(), store.by_key(URL));
-        assert!(door.objects.is_empty(), "no object yet");
-        for (code, why) in [
-            (Code::Aborted, "decided over no object"),
-            (Code::AlreadyExists, "the URL stands"),
-        ] {
+        let refused = |code: Code, why: &str| {
             let refused = door
                 .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
                 .expect_err(why);
             assert_eq!(refused.code(), code, "engine {engine:?}: {why}");
             assert_eq!((store.epoch(), store.by_key(URL)), stood);
-            assert_eq!(door.objects.len(), 1, "the refusal's read laid it");
+        };
+        for _ in 0..2 {
+            refused(Code::Aborted, "decided over no object");
+            assert!(door.objects.is_empty(), "a refused add lays nothing");
         }
+        // The holder's pass over a cut's rows, run over the store's:
+        // this store leads a term and refuses a restore of its own cut.
+        lay_standing(&door.objects, &store);
+        refused(Code::AlreadyExists, "the URL stands");
+        assert_eq!(door.objects.len(), 1, "the cut laid it");
     }
 }
 

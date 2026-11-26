@@ -49,7 +49,7 @@ fn a_door_reads_the_row_each_write_left() {
 
 /// No read starts with a read of the store. A row a writer outside the
 /// holder left in the table is in no read until the holder lays it,
-/// here behind a refused write of its key.
+/// here by its pass over a cut's rows.
 /// It is in each read behind that: by id, by key, among
 /// its engine's rows, in a first copy and in a lone read.
 #[test]
@@ -74,8 +74,7 @@ fn a_row_written_around_the_holder_is_read_once_the_holder_lays_it() {
             .store
             .upsert_by(facts(1, "gold"), Registrant::Control);
         assert_eq!(read(&replica), None, "{name}: no object, so no row");
-        // The key's next write through the holder is refused, and its
-        // read lays the row.
+        // The holder's pass over a cut's rows, run over the store's.
         lay_standing(&replica.objects, &replica.store);
         let row = read(&replica);
         assert!(row.is_some(), "{name}");

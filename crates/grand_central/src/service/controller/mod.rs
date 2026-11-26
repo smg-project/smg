@@ -813,8 +813,7 @@ impl Controller {
     /// the holder's doc says what a write on a replica that follows comes
     /// to ("A host's write calls"). A row written through the entries of
     /// [`Self::store`] itself has no worker object, and no first copy holds
-    /// it, until a registration under its key is refused or a cut is laid
-    /// whole.
+    /// it, until a cut is laid whole.
     pub fn workers(&self) -> Arc<Objects<Members>> {
         self.workers.holder()
     }

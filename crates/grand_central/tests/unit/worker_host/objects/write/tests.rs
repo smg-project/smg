@@ -140,21 +140,12 @@ pub(crate) fn facts(incarnation: u64, tier: &str) -> WorkerFacts {
 }
 
 /// Have `objects` lay each row `store` holds that no object of its was
-/// built from: a row written around the holder. The row's facts are
-/// written again through the holder, which decides over what it holds.
-/// The store refuses that write, and the holder lays the record that
-/// stands under the key ([`Objects::upsert`]).
+/// built from: a row written around the holder. The holder's pass over
+/// a cut's rows runs over the store's, in the holder's turn.
 pub(crate) fn lay_standing<G: Generation>(objects: &Objects<G>, store: &MemoryStore) {
+    let _turn = objects.turn.lock();
     let (_, rows) = store.all_rows();
-    for row in rows {
-        let read = objects.object(row.id);
-        let read = read.and_then(|object| objects.row_of(&object));
-        let built = |read: WorkerRow| read.revision == row.revision && read.facts == row.facts;
-        if !read.is_some_and(built) {
-            let refused = objects.upsert(store, row.facts, Registrant::Control);
-            assert_eq!(refused, None, "decided over what the holder holds");
-        }
-    }
+    objects.reconcile(store, &rows);
 }
 
 /// Each write of a row is decided over the objects: the object stands
@@ -422,19 +413,21 @@ fn a_patch_or_a_removal_under_another_revision_writes_nothing() {
     assert!(replica.object(A).is_some(), "the object stands");
 }
 
-/// A change the store took and the registry did not get is laid where
-/// the store next refuses a write of the row. A patch and a removal by
-/// the row's id find no object to guard them: each answers `None`,
-/// reads nothing and lays nothing. A registration under its key is
-/// decided over no object: the store refuses it, the object stands when
-/// it answers `None`, and the same call again is decided over it.
+/// A row written around the holder has no object: the store took its
+/// registration through its own entry. A patch and a removal by the
+/// row's id find no object to guard them. A registration under its key
+/// is decided over no object, and the store refuses it each time it is
+/// made. Each answers `None`, tells nothing and lays nothing. A cut laid
+/// whole lays the row's object, and the same registration is decided
+/// over it.
 #[test]
-fn a_row_with_no_object_is_laid_where_its_registration_is_refused() {
+fn a_row_written_around_the_holder_has_no_object_until_a_cut_is_laid_whole() {
     let replica = Replica::new();
     let (store, objects) = (&replica.store, &replica.objects);
     let now = Instant::now();
     let (change, row) = WorkerRow::laid_over(facts(1, "gold"), None, Registrant::Control, now);
-    assert!(store.follow_objects(change, Some(row.clone()), None, None));
+    store.follow(Position::default(), 1, change, Some(row.clone()));
+    assert_eq!(store.by_key(A).as_ref(), Some(&row), "the store took it");
     let id = change.id();
     let patch = WorkerPatch {
         priority: Some(7),
@@ -442,29 +435,32 @@ fn a_row_with_no_object_is_laid_where_its_registration_is_refused() {
     };
     assert_eq!(objects.patch(store, id, patch, 1), None);
     assert_eq!(objects.remove(store, id, 1), None);
-    assert_eq!(replica.object(A), None, "neither read the store");
     let told = replica.told.0.lock().len();
-    assert_eq!(replica.upsert(facts(1, "iron")), None, "refused once");
-    let object = replica.object(A).expect("the refusal's read laid it");
-    assert_eq!(objects.row_of(&object), Some(row));
+    for _ in 0..2 {
+        assert_eq!(replica.upsert(facts(1, "iron")), None, "refused");
+        assert_eq!(replica.object(A), None, "nothing is laid");
+    }
     assert_eq!(replica.told.0.lock().len(), told, "nothing told");
+    assert_eq!(store.by_key(A).as_ref(), Some(&row), "the table stands");
+    assert!(objects.restore_from(store, store.checkpoint()));
+    let object = replica.object(A).expect("the cut laid it");
+    assert_eq!(objects.row_of(&object), Some(row));
     let again = replica.upsert(facts(1, "iron"));
     assert_eq!(again, Some(MembershipChange::Relabelled { id }));
     assert_eq!(replica.one_row(A).facts, facts(1, "iron"));
 }
 
-/// A write decided over a row another writer moved since is refused
-/// under the store's lock, by the revision the holder read: a
+/// A write decided over a row that was written around the holder since
+/// is refused under the store's lock, by the revision the holder read: a
 /// registration in place, a patch, a key's next life and a removal.
+/// That writer moved the row in place, or left the key's next life.
+///
 /// Each answers `None`, which a door answers as a row that moved, and
-/// tells the journal nothing. The registry holds what the other writer
-/// left under the key when the write answers: the row
-/// whose object a removal took out has one anew, and where that writer
-/// left the key's next life, the old life's object is gone. A row that
-/// writer moved in place is laid in its object's place: the object
-/// keeps its id in the registry.
+/// tells the journal nothing. The table holds what that writer left,
+/// and the registry holds the old row as it stood: nothing is laid. A
+/// removal took its object out first, and laid the row again.
 #[test]
-fn a_write_over_a_row_another_writer_moved_is_refused_and_reads_it() {
+fn a_write_over_a_row_written_around_the_holder_is_refused_and_lays_nothing() {
     type Write = fn(&Replica, WorkerRow) -> Option<MembershipChange>;
     /// Another writer, outside the holder's turn: a write of the
     /// store's own, which takes no turn of the holder.
@@ -525,104 +521,22 @@ fn a_write_over_a_row_another_writer_moved_is_refused_and_reads_it() {
             other(store, &read);
             let told = replica.told.0.lock().len();
             let left = store.by_key(A).expect("the row that writer left");
-            assert_eq!(write(&replica, read), None, "{what}, {how}");
+            let wrote = write(&replica, read.clone());
             drop(turn);
             let tells = replica.told.0.lock().len();
-            assert_eq!(tells, told, "{what}, {how}: nothing told");
             let table = store.by_key(A);
+            let object = replica.object(A);
+            let laid = object.as_ref().and_then(|object| objects.row_of(object));
+            assert_eq!(wrote, None, "{what}, {how}: refused");
+            assert_eq!(tells, told, "{what}, {how}: nothing told");
             assert_eq!(table.as_ref(), Some(&left), "{what}, {how}: the table");
-            let object = replica.object(A).expect("an object stands");
-            let laid = objects.row_of(&object);
-            assert_eq!(laid, Some(left), "{what}, {how}: the registry");
-            assert_eq!(objects.len(), 1, "{what}, {how}: the key's one object");
-            // In place, but behind a removal: it took the object out
-            // ahead of the store's word.
-            if how == "moved in place" && what != "a removal" {
-                assert_eq!(Some(object), stood, "{what}, {how}: in its place");
-            }
+            // The old row stands as it stood. A removal took its
+            // object out and laid the row again.
+            assert_eq!(laid, Some(read), "{what}, {how}: the registry");
+            let anew = what == "a removal";
+            assert_eq!(object != stood, anew, "{what}, {how}: its object");
         }
     }
-}
-
-/// A row that left and came back under its id around the holder is
-/// another life, admitted at another time. A write decided over the old
-/// life's object is refused, and its read ends that object before it
-/// lays the row. So the new life's object takes another id in the
-/// registry and none of the old one's running state, here a drain.
-#[test]
-fn a_refused_write_ends_the_object_of_a_life_that_left() {
-    let replica = Replica::new();
-    let (store, objects) = (&replica.store, &replica.objects);
-    let id = replica.upsert(facts(1, "gold")).expect("registered").id();
-    replica.upsert(facts(1, "iron")).expect("relabelled");
-    assert!(objects.drain_row(store, id, 2), "the old life drains");
-    let old = replica.object(A).expect("the old life's object");
-    // Around the holder: the row leaves and comes back under its id,
-    // at the first revision.
-    assert!(store.remove(id, 2).is_some(), "the store's own removal");
-    let back = store.upsert_by(facts(1, "iron"), Registrant::Control);
-    assert_eq!(back, MembershipChange::Registered { id });
-    let patch = WorkerPatch {
-        priority: Some(7),
-        ..WorkerPatch::default()
-    };
-    assert_eq!(objects.patch(store, id, patch, 2), None, "the old life's");
-    let new = replica.object(A).expect("the new life's object");
-    assert_ne!(new, old, "another object under another id");
-    let row = objects.row_of(&new).expect("its row");
-    let started = (row.revision, row.status);
-    assert_eq!(started, (1, WorkerStatus::Pending), "no drain taken over");
-    assert_eq!(Some(row), store.by_key(A), "the object against the table");
-    assert_eq!(objects.len(), 1);
-}
-
-/// A refused write reads the row that stands under its own key in the
-/// store, and no other. A row of another key that the store took around
-/// the holder has no object behind that read: it gets one where its own
-/// key's registration is refused. A
-/// registration over a row that left the store around the holder is
-/// refused too, and the key's object goes: the same call again
-/// registers the key anew.
-#[test]
-fn a_refused_write_reads_the_row_under_its_own_key_alone() {
-    const B: &str = "http://b:8000";
-    const C: &str = "http://c:8000";
-    let replica = Replica::new();
-    let (store, objects) = (&replica.store, &replica.objects);
-    let keyed = |key: &str| WorkerFacts {
-        key: key.to_owned(),
-        engine: key.to_owned(),
-        ..facts(1, "gold")
-    };
-    let now = Instant::now();
-    for key in [A, B, C] {
-        let (change, row) = WorkerRow::laid_over(keyed(key), None, Registrant::Control, now);
-        assert!(store.follow_objects(change, Some(row), None, None));
-    }
-    assert_eq!(replica.upsert(facts(1, "iron")), None, "refused once");
-    assert!(replica.object(A).is_some(), "the row under its key is laid");
-    assert_eq!(objects.len(), 1, "no other row is read");
-    let refused = objects.upsert(store, keyed(B), Registrant::Control);
-    assert_eq!(refused, None, "the other key's own registration");
-    assert!(replica.object(B).is_some(), "laid by its own refusal");
-    assert_eq!(replica.object(C), None, "a third key's row waits");
-    lay_standing(objects, store);
-    assert!(replica.object(C).is_some(), "laid by its own refusal");
-    assert_eq!(objects.len(), 3);
-    // The row under B leaves the store around the holder.
-    let left = store.by_key(B).expect("the row");
-    assert!(store.remove(left.id, left.revision).is_some());
-    let again = WorkerFacts {
-        priority: 7,
-        ..keyed(B)
-    };
-    let refused = objects.upsert(store, again.clone(), Registrant::Control);
-    assert_eq!(refused, None, "decided over a row that left");
-    assert_eq!(replica.object(B), None, "the key's object goes");
-    let change = objects.upsert(store, again, Registrant::Control);
-    let registered = MembershipChange::Registered { id: left.id };
-    assert_eq!(change, Some(registered), "the key registers anew");
-    assert!(replica.object(B).is_some());
 }
 
 /// A bare address and the same address with its scheme are two keys, as

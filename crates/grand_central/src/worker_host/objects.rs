@@ -188,14 +188,13 @@ impl Held {
 /// which carries the standing object's running state over. An entry's
 /// revision never moves under an object that stands.
 ///
-/// With a keeper ([`Self::with_credentials`]), two passes have the keeper
-/// forget the rows that left, whoever wrote the removal: a cut laid whole
-/// and a write the store refuses. An entry goes with its last row. A cut
+/// With a keeper ([`Self::with_credentials`]), a cut laid whole has the
+/// keeper forget the rows that left, whoever wrote the removal. An entry
+/// goes with its last row. A cut
 /// laid whole lays the cut's own rows, then reads the status the table
 /// holds for each. A write
-/// the store refuses reads the write's own record, and
-/// the keeper forgets that one row where it left. The
-/// keeper's clock is read ahead of each pass: a row bound behind that read
+/// the store refuses reads no row. The
+/// keeper's clock is read ahead of the pass: a row bound behind that read
 /// stays, and a later pass forgets it where it left.
 /// Two turns forget with no read. A write call that takes a row
 /// out has the keeper forget that row. [`Self::lay_again`] has it forget
@@ -215,9 +214,8 @@ impl Held {
 /// membership lock. A generation's apply and a term's start change no row.
 /// A caller of the store's own registration, patch or removal takes no
 /// turn either: no product code calls those, and they go with the store's
-/// table. A row written so has no object, and no copy holds it, until the
-/// holder reads it: where the store refuses its key's next write, or where
-/// a cut is laid whole.
+/// table. A row written so has no object, and no copy holds it, until a
+/// cut is laid whole.
 ///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
@@ -497,7 +495,7 @@ impl<G: Generation> Objects<G> {
     /// The call holds the holder's turn from the word to the last lay, so
     /// every build reads one word. It reads no row of `store`: a row the
     /// holder has not read yet, and another life of a row under its id,
-    /// are built under the word at the holder's read of them. So a host
+    /// are built under the word where a cut laid whole lays them. So a host
     /// that states the word ahead of its first write builds each object
     /// once.
     ///
@@ -544,7 +542,7 @@ impl<G: Generation> Objects<G> {
         };
         let mut laid = 0;
         // Each row as the holder holds it: a row the holder has not read
-        // is built under the word at its read.
+        // is built under the word where a cut laid whole lays it.
         for row in changed.into_iter().filter_map(|id| self.row(id)) {
             self.lay(store, &row);
             // What lays an object in another's place settles the two.
@@ -791,9 +789,8 @@ impl<G: Generation> Objects<G> {
     }
 
     /// Have the keeper forget the one row `left`, where no object stands
-    /// for it any more: a write took it out, or a refused write's read of
-    /// its record found it gone. No other bound row is asked about: no
-    /// other row of the store was read.
+    /// for it any more: a write took it out. No other bound row is asked
+    /// about.
     /// A row bound for a write the holder has not read yet so stays.
     fn forget_one(&self, read: Option<u64>, left: WorkerId) {
         let (Some(credentials), Some(read)) = (&self.credentials, read) else {
@@ -861,23 +858,6 @@ impl<G: Generation> Objects<G> {
             .is_some_and(|laid| {
                 laid.remainder.maker != row.maker || laid.remainder.admitted_at != row.admitted_at
             })
-    }
-
-    /// Settle the object of `id` against the row as the store holds it. A
-    /// row whose object was built at its current revision keeps it. Within
-    /// one life of a row, the revision tells its facts.
-    fn settle<S: WorkersStore + ?Sized>(&self, store: &S, id: WorkerId) {
-        let Some(row) = store.get(id) else {
-            self.end(id);
-            return;
-        };
-        let built_from = self
-            .object(id)
-            .and_then(|held| self.standing(&held))
-            .map(|standing| standing.revision);
-        if built_from != Some(row.revision) {
-            self.lay(store, &row);
-        }
     }
 
     /// The status the table holds for the row an object was built from,
@@ -1090,8 +1070,8 @@ impl Objects<Members> {
     /// A fact these lists carry does not move within a row's life: every
     /// registration path starts another life where the image bit or a
     /// demand fact differs, which publishes. A raw store write that moves
-    /// either in place publishes too: the holder's next read lays the row
-    /// again, and its new object takes the standing one's place in the
+    /// either in place publishes where a cut laid whole lays the row
+    /// again: its new object takes the standing one's place in the
     /// registry.
     ///
     /// A member the holder holds no row's object for is left out of the

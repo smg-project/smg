@@ -443,6 +443,11 @@ impl MemoryStore {
     /// the journal takes the write there, and no write of the store's own
     /// does.
     ///
+    /// It is the call of a store with no holder of worker objects, and of a
+    /// fixture. A holder is told nothing of a change written here. The row
+    /// such a change leaves has no object until a cut is laid whole, and the
+    /// holder's registration of its key is refused until then.
+    ///
     /// The pools follow as at the leader's own write: a join, a refresh and
     /// a patch leave their build owed, which the replica's loop pays at the
     /// window's end, and a leave pays its own before it is told: a removal,
@@ -1761,8 +1766,7 @@ impl MemoryStore {
     ///   the status the log told of its row (`Objects::copy_status`).
     ///
     /// What else reads a row's status reads the table's whole row and
-    /// goes with the table: the holder's read of a row a writer left
-    /// outside its turn, and the store's own reads of a row.
+    /// goes with the table: the store's own reads of a row.
     pub(crate) fn told(&self) -> Told {
         let workers = self.workers.lock();
         let at = self

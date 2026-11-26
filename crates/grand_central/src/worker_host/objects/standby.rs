@@ -18,8 +18,8 @@
 //! build and the registry's write, and a removal's object leaves the
 //! registry before the store is told. An event the store does not take
 //! lays nothing: it does not fit the tables, and the applier stops its
-//! batch there. Where the store does not take a removal, the row that
-//! stands is settled again and gets an object anew.
+//! batch there. Where the store does not take a removal, the row is
+//! laid again as it was read back.
 //!
 //! The wire tells a row's age, not the instant it was admitted at. A row
 //! an event changes in place keeps the instant its entry holds, as the
@@ -83,13 +83,14 @@ impl<G: Generation> Objects<G> {
         let _turn = self.turn.lock();
         match (change, row) {
             // The row is read back, the object leaves the registry, then
-            // the store is told and handed the row.
+            // the store is told and handed the row. A removal the store
+            // refuses lays the row again, as it was read back.
             (MembershipChange::Removed { id }, None) => {
                 let mut left = self.row(id);
                 self.end(id);
                 let landed = store.follow_landed(at, epoch, change, None, left.as_mut());
-                if !landed {
-                    self.settle(store, id);
+                if let (false, Some(row)) = (landed, &left) {
+                    self.lay(store, row);
                 }
                 landed
             }

@@ -53,12 +53,12 @@ use crate::{engine::view::WorkerId, store::WorkerFacts};
 /// what stood, and each returns `true` where an object may hold a
 /// credential that is not its row's any more.
 ///
-/// The holder forgets by itself. Each of its reads of the store drops the
-/// rows it finds gone from the keeper, and an entry goes with its last row.
+/// The holder forgets by itself. A cut laid whole drops the rows it
+/// finds gone from the keeper, and an entry goes with its last row.
 /// A write of the holder's own that takes a row out drops that row, and
 /// the lay-again an answer asks for drops each bound row that holds no
 /// object. Neither reads the store.
-/// The holder reads the keeper's clock ahead of the store: a row bound
+/// The holder reads the keeper's clock ahead of each pass: a row bound
 /// behind that read may have been written behind it, and stays. A
 /// forgetting that misses a row leaves a binding no later worker matches.
 ///
@@ -359,8 +359,8 @@ impl Credentials {
 
     /// Forget the rows that left. The holder calls this with the clock it
     /// read ahead and the rows that stand. It calls behind a cut laid whole,
-    /// at a lay-again, and for the one row a write took out or a refused
-    /// write's read found gone. A bound row that does not stand and was
+    /// at a lay-again, and for the one row a write took out.
+    /// A bound row that does not stand and was
     /// bound no later than `read` is dropped.
     /// One bound later stays: its row may have been written behind that
     /// read. A call about one record asks about that record's row alone,
