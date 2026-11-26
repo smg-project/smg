@@ -1395,7 +1395,10 @@ pub enum Unplaced {
         /// route's rule that takes no worker of the list (`admits`), a
         /// budget the call's earlier decisions used up (`budget`), a
         /// worker the request names that cannot take it
-        /// (`target-worker`). A caller's refusal line names it.
+        /// (`target-worker`). Under [`ShedReason::PolicyDeclined`] the
+        /// name `binding` says that the spec in force binds no plan of
+        /// the request's kind for its model: a caller answers that no
+        /// retry changes it. A caller's refusal line names it.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room: a caller's
         /// retry hint.

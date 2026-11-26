@@ -1359,7 +1359,9 @@ mod tests {
     /// binding. The single binding's shadow loads, and so do the shadows
     /// by side of the pair's binding, with that binding's phase list empty
     /// or naming its two phases. Scoped to the decode phase, the single
-    /// binding's shadow is refused, beside the pair's shadows and alone.
+    /// binding's shadow is refused, beside the pair's shadows and alone,
+    /// and behind a pair's binding with shadows too: the loader's walk
+    /// does not end there.
     ///
     /// The classic router reads no policy document and runs no second
     /// policy beside a request: the load is the engine's own.
@@ -1403,6 +1405,19 @@ mod tests {
         let pair = document.bindings.last_mut().expect("the pair's binding");
         pair.shadow = None;
         assert_eq!(refused(&document), outside);
+
+        // The walk goes on past a pair's binding with shadows: behind one
+        // scoped to a model of its own, the single binding's shadow is
+        // refused at its own place.
+        let pair = document.bindings.last_mut().expect("the pair's binding");
+        pair.shadow = Some(ShadowSpec::Sides(by_side.into()));
+        pair.matcher.model = "another-model".to_owned();
+        document.bindings.swap(0, 1);
+        let behind = Some(SpecError::NotInBuild {
+            path: "bindings[1].shadow".to_owned(),
+            what: "a shadow outside the single phase",
+        });
+        assert_eq!(refused(&document), behind);
     }
 
     #[test]
