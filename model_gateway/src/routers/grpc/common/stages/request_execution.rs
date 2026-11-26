@@ -17,7 +17,7 @@ use smg_grpc_client::{
 };
 use smg_worker::{
     health::{liveness, liveness::SideReprieve},
-    identity::basic::{ConnectionModeExt, Worker, WorkerTypeExt},
+    identity::basic::{ConnectionModeExt, RuntimeType, Worker, WorkerTypeExt},
     metrics::writers::Metrics as WorkerMetrics,
 };
 use tokio::sync::{oneshot, watch};
@@ -742,52 +742,63 @@ fn decode_is_owed_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelec
             .is_some_and(|protocol| protocol.dispatch == PdDispatch::Sequential)
 }
 
-/// The pair protocol of the runtime `workers` name, or what refuses a
-/// pair's request ahead of it: a selection that is no pair's, which is the
-/// pipeline's own fault, and a runtime that speaks no disaggregated mode.
-// Always in line: one request's dispatch asks it on every pair request's
-// path, where these lines stood before a batch asked them too. Their log
-// lines keep the dispatch's name.
+/// What answers a pair's request whose selection is no pair's, which is
+/// the pipeline's own fault.
+// Always in line: these words stood in one request's dispatch, on every
+// pair request's path, before a batch's ask said them too. The log line
+// keeps the dispatch's name.
 #[inline(always)]
-fn pd_protocol(workers: &WorkerSelection) -> Result<PdProtocol, Response> {
-    let Some(runtime_type) = workers.disaggregated_runtime_type() else {
-        error!(
-            function = "execute_pd_dispatch",
-            "PD mode requires disaggregated worker selection"
-        );
-        return Err(error::internal_error(
-            "pd_mode_requires_disaggregated_workers",
-            "PD mode requires disaggregated worker selection",
-        ));
-    };
-    let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
-        error!(
-            function = "execute_pd_dispatch",
-            runtime_type = ?runtime_type,
-            "Runtime does not support PD disaggregated mode"
-        );
-        return Err(error::bad_request(
-            "runtime_pd_not_supported",
-            "This runtime does not support PD disaggregated mode",
-        ));
-    };
-    Ok(protocol)
+fn pd_selection_missing() -> Response {
+    error!(
+        function = "execute_pd_dispatch",
+        "PD mode requires disaggregated worker selection"
+    );
+    error::internal_error(
+        "pd_mode_requires_disaggregated_workers",
+        "PD mode requires disaggregated worker selection",
+    )
 }
 
-/// What a pair's dispatch refuses of `proto_request` ahead of its
-/// prefill's send ([`execute_pd_dispatch`]): the runtime's refusals and,
-/// where the two sides go out one behind the other, the sequential plan's.
-/// A batch asks this of every sub-request ahead of its one word of the
-/// send, where that word says anything ([`PrefillAhead::sent_behind`]).
+/// What answers a pair's request under a runtime that speaks no
+/// disaggregated mode.
+// Always in line, as the answer above.
+#[inline(always)]
+fn pd_runtime_unsupported(runtime_type: &RuntimeType) -> Response {
+    error!(
+        function = "execute_pd_dispatch",
+        runtime_type = ?runtime_type,
+        "Runtime does not support PD disaggregated mode"
+    );
+    error::bad_request(
+        "runtime_pd_not_supported",
+        "This runtime does not support PD disaggregated mode",
+    )
+}
+
+/// What the dispatch of a pair's sub-request refuses ahead of its prefill's
+/// send ([`execute_pd_dispatch`]), asked of every sub-request of a batch:
+/// the runtime's refusals and, where the two sides go out one behind the
+/// other, the sequential plan's, by the check that builds no plan
+/// ([`SequentialPlan::refuses`]). A batch asks this ahead of its one word of
+/// the send, where that word says anything
+/// ([`PrefillAhead::says_its_send`]).
 // Out of line: a batch of a classic answer never comes here, and its
 // dispatch keeps the body it had.
 #[inline(never)]
-fn pd_refusal(
-    proto_request: &ProtoGenerateRequest,
+fn pd_batch_refusal(
+    requests: &[ProtoGenerateRequest],
     workers: &WorkerSelection,
 ) -> Result<(), Response> {
-    match pd_protocol(workers)?.dispatch {
-        PdDispatch::Sequential => SequentialPlan::decide(proto_request, workers).map(drop),
+    let Some(runtime_type) = workers.disaggregated_runtime_type() else {
+        return Err(pd_selection_missing());
+    };
+    let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
+        return Err(pd_runtime_unsupported(runtime_type));
+    };
+    match protocol.dispatch {
+        PdDispatch::Sequential => requests
+            .iter()
+            .try_for_each(|request| SequentialPlan::refuses(request, workers)),
         PdDispatch::Parallel => Ok(()),
     }
 }
@@ -817,7 +828,12 @@ async fn execute_pd_dispatch(
     encode: Option<EncodeWatch>,
     behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
-    let protocol = pd_protocol(workers)?;
+    let Some(runtime_type) = workers.disaggregated_runtime_type() else {
+        return Err(pd_selection_missing());
+    };
+    let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
+        return Err(pd_runtime_unsupported(runtime_type));
+    };
     // Dispatch shape comes from the per-runtime PD protocol table (see
     // `PdProtocol::for_runtime`): sequential sides relay the KV handoff
     // through the router, parallel sides rendezvous on bootstrap info
@@ -831,7 +847,7 @@ async fn execute_pd_dispatch(
     // batch said its send once, ahead of its sub-requests' dispatches
     // ([`execute_batch_dispatch`]): for one of those the word is said
     // already. Where that word says anything, the batch asked these
-    // refusals ahead of it ([`pd_refusal`]), so none comes behind it.
+    // refusals ahead of it ([`pd_batch_refusal`]), so none comes behind it.
     let result = match protocol.dispatch {
         PdDispatch::Sequential => {
             let plan = SequentialPlan::decide(&proto_request, workers)?;
@@ -1213,19 +1229,24 @@ async fn execute_batch_dispatch(
     // said here, once, ahead of the handles made of the load. Where that
     // word says anything, for an answer of Grand Central, what a
     // sub-request's dispatch refuses ahead of its send is asked first
-    // ([`pd_refusal`]): a batch refused there sent nothing, and its load is
-    // dropped as it was acquired. A classic answer's send says nothing and
-    // asks nothing here: its sub-requests make their refusals as before.
+    // ([`pd_batch_refusal`]): a batch refused there sent nothing, and its
+    // load is dropped as it was acquired. A classic answer's send says
+    // nothing and asks nothing here: its sub-requests make their refusals
+    // as before.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
         ExecutionPlanKind::Single => requests.iter().map(|_| None).collect(),
         ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
-            let refusal = || {
-                requests
-                    .iter()
-                    .try_for_each(|request| pd_refusal(request, workers))
-            };
+            // The look is at the load where it lies. A load that is named,
+            // or handed through an answer, ahead of its send is carried to
+            // another place on a classic answer's path too.
+            if prefill_guard
+                .as_ref()
+                .is_some_and(PrefillAhead::says_its_send)
+            {
+                pd_batch_refusal(&requests, workers)?;
+            }
             require_prefill_guard(prefill_guard)?
-                .sent_behind(refusal)?
+                .sent()
                 .replicate_to(requests.len())
                 .into_iter()
                 .map(Some)
