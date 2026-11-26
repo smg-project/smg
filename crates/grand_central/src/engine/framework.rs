@@ -7577,7 +7577,7 @@ impl Engine {
                 if let Some(respilled) = self.respill(
                     profile, index, rule, placing, facts, pool, set, cx, buf, c.id,
                 ) {
-                    return self.moved::<WRITE_SESSIONS, MOVES>(key, respilled);
+                    return self.moved::<WRITE_SESSIONS, MOVES>(key, facts, respilled);
                 }
             }
             let mut targets = Targets::new();
@@ -7656,7 +7656,7 @@ impl Engine {
                             profile, index, rule, placing, facts, pool, set, cx, buf, all_vetoed,
                             first,
                         ) {
-                            return self.moved::<WRITE_SESSIONS, MOVES>(key, handed);
+                            return self.moved::<WRITE_SESSIONS, MOVES>(key, facts, handed);
                         }
                     }
                     return decision;
@@ -7730,7 +7730,7 @@ impl Engine {
                                     profile, index, rule, placing, facts, pool, set, cx, buf,
                                     all_vetoed, owner,
                                 ) {
-                                    return self.moved::<WRITE_SESSIONS, MOVES>(key, handed);
+                                    return self.moved::<WRITE_SESSIONS, MOVES>(key, facts, handed);
                                 }
                             }
                         }
@@ -7754,18 +7754,20 @@ impl Engine {
     /// prefill the pair forms on ([`Self::decide_pair`]).
     /// A placement on the pin again, and one on another worker at the cap,
     /// move no pin ([`Self::respill`]). `key` is the key the decision
-    /// looked up.
+    /// looked up in `facts`, and the move is told under that request's
+    /// instant.
     #[inline]
     fn moved<const WRITE_SESSIONS: bool, const MOVES: bool>(
         &self,
         key: Session,
+        facts: &RequestFacts<'_>,
         handed: Decision,
     ) -> Decision {
         if WRITE_SESSIONS && MOVES {
             if let Decision::Pick(pick) = &handed {
                 if pick.session_verdict == SessionVerdict::Respill {
                     if let Some(first) = pick.targets.first() {
-                        self.sessions.respilled(key, first.id);
+                        self.sessions.respilled(key, first.id, facts.now_micros);
                     }
                 }
             }
@@ -8878,8 +8880,8 @@ impl Engine {
                     // is a pin at no instant, so no pin is taken back,
                     // and none another request was sent to meanwhile.
                     if prefill_pick.session_verdict == SessionVerdict::Respill {
-                        let key = prefill_facts.session();
-                        self.sessions.respilled(key, prefill_target.id);
+                        let (key, at) = (prefill_facts.session(), prefill_facts.now_micros);
+                        self.sessions.respilled(key, prefill_target.id, at);
                     }
                     return decision;
                 }
@@ -9654,15 +9656,16 @@ impl Engine {
         }
     }
 
-    /// The session table's part of a decode call that claimed
-    /// ([`SessionTable::date_claim`]). The call claimed `leased` for `key` at
-    /// `at`, its own instant, and that claim takes `issued`, the instant of
-    /// the lease its pair's first decision issued. The pair's decode
-    /// entries ask here, so they read no table of the engine's.
+    /// The session table's part of a decode call that states a verdict of
+    /// its key ([`SessionTable::told_under`]). The call read `key` at `at`,
+    /// its own instant, and tells its words under `issued`, the instant of
+    /// the lease its pair's first decision issued. A claim it made, of
+    /// `claimed`, takes that date. The pair's decode entries ask here, so
+    /// they read no table of the engine's.
     #[cfg(feature = "in-process")]
     #[inline]
-    pub(crate) fn date_claim(&self, key: Session, leased: WorkerId, at: u64, issued: u64) {
-        self.sessions.date_claim(key, leased, at, issued);
+    pub(crate) fn told_under(&self, key: Session, claimed: Option<WorkerId>, at: u64, issued: u64) {
+        self.sessions.told_under(key, claimed, at, issued);
     }
 
     /// The stages' part of a release, behind the table's
