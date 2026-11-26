@@ -20,7 +20,7 @@ use crate::{
         endpoint::{grpc_base_url, Endpoint},
         sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
     },
-    labels::{flat_labels, SUPPORTS_THINKING_TOKEN_BUDGET_LABEL},
+    labels::flat_labels,
 };
 
 /// Per-request deadline for metadata fetches.
@@ -58,14 +58,6 @@ pub(super) struct ServerInfo {
     /// then gives each its share of the window, on this path as on the
     /// gRPC one.
     pub enable_dp_attention: Option<bool>,
-    #[serde(skip_serializing)]
-    pub enable_strict_thinking: Option<bool>,
-    #[serde(skip_serializing)]
-    pub reasoning_parser: Option<String>,
-    #[serde(skip_serializing)]
-    pub skip_tokenizer_init: Option<bool>,
-    #[serde(skip_serializing)]
-    pub grammar_backend: Option<String>,
     pub weight_version: Option<String>,
 }
 
@@ -221,18 +213,7 @@ async fn read_info_routes(
     match get_json_with_fallback_classified::<ServerInfo>(client, &base, "server_info", api_key)
         .await
     {
-        Ok(info) => {
-            if info.enable_strict_thinking == Some(true)
-                // These parsers install a strict token filter without an
-                // engine-side environment override, which HTTP does not report.
-                && matches!(info.reasoning_parser.as_deref(), Some("qwen3" | "qwen3-thinking"))
-                && info.skip_tokenizer_init != Some(true)
-                && matches!(info.grammar_backend.as_deref(), None | Some("xgrammar"))
-            {
-                labels.insert(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL.into(), "true".into());
-            }
-            labels.extend(flat_labels(&info));
-        }
+        Ok(info) => labels.extend(flat_labels(&info)),
         Err(MetadataError::Failed(e)) if strict => return Err(format!("server_info: {e}")),
         // A tolerant read leaves the gap, and the engine's data-parallel
         // size is in it: a registration that reads no size registers one
@@ -282,18 +263,6 @@ async fn read_info_routes(
     Ok(labels)
 }
 
-/// vLLM 0.28 added thinking budgets to its second GPU model runner; older
-/// HTTP frontends can accept this parameter and then silently discard it.
-fn vllm_http_supports_thinking_budget(version: &str) -> bool {
-    let release = version.split('+').next().unwrap_or(version);
-    let mut parts = release.split('.');
-    let mut component = || parts.next()?.parse::<u32>().ok();
-    let (Some(major), Some(minor), Some(patch)) = (component(), component(), component()) else {
-        return false;
-    };
-    parts.next().is_none() && (major, minor, patch) >= (0, 28, 0)
-}
-
 /// The metadata of the model list and of `path`, the row's own path, which
 /// answers a version; `strict` as for the info routes.
 async fn read_model_list_and_path(
@@ -333,9 +302,6 @@ async fn read_model_list_and_path(
     {
         Ok(v) => {
             if !v.version.is_empty() {
-                if vllm_http_supports_thinking_budget(&v.version) {
-                    labels.insert(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL.into(), "true".into());
-                }
                 labels.insert("version".to_string(), v.version);
             }
         }

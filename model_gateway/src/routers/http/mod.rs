@@ -26,13 +26,9 @@ use crate::routers::error;
 /// `high` there) is applied once, where the request is committed to an HTTP
 /// upstream. The profile is the one request validation selected, from the
 /// model the client asked for.
-pub(crate) fn chat_for_upstream(
-    mut body: ChatCompletionRequest,
-) -> Result<ChatCompletionRequest, Response> {
-    body.normalize_thinking_token_budget()
-        .map_err(|e| error::bad_request("invalid_thinking_token_budget", e.to_string()))?;
+pub(crate) fn chat_for_upstream(mut body: ChatCompletionRequest) -> ChatCompletionRequest {
     ProviderProfile::for_model(&body.model).normalize_chat_for_upstream(&mut body);
-    Ok(body)
+    body
 }
 
 /// Rewrite the `model` field of an outbound request body.

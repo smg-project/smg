@@ -2601,14 +2601,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflicting_thinking_token_budgets_return_400_before_routing() {
+    async fn thinking_token_budget_precedence_is_independent_of_key_order() {
         for stream in [true, false] {
-            let input = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}],
-                "stream":stream, "thinking_token_budget":0, "custom_params":{"thinking_budget":1}});
-            let (status, body) = chat_request(&input.to_string()).await.unwrap_err();
+            for fields in [
+                r#""thinking_token_budget":0,"custom_params":{"thinking_budget":1}"#,
+                r#""custom_params":{"thinking_budget":1},"thinking_token_budget":0"#,
+            ] {
+                let body = format!(
+                    r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":{stream},{fields}}}"#
+                );
+                let request = chat_request(&body).await.unwrap();
+                assert_eq!(request.resolved_thinking_token_budget().unwrap(), Some(0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_effective_thinking_token_budget_returns_400_before_routing() {
+        for (canonical, param) in [
+            (json!(-2), "thinking_token_budget"),
+            (Value::Null, "custom_params.thinking_budget"),
+        ] {
+            let body = json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "thinking_token_budget": canonical, "custom_params": {"thinking_budget": "invalid"}
+            });
+            let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
             assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(body["error"]["code"], "conflicting_thinking_token_budget");
-            assert_eq!(body["error"]["param"], "thinking_token_budget");
+            assert_eq!(error["error"]["code"], "invalid_thinking_token_budget");
+            assert_eq!(error["error"]["param"], param);
         }
     }
 

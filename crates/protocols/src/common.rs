@@ -165,6 +165,15 @@ where
 // GenerationRequest Trait
 // ============================================================================
 
+/// The budget field a typed HTTP relay may need to translate for its worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThinkingTokenBudget {
+    /// An explicit `custom_params.thinking_budget: null` with no numeric override.
+    NullAlias,
+    /// The effective signed value, including an explicit native `-1`.
+    Tokens(i64),
+}
+
 /// The request fields that partition a backend's prefix cache.
 ///
 /// Engines namespace their prefix (KV) caches by client-supplied values: a
@@ -236,8 +245,8 @@ pub trait GenerationRequest: Send + Sync {
         None
     }
 
-    /// Per-request reasoning token cap, when the endpoint carries one.
-    fn thinking_token_budget(&self) -> Option<u32> {
+    /// The HTTP budget field, when this worker's request may need a wire edit.
+    fn thinking_token_budget(&self) -> Option<ThinkingTokenBudget> {
         None
     }
 

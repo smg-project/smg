@@ -11,23 +11,6 @@ use crate::{
     },
 };
 
-#[test]
-fn http_vllm_thinking_token_budget_support_uses_a_known_release() {
-    for version in ["0.28.0", "0.31.0+cu130", "1.0.0"] {
-        assert!(vllm_http_supports_thinking_budget(version), "{version}");
-    }
-    for version in [
-        "",
-        "unknown",
-        "0.19.0",
-        "0.27.9",
-        "0.28.0rc1",
-        "0.28.0.dev1",
-    ] {
-        assert!(!vllm_http_supports_thinking_budget(version), "{version}");
-    }
-}
-
 /// The path of the table's row whose metadata is the model list and its own
 /// path.
 const ROW_PATH: &str = "/version";
@@ -42,36 +25,6 @@ async fn info_routes_labels(
     read_info_routes(client, url, api_key, false)
         .await
         .unwrap_or_default()
-}
-
-#[tokio::test]
-async fn http_sglang_thinking_token_budget_requires_a_live_strict_filter() {
-    use http::StatusCode;
-    use serde_json::json;
-
-    for (parser, strict, skip, grammar, supported) in [
-        ("qwen3", true, false, "xgrammar", true),
-        ("qwen3-thinking", true, false, "xgrammar", true),
-        ("qwen3", false, false, "xgrammar", false),
-        ("qwen3", true, true, "xgrammar", false),
-        ("qwen3", true, false, "none", false),
-        ("another-parser", true, false, "xgrammar", false),
-    ] {
-        let url = serve_json_routes(vec![(
-            "/server_info",
-            StatusCode::OK,
-            json!({
-                "reasoning_parser": parser, "enable_strict_thinking": strict,
-                "skip_tokenizer_init": skip, "grammar_backend": grammar
-            }),
-        )])
-        .await;
-        let labels = info_routes_labels(&worker_client(), &url, None).await;
-        assert_eq!(
-            labels.contains_key(SUPPORTS_THINKING_TOKEN_BUDGET_LABEL),
-            supported
-        );
-    }
 }
 
 /// The model list and the row's path as registration reads them: a failed

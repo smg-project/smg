@@ -40,9 +40,13 @@ SGLang with `pyzmq>=25.0.0` and `msgspec>=0.18.0`).
 
 ### Reasoning token budgets in Chat Completions
 
-Set `thinking_token_budget` on each `POST /v1/chat/completions` request to cap
-the tokens generated inside a reasoning block. For example, the same model
-can serve requests with different budgets:
+Use `thinking_token_budget` or `custom_params.thinking_budget` on
+`POST /v1/chat/completions` to limit reasoning within a generated answer.
+Zero is an explicit budget. Reasoning mode and the total output token limit
+are controlled separately. For SGLang, vLLM and TensorRT-LLM HTTP workers and
+supported gRPC workers, SMG reads `thinking_token_budget` first, in either
+JSON key order. It reads the nested field only when the top-level value
+is missing or null. An invalid effective budget returns HTTP 400.
 
 ```json
 {
@@ -52,21 +56,29 @@ can serve requests with different budgets:
 }
 ```
 
-SMG also accepts `"custom_params": {"thinking_budget": 64}`. If both spellings
-carry integers they must agree, otherwise SMG returns HTTP 400. Zero is an
-explicit budget. Omission, null, and -1 leave the worker default in effect.
-A budget does not turn on reasoning or change the output token limit.
-Engines can count each reasoning block separately, including TensorRT-LLM.
+**HTTP workers.** SGLang reads `custom_params.thinking_budget`. vLLM and
+TensorRT-LLM read `thinking_token_budget`. SMG uses its typed chat request
+path to send the selected worker its native field and preserve other
+`custom_params` entries. It buffers the full chat request body before
+contacting the worker. Clients can still stream the response with
+`stream: true`. For unknown runtimes and external providers, SMG passes
+through both spellings when both have values. A top-level JSON null
+is treated as an omitted field.
 
-| Worker | HTTP | gRPC |
-| --- | --- | --- |
-| SGLang | Strict-thinking worker with a tokenizer and a supported reasoning parser. SMG infers support for the Qwen3 parsers using xgrammar. | A matching SMG servicer must advertise an active reasoning token filter. |
-| vLLM | SMG recognizes releases from 0.28.0, which implement budgets on both GPU model runners. The engine needs a configured reasoning parser or reasoning token IDs. | A matching SMG servicer must advertise support from the engine configuration. |
-| TensorRT-LLM | Register the worker with `runtime_type: "trtllm"`. The native server supports budgets from 1.3.0rc17 with a reasoning parser and tokenizer. GPT-OSS/Harmony rejects finite budgets. | Returns HTTP 400. The current NVIDIA gRPC service and ZMQ shim do not carry a thinking budget to the engine. |
+HTTP forwarding is independent of the worker's version, capability labels
+and strict-thinking setting. Enforcement depends on the upstream model and
+configuration. Omit the budget to use the worker default. Both `0` and `-1`
+reach the upstream as supplied.
+In SGLang strict thinking, `-1` removes even a finite server-wide cap for
+that request. TensorRT-LLM applies a finite budget separately to each
+reasoning block. Its GPT-OSS/Harmony path rejects finite budgets and accepts
+`reasoning_effort` instead. [SGLang thinking budgets](https://github.com/sgl-project/sglang/blob/v0.5.23/docs/docs/advanced_features/thinking_budget.mdx#L54-L97) · [TensorRT-LLM sampling parameters](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.3.0rc24/tensorrt_llm/sampling_params.py#L264) · [GPT-OSS/Harmony handling](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.3.0rc24/tensorrt_llm/serve/openai_server.py#L2075-L2081)
 
-For an HTTP deployment with verified SGLang or vLLM budget support that discovery
-cannot detect, register the worker with the label `supports_thinking_token_budget=true`.
-A mixed fleet can reject a budgeted request if the selected worker lacks support.
+**gRPC workers.** A finite budget from 0 through 4,294,967,295 requires a
+SGLang servicer advertising an active reasoning token filter or a vLLM
+servicer advertising a configured reasoning budget. TensorRT-LLM gRPC
+returns HTTP 400 for a finite budget. Omission, `null` and `-1` all use
+the worker default on gRPC.
 
 ### vLLM
 

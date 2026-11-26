@@ -1962,6 +1962,14 @@ fn chat_thinking_token_budget_reaches_engine_core() {
     for (fields, budget) in [
         (json!({"thinking_token_budget": 0}), Some(0)),
         (json!({"custom_params": {"thinking_budget": 7}}), Some(7)),
+        (
+            json!({"thinking_token_budget": 3, "custom_params": {"thinking_budget": 7}}),
+            Some(3),
+        ),
+        (
+            json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": 7}}),
+            Some(7),
+        ),
         (json!({"thinking_token_budget": -1}), None),
         (json!({}), None),
     ] {

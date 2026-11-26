@@ -1108,6 +1108,8 @@ mod tests {
         for fields in [
             serde_json::json!({"thinking_token_budget": 0}),
             serde_json::json!({"custom_params": {"thinking_budget": 0}}),
+            serde_json::json!({"thinking_token_budget": 0, "custom_params": {"thinking_budget": 7}}),
+            serde_json::json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": 0}}),
         ] {
             let mut body = serde_json::json!({"model": "test", "messages": [{"role": "user", "content": "hi"}]});
             body.as_object_mut()

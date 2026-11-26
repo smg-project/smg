@@ -150,14 +150,7 @@ pub(super) async fn route_chat(
     let start = Instant::now();
     let model = model_id;
     let streaming = body.stream;
-    let mut body = chat_for_upstream(body);
-    if let Err(e) = body.normalize_thinking_token_budget() {
-        return error::bad_request("invalid_thinking_token_budget", e.to_string());
-    }
-    if body.thinking_token_budget.is_some() {
-        return error::bad_request("unsupported_thinking_token_budget",
-            "thinking_token_budget requires a local inference worker that supports reasoning budgets");
-    }
+    let body = chat_for_upstream(body);
 
     Metrics::record_router_request(
         metrics_labels::ROUTER_OPENAI,
@@ -628,6 +621,66 @@ mod tests {
             (4000..5500).contains(&per_thousand),
             "bytes allocated per thousand bytes of message text: {per_thousand}"
         );
+    }
+
+    #[tokio::test]
+    async fn external_chat_forwards_thinking_token_budget_fields_as_supplied() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let workers: Arc<dyn WorkerSource> = Arc::new(OneWorker(StubWorker::at(&url)));
+        let deps = ChatRouterContext {
+            workers: &workers,
+            provider_registry: &ProviderRegistry::new(),
+            shared_components: &Arc::new(SharedComponents {
+                client: http_client(),
+            }),
+            retry_config: &RetryConfig::default(),
+        };
+        // Return the body as received by the external provider, after its request transform.
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: Json<Value>| async { body }),
+        );
+        let requests = async {
+            let tenant = TenantRequestMeta::new(TenantKey::new("t"));
+            for fields in [
+                json!({"thinking_token_budget": 0}),
+                json!({"custom_params": {"thinking_budget": 8, "other": true}}),
+                json!({"thinking_token_budget": 0, "custom_params": {"thinking_budget": 8}}),
+                json!({"thinking_token_budget": -1}),
+                json!({"custom_params": {"thinking_budget": -1}}),
+                json!({}),
+            ] {
+                let mut body = json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                let response = route_chat(
+                    &deps,
+                    None,
+                    &tenant,
+                    serde_json::from_value(body).unwrap(),
+                    "m",
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let received: Value = serde_json::from_slice(&bytes_of(response).await).unwrap();
+                for key in ["thinking_token_budget", "custom_params"] {
+                    assert_eq!(
+                        received.get(key),
+                        fields.get(key),
+                        "external request {fields}"
+                    );
+                }
+            }
+        };
+        tokio::select! {
+            result = axum::serve(listener, app) => panic!("provider exited early: {result:?}"),
+            () = requests => {}
+        }
     }
 
     /// A chat request nothing answers: the caller's 503 says why without the

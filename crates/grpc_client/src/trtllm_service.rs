@@ -722,6 +722,8 @@ mod tests {
             json!({"thinking_token_budget": 0}),
             json!({"custom_params": {"thinking_budget": 7}, "stream": true}),
             json!({"thinking_token_budget": 5, "custom_params": {"thinking_budget": 5}}),
+            json!({"thinking_token_budget": 0, "custom_params": {"thinking_budget": -1}}),
+            json!({"thinking_token_budget": null, "custom_params": {"thinking_budget": 7}}),
         ] {
             let error = build(options).expect_err("a finite budget needs worker support");
             assert!(
@@ -730,17 +732,12 @@ mod tests {
             );
         }
 
-        let conflict = build(json!({
-            "thinking_token_budget": 0, "custom_params": {"thinking_budget": 1}
-        }))
-        .expect_err("conflicting spellings must retain their validation error");
-        assert!(conflict.contains("must agree"), "{conflict}");
-
         for options in [
             json!({}),
             json!({"thinking_token_budget": null}),
             json!({"thinking_token_budget": -1}),
             json!({"custom_params": {"thinking_budget": -1}}),
+            json!({"thinking_token_budget": -1, "custom_params": {"thinking_budget": 7}}),
         ] {
             let request = build(options).expect("an unset budget uses normal generation");
             assert_eq!(request.max_tokens, 32);
