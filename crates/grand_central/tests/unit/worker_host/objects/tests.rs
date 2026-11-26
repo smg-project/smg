@@ -1387,6 +1387,33 @@ fn a_keeping_write_runs_in_a_turn_of_its_own() {
     assert!(!objects.keeping.is_locked(), "let go behind the write");
 }
 
+/// A registration that keeps, whose door answers and names no row the
+/// registration stands on, is put back. The keep stands ahead of the
+/// write and inside the turn. Nothing is kept behind it, the door's
+/// answer comes back whole, and the turn is let go.
+#[test]
+fn a_keeping_registration_whose_answer_names_no_row_is_put_back() {
+    let replica = Replica::new();
+    let (objects, credentials) = (&replica.objects, &replica.credentials);
+    let stated = facts(A, 1);
+    let wrote = objects.register_keeping(
+        replica.store.as_ref(),
+        Some((&stated, Some(KEY_A.to_owned()))),
+        (A, None),
+        || {
+            assert!(
+                objects.keeping.is_locked(),
+                "the write runs inside the turn"
+            );
+            assert_eq!(credentials.len(), 1, "kept ahead of the write");
+            Ok(Vec::new())
+        },
+    );
+    assert_eq!(wrote, Ok(Ok(Vec::new())));
+    assert!(credentials.is_empty(), "put back");
+    assert!(!objects.keeping.is_locked(), "let go behind the answer");
+}
+
 #[test]
 fn laying_again_reaches_each_rank_row_that_dials_the_address_and_no_other() {
     let replica = Replica::new();

@@ -55,8 +55,8 @@
 //! the rows its registrations wrote: a row no registration of this host
 //! stated takes none. Where a registration's answer says so, the host has
 //! the holder lay the address's objects again ([`Objects::lay_again`]).
-//! [`registration_into_store_keeping_credentials`] makes these calls with the
-//! keeper the host's holder was built with.
+//! [`registration_into_store_keeping_credentials`] has the holder make these
+//! calls, with the keeper the holder was built with.
 //!
 //! # The adapters
 //!

@@ -36,8 +36,8 @@ use crate::{
         facts,
         membership_writer::tests::{HolderDoor, StoreDoor},
         objects::lay_standing,
-        Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects, Over,
-        Precondition, Remover, RowRevision,
+        Credentials, Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter,
+        Objects, Over, Precondition, Remover, RowRevision,
     },
 };
 
@@ -232,14 +232,12 @@ impl Fixture {
         (fixture, credentials)
     }
 
-    /// The write that keeps in `credentials`.
-    fn write_keeping(&self, credentials: &Arc<Credentials>) -> WriteWorkersToStore<Members> {
+    /// The write that keeps: its holder keeps, in the keeper
+    /// [`Self::keeping`] built that holder with.
+    fn write_keeping(&self) -> WriteWorkersToStore<Members> {
         let store: Arc<dyn WorkersStore> = self.store.clone();
         WriteWorkersToStore {
-            keeping: Some(Keeping {
-                credentials: Arc::clone(credentials),
-                store,
-            }),
+            keeping: Some(store),
             ..self.write()
         }
     }
@@ -733,9 +731,9 @@ async fn a_registration_retries_only_when_the_door_or_row_moved() {
 /// with it. A worker that states none is built with none.
 #[tokio::test]
 async fn a_keeping_write_builds_each_rows_object_with_what_its_worker_states() {
-    let (f, credentials) = Fixture::keeping();
+    let (f, _) = Fixture::keeping();
     let plain = "http://plain:8000";
-    let write = f.write_keeping(&credentials);
+    let write = f.write_keeping();
     // A job's workers are one engine's, so each engine is its own job.
     for workers in [vec![keyed(URL, "key-a")], vec![worker(plain, "model")]] {
         let mut cx = f.registration(WorkerJobAsker::Startup, workers);
@@ -766,7 +764,7 @@ async fn a_keeping_write_of_several_ranks_binds_every_ranks_row() {
         })
         .collect();
     let mut cx = f.registration(WorkerJobAsker::Startup, ranks);
-    let write = f.write_keeping(&credentials);
+    let write = f.write_keeping();
     write.execute(&mut cx).await.expect("written");
     assert_eq!(credentials.len(), 1);
     for rank in 0..3 {
@@ -780,8 +778,8 @@ async fn a_keeping_write_of_several_ranks_binds_every_ranks_row() {
 /// address's object again, and that object holds the new credential.
 #[tokio::test]
 async fn a_keeping_write_of_another_credential_lays_the_object_again() {
-    let (f, credentials) = Fixture::keeping();
-    let write = f.write_keeping(&credentials);
+    let (f, _) = Fixture::keeping();
+    let write = f.write_keeping();
     let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
     write.execute(&mut cx).await.expect("written");
     assert_eq!(held_key(&f, URL).as_deref(), Some("key-a"));
@@ -804,7 +802,7 @@ async fn a_keeping_write_the_door_refuses_keeps_nothing() {
         .expect("registered");
 
     let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
-    let write = f.write_keeping(&credentials);
+    let write = f.write_keeping();
     write
         .execute(&mut cx)
         .await
@@ -824,15 +822,15 @@ async fn a_keeping_write_at_an_address_in_flight_fails_and_is_tried_again() {
         .expect("no registration in flight");
 
     let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-b")]);
-    let write = f.write_keeping(&credentials);
+    let write = f.write_keeping();
     let error = write.execute(&mut cx).await.expect_err("in flight");
     assert!(StepExecutor::<Registration>::is_retryable(&write, &error));
     assert!(f.store.by_key(URL).is_none(), "the door was not asked");
     assert!(!token.put_back());
 }
 
-/// The line that keeps reads the keeper from its holder, where the line
-/// is built. A holder built with none is refused.
+/// The line that keeps asks its holder, where the line is built, whether
+/// it holds a keeper. A holder built with none is refused.
 #[test]
 fn the_line_that_keeps_is_not_built_over_a_holder_with_no_keeper() {
     let f = Fixture::new();
@@ -926,19 +924,16 @@ impl MembershipWriter for MovedUnder {
 /// with the credential that stands.
 #[tokio::test]
 async fn a_refused_keeping_write_lays_again_an_object_built_in_its_flight() {
-    let (f, credentials) = Fixture::keeping();
+    let (f, _) = Fixture::keeping();
     let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
-    f.write_keeping(&credentials)
-        .execute(&mut cx)
-        .await
-        .expect("written");
+    f.write_keeping().execute(&mut cx).await.expect("written");
     assert_eq!(held_key(&f, URL).as_deref(), Some("key-a"));
 
     let write = WriteWorkersToStore {
         door: Arc::new(MovedUnder {
             door: Arc::clone(&f.door),
         }),
-        ..f.write_keeping(&credentials)
+        ..f.write_keeping()
     };
     let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-b")]);
     let error = write.execute(&mut cx).await.expect_err("moved");
@@ -953,8 +948,8 @@ async fn a_refused_keeping_write_lays_again_an_object_built_in_its_flight() {
 /// registration stated.
 #[tokio::test]
 async fn a_keeping_write_that_replaces_a_row_binds_the_new_row() {
-    let (f, credentials) = Fixture::keeping();
-    let write = f.write_keeping(&credentials);
+    let (f, _) = Fixture::keeping();
+    let write = f.write_keeping();
     let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
     write.execute(&mut cx).await.expect("written");
     let old = f.store.by_key(URL).expect("the row").id;
@@ -995,8 +990,8 @@ async fn a_keeping_write_that_replaces_a_row_binds_the_new_row() {
 /// revision.
 #[tokio::test]
 async fn a_guarded_keeping_write_is_refused_once_another_object_stands() {
-    let (f, credentials) = Fixture::keeping();
-    let write = f.write_keeping(&credentials);
+    let (f, _) = Fixture::keeping();
+    let write = f.write_keeping();
     let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
     write.execute(&mut cx).await.expect("written");
     let id = f.host.registry.get_id_by_url(URL).expect("the worker's id");

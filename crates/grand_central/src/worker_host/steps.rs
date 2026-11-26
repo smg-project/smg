@@ -22,13 +22,10 @@ use wfaas::{
 };
 
 use super::{
-    facts, found::engine_of, Credentials, KeptCredential, MembershipWriteOutcome,
-    MembershipWriteRefused, MembershipWriter, Objects, Over, Precondition, Remover, RowRevision,
+    facts, found::engine_of, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter,
+    Objects, Over, Precondition, Remover, RowRevision,
 };
-use crate::{
-    engine::view::WorkerId,
-    store::{ProviderKeyError, Registrant, WorkersStore},
-};
+use crate::store::{ProviderKeyError, Registrant, WorkersStore};
 
 /// The provider name used by the host's own discovery source.
 pub const DISCOVERY: &str = "discovery";
@@ -74,21 +71,14 @@ pub const REMOVE_WORKERS_FROM_STORE_STEP: &str = "remove_workers_at_door";
 pub struct WriteWorkersToStore<G> {
     door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<G>>,
-    keeping: Option<Keeping>,
-}
-
-/// What a write that keeps holds. A row holds no credential: the write
-/// keeps what each worker states ahead of its row, and answers the keeper
-/// with the door's answer.
-struct Keeping {
-    /// The keeper the write's holder reads at an object's build, read from
-    /// that holder where the line is built ([`Objects::credentials`]). So
-    /// the write and the build read one keeper.
-    credentials: Arc<Credentials>,
-    /// The store the write's door writes. Where the keeper's answer says
-    /// so, the write has the holder lay the address's objects again, and
-    /// a lay hands each row's count to this store. No row is read from it.
-    store: Arc<dyn WorkersStore>,
+    /// The store the write's door writes, where the write keeps. A row
+    /// holds no credential: the holder keeps what each registration states
+    /// ahead of its rows, in the keeper it reads at an object's build, and
+    /// answers that keeper with the door's answer
+    /// ([`Objects::register_keeping`]). Where the keeper's answer says so,
+    /// the holder lays the address's objects again, and a lay hands each
+    /// row's count to this store. No row is read from it.
+    keeping: Option<Arc<dyn WorkersStore>>,
 }
 
 /// A registration that keeps credentials was asked over worker objects built
@@ -175,14 +165,15 @@ pub fn registration_into_store_keeping_credentials<H: WorkflowHost>(
     store: Arc<dyn WorkersStore>,
     behind: &[&'static str],
 ) -> Result<WorkflowDefinition<WorkerRegistrationWorkflowData<H>>, NoCredentials> {
-    let credentials = Arc::clone(objects.credentials().ok_or(NoCredentials)?);
-    let keeping = Keeping { credentials, store };
+    if !objects.keeps_credentials() {
+        return Err(NoCredentials);
+    }
     Ok(registration_line(
         settings,
         gates,
         door,
         objects,
-        Some(keeping),
+        Some(store),
         behind,
     ))
 }
@@ -193,7 +184,7 @@ fn registration_line<H: WorkflowHost>(
     gates: RegistrationGates,
     door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<H::Generation>>,
-    keeping: Option<Keeping>,
+    keeping: Option<Arc<dyn WorkersStore>>,
     behind: &[&'static str],
 ) -> WorkflowDefinition<WorkerRegistrationWorkflowData<H>> {
     let dependencies = if behind.is_empty() {
@@ -394,16 +385,18 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
 
 impl<G: Generation> WriteWorkersToStore<G> {
     /// Write a registration's workers at the door, in one call. A line
-    /// that keeps runs the whole of it in its holder's turn
-    /// ([`Objects::keeping`]): the keep, the door's write, the keeper's
-    /// answer and the lay-again that answer asks for. A guarded write is
-    /// refused there as moved, ahead of its keep, where another object
-    /// stands under the URL by then. The plain line takes no turn here.
+    /// that keeps has its holder run the whole of it in the holder's turn
+    /// ([`Objects::register_keeping`]): the keep, the door's write, the
+    /// keeper's answer and the lay-again that answer asks for. A guarded
+    /// write is refused there as moved, ahead of its keep, where another
+    /// object stands under the URL by then. The plain line takes no turn
+    /// here.
     ///
     /// The workers are the ranks of one engine and dial one address, where
     /// one registration is in flight. So the keep is the registration's:
     /// it holds the credential the first worker states, and its acceptance
-    /// binds every row the door answered.
+    /// binds every row the door answered. A second registration in flight
+    /// there fails before the door, and is tried again.
     fn write_at_door(
         &self,
         maker: &Registrant,
@@ -414,81 +407,21 @@ impl<G: Generation> WriteWorkersToStore<G> {
         let first = workers.first();
         // The refusal names the engine as the rows' facts state it.
         let engine = first.map_or("", |worker| engine_of(worker.as_ref()));
-        let write = || -> WorkflowResult<Vec<MembershipWriteOutcome>> {
-            // Kept ahead of the write: the holder may build a row's object
-            // inside the door's turn.
-            let kept = match first {
-                Some(worker) => self.keep(worker.as_ref())?,
-                None => None,
-            };
-            let answer = self.door.found_rows(maker, expect, workers, over);
-            if let Some(worker) = first {
-                self.answer_kept(worker.as_ref(), kept, answer.as_deref().ok());
+        let write = || self.door.found_rows(maker, expect, workers, over);
+        let answer = match &self.keeping {
+            None => write(),
+            Some(store) => {
+                let url = first.map_or("", |worker| worker.url());
+                let stating = first.map(|worker| facts(worker.as_ref(), None));
+                let stated = first
+                    .zip(stating.as_ref())
+                    .map(|(worker, facts)| (facts, worker.api_key().cloned()));
+                self.objects
+                    .register_keeping(store.as_ref(), stated, (url, over.map(Over::object)), write)
+                    .map_err(|_| failed(WRITE_WORKERS_TO_STORE_STEP, IN_FLIGHT))?
             }
-            answer.map_err(|refusal| registration_refusal(engine, refusal))
         };
-        if self.keeping.is_none() {
-            return write();
-        }
-        let url = first.map_or("", |worker| worker.url());
-        self.objects
-            .keeping(url, over.map(Over::object), write)
-            .map_err(|refusal| registration_refusal(engine, refusal))?
-    }
-
-    /// Keep what `worker` states for its engine, ahead of the rows' write.
-    /// One registration is in flight at an address: a second fails here,
-    /// before the door, and is tried again.
-    fn keep(&self, worker: &dyn Worker) -> WorkflowResult<Option<KeptCredential>> {
-        let Some(keeping) = &self.keeping else {
-            return Ok(None);
-        };
-        keeping
-            .credentials
-            .keep(&facts(worker, None), worker.api_key().cloned())
-            .map(Some)
-            .map_err(|_| failed(WRITE_WORKERS_TO_STORE_STEP, IN_FLIGHT))
-    }
-
-    /// Answer the keeper at the door's answer, with no await between the
-    /// two: the rows the door wrote are accepted, and a refusal puts back
-    /// what stood. Where the keeper says an object may hold another
-    /// credential than its row takes, the holder lays the address again.
-    fn answer_kept(
-        &self,
-        worker: &dyn Worker,
-        kept: Option<KeptCredential>,
-        wrote: Option<&[MembershipWriteOutcome]>,
-    ) {
-        let (Some(keeping), Some(kept)) = (&self.keeping, kept) else {
-            return;
-        };
-        let rows: Vec<WorkerId> = wrote
-            .into_iter()
-            .flatten()
-            .filter_map(written_row)
-            .collect();
-        let again = if rows.is_empty() {
-            kept.put_back()
-        } else {
-            kept.accepted_rows(&rows)
-        };
-        if again {
-            self.objects
-                .lay_again(keeping.store.as_ref(), &facts(worker, None));
-        }
-    }
-}
-
-/// The row a registration's write stands on: the new one of a replacement.
-/// A removal's answers name no such row.
-fn written_row(wrote: &MembershipWriteOutcome) -> Option<WorkerId> {
-    match *wrote {
-        MembershipWriteOutcome::Registered(row)
-        | MembershipWriteOutcome::InPlace(row)
-        | MembershipWriteOutcome::Unmoved(row) => Some(row),
-        MembershipWriteOutcome::Another { new, .. } => Some(new),
-        MembershipWriteOutcome::Draining(_) | MembershipWriteOutcome::Removed(_) => None,
+        answer.map_err(|refusal| registration_refusal(engine, refusal))
     }
 }
 
