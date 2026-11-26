@@ -182,16 +182,11 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
             );
         }
     }
-    // This servicer gives both fields to the scheduler. It writes the key
-    // itself because the launcher's package has its own version.
-    server_args.fields.insert(
-        "cache_partition_fields".to_string(),
-        prost_types::Value {
-            kind: Some(prost_types::value::Kind::StringValue(
-                "cache_salt,extra_key".to_string(),
-            )),
-        },
-    );
+    // The servicer writes the key itself because the launcher's package has
+    // its own version.
+    server_args
+        .fields
+        .extend([engine_zmq_adapter::cache_partition_fields_arg()]);
     if state.media.is_some() {
         for (key, value) in [
             ("mm_processor", "smg"),

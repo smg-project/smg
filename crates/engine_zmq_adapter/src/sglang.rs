@@ -435,6 +435,20 @@ pub(crate) struct SglangConnection<'a> {
     pub(crate) per_image: PerImageItems,
 }
 
+/// The `server_args` entry that names the cache partition fields that
+/// `translate_request_sglang` gives to the scheduler. The gateway reads it as
+/// a worker label.
+pub fn cache_partition_fields_arg() -> (String, prost_types::Value) {
+    (
+        "cache_partition_fields".to_string(),
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(
+                "cache_salt,extra_key".to_string(),
+            )),
+        },
+    )
+}
+
 /// Translate an SGLang proto `GenerateRequest` into the scheduler's
 /// `TokenizedGenerateReqInput`, as its `connection` takes it. ZMQ mode
 /// requires pre-tokenized input (SMG tokenizes upstream). The slim output
@@ -1761,6 +1775,25 @@ mod tests {
             })));
             assert_eq!((cache_salt.as_deref(), extra_key.as_deref()), expected);
         }
+    }
+
+    /// The direct-ZMQ lane gives both fields to the scheduler, so its worker
+    /// gets the `cache_partition_fields` label.
+    #[tokio::test]
+    async fn a_direct_zmq_worker_advertises_the_cache_partition_fields() {
+        use smg_grpc_client::engine_labels::ServerInfo;
+
+        use crate::client::ZmqServerInfo;
+
+        let (client, _engine, _dir) = connected_pair(RuntimeType::Sglang).await;
+        let ZmqServerInfo::Sglang(info) = client.server_info() else {
+            panic!("expected SGLang server info");
+        };
+        let labels = ServerInfo::Sglang(info).to_labels();
+        assert_eq!(
+            labels.get("cache_partition_fields").map(String::as_str),
+            Some("cache_salt,extra_key")
+        );
     }
 
     /// The data-parallel pin is placed as the engine's own frontend places

@@ -57,7 +57,9 @@ pub use engine_zmq_client::{
     EngineCount,
 };
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
-pub use sglang::{to_sglang_response, SglangGenerateStream, SglangProfileStart};
+pub use sglang::{
+    cache_partition_fields_arg, to_sglang_response, SglangGenerateStream, SglangProfileStart,
+};
 pub use sglang_encode::{
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq,

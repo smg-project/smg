@@ -231,8 +231,8 @@ pub struct TokenizedGenerateReqInput {
     pub encoder_urls: Option<Vec<String>>,
     /// The request's cache partition, in the scheduler's own two slots. The
     /// scheduler's radix key reads an empty `extra_key` and an absent one as
-    /// two partitions, so unset is `None`. A value can be a secret: never log
-    /// it.
+    /// two partitions, so unset is `None`. A value can be a secret: do not
+    /// log it.
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
     /// The caller's W3C trace context (`traceparent`, `tracestate`) for the
