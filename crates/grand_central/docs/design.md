@@ -3030,8 +3030,8 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    second is the instant a record changed in place was admitted at: the one body lays the
    table's over every writer's record, and a keeper and a standby's applier hand that same
    instant. The third is the record of a status event, on a leader and on a standby, until a
-   status entry holds what its readers read **[planned]**. The fourth is every record the
-   store's own write entries tell: no product code calls them, and they end with the table.
+   status entry holds what its readers read **[planned]**. The fourth is the record taken out
+   by a decided change that a host hands the store itself (`MemoryStore::follow`): no product code hands one so.
    The fifth is the record a standby's applied change takes out where that record has no
    object.
 
@@ -3054,9 +3054,9 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    word: a drain and a connect signal write the object and tell the table, a key's next life
    starts in the status its worker object stood in, and a call's answer waits on no follow.
 
-   A change the store refuses lays nothing: a refused write reads no record of the store. A
+   A change the store refuses lays nothing new: a refused write reads no record of the store, and a refused removal lays its record again as it was read. A
    record with no object waits for a cut laid whole, and its key's registration through the keeper is
-   refused until then. It is one written through the store's own entries, or one the store took and the registry did not get. A change that moves a fact the object holds builds the object again: the
+   refused until then. It is one a store took as a decided change around the keeper, or one the store took and the registry did not get. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects **[built]**. A call reads the
@@ -3072,13 +3072,13 @@ A fact leaves the remainder when the worker object gets a field that holds it as
 4. The table of records is taken apart in removals. The second copy of the facts, the two
    conversions between a record and an object, and the task that follows the table are
    deleted. The removals come in this order. First the store's log of its changes
-   **[built]**, then a cut's read back **[built]** and the store's own write entries. Then its read
+   **[built]**, then a cut's read back **[built]** and the store's own write entries **[built]**. Then its read
    entries with its own cut, and last the store's reads of the record before a write. The
    records themselves stay for the published copy's membership build, and go with that copy.
    The task is deleted
    **[built]**: the calls a record is written by are public, a host of the worker objects
    writes through them, and a served controller hands the code that keeps its objects. A
-   record written through the store's own entries gets its object in one place: where a cut
+   record a store took as a decided change around the keeper gets its object in one place: where a cut
    is laid whole.
    No task lays it. No turn that takes the controller's own store starts with
    a read of its table **[built]**: a write call decides over the object that stands, a call's read
@@ -3091,10 +3091,10 @@ A fact leaves the remainder when the worker object gets a field that holds it as
 **One rule for a registration's write [built].** What a registration makes of the record under
 its address is one function beside the other membership rules (`WorkerRow::laid_over`,
 `store/membership.rs`): from the record that stands and the facts stated, the change and the
-record it leaves. The store's own write decides by it over the table's record. It then writes
-the decided change by the one body a standby's applier writes a leader's change by
-(`MemoryStore::decided`). The rule's second caller is the code that keeps the worker
-objects, over the record read back from an object (step 1).
+record it leaves. The code that keeps the worker objects decides by it, over the record read
+back from an object (step 1). The store writes the decided change by the one body a standby's
+applier writes a leader's change by (`MemoryStore::decided`). The store's own write, which
+decided by the rule over the table's record, is deleted.
 
 **A standby's events through the worker objects [built].** A standby's applier hands each
 membership event of its leader's log, and each restore, to the code that keeps the worker
@@ -3122,14 +3122,14 @@ deleted.
 is restored from and what an operator reads are cut from the worker objects and their
 remainders (the last part of step 2), in the turn of the code that keeps them. Every writer
 of a record's facts holds that turn from its decision to the log's telling. The store's own
-entries for a registration, a patch and a removal take no such turn: no product code calls
-them, and they end with step 4.
+entries for a registration, a patch and a removal are deleted. A decided change handed to
+a store around that code takes no such turn: no product code hands one so.
 
 A copy reads the log's place and the store's epoch in one
 hold, and no record of the table. So a copy holds
 each record the log told at the copy's place, and none it did not, beside every writer that holds the turn. A
 record the store took and the registry did not get is in no copy until it is laid (step 1).
-One written through the store's own entries is laid
+One a store took as a decided change around that code is laid
 where a cut is laid whole. A copy's statuses are the
 ones the log last told at its place, and not the objects': an object can stand one tell
 ahead of the log. The store keeps what the log last told of each record's status, beside its

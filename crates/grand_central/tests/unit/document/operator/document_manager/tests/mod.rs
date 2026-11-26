@@ -115,7 +115,7 @@ fn generations() -> (Arc<MemoryStore>, DocumentManager) {
 /// joins after.
 #[test]
 fn a_document_applied_through_the_door_lists_the_member_that_joins() {
-    use crate::store::{OutsideLists, WorkerFacts, WorkersStore};
+    use crate::store::{OutsideLists, WorkerFacts};
 
     let (store, generations) = generations();
     let document = format!("{RANDOM}view:\n  engines: [alpha]\n");
@@ -150,7 +150,7 @@ fn a_document_applied_through_the_door_lists_the_member_that_joins() {
 /// build come between the apply and the read.
 #[test]
 fn an_apply_of_other_lists_counts_the_standing_members_under_them() {
-    use crate::store::{OutsideLists, WorkerFacts, WorkersStore};
+    use crate::store::{OutsideLists, WorkerFacts};
 
     let (store, generations) = generations();
     let listing = |engines: &str| {
@@ -189,7 +189,7 @@ fn an_apply_of_other_lists_counts_the_standing_members_under_them() {
 /// listed ones.
 #[test]
 fn a_member_written_again_is_read_again_under_the_lists() {
-    use crate::store::{OutsideLists, WorkerFacts, WorkersStore};
+    use crate::store::{OutsideLists, WorkerFacts};
 
     let (store, generations) = generations();
     let document = format!("{RANDOM}view:\n  engines: [alpha]\n  zones: [east]\n");
@@ -226,7 +226,7 @@ fn a_member_written_again_is_read_again_under_the_lists() {
 /// join: a list of families counts by family, a list of zones by zone.
 #[test]
 fn lists_of_labels_alone_leave_no_member_outside_and_the_next_lists_count_every_member() {
-    use crate::store::{OutsideLists, WorkerFacts, WorkersStore};
+    use crate::store::{OutsideLists, WorkerFacts};
 
     let (store, generations) = generations();
     let view = |lists: &str| {

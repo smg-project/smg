@@ -23,7 +23,7 @@ use crate::{
         InProcess, Members,
     },
     stages::{registry::StageRegistry, Lifecycle},
-    store::{MemoryStore, WorkerFacts, WorkersStore},
+    store::{MemoryStore, WorkerFacts},
     tracking::lease::Membership,
 };
 

@@ -8,11 +8,13 @@
     reason = "the store's table of worker records leaves the crate, and its types with it"
 )]
 
-use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher, sync::Arc, time::Instant};
+use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher};
+#[cfg(any(test, feature = "worker-host"))]
+use std::{sync::Arc, time::Instant};
 
-use super::workers::{
-    identity, MembershipChange, Registrant, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
-};
+#[cfg(any(test, feature = "worker-host"))]
+use super::workers::{identity, MembershipChange, WorkerPatch};
+use super::workers::{Registrant, WorkerFacts, WorkerRow, WorkerStatus};
 
 /// A write of a row by a caller that did not register it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +133,10 @@ pub(super) fn same_worker(old: &WorkerFacts, new: &WorkerFacts) -> bool {
     old.role == new.role && old.same_models(new) && old.wire_modes == new.wire_modes
 }
 
+// The rule's three items are built where a holder of worker objects is:
+// the holder is the rule's one writer. A test build has one more caller,
+// the cases' road to a store's table.
+#[cfg(any(test, feature = "worker-host"))]
 impl WorkerRow {
     /// What a registration of `facts` by `maker` makes of `standing`, the
     /// row that stands under their key, at `now`: the change, and the
@@ -224,6 +230,7 @@ impl WorkerRow {
     }
 }
 
+#[cfg(any(test, feature = "worker-host"))]
 impl WorkerPatch {
     /// Writes the patch over `facts`: each fact it names, and no other.
     /// Every field is named: one more stops the build here until it says

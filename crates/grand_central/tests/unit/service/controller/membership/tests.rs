@@ -260,8 +260,8 @@ fn a_call_builds_a_rows_object_at_its_write_and_its_status_follows() {
 }
 
 /// A door's patch and removal are decided over the worker objects, as
-/// its registration is: each runs the store's one body, which the
-/// store's own patch and removal never run, and a removal's object has
+/// its registration is: each runs the store's one body,
+/// and a removal's object has
 /// left the registry when the store hears of it. So it is for a control
 /// call and for a removal by the replica's own writer.
 #[test]

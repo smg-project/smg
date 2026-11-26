@@ -212,10 +212,10 @@ impl Held {
 /// stays whole beside each. A status tell changes no row's facts, and a
 /// copy reads the told statuses with the place in one hold of the store's
 /// membership lock. A generation's apply and a term's start change no row.
-/// A caller of the store's own registration, patch or removal takes no
-/// turn either: no product code calls those, and they go with the store's
-/// table. A row written so has no object, and no copy holds it, until a
-/// cut is laid whole.
+/// A change handed to the store around the holder
+/// ([`MemoryStore::follow`]) takes no turn either: no product code hands
+/// one so. A row written so has no object,
+/// and no copy holds it, until a cut is laid whole.
 ///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
