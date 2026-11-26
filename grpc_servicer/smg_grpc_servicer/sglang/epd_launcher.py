@@ -538,7 +538,7 @@ async def serve(config, args):
         )
         hf_config = backend.encoder.model_config.hf_config
         config.setdefault("max_context_bytes", resolve_max_context_bytes())
-        config["item_cache_bytes"] = item_cache_bytes
+        config["item_cache_bytes"] = item_cache_bytes if getattr(args, "tp_size", 1) == 1 else 0
         max_batch_size = getattr(backend.scheduler, "max_batch_size", None)
         staging_width = _encoder_embedding_width(backend.encoder, hf_config)
         staging_dtype = _normalize_dtype(

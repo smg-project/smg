@@ -266,6 +266,7 @@ class RustPreprocessorBridge:
         stable_identity_ns=None,
         identity_sink=None,
         tp_size=1,
+        item_cache_enabled=None,
     ):
         """Wrap SGLang's encoder preprocessor to consume immutable Rust-produced artifacts."""
         self.original = original
@@ -277,6 +278,11 @@ class RustPreprocessorBridge:
         )
         self.identity_sink = identity_sink
         self.tp_size = max(1, int(tp_size))
+        self._item_cache_enabled = (
+            bool(item_cache_enabled)
+            if item_cache_enabled is not None
+            else (self.tp_size == 1 and _item_cache_budget_bytes() > 0)
+        )
 
     def supports_modality(self, modality):
         """Return True only for IMAGE and VIDEO modalities supported by managed EPD."""
@@ -330,7 +336,7 @@ class RustPreprocessorBridge:
             if self.original is not None
             else (lambda row, _mod: int(row[0]) * int(row[1]) * int(row[2]))
         )
-        need_legacy_keys = self.identity_sink is not None or _item_cache_budget_bytes() > 0
+        need_legacy_keys = self.identity_sink is not None or self._item_cache_enabled
         pixels, grids, counts, items_per_req, second_per_grids, all_keys = [], [], [], [], [], []
         pinned_embs = []
         pixel_item_indices = []
@@ -611,6 +617,16 @@ def _item_cache_budget_bytes():
     return default_bytes
 
 
+def _encoder_item_cache_budget_bytes(encoder):
+    """Return the startup-resolved per-item cache budget cached on ``encoder``."""
+    cached = getattr(encoder, "_smg_item_cache_budget_bytes", None)
+    if cached is not None:
+        return cached
+    budget = _item_cache_budget_bytes()
+    encoder._smg_item_cache_budget_bytes = budget
+    return budget
+
+
 class PerItemEmbeddingCache:
     """Thread-safe LRU cache keyed by per-item preprocessed image features."""
 
@@ -745,7 +761,7 @@ async def cached_compute_direct_embedding(original, encoder, ctx, *, keep_on_gpu
     ):
         return await original(encoder, ctx, keep_on_gpu=keep_on_gpu)
 
-    budget_bytes = _item_cache_budget_bytes()
+    budget_bytes = _encoder_item_cache_budget_bytes(encoder)
     if budget_bytes <= 0 and pinned_embs is None:
         return await original(encoder, ctx, keep_on_gpu=keep_on_gpu)
 
@@ -823,6 +839,8 @@ async def cached_compute_direct_embedding(original, encoder, ctx, *, keep_on_gpu
     if len(miss_embedding.shape) != 2:
         miss_embedding = miss_embedding.reshape(-1, miss_embedding.shape[-1])
     if miss_embedding.shape[0] != sum(token_counts[i] for i in miss_indices):
+        if pinned_embs is not None:
+            raise ValueError("partial-pixel cache-hit batch miss embedding token count mismatch")
         return await original(encoder, ctx, keep_on_gpu=keep_on_gpu)
 
     srv_mod = sys.modules.get("sglang.srt.disaggregation.encoder.server")
@@ -898,6 +916,7 @@ def install_bridge(encoder, processor_contract, max_artifact_bytes):
     if not processor_contract or max_artifact_bytes <= 0:
         raise ValueError("managed Rust processor requires a contract and byte limit")
     tp_size = getattr(encoder, "tp_size", 1)
+    budget_bytes = 0
     if tp_size == 1:
         # Unify per-item embedding cache with Rust pre-decode index so SGLang's native cache
         # never allocates a second buffer or re-hashes unpacked pixel tensors.
@@ -906,6 +925,7 @@ def install_bridge(encoder, processor_contract, max_artifact_bytes):
         budget_bytes = _item_cache_budget_bytes()
         if budget_bytes > 0 and getattr(encoder, "_smg_item_cache", None) is None:
             encoder._smg_item_cache = PerItemEmbeddingCache(budget_bytes)
+    encoder._smg_item_cache_budget_bytes = budget_bytes
     sink = {} if getattr(encoder, "rank", 0) == 0 else None
     if sink is not None:
         encoder._smg_req_item_identities = sink
@@ -915,6 +935,7 @@ def install_bridge(encoder, processor_contract, max_artifact_bytes):
         stable_identity_ns=_build_stable_identity_namespace(encoder, processor_contract),
         identity_sink=sink,
         tp_size=tp_size,
+        item_cache_enabled=budget_bytes > 0,
     )
     if hasattr(encoder, "cache_namespace"):
         encoder.cache_namespace = (
@@ -1314,7 +1335,7 @@ class NativeEncoder:
             kind = artifact_v2.get("kind")
             if kind == "cache_hit":
                 item_keys_hex = artifact_v2.get("item_keys") or []
-                budget_bytes = _item_cache_budget_bytes()
+                budget_bytes = _encoder_item_cache_budget_bytes(self.backend.encoder)
                 cache = (
                     getattr(self.backend.encoder, "_smg_item_cache", None)
                     if budget_bytes > 0 and getattr(self.backend.encoder, "tp_size", 1) == 1
@@ -1443,7 +1464,7 @@ class NativeEncoder:
             cache = getattr(self.backend.encoder, "_smg_item_cache", None)
             if cache is not None:
                 cache_evicted = cache.drain_evictions() or None
-                if error is None and req_identities and _item_cache_budget_bytes() > 0:
+                if error is None and req_identities and cache.max_bytes > 0:
                     resident = [
                         k if cache.contains(bytes.fromhex(k)) else None for k in req_identities
                     ]

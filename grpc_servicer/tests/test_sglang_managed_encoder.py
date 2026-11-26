@@ -2582,3 +2582,154 @@ def test_encoder_staging_bytes_prefers_loaded_encoder_dims_and_element_size():
         epd_launcher._encoder_staging_bytes(fallback, hf_cfg, "bfloat16", max_tokens=100)
         == 100 * (4096 * 4) * 2
     )
+
+
+@pytest.mark.asyncio
+async def test_cached_compute_direct_embedding_raises_on_pinned_miss_shape_mismatch(monkeypatch):
+    """Mismatched miss embedding rows on a partial-pixel pinned batch must raise, not fall back."""
+
+    class _NoopCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _FakeTensor:
+        def __init__(self, rows, cols):
+            self.shape = (rows, cols)
+
+        def cpu(self):
+            return self
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(inference_mode=lambda: _NoopCtx()))
+    monkeypatch.setenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", "64")
+
+    preproc = SimpleNamespace(
+        token_counts=[4, 6],
+        _smg_item_keys=[b"k0", b"k1"],
+        _smg_pinned_embeddings=[object(), None],
+        mm_inputs={},
+        grid_thw=None,
+    )
+    ctx = SimpleNamespace(
+        is_health_check=False,
+        modality=SimpleNamespace(name="IMAGE"),
+        num_items=2,
+        preprocess_result=preproc,
+        mm_feature=None,
+        get_feature_fn=lambda _items: _FakeTensor(3, 8),  # expected 6 rows for miss idx 1
+    )
+    encoder = SimpleNamespace(
+        tp_size=1,
+        _build_model_mm_items=lambda *_a: ["miss-item"],
+    )
+    called = []
+
+    async def original(*_a, **_kw):
+        called.append(True)
+        return "should-not-run"
+
+    with pytest.raises(ValueError, match="miss embedding token count mismatch"):
+        await epd_encoder.cached_compute_direct_embedding(original, encoder, ctx)
+    assert not called
+
+
+def test_encoder_item_cache_budget_is_cached_on_encoder(monkeypatch):
+    """Hot-path budget lookup resolves available_memory_bytes once per encoder, not per request."""
+    monkeypatch.delenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", raising=False)
+    monkeypatch.delenv("SGLANG_VLM_CACHE_SIZE_MB", raising=False)
+    calls = []
+
+    def fake_avail():
+        calls.append(1)
+        return 64 * 1024**3
+
+    monkeypatch.setattr(epd_launcher, "available_memory_bytes", fake_avail)
+    encoder = SimpleNamespace(tp_size=1)
+    first = epd_encoder._encoder_item_cache_budget_bytes(encoder)
+    second = epd_encoder._encoder_item_cache_budget_bytes(encoder)
+    third = epd_encoder._encoder_item_cache_budget_bytes(encoder)
+    assert first == second == third == 4 * 1024**3
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_serve_does_not_reserve_item_cache_bytes_when_tp_gt_1(monkeypatch):
+    """tp_size > 1 must not reserve per-item cache RAM since the cache is only built at tp_size == 1."""
+    monkeypatch.setenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", "1024")
+    captured = {}
+
+    class _FakeServer:
+        def __init__(self, cfg_json, *_a):
+            captured.update(json.loads(cfg_json))
+
+        def drain(self):
+            pass
+
+        def active(self):
+            return 0
+
+        def running(self):
+            return True
+
+        def last_error(self):
+            return None
+
+        def stop(self, _timeout):
+            pass
+
+    async def fake_stop():
+        return None
+
+    fake_backend = SimpleNamespace(
+        encoder=SimpleNamespace(
+            preprocessor=SimpleNamespace(max_artifact_bytes=1),
+            model=SimpleNamespace(visual=SimpleNamespace(dtype="bfloat16")),
+            model_config=SimpleNamespace(
+                hidden_size=4096,
+                context_len=32768,
+                hf_config=SimpleNamespace(model_type="qwen3_vl", vision_config={"patch_size": 16}),
+            ),
+            _embedding_dims={"image": 4096},
+            _element_size=2,
+        ),
+        scheduler=SimpleNamespace(max_batch_size=8),
+        tp_processes=[],
+        start=lambda: None,
+        stop=fake_stop,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "smg",
+        SimpleNamespace(smg_rs=SimpleNamespace(ManagedEncoderServer=_FakeServer)),
+    )
+    monkeypatch.setitem(
+        sys.modules, "smg.smg_rs", SimpleNamespace(ManagedEncoderServer=_FakeServer)
+    )
+    monkeypatch.setattr(
+        "smg_grpc_servicer.sglang.model_artifacts.encoder_artifact_dirs",
+        lambda _args: ("/tmp/m", "/tmp/t"),
+    )
+    monkeypatch.setattr(epd_encoder, "launch_runtime", lambda *_a, **_kw: fake_backend)
+
+    async def fake_serve_native(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(epd_encoder, "serve_native", fake_serve_native)
+    monkeypatch.setattr(epd_launcher, "resolve_max_context_bytes", lambda: 64 * 1024**3)
+
+    cfg = {
+        "max_active": 8,
+        "max_control_bytes": 64 * 1024**2,
+        "max_receivers": 4,
+        "embedding_backend": "mooncake",
+        "embedding_dtype": "bfloat16",
+        "processor_options": {},
+        "shutdown_timeout_seconds": 1.0,
+    }
+    args = SimpleNamespace(
+        model_path="m", served_model_name=None, host="127.0.0.1", port=30000, tp_size=2
+    )
+    await epd_launcher.serve(cfg, args)
+    assert captured["item_cache_bytes"] == 0
