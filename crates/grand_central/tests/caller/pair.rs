@@ -425,8 +425,9 @@ pub(crate) fn in_turn(
 /// `a_decode_asked_again_that_takes_no_other_worker_leaves_the_first_standing`
 /// (`model_gateway/src/routers/common/placement.rs`).
 ///
-/// It makes no ask for a decode booked with its prefill either: the test of
-/// `decode_chosen` in `ByEngine::decode_again` there. Its case is
+/// The gateway makes no ask for a decode booked with its prefill either: the
+/// test of `decode_chosen` in `ByEngine::decode_again`
+/// (`model_gateway/src/routers/common/placement.rs`). Its case is
 /// `a_decode_booked_with_its_prefill_answers_the_ask_as_the_first_decode_standing`.
 ///
 /// A pair the classic policies picked is sent the decode its one selection
