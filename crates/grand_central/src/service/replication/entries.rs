@@ -23,7 +23,7 @@ pub enum EntryReplication {
 const HELLO: &str = "a gateway's own fact: it returns in the gateway's hello";
 const DISPATCHED: &str = "a new leader reads dispatched leases from the engines' in-flight \
                           snapshots and rebuilds credits from its own tally";
-const LEASES: &str = "no journal entry carries a reservation, an issue or a lease's end yet";
+const LEASES: &str = "no journal entry carries an issue or a lease's end yet";
 const PUBLISHED: &str = "every replica publishes its own world";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
@@ -54,18 +54,6 @@ pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
         EntryReplication::Rebuilt(HELLO),
     ),
     ("HealthSink", "vetoed", EntryReplication::Read),
-    ("ReservationStore", "window", EntryReplication::Read),
-    (
-        "ReservationStore",
-        "try_reserve",
-        EntryReplication::NotYet(LEASES),
-    ),
-    (
-        "ReservationStore",
-        "release",
-        EntryReplication::NotYet(LEASES),
-    ),
-    ("ReservationStore", "held", EntryReplication::Read),
     ("LeasesStore", "term", EntryReplication::Read),
     // The term is told to the journal: every later position is under it.
     ("LeasesStore", "set_term", EntryReplication::Journaled),

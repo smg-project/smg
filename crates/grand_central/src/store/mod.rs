@@ -3,7 +3,7 @@
 //! embedded mode feeds the same store from its own process.
 //!
 //! The store holds what a decision reads and nothing a request path writes:
-//! membership, health, reservations and leases. Every path that writes it
+//! membership, health and leases. Every path that writes it
 //! today ends in one of these sinks, so the drivers that move into the
 //! controller (discovery, the handshake, the prober) and the gateway's own
 //! copies of them in the embedded mode speak one set of traits:
@@ -12,7 +12,6 @@
 //! |---|---|---|
 //! | [`WorkersStore`] | discovery and the registration handshake, the control scope's register, patch and deregister calls | per membership change; a rollout of 512 workers is under one change per second |
 //! | [`HealthSink`] | every gateway's vetoes. A worker's status is its worker object's word, told by the holder of the objects | per veto a gateway sets or lifts |
-//! | [`ReservationStore`] | a commit (a prefill slot, a decode room), a lease's end | two per pair dispatch |
 //! | [`LeasesStore`] | every decision, dispatch and completion report, the dispatch-deadline sweep, `Hello` pages | two to three frames per request |
 //!
 //! KV events are not among them: their index, its lanes and its cursors are
@@ -24,8 +23,7 @@
 //!   registration key names the row revision it read; a stale one is refused
 //!   (`None`), never applied to the successor. The registry's status
 //!   transitions and probe completions work this way today.
-//! - **Late and duplicate records.** A release of a lease or a reservation
-//!   is idempotent.
+//! - **Late and duplicate records.** A release of a lease is idempotent.
 //! - **Instants.** The store is in-process; its instants are the host's
 //!   `Instant`. The wire carries durations only (a record's age, a lease's
 //!   deadline as an offset), converted at the edge by the relay or the
@@ -33,9 +31,8 @@
 //! - **The fencing term.** A lease carries the term of the leader that issued
 //!   it. A record whose term is above the store's own is refused (the wire's
 //!   `FAILED_PRECONDITION`); one below it is kept, as a lease restored from a
-//!   gateway's `Hello` pages after a failover is. Reservations are exclusive
-//!   under one fenced leader; credits are rebuilt from `Hello`, never
-//!   replicated.
+//!   gateway's `Hello` pages after a failover is. Credits are rebuilt from
+//!   `Hello`, never replicated.
 //!
 //! [`MemoryStore`] is the one-process store behind every trait: the
 //! controller's own store once its drivers move in, and the double the
@@ -58,7 +55,6 @@ pub(crate) mod leases;
 pub mod membership;
 pub(crate) mod memory;
 pub mod pairing;
-pub(crate) mod reservations;
 pub(crate) mod snapshot;
 pub(crate) mod workers;
 
@@ -76,7 +72,6 @@ pub use leases::{
 #[cfg(feature = "controller")]
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats, Wake};
-pub use reservations::{ReservationKind, ReservationStore};
 pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{
     identity, identity_of, token, HealthPolicy, MembershipChange, Overload, ProviderKey,

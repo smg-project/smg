@@ -15,8 +15,8 @@ use super::{
     leases::{InFlightCounts, WorkerSlot},
     AtWork, DecodeMark, DecodeSide, GatewayId, Hand, HealthSink, Journal, LeaseRecord,
     LeaseRefused, LeaseState, LeasesStore, LookOutcome, MembershipChange, MemoryStore, PickRecord,
-    Position, ReservationKind, ReservationStore, Sides, StoreSnapshot, VetoWrite, WorkerFacts,
-    WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    Position, Sides, StoreSnapshot, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+    WorkersStore,
 };
 use crate::{
     document::spec,
@@ -465,97 +465,6 @@ fn the_store_formats_without_holding_a_table_twice() {
     let store = MemoryStore::new();
     let shown = format!("{store:?}");
     assert!(shown.starts_with("MemoryStore"), "{shown}");
-}
-
-#[test]
-fn a_reservation_is_all_or_nothing_within_the_window_and_released_by_its_lease() {
-    let store = MemoryStore::new();
-    let id = ready(&store, "http://d:8000");
-    let rooms: &dyn ReservationStore = &store;
-    assert_eq!(rooms.window(id, ReservationKind::Room), Some(4));
-    let (a, b, c) = (LeaseId(1), LeaseId(2), LeaseId(3));
-    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 3, a));
-    assert!(
-        !rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 2, b),
-        "five rooms do not fit a window of four"
-    );
-    assert_eq!(
-        rooms.held(id, ReservationKind::Room),
-        3,
-        "nothing was claimed"
-    );
-    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, b));
-    assert!(
-        !rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, b),
-        "one reservation per kind per lease"
-    );
-    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Slot, 1, b));
-    rooms.release(GatewayId::LOCAL, a);
-    rooms.release(GatewayId::LOCAL, a);
-    assert_eq!(rooms.held(id, ReservationKind::Room), 1);
-    assert!(rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 3, c));
-    rooms.release(GatewayId::LOCAL, b);
-    assert_eq!(rooms.held(id, ReservationKind::Room), 3);
-    assert_eq!(rooms.held(id, ReservationKind::Slot), 0);
-    // A live worker without a bound has no window and the gate abstains; a
-    // worker the store does not know, or dropped, is refused outright.
-    let unbounded = store
-        .upsert(WorkerFacts {
-            max_running: None,
-            ..facts("http://p:8000", 1)
-        })
-        .id();
-    assert_eq!(rooms.window(unbounded, ReservationKind::Room), None);
-    assert!(
-        rooms.try_reserve(
-            GatewayId::LOCAL,
-            unbounded,
-            ReservationKind::Room,
-            100,
-            LeaseId(9)
-        ),
-        "no window: the gate abstains"
-    );
-    let unknown = WorkerId(77);
-    assert_eq!(rooms.window(unknown, ReservationKind::Room), None);
-    assert!(
-        !rooms.try_reserve(
-            GatewayId::LOCAL,
-            unknown,
-            ReservationKind::Room,
-            1,
-            LeaseId(10)
-        ),
-        "a worker the store does not know is refused"
-    );
-    let revision = WorkersStore::get(&store, id).expect("the row").revision;
-    store.remove(id, revision).expect("removed");
-    assert!(
-        !rooms.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, LeaseId(11)),
-        "a removed worker is refused whatever its window was"
-    );
-}
-
-#[test]
-fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
-    let store = MemoryStore::new();
-    let id = ready(&store, "http://d:8000");
-    let rooms: &dyn ReservationStore = &store;
-    let (g1, g2) = (GatewayId(1), GatewayId(2));
-    assert!(rooms.try_reserve(g1, id, ReservationKind::Room, 2, LeaseId(1)));
-    assert!(
-        rooms.try_reserve(g2, id, ReservationKind::Room, 2, LeaseId(1)),
-        "the other gateway's lease of the same number is its own"
-    );
-    assert_eq!(rooms.held(id, ReservationKind::Room), 4);
-    rooms.release(g1, LeaseId(1));
-    assert_eq!(
-        rooms.held(id, ReservationKind::Room),
-        2,
-        "one gateway's release frees its own claim alone"
-    );
-    rooms.release(g2, LeaseId(1));
-    assert_eq!(rooms.held(id, ReservationKind::Room), 0);
 }
 
 /// The manual preset as `generation`, its keys pinned for `ttl_s` and swept
