@@ -658,6 +658,9 @@ impl Controller {
     /// The stages a policy document may name in this controller, fixed at
     /// the bind: a spec file's document is validated against them
     /// ([`Controller::spec_file`]).
+    ///
+    /// A stage the host registered under a name the engine refuses
+    /// requests under is among them, and no document may name it.
     pub fn stage_registry(&self) -> &StageRegistry {
         &self.catalog
     }

@@ -3,12 +3,16 @@
 //! document names a stage; the validator resolves every name here, once,
 //! when the document becomes an engine. No decision reads the catalog.
 //!
-//! One namespace covers the three kinds. A built-in whose parameters are a
+//! One namespace covers the three kinds. The engine keeps the names it
+//! refuses under: a host's stage is taken under one of them, and the
+//! validator refuses a document that names it. At the name it answers
+//! [`SpecError::BadStage`]. A built-in whose parameters are a
 //! struct of the spec (every scorer, the `best-with-temperature` picker) is
 //! held by name and built by the validator from what the document wrote.
 //! A factory that takes no parameters builds a stage at registration to
 //! check its name and again for each use during validation. A factory that
 //! takes parameters builds during validation from each entry that names it.
+//! Under a name the engine refuses under neither builds during validation.
 //! Each validated policy owns its stages.
 //!
 //! A stage in code is the host's own binary, trusted as a built-in is: no
@@ -29,7 +33,10 @@ use serde_json::{Map, Value};
 
 use crate::{
     document::spec::{Needs, SpecError, SCORERS},
-    engine::framework::{Filter, Picker, Scorer},
+    engine::{
+        decision::KEPT,
+        framework::{Filter, Picker, Scorer},
+    },
     load::{
         load_report_reader::LoadReportReader,
         signals::{column_named, SignalColumn},
@@ -49,7 +56,8 @@ use crate::{
 };
 
 /// Builds one stage: once at its registration, then once for each place a
-/// document names it in each engine.
+/// document names it in each engine. Under a name the engine refuses under
+/// ([`KEPT`]) no place of a document builds it.
 type Factory<T> = Box<dyn Fn() -> Box<T> + Send + Sync>;
 
 type ScorerFactory =
@@ -81,6 +89,10 @@ pub(crate) enum Found<T: ?Sized, F = Infallible> {
     Built(Box<T>),
     /// The factory the validator calls with the parameters.
     With(F),
+    /// A host's stage under a name the engine refuses under ([`KEPT`]):
+    /// the validator refuses the document that names it, and the lookup
+    /// runs no factory for it.
+    Kept,
 }
 
 /// The parameters and profile state available to a stage's factory.
@@ -161,9 +173,10 @@ impl StageBuild<'_> {
     /// Reads the parameters into `T`. A bare name supplies an empty map.
     /// The validator removes a scorer's `weight`, so it appears in
     /// neither `T`'s input nor [`Self::written`]; a filter's map and a
-    /// picker's are handed whole. Derive
+    /// picker's are handed whole. Put
     /// `#[serde(deny_unknown_fields)]` on `T`: otherwise a misspelled
-    /// parameter is ignored and its default runs.
+    /// parameter is ignored, a field with a default takes it, and a
+    /// required field is reported missing.
     pub fn params<T: DeserializeOwned>(&self) -> Result<T, StageError> {
         serde_json::from_value(Value::Object(self.written.clone())).map_err(StageError::from)
     }
@@ -347,6 +360,12 @@ pub enum StageRegistryError {
 /// build's; a host adds its own under new names and hands the catalog to
 /// the validator ([`crate::document::PolicySpec::validate_in`]).
 ///
+/// A host's stage is taken under a name the engine refuses requests under
+/// by itself, such as [`BINDING`](crate::engine::BINDING) or
+/// [`TARGET_WORKER`](crate::engine::TARGET_WORKER), and validation refuses
+/// a document that names it: at the name it answers
+/// [`SpecError::BadStage`].
+///
 /// A running engine keeps a profile's stages from one document to the next
 /// (`InProcess::apply`) only where both were validated over the stock
 /// table, or over one table of the host's own as it stood at both
@@ -458,6 +477,9 @@ impl StageRegistry {
     /// The factory runs once for each place the document names the filter
     /// at every validation, including a start, an apply, and a dry run.
     /// It must have no effect outside the filter it returns.
+    ///
+    /// Under a name the engine refuses requests under the factory runs at
+    /// no place: validation refuses a document that names the filter.
     pub fn filter_with<F>(
         &mut self,
         name: &'static str,
@@ -498,6 +520,9 @@ impl StageRegistry {
     /// The factory runs once for each place the document names the scorer
     /// at every validation, including a start, an apply, and a dry run.
     /// It must have no effect outside the scorer it returns.
+    ///
+    /// Under a name the engine refuses requests under the factory runs at
+    /// no place: validation refuses a document that names the scorer.
     pub fn scorer_with<F>(
         &mut self,
         name: &'static str,
@@ -539,6 +564,9 @@ impl StageRegistry {
     /// The factory runs once for each profile that names the picker at
     /// every validation, including a start, an apply, and a dry run. It
     /// must have no effect outside the picker it returns.
+    ///
+    /// Under a name the engine refuses requests under the factory runs for
+    /// no profile: validation refuses a document that names the picker.
     pub fn picker_with<F>(
         &mut self,
         name: &'static str,
@@ -622,18 +650,25 @@ impl StageRegistry {
     }
 }
 
+/// What `held`, the stages of one kind, holds under `name`: the one lookup
+/// behind the three kinds. A name the engine refuses under ([`KEPT`]) that
+/// a stage of the kind holds answers [`Found::Kept`], ahead of any build:
+/// no factory runs for it. One that no stage of the kind holds answers
+/// `None`, as any other name does.
 fn find<'a, T: ?Sized, B, F>(
     held: &'a [(&'static str, Build<T, B>)],
     name: &str,
     factory_ref: impl FnOnce(&'a B) -> F,
 ) -> Option<Found<T, F>> {
-    held.iter()
-        .find(|(held, _)| *held == name)
-        .map(|(_, build)| match build {
-            Build::Typed => Found::Typed,
-            Build::Factory(factory) => Found::Built(factory()),
-            Build::With(factory) => Found::With(factory_ref(factory)),
-        })
+    let (_, build) = held.iter().find(|(held, _)| *held == name)?;
+    if KEPT.contains(&name) {
+        return Some(Found::Kept);
+    }
+    Some(match build {
+        Build::Typed => Found::Typed,
+        Build::Factory(factory) => Found::Built(factory()),
+        Build::With(factory) => Found::With(factory_ref(factory)),
+    })
 }
 
 /// The names by kind, the host's one fact, whether it makes the

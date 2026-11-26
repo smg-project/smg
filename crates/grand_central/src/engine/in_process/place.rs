@@ -95,7 +95,9 @@ use crate::{
         DerivedKeys, KeySource,
     },
     engine::{
-        decision::{Decision, PairSide, Pick, ShedReason, Target, MAX_TARGETS},
+        decision::{
+            Decision, PairSide, Pick, ShedReason, Target, ADMITS, BUDGET, ENCODE_ITEMS, MAX_TARGETS,
+        },
         decision_engine::{
             AlonePick, DecideOutcome, DecisionRefused, Plain, Request, RequestMaker, TextKey,
             TokenKey, WorkerLists,
@@ -1520,20 +1522,6 @@ fn admitted(request: &PlaceRequest<'_>, worker: &dyn Worker) -> bool {
 pub(super) fn sendable(request: &PlaceRequest<'_>, worker: &dyn Worker) -> bool {
     ready(worker) && admitted(request, worker)
 }
-
-/// What a request that carries encode items over other lists than an
-/// encode request's three is declined under: no list of it holds an encoder.
-const ENCODE_ITEMS: &str = "encode-items";
-
-/// What a request is shed under where its route's rule takes no worker of
-/// its list: the rule's own name on a request ([`PlaceRequest::admits`]).
-/// A pair's first decision's shed as saturated is the answer in its place
-/// where that shed stands ([`pair::again`]).
-const ADMITS: &str = "admits";
-
-/// What a request is shed under where its call's earlier decisions left
-/// none of its budget ([`PlaceRequest::budget_micros`]).
-const BUDGET: &str = "budget";
 
 /// The refusal of a request this call does not place, by name: the shed a
 /// decision answers for what no stage of it runs.

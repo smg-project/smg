@@ -15,7 +15,8 @@ use crate::{
     engine::{
         decision::{
             Decision, LiftedVeto, Overlap, PairSide, Pick, Placing, Shed, ShedReason, Survivors,
-            Target, Targets, Trace, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
+            Target, Targets, Trace, AFFINITY_COLUMN, BINDING, EC_COMPATIBLE, MAX_TARGETS, NO_STAGE,
+            PARTNERED, PARTNERS, PREFILL_GONE, TARGET_WORKER, TRACE_TOP, VISION, WRITTEN_ROWS,
         },
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
@@ -2185,7 +2186,7 @@ fn filter(
             places::open(kept, candidates.len(), cx);
             kept.retain(|&i| classed(classes, candidates[i as usize].pair_class));
             if kept.is_empty() {
-                return Some("partners");
+                return Some(PARTNERS);
             }
             // The decode a pair's request names: the row its number reaches
             // among these, and the side's one row. A number past them
@@ -2206,13 +2207,13 @@ fn filter(
                     .extend(rows.filter(|&i| classed(classes, candidates[i as usize].pair_class))),
             }
             if kept.is_empty() {
-                return Some("partners");
+                return Some(PARTNERS);
             }
         }
         None => places::open(kept, candidates.len(), cx),
     }
     if kept.is_empty() {
-        return Some("none");
+        return Some(NO_STAGE);
     }
     if let Some(p) = partnered {
         match only(p) {
@@ -2226,7 +2227,7 @@ fn filter(
     if encode {
         kept.retain(|&i| candidates[i as usize].ec_compatible);
         if kept.is_empty() {
-            return Some("ec-compatible");
+            return Some(EC_COMPATIBLE);
         }
         kept.retain(|&i| vision_fits(facts, &candidates[i as usize]));
         if kept.is_empty() {
@@ -2589,12 +2590,6 @@ impl<'a> Set<'a> {
         Self { vetoed, ..self }
     }
 }
-
-/// The stage a pool is shed under when none of its rows takes the pixels
-/// its request holds, an image or a video: the `epd` plan's vision rule
-/// sheds under it, and so does a request's vision demand
-/// ([`UnmetDemand::Vision`](crate::engine::demands::UnmetDemand::Vision)).
-pub(crate) const VISION: &str = "vision";
 
 /// The `epd` plan's vision rule: a request that holds pixels, an image or
 /// a video ([`MediaCounts::holds_pixels`]), takes an encoder with a vision
@@ -5387,17 +5382,6 @@ impl<'a> PairPools<'a> {
     }
 }
 
-/// The stage a decision names when it is refused for its affinity column:
-/// what a host counts its sheds under.
-const AFFINITY_COLUMN: &str = "affinity-column";
-
-/// The stage a pair's decision names where the workers left pair with
-/// nobody that stands: a prefill side narrowed to the classes with an open
-/// partner that keeps no row ([`filter`]), prefills that stand and pair
-/// with no decode, and a shed with no endpoint whose worker with room
-/// pairs with nobody ([`Half::refused_room`]).
-const PARTNERED: &str = "partnered";
-
 /// Whether the request carries a column of its own or names rows. A pair
 /// reads neither: its columns ride its two pools ([`PairPools`]), and
 /// either on the request names neither pool.
@@ -5456,10 +5440,6 @@ fn target_missed(decision: Decision) -> Decision {
         other => other,
     }
 }
-
-/// The stage a decision names when a profile that shows its rows to a
-/// plugin was handed rows that carry a mask beside them.
-const WRITTEN_ROWS: &str = "written-rows";
 
 /// The decline of a decision whose rows were not written for the plugin
 /// they are shown to, under the profile that declines. Cold and out of
@@ -7385,7 +7365,7 @@ impl Engine {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
         let Some((entry, index, profile)) = self.resolve(facts.model, facts.phase) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         let Entry {
             binding,
@@ -8725,7 +8705,7 @@ impl Engine {
         // profile is the pair's decode side. A binding of the single plan
         // declines a pair decision: the host and the spec disagree.
         let Some(entry) = self.pair_entry(facts.model) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         // The binding's word for a pool a soft veto empties: the live
         // decode side is put to the all-vetoed rule by it ([`Set::ruled`]).
@@ -8735,7 +8715,7 @@ impl Engine {
             self.profiles.get(usize::from(binding.profile)),
             self.profiles.get(usize::from(decode_index)),
         ) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         // A plugin reads a row's own fields: a side that shows its rows is
         // handed rows written for the decision. A mask beside that side's
@@ -9101,7 +9081,7 @@ impl Engine {
                         let whole = Set::side(prefills, None, None);
                         let buf = &mut scratch.single;
                         let stage = filter(prefill_profile, &prefill_facts, run_cx, buf, whole);
-                        Some(stage.unwrap_or("none"))
+                        Some(stage.unwrap_or(NO_STAGE))
                     } else if scratch.classes.is_empty() {
                         Some(PARTNERED)
                     } else {
@@ -9113,7 +9093,7 @@ impl Engine {
                         let partners = Set::side(decodes, None, Some(&scratch.classes));
                         let buf = &mut scratch.decode;
                         filter(decode_profile, &decode_facts, decode_cx, buf, partners)
-                            .filter(|&stage| stage != "none")
+                            .filter(|&stage| stage != NO_STAGE)
                     };
                     let reason = named.map_or(prefill_shed.reason, reason_of);
                     // A pass the overload veto ended names that veto, the
@@ -9296,7 +9276,7 @@ impl Engine {
             // target's name.
             Some(last) if decode_cx.target_worker.is_some() => target_missed(Decision::Shed(last)),
             Some(last) => Decision::Shed(last),
-            None => shed(ShedReason::NoEndpoints, "partners", prefill_pick.trace),
+            None => shed(ShedReason::NoEndpoints, PARTNERS, prefill_pick.trace),
         }
         .of_side(PairSide::Decode)
     }
@@ -9688,8 +9668,7 @@ impl Engine {
                                 lifted: LiftedVeto::None,
                                 ..pick.trace
                             };
-                            shed(ShedReason::NoEndpoints, "partners", trace)
-                                .of_side(PairSide::Decode)
+                            shed(ShedReason::NoEndpoints, PARTNERS, trace).of_side(PairSide::Decode)
                         }
                         step => step,
                     }
@@ -9870,12 +9849,12 @@ impl Engine {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         };
         let Some(entry) = self.pair_entry(facts.model) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         let binding = &entry.binding;
         let index = binding.decode_profile.unwrap_or(binding.profile);
         let Some(profile) = self.profiles.get(usize::from(index)) else {
-            return shed(ShedReason::PolicyDeclined, "binding", bare);
+            return shed(ShedReason::PolicyDeclined, BINDING, bare);
         };
         // The held prefill is looked for before any constraint is read: a
         // call whose prefill left the lists says so, whatever it states.
@@ -9886,7 +9865,7 @@ impl Engine {
                 ..bare
             };
             // The held prefill is the side left with nobody.
-            return shed(ShedReason::NoEndpoints, "prefill-gone", under).of_side(PairSide::Prefill);
+            return shed(ShedReason::NoEndpoints, PREFILL_GONE, under).of_side(PairSide::Prefill);
         };
         let shown = self.marks[usize::from(index)].scoped();
         if shown && !decode_cx.stalled.is_empty() {

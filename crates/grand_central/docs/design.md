@@ -510,6 +510,8 @@ The built-in stages:
 
 A program that embeds the crate can add stages of its own under new names
 (`StageRegistry::filter`, `scorer`, `picker`) and validate documents against that table.
+The engine keeps the names it refuses under. The registry takes a host's stage of such a name, and
+the check refuses a document that names it.
 
 **[built]** One default method is shown, `balances_load_against_affinity`: a scorer of a program's
 own that weighs load against affinity must answer it, because a pair's lift rests on it. A scorer
