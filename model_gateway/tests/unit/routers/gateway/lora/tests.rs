@@ -339,8 +339,54 @@ fn an_adapter_request_goes_to_the_family_that_can_serve_it() {
 
     for draw in 0..100 {
         let router = gateway
-            .select_router_for_adapter("base", Some("adapter"))
+            .select_router_for_adapter("base", Some("adapter"), Media::Absent)
             .expect("the pair serves the adapter");
         assert_eq!(router.router_type(), "grpc_pd", "draw {draw}");
     }
+}
+
+/// The adapter draw sees the request's media. The EPD family's encode
+/// worker is down, so an adapter request with media goes to the regular
+/// family, and the EPD family still takes text.
+#[test]
+fn an_adapter_request_with_media_needs_an_encode_worker_that_can_serve() {
+    use WorkerStatus::{NotReady, Ready};
+    let registry = Arc::new(WorkerRegistry::new());
+    for (port, role, status) in [
+        (9650, WorkerType::Regular, Ready),
+        (9651, WorkerType::Encode, NotReady),
+        (9652, WorkerType::Prefill, Ready),
+        (9653, WorkerType::Decode, Ready),
+    ] {
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
+                    .model(ModelCard::new("base"))
+                    .worker_type(role)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Sglang)
+                    .status(status)
+                    .build(),
+            ))
+            .unwrap();
+    }
+    let mut gateway = Gateway::new(registry);
+    gateway.enable_igw = true;
+    gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(Capture("grpc")));
+    gateway.register_router(router_ids::GRPC_EPD, Arc::new(Capture("grpc_epd")));
+
+    let draw = |media| {
+        gateway
+            .select_router_for_adapter("base", Some("adapter"), media)
+            .expect("a family serves the adapter")
+            .router_type()
+    };
+    for draw_index in 0..100 {
+        assert_eq!(draw(Media::Present), "grpc", "draw {draw_index}");
+    }
+    let text: Vec<_> = (0..100).map(|_| draw(Media::Absent)).collect();
+    assert!(
+        text.contains(&"grpc_epd"),
+        "the EPD family took no text: {text:?}"
+    );
 }

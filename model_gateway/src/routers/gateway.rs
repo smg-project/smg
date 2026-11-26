@@ -65,7 +65,10 @@ use crate::{
         },
         error as route_error,
         factory::{router_ids, RouterId},
-        grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
+        grpc::{
+            multimodal::{media_plan_chat, media_plan_messages},
+            regular::stages::decisions::supports_worker as supports_decisions_worker,
+        },
         message_threads::{MessageThreads, ThreadTurn},
         BodyPolicy, RouterFactory, RouterTrait,
     },
@@ -88,7 +91,7 @@ struct RouterFamily {
     /// The wire a PD or EPD family pairs its prefill and decode workers on;
     /// `None` for a regular family.
     wire: Option<PdWire>,
-    /// The encode pool of an EPD family: an image request needs a worker
+    /// The encode pool of an EPD family: a request with media needs a worker
     /// there, a text request does not.
     encode: Option<RoutingPool>,
     /// A family whose weight takes this one's place.
@@ -140,29 +143,41 @@ const ROUTER_FAMILIES: [RouterFamily; 5] = [
     },
 ];
 
-/// One check of the family draw ([`Gateway::draw_family`]).
-struct DrawCheck {
-    /// Which workers can serve.
-    can_serve: fn(&dyn Worker) -> bool,
-    /// Whether an EPD family needs an encode worker that can serve.
-    needs_encode: bool,
+/// Whether a request carries a media item: an image, audio or video. An EPD
+/// router sends each media item to an encode worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Media {
+    /// No media item: an EPD family needs only a prefill and decode pair.
+    Absent,
+    /// A media item: an EPD family also needs an encode worker.
+    Present,
 }
 
-/// The checks of the family draw, in the order it tries them.
-const DRAW_CHECKS: [DrawCheck; 3] = [
-    DrawCheck {
-        can_serve: routable_but_for_overload,
-        needs_encode: true,
-    },
-    DrawCheck {
-        can_serve: routable_but_for_overload,
-        needs_encode: false,
-    },
-    DrawCheck {
-        can_serve: routable_but_for_veto,
-        needs_encode: false,
-    },
-];
+impl Media {
+    /// The media of a chat request, as the gRPC chat pipeline reads it.
+    fn of_chat(request: &ChatCompletionRequest) -> Self {
+        Self::when(!media_plan_chat(&request.messages).is_empty())
+    }
+
+    /// The media of a Messages request, as the gRPC Messages pipeline reads
+    /// it.
+    fn of_messages(request: &CreateMessageRequest) -> Self {
+        Self::when(!media_plan_messages(&request.messages).is_empty())
+    }
+
+    /// The media of a generate request.
+    fn of_generate(request: &GenerateRequest) -> Self {
+        Self::when(request.carries_media())
+    }
+
+    fn when(carried: bool) -> Self {
+        if carried {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+}
 
 /// The default router, resolved when it is set or mounted and read per
 /// request as it is: a single-router gateway reached its one router through
@@ -407,27 +422,21 @@ impl Gateway {
 
     /// Draws the router for one request. `registered` holds each family's
     /// weight from its registered workers, in [`ROUTER_FAMILIES`] order.
-    /// `takes` tells which workers of a pool can take this request.
+    /// `media` tells if the request carries a media item, and `takes` tells
+    /// which workers of a pool can take the request.
     ///
     /// A router selects only from its own pools. If no worker there can
     /// serve, it refuses the request. So when more than one family has
     /// weight, a family weighs only its workers that can serve. A PD or EPD
     /// family gets weight only if a compatible prefill and decode pair can
-    /// serve.
+    /// serve. For a request with media, an EPD family also needs an encode
+    /// worker that can serve.
     ///
-    /// The draw does not see the request, so it tries three checks, in this
-    /// order. In the first two, a worker can serve if it is ready, permitted
-    /// by the circuit breaker, and not stalled.
-    ///
-    /// 1. An EPD family also needs an encode worker that can serve. So the
-    ///    family drawn can take every request.
-    /// 2. An EPD family needs no encode worker. It can take text requests
-    ///    only, because an image request needs an encode worker.
-    /// 3. A stalled worker can serve too. A router uses a stalled worker
-    ///    when it has no other.
-    ///
-    /// If no family gets weight from any check, the registered weights
-    /// decide, and the router drawn refuses the request.
+    /// A worker can serve if it is ready, permitted by the circuit breaker,
+    /// and not stalled. If no family gets weight, a stalled worker can serve
+    /// too, because a router uses a stalled worker when it has no other. If
+    /// still no family gets weight, the registered weights decide, and the
+    /// router drawn refuses the request.
     ///
     /// Overload does not remove weight. If it did, all requests of a busy
     /// family would move at once. They could move to an HTTP worker whose
@@ -438,6 +447,7 @@ impl Gateway {
         &self,
         snapshot: &ModelWorkerSnapshot,
         registered: &[usize; ROUTER_FAMILIES.len()],
+        media: Media,
         takes: impl Fn(RoutingPool, &dyn Worker) -> bool,
     ) -> Option<Arc<dyn RouterTrait>> {
         if registered.iter().filter(|weight| **weight > 0).count() <= 1 {
@@ -448,11 +458,9 @@ impl Gateway {
             .as_ref()
             .map(|policies| policies.pd_pairing_mode())
             .unwrap_or_default();
-        for DrawCheck {
-            can_serve,
-            needs_encode,
-        } in DRAW_CHECKS
-        {
+        let checks: [fn(&dyn Worker) -> bool; 2] =
+            [routable_but_for_overload, routable_but_for_veto];
+        for can_serve in checks {
             let serves = |pool: RoutingPool, worker: &Arc<dyn Worker>| {
                 takes(pool, worker.as_ref()) && can_serve(worker.as_ref())
             };
@@ -477,7 +485,7 @@ impl Gateway {
                     && family.wire.is_none_or(&pair_serves)
                     && family
                         .encode
-                        .is_none_or(|pool| !needs_encode || pool_serves(pool));
+                        .is_none_or(|pool| media == Media::Absent || pool_serves(pool));
                 if !can_take {
                     continue;
                 }
@@ -554,7 +562,11 @@ impl Gateway {
     /// the family cannot use (ZMQ prefill or decode) no longer counts; a
     /// family with one pool missing takes the request only when no family
     /// has weight (see [`Self::incomplete_disaggregated_router`]).
-    fn select_router_for_model(&self, model_id: Option<&str>) -> Option<Arc<dyn RouterTrait>> {
+    fn select_router_for_model(
+        &self,
+        model_id: Option<&str>,
+        media: Media,
+    ) -> Option<Arc<dyn RouterTrait>> {
         let snapshot = self
             .worker_registry
             .get_routing_snapshot(model_id.unwrap_or(UNKNOWN_MODEL_ID));
@@ -565,7 +577,7 @@ impl Gateway {
         }
         let size = |pool: RoutingPool| snapshot.pool(pool).len();
         let registered = self.family_weights(size);
-        self.draw_family(&snapshot, &registered, |_, _| true)
+        self.draw_family(&snapshot, &registered, media, |_, _| true)
             .or_else(|| {
                 self.incomplete_disaggregated_router(
                     size(RoutingPool::GrpcEncode),
@@ -696,11 +708,24 @@ impl Gateway {
         self.enable_igw && (model_id.trim().is_empty() || model_id == UNKNOWN_MODEL_ID)
     }
 
-    /// The router that serves `model_id`, or the default router when the
-    /// fleet gives no answer.
+    /// The router that serves `model_id` for a request with no media item,
+    /// or the default router when the fleet gives no answer.
     pub fn select_router_for_request(
         &self,
         model_id: Option<&str>,
+    ) -> Option<Arc<dyn RouterTrait>> {
+        self.select_router_for_media(model_id, Media::Absent)
+    }
+
+    /// [`Self::select_router_for_request`] for a request that carries
+    /// `media`. Only the chat, generate and Messages routes can send media to
+    /// an EPD router. The other routes draw with [`Media::Absent`]: a
+    /// completion request has no media, and the EPD router refuses the
+    /// routes that can carry media, such as responses.
+    fn select_router_for_media(
+        &self,
+        model_id: Option<&str>,
+        media: Media,
     ) -> Option<Arc<dyn RouterTrait>> {
         // In single-router mode (enable_igw=false), always use the default router
         if !self.enable_igw {
@@ -714,7 +739,7 @@ impl Gateway {
             }
         }
 
-        self.select_router_for_model(model_id).or_else(|| {
+        self.select_router_for_model(model_id, media).or_else(|| {
             if let Some(model) = model_id {
                 if self.external_router_missing(model) {
                     warn!(
@@ -765,16 +790,16 @@ impl Gateway {
 
     /// The router of a Messages request: in IGW mode an empty message (a
     /// `max_tokens` of 0) may go to a router that answers it without an
-    /// engine. Takes the request's `max_tokens`, the one field it reads.
+    /// engine. Any other request draws by its media.
     fn select_messages_router(
         &self,
-        max_tokens: u32,
+        request: &CreateMessageRequest,
         model_id: &str,
     ) -> Option<Arc<dyn RouterTrait>> {
-        if self.enable_igw && max_tokens == 0 {
+        if self.enable_igw && request.max_tokens == 0 {
             self.select_router_for_empty_message(model_id)
         } else {
-            self.select_router_for_request(Some(model_id))
+            self.select_router_for_media(Some(model_id), Media::of_messages(request))
         }
     }
 
@@ -840,7 +865,7 @@ impl Gateway {
         };
         let lineage = self.thread_lineage_headers(headers, turn.as_ref());
         let headers = lineage.as_ref().or(headers);
-        let response = match self.select_messages_router(body.max_tokens, model_id) {
+        let response = match self.select_messages_router(&body, model_id) {
             Some(router) => {
                 router
                     .route_messages(headers, tenant_meta, Arc::new(body), model_id)
@@ -924,6 +949,7 @@ impl RouterTrait for Gateway {
         let router = self.select_router_for_adapter(
             model_id,
             body.lora_path.as_deref().or(body.lora_id.as_deref()),
+            Media::of_generate(&body),
         );
         match router {
             Some(router) => {
@@ -954,10 +980,11 @@ impl RouterTrait for Gateway {
             Err(response) => return response,
         };
         let model_id = lora_model.as_deref().unwrap_or(model_id);
+        let media = Media::of_chat(&body);
         let router = if lora_model.is_some() {
-            self.select_lora_router(model_id)
+            self.select_lora_router(model_id, media)
         } else {
-            self.select_router_for_adapter(model_id, body.lora_path.as_deref())
+            self.select_router_for_adapter(model_id, body.lora_path.as_deref(), media)
         };
         match router {
             Some(router) => {
@@ -985,10 +1012,11 @@ impl RouterTrait for Gateway {
             Err(response) => return response,
         };
         let model_id = lora_model.as_deref().unwrap_or(model_id);
+        // A completion request carries no media.
         let router = if lora_model.is_some() {
-            self.select_lora_router(model_id)
+            self.select_lora_router(model_id, Media::Absent)
         } else {
-            self.select_router_for_adapter(model_id, body.lora_path.as_deref())
+            self.select_router_for_adapter(model_id, body.lora_path.as_deref(), Media::Absent)
         };
         match router {
             Some(router) => {
@@ -1014,7 +1042,7 @@ impl RouterTrait for Gateway {
             return Box::pin(self.route_messages_thread(headers, tenant_meta, body, model_id))
                 .await;
         }
-        match self.select_messages_router(body.max_tokens, model_id) {
+        match self.select_messages_router(&body, model_id) {
             Some(router) => {
                 router
                     .route_messages(headers, tenant_meta, body, model_id)
@@ -1197,7 +1225,7 @@ impl RouterTrait for Gateway {
                     "Decisions requires a regular HTTP or SGLang gRPC worker for this model",
                 );
             }
-            self.draw_family(&snapshot, &[0, 0, 0, grpc, http], takes)
+            self.draw_family(&snapshot, &[0, 0, 0, grpc, http], Media::Absent, takes)
         } else {
             self.select_router_for_request(Some(model_id))
         };
@@ -2078,15 +2106,45 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// A Messages router that answers with its own name, so a test can read
-    /// which router the gateway chose.
+    /// A router that answers chat, completion, generate and Messages requests
+    /// with its own name, so a test can read which router the gateway chose.
     #[derive(Debug)]
-    struct NamedMessagesRouter(&'static str);
+    struct NamedRouter(&'static str);
 
     #[async_trait]
-    impl RouterTrait for NamedMessagesRouter {
+    impl RouterTrait for NamedRouter {
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+
+        async fn route_chat(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: Arc<ChatCompletionRequest>,
+            _model_id: &str,
+        ) -> Response {
+            (StatusCode::OK, self.0).into_response()
+        }
+
+        async fn route_completion(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: CompletionRequest,
+            _model_id: &str,
+        ) -> Response {
+            (StatusCode::OK, self.0).into_response()
+        }
+
+        async fn route_generate(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: GenerateRequest,
+            _model_id: &str,
+        ) -> Response {
+            (StatusCode::OK, self.0).into_response()
         }
 
         async fn route_messages(
@@ -2411,14 +2469,8 @@ mod tests {
     #[tokio::test]
     async fn max_tokens_zero_goes_to_a_grpc_router_in_mixed_deployments() {
         let gateway = test_gateway(true);
-        gateway.register_router(
-            router_ids::HTTP_REGULAR,
-            Arc::new(NamedMessagesRouter("http")),
-        );
-        gateway.register_router(
-            router_ids::GRPC_REGULAR,
-            Arc::new(NamedMessagesRouter("grpc")),
-        );
+        gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(NamedRouter("http")));
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(NamedRouter("grpc")));
         register_worker(
             &gateway,
             "grpc://worker-0:30000",
@@ -2446,14 +2498,8 @@ mod tests {
         assert!(["grpc", "http"].contains(&messages_router(&gateway, 1).await.as_str()));
 
         let gateway = test_gateway(true);
-        gateway.register_router(
-            router_ids::HTTP_REGULAR,
-            Arc::new(NamedMessagesRouter("http")),
-        );
-        gateway.register_router(
-            router_ids::GRPC_PD,
-            Arc::new(NamedMessagesRouter("grpc-pd")),
-        );
+        gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(NamedRouter("http")));
+        gateway.register_router(router_ids::GRPC_PD, Arc::new(NamedRouter("grpc-pd")));
         register_worker(
             &gateway,
             "grpc://prefill:30000",
@@ -2479,14 +2525,8 @@ mod tests {
         }
 
         let gateway = test_gateway(true);
-        gateway.register_router(
-            router_ids::HTTP_REGULAR,
-            Arc::new(NamedMessagesRouter("http")),
-        );
-        gateway.register_router(
-            router_ids::GRPC_REGULAR,
-            Arc::new(NamedMessagesRouter("grpc")),
-        );
+        gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(NamedRouter("http")));
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(NamedRouter("grpc")));
         register_worker(
             &gateway,
             "http://worker-1:8080",
@@ -2622,7 +2662,7 @@ mod tests {
             // answer with their own names.
             manager.register_router(router_ids::HTTP_REGULAR, Arc::new(StubRouter));
             for (id, name) in families {
-                manager.register_router((*id).clone(), Arc::new(NamedMessagesRouter(name)));
+                manager.register_router((*id).clone(), Arc::new(NamedRouter(name)));
             }
             manager
         }
@@ -2886,7 +2926,7 @@ mod tests {
             (router_ids::GRPC_REGULAR, "grpc"),
             (router_ids::HTTP_REGULAR, "http"),
         ] {
-            gateway.register_router(id, Arc::new(NamedMessagesRouter(name)));
+            gateway.register_router(id, Arc::new(NamedRouter(name)));
         }
         for (index, (mode, role, serving)) in workers.iter().enumerate() {
             let url = format!("http://w{index}:8000");
@@ -2916,24 +2956,31 @@ mod tests {
         gateway
     }
 
-    /// [`assert_drawn`] over a [`named_family_gateway`] of `workers`.
+    /// [`assert_drawn`] for a text request, over a [`named_family_gateway`]
+    /// of `workers`.
     fn assert_shares(
         workers: &[(ConnectionMode, WorkerType, Serving)],
         expected: &[(&'static str, f64)],
     ) {
-        assert_drawn(&named_family_gateway(workers), workers, expected);
+        let gateway = named_family_gateway(workers);
+        assert_drawn(&gateway, Media::Absent, workers, expected);
     }
 
-    /// Draws a router for model `m` many times. Asserts that only the
-    /// `expected` families are drawn, each within 5 points of its share.
-    /// `fleet` names the workers in the failure message.
-    fn assert_drawn(gateway: &Gateway, fleet: impl Debug, expected: &[(&'static str, f64)]) {
+    /// Draws a router for a request to model `m` with `media` many times.
+    /// Asserts that only the `expected` families are drawn, each within 5
+    /// points of its share. `fleet` names the workers in the failure message.
+    fn assert_drawn(
+        gateway: &Gateway,
+        media: Media,
+        fleet: impl Debug,
+        expected: &[(&'static str, f64)],
+    ) {
         const DRAWS: u32 = 10_000;
         const TOLERANCE: f64 = 0.05;
         let mut drawn = BTreeMap::<_, f64>::new();
         for _ in 0..DRAWS {
             let router = gateway
-                .select_router_for_request(Some("m"))
+                .select_router_for_media(Some("m"), media)
                 .expect("a family serves the model");
             *drawn.entry(router.router_type()).or_default() += 1.0 / f64::from(DRAWS);
         }
@@ -2943,7 +2990,10 @@ mod tests {
                     .get(family)
                     .is_some_and(|drawn| (drawn - share).abs() < TOLERANCE)
             });
-        assert!(within, "{fleet:?}: drew {drawn:?}, expected {expected:?}");
+        assert!(
+            within,
+            "{media:?}, {fleet:?}: drew {drawn:?}, expected {expected:?}"
+        );
     }
 
     const HTTP: ConnectionMode = ConnectionMode::Http;
@@ -3044,30 +3094,136 @@ mod tests {
         );
     }
 
-    /// An EPD fleet with no encode worker that can serve takes no image
-    /// request, so a family that can take every request goes first. Beside a
-    /// stalled worker, the EPD fleet takes the requests, because it can take
-    /// text. The gRPC PD family stays behind it.
+    /// An EPD family takes a request with media only if an encode worker can
+    /// serve it. A text request needs no encode worker, so while the encode
+    /// worker is down the EPD family still takes text. The gRPC PD family
+    /// stays behind the EPD family.
     #[test]
-    fn an_epd_fleet_without_an_encode_worker_yields_to_a_family_that_serves_all() {
+    fn an_epd_family_takes_media_only_if_an_encode_worker_can_serve() {
+        use Serving::{NotReady, Overloaded, Stalled, Yes};
+        use WorkerType::{Decode, Encode, Prefill, Regular};
+        let (up, down) = ((GRPC, Encode, Yes), (GRPC, Encode, NotReady));
+        let (prefill, decode) = ((GRPC, Prefill, Yes), (GRPC, Decode, Yes));
+        let (stalled_prefill, stalled_decode) = ((GRPC, Prefill, Stalled), (GRPC, Decode, Stalled));
+        let registered = vec![("grpc_epd", 0.75), ("http", 0.25)];
+        let pair_and_http = vec![("grpc_epd", 2.0 / 3.0), ("http", 1.0 / 3.0)];
+        let (epd, http) = (vec![("grpc_epd", 1.0)], vec![("http", 1.0)]);
+        // Each fleet, with the shares of a text request and of a request
+        // with media.
+        for (fleet, text, media) in [
+            (
+                vec![up, prefill, decode, (HTTP, Regular, Yes)],
+                registered.clone(),
+                registered,
+            ),
+            (
+                vec![down, prefill, decode, (HTTP, Regular, Yes)],
+                pair_and_http.clone(),
+                http.clone(),
+            ),
+            // Overload does not remove weight, so the overloaded worker
+            // gets only its share of text.
+            (
+                vec![down, prefill, decode, (HTTP, Regular, Overloaded)],
+                pair_and_http.clone(),
+                http.clone(),
+            ),
+            (
+                vec![down, prefill, decode, (HTTP, Regular, Stalled)],
+                epd.clone(),
+                http.clone(),
+            ),
+            (
+                vec![
+                    down,
+                    stalled_prefill,
+                    stalled_decode,
+                    (HTTP, Regular, Stalled),
+                ],
+                pair_and_http,
+                http,
+            ),
+            // A family alone takes every request, and its router refuses
+            // the ones it cannot serve.
+            (vec![down, prefill, decode], epd.clone(), epd),
+        ] {
+            let gateway = named_family_gateway(&fleet);
+            assert_drawn(&gateway, Media::Absent, &fleet, &text);
+            assert_drawn(&gateway, Media::Present, &fleet, &media);
+        }
+    }
+
+    /// The chat, generate and Messages routes tell the draw if the request
+    /// carries media. A completion request is text. The encode worker is
+    /// down and the HTTP worker is stalled, so a request with media goes to
+    /// HTTP and a text request goes to the EPD family.
+    #[tokio::test]
+    async fn a_route_draws_by_the_media_of_its_request() {
+        use serde_json::json;
         use Serving::{NotReady, Stalled, Yes};
         use WorkerType::{Decode, Encode, Prefill, Regular};
-        let prefill = (GRPC, Prefill, Yes);
-        let decode = (GRPC, Decode, Yes);
-        assert_shares(
-            &[(GRPC, Encode, Yes), prefill, decode, (HTTP, Regular, Yes)],
-            &[("grpc_epd", 0.75), ("http", 0.25)],
-        );
-        let encode = (GRPC, Encode, NotReady);
-        assert_shares(&[encode, prefill, decode], &[("grpc_epd", 1.0)]);
-        assert_shares(
-            &[encode, prefill, decode, (HTTP, Regular, Yes)],
-            &[("http", 1.0)],
-        );
-        assert_shares(
-            &[encode, prefill, decode, (HTTP, Regular, Stalled)],
-            &[("grpc_epd", 1.0)],
-        );
+        let gateway = named_family_gateway(&[
+            (GRPC, Encode, NotReady),
+            (GRPC, Prefill, Yes),
+            (GRPC, Decode, Yes),
+            (HTTP, Regular, Stalled),
+        ]);
+        let tenant = test_tenant_meta();
+        let image = "https://example.com/cat.png";
+        let chat_image = json!([{"type": "image_url", "image_url": {"url": image}}]);
+        let messages_image = json!([{"type": "image", "source": {"type": "url", "url": image}}]);
+        for (media, expected) in [(false, "grpc_epd"), (true, "http")] {
+            let chat = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": if media { chat_image.clone() } else { json!("hi") }}],
+            });
+            let mut generate = json!({"model": "m", "text": "hi"});
+            let messages = json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": if media { messages_image.clone() } else { json!("hi") }}],
+            });
+            if media {
+                generate["image_data"] = json!(image);
+            }
+            for draw in 0..20 {
+                let mut answers = vec![
+                    (
+                        "chat",
+                        gateway
+                            .route_chat(None, &tenant, Arc::new(body(chat.clone())), "m")
+                            .await,
+                    ),
+                    (
+                        "generate",
+                        gateway
+                            .route_generate(None, &tenant, body(generate.clone()), "m")
+                            .await,
+                    ),
+                    (
+                        "messages",
+                        gateway
+                            .route_messages(None, &tenant, Arc::new(body(messages.clone())), "m")
+                            .await,
+                    ),
+                ];
+                if !media {
+                    let completion = body(json!({"model": "m", "prompt": "hi"}));
+                    answers.push((
+                        "completion",
+                        gateway
+                            .route_completion(None, &tenant, completion, "m")
+                            .await,
+                    ));
+                }
+                for (route, response) in answers {
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    assert_eq!(bytes, expected, "{route}, media {media}, draw {draw}");
+                }
+            }
+        }
     }
 
     /// The draw pairs workers by the routers' pairing mode. Under `strict`,
@@ -3089,7 +3245,7 @@ mod tests {
             let gateway =
                 Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
             let gateway = named_families_over(gateway, &workers);
-            assert_drawn(&gateway, (mode, workers), &[(expected, 1.0)]);
+            assert_drawn(&gateway, Media::Absent, (mode, workers), &[(expected, 1.0)]);
         }
     }
 
@@ -3120,6 +3276,7 @@ mod tests {
             }
             assert_drawn(
                 &gateway,
+                Media::Absent,
                 format!("stalled HTTP, SGLang prefill, {decode:?} decode"),
                 &[(expected, 1.0)],
             );

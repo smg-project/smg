@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker};
 
-use super::{route_error, router_ids, Gateway, RouterTrait};
+use super::{route_error, router_ids, Gateway, Media, RouterTrait};
 use crate::routers::common::snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt};
 
 fn sglang_grpc(worker: &dyn Worker) -> bool {
@@ -64,17 +64,22 @@ impl Gateway {
         &self,
         model: &str,
         adapter: Option<&str>,
+        media: Media,
     ) -> Option<Arc<dyn RouterTrait>> {
         if adapter.is_some() && has_sglang_grpc(&self.worker_registry, model) {
-            self.select_lora_router(model)
+            self.select_lora_router(model, media)
         } else {
-            self.select_router_for_request(Some(model))
+            self.select_router_for_media(Some(model), media)
         }
     }
 
     /// A composite SGLang selector must stay on the tokenized SGLang path:
     /// an HTTP or external family may ignore the normalized LoRA extension.
-    pub(super) fn select_lora_router(&self, model: &str) -> Option<Arc<dyn RouterTrait>> {
+    pub(super) fn select_lora_router(
+        &self,
+        model: &str,
+        media: Media,
+    ) -> Option<Arc<dyn RouterTrait>> {
         if !self.enable_igw {
             let default = self.default_router.load();
             let default = default.as_ref()?;
@@ -99,14 +104,16 @@ impl Gateway {
                 .count()
         };
         let registered = self.family_weights(size);
-        self.draw_family(&snapshot, &registered, |_, worker| sglang_grpc(worker))
-            .or_else(|| {
-                self.incomplete_disaggregated_router(
-                    size(RoutingPool::GrpcEncode),
-                    size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
-                    0,
-                )
-            })
+        self.draw_family(&snapshot, &registered, media, |_, worker| {
+            sglang_grpc(worker)
+        })
+        .or_else(|| {
+            self.incomplete_disaggregated_router(
+                size(RoutingPool::GrpcEncode),
+                size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
+                0,
+            )
+        })
     }
 }
 
