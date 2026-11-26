@@ -2481,11 +2481,24 @@ request ──> route (HTTP or gRPC, any family)
   the series can count such a request in the next bucket, where the match's share lies that close
   to a bucket's edge.
 
-  Where the engine places no worker for a request, the gateway names the client's answer itself,
-  by classic's own judgement of the pool. The engine's word for the refusal goes to a log line
-  and no further: at `debug`, or at `warn` where the engine refused the decision itself. One word
-  is acted on, a pair's prefills all at their admission limit: the route waits for a slot, as
-  under classic.
+  Where the engine places no worker for a single request, the gateway names the client's answer
+  itself, by classic's own judgement of the pool. The engine's word for the refusal goes to a log
+  line and no further: at `debug`, or at `warn` where the engine refused the decision itself.
+
+  A pair's route answers by the engine's word. A pair's prefills all at their admission limit make
+  the route wait for a slot, as under classic. A pair the policy spec in force binds no pair plan
+  for is refused with a 501 under the code `no_policy_plan_for_model`, with no retry hint.
+  A model with no worker on a side, or with no pair that shares a transfer protocol, is answered
+  for that ahead of the engine, as under classic.
+  A pair the engine declined under any other name is answered as classic answers a policy that
+  picked nobody, under the engine's name, for the side the engine's refusal names.
+
+  Every other refusal is judged from the pools, as classic judges its own. A side with nobody open
+  is the fleet's own state, and it is the role, the prefills first: the answer is classic's for
+  the same fleet, whatever side the engine's refusal names. Where both sides stand open, the role
+  is the side the engine's refusal names, and the decode's where it names none. Two limits stand:
+  a side that a stage other than health or overload emptied reads as unavailable, and so does a
+  decision the engine itself refused.
 
   The fourth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the gateway does not yet hand the engine an encode request's three lists.
 

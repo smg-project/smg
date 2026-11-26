@@ -269,6 +269,9 @@ impl<'a> PdSetup<'a> {
 enum PdSelectionFailure {
     /// Every worker on one role is vetoed: a ready-made, already-counted 503.
     Shed(Response),
+    /// The policy spec in force binds no pair plan for the model: the
+    /// placement's ready-made 501.
+    NoPlanBound(Response),
     /// The pre-existing string: no workers configured, all unhealthy or
     /// circuit-broken, or the policy declined.
     Unavailable(String),
@@ -605,6 +608,8 @@ impl PDRouter {
             // counter; re-describing it as a circuit-breaker/health failure is
             // exactly the misdiagnosis this path used to hand operators.
             PdSelectionFailure::Shed(shed) => shed,
+            // Its line is written by [`Self::report_refusal`] too.
+            PdSelectionFailure::NoPlanBound(refusal) => refusal,
             PdSelectionFailure::Incompatible(error) => {
                 error!("Failed to select PD pair error={}", error);
                 error::service_unavailable("no_compatible_pd_pair", error)
@@ -623,7 +628,8 @@ impl PDRouter {
     }
 
     /// The line and marker of a refusal this router answers on its own (the
-    /// `no_available_workers` 503 of a role that is down): one WARN per
+    /// `no_available_workers` 503 of a role that is down, the
+    /// `no_policy_plan_for_model` 501 of a pair no plan binds): one WARN per
     /// refusal, rate-limited, with both roles' state, through
     /// [`placement::report_refusal`]; the access log then keeps quiet about
     /// it. Every other response passes through unchanged.
@@ -2781,15 +2787,23 @@ impl PDRouter {
         };
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => PdSelectionFailure::Shed(shed),
+            PlacementFailure::NoPlanBound(refusal) => PdSelectionFailure::NoPlanBound(refusal),
             PlacementFailure::NoCandidates => PdSelectionFailure::Unavailable(format!(
                 "No {role} workers available. Please check if {role} servers are configured and healthy."
             )),
             PlacementFailure::Unavailable => PdSelectionFailure::Unavailable(format!(
                 "No available {role} workers (all circuits open or unhealthy)"
             )),
-            PlacementFailure::PolicyDeclined(policy) => PdSelectionFailure::Unavailable(
-                format!("Policy {policy} failed to select a {role} worker"),
-            ),
+            // Under Grand Central the name is the engine's, and a decline
+            // that names no side is the pair's whole.
+            PlacementFailure::PolicyDeclined(policy) => {
+                PdSelectionFailure::Unavailable(match failure.role {
+                    WorkerRole::Single => format!("Policy {policy} failed to select a pair"),
+                    WorkerRole::Prefill | WorkerRole::Decode => {
+                        format!("Policy {policy} failed to select a {role} worker")
+                    }
+                })
+            }
             // Admission turns this verdict into a wait before it gets here.
             PlacementFailure::PrefillAtCapacity => PdSelectionFailure::Unavailable(format!(
                 "No {role} workers below their Prefill admission limit"
@@ -3331,7 +3345,9 @@ impl RouterTrait for PDRouter {
             // an all-vetoed fleet fails the probe, exactly as an all-circuit-
             // broken one already did.
             Err(failure) => match Self::pair_failure(*failure) {
-                PdSelectionFailure::Shed(shed) => return shed,
+                PdSelectionFailure::Shed(refusal) | PdSelectionFailure::NoPlanBound(refusal) => {
+                    return refusal;
+                }
                 PdSelectionFailure::Incompatible(e) => {
                     return error::service_unavailable("no_compatible_pd_pair", e);
                 }
@@ -4735,6 +4751,7 @@ mod tests {
                 assert!(error.contains("No prefill workers available"));
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
+            PdSelectionFailure::NoPlanBound(_) => panic!("a classic gateway runs no policy spec"),
             PdSelectionFailure::Incompatible(_) => {
                 panic!("an empty fleet has no pairing to be incompatible about")
             }
@@ -4742,6 +4759,31 @@ mod tests {
                 panic!("selection without admission cannot be queued")
             }
         }
+    }
+
+    /// A declined policy's sentence names the role it declined for. Under
+    /// Grand Central a decline may name no side: the sentence then says the
+    /// pair.
+    #[test]
+    fn a_decline_that_names_no_side_says_the_pair() {
+        let sentence = |role| {
+            let failure = PairFailure {
+                role,
+                verdict: PlacementFailure::PolicyDeclined("a-stage"),
+            };
+            let PdSelectionFailure::Unavailable(sentence) = PDRouter::pair_failure(failure) else {
+                panic!("a declined policy is answered as unavailable");
+            };
+            sentence
+        };
+        assert_eq!(
+            sentence(WorkerRole::Single),
+            "Policy a-stage failed to select a pair"
+        );
+        assert_eq!(
+            sentence(WorkerRole::Decode),
+            "Policy a-stage failed to select a decode worker"
+        );
     }
 
     /// Loopback stub answering `{}` on any path, recording each request's
@@ -10986,6 +11028,160 @@ mod tests {
         assert!(
             refusal_lines.load(Ordering::Relaxed) <= allowance,
             "{refusals} refusals inside one second write at most {allowance} lines"
+        );
+    }
+
+    /// A pair of a model that the policy spec in force binds no pair plan
+    /// for is refused with a 501 under the cause's own code, with no retry
+    /// hint, in words that name the cause, though both its workers are
+    /// open: no worker is asked. The refusal is marked as reported and
+    /// written at WARN, never at ERROR. Judged from the pools, the client
+    /// read "No available decode workers" and was told to come back in a
+    /// second.
+    #[tokio::test]
+    async fn a_pair_the_spec_binds_no_plan_for_is_refused_501_with_no_retry_hint() {
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
+        // Nothing listens at either address: a request that reached one
+        // would answer a failed dispatch.
+        let router = pair_router_under(
+            false,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:10".to_string(),
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            placement::NO_PLAN_BOUND_CODE
+        );
+        assert!(response.headers().get(RETRY_AFTER).is_none());
+        assert!(
+            response.extensions().get::<ReportedRefusal>().is_some(),
+            "the refusal is marked as reported, so the access log keeps quiet"
+        );
+        assert_eq!(errors.load(Ordering::Relaxed), 0);
+        assert_eq!(refusal_lines.load(Ordering::Relaxed), 1);
+        // The client's words name the model the request was routed under.
+        assert_eq!(
+            error_message(response).await,
+            format!("the policy spec in force binds no pair plan for model '{UNKNOWN_MODEL_ID}'")
+        );
+    }
+
+    /// A pair router whose engine runs a stock document, over one registered
+    /// pair at the two addresses. Where `pair_plan`, the stock pair of two
+    /// rotations, which binds a pair plan for every model. Else the stock
+    /// rotation, which binds single requests alone: no pair plan for any
+    /// model.
+    fn pair_router_under(pair_plan: bool, prefill_url: String, decode_url: String) -> PDRouter {
+        use smg_grand_central::document::{AppliedSpec, PolicySpec};
+
+        use crate::config::types::RoutingKeyOverrideConfig;
+
+        let document = if pair_plan {
+            PolicySpec::pair_presets("round_robin", "round_robin")
+        } else {
+            PolicySpec::preset("round_robin")
+        };
+        let document = document.expect("a stock document");
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        engine_on(
+            &policies,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let router = PDRouter {
+            policy_registry: Arc::new(policies),
+            ..create_test_pd_router()
+        };
+        register_pd_pair(&router, prefill_url, decode_url);
+        router
+    }
+
+    /// A pair no plan binds is counted as a verdict on the configuration,
+    /// as a pair no transfer protocol joins is: by its status for the type,
+    /// and under the reason of a fleet that cannot serve the request as it
+    /// is configured. No worker was asked, and the gateway's own processing
+    /// did not fail: counted by its status alone, the reason read
+    /// `internal`.
+    #[test]
+    fn a_pair_no_plan_binds_is_counted_as_a_configuration_verdict() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let router = pair_router_under(
+            false,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:10".to_string(),
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let response = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(router.route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID))
+        });
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"pd\"")
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"backend_error\""), "{line}");
+        assert!(line.contains("reason=\"no_capable_worker\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// The deep probe gets the answer routing gives. Under a spec that
+    /// binds a pair plan for every model it reads a healthy pair as
+    /// healthy, as it did. Under one that binds no pair plan for the name
+    /// the probe asks under, it reads the unbound plan's 501: judged from
+    /// the pools, it read `no_healthy_worker_pair` on a fleet with nobody
+    /// down.
+    #[tokio::test]
+    async fn the_deep_probe_reads_an_unbound_plan_as_routing_does() {
+        async fn probe(pair_plan: bool) -> Response {
+            let answering =
+                || spawn_stub(axum::Router::new().fallback(|| async { StatusCode::OK }));
+            let router = pair_router_under(pair_plan, answering().await, answering().await);
+            let request = Request::builder().body(Body::empty()).unwrap();
+            tokio::time::timeout(ROUND_TRIP_GUARD, router.health_generate(request))
+                .await
+                .expect("the probe answers")
+        }
+        let healthy = probe(true).await;
+        assert_eq!(healthy.status(), StatusCode::OK);
+        let refused = probe(false).await;
+        assert_eq!(refused.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            placement::NO_PLAN_BOUND_CODE
         );
     }
 
