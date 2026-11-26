@@ -1,7 +1,7 @@
 //! The types that grow, written as a crate outside this one writes them:
 //! each enum the crate marks non-exhaustive is matched with every case it
 //! has today and an arm for the rest, and the marked records are made by
-//! their calls.
+//! their calls or started from their defaults.
 //!
 //! A test target is a program outside the library. The arm for the rest is
 //! what a mark asks of such a program, and the arm holds the mark in turn:
