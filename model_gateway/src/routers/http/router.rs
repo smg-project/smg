@@ -381,7 +381,7 @@ impl Router {
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
         stated: impl FnOnce() -> placement::Stated,
-    ) -> Option<placement::Placed> {
+    ) -> Result<placement::Placed, placement::SingleMiss> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
         placement::select_single(
@@ -466,7 +466,8 @@ impl Router {
     }
 
     /// The line and marker of a refusal this router answers on its own (a
-    /// `no_available_workers` 503, a `model_not_found` 404): one WARN per
+    /// `no_available_workers` 503, a `model_not_found` 404, the
+    /// `no_policy_plan_for_model` 501 of a request no plan binds): one WARN per
     /// refusal, rate-limited, with the regular pool's state, through
     /// [`placement::report_refusal`]; the access log then keeps quiet about
     /// it. Every other response passes through unchanged.
@@ -828,27 +829,38 @@ impl Router {
                 )
             })
         }) {
-            Some(placed) => Ok(placed),
-            None => {
-                // The verdict is judged from exactly the pool selection drew
-                // from, wildcard model included: that is what makes the shed
+            Ok(placed) => Ok(placed),
+            Err(miss) => {
+                // The verdict is judged from what the placement said of the
+                // miss, and from exactly the pool selection drew from,
+                // wildcard model included: that is what makes the shed
                 // fire for a model-less `/generate` and for a model that is
                 // also served over gRPC.
+                const UNAVAILABLE: &str =
+                    "All workers are unavailable (circuit breaker open or unhealthy)";
                 let refusal = match placement::single_failure(
                     &self.worker_registry,
                     model_id,
                     RoutingPool::HttpRegular,
                     None,
+                    miss,
                 ) {
                     PlacementFailure::NoCandidates => error::model_not_found(model_id),
                     PlacementFailure::AllOverloaded(refusal)
-                    | PlacementFailure::NoPlanBound(refusal) => refusal,
+                    | PlacementFailure::NoPlanBound(refusal)
+                    | PlacementFailure::DecisionFailed(refusal) => refusal,
+                    // The client's words stay, and the line names the
+                    // engine's word.
+                    PlacementFailure::ShedUnder(name) => placement::no_available_workers_because(
+                        UNAVAILABLE,
+                        placement::shed_under(name, None),
+                    ),
                     PlacementFailure::Unavailable
                     | PlacementFailure::PolicyDeclined(_)
                     | PlacementFailure::NoCompatiblePair { .. }
-                    | PlacementFailure::PrefillAtCapacity => placement::no_available_workers(
-                        "All workers are unavailable (circuit breaker open or unhealthy)",
-                    ),
+                    | PlacementFailure::PrefillAtCapacity => {
+                        placement::no_available_workers(UNAVAILABLE)
+                    }
                 };
                 Err(self.report_refusal("Router::route_typed_request", model_id, refusal))
             }
@@ -1453,7 +1465,7 @@ impl Router {
                 error::model_not_found(model_id),
             ));
         }
-        let Some(placed) = placement::select_single_of(
+        let miss = match placement::select_single_of(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
@@ -1471,39 +1483,44 @@ impl Router {
                 tried,
             },
             placement::Stated::nothing,
-        ) else {
-            // Judged from the same candidates whether the pre-filter emptied
-            // or a self-filtering policy missed on an all-overloaded pool, so
-            // a shed keeps its Retry-After, retryability and metric.
-            let resp = match placement::failure_from(
-                all_workers,
-                model_id,
-                self.worker_registry.overload_shed_enabled(),
-            ) {
-                PlacementFailure::AllOverloaded(refusal)
-                | PlacementFailure::NoPlanBound(refusal) => refusal,
-                PlacementFailure::NoCandidates
-                | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_)
-                | PlacementFailure::NoCompatiblePair { .. }
-                | PlacementFailure::PrefillAtCapacity => {
-                    // The verdict cannot tell a policy miss from a drained
-                    // pool; the pool can.
-                    let message = if all_workers.iter().any(|w| w.is_available()) {
-                        "Policy returned no eligible worker"
-                    } else {
-                        "All workers are unavailable (circuit breaker open or unhealthy)"
-                    };
-                    placement::no_available_workers(message)
-                }
-            };
-            return Err(self.report_refusal(
-                "Router::route_multipart_transcription",
-                model_id,
-                resp,
-            ));
+        ) {
+            Ok(placed) => return Ok(placed),
+            Err(miss) => miss,
         };
-        Ok(placed)
+        // The verdict cannot tell a policy miss from a drained pool; the
+        // pool can.
+        let unavailable = || {
+            if all_workers.iter().any(|w| w.is_available()) {
+                "Policy returned no eligible worker"
+            } else {
+                "All workers are unavailable (circuit breaker open or unhealthy)"
+            }
+        };
+        // Judged from what the placement said of the miss, and from the same
+        // candidates whether the pre-filter emptied or a self-filtering
+        // policy missed on an all-overloaded pool, so a shed keeps its
+        // Retry-After, retryability and metric.
+        let resp = match placement::miss_failure(
+            miss,
+            all_workers,
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            PlacementFailure::AllOverloaded(refusal)
+            | PlacementFailure::NoPlanBound(refusal)
+            | PlacementFailure::DecisionFailed(refusal) => refusal,
+            // The client's words stay, and the line names the engine's word.
+            PlacementFailure::ShedUnder(name) => placement::no_available_workers_because(
+                unavailable(),
+                placement::shed_under(name, None),
+            ),
+            PlacementFailure::NoCandidates
+            | PlacementFailure::Unavailable
+            | PlacementFailure::PolicyDeclined(_)
+            | PlacementFailure::NoCompatiblePair { .. }
+            | PlacementFailure::PrefillAtCapacity => placement::no_available_workers(unavailable()),
+        };
+        Err(self.report_refusal("Router::route_multipart_transcription", model_id, resp))
     }
 
     /// The send of a transcription to its worker: the trace headers, the
@@ -2659,7 +2676,9 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let Some(placed) = self.select_worker_for_model(
+        // A miss is answered on the buffered path, which asks the placement
+        // again and judges what it says of it.
+        let Ok(placed) = self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
@@ -3343,7 +3362,7 @@ mod tests {
                     REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
                     REASON_WASM_REQUEST_HOOK,
                 },
-                placement::tests::{engine_on, hearing_engine_on},
+                placement::tests::{engine_on, hearing_engine_on, Refusing},
                 request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
                 test_support::fast_retry_config,
             },
@@ -4171,7 +4190,7 @@ mod tests {
                 &[],
                 placement::Stated::nothing,
             )
-            .is_none());
+            .is_err());
     }
 
     #[tokio::test]
@@ -4209,6 +4228,92 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1")
         );
+    }
+
+    /// What the typed route answers a single request by the engine's
+    /// word, on a pool whose two workers are open. A model that the policy
+    /// spec in force binds no single-request plan for is refused with a
+    /// 501 under the cause's own code. A decision the engine refuses is a
+    /// 500 under its own code. Neither carries a retry hint, and the route
+    /// replays neither. Judged from the pool, each read as every worker
+    /// unavailable, with a retry hint. A filter of the spec that keeps
+    /// nobody still reads so, and the refusal's line names the filter. A
+    /// model nobody serves keeps its 404 under each spec. For the 501 and
+    /// the 500 the gateway's own selection has no like case: it reads no
+    /// spec, and it has no engine to refuse. Its own miss on a pool that
+    /// is down reads as before, and its line keeps the route's own
+    /// sentence, with no word of an engine (`single_failure`, in
+    /// `model_gateway/src/routers/common/placement.rs`).
+    #[tokio::test]
+    async fn the_typed_route_answers_a_single_request_by_the_engines_word() {
+        let answered = |refusing: Option<Refusing>, model: &'static str| async move {
+            let router = create_test_regular_router();
+            match refusing {
+                Some(refusing) => refusing.single_on(&router.policy_registry),
+                // The gateway's own selection, on a pool that is down.
+                None => router.worker_registry.get_all().iter().for_each(|worker| {
+                    worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+                }),
+            }
+            let request = DropProbeRequest {
+                text: "refused".to_string(),
+                _probe: Arc::new(()),
+            };
+            router
+                .route_typed_request(None, None, request, "/generate", model)
+                .await
+        };
+        let hint = |response: &Response| {
+            let hint = response.headers().get(RETRY_AFTER);
+            hint.and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        let unbound = answered(Some(Refusing::Unbound), UNKNOWN_MODEL_ID).await;
+        assert_eq!(unbound.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            extract_error_code_from_response(&unbound),
+            placement::NO_PLAN_BOUND_CODE
+        );
+        assert_eq!(
+            placement::refusal_reason(&unbound),
+            Some("the policy spec in force binds no single-request plan for model 'unknown'")
+        );
+
+        let faulted = answered(Some(Refusing::Faulted), UNKNOWN_MODEL_ID).await;
+        assert_eq!(faulted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            extract_error_code_from_response(&faulted),
+            placement::DECISION_FAILED_CODE
+        );
+        for refused in [&unbound, &faulted] {
+            assert_eq!(hint(refused), None);
+            assert!(!is_retryable_response(refused));
+        }
+
+        let nobody = answered(Some(Refusing::Nobody), UNKNOWN_MODEL_ID).await;
+        let down = answered(None, UNKNOWN_MODEL_ID).await;
+        for response in [&nobody, &down] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                extract_error_code_from_response(response),
+                placement::NO_AVAILABLE_WORKERS_CODE
+            );
+            assert_eq!(hint(response).as_deref(), Some("1"));
+        }
+        assert_eq!(
+            placement::refusal_reason(&nobody),
+            Some("Grand Central shed the request under nobody")
+        );
+        assert_eq!(
+            placement::refusal_reason(&down),
+            Some("All workers are unavailable (circuit breaker open or unhealthy)")
+        );
+
+        for refusing in [Refusing::Unbound, Refusing::Faulted, Refusing::Nobody] {
+            let unserved = answered(Some(refusing), "nobody-serves-this").await;
+            assert_eq!(unserved.status(), StatusCode::NOT_FOUND, "{refusing:?}");
+        }
     }
 
     /// Loopback POST stub answering `status` with a JSON body on the given

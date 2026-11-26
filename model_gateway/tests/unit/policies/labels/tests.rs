@@ -345,8 +345,8 @@ async fn a_spec_a_label_puts_in_force_publishes_the_worker_lists_again() {
             let nothing = Stated::nothing;
             select_single(&workers, &policies, model, pool, None, inputs, nothing)
         };
-        assert!(asked(STAYS).is_some(), "a worker");
-        assert!(asked(UNSERVED).is_none(), "no worker");
+        assert!(asked(STAYS).is_ok(), "a worker");
+        assert!(asked(UNSERVED).is_err(), "no worker");
     };
     // What the engine keeps in the cell beside a model's list, as the cell
     // prints it: the count of its values, then each one's spec.

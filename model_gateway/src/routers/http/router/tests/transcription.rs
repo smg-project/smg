@@ -33,7 +33,10 @@ use super::super::*;
 use crate::{
     app_context::testing::app_context_for_tests,
     config::{types::PolicyConfig, RouterConfig},
-    routers::{common::placement::tests::engine_on, grpc::backend_client::BasicWorkerBuilder},
+    routers::{
+        common::placement::tests::{engine_on, Refusing},
+        grpc::backend_client::BasicWorkerBuilder,
+    },
     tenant::TenantKey,
 };
 
@@ -305,6 +308,96 @@ async fn the_refusals_that_stay_hold_over_rank_workers_alone() {
 
     let half = [ranked(0, 0, 2).state(State::Down), ranked(0, 1, 2)];
     expect(&half, false, &placed(&[1])).await;
+}
+
+/// What the route's selection answers a transcription by the engine's word,
+/// on a pool whose one worker is free. A model that the policy spec in force
+/// binds no single-request plan for is the 501 `no_policy_plan_for_model`. A
+/// decision the engine refuses is the 500 `grand_central_decision_failed`.
+/// Neither says when to come back. Judged from the pool, each read as the
+/// 503 `no_available_workers` of a pool that is down. A filter of the spec
+/// that keeps nobody still reads so: the refusal's line names the filter,
+/// and the client reads the route's own words. A model no worker serves
+/// keeps its 404 under each. A later attempt's selection, which names the
+/// worker a first attempt tried, takes the 501 and the 500 as the first
+/// does. The gateway's own selection has no like case for those two: it
+/// reads no spec, and it has no engine to refuse. Its own refusals stand in
+/// `the_refusals_that_stay_hold_over_rank_workers_alone`.
+#[tokio::test]
+async fn a_transcription_is_answered_by_the_engines_word() {
+    const ONE: &[Member] = &[plain(0)];
+    const TWO: &[Member] = &[plain(0), plain(1)];
+    let answer = |refusing: Refusing, members: &'static [Member]| async move {
+        let bed = Bed::of(members, false, Placer::Classic).await;
+        refusing.single_on(&bed.router.policy_registry);
+        bed.answer()
+    };
+    assert_eq!(
+        answer(Refusing::Unbound, ONE).await,
+        refused(501, "no_policy_plan_for_model", false)
+    );
+    assert_eq!(
+        answer(Refusing::Faulted, ONE).await,
+        refused(500, "grand_central_decision_failed", false)
+    );
+    assert_eq!(
+        answer(Refusing::Nobody, ONE).await,
+        refused(503, "no_available_workers", true)
+    );
+    let unserved = refused(404, "model_not_found", false);
+    for refusing in [Refusing::Unbound, Refusing::Faulted, Refusing::Nobody] {
+        assert_eq!(answer(refusing, &[]).await, unserved, "{refusing:?}");
+    }
+
+    // The refusal's line names the filter that kept nobody, and the client
+    // reads the route's own words.
+    let bed = Bed::of(ONE, false, Placer::Classic).await;
+    Refusing::Nobody.single_on(&bed.router.policy_registry);
+    let routing = RoutingDerivatives {
+        tokens: None,
+        text: None,
+        rid_key: None,
+        cache_namespace: None,
+    };
+    let refusal = bed
+        .router
+        .select_transcription_worker(None, MODEL, &routing, None, None, &[])
+        .expect_err("no worker passes the filter");
+    assert_eq!(
+        placement::refusal_reason(&refusal),
+        Some("Grand Central shed the request under nobody")
+    );
+    let body = to_bytes(refusal.into_body(), usize::MAX)
+        .await
+        .expect("the body is in memory");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON error envelope");
+    assert_eq!(
+        body["error"]["message"],
+        "Policy returned no eligible worker"
+    );
+
+    // A later attempt's selection names the worker a first attempt tried,
+    // beside one that is still free.
+    for (refusing, status, code) in [
+        (Refusing::Unbound, 501, "no_policy_plan_for_model"),
+        (Refusing::Faulted, 500, "grand_central_decision_failed"),
+    ] {
+        let bed = Bed::of(TWO, false, Placer::Classic).await;
+        refusing.single_on(&bed.router.policy_registry);
+        let tried = [bed.workers[0].base_url().to_string()];
+        let refusal = bed
+            .router
+            .select_transcription_worker(None, MODEL, &routing, None, None, &tried)
+            .expect_err("the engine places no worker for a later attempt");
+        assert_eq!(
+            (
+                refusal.status().as_u16(),
+                extract_error_code_from_response(&refusal)
+            ),
+            (status, code),
+            "{refusing:?}"
+        );
+    }
 }
 
 /// What the stand-in engine was sent: each request's path and body.

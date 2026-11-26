@@ -2995,9 +2995,16 @@ request ──> route (HTTP or gRPC, any family)
   the series can count such a request in a neighbouring bucket, above or below, where the match's
   share lies that close to a bucket's edge.
 
-  Where the engine places no worker for a single request, the gateway names the client's answer
-  itself, by classic's own judgement of the pool. The engine's word for the refusal goes to a log
-  line and no further: at `debug`, or at `warn` where the engine refused the decision itself.
+  A single request's route answers by the engine's word. A pool nobody is in keeps its answer. A
+  request the policy spec in force binds no single-request plan for is refused with a 501 under
+  the code `no_policy_plan_for_model`, with no retry hint. A decision the engine itself refused
+  reads the 500 below, judged from no pool.
+
+  Every other refusal is judged from the pool, as classic judges its own. Where that pool reads
+  unavailable, the refusal's line names what the engine shed the request under. The pair router's
+  token count is apart: it keeps its own 503 there, and writes no refusal line. The engine's own
+  line keeps its whole answer: at `debug`, or at `warn` where the engine refused the decision
+  itself.
 
   A pair's route answers by the engine's word. It is told to wait for a slot where the prefill
   side's filters leave its run nobody and a prefill with an open partner stands but for its
@@ -3007,17 +3014,33 @@ request ──> route (HTTP or gRPC, any family)
 
   A pair the policy spec in force binds no pair plan for is refused with a 501 under the code
   `no_policy_plan_for_model`, with no retry hint.
-  A model with no worker on a side, or with no pair that shares a transfer protocol, is answered
-  for that ahead of the engine, as under classic.
-  A pair the engine declined under any other name is answered as classic answers a policy that
-  picked nobody, under the engine's name, for the side the engine's refusal names.
 
-  Every other refusal is judged from the pools, as classic judges its own. A side with nobody open
-  is the fleet's own state, and it is the role, the prefills first: the answer is classic's for
-  the same fleet, whatever side the engine's refusal names. Where both sides stand open, the role
-  is the side the engine's refusal names, and the decode's where it names none. Two limits stand:
-  a side that a stage other than health or overload emptied reads as unavailable, and so does a
-  decision the engine itself refused.
+  A model with no worker on a side, or with no pair that shares a transfer protocol, is answered for
+  that ahead of the engine, as under classic. A pair the engine declined under any other name is
+  answered as classic answers a policy that picked nobody. So is a pair shed under the worker its
+  request names, whatever the reason. The answer stands under the engine's name, for the side the
+  engine's refusal names.
+
+  Every other refusal, but a decision the engine itself refused, is judged from the pools, as
+  classic judges its own. A side with nobody open is the fleet's own state, and it is the role, the
+  prefills first, whatever side the engine's refusal names. Where both sides stand open, the role
+  is the side the engine's refusal names, and the decode's where it names none.
+
+  The role's pool gives the verdict. A pool that the gateway sheds for overload keeps its overload
+  answer, and the refusal's line names no stage of the engine. Any other pool reads as unavailable,
+  whatever stage emptied a side. Where the engine shed the pair and the route answers by this
+  verdict, its refusal line names what the engine shed the pair under, and the side the answer is
+  for. A route can put an answer of its own in the verdict's place: the gRPC stage does for media
+  that no worker of the role processes, and the HTTP pair route's deep probe keeps its own 503.
+
+  For a side that is down or shed, the client reads classic's answer for the same fleet. A side
+  that is vetoed whole and not shed is apart: over its overload thresholds with shedding off, or
+  under a liveness doubt. The engine's default crosses such a veto, as classic's does. Where a
+  stage still sheds the pair, such a side counts here as one with nobody open.
+
+  A decision that the engine itself refused reads a 500 under the code
+  `grand_central_decision_failed`: no retry hint, and no retry by the gateway. Single and pair
+  routes answer it alike.
 
   The fourth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the gateway does not yet hand the engine an encode request's three lists.
 

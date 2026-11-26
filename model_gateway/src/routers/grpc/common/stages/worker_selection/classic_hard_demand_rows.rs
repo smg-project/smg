@@ -543,7 +543,7 @@ impl Bed {
         let admits: Option<CandidateFilter<'_>> = decided_on.is_some().then_some(&alike);
         let mut placed = BTreeSet::new();
         for _ in 0..ROUNDS * self.workers.len().max(1) {
-            let Some(worker) = self.stage.select_regular(
+            let worker = match self.stage.select_regular(
                 MODEL,
                 context,
                 media,
@@ -556,12 +556,15 @@ impl Bed {
                 None,
                 wire,
                 &[],
-            ) else {
-                assert!(placed.is_empty(), "a request placed once is placed again");
-                let refusal = self
-                    .stage
-                    .context_selection_failure(MODEL, wire, media, context);
-                return refused(refusal).await;
+            ) {
+                Ok(worker) => worker,
+                Err(miss) => {
+                    assert!(placed.is_empty(), "a request placed once is placed again");
+                    let refusal = self
+                        .stage
+                        .context_selection_failure(MODEL, wire, media, context, miss);
+                    return refused(refusal).await;
+                }
             };
             let at = self
                 .workers

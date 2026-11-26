@@ -1444,7 +1444,11 @@ pub enum Unplaced {
         /// stage by the list judged, which may be another than the one
         /// that ended a pass
         /// ([`Shed::emptied_by`](crate::engine::decision::Shed::emptied_by)).
-        /// A caller's refusal line names it.
+        /// A caller answers by two of these names, each a constant of
+        /// the crate: [`BINDING`](crate::engine::decision::BINDING), and
+        /// [`TARGET_WORKER`](crate::engine::decision::TARGET_WORKER),
+        /// under which a shed is a decline whatever its reason. A
+        /// caller's refusal line can name it.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room: a caller's
         /// retry hint.
@@ -1517,8 +1521,9 @@ pub enum Unplaced {
     NoWorkers,
     /// The engine refused the call's last decision, for the reason it
     /// carries: it made none in its place. Where the call decided again,
-    /// the decisions it gave up stand behind this one. A caller answers
-    /// that it cannot place the request now.
+    /// the decisions it gave up stand behind this one. The fault is the
+    /// deciding side's own and not the fleet's state: a caller answers
+    /// that the decision failed, and gives no retry hint.
     Refused(DecisionRefused),
 }
 
