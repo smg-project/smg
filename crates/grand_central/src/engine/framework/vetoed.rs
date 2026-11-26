@@ -46,8 +46,8 @@
 
 use super::{
     classed, engines::run_owned, filter, keep_folded, leads, places, reason_of, run_single, shed,
-    single_emptied, trace_of, Assignment, Binding, Buffers, Engine, Filter, PairTable, Picker,
-    Plan, Profile, Scorer, Scratch, SessionRule, Set,
+    single_emptied, trace_of, Assignment, Binding, Buffers, Engine, Filter, PairSide, PairTable,
+    Picker, Plan, Profile, Scorer, Scratch, SessionRule, Set,
 };
 use crate::{
     engine::{
@@ -893,7 +893,10 @@ pub(super) fn paired(
                 lifted: LiftedVeto::None,
                 ..taken.trace
             };
-            return Some(shed(reason_of(limit.name()), limit.name(), trace));
+            // The prefill the default took is at its limit: the prefill
+            // side's refusal.
+            let refused = shed(reason_of(limit.name()), limit.name(), trace);
+            return Some(refused.of_side(PairSide::Prefill));
         }
         // The decode: the taken prefill's usable partner of the fewest
         // requests.

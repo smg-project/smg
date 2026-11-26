@@ -15,7 +15,18 @@ pub(super) const MISSED: Unplaced = Unplaced::Shed {
     reason: ShedReason::NoEndpoints,
     emptied_by: "target-worker",
     retry_after_secs: 1,
+    side: None,
 };
+
+/// [`MISSED`] for a pair, on the side its named worker was missed on.
+pub(super) const fn missed_on(side: PairSide) -> Unplaced {
+    Unplaced::Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "target-worker",
+        retry_after_secs: 1,
+        side: Some(side),
+    }
+}
 
 /// Adds the hash ring's target source to the one binding of `document`,
 /// as its block's last source. A binding that named no block is given the
@@ -326,6 +337,7 @@ fn the_number_counts_among_the_workers_that_meet_the_requests_demands() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "wires",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(none, Err(wires), "no worker states the runtime 3");
     assert_eq!(*asked.borrow(), [], "and the rule is asked of none");

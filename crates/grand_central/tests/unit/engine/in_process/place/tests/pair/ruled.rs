@@ -186,6 +186,7 @@ fn a_pair_whose_rule_takes_no_worker_of_a_list_is_shed_under_its_name() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "admits",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(engine.place(&request).err(), Some(shed));
     let (first, decodes) = (prefills[0], [0, 1].map(|at| lists.decode_id(at)));
@@ -710,6 +711,7 @@ fn a_pair_shed_as_saturated_whose_rule_takes_no_worker_of_a_list_is_shed_under_i
         reason: ShedReason::NoEndpoints,
         emptied_by: "admits",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(engine.place(&request).err(), Some(shed));
     let decodes = [0, 1].map(|at| lists.decode_id(at));

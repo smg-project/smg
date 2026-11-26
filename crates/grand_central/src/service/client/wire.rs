@@ -226,6 +226,8 @@ pub(crate) fn decided(told: &proto::Decision, now: Instant) -> Result<DecideOutc
             emptied_by: "controller",
             retry_after_secs: narrow(shed.retry_after_secs, "shed.retry_after_secs")?,
             wait_allowed: shed.wait_allowed,
+            // The message has no field for the side of a pair.
+            side: None,
             trace,
         }),
         Outcome::Queue(queue) => Decision::Queue(Queue {

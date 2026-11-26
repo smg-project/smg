@@ -323,13 +323,16 @@ impl<'r> Bed<'r> {
         };
         let mut placement = match self.engine.place(&request) {
             Ok(placement) => placement,
-            // A shed by its reason and its stage, as the pair placement's
-            // replay reads one. No row runs behind an admission, so no
-            // request waits at one.
+            // A shed by its reason, its stage and its side, as the pair
+            // placement's replay reads one. No row runs behind an admission,
+            // so no request waits at one.
             Err(Unplaced::Shed {
-                reason, emptied_by, ..
-            }) => return Ok(Here::None(why(reason, emptied_by), emptied_by)),
-            Err(_) => return Ok(Here::None("unavailable", "place")),
+                reason,
+                emptied_by,
+                side,
+                ..
+            }) => return Ok(Here::None(why(reason, emptied_by), emptied_by, side)),
+            Err(_) => return Ok(Here::None("unavailable", "place", None)),
         };
         let at = |list: &[Arc<dyn Worker>], worker: &Arc<dyn Worker>| {
             let place = list.iter().position(|listed| Arc::ptr_eq(listed, worker));

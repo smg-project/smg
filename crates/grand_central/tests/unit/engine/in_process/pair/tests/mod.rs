@@ -443,17 +443,32 @@ fn a_request_that_states_what_a_pair_is_not_narrowed_by_is_shed_under_that_stage
     assert_eq!(shed_under(&held), declined);
 }
 
+/// The refusal names the side of the list that holds no record, the
+/// prefills' first: the gateway's own pair selection refuses a pool
+/// with no worker for that pool's role, and reads the prefills first
+/// (`model_gateway/src/routers/common/placement.rs:2860-2867`, on main
+/// `d43c7b2a9`).
 #[test]
 fn one_side_alone_is_no_pair() {
     let (spec, _) = hearing();
-    let (mut prefills, mut decodes) = lists(2, 0);
-    let classes = every(2, 0);
-    stamp(&mut prefills, &mut decodes, &classes, &OPEN);
-    let decision = decide_over(&spec, &facts(), &prefills, &decodes, &classes);
-    // A pair's first decision over no candidate is emptied by no stage.
-    let none = matches!(decision, Decision::Shed(shed) if shed.emptied_by == "none");
-    assert!(none, "{decision:?}");
-    assert!(!prefills_full(&decision));
+    let sides = [
+        (2, 0, PairSide::Decode),
+        (0, 2, PairSide::Prefill),
+        (0, 0, PairSide::Prefill),
+    ];
+    for (prefills, decodes, side) in sides {
+        let classes = every(prefills as usize, decodes as u32);
+        let (mut prefills, mut decodes) = lists(prefills, decodes);
+        stamp(&mut prefills, &mut decodes, &classes, &OPEN);
+        let decision = decide_over(&spec, &facts(), &prefills, &decodes, &classes);
+        // A pair's first decision over no candidate is emptied by no
+        // stage.
+        let Decision::Shed(shed) = &decision else {
+            panic!("not shed: {decision:?}");
+        };
+        assert_eq!((shed.emptied_by, shed.side), ("none", Some(side)));
+        assert!(!prefills_full(&decision));
+    }
 }
 
 /// One prefill and its decodes, the pick over them, and the words the
@@ -1325,21 +1340,27 @@ fn the_decode_asked_again_asks_the_limit_of_its_held_prefill_alone() {
 ///
 /// The classic router places both sides of a pair in one call
 /// (`placement.rs:1227`) and decides no decode again, so this answer
-/// is the engine's own.
+/// is the engine's own. Each refusal names its side: the decodes' for
+/// the partners the call lacks, and the prefills' for the held prefill
+/// that left its list.
 #[test]
 fn a_decode_asked_again_over_no_decode_is_not_shed_as_a_prefill_that_left() {
     let shed_under = |host: &Host, held: &Target| match host.decide_held(&OPEN, 4, Some(held)) {
-        Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+        Decision::Shed(shed) => (shed.reason, shed.emptied_by, shed.side),
         other => panic!("not shed: {other:?}"),
     };
     let host = Host::of(1, 0);
     let held = worker_id(host.prefills[0].as_ref());
-    let no_partner = (ShedReason::NoEndpoints, "partners");
+    let no_partner = (ShedReason::NoEndpoints, "partners", Some(PairSide::Decode));
     assert_eq!(shed_under(&host, &prefill_alone(held)), no_partner);
     let first = first_target(&Host::of(1, 1).decide(&OPEN, 3, None));
     assert_eq!((first.id, first.pair.is_some()), (held, true));
     assert_eq!(shed_under(&host, &first), no_partner);
-    let gone = (ShedReason::NoEndpoints, "prefill-gone");
+    let gone = (
+        ShedReason::NoEndpoints,
+        "prefill-gone",
+        Some(PairSide::Prefill),
+    );
     let left = prefill_alone(WorkerId(held.0 ^ 1));
     assert_eq!(shed_under(&host, &left), gone);
     assert_eq!(shed_under(&Host::of(0, 1), &prefill_alone(held)), gone);
@@ -1427,6 +1448,14 @@ fn shed_of(decision: &Decision) -> (ShedReason, &'static str) {
     }
 }
 
+/// The side a decision that sheds names.
+fn side_of(decision: &Decision) -> Option<PairSide> {
+    match decision {
+        Decision::Shed(shed) => shed.side,
+        other => panic!("not shed: {other:?}"),
+    }
+}
+
 /// A pair that states a hard demand is decided over its two lists,
 /// each side held to the workers that meet the demand: every pick
 /// names one of them on each side, and each of them takes its turn.
@@ -1501,8 +1530,15 @@ fn a_pairs_prefill_is_held_to_neither_the_completions_bound_nor_a_constraints_wa
 
 /// A side the demand leaves nobody sheds the pair with no endpoint
 /// under the stage of the demand that took that side's last worker, as
-/// a single request's list is shed. Where each side is left nobody, the
-/// prefills' demand is the one named.
+/// a single request's list is shed, and the shed names that side.
+/// Where each side is left nobody, the prefills' demand is the one
+/// named, and the prefills' side.
+///
+/// The classic router holds a pair's pools to the request's own rule
+/// and refuses for the prefill's role where no prefill is left, ahead
+/// of the decodes
+/// (`model_gateway/src/routers/common/placement.rs:2900-2918`, then
+/// `:2943-2970`, on main `d43c7b2a9`).
 #[test]
 fn a_side_a_demand_leaves_nobody_sheds_the_pair_under_that_demands_stage() {
     // No prefill takes images. Every decode does, and each states a
@@ -1517,25 +1553,26 @@ fn a_side_a_demand_leaves_nobody_sheds_the_pair_under_that_demands_stage() {
     });
     let shed_under = |demands: Demands| {
         let decision = host.decide_among(&OPEN, 0, None, demanding(demands), [None, None]);
-        shed_of(&decision)
+        (shed_of(&decision), side_of(&decision))
     };
     let pixels = Demands {
         vision: true,
         ..Demands::default()
     };
-    assert_eq!(shed_under(pixels), (ShedReason::NoEndpoints, "vision"));
+    let blind = ((ShedReason::NoEndpoints, "vision"), Some(PairSide::Prefill));
+    assert_eq!(shed_under(pixels), blind);
     let long = Demands {
         output_window: 8_000,
         ..Demands::default()
     };
     let narrow = (ShedReason::NoEndpoints, "context-window");
-    assert_eq!(shed_under(long), narrow);
+    assert_eq!(shed_under(long), (narrow, Some(PairSide::Decode)));
     // Both sides are left nobody, each by another demand.
     let each = Demands {
         vision: true,
         ..long
     };
-    assert_eq!(shed_under(each), (ShedReason::NoEndpoints, "vision"));
+    assert_eq!(shed_under(each), blind);
 }
 
 /// A demand is judged among the places a pair's host states for a
@@ -1611,11 +1648,17 @@ fn a_decode_asked_again_is_held_to_the_decodes_that_meet_the_demand() {
     // The pair's first decision judges its prefills.
     let first = host.decide_among(&OPEN, 0, None, pixels, [None, None]);
     assert_eq!(shed_of(&first), (ShedReason::NoEndpoints, "vision"));
+    assert_eq!(side_of(&first), Some(PairSide::Prefill));
     // No decode takes images.
     let blind = stating(1, 2, |_, _| FixedFacts::default());
     let held = prefill_alone(worker_id(blind.prefills[0].as_ref()));
     let again = blind.decide_among(&OPEN, 0, Some(&held), pixels, [None, None]);
     assert_eq!(shed_of(&again), (ShedReason::NoEndpoints, "vision"));
+    assert_eq!(
+        side_of(&again),
+        Some(PairSide::Decode),
+        "no prefill is judged"
+    );
 }
 
 /// Under round robin on both sides a pair's first decision takes the

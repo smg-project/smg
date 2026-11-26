@@ -98,6 +98,7 @@ fn a_request_no_other_worker_can_take_ends_with_the_workers_own_answer() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "admits",
         retry_after_secs: 1,
+        side: None,
     };
     for size in [1, 2] {
         let fleet = workers(size);
@@ -167,6 +168,7 @@ fn a_shed_for_another_cause_at_a_retry_is_answered_as_at_a_first_attempt() {
             reason: ShedReason::NoEndpoints,
             emptied_by,
             retry_after_secs: 1,
+            side: None,
         };
         let answer = program.serve(&PLAIN);
         assert_eq!(answer.sent.len(), 1, "under {emptied_by}: {answer:?}");

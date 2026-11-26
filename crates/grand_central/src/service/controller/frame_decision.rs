@@ -770,7 +770,9 @@ fn decide_sides(
 ///   it too. A shed of that decision with no endpoint, or for workers over
 ///   their thresholds, is the pair's shed under `target-worker`
 ///   ([`named_worker::held_answer`]). A number that reaches no worker on a
-///   side sheds the pair so, and the engine is asked nothing. Where every
+///   side sheds the pair so, on that side, and the engine is asked nothing.
+///   The side stays in this process: the answer's message has no field for
+///   it. Where every
 ///   decode is over its thresholds and the binding steers such a pool, the
 ///   decision is held to the prefill alone and takes its decode by load.
 /// - **The decode's side alone.** The prefill is the decision's own pick.
@@ -845,10 +847,10 @@ fn decide_named_pair(
             let (decision, said) = front.decide_without_lease(&maker, now)?;
             Ok((named_worker::held_answer(decision), said))
         }
-        ReachedPair::NoWorker => {
+        ReachedPair::NoWorker(side) => {
             let (seed, generation) = (frame.seed(), spec.generation());
             let answer = shed(ShedReason::NoEndpoints, TARGET_WORKER, seed, generation);
-            Ok((answer, None))
+            Ok((answer.of_side(side), None))
         }
         ReachedPair::NoneToCount => unnamed(),
     }

@@ -683,6 +683,7 @@ fn a_refused_pair_keeps_no_claim_on_either_side() {
             reason: ShedReason::NoEndpoints,
             emptied_by: "admits",
             retry_after_secs: 1,
+            side: None,
         };
         assert_eq!(engine.place(&ruled).err(), Some(shed));
         // The workers the first decision claimed are the busier by now.
@@ -1007,6 +1008,7 @@ fn a_pair_that_states_a_demand_is_placed_on_the_workers_that_meet_it() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "decoding",
         retry_after_secs: 1,
+        side: Some(PairSide::Decode),
     };
     assert_eq!(engine.place(&decided).err(), Some(none));
     assert_eq!(said(&heard).len(), from, "a shed issues nothing");
