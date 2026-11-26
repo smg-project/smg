@@ -635,6 +635,37 @@ async fn the_budget_ends_the_wait_and_the_id_stays_taken_until_its_answer() {
     assert_eq!(within(peer.requests.next()).await, Some(request(2)));
 }
 
+/// A budget past the clock's range sets no deadline: the ask waits
+/// however far the clock moves, and takes its answer.
+#[tokio::test(start_paused = true)]
+async fn a_budget_past_the_clocks_range_waits_with_no_bound() {
+    let mut peer = Peer::new(1);
+    let mut asked = Box::pin(peer.link.ask(request(1), Duration::MAX));
+    assert!(poll(asked.as_mut()).is_pending());
+    assert_eq!(within(peer.requests.next()).await, Some(request(1)));
+    advance(Duration::from_secs(86_400)).await;
+    assert!(poll(asked.as_mut()).is_pending());
+    peer.answer(1, 5, decision(7, &[Side::Single]));
+    let (answer, _) = within(asked).await.expect("the ask's own answer");
+    assert_eq!(answer.leases[0].id, 7);
+}
+
+/// A wait with no deadline still ends where its session does: the ask
+/// answers that the session ended.
+#[tokio::test]
+async fn a_wait_with_no_bound_ends_where_its_session_does() {
+    let mut peer = Peer::new(1);
+    let link = peer.link.clone();
+    let mut asked = Box::pin(link.ask(request(1), Duration::MAX));
+    assert!(poll(asked.as_mut()).is_pending());
+    closes(&link, || drop(peer.decide.take())).await;
+    assert!(matches!(
+        within(asked).await,
+        Err(DecisionUnavailable::Ended)
+    ));
+    Peer::readers_end(peer.readers).await;
+}
+
 #[tokio::test]
 async fn answers_without_an_ask_release_each_lease_and_drop_busy() {
     let mut peer = Peer::new(4);

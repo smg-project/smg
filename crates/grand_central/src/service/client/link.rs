@@ -314,17 +314,11 @@ impl Link {
             Err(error) => return Err(DecisionUnavailable::Unsent(error)),
         };
         let deadline = Instant::now().checked_add(budget);
-        let mut pending = self.shared.begin(request, deadline, cut + left_out)?;
+        let pending = self.shared.begin(request, deadline, cut + left_out)?;
         if budget.is_zero() {
             return Err(DecisionUnavailable::Late);
         }
-        let answer = match deadline {
-            Some(at) => timeout_at(at, &mut pending.answer)
-                .await
-                .map_err(|_| DecisionUnavailable::Late)?,
-            None => (&mut pending.answer).await,
-        };
-        match answer.map_err(|_| DecisionUnavailable::Ended)? {
+        match pending.wait().await? {
             Answer::Decision(decision, encode) => Ok((decision, encode)),
             Answer::Busy(busy) => Err(DecisionUnavailable::Busy(busy)),
         }
@@ -791,6 +785,7 @@ impl Shared {
             shared: self,
             session: state.session,
             id,
+            deadline,
             answer,
         })
     }
@@ -942,7 +937,30 @@ struct Pending<'a> {
     // The session the ask went out on.
     session: u64,
     id: Arc<[u8]>,
+    // The deadline the ask was registered under.
+    deadline: Option<Instant>,
     answer: oneshot::Receiver<Answer>,
+}
+
+impl Pending<'_> {
+    /// Waits for the ask's answer, to the deadline it was registered
+    /// under. No answer by then is [`DecisionUnavailable::Late`]. A
+    /// session's end that the wait sees first is
+    /// [`DecisionUnavailable::Ended`].
+    ///
+    /// The wait takes the record by value. So the asker leaves at every
+    /// end of the wait: with its answer, at its deadline, at its session's
+    /// end, or where its caller drops the wait. An id it leaves ahead of
+    /// its answer stays taken until that answer arrives.
+    async fn wait(mut self) -> Result<Answer, DecisionUnavailable> {
+        let answer = match self.deadline {
+            Some(at) => timeout_at(at, &mut self.answer)
+                .await
+                .map_err(|_| DecisionUnavailable::Late)?,
+            None => (&mut self.answer).await,
+        };
+        answer.map_err(|_| DecisionUnavailable::Ended)
+    }
 }
 
 impl Drop for Pending<'_> {
