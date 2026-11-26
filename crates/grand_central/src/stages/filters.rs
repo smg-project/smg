@@ -892,23 +892,6 @@ fn row_word(c: &Candidate) -> u64 {
         | u64::from(c.has_room) << 56
 }
 
-/// The five filters of this file a set names, by bit: what the cases of the
-/// folded test walk, here and in the engine's.
-#[cfg(test)]
-pub(crate) fn filters_of(set: u8) -> Vec<Box<dyn Filter>> {
-    let all: [fn() -> Box<dyn Filter>; 5] = [
-        || Box::new(Healthy),
-        || Box::new(NotOverloaded),
-        || Box::new(HasCapacity),
-        || Box::new(HasRoom),
-        || Box::new(NotTried),
-    ];
-    (0..all.len())
-        .filter(|bit| set & (1 << bit) != 0)
-        .map(|bit| all[bit]())
-        .collect()
-}
-
 #[cfg(test)]
 #[path = "../../tests/unit/stages/filters/tests.rs"]
-mod tests;
+pub(crate) mod tests;

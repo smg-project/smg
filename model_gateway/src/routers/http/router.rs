@@ -815,7 +815,8 @@ impl Router {
                     None,
                 ) {
                     PlacementFailure::NoCandidates => error::model_not_found(model_id),
-                    PlacementFailure::AllOverloaded(shed) => shed,
+                    PlacementFailure::AllOverloaded(refusal)
+                    | PlacementFailure::NoPlanBound(refusal) => refusal,
                     PlacementFailure::Unavailable
                     | PlacementFailure::PolicyDeclined(_)
                     | PlacementFailure::NoCompatiblePair { .. }
@@ -1319,7 +1320,8 @@ impl Router {
                 model_id,
                 self.worker_registry.overload_shed_enabled(),
             ) {
-                PlacementFailure::AllOverloaded(shed) => shed,
+                PlacementFailure::AllOverloaded(refusal)
+                | PlacementFailure::NoPlanBound(refusal) => refusal,
                 PlacementFailure::NoCandidates
                 | PlacementFailure::Unavailable
                 | PlacementFailure::PolicyDeclined(_)

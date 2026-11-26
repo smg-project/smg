@@ -22,8 +22,11 @@
 //!
 //! A tell the store refuses writes nothing, and the call does not try it
 //! again: the row left the revision the object was built from, no row
-//! stands, or the writer's term ended. The row's next lay or the object's
-//! next move settles it. A status the object took ahead of a tell the
+//! stands, or the writer's term ended. A writer that names its term hands
+//! it on with its word ([`LeadWord`]): the store's journal compares it
+//! where the status's event takes its place, so a term that ended by then
+//! writes nothing either. The row's next lay or the object's next move
+//! settles it. A status the object took ahead of a tell the
 //! store takes no word of is taken back in the tell's own turn: the
 //! object takes the status its row holds, and where no row stands for it
 //! the status it left.
@@ -44,7 +47,7 @@ use smg_worker::{
 use super::{super::object::row_status, Objects};
 use crate::{
     engine::view::WorkerId,
-    store::{HealthWrite, MemoryStore},
+    store::{HealthWrite, LeadWord, MemoryStore},
 };
 
 /// An object's move: the status it left, then the one that stands.
@@ -84,9 +87,9 @@ impl<G: Generation> Objects<G> {
     /// behind a move the registry's state machine made, `moved`: the
     /// status the object left, then the one it took. `leads` is the
     /// driver's last word, asked under the object's lock and again under
-    /// the store's. Where the store takes no word, the move is taken back
-    /// in this turn ([`Self::status_under`]). What the store made of the
-    /// status.
+    /// the store's. A driver's word names no term to the store's journal.
+    /// Where the store takes no word, the move is taken back in this turn
+    /// ([`Self::status_under`]). What the store made of the status.
     pub(crate) fn tell_status(
         &self,
         store: &MemoryStore,
@@ -96,7 +99,8 @@ impl<G: Generation> Objects<G> {
         leads: &dyn Fn() -> bool,
     ) -> HealthWrite {
         let write = Write::Tell(Some(moved));
-        self.status_under(store, id, revision, None, leads, write).0
+        let word = LeadWord::of(leads);
+        self.status_under(store, id, revision, None, word, write).0
     }
 
     /// The connect signal of the object under `id`, as
@@ -110,7 +114,8 @@ impl<G: Generation> Objects<G> {
         revision: u64,
         leads: &dyn Fn() -> bool,
     ) -> Moved {
-        self.status_under(store, id, revision, None, leads, Write::Connect)
+        let word = LeadWord::of(leads);
+        self.status_under(store, id, revision, None, word, Write::Connect)
             .1
     }
 
@@ -119,24 +124,25 @@ impl<G: Generation> Objects<G> {
     /// A ready or a draining object stands, and its counters with it. A row
     /// that left the revision, or left, moves nothing. One of a host's
     /// write calls ([`Objects`]): its caller asks its term itself, so the
-    /// call hands the store no last word.
+    /// call hands the store no last word and no term.
     pub fn connect_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
-        self.connect_row_under(store, row, revision, &|| true);
+        self.connect_row_under(store, row, revision, LeadWord::FREE);
     }
 
-    /// [`Self::connect_row`] under its writer's word of its lead, `leads`,
-    /// for a caller whose term can end while the write waits: asked under
-    /// the object's lock and again under the store's, as
-    /// [`Self::tell_status`] asks a driver's. Where it says no at either,
+    /// [`Self::connect_row`] under its writer's word of its lead, `word`,
+    /// for a caller whose term can end while the write waits. Its read is
+    /// asked under the object's lock and again under the store's, as
+    /// [`Self::tell_status`] asks a driver's, and its term goes to the
+    /// store's journal with the status. Where any of the three says no,
     /// no status is written and the object stands.
     pub(crate) fn connect_row_under(
         &self,
         store: &MemoryStore,
         row: WorkerId,
         revision: u64,
-        leads: &dyn Fn() -> bool,
+        word: LeadWord<'_>,
     ) {
-        self.row_status(store, row, revision, leads, Write::Connect);
+        self.row_status(store, row, revision, word, Write::Connect);
     }
 
     /// The drain of the row `row`, read at `revision`, as
@@ -144,7 +150,7 @@ impl<G: Generation> Objects<G> {
     /// `store` is told. Whether the row's object moved: a row that left
     /// the revision, or left, moves nothing, and a draining object stands.
     pub fn drain_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) -> bool {
-        self.drain_row_under(store, row, revision, &|| true)
+        self.drain_row_under(store, row, revision, LeadWord::FREE)
     }
 
     /// [`Self::drain_row`] under its writer's word of its lead, as
@@ -156,9 +162,9 @@ impl<G: Generation> Objects<G> {
         store: &MemoryStore,
         row: WorkerId,
         revision: u64,
-        leads: &dyn Fn() -> bool,
+        word: LeadWord<'_>,
     ) -> bool {
-        self.row_status(store, row, revision, leads, Write::Drain)
+        self.row_status(store, row, revision, word, Write::Drain)
             .is_some()
     }
 
@@ -166,7 +172,7 @@ impl<G: Generation> Objects<G> {
     /// a write that laid the object in another's place: it took the
     /// standing object's status there, and the table holds its own.
     pub(super) fn tell_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
-        self.row_status(store, row, revision, &|| true, Write::Tell(None));
+        self.row_status(store, row, revision, LeadWord::FREE, Write::Tell(None));
     }
 
     /// Settle the status of the object that stands for `row` with the
@@ -174,9 +180,10 @@ impl<G: Generation> Objects<G> {
     /// another's place: it took the standing object's status there, and a
     /// move a health driver made on that one ahead of its telling tells
     /// nothing ([`Self::status_under`]). `leads` is the caller's own word
-    /// of its lead. Where it holds, the table is told the object's status,
-    /// as [`Self::tell_row`] tells it. Where it does not, the table is not
-    /// written, and the object takes the status its row holds.
+    /// of its lead, and it names no term. Where it holds, the table is
+    /// told the object's status, as [`Self::tell_row`] tells it. Where it
+    /// does not, the table is not written, and the object takes the status
+    /// its row holds.
     pub(super) fn settle_row(
         &self,
         store: &MemoryStore,
@@ -184,7 +191,8 @@ impl<G: Generation> Objects<G> {
         revision: u64,
         leads: &dyn Fn() -> bool,
     ) {
-        self.row_status(store, row, revision, leads, Write::Tell(None));
+        let word = LeadWord::of(leads);
+        self.row_status(store, row, revision, word, Write::Tell(None));
     }
 
     /// A status write that names its row: on the object that stands for
@@ -195,12 +203,12 @@ impl<G: Generation> Objects<G> {
         store: &MemoryStore,
         row: WorkerId,
         revision: u64,
-        leads: &dyn Fn() -> bool,
+        word: LeadWord<'_>,
         write: Write,
     ) -> Moved {
         let id = self.object(row)?;
         let object = self.registry.get(&id)?;
-        self.status_under(store, &id, object.revision(), Some(revision), leads, write)
+        self.status_under(store, &id, object.revision(), Some(revision), word, write)
             .1
     }
 
@@ -239,7 +247,7 @@ impl<G: Generation> Objects<G> {
         id: &ObjectId,
         revision: u64,
         seen: Option<u64>,
-        leads: &dyn Fn() -> bool,
+        word: LeadWord<'_>,
         write: Write,
     ) -> (HealthWrite, Moved) {
         let under = |object: &Arc<dyn Worker>| {
@@ -260,8 +268,8 @@ impl<G: Generation> Objects<G> {
             let status = row_status(next.unwrap_or(from));
             // A call can wait here for the object's lock through the end of
             // its term: it tells nothing.
-            let told = if leads() {
-                store.status_told(standing.row, status, standing.revision, leads)
+            let told = if (word.leads)() {
+                store.status_told(standing.row, status, standing.revision, word)
             } else {
                 HealthWrite::Stale
             };

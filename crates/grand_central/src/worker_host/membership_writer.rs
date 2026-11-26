@@ -325,8 +325,9 @@ pub(crate) trait Turn {
     /// The turn's connect signal for the row `id`, read at `revision`, a
     /// row whose checks are off: ready at once, unless it drains or is
     /// ready. A door with a holder writes it on the row's worker object,
-    /// and the store is told. A turn under a term asks its log last under
-    /// the membership lock, and writes nothing where the term ended by then
+    /// and the store is told. A turn under a term hands it on with the
+    /// status: the store's journal compares it where the status's event
+    /// takes its place, and nothing is written where the log has left it
     /// ([`Objects::connect_row_under`](super::Objects::connect_row_under)).
     /// A registration of equal facts sends it too, where its row waits for
     /// it still ([`awaits_connect`]).
@@ -336,7 +337,8 @@ pub(crate) trait Turn {
     /// [`Self::connect`] writes a status
     /// ([`Objects::drain_row_under`](super::Objects::drain_row_under)).
     /// Whether the row moved: `false` where another writer moved it under
-    /// the turn, and where the turn's term ended ahead of the last ask.
+    /// the turn, and where the log left the turn's term ahead of the
+    /// status's event.
     fn drain(&self, id: WorkerId, revision: u64) -> bool;
 
     /// Check the term ahead of a write. A registration asks before each

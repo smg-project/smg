@@ -189,7 +189,7 @@ impl Witness {
     /// the promise is excused only where another frame's flight already
     /// shows the thread stalled: alone it misses before the thread can be
     /// seen late, and its miss is nobody's to say ([`Self::vouches_for`]).
-    pub(crate) fn stalled_between(&self, from: Instant, until: Instant) -> bool {
+    fn stalled_between(&self, from: Instant, until: Instant) -> bool {
         let (from, until) = (self.micros(from), self.micros(until));
         if until.saturating_sub(self.ran.load(Ordering::Relaxed)) > PROMISE_MICROS {
             return true;
@@ -208,17 +208,17 @@ impl Witness {
     pub(crate) const fn vouches_for(flight_micros: u64) -> bool {
         flight_micros > PROMISE_MICROS
     }
-}
 
-/// Stamps the witness once a tick while any frame is in flight; with none
-/// it waits for the first.
-async fn witness_ticks(witness: Arc<Witness>) {
-    loop {
-        while witness.in_flight.load(Ordering::Relaxed) == 0 {
-            witness.wake.notified().await;
+    /// Stamps the witness once a tick while any frame is in flight; with
+    /// none it waits for the first.
+    async fn ticks(self: Arc<Self>) {
+        loop {
+            while self.in_flight.load(Ordering::Relaxed) == 0 {
+                self.wake.notified().await;
+            }
+            self.stamp();
+            tokio::time::sleep(WITNESS_TICK).await;
         }
-        witness.stamp();
-        tokio::time::sleep(WITNESS_TICK).await;
     }
 }
 
@@ -525,11 +525,9 @@ pub(crate) enum Wait {
 }
 
 impl Lane {
-    pub(crate) fn new(
-        peer: Arc<Peer>,
-        events: Weak<dyn LaneEvents>,
-        witness: Arc<Witness>,
-    ) -> Self {
+    /// A lane that counts its frames on `witness`: a runtime makes its own
+    /// ([`Runtime::lane`]).
+    fn new(peer: Arc<Peer>, events: Weak<dyn LaneEvents>, witness: Arc<Witness>) -> Self {
         Self {
             peer,
             events,
@@ -561,6 +559,10 @@ impl Lane {
     }
 
     fn ask(self: &Arc<Self>, runtime: &Runtime, pause: Duration) {
+        debug_assert!(
+            self.is_of(runtime),
+            "a lane asks the runtime that made it for its stream"
+        );
         let mut state = self.state.lock();
         let due = match &*state {
             LaneState::Cold => true,
@@ -574,6 +576,19 @@ impl Lane {
                 self.fail("the plugin runtime is gone".into());
             }
         }
+    }
+
+    /// Whether `runtime` made this lane: a lane counts its frames on its
+    /// maker's witness, and the maker's I/O thread stamps that one.
+    fn is_of(&self, runtime: &Runtime) -> bool {
+        runtime.stamps(&self.witness)
+    }
+
+    /// Whether the I/O thread stalled while an answer was owed on this
+    /// lane from `from` to `until`: the word of the witness its frames
+    /// are counted on ([`Witness::stalled_between`]).
+    pub(crate) fn stalled_between(&self, from: Instant, until: Instant) -> bool {
+        self.witness.stalled_between(from, until)
     }
 
     /// The stage bits the plugin implements, when the stream is open.
@@ -900,9 +915,16 @@ impl Runtime {
         &self.decisions
     }
 
-    /// The I/O thread's witness.
-    pub(crate) fn witness(&self) -> &Arc<Witness> {
-        &self.witness
+    /// A lane of this runtime to `peer`: its frames are counted on this
+    /// runtime's witness, the one its I/O thread stamps.
+    pub(crate) fn lane(&self, peer: Arc<Peer>, events: Weak<dyn LaneEvents>) -> Lane {
+        Lane::new(peer, events, Arc::clone(&self.witness))
+    }
+
+    /// Whether `witness` is this runtime's own, the one its I/O thread
+    /// stamps.
+    fn stamps(&self, witness: &Arc<Witness>) -> bool {
+        Arc::ptr_eq(&self.witness, witness)
     }
 
     pub(crate) fn send(&self, command: Command) -> bool {
@@ -949,7 +971,7 @@ async fn run_commands(
     witness: Arc<Witness>,
 ) -> JoinSet<()> {
     let mut streams = JoinSet::new();
-    streams.spawn(witness_ticks(witness));
+    streams.spawn(witness.ticks());
     loop {
         tokio::select! {
             command = commands.recv() => match command {

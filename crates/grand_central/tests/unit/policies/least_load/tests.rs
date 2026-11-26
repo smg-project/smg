@@ -7,8 +7,7 @@ use crate::{
     stages::{
         pickers::{target_of, Best},
         scorers::{
-            take_lane,
-            tests::{candidate, kept, report},
+            tests::{candidate, kept, report, take_lane},
             HeldCredit, SessionAffinity, RANK_CREDIT_KEPT,
         },
     },

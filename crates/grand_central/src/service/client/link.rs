@@ -377,7 +377,7 @@ fn in_range(request: &DecideRequest) -> Result<(), Error> {
                 // A decode call is read at the decode phase, whatever its
                 // facts say.
                 let phase = if decode_of == 0 { phase } else { Phase::Decode };
-                wire::stated_demands(stated, phase, request.named_worker.is_some()).map(|_| ())
+                wire::stated_demands(stated, phase).map(|_| ())
             }
         }
     });

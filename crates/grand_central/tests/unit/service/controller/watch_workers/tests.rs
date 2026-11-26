@@ -477,9 +477,10 @@ async fn a_membership_entry_with_no_wire_form_is_logged_once_and_told_to_no_watc
         let text = String::from_utf8(lines.0.lock().clone()).expect("the lines as text");
         text.matches("has no wire form").count()
     };
-    journal.member(None, 2, MembershipChange::Removed { id }, None, None);
+    let removed = MembershipChange::Removed { id };
+    assert!(journal.member(None, None, 2, removed, None, None));
     let replaced = MembershipChange::Replaced { old: id, new: id };
-    journal.member(None, 3, replaced, Some(&row), None);
+    assert!(journal.member(None, None, 3, replaced, Some(&row), None));
     journal.released();
     let unwired = leader.head();
     leader.register(1, 1, "model-a");
@@ -500,7 +501,7 @@ async fn a_membership_entry_with_no_wire_form_is_logged_once_and_told_to_no_watc
     leader.store.set_term(3);
     let mut later = leader.watch(Start::Snapshot, &[]);
     next(&mut later).await;
-    journal.member(None, 4, MembershipChange::Removed { id }, None, None);
+    assert!(journal.member(None, None, 4, removed, None, None));
     journal.released();
     let again = leader.head();
     assert!(again.seq < unwired.seq && again.term == 3, "{again:?}");

@@ -28,6 +28,41 @@ use crate::{
     Draw,
 };
 
+/// Pins this thread's lane, so a test owns one lane per thread.
+pub(crate) fn take_lane(lane: usize) {
+    LANE.with(|drawn| drawn.set(Some(lane)));
+}
+
+// What a test reads of a row. The row's words stay `scorers.rs`'s own.
+impl RankCredit {
+    /// The held token-work and requests, and the sends of no stated size.
+    pub(crate) fn held_for_test(&self) -> (HeldCredit, u16) {
+        (
+            self.held_credit(),
+            self.unsized_held.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The row's three words as they stand: the stated token-work, the
+    /// requests, the sends of no stated size and their estimates.
+    fn words_for_test(&self) -> (u64, u64, u16, u64) {
+        let (HeldCredit { tokens, requests }, unsized_held) = self.held_for_test();
+        (tokens, requests, unsized_held, self.estimated())
+    }
+
+    /// One retirement, as a dispatch that found the row at its bound runs
+    /// it.
+    pub(crate) fn retire_for_test(&self) {
+        self.retire_oldest();
+    }
+
+    /// Whether every lane's lock is held now: what a dispatch's record
+    /// and a release wait for.
+    pub(crate) fn lanes_held_for_test(&self) -> bool {
+        self.lanes.iter().all(|lane| lane.dispatches.is_locked())
+    }
+}
+
 pub(crate) fn candidate(position: u32, in_flight: u32) -> Candidate {
     Candidate {
         position,

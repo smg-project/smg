@@ -2542,11 +2542,24 @@ request ──> route (HTTP or gRPC, any family)
   the series can count such a request in a neighbouring bucket, above or below, where the match's
   share lies that close to a bucket's edge.
 
-  Where the engine places no worker for a request, the gateway names the client's answer itself,
-  by classic's own judgement of the pool. The engine's word for the refusal goes to a log line
-  and no further: at `debug`, or at `warn` where the engine refused the decision itself. One word
-  is acted on, a pair's prefills all at their admission limit: the route waits for a slot, as
-  under classic.
+  Where the engine places no worker for a single request, the gateway names the client's answer
+  itself, by classic's own judgement of the pool. The engine's word for the refusal goes to a log
+  line and no further: at `debug`, or at `warn` where the engine refused the decision itself.
+
+  A pair's route answers by the engine's word. A pair's prefills all at their admission limit make
+  the route wait for a slot, as under classic. A pair the policy spec in force binds no pair plan
+  for is refused with a 501 under the code `no_policy_plan_for_model`, with no retry hint.
+  A model with no worker on a side, or with no pair that shares a transfer protocol, is answered
+  for that ahead of the engine, as under classic.
+  A pair the engine declined under any other name is answered as classic answers a policy that
+  picked nobody, under the engine's name, for the side the engine's refusal names.
+
+  Every other refusal is judged from the pools, as classic judges its own. A side with nobody open
+  is the fleet's own state, and it is the role, the prefills first: the answer is classic's for
+  the same fleet, whatever side the engine's refusal names. Where both sides stand open, the role
+  is the side the engine's refusal names, and the decode's where it names none. Two limits stand:
+  a side that a stage other than health or overload emptied reads as unavailable, and so does a
+  decision the engine itself refused.
 
   The fourth, the encode stage's own selection, takes its pair from `select_pair` and refuses a request that carries an item for the encode workers by name **[planned]**: the gateway does not yet hand the engine an encode request's three lists.
 
@@ -2817,20 +2830,22 @@ crate's own client states for no request.
   with the controller (10.2), and a gateway's own process counts in the order of its own list. It
   ends when a gateway under a controller follows the controller's list and keeps its order
   (section 11) **[planned]**.
-- **No hard demand crosses beyond a single request's frame that names no worker.** A single
-  request's frame that names none states its demands from protocol 2 **[built]**
-  (`DecideRequest.demands`), and the controller keeps the workers that meet them ahead of every
-  stage. A frame that names its worker states none yet, and neither does a pair's frame, a decode
-  call or an encode request's frame: such a frame that states one is refused by the field, and a
-  host decides its request by itself. So the controller's count leaves no worker out for a
-  demand. It ends when those frames state a request's demands **[planned]**. A frame that
-  demands vision is held to the workers that take images. No registration over the wire states
-  that bit, so such a frame is shed unless the controller's own host laid a worker that does.
-  The handle refuses that part by its name. A shed keeps its demand's stage through the handle,
-  and any other stage reads `controller` there. What a worker states for the other demands
-  crosses already **[built]**: a registration states it and the log's row tells it, so a standby
-  and a watcher hold it. A worker whose row states none meets no demand for a runtime, for media
-  by reference or for a way to decide a constraint, and it takes a request of any size.
+- **An encode request's frame states no hard demand.** Every other frame states its request's
+  demands from protocol 2 **[built]** (`DecideRequest.demands`). Those are a single request's
+  frame, a pair's, a decode call's, a side's that stands alone and one that names its worker. The
+  controller keeps the workers that meet them ahead of every stage, each side by its role's part.
+  Its count passes over a worker a demand leaves out, as a gateway's own process does. An encode
+  request's frame that states one is refused by the field, and a host decides its request by
+  itself. It ends when that frame states a request's demands **[planned]**. A frame that demands
+  vision is held to the workers that take images. No registration over the wire states that bit,
+  so such a frame is shed unless the controller's own host laid a worker that does. The handle
+  refuses that part by its name. A shed keeps its demand's stage through the handle, and any
+  other stage reads `controller` there. `wires` and `vision` also name the controller's own shed
+  of a gateway's reach and of an encode request's media, as they do in process. What a worker
+  states for the other demands crosses already **[built]**: a registration states it and the
+  log's row tells it, so a standby and a watcher hold it. A worker whose row states none meets no
+  demand for a runtime, for media by reference or for a way to decide a constraint. It takes a
+  request of any size.
 - **A named prefill at its admission limit is not waited for.** A gateway's own process waits for
   the prefill a pair names where it stands at that gateway's admission limit (section 8.2). A
   controller keeps no gate: its count takes the prefill, and the gateway finds the limit. It ends
@@ -2932,10 +2947,10 @@ tells the data once more:
 
 | Copy | Where | Read by |
 |---|---|---|
-| the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: the one record behind a write the store refuses, a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
+| the worker record | the store's table of records (`store/memory.rs`) | the code that keeps the objects, among its reads: a record's status where a leader's log tells it, and a first copy, for the status the log told of each record; and the store itself, for its published copy and the membership log's event |
 | a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
 | the worker object | the worker-crate registry | the health checker, the follower of cache events, a decision, and a watcher's, a standby's and an operator's first copy |
-| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a single request's frame that states a demand is held to it. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | a decision, for the record's id, whether the worker takes images, its wire modes and from where it is reached. A pair's classes read the worker's engine kind and its pairing descriptor too, and for a record that states no descriptor the pairing facts its worker object derives of its labels. What the worker states for a request's hard demands is lent with the list, and a frame that states a demand is held to it, every frame but an encode request's. The follower of cache events asks here whether a worker's events are indexed: its signals stand here and its models on the object (`worker_host/kv_feed.rs:191`, through `Objects::row_of`) |
 | the published copy: of a record its id alone, beside its slot in the counts and in a gateway's vetoes by pool; with them each pool's index by model and role, the generation and the clock | the store | a pick's booking and a gateway's vetoes; every other loader reads the generation; no row of a record stands in it and no request is decided over it |
 | the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
 
@@ -3032,16 +3047,16 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    store over a write of the registry. The store takes a decided change only where the record
    it was decided over still stands at the revision the keeper read, tested under the
    membership lock: a write that landed between the two is never written over, and the keeper
-   reads that record again before it answers.
+   reads no record behind the refusal.
 
    A first copy is cut from the objects in the
    keeper's turn, the last part of step 2. Since step 3 a status is the object's
    word: a drain and a connect signal write the object and tell the table, a key's next life
    starts in the status its worker object stood in, and a call's answer waits on no follow.
 
-   A change the store took and the registry did not get is laid where the store next refuses a
-   write of the record: the keeper reads that record again before it answers. A record with no
-   object at all is reached so by a registration under its key alone. A change that moves a fact the object holds builds the object again: the
+   A change the store refuses lays nothing: a refused write reads no record of the store. A
+   record with no object waits for a cut laid whole, and its key's registration through the keeper is
+   refused until then. It is one written through the store's own entries, or one the store took and the registry did not get. A change that moves a fact the object holds builds the object again: the
    new object takes the standing one's place under its id, with its running state, as the code
    that keeps the objects does today for a record that changed.
 2. A standby applies the leader's events to its own worker objects **[built]**. A call reads the
@@ -3063,13 +3078,13 @@ A fact leaves the remainder when the worker object gets a field that holds it as
    The task is deleted
    **[built]**: the calls a record is written by are public, a host of the worker objects
    writes through them, and a served controller hands the code that keeps its objects. A
-   record written through the store's own entries gets its object in two places: at its
-   key's next refused registration, and where a cut is laid whole.
+   record written through the store's own entries gets its object in one place: where a cut
+   is laid whole.
    No task lays it. No turn that takes the controller's own store starts with
    a read of its table **[built]**: a write call decides over the object that stands, a call's read
    and a first copy read the objects, and a standby's applier lays its leader's event. A
    turn of the keeper's own reads no log of the store's changes **[built]**: a refused write
-   reads its own record, a cut laid whole lays the cut's own records, then reads the status the
+   reads no record, a cut laid whole lays the cut's own records, then reads the status the
    table holds for each, and the call that lays a kept credential again reads the objects. No
    host follows the store **[built]**.
 
@@ -3114,7 +3129,7 @@ A copy reads the log's place and the store's epoch in one
 hold, and no record of the table. So a copy holds
 each record the log told at the copy's place, and none it did not, beside every writer that holds the turn. A
 record the store took and the registry did not get is in no copy until it is laid (step 1).
-One written through the store's own entries is laid at its key's next refused registration, or
+One written through the store's own entries is laid
 where a cut is laid whole. A copy's statuses are the
 ones the log last told at its place, and not the objects': an object can stand one tell
 ahead of the log. The store keeps what the log last told of each record's status, beside its
@@ -3148,16 +3163,23 @@ the worker registry's own health machine, which moves the object. The code that 
 objects then tells the store the status that stands, under the object's own lock, through one
 entry that asks the writer's lead under the membership lock. A move the store takes no word
 of is taken back in that same turn of the object's lock: the object takes the status its
-record holds or, where no record stands for it, the status it left. A registration call's
-connect signal and its drain go through
-that entry too, with the word of the call's term. The store is told first, and the object
-moves where the store took the status. The store asks the word last under its membership
-lock. A term that ends behind that ask still writes the status. The journal then stamps it
-with the term its store leads at that instant, or with none where it follows. A call whose
-term ended while its write waited writes no status, and its drain answers that the replica
-does not lead that term. A connect signal that was not written is sent again by an upsert of
-the same registration: equal facts write no record, and the signal goes with the word of that
-call's own term, to a worker whose checks are off and which is neither ready nor draining.
+record holds or, where no record stands for it, the status it left.
+
+A registration call's connect signal and its drain go through that entry too, with the word
+of the call's term. The store is told first, and the object moves where the store took the
+status. The store tells the journal first, with the call's term. The journal compares that
+term in the same turn of its lock that stamps the event. Where the log has left the term, it
+takes no event, and the store moves nothing.
+
+A probe's verdict names no term. Its writer's lead is asked last under the membership lock.
+The journal stamps the status behind that ask, with the term its store leads then or with
+none.
+
+The log's term is as fresh as the election's last word to it. A call whose term ended while
+its write waited writes no status, and its drain answers that the replica does not lead that
+term. A connect signal that was not written is sent again by an upsert of the same
+registration. Equal facts write no record. The signal goes with the word of that call's own
+term, to a worker whose checks are off and which is neither ready nor draining.
 
 The locks in their order: the object's own, then the store's membership lock. No
 holder of the store's lock takes an object's, and no decision takes one.

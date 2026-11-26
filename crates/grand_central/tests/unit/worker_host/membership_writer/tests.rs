@@ -2225,7 +2225,7 @@ mod decided {
     }
 
     /// A holder with a registry of its own. It lays the rows of a store
-    /// where a case has it lay them, as a refused write does, and builds
+    /// where a case has it lay them, as a cut laid whole does, and builds
     /// each object in its row's status.
     fn holder() -> Objects<Members> {
         Objects::new(Arc::new(WorkerRegistry::new()))

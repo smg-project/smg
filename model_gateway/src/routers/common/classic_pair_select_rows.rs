@@ -363,6 +363,10 @@ impl Bed {
                     PlacementFailure::PrefillAtCapacity => "at_capacity",
                     PlacementFailure::PolicyDeclined(_) => "declined",
                     PlacementFailure::NoCompatiblePair { .. } => "other",
+                    // The recorder starts no Grand Central, so no row of
+                    // its sheet records this refusal. It has its name all
+                    // the same, as in the encode pairs' recorder.
+                    PlacementFailure::NoPlanBound(_) => "no_plan_bound",
                 },
             },
         }

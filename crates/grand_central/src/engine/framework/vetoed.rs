@@ -745,6 +745,18 @@ impl<'a> Half<'a> {
         places::rows(self.rows, self.cx)
     }
 
+    /// Whether each hard filter of the side reads a row alone
+    /// ([`Filter::row_wise`]) and holds no decision scope. Such a filter
+    /// answers alike behind the decision it stood in. Any other may answer
+    /// by a scope that is closed by then, or by what it kept of being
+    /// asked. A prefill side's shadow asks this of the live decode profile
+    /// before its default asks that profile's filters
+    /// ([`Engine::shadow_side`]).
+    pub(super) fn reads_rows_alone(&self) -> bool {
+        let mut hard = self.profile.filters.iter().filter(|f| !f.soft());
+        hard.all(|f| f.row_wise() && f.scope().is_none())
+    }
+
     /// Whether `row` stands but for the side's admission limit: the side's
     /// hard filters keep it with the limit set aside, under the side's own
     /// constraints. A pair's decision judges the limit over the prefills
@@ -758,12 +770,28 @@ impl<'a> Half<'a> {
         aside.stands(row, aside.cx)
     }
 
+    /// Whether one of the side's rows of `classes` stands but for the
+    /// side's admission limit ([`Self::but_for_the_limit`]): the limit
+    /// alone left the side's run nobody among them. A pair's decision sheds
+    /// such a request under the limit's stage, on which its host waits for
+    /// room ([`Engine::decide_pair`]). A prefill side's shadow asks the
+    /// same test ([`Engine::shadow_side`]).
+    ///
+    /// In line at each caller: as a call, it cost a pair's decision that
+    /// never asks it 3 instructions.
+    #[inline(always)]
+    pub(super) fn waits_among(&self, classes: &[u32]) -> bool {
+        let listed = |row: &&Candidate| classed(classes, row.pair_class);
+        let mut among = self.places().filter(listed);
+        among.any(|row| self.but_for_the_limit(row))
+    }
+
     /// The side's rows that stand in the pass that lifts `lifted`
     /// ([`lifted_cx`]), into `buf.kept`, the mark left in `buf.lifted`. The
     /// set opens with the places the side's host states, as every pass of
     /// the rule does ([`places::open`]). With the liveness veto lifted, rows
     /// that carry a doubt are read with none ([`undoubted`]).
-    fn usable(&self, lifted: LiftedVeto, steers: bool, buf: &mut Buffers) {
+    pub(super) fn usable(&self, lifted: LiftedVeto, steers: bool, buf: &mut Buffers) {
         let doubt = lifted == LiftedVeto::Liveness;
         let pass = lifted_cx(self.cx, steers, doubt);
         // The rows are written again only where one carries a doubt.
@@ -829,7 +857,49 @@ impl<'a> Half<'a> {
 /// prefill profile lists it as a hard filter (`:1148-1153`). At its limit
 /// the request is shed under the limit's stage, and that refusal's trace
 /// names no lifted veto: no request was steered.
+///
+/// Two steps make it, and a side's shadow asks its own step alone
+/// ([`Engine::shadow_side`]): the prefill ([`paired_prefill`]), then that
+/// prefill's decode ([`paired_decode`]).
 pub(super) fn paired(
+    sides: [Half<'_>; 2],
+    table: &PairTable<'_>,
+    words: (bool, bool),
+    pool: &PoolFacts<'_>,
+    scratch: &mut Scratch,
+) -> Option<Decision> {
+    let [prefill, decode] = sides;
+    let step = paired_prefill::<false>(sides, table, words, pool, scratch)?;
+    let Decision::Pick(taken) = &step else {
+        // The admission limit's shed of the prefill taken.
+        return Some(step);
+    };
+    let first = *taken.targets.first()?;
+    let class = prefill.rows.get(first.position as usize)?.pair_class;
+    let mut pair = paired_decode::<false>(&decode, table, class, pool, &mut scratch.decode);
+    if let Decision::Pick(pick) = &mut pair {
+        pick.targets
+            .pair_under(&first, SessionVerdict::None, Placing::Stages);
+        pick.trace = taken.trace;
+    }
+    Some(pair)
+}
+
+/// The first step of the pair's default ([`paired`]): the prefill it takes,
+/// which is the prefill of the least pair, or the admission limit's shed of
+/// that prefill. `None` where the default answers nothing. The pass that
+/// paired leaves its mark in both buffers ([`Half::usable`]) and the
+/// decodes it kept in `scratch.decode.kept`, where the second step reads
+/// them ([`paired_decode`]).
+///
+/// A prefill side's shadow whose own run shed asks this step alone
+/// ([`shadow_prefill`]).
+///
+/// No line reads `SHADOW`. It gives the default and a shadow a copy of
+/// this step each, so the default's copy is compiled into its one caller.
+/// One copy for both costs the default's decision about 190 instructions:
+/// the bench cell `pair_default` counts them.
+pub(super) fn paired_prefill<const SHADOW: bool>(
     [prefill, decode]: [Half<'_>; 2],
     table: &PairTable<'_>,
     (steers, weighs): (bool, bool),
@@ -898,20 +968,82 @@ pub(super) fn paired(
             let refused = shed(reason_of(limit.name()), limit.name(), trace);
             return Some(refused.of_side(PairSide::Prefill));
         }
-        // The decode: the taken prefill's usable partner of the fewest
-        // requests.
-        let (classes, buf) = (table.of(&row.pair_class), &mut scratch.decode);
-        buf.kept
-            .retain(|&at| classed(classes, decode.rows[at as usize].pair_class));
-        let mut pair = steered(decode.index, decode.facts, pool, decode.rows, buf);
-        if let Decision::Pick(pick) = &mut pair {
-            pick.targets
-                .pair_under(&first, SessionVerdict::None, Placing::Stages);
-            pick.trace = taken.trace;
-        }
-        return Some(pair);
+        return Some(Decision::Pick(taken));
     }
     None
+}
+
+/// The scratch of a pair's decision while the default's first step reads
+/// it for a prefill side's shadow ([`shadow_prefill`]). Its end puts back
+/// what that step changed and the decode's shadow reads: the classes, and
+/// the mark on the prefill's buffer. It runs on a return and on a panic.
+struct PutBack<'a> {
+    scratch: &'a mut Scratch,
+    /// The mark the pair's decision left on the prefill's buffer.
+    mark: LiftedVeto,
+}
+
+impl Drop for PutBack<'_> {
+    fn drop(&mut self) {
+        let scratch = &mut *self.scratch;
+        if scratch.among_first {
+            std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
+        }
+        scratch.single.lifted = self.mark;
+    }
+}
+
+/// The default's first step ([`paired_prefill`]) for a prefill side's
+/// shadow whose own run shed ([`Engine::shadow_side`]), with its profile in
+/// the prefill's place.
+///
+/// The step reads every open class. Among first partners the pair's
+/// decision left those in `scratch.firsts`, so the two lists are swapped
+/// for the call. The step also writes the prefill buffer's mark, which
+/// held `mark` until then.
+///
+/// The scratch is left as the pair's decision left it ([`PutBack`]), where
+/// the step panics too. A host catches each side's shadow by itself, so
+/// the decode's shadow runs on this scratch behind a prefill's that
+/// panicked.
+pub(super) fn shadow_prefill(
+    sides: [Half<'_>; 2],
+    table: &PairTable<'_>,
+    words: (bool, bool),
+    pool: &PoolFacts<'_>,
+    scratch: &mut Scratch,
+    mark: LiftedVeto,
+) -> Option<Decision> {
+    if scratch.among_first {
+        std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
+    }
+    let back = PutBack { scratch, mark };
+    paired_prefill::<true>(sides, table, words, pool, &mut *back.scratch)
+}
+
+/// The second step of the pair's default ([`paired`]): the decode, which is
+/// the usable partner that holds the fewest requests of the prefill of
+/// class `class`. `buf.kept` holds the side's rows that stand in the pass
+/// that paired ([`Half::usable`]). The pick is the rule's ([`steered`]):
+/// its targets name decodes, and the caller pairs them with the prefill.
+///
+/// A decode side's shadow beside the default's pair asks this step alone,
+/// for the live pair's prefill and behind its own profile's usable rows.
+///
+/// No line reads `SHADOW`. It gives each caller its own copy, as the first
+/// step's does ([`paired_prefill`]), and the bench cell `pair_default`
+/// counts what that saves.
+pub(super) fn paired_decode<const SHADOW: bool>(
+    decode: &Half<'_>,
+    table: &PairTable<'_>,
+    class: u32,
+    pool: &PoolFacts<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    let classes = table.of(&class);
+    buf.kept
+        .retain(|&at| classed(classes, decode.rows[at as usize].pair_class));
+    steered(decode.index, decode.facts, pool, decode.rows, buf)
 }
 
 #[cfg(test)]

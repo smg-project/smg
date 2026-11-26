@@ -2054,6 +2054,7 @@ fn a_write_a_leave_made_stale_takes_no_kept_write_with_it() {
 /// a longer request. A worker leaves, and the longer request's write for
 /// the same worker meets the record held. It takes the leading part's place
 /// among the eight: the other record's write stays, and nothing is left out.
+/// The thread's next column reads the longer request at the worker.
 #[test]
 fn a_stale_kept_write_leaves_for_the_write_that_continues_it() {
     let (affinity, _, _) = hosted(false);
@@ -2080,12 +2081,15 @@ fn a_stale_kept_write_leaves_for_the_write_that_continues_it() {
             bed.affinity.forget(bed.ids[3]);
             other.affinity.while_held(|| {
                 bed.affinity.while_held(|| {
-                    bed.decide(&request(&whole, 7, NOW), Some(1));
-                    (other.affinity.left_out(), bed.affinity.left_out())
+                    let longer = request(&whole, 7, NOW);
+                    bed.decide(&longer, Some(1));
+                    let kept = held(&bed.column(&longer, Phase::Single).0);
+                    (other.affinity.left_out(), bed.affinity.left_out(), kept)
                 })
             })
         });
-        assert_eq!(keeper.join().expect("a keeper"), (0, 0));
+        let at_the_second = vec![(0, 0), (0, 4), (0, 0), (0, 0)];
+        assert_eq!(keeper.join().expect("a keeper"), (0, 0, at_the_second));
     });
 }
 
@@ -2096,40 +2100,110 @@ fn a_stale_kept_write_leaves_for_the_write_that_continues_it() {
 /// eight more columns, as the decisions a stage asks for inside the pair's
 /// own would leave them. The first column's write meets the record held
 /// too. The eight stay, the thread's next column still reads the oldest,
-/// and nothing is left out.
+/// and nothing is left out. So for a request the record holds no block of,
+/// and for one whose leading part stands for the picked worker: that write
+/// begins behind the blocks that stand.
 #[test]
 fn a_stale_write_that_meets_a_held_record_is_not_kept() {
-    let (affinity, _, _) = hosted(false);
-    let prefills = Bed::new(affinity, paired(), 4);
-    let (stale, oldest) = (prompt(9_000, 4), prompt(1_000, 4));
-    let first = request(&stale, 7, NOW);
-    let (list, to) = (&prefills.pool, prefills.ids[2]);
-    // What the thread's next column reads of the oldest kept write.
-    let kept = || held(&prefills.column(&request(&oldest, 7, NOW), Phase::Prefill).0);
-    thread::scope(|scope| {
-        let keeper = scope.spawn(|| {
-            let (column_of, read) = prefills.column(&first, Phase::Prefill);
-            let read = read.expect("the record speaks for the prefills");
-            prefills.affinity.forget(prefills.ids[3]);
-            prefills.affinity.while_held(|| {
-                for more in 1..9 {
-                    let asked = prompt(1_000 * more, 4);
-                    let facts = request(&asked, 7, NOW);
-                    let (column, named) = prefills.column(&facts, Phase::Prefill);
-                    let named = named.expect("the record speaks for the prefills");
-                    record_by_column(list, Phase::Prefill, &facts, named, &column, to);
+    for leading in [false, true] {
+        let (affinity, _, _) = hosted(false);
+        let prefills = Bed::new(affinity, paired(), 4);
+        let (stale, oldest) = (prompt(9_000, 4), prompt(1_000, 4));
+        let (first, part) = (request(&stale, 7, NOW), prompt(9_000, 2));
+        let (list, to) = (&prefills.pool, prefills.ids[2]);
+        // The write of one column behind its fill, as a pick makes it.
+        let write_for = |asked: &PromptHashes, id: WorkerId| {
+            let facts = request(asked, 7, NOW);
+            let (column, named) = prefills.column(&facts, Phase::Prefill);
+            let named = named.expect("the record speaks for the prefills");
+            record_by_column(list, Phase::Prefill, &facts, named, &column, id);
+        };
+        // What the thread's next column reads of the oldest kept write.
+        let kept = || held(&prefills.column(&request(&oldest, 7, NOW), Phase::Prefill).0);
+        thread::scope(|scope| {
+            let keeper = scope.spawn(|| {
+                if leading {
+                    write_for(&part, prefills.ids[1]);
                 }
-                let eight = (prefills.affinity.left_out(), kept());
-                let id = prefills.ids[1];
-                record_by_column(list, Phase::Prefill, &first, read, &column_of, id);
-                (eight, (prefills.affinity.left_out(), kept()))
-            })
+                let (column_of, read) = prefills.column(&first, Phase::Prefill);
+                let read = read.expect("the record speaks for the prefills");
+                // The second shape's write begins behind the leading part's
+                // two blocks: the fill reads them at the picked worker.
+                let at_the_picked = if leading { (0, 2) } else { (0, 0) };
+                assert_eq!(held(&column_of)[1], at_the_picked, "leading: {leading}");
+                prefills.affinity.forget(prefills.ids[3]);
+                prefills.affinity.while_held(|| {
+                    for more in 1..9 {
+                        write_for(&prompt(1_000 * more, 4), to);
+                    }
+                    let eight = (prefills.affinity.left_out(), kept());
+                    let id = prefills.ids[1];
+                    record_by_column(list, Phase::Prefill, &first, read, &column_of, id);
+                    (eight, (prefills.affinity.left_out(), kept()))
+                })
+            });
+            let (eight, behind) = keeper.join().expect("a keeper");
+            let at_the_third = vec![(0, 0), (0, 0), (0, 4), (0, 0)];
+            assert_eq!(eight, (0, at_the_third.clone()), "leading: {leading}");
+            assert_eq!(behind, (0, at_the_third), "leading: {leading}");
         });
-        let (eight, behind) = keeper.join().expect("a keeper");
-        let at_the_third = vec![(0, 0), (0, 0), (0, 4), (0, 0)];
-        assert_eq!(eight, (0, at_the_third.clone()));
-        assert_eq!(behind, (0, at_the_third));
-    });
+    }
+}
+
+/// A kept write that a leave made stale holds back no write behind it. The
+/// thread keeps a write of one record, and a worker of that record's list
+/// leaves: the kept write is stale. The thread then keeps a write of a
+/// second record. Its next pick is of the second record, which is free,
+/// while the first is held still. The stale write meets its record held
+/// and leaves, and the write behind it is written on. So a reader on
+/// another thread finds the second record's request at its worker and no
+/// block of the stale write's, and nothing is left out. So for a kept write
+/// that stands at no block, and for one whose request's leading part was
+/// written for its worker before: that one is kept, and tried again at its
+/// held record, behind two blocks that stand.
+#[test]
+fn a_stale_kept_write_met_held_leaves_and_the_write_behind_it_is_written() {
+    for leading in [false, true] {
+        let (affinity, _, _) = hosted(false);
+        let (beside, _, _) = hosted(false);
+        let bed = Bed::new(affinity, preset("cache_aware"), 4);
+        let other = Bed::new(beside, preset("cache_aware"), 4);
+        let (stale, behind) = (prompt(1_000, 4), prompt(8_000, 4));
+        // The first reads make the two records.
+        assert!(bed.holders(&stale, NOW).is_empty());
+        assert!(other.holders(&behind, NOW).is_empty());
+        // What the record holds of the stale write's request ahead of it.
+        let stood = if leading {
+            bed.decide(&request(&prompt(1_000, 2), 7, NOW), Some(1));
+            vec![(1, 0, 2)]
+        } else {
+            Vec::new()
+        };
+        thread::scope(|scope| {
+            let keeper = scope.spawn(|| {
+                bed.affinity
+                    .while_held(|| bed.decide(&request(&stale, 7, NOW), Some(1)));
+                bed.affinity.forget(bed.ids[3]);
+                other
+                    .affinity
+                    .while_held(|| other.decide(&request(&behind, 7, NOW), Some(2)));
+                // The pick that writes the kept writes on.
+                bed.affinity
+                    .while_held(|| other.decide(&request(&prompt(9_000, 4), 7, NOW), Some(3)));
+                // What a thread that keeps no write reads.
+                thread::scope(|scope| {
+                    let reader =
+                        scope.spawn(|| (other.holders(&behind, NOW), bed.holders(&stale, NOW)));
+                    reader.join().expect("a reader")
+                })
+            });
+            let (written, stopped) = keeper.join().expect("a keeper");
+            assert_eq!(written, [(2, 0, 4)], "leading: {leading}");
+            assert_eq!(stopped, stood, "leading: {leading}");
+        });
+        let left_out = (bed.affinity.left_out(), other.affinity.left_out());
+        assert_eq!(left_out, (0, 0), "leading: {leading}");
+    }
 }
 
 /// A pick of a worker the record holds the whole request for leaves nothing

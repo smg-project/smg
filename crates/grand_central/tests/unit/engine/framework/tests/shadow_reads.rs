@@ -689,9 +689,9 @@ fn a_pairs_side_is_decided_once_more_over_the_rows_its_live_side_saw() {
     assert_eq!(engine(None, None).shadow_for("m", Phase::Prefill), None);
 }
 
-/// The prefill's shadow asks no stage of a live profile again. The
-/// live decision's scope closes with it, and a stage asked behind it
-/// answers by its fallback. The live decode profile's filter here
+/// The prefill shadow's own runs ask no stage of a live profile again.
+/// The live decision's scope closes with it, and a stage asked behind
+/// it answers by its fallback. The live decode profile's filter here
 /// keeps a row only while its decision stands open: asked again, it
 /// would refuse every partner, and the shadow would be shown no
 /// prefill. The classes the live prefill was shown stand in the

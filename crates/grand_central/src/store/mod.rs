@@ -64,6 +64,8 @@ mod tests;
 
 pub use applied::EngineFaults;
 pub use encoding::{EncodeHandoff, EncodeOffer};
+#[cfg(feature = "worker-host")]
+pub(crate) use health::LeadWord;
 pub use health::{HealthSink, HealthWrite, VetoWrite};
 pub use journal::{Journal, Position};
 pub use leases::{

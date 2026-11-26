@@ -115,8 +115,10 @@ fn a_ring_is_in_the_order_of_its_workers_places() {
 /// one without the worker.
 ///
 /// The gateway's ring is one of a generation too. A request is lent the ring
-/// of the generation its list is read from: `ModelRing::of`
-/// (`model_gateway/src/routers/common/placement.rs`).
+/// of the generation its list is read from, once that ring is filled:
+/// `ModelRing::of` (`model_gateway/src/routers/common/placement.rs`). Until
+/// then it is lent the ring the registry kept from another generation, and
+/// a ring that holds no worker where the registry kept none.
 #[test]
 fn a_worker_that_leaves_hands_its_keys_to_the_next_on_the_ring() {
     let fleet = workers(4);
