@@ -415,11 +415,17 @@ fn a_pair_held_to_places_is_counted_among_them() {
 /// number, a number past the workers counted, and a pair the rule takes
 /// when it is counted and refuses as the pick. Behind that pick no second
 /// decision is made: the rule is asked of the two picks and of no worker
-/// more. An empty text names no worker.
+/// more. The shed names the prefill side: both picks are refused, and a
+/// pair that lost its prefill is the prefill's, with its decode or
+/// without. An empty text names no worker.
 ///
 /// The classic policy misses a text it cannot read as a number and a
 /// number outside its workers, and names no other worker (`CH:155-161`,
-/// `CH:191`): the pair is refused on that side (`P:2873`, `P:2919`).
+/// `CH:191`): the pair is refused on that side (`P:3446`, `P:3492`). It
+/// reads the health of the worker at the named place once more at its
+/// pick, and one that is not healthy and eligible then is its miss: the
+/// prefill's role, with no decode picked (`P:3427-3446`). The lines are
+/// main `b896a65a8`'s.
 #[test]
 fn a_number_that_reaches_no_pair_is_shed_under_its_own_name() {
     let engine = rings();
@@ -442,9 +448,10 @@ fn a_number_that_reaches_no_pair_is_shed_under_its_own_name() {
         admits: Some(&rule),
         ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
     };
-    // The pair the count reached is refused as the pick: no list was left
-    // with nobody, and the shed names no side.
-    assert_eq!(placed(engine, &lists, &request), Err(MISSED));
+    // The pair the count reached is refused as the pick, its prefill and
+    // its decode: a pair that lost both workers is the prefill's.
+    let on_prefills = Err(missed_on(PairSide::Prefill));
+    assert_eq!(placed(engine, &lists, &request), on_prefills);
     assert_eq!(asked.get(), 6, "one decision's two picks");
 }
 
@@ -504,6 +511,171 @@ fn a_pair_shed_under_its_named_worker_names_the_side_it_was_missed_on() {
     };
     assert_eq!(leaving(true), on_prefills, "the named prefill left");
     assert_eq!(leaving(false), on_decodes, "the named decode left");
+}
+
+/// A pair held to the two workers it names whose pick cannot be sent to
+/// after all is shed on the side its call's walk could not send to: the
+/// decode side where the pick's prefill could be sent to and its decode
+/// could not, and the prefill side where its prefill could not, with its
+/// decode or without. The route's rule takes every worker while the pair
+/// is counted and refuses one, both or neither as the pick, so no stage
+/// of the decision left a list with nobody.
+///
+/// The classic router's pair selection asks the prefill first. Its hash
+/// policy reads the health of the worker at the named place once more at
+/// its pick, and one that is not healthy and eligible then is that
+/// policy's miss: the prefill's role, with no decode picked
+/// (`CH:150-162`, `P:3427-3446`). Behind the prefill's pick it reads the
+/// pick's partners a second time. Nobody open there is the decode's role
+/// (`P:3455-3467`), and a number that reaches none of them is the decode
+/// policy's decline (`P:3492`). The lines are main `b896a65a8`'s.
+///
+/// The side costs the call's record no byte: it stands in one the record
+/// had spare.
+#[test]
+fn a_named_pair_that_cannot_be_sent_to_after_all_names_the_side_its_walk_lost() {
+    let engine = rings();
+    // The count asks the rule of the two prefills and the two decodes.
+    // Behind those four it refuses the named prefill, the named decode,
+    // both, or neither.
+    let refusing = |prefill: bool, decode: bool| {
+        let lists = Lists::of(2, 2);
+        let classes = lists.every();
+        let named = (lists.prefills[1].url(), lists.decodes[1].url());
+        let asked = Cell::new(0_u32);
+        let rule = |worker: &dyn Worker| {
+            asked.set(asked.get() + 1);
+            let refused = [(prefill, named.0), (decode, named.1)];
+            asked.get() <= 4 || !refused.contains(&(true, worker.url()))
+        };
+        let headers = [(TARGET, "1")];
+        let request = PlaceRequest {
+            headers: &headers,
+            admits: Some(&rule),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+        };
+        let answer = placed(engine, &lists, &request);
+        assert_eq!(asked.get(), 6, "the count's four, one decision's two picks");
+        answer
+    };
+    let on_decodes = Err(missed_on(PairSide::Decode));
+    assert_eq!(refusing(false, true), on_decodes, "the decode alone");
+    let on_prefills = Err(missed_on(PairSide::Prefill));
+    assert_eq!(refusing(true, false), on_prefills, "the prefill alone");
+    assert_eq!(refusing(true, true), on_prefills, "the prefill, its decode");
+    assert_eq!(refusing(false, false), Ok((1, 1)), "neither");
+    assert_eq!(size_of::<Call>(), 200);
+}
+
+/// A pair held to its prefill alone names no side where the route's rule
+/// takes every worker while the pair is counted and turns behind that: on
+/// the named prefill, or on every decode. The call's first decision
+/// picks, and its walk can send to no target. The rule is then asked of
+/// the named prefill's place, and of the decodes where it takes that
+/// prefill. It takes no worker of one list, and the call ends on the
+/// rule's refusal, which takes the target's name on no side (`again` in
+/// `place/pair.rs`). The side the walk wrote is not answered.
+///
+/// The classic router's pair selection asks the route's rule where it
+/// reads a list, at other reads than the engine's. A rule that refuses
+/// the named prefill at its one pass leaves that number no open prefill
+/// here: the prefill's role (`P:3329-3344`, `P:3427-3446`). One that
+/// refuses every decode there leaves no prefill a partner: the decode's
+/// role (`P:3345-3372`). The engine's answer names no side for either.
+/// The lines are main `b896a65a8`'s.
+#[test]
+fn a_pair_held_to_its_prefill_alone_names_no_side_behind_a_rule_that_turns() {
+    let engine = stock("consistent_hashing", "round_robin");
+    // The count asks the rule of the four workers. Behind those four it
+    // refuses the named prefill, or every decode.
+    let turning = |on_prefill: bool| {
+        let lists = Lists::of(2, 2);
+        let classes = lists.every();
+        let named = lists.prefills[1].url();
+        let decodes: Vec<_> = lists.decodes.iter().map(|decode| decode.url()).collect();
+        let asked = Cell::new(0_u32);
+        let rule = |worker: &dyn Worker| {
+            asked.set(asked.get() + 1);
+            let turned = if on_prefill {
+                worker.url() == named
+            } else {
+                decodes.contains(&worker.url())
+            };
+            asked.get() <= 4 || !turned
+        };
+        let headers = [(TARGET, "1")];
+        let request = PlaceRequest {
+            headers: &headers,
+            admits: Some(&rule),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+        };
+        (placed(engine, &lists, &request), asked.get())
+    };
+    assert_eq!(turning(true), (Err(MISSED), 9), "on the named prefill");
+    assert_eq!(turning(false), (Err(MISSED), 11), "on every decode");
+}
+
+/// A pair held to its prefill alone that spends its asks is shed on the
+/// side its last walk lost. The route's rule takes every worker while the
+/// pair is counted and where it is asked behind the first ask, so no
+/// refusal of the rule's ends the call. Each of the call's three asks
+/// walks two pairs of the named prefill, and the rule refuses a worker of
+/// each. Where the last walk's rows lost different sides, one its prefill
+/// alone and one its decode alone, the shed is on the decode side in
+/// either order: a pair of that walk lost its decode alone. Where each
+/// row lost its prefill, with its decode or without, the shed is on the
+/// prefill side.
+///
+/// The classic router's pair selection asks the prefill first
+/// (`CH:150-162`, `P:3427-3446`), and behind a prefill it picked it
+/// refuses for the decode's role (`P:3455-3467`, `P:3492`). It asks the
+/// rule of a prefill once in its pass (`P:3329-3344`). Rows that differ
+/// on the named prefill need a rule that turns inside one walk, and
+/// that selection's answer then follows the calls its own reads fall on.
+/// The lines are main `b896a65a8`'s.
+#[test]
+fn a_pair_held_to_its_prefill_alone_that_spends_its_asks_names_the_side_its_last_walk_lost() {
+    let engine = stock("consistent_hashing", "round_robin");
+    // What the rule answers of the last walk's four reads, in their
+    // order: a row's prefill, then its decode.
+    let spending = |last: [bool; 4]| {
+        let lists = Lists::of(2, 2);
+        let classes = lists.every();
+        let named = lists.prefills[1].url();
+        let asked = Cell::new(0_u32);
+        let rule = |worker: &dyn Worker| {
+            asked.set(asked.get() + 1);
+            match asked.get() {
+                // The count's four, and the rule asked behind the first ask.
+                1..=4 | 9..=11 => true,
+                // The first two walks lose the named prefill alone.
+                5..=8 | 12..=15 => worker.url() != named,
+                read => {
+                    let at = usize::try_from(read - 16).unwrap_or(usize::MAX);
+                    last.get(at).copied().unwrap_or(false)
+                }
+            }
+        };
+        let headers = [(TARGET, "1")];
+        let request = PlaceRequest {
+            headers: &headers,
+            admits: Some(&rule),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+        };
+        let answer = placed(engine, &lists, &request);
+        let asks = "the count's four, three walks' four each, the rule's three";
+        assert_eq!(asked.get(), 19, "{asks}");
+        answer
+    };
+    let on_decodes = Err(missed_on(PairSide::Decode));
+    let differing = [false, true, true, false];
+    assert_eq!(spending(differing), on_decodes, "rows of different sides");
+    let turned = [true, false, false, true];
+    assert_eq!(spending(turned), on_decodes, "the decode's row first");
+    let on_prefills = Err(missed_on(PairSide::Prefill));
+    assert_eq!(spending([false; 4]), on_prefills, "each row both workers");
+    let prefills = [false, true, false, true];
+    assert_eq!(spending(prefills), on_prefills, "each row its prefill");
 }
 
 /// Where no decode can be sent to, a decode over its overload thresholds

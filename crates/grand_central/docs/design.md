@@ -1379,7 +1379,9 @@ pub struct Trace {
 A pair's refusal names the side it is for (`Shed::side`): the role the gateway's own pair
 selection names in the same refusal, for which a host answers. It is the prefill side where the
 prefill's picker declined, and where the prefills stand at their admission limit. It is the decode
-side where the prefill was picked and the decode's own run refused.
+side where the prefill was picked and the decode's own run refused. A decode decided again names
+the decode side where its own run refused, and the prefill side where the held prefill left its
+list.
 
 Where the prefill side places nobody else, the side is the first of these that holds, in that
 selection's order (`pair_pass` in `model_gateway/src/routers/common/placement.rs`):
@@ -1404,7 +1406,11 @@ to the cut. So does its cut of the prefills, where no prefill it leaves pairs wi
 it cut does.
 
 A pair whose named worker's number reaches nobody names the side it reaches nobody on, the
-prefills' first. A call's shed as saturated that stands behind a route's rule names the side of
+prefills' first. A named pair that cannot be sent to after all names the decode side where a pair
+of the call's last decision lost its decode alone. It names the prefill side otherwise, as that
+selection asks the prefill first (section 8.2).
+
+A call's shed as saturated that stands behind a route's rule names the side of
 the list that selection judges among the rule's workers. It is the prefill side where none of the
 rule's prefills can take the request, whichever list the decision said (section 8.2). A shed made
 where no prefill of the lists pairs with a decode keeps its side under a route's rule: the rule is
@@ -1416,6 +1422,10 @@ No side is named for:
 - a pair refused before either side was read: no binding takes it, or it states what a pair's
   decision does not honour;
 - a call's shed with no endpoint that stands behind a route's rule, whose lists the rule narrowed;
+- a call's own refusals of no one list: under the route's rule's name, under the budget, and for
+  what the call does not place;
+- a pair held to its prefill alone, behind a rule that then takes no worker of a list
+  (section 8.2);
 - an answer that came over a link: the protocol's `Shed` has no field for it.
 
 An encode request's refusal for a hard demand names a side as its pair's alone does. Over lists
@@ -2570,6 +2580,24 @@ free room is taken, because the `has-room` filter is soft (classic,
 `retain_decodes_with_a_room`). A retry is handed the pair again. A number that reaches no worker
 on a side sheds the pair under `target-worker` and names that side, as classic refuses for the
 role whose policy found no target.
+
+A named pair that cannot be sent to after all is shed under `target-worker` too, and moves to no
+other worker. Its side follows the order of classic's reads, the prefill's first. The shed names
+the decode side where a pair of the call's last decision lost its decode alone. It names the
+prefill side otherwise: a pair that lost both workers is no such pair.
+
+Classic's hash policy reads the health of the worker at the named place once more at its pick. One
+that is not healthy and eligible then is that policy's miss: the pair is declined for the prefill's
+role, and no decode is picked. Behind the prefill's pick classic reads the pick's partners a second
+time. It refuses for the decode's role where none is open, or where its number reaches none.
+
+One such refusal names no side, for a pair held to its prefill alone. Behind an ask of it that sent
+to nobody, the route's rule is asked of the named prefill's place, and of the decodes where it
+takes that prefill. A pair held on both sides is asked no second time. Where the rule takes no
+worker of a list, the call ends on the rule's refusal there, under `target-worker`. That needs a
+rule that took the worker at the count and refuses it later in the same call. Classic asks such a
+rule at other reads than the engine's, so its answer there can differ: it names a role, or places
+the pair.
 
 Where no decode can be
 sent to, a decode over its thresholds alone counts as a partner, and the decode goes by load, as
@@ -3816,8 +3844,8 @@ Five things follow, and they are the first work of section 16.
    `least_load` and `consistent_hashing`. Their only recorded lines are over pools in trouble.
    New recorders are decision 2.
 4. **One limit on "as classic recorded".** A pair's refusal names its side in the engine's
-   answer (`Shed::side`). The four pair sheets' refusals are compared by their reason and by
-   their role, where classic names the role.
+   answer (`Shed::side`). The four pair sheets that hold a refusal have theirs compared by
+   reason and by role, where classic names the role.
 
    They hold 54 recorded refusals on 27 lines, and all 54 agree on both: the pair's decision
    judges one list for its refusal, as classic's selection does (section 8.2).
