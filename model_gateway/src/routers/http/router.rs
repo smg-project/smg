@@ -751,9 +751,10 @@ impl Router {
             .dispatch_attempt(attempt, &placed, &mut decision_adapter)
             .await;
 
-        // A streamed head's success was recorded before its relay task was
-        // spawned (see `forward_worker_response`); the adapter's verdict
-        // below may still turn the answer into a failure, which is recorded.
+        // A streamed head's breaker sample is its relay's to take, at the
+        // head or at the stream's end (see `forward_worker_response`); the
+        // adapter's verdict below may still turn the answer into a failure,
+        // which is recorded.
         let head_success_recorded = head_success_recorded(&response);
 
         // Judge the converted result so malformed successes become backend
@@ -983,8 +984,8 @@ impl Router {
     }
 
     /// The attempt's answer on the request's ledger: the worker's breaker
-    /// outcome, unless a streamed head already recorded a success that the
-    /// verdict kept; the retry window settled on a definitive answer; the
+    /// outcome, unless a streamed head left its sample to its relay and the
+    /// verdict kept it; the retry window settled on a definitive answer; the
     /// engine on the tried list after a replayable failure; the worker error
     /// metric on a server error. Where the breaker's outcome is recorded,
     /// the same status is reported through `placed`, the answer the
@@ -2514,9 +2515,9 @@ impl Router {
             REQUEST_BODY_STALLED | REQUEST_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
         );
         if !client_body_fault {
-            // A streamed head's success was recorded before its relay task
-            // was spawned (see `forward_worker_response`), and its end is
-            // that relay's to report.
+            // A streamed head's breaker sample is its relay's to take (see
+            // `forward_worker_response`), and its end is that relay's to
+            // report.
             if !head_success_recorded(&response) {
                 worker.record_outcome(status.as_u16());
                 placed.ended(status.as_u16(), || worker_answered(&response));
@@ -6382,8 +6383,8 @@ mod tests {
         );
     }
 
-    /// The successful head of a streamed response is recorded on the worker's
-    /// breaker before the relay task is spawned, so a body the worker cuts
+    /// On a breaker that is not closed, a streamed response's successful head
+    /// is recorded before the relay task is spawned, so a body the worker cuts
     /// right behind the head is sampled after the head's success and stands,
     /// instead of being erased by a success recorded after it. Read on a
     /// current-thread runtime, where the relay cannot run before the body is
@@ -6703,6 +6704,84 @@ mod tests {
             "the event names the timeout as the 504 does: {body}"
         );
         assert_eq!(events[3], "data: [DONE]");
+    }
+
+    /// A stream the gateway's request timeout ends is its worker's failure,
+    /// as the timeout of a request that is not streamed is
+    /// (`a_request_timeout_is_answered_once_and_not_replayed`), and a closed
+    /// breaker's one sample of that stream: two such streams in a row open a
+    /// breaker with a threshold of two, the next request finds no worker, and
+    /// the outcome series counts the two failures alone. The head's success
+    /// used to set the failure streak back between the two, and was counted.
+    /// The timeout also covers the connect and the head, which run on the
+    /// wall clock, so it is wide; the clock is paused once a head is in, and
+    /// the body's read runs the timeout out with no wait.
+    #[tokio::test]
+    async fn streams_the_request_timeout_ends_open_the_breaker_at_its_threshold() {
+        let url =
+            spawn_stalled_stream_stub("/v1/chat/completions", "text/event-stream", CHAT_SSE_CHUNKS)
+                .await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .circuit_breaker_config(CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            })
+            .http_client(client_with_timeout(Duration::from_secs(30)))
+            .build();
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+        let worker = Arc::clone(&router.worker_registry.get_all()[0]);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let chat = || {
+            router.route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+        };
+
+        for (stream, behind_it) in [(1, CircuitState::Closed), (2, CircuitState::Open)] {
+            let response = chat().await;
+            assert_eq!(response.status(), StatusCode::OK, "stream {stream}");
+            tokio::time::pause();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the body ends cleanly after the error event");
+            tokio::time::resume();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(
+                body.contains("call_upstream_timeout"),
+                "stream {stream}: {body}"
+            );
+            assert_eq!(
+                worker.circuit_breaker_state(),
+                behind_it,
+                "behind stream {stream} of the two the timeout ended"
+            );
+        }
+
+        let response = chat().await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        // One sample a stream: the two failures, and no head's success.
+        let rendered = handle.render();
+        let outcomes: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_worker_cb_outcomes_total{"))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "{rendered}");
+        assert!(
+            outcomes[0].contains(r#"outcome="failure""#) && outcomes[0].ends_with(" 2"),
+            "{rendered}"
+        );
     }
 
     /// On the Messages API the same cut ends the stream with the API's own
