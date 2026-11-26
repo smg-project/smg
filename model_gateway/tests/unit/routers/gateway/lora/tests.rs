@@ -7,7 +7,7 @@ use axum::{
 };
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-    model_card::ModelCard,
+    model_card::ModelCard, worker::WorkerStatus,
 };
 use serde_json::{json, Value};
 use smg_worker::identity::basic::WorkerType;
@@ -302,5 +302,45 @@ async fn native_selectors_pin_mixed_fleets_and_preserve_http_only_routing() {
             assert_eq!(response["family"], if grpc { "grpc" } else { "http" });
             assert_eq!(response["lora_path"], "adapter");
         }
+    }
+}
+
+/// An adapter request goes only to a family whose SGLang workers can serve.
+/// The regular family's SGLang worker is down, so the PD family gets every
+/// request. The ready vLLM worker gives no weight, because adapter requests
+/// do not go to it.
+#[test]
+fn an_adapter_request_goes_to_the_family_that_can_serve_it() {
+    use RuntimeType::{Sglang, Vllm};
+    use WorkerStatus::{NotReady, Ready};
+    let registry = Arc::new(WorkerRegistry::new());
+    for (port, role, runtime, status) in [
+        (9640, WorkerType::Regular, Sglang, NotReady),
+        (9641, WorkerType::Regular, Vllm, Ready),
+        (9642, WorkerType::Prefill, Sglang, Ready),
+        (9643, WorkerType::Decode, Sglang, Ready),
+    ] {
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
+                    .model(ModelCard::new("base"))
+                    .worker_type(role)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(runtime)
+                    .status(status)
+                    .build(),
+            ))
+            .unwrap();
+    }
+    let mut gateway = Gateway::new(registry);
+    gateway.enable_igw = true;
+    gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(Capture("grpc")));
+    gateway.register_router(router_ids::GRPC_PD, Arc::new(Capture("grpc_pd")));
+
+    for draw in 0..100 {
+        let router = gateway
+            .select_router_for_adapter("base", Some("adapter"))
+            .expect("the pair serves the adapter");
+        assert_eq!(router.router_type(), "grpc_pd", "draw {draw}");
     }
 }

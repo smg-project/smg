@@ -5,8 +5,9 @@
 //! built. In IGW mode the choice is made per request from the model's
 //! routing snapshot: an external worker sends the request to the provider
 //! router that takes it; otherwise the family routers are weighted by the
-//! size of the pools they would select from, so traffic can migrate between
-//! HTTP and gRPC and between regular and disaggregated fleets gradually.
+//! workers that can serve in the pools they would select from, so traffic
+//! can migrate between HTTP and gRPC and between regular and disaggregated
+//! fleets gradually.
 
 mod lora;
 
@@ -46,7 +47,7 @@ use openai_protocol::{
 };
 use smg_data_connector::MemoryConfig;
 use smg_external_router::spec_for_provider;
-use smg_worker::identity::basic::ConnectionMode;
+use smg_worker::identity::basic::{ConnectionMode, Worker};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -58,7 +59,8 @@ use crate::{
         common::{
             body_policy::REASON_MODEL_SELECTION,
             header_utils::ROUTING_KEY_HINT_MAX_BYTES,
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            overload::{routable_but_for_overload, routable_but_for_veto},
+            snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
         error as route_error,
         factory::{router_ids, RouterId},
@@ -74,9 +76,11 @@ use crate::{
 /// pools whose workers give it weight. A disaggregated family needs every
 /// one of its pools before it takes any weight; the weight is then the pools'
 /// worker counts summed, so operators migrate traffic between HTTP and gRPC
-/// and between regular and disaggregated workers by moving workers. The
-/// gRPC PD family stands aside while the EPD family has weight: a fleet with
-/// encode workers is served as EPD.
+/// and between regular and disaggregated workers by moving workers. When a
+/// model has more than one family, only the workers that can serve count
+/// ([`Gateway::draw_family`]). The gRPC PD family stands aside while the EPD
+/// family has registered workers: a fleet with encode workers is served as
+/// EPD.
 struct RouterFamily {
     router: RouterId,
     pools: &'static [RoutingPool],
@@ -360,8 +364,69 @@ impl Gateway {
         weights
     }
 
+    /// Draws the router for one request. `registered` holds each family's
+    /// weight from its registered workers, in [`ROUTER_FAMILIES`] order.
+    /// `takes` tells which workers of a pool can take this request.
+    ///
+    /// A router selects only from its own pools. If no worker there can
+    /// serve, it refuses the request. So when more than one family has
+    /// weight, a family weighs only its workers that can serve. A family gets
+    /// no weight if one of its pools has no such worker. The draw tries two
+    /// checks, in this order:
+    ///
+    /// 1. ready, permitted by the circuit breaker, and not stalled;
+    /// 2. ready and permitted by the circuit breaker. A router uses a stalled
+    ///    worker when it has no other.
+    ///
+    /// If no family gets weight from either check, the registered weights
+    /// decide, and the router drawn refuses the request.
+    ///
+    /// Overload does not remove weight. If it did, all requests of a busy
+    /// family would move at once. They could move to an HTTP worker whose
+    /// engine stopped, because that worker reports no load.
+    ///
+    /// When only one family has weight, the draw reads no worker.
+    fn draw_family(
+        &self,
+        snapshot: &ModelWorkerSnapshot,
+        registered: &[usize; ROUTER_FAMILIES.len()],
+        takes: impl Fn(RoutingPool, &dyn Worker) -> bool,
+    ) -> Option<Arc<dyn RouterTrait>> {
+        if registered.iter().filter(|weight| **weight > 0).count() <= 1 {
+            return self.pick_router_by_weights(registered);
+        }
+        let checks: [fn(&dyn Worker) -> bool; 2] =
+            [routable_but_for_overload, routable_but_for_veto];
+        for can_serve in checks {
+            let serving = |pool: &RoutingPool| {
+                snapshot
+                    .pool(*pool)
+                    .iter()
+                    .filter(|worker| takes(*pool, worker.as_ref()) && can_serve(worker.as_ref()))
+                    .count()
+            };
+            let mut weights = [0usize; ROUTER_FAMILIES.len()];
+            for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
+                // A family with no registered weight stays at zero, so the
+                // gRPC PD family stays behind the EPD family.
+                if registered[i] > 0 {
+                    weights[i] = family
+                        .pools
+                        .iter()
+                        .map(serving)
+                        .try_fold(0, |sum, count| (count > 0).then_some(sum + count))
+                        .unwrap_or(0);
+                }
+            }
+            if let Some(router) = self.pick_router_by_weights(&weights) {
+                return Some(router);
+            }
+        }
+        self.pick_router_by_weights(registered)
+    }
+
     /// One router drawn with probability proportional to its family's
-    /// weight, `weights` in [`ROUTER_FAMILIES`] order ([`Self::family_weights`]
+    /// weight, `weights` in [`ROUTER_FAMILIES`] order ([`Self::draw_family`]
     /// for the model-serving draw; other routes weigh the families their own
     /// way). A family whose router is not mounted takes no part; `None` when
     /// none has weight.
@@ -406,8 +471,10 @@ impl Gateway {
 
     /// The router for `model_id` (the whole fleet when `None`), read from the
     /// model's routing snapshot: the pools are the same projections the
-    /// routers select from, cached across requests, so this costs a few
-    /// pool-length reads rather than a walk over every worker.
+    /// routers select from, cached across requests, so a model with one
+    /// family costs a few pool-length reads, not a walk over every worker. A
+    /// model with more than one family reads each worker of its pools
+    /// ([`Self::draw_family`]).
     ///
     /// An external worker sends the request to its provider's router. A
     /// disaggregated family is weighted only when both of its pools exist on
@@ -425,14 +492,15 @@ impl Gateway {
             }
         }
         let size = |pool: RoutingPool| snapshot.pool(pool).len();
-        let weights = self.family_weights(size);
-        self.pick_router_by_weights(&weights).or_else(|| {
-            self.incomplete_disaggregated_router(
-                size(RoutingPool::GrpcEncode),
-                size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
-                size(RoutingPool::HttpPrefill) + size(RoutingPool::HttpDecode),
-            )
-        })
+        let registered = self.family_weights(size);
+        self.draw_family(&snapshot, &registered, |_, _| true)
+            .or_else(|| {
+                self.incomplete_disaggregated_router(
+                    size(RoutingPool::GrpcEncode),
+                    size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
+                    size(RoutingPool::HttpPrefill) + size(RoutingPool::HttpDecode),
+                )
+            })
     }
 
     /// The router for a model whose only workers are the pools of a
@@ -1040,19 +1108,24 @@ impl RouterTrait for Gateway {
             }
             // Weight only transports that can serve this endpoint. The gRPC
             // pipeline also filters its initial and retry worker selections.
-            let http = snapshot.pool(RoutingPool::HttpRegular).len();
-            let grpc = snapshot
-                .pool(RoutingPool::GrpcPipelineRegular)
-                .iter()
-                .filter(|worker| supports_decisions_worker(worker.as_ref()))
-                .count();
+            let takes = |pool: RoutingPool, worker: &dyn Worker| {
+                pool == RoutingPool::HttpRegular || supports_decisions_worker(worker)
+            };
+            let size = |pool: RoutingPool| {
+                let workers = snapshot.pool(pool).iter();
+                workers
+                    .filter(|worker| takes(pool, worker.as_ref()))
+                    .count()
+            };
+            let http = size(RoutingPool::HttpRegular);
+            let grpc = size(RoutingPool::GrpcPipelineRegular);
             if http == 0 && grpc == 0 {
                 return route_error::not_implemented(
                     "decisions_not_supported",
                     "Decisions requires a regular HTTP or SGLang gRPC worker for this model",
                 );
             }
-            self.pick_router_by_weights(&[0, 0, 0, grpc, http])
+            self.draw_family(&snapshot, &[0, 0, 0, grpc, http], takes)
         } else {
             self.select_router_for_request(Some(model_id))
         };
@@ -1248,7 +1321,7 @@ impl std::fmt::Debug for Gateway {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use async_trait::async_trait;
     use axum::{http::StatusCode, response::IntoResponse};
@@ -1256,6 +1329,7 @@ mod tests {
     use smg_worker::{
         health::circuit_breaker::CircuitBreakerConfig,
         identity::basic::{RuntimeType, WorkerType},
+        runtime::StallReason,
     };
 
     use super::*;
@@ -2704,6 +2778,240 @@ mod tests {
             .select_router_for_request(Some("model-alias"))
             .expect("alias should select the PD router");
         assert_eq!(router.router_type(), "pd");
+    }
+
+    /// The state of one test worker.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Serving {
+        Yes,
+        NotReady,
+        CircuitOpen,
+        Stalled,
+        Overloaded,
+    }
+
+    /// A gateway with the five family routers, each named for its family,
+    /// and one worker of model `m` for each entry.
+    fn named_family_gateway(workers: &[(ConnectionMode, WorkerType, Serving)]) -> Arc<Gateway> {
+        let gateway = test_gateway(true);
+        for (id, name) in [
+            (router_ids::GRPC_EPD, "grpc_epd"),
+            (router_ids::GRPC_PD, "grpc_pd"),
+            (router_ids::HTTP_PD, "http_pd"),
+            (router_ids::GRPC_REGULAR, "grpc"),
+            (router_ids::HTTP_REGULAR, "http"),
+        ] {
+            gateway.register_router(id, Arc::new(NamedMessagesRouter(name)));
+        }
+        for (index, (mode, role, serving)) in workers.iter().enumerate() {
+            let url = format!("http://w{index}:8000");
+            let status = match serving {
+                Serving::NotReady => WorkerStatus::NotReady,
+                Serving::Yes | Serving::CircuitOpen | Serving::Stalled | Serving::Overloaded => {
+                    WorkerStatus::Ready
+                }
+            };
+            register_worker_in(&gateway, &url, *mode, *role, status);
+            let worker = gateway.worker_registry.get_by_url(&url).unwrap();
+            match serving {
+                Serving::Yes | Serving::NotReady => {}
+                Serving::CircuitOpen => {
+                    for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+                        worker.record_circuit_breaker_outcome(false);
+                    }
+                }
+                Serving::Stalled => {
+                    worker.set_stall(Some(StallReason::Unreachable));
+                }
+                Serving::Overloaded => {
+                    worker.set_overloaded(true);
+                }
+            }
+        }
+        gateway
+    }
+
+    /// Draws a router for model `m` many times. Asserts that only the
+    /// `expected` families are drawn, each within 5 points of its share.
+    fn assert_shares(
+        workers: &[(ConnectionMode, WorkerType, Serving)],
+        expected: &[(&'static str, f64)],
+    ) {
+        const DRAWS: u32 = 10_000;
+        const TOLERANCE: f64 = 0.05;
+        let gateway = named_family_gateway(workers);
+        let mut drawn = BTreeMap::<_, f64>::new();
+        for _ in 0..DRAWS {
+            let router = gateway
+                .select_router_for_request(Some("m"))
+                .expect("a family serves the model");
+            *drawn.entry(router.router_type()).or_default() += 1.0 / f64::from(DRAWS);
+        }
+        let within = drawn.len() == expected.len()
+            && expected.iter().all(|(family, share)| {
+                drawn
+                    .get(family)
+                    .is_some_and(|drawn| (drawn - share).abs() < TOLERANCE)
+            });
+        assert!(within, "{workers:?}: drew {drawn:?}, expected {expected:?}");
+    }
+
+    const HTTP: ConnectionMode = ConnectionMode::Http;
+    const GRPC: ConnectionMode = ConnectionMode::Grpc;
+
+    /// A family with no worker that can serve gets no request while another
+    /// family can serve, for each transport and each reason a worker cannot
+    /// serve. A draw by registered workers gave it its share: all `503`s.
+    #[test]
+    fn a_family_with_no_worker_that_can_serve_takes_no_request() {
+        use Serving::{CircuitOpen, NotReady, Stalled, Yes};
+        use WorkerType::{Decode, Prefill, Regular};
+        for down in [NotReady, CircuitOpen, Stalled] {
+            for (live, dead, expected) in [(GRPC, HTTP, "grpc"), (HTTP, GRPC, "http")] {
+                assert_shares(
+                    &[
+                        (live, Regular, Yes),
+                        (dead, Regular, down),
+                        (dead, Regular, down),
+                    ],
+                    &[(expected, 1.0)],
+                );
+            }
+            // A PD family needs a worker that can serve on each side.
+            for (prefill, decode) in [(down, Yes), (Yes, down)] {
+                assert_shares(
+                    &[
+                        (GRPC, Regular, Yes),
+                        (HTTP, Prefill, prefill),
+                        (HTTP, Decode, decode),
+                    ],
+                    &[("grpc", 1.0)],
+                );
+            }
+        }
+    }
+
+    /// Workers that cannot serve add no weight. So one live worker does not
+    /// get the share of its whole pool.
+    #[test]
+    fn a_family_weighs_the_workers_that_can_serve() {
+        use Serving::{NotReady, Yes};
+        use WorkerType::Regular;
+        // 4 HTTP workers, of which 1 can serve, and 1 gRPC worker.
+        assert_shares(
+            &[
+                (HTTP, Regular, Yes),
+                (HTTP, Regular, NotReady),
+                (HTTP, Regular, NotReady),
+                (HTTP, Regular, NotReady),
+                (GRPC, Regular, Yes),
+            ],
+            &[("grpc", 0.5), ("http", 0.5)],
+        );
+    }
+
+    /// An overloaded worker keeps its weight. If it did not, all requests of
+    /// a busy family would move at once. They could move to an HTTP worker
+    /// whose engine stopped, which looks ready until its health checks fail.
+    #[test]
+    fn an_overloaded_family_keeps_its_share() {
+        use Serving::{NotReady, Overloaded, Yes};
+        use WorkerType::Regular;
+        assert_shares(
+            &[(HTTP, Regular, Yes), (GRPC, Regular, Overloaded)],
+            &[("grpc", 0.5), ("http", 0.5)],
+        );
+        assert_shares(
+            &[(HTTP, Regular, NotReady), (GRPC, Regular, Overloaded)],
+            &[("grpc", 1.0)],
+        );
+    }
+
+    /// When no worker can serve, a stalled worker counts, because its router
+    /// still uses it. If no worker is stalled either, the registered workers
+    /// decide, and the router drawn refuses the request.
+    #[test]
+    fn a_fleet_with_no_worker_that_can_serve_draws_by_what_is_left() {
+        use Serving::{CircuitOpen, NotReady, Stalled};
+        use WorkerType::Regular;
+        assert_shares(
+            &[
+                (HTTP, Regular, NotReady),
+                (HTTP, Regular, CircuitOpen),
+                (GRPC, Regular, Stalled),
+            ],
+            &[("grpc", 1.0)],
+        );
+        // 3 HTTP workers and 1 gRPC worker are registered.
+        assert_shares(
+            &[
+                (HTTP, Regular, NotReady),
+                (HTTP, Regular, NotReady),
+                (HTTP, Regular, CircuitOpen),
+                (GRPC, Regular, NotReady),
+            ],
+            &[("grpc", 0.25), ("http", 0.75)],
+        );
+    }
+
+    /// A fleet with encode workers stays an EPD fleet when they are down. The
+    /// gRPC PD family stays behind the EPD family, because registered workers
+    /// decide this. Another family that can serve gets the requests.
+    #[test]
+    fn encode_workers_that_cannot_serve_bring_no_pd_family_forward() {
+        use Serving::{NotReady, Yes};
+        use WorkerType::{Decode, Encode, Prefill, Regular};
+        let encode = (GRPC, Encode, NotReady);
+        let prefill = (GRPC, Prefill, Yes);
+        let decode = (GRPC, Decode, Yes);
+        assert_shares(&[encode, prefill, decode], &[("grpc_epd", 1.0)]);
+        assert_shares(
+            &[encode, prefill, decode, (HTTP, Regular, Yes)],
+            &[("http", 1.0)],
+        );
+    }
+
+    /// The decisions route counts only workers that can take a decision. A
+    /// vLLM gRPC worker cannot, so it gives no weight to a gRPC family whose
+    /// SGLang worker is down.
+    #[tokio::test]
+    async fn decisions_go_to_the_family_that_can_serve_them() {
+        use RuntimeType::{Sglang, Vllm};
+        use WorkerStatus::{NotReady, Ready};
+        // The router of the down family does not answer 200.
+        let (serves, down) = (router_ids::HTTP_REGULAR, router_ids::GRPC_REGULAR);
+        for (serves, down, http, sglang) in [
+            (serves.clone(), down.clone(), Ready, NotReady),
+            (down, serves, NotReady, Ready),
+        ] {
+            let gateway = test_gateway(true);
+            gateway.register_router(serves, Arc::new(DecisionsStubRouter));
+            gateway.register_router(down, Arc::new(PdStubRouter));
+            for (url, mode, runtime, status) in [
+                ("http://w0:8000", HTTP, Sglang, http),
+                ("grpc://w1:8000", GRPC, Sglang, sglang),
+                ("grpc://w2:8000", GRPC, Vllm, Ready),
+            ] {
+                gateway
+                    .worker_registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::new(url)
+                            .connection_mode(mode)
+                            .runtime_type(runtime)
+                            .model(ModelCard::new("m"))
+                            .status(status)
+                            .build(),
+                    ))
+                    .unwrap();
+            }
+            for call in 0..50 {
+                assert_eq!(
+                    decision_status(&gateway, "m").await,
+                    StatusCode::OK,
+                    "call {call}, HTTP {http:?}, SGLang gRPC {sglang:?}"
+                );
+            }
+        }
     }
 
     /// A router double that records the headers of each Messages request it

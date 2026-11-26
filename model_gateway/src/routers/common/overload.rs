@@ -60,6 +60,12 @@ pub(crate) fn routable_but_for_veto(worker: &dyn Worker) -> bool {
     worker.is_healthy() && worker.circuit_breaker_can_execute()
 }
 
+/// Ready, permitted by the circuit breaker, and not stalled. Overload is not
+/// checked.
+pub(crate) fn routable_but_for_overload(worker: &dyn Worker) -> bool {
+    worker.routing_state().eligible_ignoring_overload()
+}
+
 /// Whether every otherwise-routable worker in a non-empty pool is overloaded.
 ///
 /// `candidates` is the pool *before* the `is_available()` filter, narrowed by

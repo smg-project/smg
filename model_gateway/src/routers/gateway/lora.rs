@@ -98,14 +98,15 @@ impl Gateway {
                 .filter(|worker| sglang_grpc(worker.as_ref()))
                 .count()
         };
-        let weights = self.family_weights(size);
-        self.pick_router_by_weights(&weights).or_else(|| {
-            self.incomplete_disaggregated_router(
-                size(RoutingPool::GrpcEncode),
-                size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
-                0,
-            )
-        })
+        let registered = self.family_weights(size);
+        self.draw_family(&snapshot, &registered, |_, worker| sglang_grpc(worker))
+            .or_else(|| {
+                self.incomplete_disaggregated_router(
+                    size(RoutingPool::GrpcEncode),
+                    size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
+                    0,
+                )
+            })
     }
 }
 
