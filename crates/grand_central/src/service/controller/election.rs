@@ -28,11 +28,6 @@
 //! hand-over names that term, and the thread drops one whose term this replica
 //! no longer holds the lease under: that lease is left already.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
     fmt, io,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
@@ -100,8 +95,13 @@ impl fmt::Display for LeasePlace {
     }
 }
 
-/// The election's configuration (design 5.3).
+/// The election's configuration (design 5.3). The default is one replica
+/// that leads itself over a lease in its own process.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it states otherwise, and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ElectionConfig {
     /// Where the lease lives.
     pub lease: LeasePlace,

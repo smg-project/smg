@@ -5,11 +5,6 @@
 //! shutdown bounds, and worker discovery settings when built with discovery.
 //! The configuration is validated before anything binds.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
     collections::BTreeMap,
     fmt,
@@ -75,7 +70,11 @@ impl fmt::Display for Scope {
 }
 
 /// The TLS material of a listener, as paths read once at bind.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`Tls::of`], and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Tls {
     /// The server certificate chain, PEM.
     pub cert: PathBuf,
@@ -89,8 +88,30 @@ pub struct Tls {
     pub client_ca: Option<PathBuf>,
 }
 
+impl Tls {
+    /// A listener's TLS under the server's `cert` and `key`, with the
+    /// clients' authority `client_ca` where the listener is mutual TLS. It
+    /// takes all three fields: the authority is a guard, and one left out
+    /// by silence would be a listener that verifies no client's
+    /// certificate. It checks nothing: the files are read at bind. Code
+    /// outside this crate starts here: the record gains fields, so no
+    /// literal of it builds there.
+    #[must_use]
+    pub fn of(cert: PathBuf, key: PathBuf, client_ca: Option<PathBuf>) -> Self {
+        Self {
+            cert,
+            key,
+            client_ca,
+        }
+    }
+}
+
 /// One gRPC listener: an address, the scopes mounted on it and its TLS.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`Listener::of`], and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Listener {
     /// The listener's name in log lines and refusals; the binary names each
     /// after its flag (`gateway`, `control`, `replication`).
@@ -108,9 +129,32 @@ pub struct Listener {
     pub tls: Option<Tls>,
 }
 
+impl Listener {
+    /// A listener of `name` on `addr` that serves `scopes` under `tls`. It
+    /// takes all four fields: a name, an address and the scopes have no
+    /// neutral value, and a TLS left out by silence would be a plaintext
+    /// listener. It checks nothing: [`Config::validate`] refuses a wrong
+    /// one. Code outside this crate starts here: the record gains fields,
+    /// so no literal of it builds there.
+    #[must_use]
+    pub fn of(name: String, addr: SocketAddr, scopes: Vec<Scope>, tls: Option<Tls>) -> Self {
+        Self {
+            name,
+            addr,
+            scopes,
+            tls,
+        }
+    }
+}
+
 /// The controller's start-up configuration. It is compared by `PartialEq`
 /// alone: its overload usage is a ratio.
+///
+/// The record gains fields: code outside this crate starts from
+/// [`Config::of`] and assigns what it states otherwise, and a pattern of it
+/// ends with `..`.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Config {
     /// This controller's identity: the holder of the leases it takes
     /// (design 10, `controller-id@host:port`) and the name on its log lines.
@@ -212,6 +256,39 @@ impl Config {
     /// design's count for its busiest fleet.
     pub fn default_decide_shards() -> usize {
         thread::available_parallelism().map_or(1, |cpus| cpus.get().min(8))
+    }
+
+    /// A configuration of `controller_id`, `listeners` and `admin`: the
+    /// three fields the crate states no value for. Each of the seven
+    /// others takes the value the crate states once, which the command
+    /// line's flag takes too:
+    ///
+    /// - `shutdown_settle`: [`Self::DEFAULT_SHUTDOWN_SETTLE`]
+    /// - `shutdown_grace`: [`Self::DEFAULT_SHUTDOWN_GRACE`]
+    /// - `load_poll_interval`: [`Self::DEFAULT_LOAD_POLL_INTERVAL`]
+    /// - `worker_overload`: [`Self::DEFAULT_WORKER_OVERLOAD`]
+    /// - `decide_shards`: [`Self::default_decide_shards`]
+    /// - `election`: its own default, one replica that leads itself
+    /// - `discovery`: `None`, no provider
+    ///
+    /// The deciding threads are the machine's number, so this is no
+    /// constant function. It checks nothing: [`Self::validate`] is the
+    /// check. Code outside this crate starts here: the record gains
+    /// fields, so no literal of it builds there.
+    #[must_use]
+    pub fn of(controller_id: String, listeners: Vec<Listener>, admin: SocketAddr) -> Self {
+        Self {
+            controller_id,
+            listeners,
+            admin,
+            shutdown_settle: Self::DEFAULT_SHUTDOWN_SETTLE,
+            shutdown_grace: Self::DEFAULT_SHUTDOWN_GRACE,
+            load_poll_interval: Self::DEFAULT_LOAD_POLL_INTERVAL,
+            worker_overload: Self::DEFAULT_WORKER_OVERLOAD,
+            decide_shards: Self::default_decide_shards(),
+            election: ElectionConfig::default(),
+            discovery: None,
+        }
     }
 
     /// Holds default overload thresholds to their bounds, each signal that

@@ -71,11 +71,11 @@ const BROKEN: Duration = Duration::from_secs(10);
 /// The design's order between the settings at a third of its size, with the
 /// whole second the `Lease` stores.
 fn settings() -> ElectionSettings {
-    ElectionSettings {
-        duration: Duration::from_secs(1),
-        renew_period: Duration::from_millis(250),
-        renew_deadline: Duration::from_millis(500),
-    }
+    let mut settings = ElectionSettings::default();
+    settings.duration = Duration::from_secs(1);
+    settings.renew_period = Duration::from_millis(250);
+    settings.renew_deadline = Duration::from_millis(500);
+    settings
 }
 
 fn wall_micros() -> u64 {

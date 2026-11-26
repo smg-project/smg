@@ -101,12 +101,11 @@ async fn the_serve_runs_the_load_monitor_and_renders_its_counts() {
         .await
         .expect("a metrics server");
     let polled = format!("http://{addr}");
-    let controller = Controller::bind(Config {
-        load_poll_interval: Duration::from_secs(1),
-        ..config()
-    })
-    .await
-    .expect("the controller binds");
+    let mut configuration = config();
+    configuration.load_poll_interval = Duration::from_secs(1);
+    let controller = Controller::bind(configuration)
+        .await
+        .expect("the controller binds");
     let admin = controller.addresses().admin;
     let (store, loads) = (controller.store(), controller.loads());
     let holder = controller.workers();
@@ -208,13 +207,12 @@ async fn a_start_states_the_overload_thresholds_a_worker_with_none_is_judged_by(
         (&busy, (9, 0.9), stating(None, None), false),
     ];
     for (worker, (queued, used), worker_overload, vetoed) in starts {
-        let controller = Controller::bind(Config {
-            load_poll_interval: Duration::from_secs(1),
-            worker_overload,
-            ..config()
-        })
-        .await
-        .expect("the controller binds");
+        let mut configuration = config();
+        configuration.load_poll_interval = Duration::from_secs(1);
+        configuration.worker_overload = worker_overload;
+        let controller = Controller::bind(configuration)
+            .await
+            .expect("the controller binds");
         let admin = controller.addresses().admin;
         let (store, loads) = (controller.store(), controller.loads());
         let holder = controller.workers();
@@ -324,16 +322,15 @@ async fn a_document_that_switches_the_default_off_lifts_a_served_controllers_ver
     };
     let file = tempfile::NamedTempFile::new().expect("a policy file");
     std::fs::write(file.path(), switched(true)).expect("the document is written");
-    let mut controller = Controller::bind(Config {
-        load_poll_interval: Duration::from_secs(1),
-        worker_overload: OverloadThresholds {
-            waiting_requests: Some(4),
-            token_usage: None,
-        },
-        ..config()
-    })
-    .await
-    .expect("the controller binds");
+    let mut configuration = config();
+    configuration.load_poll_interval = Duration::from_secs(1);
+    configuration.worker_overload = OverloadThresholds {
+        waiting_requests: Some(4),
+        token_usage: None,
+    };
+    let mut controller = Controller::bind(configuration)
+        .await
+        .expect("the controller binds");
     controller
         .spec_file(file.path())
         .await

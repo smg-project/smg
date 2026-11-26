@@ -20,11 +20,6 @@
 //! answers can name a row whose event the watch has not told yet. The
 //! owner passes that target over and asks again.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{io, sync::Arc, time::Duration};
 
 use smg_worker::registry::Generation;
@@ -49,7 +44,11 @@ const FIRST_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(5);
 
 /// A PEM file of the follower's TLS dial.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`PemFile::of`], and a pattern of it ends with `..`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PemFile {
     /// The name its user set the file by, as a flag or a configuration key.
     /// A read that fails says this name.
@@ -58,8 +57,23 @@ pub struct PemFile {
     pub path: String,
 }
 
+impl PemFile {
+    /// The file at `path`, which its user set by `setting`. It takes both
+    /// fields: neither has a neutral value. It checks nothing: the dial
+    /// reads the file. Code outside this crate starts here: the record
+    /// gains fields, so no literal of it builds there.
+    #[must_use]
+    pub fn of(setting: &'static str, path: String) -> Self {
+        Self { setting, path }
+    }
+}
+
 /// How a follower reaches its controller.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`WorkerFollowerSettings::of`], and a pattern of it ends with `..`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct WorkerFollowerSettings {
     /// The controller's address, as `host:port`.
     pub address: String,
@@ -72,7 +86,11 @@ pub struct WorkerFollowerSettings {
 }
 
 /// The TLS files of a follower's dial.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`Tls::of`], and a pattern of it ends with `..`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Tls {
     /// The certificate authority the controller's certificate is checked
     /// against: the one root the dial trusts.
@@ -81,13 +99,41 @@ pub struct Tls {
     pub identity: Option<ClientIdentity>,
 }
 
+impl Tls {
+    /// The TLS of a dial that trusts `ca_cert` alone and sends `identity`
+    /// where one is set. It takes both fields: the root is the guard, and
+    /// an identity left out by silence would be a dial that presents no
+    /// certificate. It checks nothing: the dial reads the files. Code
+    /// outside this crate starts here: the record gains fields, so no
+    /// literal of it builds there.
+    #[must_use]
+    pub fn of(ca_cert: PemFile, identity: Option<ClientIdentity>) -> Self {
+        Self { ca_cert, identity }
+    }
+}
+
 /// A gateway's own certificate and the key of it.
+///
+/// The record gains fields: code outside this crate makes one by
+/// [`ClientIdentity::of`], and a pattern of it ends with `..`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ClientIdentity {
     /// The certificate.
     pub cert: PemFile,
     /// The certificate's key.
     pub key: PemFile,
+}
+
+impl ClientIdentity {
+    /// The identity of `cert` and its `key`. It takes both fields: a
+    /// certificate without its key is no identity. It checks nothing: the
+    /// dial reads the files. Code outside this crate starts here: the
+    /// record gains fields, so no literal of it builds there.
+    #[must_use]
+    pub fn of(cert: PemFile, key: PemFile) -> Self {
+        Self { cert, key }
+    }
 }
 
 /// Why a dial of the controller failed.
@@ -133,6 +179,21 @@ async fn read(file: &PemFile) -> Result<Vec<u8>, DialError> {
 }
 
 impl WorkerFollowerSettings {
+    /// The settings of a follower that dials `address` under `tls` and
+    /// states `gateway_id`. It takes all three fields: an address and a
+    /// name have no neutral value, and a TLS left out by silence would be
+    /// a plain dial. It checks nothing: the dial does. Code outside this
+    /// crate starts here: the record gains fields, so no literal of it
+    /// builds there.
+    #[must_use]
+    pub fn of(address: String, tls: Option<Tls>, gateway_id: String) -> Self {
+        Self {
+            address,
+            tls,
+            gateway_id,
+        }
+    }
+
     async fn connect(&self, address: &str) -> Result<Client, DialError> {
         let Some(files) = &self.tls else {
             return Ok(Client::connect(&format!("http://{address}"), &self.gateway_id).await?);

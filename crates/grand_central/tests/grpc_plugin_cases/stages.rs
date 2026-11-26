@@ -375,10 +375,8 @@ fn an_invalid_answer_fails_its_decision_once_on_a_pair() {
     let served = TestPlugin::serve();
     let runtime = runtime();
     let mut spec = spec(&served, "pair-sloppy");
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     served.behave(Behaviour::ScoreNan);
     let decision = decide_pair(&plugin, &facts(9));
@@ -544,10 +542,8 @@ fn a_gone_budget_fails_its_decision_once_on_a_pair() {
     let served = TestPlugin::serve();
     let runtime = runtime();
     let mut spec = spec(&served, "pair-budgetless");
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let mut gone = facts(9);
     gone.budget_micros = 0;
@@ -574,11 +570,10 @@ fn an_opening_writes_one_line_under_the_plugins_name() {
     let served = TestPlugin::serve();
     let runtime = runtime();
     let mut spec = spec(&served, "grpc-opener");
-    spec.breaker = BreakerSpec {
-        failures: 2,
-        window_micros: 60_000_000,
-        cooldown_micros: 60_000_000,
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = 2;
+    spec.breaker.window_micros = 60_000_000;
+    spec.breaker.cooldown_micros = 60_000_000;
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     let mut gone = facts(1);
@@ -698,10 +693,8 @@ fn each_invalid_answer_is_one_fault_and_the_frame_falls_back_whole() {
     served.script(|s| s.counters = vec![(0, 1)]);
     let runtime = Runtime::with_clock(&OpenDecisions::new(), || 1_234).expect("a runtime");
     let mut spec = spec(&served, "sloppy");
-    spec.breaker = BreakerSpec {
-        failures: failures as u32,
-        ..BreakerSpec::default()
-    };
+    spec.breaker = BreakerSpec::default();
+    spec.breaker.failures = failures as u32;
     spec.metrics = vec!["answers".to_owned()];
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));

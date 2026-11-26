@@ -414,6 +414,22 @@ fn with_no_lease_flag_one_replica_leads_itself_on_the_designs_settings() {
     );
 }
 
+/// A host that starts a controller in its own process makes its
+/// configuration by [`Config::of`]. Each of the seven fields that call does
+/// not take reads there what this command line states where none of their
+/// flags is typed: a default that moves in one place moves in both, or this
+/// case stops.
+#[test]
+fn the_start_of_a_configuration_states_what_the_command_line_states_by_default() {
+    let typed = config(&[]).expect("the defaults");
+    let started = Config::of(
+        typed.controller_id.clone(),
+        typed.listeners.clone(),
+        typed.admin,
+    );
+    assert_eq!(started, typed);
+}
+
 #[test]
 fn a_lease_file_elects_under_an_address_a_client_can_dial() {
     // The default gateway listener binds every address: a shared lease

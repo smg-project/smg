@@ -1,7 +1,7 @@
 //! The types that grow, written as a crate outside this one writes them:
 //! each enum the crate marks non-exhaustive is matched with every case it
 //! has today and an arm for the rest, and the marked records are made by
-//! their calls or started from their defaults.
+//! their calls or started from their constants or defaults.
 //!
 //! A test target is a program outside the library. The arm for the rest is
 //! what a mark asks of such a program, and the arm holds the mark in turn:
@@ -16,7 +16,10 @@
 
 #[cfg(feature = "in-process")]
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 #[cfg(feature = "in-process")]
 use smg_grand_central::engine::{TextKey, TokenKey};
@@ -28,6 +31,7 @@ use smg_grand_central::{
     },
     load::SignalCell,
     policies::prefix_hash::HeadRule,
+    service::elector::{ElectionSettings, LeaseRecord},
     stages::{Best, LeastRequests},
     store::{pairing::PairingDescriptor, EncodeHandoff, EncodeOffer, Position},
     tracking::{EventKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
@@ -396,4 +400,361 @@ fn a_profile_reads_back_the_name_it_was_started_with() {
     } = Profile::of("a profile".into(), Box::new(Best));
     assert_eq!(name, "a profile");
     assert!(filters.is_empty() && scorers.is_empty());
+}
+
+/// An election's timing starts from its default, the design's, and takes a
+/// field by assignment. It is read by a pattern that ends open.
+#[test]
+fn an_elections_timing_starts_from_its_default_and_takes_a_field_by_assignment() {
+    let mut timing = ElectionSettings::default();
+    timing.duration = Duration::from_secs(6);
+    let ElectionSettings {
+        duration,
+        renew_period,
+        renew_deadline,
+        ..
+    } = timing;
+    assert_eq!(
+        (duration, renew_period, renew_deadline),
+        (
+            Duration::from_secs(6),
+            Duration::from_secs(1),
+            Duration::from_secs(2)
+        )
+    );
+}
+
+/// A lease's record as its backend stores it starts from its default, no
+/// holder under term zero, and takes a field by assignment. It is read by a
+/// pattern that ends open.
+#[test]
+fn a_leases_record_starts_from_its_default_and_takes_a_field_by_assignment() {
+    let mut record = LeaseRecord::default();
+    record.holder = "controller-0".to_owned();
+    record.term = 3;
+    let LeaseRecord {
+        holder,
+        term,
+        acquired_at_micros,
+        renewed_at_micros,
+        duration_ms,
+        ..
+    } = record;
+    assert_eq!(
+        (
+            holder.as_str(),
+            term,
+            acquired_at_micros,
+            renewed_at_micros,
+            duration_ms
+        ),
+        ("controller-0", 3, 0, 0, 0)
+    );
+}
+
+/// What a host starts a plugin with: the records of a plugin's row.
+#[cfg(any(feature = "wasm", feature = "controller"))]
+mod a_plugins_row {
+    use smg_grand_central::plugins::shared::{BreakerSpec, Exposure, HeaderSet, Reveal};
+
+    /// A plugin's exposure starts from its default, the fingerprints and no
+    /// header, and takes a field by assignment. It is read by a pattern
+    /// that ends open.
+    #[test]
+    fn an_exposure_starts_from_its_default_and_takes_a_field_by_assignment() {
+        let mut view = Exposure::default();
+        view.tenant = Reveal::Plain;
+        let Exposure {
+            tenant,
+            session_key,
+            headers,
+            ..
+        } = view;
+        assert_eq!(
+            (tenant, session_key, headers),
+            (Reveal::Plain, Reveal::Hash, HeaderSet::NONE)
+        );
+    }
+
+    /// A plugin's breaker starts from its default and takes a field by
+    /// assignment. It is read by a pattern that ends open.
+    #[test]
+    fn a_breaker_starts_from_its_default_and_takes_a_field_by_assignment() {
+        let mut breaker = BreakerSpec::default();
+        breaker.failures = 2;
+        let BreakerSpec {
+            failures,
+            window_micros,
+            cooldown_micros,
+            ..
+        } = breaker;
+        assert_eq!(
+            (failures, window_micros, cooldown_micros),
+            (2, 10_000_000, 30_000_000)
+        );
+    }
+
+    /// The version of a module's interface is made by its call, which takes
+    /// both numbers, and read by a pattern that ends open. A version the
+    /// crate names is its constant.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn an_interface_version_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        use smg_grand_central::plugins::wasm::Abi;
+
+        let Abi { major, minor, .. } = Abi::of(1, 2);
+        assert_eq!((major, minor), (1, 2));
+        assert_eq!(Abi::of(1, 2), Abi::V1_2);
+    }
+
+    /// The TLS of a dial to a gRPC plugin is made by its call, which takes
+    /// all four fields, and read by a pattern that ends open.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_plugin_dials_tls_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        use smg_grand_central::plugins::grpc::Tls;
+
+        let Tls {
+            server_name,
+            ca_pem,
+            cert_pem,
+            key_pem,
+            ..
+        } = Tls::of(
+            "plugin.internal".to_owned(),
+            b"an authority".to_vec(),
+            b"a chain".to_vec(),
+            b"a key".to_vec(),
+        );
+        assert_eq!(
+            (
+                server_name.as_str(),
+                &ca_pem[..],
+                &cert_pem[..],
+                &key_pem[..]
+            ),
+            (
+                "plugin.internal",
+                &b"an authority"[..],
+                &b"a chain"[..],
+                &b"a key"[..]
+            )
+        );
+    }
+}
+
+/// What a host starts the controller with.
+#[cfg(feature = "controller")]
+mod a_controllers_start {
+    use std::{net::SocketAddr, path::PathBuf};
+
+    use smg_grand_central::service::{
+        controller::{Config, ElectionConfig, LeasePlace, Listener, Scope, Tls},
+        elector::ElectionSettings,
+    };
+
+    fn local(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A listener's TLS is made by its call, which takes all three fields,
+    /// and read by a pattern that ends open.
+    #[test]
+    fn a_listeners_tls_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        let Tls {
+            cert,
+            key,
+            client_ca,
+            ..
+        } = Tls::of(
+            "a chain".into(),
+            "a key".into(),
+            Some("an authority".into()),
+        );
+        assert_eq!(
+            (cert, key, client_ca),
+            (
+                PathBuf::from("a chain"),
+                PathBuf::from("a key"),
+                Some(PathBuf::from("an authority"))
+            )
+        );
+    }
+
+    /// A listener is made by its call, which takes all four fields, its TLS
+    /// among them, and read by a pattern that ends open.
+    #[test]
+    fn a_listener_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        let served = || Tls::of("a chain".into(), "a key".into(), None);
+        let Listener {
+            name,
+            addr,
+            scopes,
+            tls,
+            ..
+        } = Listener::of(
+            "gateway".to_owned(),
+            local(30100),
+            vec![Scope::Gateway],
+            Some(served()),
+        );
+        assert_eq!(
+            (name.as_str(), addr, &scopes[..], tls),
+            (
+                "gateway",
+                local(30100),
+                &[Scope::Gateway][..],
+                Some(served())
+            )
+        );
+    }
+
+    /// A configuration is made by its call, which takes the three fields
+    /// the crate states no value for. Each of the seven others reads the
+    /// value the crate states once, and takes another by assignment.
+    #[test]
+    fn a_configuration_is_made_by_its_call_and_reads_the_crates_values_for_the_rest() {
+        let listener = Listener::of(
+            "gateway".to_owned(),
+            local(30100),
+            Scope::ALL.to_vec(),
+            None,
+        );
+        let mut config = Config::of(
+            "controller-0".to_owned(),
+            vec![listener.clone()],
+            local(30103),
+        );
+        config.decide_shards = 2;
+        let Config {
+            controller_id,
+            listeners,
+            admin,
+            shutdown_settle,
+            shutdown_grace,
+            load_poll_interval,
+            worker_overload,
+            decide_shards,
+            election,
+            discovery,
+            ..
+        } = config;
+        assert_eq!(
+            (controller_id.as_str(), listeners, admin),
+            ("controller-0", vec![listener], local(30103))
+        );
+        assert_eq!(
+            (shutdown_settle, shutdown_grace, load_poll_interval),
+            (
+                Config::DEFAULT_SHUTDOWN_SETTLE,
+                Config::DEFAULT_SHUTDOWN_GRACE,
+                Config::DEFAULT_LOAD_POLL_INTERVAL
+            )
+        );
+        assert_eq!(worker_overload, Config::DEFAULT_WORKER_OVERLOAD);
+        assert_eq!(decide_shards, 2);
+        assert_eq!(election, ElectionConfig::default());
+        assert!(discovery.is_none());
+    }
+
+    /// An election's configuration starts from its default, one replica
+    /// that leads itself, and takes a field by assignment. It is read by a
+    /// pattern that ends open.
+    #[test]
+    fn an_elections_configuration_starts_from_its_default_and_takes_a_field_by_assignment() {
+        let mut election = ElectionConfig::default();
+        election.advertise = Some("replica-0:30100".to_owned());
+        let ElectionConfig {
+            lease,
+            settings,
+            advertise,
+            ..
+        } = election;
+        assert_eq!(
+            (lease, settings, advertise.as_deref()),
+            (
+                LeasePlace::Process,
+                ElectionSettings::default(),
+                Some("replica-0:30100")
+            )
+        );
+    }
+}
+
+/// What a gateway starts its worker follower with.
+#[cfg(feature = "client")]
+mod a_followers_start {
+    use smg_grand_central::service::worker_follower::{
+        ClientIdentity, PemFile, Tls, WorkerFollowerSettings,
+    };
+
+    /// A PEM file is made by its call, which takes both fields, and read
+    /// by a pattern that ends open.
+    #[test]
+    fn a_pem_file_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        let PemFile { setting, path, .. } =
+            PemFile::of("--controller-ca", "an authority".to_owned());
+        assert_eq!(
+            (setting, path.as_str()),
+            ("--controller-ca", "an authority")
+        );
+    }
+
+    /// A gateway's own identity is made by its call, which takes the
+    /// certificate and its key, and read by a pattern that ends open.
+    #[test]
+    fn a_gateways_identity_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        let ClientIdentity { cert, key, .. } = ClientIdentity::of(
+            PemFile::of("--controller-cert", "a chain".to_owned()),
+            PemFile::of("--controller-key", "a key".to_owned()),
+        );
+        assert_eq!(
+            (cert.path.as_str(), key.path.as_str()),
+            ("a chain", "a key")
+        );
+    }
+
+    /// The TLS of a follower's dial is made by its call, which takes the
+    /// root and the identity, and read by a pattern that ends open.
+    #[test]
+    fn a_followers_tls_is_made_by_its_call_and_read_by_a_pattern_that_ends_open() {
+        let root = PemFile::of("--controller-ca", "an authority".to_owned());
+        let own = ClientIdentity::of(
+            PemFile::of("--controller-cert", "a chain".to_owned()),
+            PemFile::of("--controller-key", "a key".to_owned()),
+        );
+        let Tls {
+            ca_cert, identity, ..
+        } = Tls::of(root, Some(own));
+        let sent = identity.map(|own| own.cert.path);
+        assert_eq!(ca_cert.path, "an authority");
+        assert_eq!(sent.as_deref(), Some("a chain"));
+    }
+
+    /// A follower's settings are made by their call, which takes all three
+    /// fields, and read by a pattern that ends open.
+    #[test]
+    fn a_followers_settings_are_made_by_their_call_and_read_by_a_pattern_that_ends_open() {
+        let WorkerFollowerSettings {
+            address,
+            tls,
+            gateway_id,
+            ..
+        } = WorkerFollowerSettings::of(
+            "controller:30100".to_owned(),
+            Some(Tls::of(
+                PemFile::of("--controller-ca", "an authority".to_owned()),
+                None,
+            )),
+            "gateway-0".to_owned(),
+        );
+        assert_eq!(
+            (address.as_str(), gateway_id.as_str()),
+            ("controller:30100", "gateway-0")
+        );
+        assert_eq!(
+            tls.map(|files| files.ca_cert.path).as_deref(),
+            Some("an authority")
+        );
+    }
 }

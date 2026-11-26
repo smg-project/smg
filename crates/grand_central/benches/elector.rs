@@ -37,13 +37,12 @@ use smg_grand_central::{
 /// leader released, which a candidate takes and leads at once: a take of a
 /// lease that no record held leads one renew deadline later by the clock.
 fn holder(mut backend: Box<dyn LeaseBackend>, identity: &str) -> Elector {
-    let released = LeaseRecord {
-        holder: String::new(),
-        term: 1,
-        acquired_at_micros: 1,
-        renewed_at_micros: 1,
-        duration_ms: 0,
-    };
+    let mut released = LeaseRecord::default();
+    released.holder = String::new();
+    released.term = 1;
+    released.acquired_at_micros = 1;
+    released.renewed_at_micros = 1;
+    released.duration_ms = 0;
     assert_eq!(
         backend.write(None, &released).expect("the release"),
         ConditionalWriteOutcome::Done
