@@ -171,7 +171,7 @@ A host can add stages of its own in three ways:
 
 - [The policy spec](docs/policy-spec.md): its fields, [bindings](docs/policy-spec.md#bindings) and [plans](docs/policy-spec.md#plans)
 - [Prefill and decode pairs](docs/policy-spec.md#prefill-and-decode) and [encode with a pair](docs/policy-spec.md#encode-with-a-pair)
-- [Overload, shadows and reserved fields](REFERENCE.md#bindings-and-plans) and [session keys](REFERENCE.md#session-keys)
+- [Overload, shadows and reserved fields](REFERENCE.md#overload-shadows-and-reserved-fields) and [session keys](REFERENCE.md#session-keys)
 - [Signals a decision can read](REFERENCE.md#signals-a-decision-can-read)
 - [Decisions and refusals](REFERENCE.md#decisions-and-refusals) and [updating a policy spec](REFERENCE.md#updating-a-document)
 - [Explain and metrics](REFERENCE.md#explain-and-metrics)

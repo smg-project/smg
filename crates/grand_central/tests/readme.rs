@@ -32,7 +32,8 @@
 //!   as code;
 //! - the walk that holds those bounds refuses a short text over each of
 //!   them and passes one that stands at a bound, and the reading of a
-//!   page's headings and links is held to short texts the same way;
+//!   page's blocks, headings and links is held to short texts the same
+//!   way;
 //! - every link of the three pages to a path of the checkout resolves, and
 //!   a link that names a heading names one its page holds;
 //! - each command the README shows names what the checkout holds: this
@@ -145,30 +146,42 @@ struct Block<'a> {
     body: String,
 }
 
-/// The page's fenced blocks, in its order.
+/// How many spaces and tabs `line` begins with.
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start_matches([' ', '\t']).len()
+}
+
+/// The page's fenced blocks, in its order. A fence line is read as every
+/// walk of a page reads one ([`fence`]), so a block that stands indented,
+/// as under a list item, is a block too: its lines lose the indentation of
+/// the fence that opens it.
 fn blocks(page: &str) -> Vec<Block<'_>> {
     let mut blocks = Vec::new();
     let mut before = "";
-    let mut open: Option<Block<'_>> = None;
+    // The block that stands open, and where its opening fence begins.
+    let mut open: Option<(Block<'_>, usize)> = None;
     for line in page.lines() {
-        match open.take() {
-            Some(block) if line == "```" => blocks.push(block),
-            Some(mut block) => {
-                block.body.push_str(line);
+        match (open.take(), fence(line)) {
+            (Some((block, _)), Some("")) => blocks.push(block),
+            // A fence that names a language inside a block is the block's
+            // text here. On a short page the walk of the fences refuses it.
+            // The reference has no such walk: a lost fence shows there
+            // where a document stops running or a count of documents moves.
+            (Some((mut block, margin)), _) => {
+                block.body.push_str(&line[indent(line).min(margin)..]);
                 block.body.push('\n');
-                open = Some(block);
+                open = Some((block, margin));
             }
-            None => match line.strip_prefix("```") {
-                Some(language) => {
-                    open = Some(Block {
-                        language,
-                        before,
-                        body: String::new(),
-                    });
-                }
-                None if line.trim().is_empty() => {}
-                None => before = line,
-            },
+            (None, Some(language)) => {
+                let block = Block {
+                    language,
+                    before,
+                    body: String::new(),
+                };
+                open = Some((block, indent(line)));
+            }
+            (None, None) if line.trim().is_empty() => {}
+            (None, None) => before = line.trim(),
         }
     }
     blocks
@@ -225,6 +238,23 @@ fn every_document_of_the_page_runs_over_the_stock_catalog() {
             "the {name} shows {shown} documents that run: a fence was lost, or a new document raises the count"
         );
     }
+    // The reading itself, on a short text: a block under a list item is a
+    // block, with the mark above it, and its lines lose the fence's
+    // indentation. A fence that stands indented closes a block too.
+    let page = "- An item:\n\n  <!-- refused -->\n  ```yaml\n  profiles:\n    default: {pick: random}\n  ```\n\nA command:\n```sh\ncargo test\n  ```\nBehind them.\n";
+    let blocks = blocks(page);
+    let read: Vec<(&str, &str, &str)> = blocks
+        .iter()
+        .map(|block| (block.language, block.before, block.body.as_str()))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("yaml", REFUSED, "profiles:\n  default: {pick: random}\n"),
+            ("sh", "A command:", "cargo test\n"),
+        ],
+        "an indented block"
+    );
 }
 
 #[test]
@@ -535,7 +565,7 @@ fn item(line: &str) -> Option<&str> {
 
 /// The language a fence line names, where `line` is one: what stands behind
 /// its three backticks, nothing on the line that closes a block. Each walk
-/// of a short page's text reads a fence line by this.
+/// of a page's text reads a fence line by this.
 fn fence(line: &str) -> Option<&str> {
     line.trim().strip_prefix("```").map(str::trim)
 }
