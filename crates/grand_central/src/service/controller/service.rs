@@ -66,7 +66,7 @@ use super::{
     snapshot::{self, SnapshotQuery},
     standby::Lag,
     watch_workers::{self, Feed, Readers, Source, Start, Watching},
-    wire, PROTOCOL_VERSION,
+    wire, PROTOCOL_FLOOR, PROTOCOL_VERSION,
 };
 use crate::{
     document::{
@@ -757,7 +757,7 @@ impl Service {
             // One lease covers every model until a lease per model group
             // exists.
             groups: Vec::new(),
-            protocol_min: PROTOCOL_VERSION,
+            protocol_min: PROTOCOL_FLOOR,
             protocol_max: PROTOCOL_VERSION,
         }
     }

@@ -19,8 +19,8 @@ use tokio_stream::{
 use tonic::{transport::Endpoint, Status};
 
 use super::{
-    dial_leader, fit, hello, numbered, Answer, Decide, Error, Session, Stub, Watch, ANSWER_WAIT,
-    KEEPALIVE,
+    dial_leader, fit, hello, numbered, reads_demands, Answer, Decide, Error, Session, Stub, Watch,
+    ANSWER_WAIT, KEEPALIVE,
 };
 use crate::{
     engine::view::Phase,
@@ -28,8 +28,8 @@ use crate::{
         controller::wire::{self, Refusal},
         proto::{
             busy, controller_frame, decide_answer, gateway_frame, released, Busy, ControllerFrame,
-            DecideAnswer, DecideRequest, Decision, EncodePlaced, GatewayFrame, Released, Side,
-            SpecAck, SpecPush, WatchWorkersRequest, Welcome,
+            DecideAnswer, DecideRequest, Decision, Demands, EncodePlaced, GatewayFrame, Released,
+            Side, SpecAck, SpecPush, WatchWorkersRequest, Welcome,
         },
     },
 };
@@ -291,6 +291,12 @@ impl Link {
     /// A request the controller's check refuses is refused here, by the
     /// same check, and nothing is sent: a frame out of its ranges ends the
     /// stream it is sent on, and the link's stream is every caller's.
+    ///
+    /// A request that states a hard demand (`DecideRequest.demands`) is
+    /// sent only over a session whose welcome chose protocol 2 or later.
+    /// Over any other it is refused here by `demands`, and nothing is
+    /// sent. A controller of protocol 1 reads no demand, and would decide
+    /// the request among the workers its demand rules out.
     pub async fn ask(
         &self,
         request: DecideRequest,
@@ -355,20 +361,38 @@ impl Link {
 
 /// The ranges the controller's check reads in a request, by that check's
 /// own functions: the lease a decode call names, then the facts, then the
-/// items of an encode request. A request with no facts reads as one that
-/// leaves every field of them unset, a single's.
+/// items of an encode request, then the hard demands it states. A request
+/// with no facts reads as one that leaves every field of them unset, a
+/// single's.
 fn in_range(request: &DecideRequest) -> Result<(), Error> {
     let checked = wire::asked_decode(request.decode_of).and_then(|decode_of| {
         let phase = match &request.facts {
             Some(facts) => wire::ranges(facts)?.0,
             None => Phase::Single,
         };
-        wire::stated_items(request.encode.as_ref(), phase, decode_of)
+        wire::stated_items(request.encode.as_ref(), phase, decode_of)?;
+        match &request.demands {
+            None => Ok(()),
+            Some(stated) => {
+                // A decode call is read at the decode phase, whatever its
+                // facts say.
+                let phase = if decode_of == 0 { phase } else { Phase::Decode };
+                wire::stated_demands(stated, phase, request.named_worker.is_some()).map(|_| ())
+            }
+        }
     });
     match checked {
         Ok(()) => Ok(()),
         Err(Refusal::OutOfRange(field)) => Err(Error::OutOfRange(field)),
     }
+}
+
+/// Whether `request` states a hard demand: a message with no part states
+/// none.
+fn states_demand(request: &DecideRequest) -> bool {
+    request
+        .demands
+        .is_some_and(|demands| demands != Demands::default())
 }
 
 #[derive(Debug)]
@@ -757,7 +781,16 @@ impl Shared {
         cut: usize,
     ) -> Result<Pending<'_>, DecisionUnavailable> {
         let mut state = self.state.lock();
+        let protocol = state.welcome.protocol;
         let open = state.open.as_mut().ok_or(DecisionUnavailable::Ended)?;
+        // A controller on a protocol that reads no demand would decide the
+        // request among the workers its demand rules out: it is sent none.
+        // Neither is one whose welcome chose a version the hello did not
+        // offer. Read under the lock the ask is queued under, so the welcome
+        // is the one of the session that takes the frame.
+        if !reads_demands(protocol) && states_demand(&request) {
+            return Err(DecisionUnavailable::Unsent(Error::OutOfRange("demands")));
+        }
         if open.pending.contains_key(request.request_id.as_slice()) {
             return Err(DecisionUnavailable::InFlight);
         }

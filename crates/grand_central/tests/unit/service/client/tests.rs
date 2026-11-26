@@ -32,7 +32,7 @@ use super::{
     blocking, controller_frame, decide_answer, fit, gateway_frame, hello, numbered, Answer, Busy,
     Client, ControllerFrame, Decide, DecideAnswer, DecideRequest, Decision, Error, GatewayFrame,
     GrandCentralClient, Principal, Session, Stub, Welcome, ANSWER_WAIT, MAX_FRAME, MAX_REQUEST_ID,
-    PRINCIPAL_ENTRY, PROTOCOL_VERSION,
+    PRINCIPAL_ENTRY, PROTOCOL_FLOOR, PROTOCOL_VERSION,
 };
 use crate::service::proto::{
     busy, Completed, Credit, Dispatched, EncodePlaced, LeaderInfo, LeaderRequest, NotLeader,
@@ -85,7 +85,7 @@ fn the_hello_is_the_first_frame_and_states_the_floor_twice() {
     assert_eq!(hello.generation, 3);
     assert_eq!(
         (hello.protocol_min, hello.protocol_max),
-        (PROTOCOL_VERSION, PROTOCOL_VERSION)
+        (PROTOCOL_FLOOR, PROTOCOL_VERSION)
     );
 }
 

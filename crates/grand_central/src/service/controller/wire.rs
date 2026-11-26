@@ -60,7 +60,7 @@ use crate::{
     },
     engine::{
         decision::{Decision, ShedReason, Target},
-        demands::Demands,
+        demands::{Demands, References},
         framework::{EncodeItems, EncodePlaced},
         view::{
             fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
@@ -222,6 +222,61 @@ pub(crate) fn stated_items(
     }
 }
 
+/// The hard demands a frame states (`DecideRequest.demands`), or the field
+/// that puts them out of range. A message with no part demands nothing, on
+/// any frame. A stated demand is read on a single request's frame that
+/// names no worker (`named`). Any other frame that states one is out of
+/// range by `demands`, so a decision that holds no demand yet drops none
+/// in silence.
+///
+/// `phase` is the phase the frame is read at ([`Checked::new`]). A sender
+/// whose callers share one stream reads the field here too. It hands the
+/// phase its facts state, or the decode phase for a decode call. The
+/// answer is the same: an encode request's frame is a single's at neither
+/// phase.
+///
+/// Out of line: a frame that states no message reads none of it.
+#[cold]
+#[inline(never)]
+pub(crate) fn stated_demands(
+    stated: &proto::Demands,
+    phase: Phase,
+    named: bool,
+) -> Result<Demands, Refusal> {
+    // Every field by its name: one the contract gains stops the build here,
+    // so no demand passes unread.
+    let proto::Demands {
+        runtime,
+        vision,
+        references,
+        input_window,
+        output_window,
+        decoding,
+    } = *stated;
+    let references = match proto::demands::References::try_from(references) {
+        Ok(proto::demands::References::None) => References::None,
+        Ok(proto::demands::References::Any) => References::Any,
+        Ok(proto::demands::References::Caller) => References::Caller,
+        Ok(proto::demands::References::Worker) => References::Worker,
+        Err(_) => return Err(Refusal::OutOfRange("demands.references")),
+    };
+    let Ok(decoding) = u8::try_from(decoding) else {
+        return Err(Refusal::OutOfRange("demands.decoding"));
+    };
+    let demands = Demands {
+        runtime,
+        vision,
+        references,
+        input_window,
+        output_window,
+        decoding,
+    };
+    if !demands.is_none() && (phase != Phase::Single || named) {
+        return Err(Refusal::OutOfRange("demands"));
+    }
+    Ok(demands)
+}
+
 /// A `DecideRequest` the engine's record holds whole.
 #[derive(Debug)]
 pub(crate) struct Checked {
@@ -242,6 +297,9 @@ pub(crate) struct Checked {
     /// (`DecideRequest.named_worker`), as it came; `None` for a frame that
     /// names no worker.
     named: Option<u32>,
+    /// The request's hard demands (`DecideRequest.demands`); the default
+    /// for a frame that states none.
+    demands: Demands,
     /// The lease whose decode side the frame asks; `0` for a frame that
     /// asks none.
     decode_of: u64,
@@ -303,6 +361,10 @@ impl Checked {
         } else {
             phase
         };
+        let demands = match &request.demands {
+            None => Demands::default(),
+            Some(stated) => stated_demands(stated, phase, request.named_worker.is_some())?,
+        };
         let rare = (u8::from(text) * TEXT)
             | (u8::from(request.again) * AGAIN)
             | (u8::from(later) * DECODE_LATER)
@@ -320,6 +382,7 @@ impl Checked {
             // decision of a frame over one list reads it, under a spec
             // whose binding names a target source, and no other does.
             named: request.named_worker,
+            demands,
             decode_of,
             items,
         })
@@ -606,7 +669,7 @@ impl Checked {
             // A frame's request is counted by the leases on file alone.
             counted_on_decode: false,
             subset_hint: constraints.subset_hint,
-            demands: Demands::default(),
+            demands: self.demands,
             stalled: &[],
             held: &[],
             // No frame holds a request to places.

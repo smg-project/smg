@@ -1694,9 +1694,9 @@ pub struct Constraints<'a> {
     /// each encoder to what its encode side's constraints state, against
     /// what the encoder states beside its row
     /// ([`EncodePool::demands`](crate::engine::EncodePool::demands)).
-    /// In-process only: this protocol version
-    /// states no demand, and a handle refuses a request that states one
-    /// before it sends it over a link (`DecisionGuard::asked`).
+    /// Over a link a request states them on its frame where its controller
+    /// holds them (`DecideRequest.demands`). A handle refuses any other
+    /// request that states one before it sends it (`DecisionGuard::asked`).
     pub demands: crate::engine::Demands,
     /// The rows a standing veto of this host masks, by position, in order,
     /// where the host did not write them into the rows: a view of a

@@ -9,6 +9,7 @@ use crate::{
             Trace,
         },
         decision_engine::Request,
+        demands::{Demands, References},
         framework::{EncodeItems, EncodePlaced},
         view,
         view::{
@@ -418,6 +419,87 @@ fn a_request_that_names_its_worker_states_its_number_on_the_frame() {
     assert_eq!(read(None), (None, None), "names no worker");
 }
 
+/// A request that states a hard demand states each part on its frame
+/// (`DecideRequest.demands`), and the controller makes its request with
+/// the same demand. A request that demands nothing states no message,
+/// as the frame of a host older than the field.
+#[test]
+fn a_requests_demands_cross_the_wire_part_by_part() {
+    let read = |demands: Demands| {
+        let asked = Request {
+            id: b"a request",
+            facts: RequestFacts {
+                model: "model-a",
+                budget_micros: 2_000,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints {
+                demands,
+                ..Constraints::default()
+            },
+        };
+        let (sent, _) = request(&asked, None);
+        let stated = sent.demands;
+        let checked = Checked::new(sent).expect("the controller reads the request");
+        let made = made(&checked, &mut Lists::default(), LEFT, |_, constraints| {
+            constraints.demands
+        });
+        (stated, made)
+    };
+    assert_eq!(read(Demands::default()), (None, Demands::default()));
+    let whole = Demands {
+        runtime: 7,
+        vision: true,
+        references: References::Caller,
+        input_window: 4_096,
+        output_window: 512,
+        decoding: 255,
+    };
+    let stated = proto::Demands {
+        runtime: 7,
+        vision: true,
+        references: proto::demands::References::Caller.into(),
+        input_window: 4_096,
+        output_window: 512,
+        decoding: 255,
+    };
+    assert_eq!(read(whole), (Some(stated), whole));
+    // One part alone is a demand: it is stated, and comes back alone.
+    let none = Demands::default();
+    let parts = [
+        Demands { runtime: 1, ..none },
+        Demands {
+            vision: true,
+            ..none
+        },
+        Demands {
+            references: References::Any,
+            ..none
+        },
+        Demands {
+            references: References::Worker,
+            ..none
+        },
+        Demands {
+            input_window: 1,
+            ..none
+        },
+        Demands {
+            output_window: 1,
+            ..none
+        },
+        Demands {
+            decoding: 1,
+            ..none
+        },
+    ];
+    for part in parts {
+        let (stated, made) = read(part);
+        assert!(stated.is_some(), "{part:?}");
+        assert_eq!(made, part);
+    }
+}
+
 fn trace(survivors: Survivors) -> Trace {
     Trace {
         profile: 7,
@@ -574,6 +656,53 @@ fn a_shed_keeps_its_reason_and_pacing_and_a_queue_keeps_its_ticket() {
     let read = decided(&told(queue, None), now).expect("a queue");
     assert_eq!(read.decision, queue);
     assert!(read.lease.is_none());
+}
+
+/// A shed keeps the stage a demand sheds its pool under, each by its name:
+/// a host answers by it, as it does in process. Any other stage is the
+/// controller's document's own and reads `controller`, and so does a text
+/// that only looks like a demand's stage.
+#[test]
+fn a_shed_keeps_a_demands_stage_and_reads_any_other_as_the_controllers() {
+    use crate::engine::demands::UnmetDemand;
+
+    let now = Instant::now();
+    let shed = Shed {
+        reason: ShedReason::NoEndpoints,
+        emptied_by: "",
+        retry_after_secs: 0,
+        wait_allowed: false,
+        side: None,
+        trace: trace(Survivors::counted(0)),
+    };
+    let read = |emptied_by| {
+        let wire = told(Decision::Shed(Shed { emptied_by, ..shed }), None);
+        match decided(&wire, now).expect("a shed").decision {
+            Decision::Shed(shed) => shed.emptied_by,
+            other => panic!("a shed, got {other:?}"),
+        }
+    };
+    for demand in [
+        UnmetDemand::Runtime,
+        UnmetDemand::Vision,
+        UnmetDemand::References,
+        UnmetDemand::Pipeline,
+        UnmetDemand::Window,
+        UnmetDemand::Decoding,
+    ] {
+        assert_eq!(read(demand.stage()), demand.stage(), "{demand:?}");
+    }
+    assert_eq!(read("context-window"), "context-window");
+    for other in [
+        "not-overloaded",
+        "target-worker",
+        "none",
+        "",
+        "Context-Window",
+        "context-window ",
+    ] {
+        assert_eq!(read(other), "controller", "{other:?}");
+    }
 }
 
 /// A shed made ahead of every profile goes out with the mark over a

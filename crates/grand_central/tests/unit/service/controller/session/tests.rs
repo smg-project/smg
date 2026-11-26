@@ -21,8 +21,8 @@ use tonic::{
 use tonic_prost::ProstCodec;
 
 use super::{
-    floor, judge, refusal, release, Answers, GRACE_PERIOD, HELLO_DEADLINE, LEADER_POLL, LISTED_MAX,
-    OUT_QUEUE, PRESENT_MAX, RELEASE_MAX,
+    floor, judge, refusal, release, spoken, Answers, GRACE_PERIOD, HELLO_DEADLINE, LEADER_POLL,
+    LISTED_MAX, OUT_QUEUE, PRESENT_MAX, RELEASE_MAX,
 };
 use crate::{
     engine::view::WorkerId,
@@ -40,7 +40,7 @@ use crate::{
             principal::{tests::told, Layer, ENTRY},
             replication::journaled_at,
             service::{Service, Shared},
-            PROTOCOL_VERSION,
+            PROTOCOL_FLOOR, PROTOCOL_VERSION,
         },
         elector::{ElectionSettings, Elector, TickOutcome},
         proto::{
@@ -349,6 +349,61 @@ async fn a_hello_is_welcomed_under_the_fences_term_and_the_gateway_is_present() 
     assert!(bed.present(Instant::now() + 100 * GRACE_PERIOD));
 }
 
+/// This build speaks its own protocol version and the one before it. A
+/// hello is welcomed on the newest version its range shares with them,
+/// and a range that shares none has no version to speak. A gateway
+/// that offers the older version alone is welcomed on it, by the
+/// welcome a hello of this build's own version reads but for that
+/// number.
+#[tokio::test]
+async fn a_hello_is_welcomed_on_the_newest_version_its_range_shares_with_this_build() {
+    assert_eq!((PROTOCOL_FLOOR, PROTOCOL_VERSION), (1, 2));
+    let ranges = [
+        (1, 1, 1),
+        (1, 2, 2),
+        (2, 2, 2),
+        (2, 9, 2),
+        (0, 1, 1),
+        (0, 9, 2),
+    ];
+    for (min, max, chosen) in ranges {
+        assert_eq!(spoken(min, max), Some(chosen), "{min} to {max}");
+    }
+    for (min, max) in [(0, 0), (3, 4), (3, 1), (2, 1), (u32::MAX, u32::MAX)] {
+        assert_eq!(spoken(min, max), None, "{min} to {max}");
+    }
+
+    let mut bed = bed(PATIENT).await;
+    bed.leads(1);
+    let mut welcomes = Vec::new();
+    for (min, max) in [(2, 2), (1, 1), (1, 2)] {
+        let mut session = open(bed.addr).await;
+        let mut offered = hello(GATEWAY);
+        if let Some(Frame::Hello(hello)) = offered.frame.as_mut() {
+            (hello.protocol_min, hello.protocol_max) = (min, max);
+        }
+        session.send(offered).await;
+        let welcome = match session.frame().await.frame {
+            Some(controller_frame::Frame::Welcome(welcome)) => Some(welcome),
+            _ => None,
+        };
+        welcomes.push(welcome.expect("the hello is welcomed"));
+    }
+    let [own, older, both] = &welcomes[..] else {
+        panic!("three welcomes");
+    };
+    assert_eq!((own.protocol, older.protocol, both.protocol), (2, 1, 2));
+    let numbered = proto::Welcome {
+        protocol: own.protocol,
+        ..older.clone()
+    };
+    assert_eq!(
+        &numbered, own,
+        "the older welcome differs in its number alone"
+    );
+    assert_eq!(both, own);
+}
+
 /// Three streams no session stands on: none makes the gateway present.
 #[tokio::test]
 async fn a_stream_begins_with_a_hello_of_its_own_gateway_in_a_version_this_build_speaks() {
@@ -392,7 +447,7 @@ async fn a_stream_begins_with_a_hello_of_its_own_gateway_in_a_version_this_build
         session.status().await,
         (
             Code::FailedPrecondition,
-            "no protocol version in common: the gateway speaks 2 to 3, this controller 1"
+            "no protocol version in common: the gateway speaks 3 to 4, this controller 1 to 2"
                 .to_owned()
         )
     );

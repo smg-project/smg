@@ -3202,8 +3202,8 @@ fn a_served_pair_with_a_worker_of_unknown_runtime_goes_behind_every_other_pair()
     assert_eq!(calls, [BTreeSet::from([same]), either]);
 }
 
-/// No frame states a demand in this protocol version, so what a row states
-/// for one changes no decision. One worker stands in each role. Each states
+/// These frames state no demand, so what a row states for one changes no
+/// decision. One worker stands in each role. Each states
 /// a runtime, a pipeline for media by reference, a way to decide a
 /// constraint and a window of sixteen tokens, and every frame's prompt is
 /// 4,096 tokens long. A single request's frame, a pair's at its prefill, a

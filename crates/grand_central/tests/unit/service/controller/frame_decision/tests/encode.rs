@@ -684,8 +684,8 @@ fn an_encode_requests_frame_is_read_for_no_number() {
     }
 }
 
-/// No frame states a demand in this protocol version, so what the workers
-/// of an encode request state for one changes no decision either. Its
+/// This frame states no demand, so what the workers of an encode request
+/// state for one changes no decision either. Its
 /// prefill, its decode and its encoder each state a runtime, a pipeline for
 /// media by reference, a way to decide a constraint and a window of sixteen
 /// tokens. The frame is answered the pair and the encoders it is answered
