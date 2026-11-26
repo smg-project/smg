@@ -306,6 +306,30 @@ def _encoder_embedding_width(encoder, hf_config):
     return width
 
 
+def _encoder_staging_bytes(
+    encoder, hf_config, fallback_dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST
+):
+    """Derive staging byte cap from loaded encoder dims/element size, falling back to config."""
+    dims = getattr(encoder, "_embedding_dims", None)
+    elem_size = getattr(encoder, "_element_size", None)
+    if (
+        isinstance(dims, dict)
+        and type(elem_size) is int
+        and elem_size > 0
+        and type(max_tokens) is int
+        and max_tokens > 0
+    ):
+        valid_dims = [d for d in dims.values() if type(d) is int and d > 0]
+        if valid_dims:
+            return max_tokens * max(valid_dims) * elem_size
+    staging_dtype = _normalize_dtype(getattr(encoder, "_embedding_dtype", None) or fallback_dtype)
+    return encoder_staging_bytes(
+        _encoder_embedding_width(encoder, hf_config),
+        staging_dtype,
+        max_tokens=max_tokens,
+    )
+
+
 def encoder_staging_bytes(hidden_size, dtype, max_tokens=MAX_IMAGE_TOKENS_PER_REQUEST):
     """Compute per-request staging byte budget from embedding dimension and dtype."""
     per_token = _staging_bytes_per_token(hidden_size, dtype)
@@ -342,14 +366,22 @@ def fit_auto_media_tokens(
     embedding_dtype,
     config,
     max_batch_size=None,
+    *,
+    staging_bytes_per_token=None,
 ):
     """Fit auto-derived media tokens to preserve target execution slots within memory budget."""
     if target_tokens <= MAX_IMAGE_TOKENS_PER_REQUEST:
         return MAX_IMAGE_TOKENS_PER_REQUEST
     send_copies = 1 if config.get("embedding_backend") == "mooncake" else config["max_receivers"]
-    bytes_per_token = 2 * _artifact_bytes_per_token(hf_config, vision_dtype) + (
-        1 + send_copies
-    ) * _staging_bytes_per_token(hidden_size, embedding_dtype)
+    staging_per_token = (
+        staging_bytes_per_token
+        if staging_bytes_per_token is not None
+        else _staging_bytes_per_token(hidden_size, embedding_dtype)
+    )
+    bytes_per_token = (
+        2 * _artifact_bytes_per_token(hf_config, vision_dtype)
+        + (1 + send_copies) * staging_per_token
+    )
     budget_bytes = config.get("max_context_bytes")
     if budget_bytes is None:
         budget_bytes = resolve_max_context_bytes()
@@ -512,6 +544,12 @@ async def serve(config, args):
         staging_dtype = _normalize_dtype(
             getattr(backend.encoder, "_embedding_dtype", None) or config["embedding_dtype"]
         )
+        staging_per_token = _encoder_staging_bytes(
+            backend.encoder,
+            hf_config,
+            config["embedding_dtype"],
+            max_tokens=1,
+        )
         max_tokens = fit_auto_media_tokens(
             resolve_max_media_tokens(args, backend.encoder.model_config),
             hf_config,
@@ -520,10 +558,12 @@ async def serve(config, args):
             staging_dtype,
             config,
             max_batch_size=max_batch_size,
+            staging_bytes_per_token=staging_per_token,
         )
-        config["max_staging_bytes_per_request"] = encoder_staging_bytes(
-            staging_width,
-            staging_dtype,
+        config["max_staging_bytes_per_request"] = _encoder_staging_bytes(
+            backend.encoder,
+            hf_config,
+            config["embedding_dtype"],
             max_tokens=max_tokens,
         )
         config["max_artifact_bytes"] = encoder_artifact_bytes(

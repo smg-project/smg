@@ -2050,7 +2050,6 @@ impl PySglangGrpcServer {
     }
 }
 
-/// Native encoder control shares the existing servicer runtime and Rust media pipeline.
 /// Convert managed encoder proto items into `WorkerMediaItem`s, forwarding validated image detail.
 fn encoder_items_to_worker_items(
     modality: EncoderModality,
@@ -2073,6 +2072,7 @@ fn encoder_items_to_worker_items(
         .collect()
 }
 
+/// Native encoder control shares the existing servicer runtime and Rust media pipeline.
 #[pyclass(name = "ManagedEncoderServer")]
 pub struct PyManagedEncoderServer {
     server: EncoderServer,

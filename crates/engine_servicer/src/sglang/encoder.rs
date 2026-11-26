@@ -928,9 +928,10 @@ impl EncoderRuntime {
                             "native encoder release receipt timed out",
                         ))));
                         let late = (&mut exec).await;
-                        let late_safe = late.as_ref().is_ok_and(|r| {
-                            r.get("released").and_then(Value::as_bool) == Some(true)
-                        });
+                        let late_safe = matches!(late, Err(NativeCallError::NotSent(_)))
+                            || late.as_ref().is_ok_and(|r| {
+                                r.get("released").and_then(Value::as_bool) == Some(true)
+                            });
                         if !late_safe {
                             self.draining.store(true, Ordering::Release);
                         }
@@ -978,7 +979,6 @@ impl EncoderRuntime {
             owner.result.send_replace(Some(Err(status)));
             return;
         }
-        self.release_queued_control(&owner);
         let items: Vec<EncoderMediaItem> = raw_items
             .into_iter()
             .enumerate()
@@ -1124,6 +1124,7 @@ impl EncoderRuntime {
                 ));
             }
             let artifact = (self.processor)(modality, items).await;
+            self.release_queued_control(&owner);
             drop(cpu);
             let artifact = artifact?;
             let remaining_ms = owner
@@ -2668,6 +2669,36 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(h.runtime.loads(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn late_not_sent_after_cancel_timeout_clears_quarantine_without_draining() {
+        // Without a connected pull socket, commands.send retries ReturnToSender for ~95ms
+        // before emitting NativeCallError::NotSent. Using a shorter cancel_grace forces
+        // the quarantine path first, then resolves late with NotSent.
+        let mut h = EncoderHarness::start(false, Duration::from_millis(20), None).await;
+        h.mark_ready().await;
+
+        let handle = tokio::spawn({
+            let rt = h.runtime.clone();
+            async move {
+                rt.encode(encode_request("late-not-sent"), Duration::from_secs(5))
+                    .await
+            }
+        });
+        h.wait_for(|| h.runtime.loads().0 == 1).await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        handle.abort();
+
+        h.wait_for(|| !h.runtime.ready()).await;
+        assert!(h.runtime.fatal_error().is_none());
+
+        // Once NotSent arrives, quarantine clears without setting draining and the slot returns.
+        h.wait_for(|| h.runtime.ready() && h.runtime.loads() == (0, 0))
+            .await;
+        assert!(h.runtime.ready());
+        assert!(h.runtime.fatal_error().is_none());
         assert_eq!(h.runtime.loads(), (0, 0));
     }
 }

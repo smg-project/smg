@@ -2560,3 +2560,25 @@ def test_reuse_materialized_feature_hashes_v0521_and_0523_compat():
     epd_encoder.install_bridge(encoder, "smg-image-grid-v1", 1024 * 1024)
     assert not hasattr(encoder, "cache_namespace")
     assert isinstance(encoder.preprocessor, epd_encoder.RustPreprocessorBridge)
+
+
+def test_encoder_staging_bytes_prefers_loaded_encoder_dims_and_element_size():
+    hf_cfg = SimpleNamespace(vision_config={"deepstack_visual_indexes": [8, 16, 24]})
+    loaded = SimpleNamespace(
+        _embedding_dims={"image": 20480, "video": 12288},
+        _element_size=2,
+        _embedding_dtype="bfloat16",
+        model_config=SimpleNamespace(hidden_size=4096),
+    )
+    assert (
+        epd_launcher._encoder_staging_bytes(loaded, hf_cfg, "bfloat16", max_tokens=100)
+        == 100 * 20480 * 2
+    )
+    fallback = SimpleNamespace(
+        _embedding_dtype="float16",
+        model_config=SimpleNamespace(hidden_size=4096),
+    )
+    assert (
+        epd_launcher._encoder_staging_bytes(fallback, hf_cfg, "bfloat16", max_tokens=100)
+        == 100 * (4096 * 4) * 2
+    )
