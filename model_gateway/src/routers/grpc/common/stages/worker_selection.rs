@@ -2694,6 +2694,7 @@ impl WorkerSelectionStage {
             (!prefer_vision || decode_vision(worker))
                 && (!needs_encode || encoders.iter().any(|e| compatible(e, worker)))
         };
+        let mut fallback_encode = Vec::new();
         if needs_encode
             && !shedding
             && !encode_overload_lifted
@@ -2702,21 +2703,21 @@ impl WorkerSelectionStage {
                     && eligible_for(&available_encode, worker)
             })
         {
-            // When non-overloaded encoders exist for another runtime/contract but none
-            // match any live P/D pair, fall back to overloaded compatible encoders.
-            let overloaded_encode: Vec<_> = registered_encode
+            // Keep healthy encoders intact (a liveness-stalled P/D pair can still pair
+            // with them via `relaxed_pair`), while allowing `select_pair` to also see
+            // overloaded compatible encoders if no healthy encoder pairs with the chosen pair.
+            fallback_encode = registered_encode
                 .iter()
                 .filter(|worker| {
                     capable(worker) && overload::vetoed_by_overload_alone(worker.as_ref())
                 })
                 .cloned()
                 .collect();
-            if !overloaded_encode.is_empty() {
-                available_encode = overloaded_encode;
-                encode_overload_lifted = true;
-            }
         }
-        let eligible = |worker: &dyn Worker| eligible_for(&available_encode, worker);
+        let eligible = |worker: &dyn Worker| {
+            eligible_for(&available_encode, worker)
+                || (!fallback_encode.is_empty() && eligible_for(&fallback_encode, worker))
+        };
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
@@ -2753,6 +2754,13 @@ impl WorkerSelectionStage {
             encode_item_hashes
         };
         available_encode.retain(pairs_with_prefill);
+        if needs_encode && available_encode.is_empty() && !fallback_encode.is_empty() {
+            fallback_encode.retain(pairs_with_prefill);
+            if !fallback_encode.is_empty() {
+                available_encode = fallback_encode;
+                encode_overload_lifted = true;
+            }
+        }
         // The ring is read where an item is placed by a policy that walks it.
         let encode_policy = self.policy_registry.get_encode_policy();
         let hash_ring = (!hashes.is_empty() && policy_reads_hash_ring(encode_policy.as_ref()))
@@ -9469,11 +9477,14 @@ mod tests {
                 .connection_mode(ConnectionMode::Grpc)
                 .health_config(no_health_check())
                 .label("supports_vision", "true")
+                .label("supports_ec_transfer", "true")
                 .label("ec_role", "ec_producer")
                 .label("ec_connector", "ECCPUConnector")
                 .build(),
         );
-        registry.register(vllm_encoder).unwrap();
+        registry.register(Arc::clone(&vllm_encoder)).unwrap();
+        assert!(vllm_encoder.is_available());
+        assert!(ec_role(vllm_encoder.as_ref(), "ec_producer"));
 
         let (assigned, prefill, decode, runtime) = stage
             .select_encode_prefill_decode_workers(
@@ -9503,6 +9514,99 @@ mod tests {
         );
         assert_eq!(prefill.url(), "grpc://127.0.0.1:8972");
         assert_eq!(decode.url(), "grpc://127.0.0.1:8973");
+    }
+
+    #[test]
+    fn epd_encode_overload_fallback_preserves_healthy_encoder_with_stalled_prefill() {
+        use smg_worker::identity::basic::StallReason;
+
+        // Case A: healthy compatible encoder + liveness-stalled prefill + incompatible
+        // overloaded encoder must still succeed via `relaxed_pair` using the healthy encoder.
+        let (registry, stage, _encoders) = prepared_epd_overload_fixture(false);
+        let prefill_worker = registry.get_by_url("grpc://127.0.0.1:8972").unwrap();
+        prefill_worker.set_stall(Some(StallReason::Wedged));
+        let vllm_encoder: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8999")
+                .model(ModelCard::new("epd-overload-model"))
+                .worker_type(WorkerType::Encode)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .label("supports_vision", "true")
+                .label("supports_ec_transfer", "true")
+                .label("ec_role", "ec_producer")
+                .label("ec_connector", "ECCPUConnector")
+                .build(),
+        );
+        registry.register(Arc::clone(&vllm_encoder)).unwrap();
+        assert!(vllm_encoder.is_available());
+        assert!(ec_role(vllm_encoder.as_ref(), "ec_producer"));
+        registry.set_worker_overloaded(&vllm_encoder, true);
+
+        let (assigned, prefill, decode, runtime) = stage
+            .select_encode_prefill_decode_workers(
+                "epd-overload-model",
+                PlacementInputs::default(),
+                &[vec![0xaa, 0xbb]],
+                EpdDemands {
+                    wire: None,
+                    encode: MediaDemands {
+                        media_refs: false,
+                        vision: true,
+                        pipeline: PipelinePin::Any,
+                    },
+                    decode_vision: false,
+                    image_fanout: false,
+                },
+                None,
+            )
+            .unwrap_or_else(|_| {
+                panic!("stalled prefill must still pair with healthy compatible encoder")
+            });
+        assert_eq!(runtime, RuntimeType::Sglang);
+        assert_eq!(assigned.len(), 1);
+        assert!(
+            assigned[0].worker.url() == "grpc://127.0.0.1:8970"
+                || assigned[0].worker.url() == "grpc://127.0.0.1:8971"
+        );
+        assert_eq!(prefill.url(), "grpc://127.0.0.1:8972");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:8973");
+
+        // Case B: healthy compatible encoder (8970) + overloaded compatible encoder (8971)
+        // + liveness-stalled prefill must select ONLY the healthy compatible encoder (8970),
+        // never spilling to the overloaded one.
+        let (registry_b, stage_b, encoders_b) = prepared_epd_overload_fixture(false);
+        let prefill_b = registry_b.get_by_url("grpc://127.0.0.1:8972").unwrap();
+        prefill_b.set_stall(Some(StallReason::Wedged));
+        registry_b.set_worker_overloaded(&encoders_b[1], true);
+
+        for seed in 0u8..8 {
+            let (assigned_b, prefill_sel, decode_sel, runtime_b) = stage_b
+                .select_encode_prefill_decode_workers(
+                    "epd-overload-model",
+                    PlacementInputs::default(),
+                    &[vec![seed, 0xbb]],
+                    EpdDemands {
+                        wire: None,
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: false,
+                        image_fanout: false,
+                    },
+                    None,
+                )
+                .unwrap_or_else(|_| {
+                    panic!("stalled prefill must select healthy compatible encoder")
+                });
+            assert_eq!(runtime_b, RuntimeType::Sglang);
+            assert_eq!(assigned_b.len(), 1);
+            assert_eq!(assigned_b[0].worker.url(), "grpc://127.0.0.1:8970");
+            assert_eq!(prefill_sel.url(), "grpc://127.0.0.1:8972");
+            assert_eq!(decode_sel.url(), "grpc://127.0.0.1:8973");
+        }
     }
 }
 
