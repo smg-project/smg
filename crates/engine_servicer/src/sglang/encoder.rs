@@ -398,10 +398,11 @@ struct PreDecodeHit {
 /// Bounded Rust-side pre-decode index mapping immutable `data:` image sources + options
 /// to resident Python `PerItemEmbeddingCache` keys and layout metadata.
 struct PreDecodeCache {
-    by_source: HashMap<[u8; 32], CachedSourceMeta>,
-    order: VecDeque<[u8; 32]>,
+    by_source: HashMap<[u8; 32], (CachedSourceMeta, u64)>,
+    order: VecDeque<([u8; 32], u64)>,
     by_item_key: HashMap<String, Vec<[u8; 32]>>,
     max_entries: usize,
+    next_gen: u64,
 }
 
 impl PreDecodeCache {
@@ -412,6 +413,7 @@ impl PreDecodeCache {
             order: VecDeque::new(),
             by_item_key: HashMap::new(),
             max_entries,
+            next_gen: 0,
         }
     }
 
@@ -426,7 +428,7 @@ impl PreDecodeCache {
         let mut embedding_tokens = 0u64;
         for maybe_key in source_keys {
             let src_key = (*maybe_key)?;
-            let meta = self.by_source.get(&src_key)?;
+            let (meta, _) = self.by_source.get(&src_key)?;
             item_keys.push(meta.item_key_hex.clone());
             grid_thw.push(meta.grid_thw);
             token_counts.push(meta.token_count);
@@ -445,13 +447,14 @@ impl PreDecodeCache {
         if self.max_entries == 0 {
             return;
         }
-        if let Some(prev) = self.by_source.get(&source_key) {
+        let entry_gen = if let Some((prev, prev_gen)) = self.by_source.get(&source_key) {
             if prev.item_key_hex == meta.item_key_hex
                 && prev.grid_thw == meta.grid_thw
                 && prev.token_count == meta.token_count
             {
                 return;
             }
+            let prev_gen = *prev_gen;
             let old_key = prev.item_key_hex.clone();
             if let Some(list) = self.by_item_key.get_mut(&old_key) {
                 list.retain(|k| *k != source_key);
@@ -459,12 +462,20 @@ impl PreDecodeCache {
                     self.by_item_key.remove(&old_key);
                 }
             }
+            prev_gen
         } else {
             while self.by_source.len() >= self.max_entries {
-                let Some(oldest) = self.order.pop_front() else {
+                let Some((oldest, oldest_gen)) = self.order.pop_front() else {
                     break;
                 };
-                if let Some(evicted) = self.by_source.remove(&oldest) {
+                let matches_gen = self
+                    .by_source
+                    .get(&oldest)
+                    .is_some_and(|(_, current_gen)| *current_gen == oldest_gen);
+                if !matches_gen {
+                    continue;
+                }
+                if let Some((evicted, _)) = self.by_source.remove(&oldest) {
                     if let Some(list) = self.by_item_key.get_mut(&evicted.item_key_hex) {
                         list.retain(|k| *k != oldest);
                         if list.is_empty() {
@@ -474,15 +485,22 @@ impl PreDecodeCache {
                 }
             }
             if self.order.len() >= self.max_entries.saturating_mul(2) {
-                self.order.retain(|k| self.by_source.contains_key(k));
+                self.order.retain(|(k, g)| {
+                    self.by_source
+                        .get(k)
+                        .is_some_and(|(_, current_gen)| current_gen == g)
+                });
             }
-            self.order.push_back(source_key);
-        }
+            let generation = self.next_gen;
+            self.next_gen = self.next_gen.wrapping_add(1);
+            self.order.push_back((source_key, generation));
+            generation
+        };
         self.by_item_key
             .entry(meta.item_key_hex.clone())
             .or_default()
             .push(source_key);
-        self.by_source.insert(source_key, meta);
+        self.by_source.insert(source_key, (meta, entry_gen));
     }
 
     /// Drop all source mappings associated with item keys evicted by the Python cache.
@@ -2700,5 +2718,28 @@ mod tests {
         assert!(h.runtime.ready());
         assert!(h.runtime.fatal_error().is_none());
         assert_eq!(h.runtime.loads(), (0, 0));
+    }
+
+    #[test]
+    fn pre_decode_cache_generation_prevents_stale_eviction_after_reinsert() {
+        let mut cache = PreDecodeCache::new(2);
+        let k_a = [1u8; 32];
+        let k_b = [2u8; 32];
+        let k_c = [3u8; 32];
+        let meta = |hex: &str| CachedSourceMeta {
+            item_key_hex: hex.into(),
+            grid_thw: [1, 2, 2],
+            token_count: 1,
+        };
+        cache.insert(k_a, meta("aa"));
+        cache.evict_item_keys(["aa"]);
+        cache.insert(k_b, meta("bb"));
+        cache.insert(k_a, meta("aa"));
+        // At capacity 2 with order [(a,0-stale), (b,1), (a,2)], inserting c must skip
+        // the stale (a,0) entry, evict b, and keep the freshly re-inserted a.
+        cache.insert(k_c, meta("cc"));
+        assert!(cache.lookup_all(&[Some(k_a)]).is_some());
+        assert!(cache.lookup_all(&[Some(k_b)]).is_none());
+        assert!(cache.lookup_all(&[Some(k_c)]).is_some());
     }
 }

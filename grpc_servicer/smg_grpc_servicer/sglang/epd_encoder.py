@@ -1444,6 +1444,7 @@ class NativeEncoder:
                 error = _err(exc)
         cache_resident = None
         cache_evicted = None
+        req_identities = None
         try:
             self._wake_abandoned_sends(rid)
             await self.backend.encoder.abandon_request(rid)
@@ -1461,15 +1462,13 @@ class NativeEncoder:
             req_identities = (
                 identities_map.pop(rid, None) if isinstance(identities_map, dict) else None
             )
-            cache = getattr(self.backend.encoder, "_smg_item_cache", None)
-            if cache is not None:
-                cache_evicted = cache.drain_evictions() or None
-                if error is None and req_identities and cache.max_bytes > 0:
-                    resident = [
-                        k if cache.contains(bytes.fromhex(k)) else None for k in req_identities
-                    ]
-                    if any(resident):
-                        cache_resident = resident
+        cache = getattr(self.backend.encoder, "_smg_item_cache", None)
+        if cache is not None:
+            cache_evicted = cache.drain_evictions() or None
+            if error is None and req_identities and cache.max_bytes > 0:
+                resident = [k if cache.contains(bytes.fromhex(k)) else None for k in req_identities]
+                if any(resident):
+                    cache_resident = resident
         entry.sends.clear()
         del self.entries[rid]
         receipt = {"released": True, "error": error}

@@ -1181,7 +1181,7 @@ async def test_per_item_embedding_cache_hits_eviction_and_bypass(monkeypatch):
     monkeypatch.setenv("SMG_SGLANG_ENCODER_ITEM_CACHE_MB", "0")
     assert (
         await epd_encoder.cached_compute_direct_embedding(
-            fallback_ok, encoder, make_ctx([img1]), keep_on_gpu=True
+            fallback_ok, FakeEncoder(), make_ctx([img1]), keep_on_gpu=True
         )
         == "bypassed"
     )
@@ -2733,3 +2733,38 @@ async def test_serve_does_not_reserve_item_cache_bytes_when_tp_gt_1(monkeypatch)
     )
     await epd_launcher.serve(cfg, args)
     assert captured["item_cache_bytes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_finish_preserves_pending_evictions_when_release_fails(monkeypatch):
+    """Failed release_request must not drain and discard pending item-cache evictions."""
+    server_mod = SimpleNamespace(meta_registry=SimpleNamespace())
+    encoder_pkg = SimpleNamespace(server=server_mod)
+    for name, mod in (
+        ("sglang", SimpleNamespace()),
+        ("sglang.srt", SimpleNamespace()),
+        ("sglang.srt.disaggregation", SimpleNamespace(encoder=encoder_pkg)),
+        ("sglang.srt.disaggregation.encoder", encoder_pkg),
+        ("sglang.srt.disaggregation.encoder.server", server_mod),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    cache = epd_encoder.PerItemEmbeddingCache(max_bytes=16)
+    cache._pending_evictions.append("deadbeef")
+
+    class _FailingReleaseEncoder(_FakeEncoder):
+        def __init__(self):
+            super().__init__()
+            self._smg_item_cache = cache
+
+        async def release_request(self, rid):
+            raise RuntimeError("release boom")
+
+    owner = epd_encoder.NativeEncoder(
+        {"max_receivers": 4},
+        SimpleNamespace(encoder=_FailingReleaseEncoder(), scheduler=SimpleNamespace()),
+    )
+    entry = epd_encoder.NativeEntry(time.monotonic() + 10.0, "r-fail", "127.0.0.1", part_idx=0)
+    owner.entries["r-fail"] = entry
+    receipt = await owner._finish(entry, None)
+    assert receipt["released"] is False
+    assert cache.drain_evictions() == ["deadbeef"]
