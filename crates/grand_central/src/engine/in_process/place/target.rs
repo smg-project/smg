@@ -78,8 +78,7 @@ use crate::engine::decision::{Decision, Shed};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision::{ShedReason, TARGET_WORKER},
-        framework::PairSide,
+        decision::{PairSide, ShedReason, TARGET_WORKER},
         in_process::Loaded,
         list_cell::LentList,
         view::Role,

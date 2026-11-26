@@ -527,15 +527,17 @@ fn demanding(phase: FramePhase, demands: Demands) -> DecideRequest {
 
 /// A demand's ranges are the controller's check's too, and a demand
 /// goes to no controller that reads none. Over a session on protocol 2
-/// the link's door refuses, by its field, a demand on a frame whose
-/// decision holds none yet. It refuses a part out of its range the same
-/// way. Over a session on protocol 1, one whose welcome states none, or
-/// one on a version the hello did not offer, it refuses every stated
-/// demand by `demands`: each of the six parts, stated alone.
+/// the link's door refuses, by its field, a demand on an encode
+/// request's frame, whose decision holds none yet. It refuses a part
+/// out of its range the same way. Over a session on protocol 1, one
+/// whose welcome states none, or one on a version the hello did not
+/// offer, it refuses every stated demand by `demands`: each of the six
+/// parts, stated alone.
 ///
 /// Each refusal sends nothing, spends no credit and leaves the link
-/// standing. A single request's demand is sent over protocol 2 as it
-/// is. A message with no part demands nothing, and is sent over any.
+/// standing. Over protocol 2 a demand is sent as it is on a frame of
+/// each other kind. A message with no part demands nothing, and is
+/// sent over any.
 #[tokio::test]
 async fn an_ask_whose_demand_is_out_of_range_or_unread_sends_nothing_and_the_link_stands() {
     use crate::service::controller::PROTOCOL_VERSION;
@@ -546,15 +548,6 @@ async fn an_ask_whose_demand_is_out_of_range_or_unread_sends_nothing_and_the_lin
     };
     let mut peer = Peer::speaking(1, 2);
     let wrong = [
-        ("demands", demanding(FramePhase::Prefill, runtime)),
-        ("demands", demanding(FramePhase::Decode, runtime)),
-        (
-            "demands",
-            DecideRequest {
-                decode_of: Some(7),
-                ..demanding(FramePhase::Single, runtime)
-            },
-        ),
         (
             "demands",
             DecideRequest {
@@ -562,13 +555,8 @@ async fn an_ask_whose_demand_is_out_of_range_or_unread_sends_nothing_and_the_lin
                 ..with_items(FramePhase::Encode, 1)
             },
         ),
-        (
-            "demands",
-            DecideRequest {
-                named_worker: Some(0),
-                ..demanding(FramePhase::Single, runtime)
-            },
-        ),
+        // A frame of the encode phase with no items is such a frame.
+        ("demands", demanding(FramePhase::Encode, runtime)),
         (
             "demands.decoding",
             demanding(
@@ -582,7 +570,7 @@ async fn an_ask_whose_demand_is_out_of_range_or_unread_sends_nothing_and_the_lin
         (
             "demands.references",
             demanding(
-                FramePhase::Single,
+                FramePhase::Prefill,
                 Demands {
                     references: 4,
                     ..runtime
@@ -604,6 +592,40 @@ async fn an_ask_whose_demand_is_out_of_range_or_unread_sends_nothing_and_the_lin
     let mut asked = Box::pin(peer.link.ask(whole.clone(), WAIT));
     assert!(poll(asked.as_mut()).is_pending());
     assert_eq!(within(peer.requests.next()).await, Some(whole));
+
+    // A frame of each other kind states its demand: a pair's or a
+    // side's alone, a decode call, whatever phase its facts state, and
+    // a frame that names its worker.
+    let mut peer = Peer::speaking(8, 2);
+    let sent = [
+        demanding(FramePhase::Prefill, runtime),
+        demanding(FramePhase::Decode, runtime),
+        DecideRequest {
+            decode_of: Some(7),
+            ..demanding(FramePhase::Single, runtime)
+        },
+        DecideRequest {
+            decode_of: Some(7),
+            ..demanding(FramePhase::Encode, runtime)
+        },
+        DecideRequest {
+            named_worker: Some(0),
+            ..demanding(FramePhase::Single, runtime)
+        },
+        DecideRequest {
+            named_worker: Some(0),
+            ..demanding(FramePhase::Prefill, runtime)
+        },
+    ];
+    for (id, frame) in (1_u8..).zip(sent) {
+        let frame = DecideRequest {
+            request_id: vec![id],
+            ..frame
+        };
+        let mut asked = Box::pin(peer.link.ask(frame.clone(), WAIT));
+        assert!(poll(asked.as_mut()).is_pending(), "{frame:?}");
+        assert_eq!(within(peer.requests.next()).await, Some(frame));
+    }
 
     // A welcome that states no version, one on 1, and one on a version
     // the hello did not offer.

@@ -224,25 +224,20 @@ pub(crate) fn stated_items(
 
 /// The hard demands a frame states (`DecideRequest.demands`), or the field
 /// that puts them out of range. A message with no part demands nothing, on
-/// any frame. A stated demand is read on a single request's frame that
-/// names no worker (`named`). Any other frame that states one is out of
-/// range by `demands`, so a decision that holds no demand yet drops none
-/// in silence.
+/// any frame. A stated demand is read on every frame but an encode
+/// request's. That frame is out of range by `demands`: its decision holds
+/// no demand yet, so it drops none in silence.
 ///
-/// `phase` is the phase the frame is read at ([`Checked::new`]). A sender
-/// whose callers share one stream reads the field here too. It hands the
-/// phase its facts state, or the decode phase for a decode call. The
-/// answer is the same: an encode request's frame is a single's at neither
-/// phase.
+/// `phase` is the phase the frame's facts state, or the decode phase for a
+/// decode call. An encode request's frame states the encode phase there,
+/// with its items or with none. The check of a frame received hands that
+/// phase ([`Checked::new`]). A sender whose callers share one stream reads
+/// the field here too, and hands the same phase.
 ///
 /// Out of line: a frame that states no message reads none of it.
 #[cold]
 #[inline(never)]
-pub(crate) fn stated_demands(
-    stated: &proto::Demands,
-    phase: Phase,
-    named: bool,
-) -> Result<Demands, Refusal> {
+pub(crate) fn stated_demands(stated: &proto::Demands, phase: Phase) -> Result<Demands, Refusal> {
     // Every field by its name: one the contract gains stops the build here,
     // so no demand passes unread.
     let proto::Demands {
@@ -271,7 +266,7 @@ pub(crate) fn stated_demands(
         output_window,
         decoding,
     };
-    if !demands.is_none() && (phase != Phase::Single || named) {
+    if !demands.is_none() && phase == Phase::Encode {
         return Err(Refusal::OutOfRange("demands"));
     }
     Ok(demands)
@@ -356,14 +351,16 @@ impl Checked {
             };
             Box::new(Items { stated, placed })
         });
+        // A stated demand is read at the phase the frame states, ahead of
+        // the phase its items are read at.
+        let demands = match &request.demands {
+            None => Demands::default(),
+            Some(stated) => stated_demands(stated, phase)?,
+        };
         let phase = if items.is_some() {
             Phase::Prefill
         } else {
             phase
-        };
-        let demands = match &request.demands {
-            None => Demands::default(),
-            Some(stated) => stated_demands(stated, phase, request.named_worker.is_some())?,
         };
         let rare = (u8::from(text) * TEXT)
             | (u8::from(request.again) * AGAIN)
@@ -456,6 +453,13 @@ impl Checked {
     /// text that was no number: it reaches no worker of any list.
     pub(crate) const fn named_worker(&self) -> Option<u32> {
         self.named
+    }
+
+    /// The request's hard demands as the frame states them
+    /// (`DecideRequest.demands`). The count of a frame that names its
+    /// worker reads them: a worker they leave out takes no number.
+    pub(crate) const fn demands(&self) -> Demands {
+        self.demands
     }
 
     /// The keys of an encode request's items as the engine takes them, in

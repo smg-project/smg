@@ -311,7 +311,7 @@ fn an_arriving_answer_stamps_the_witness_and_keeps_the_gap_before_it() {
             continue;
         }
         assert!(
-            !lane.witness.stalled_between(after, after),
+            !lane.stalled_between(after, after),
             "the delivery was a run of the thread"
         );
         let soon = Instant::now() + Duration::from_secs(5);
@@ -319,31 +319,29 @@ fn an_arriving_answer_stamps_the_witness_and_keeps_the_gap_before_it() {
             panic!("the first frame was answered");
         };
         assert!(
-            lane.witness.stalled_between(sent, arrived),
+            lane.stalled_between(sent, arrived),
             "the answer came across a gap past the promise"
         );
         // The gap ends at the arrival, exclusive: a frame that took
         // flight in its closing microsecond is not crossed, and one a
         // microsecond earlier is.
         assert!(
-            !lane.witness.stalled_between(arrived, arrived),
+            !lane.stalled_between(arrived, arrived),
             "a frame in the gap's closing microsecond"
         );
         assert!(
-            lane.witness
-                .stalled_between(arrived - Duration::from_micros(1), arrived),
+            lane.stalled_between(arrived - Duration::from_micros(1), arrived),
             "a frame a microsecond before the gap closed"
         );
         // The gap began in the microsecond the first frame took
         // flight: an answer owed only until then is not crossed, and
         // one owed a microsecond longer is.
         assert!(
-            !lane.witness.stalled_between(sent, sent),
+            !lane.stalled_between(sent, sent),
             "an answer owed until the gap's first microsecond"
         );
         assert!(
-            lane.witness
-                .stalled_between(sent, sent + Duration::from_micros(1)),
+            lane.stalled_between(sent, sent + Duration::from_micros(1)),
             "an answer owed a microsecond into the gap"
         );
         break;
@@ -355,7 +353,7 @@ fn an_arriving_answer_stamps_the_witness_and_keeps_the_gap_before_it() {
 #[test]
 fn the_ticker_stamps_while_a_frame_is_in_flight_and_parks_with_none() {
     let runtime = Runtime::new(&OpenDecisions::new()).expect("a runtime");
-    let witness = Arc::clone(runtime.witness());
+    let witness = Arc::clone(&runtime.witness);
     let ran = || witness.ran.load(Ordering::Relaxed);
     let advances = |within: Duration| {
         let (from, until) = (ran(), Instant::now() + within);
@@ -383,6 +381,39 @@ fn the_ticker_stamps_while_a_frame_is_in_flight_and_parks_with_none() {
         !advances(Duration::from_millis(30)),
         "the frame landed: the ticker parks"
     );
+}
+
+/// A runtime makes its lanes: a lane counts its frames on its maker's
+/// witness, the one that runtime's I/O thread stamps, and on no other's.
+#[test]
+fn a_runtimes_lane_counts_its_frames_on_that_runtimes_witness() {
+    let (maker, other) = (
+        Runtime::new(&OpenDecisions::new()).expect("a runtime"),
+        Runtime::new(&OpenDecisions::new()).expect("another runtime"),
+    );
+    let events = Arc::new(Counted::default());
+    let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
+    let lane = maker.lane(nowhere(), Arc::downgrade(&listener));
+    assert!(Arc::ptr_eq(&lane.witness, &maker.witness));
+    assert!(lane.is_of(&maker));
+    assert!(!lane.is_of(&other));
+}
+
+/// A lane asked for its stream through another runtime than its maker
+/// would count its flights where no thread stamps: a debug build stops at
+/// the ask.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the runtime that made it")]
+fn a_lane_asked_through_another_runtime_than_its_maker_stops_a_debug_build() {
+    let (maker, other) = (
+        Runtime::new(&OpenDecisions::new()).expect("a runtime"),
+        Runtime::new(&OpenDecisions::new()).expect("another runtime"),
+    );
+    let events = Arc::new(Counted::default());
+    let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
+    let lane = Arc::new(maker.lane(nowhere(), Arc::downgrade(&listener)));
+    lane.connect(&other);
 }
 
 #[test]

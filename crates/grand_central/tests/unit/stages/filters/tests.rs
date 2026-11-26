@@ -4,6 +4,22 @@ use crate::{
     stages::scorers::tests::{candidate, kept},
 };
 
+/// The five filters of `filters.rs` a set names, by bit: what the cases of the
+/// folded test walk, here and in the engine's.
+pub(crate) fn filters_of(set: u8) -> Vec<Box<dyn Filter>> {
+    let all: [fn() -> Box<dyn Filter>; 5] = [
+        || Box::new(Healthy),
+        || Box::new(NotOverloaded),
+        || Box::new(HasCapacity),
+        || Box::new(HasRoom),
+        || Box::new(NotTried),
+    ];
+    (0..all.len())
+        .filter(|bit| set & (1 << bit) != 0)
+        .map(|bit| all[bit]())
+        .collect()
+}
+
 #[test]
 fn the_filters_read_their_bits() {
     let facts = RequestFacts::default();

@@ -1753,7 +1753,8 @@ impl WorkerSelectionStage {
                 }
             };
             match verdict {
-                PlacementFailure::AllOverloaded(shed) => return shed,
+                PlacementFailure::AllOverloaded(refusal)
+                | PlacementFailure::NoPlanBound(refusal) => return refusal,
                 PlacementFailure::Unavailable
                 | PlacementFailure::PolicyDeclined(_)
                 | PlacementFailure::NoCompatiblePair { .. }
@@ -1840,7 +1841,8 @@ impl WorkerSelectionStage {
                 model_id,
                 self.worker_registry.overload_shed_enabled(),
             ) {
-                PlacementFailure::AllOverloaded(shed) => return shed,
+                PlacementFailure::AllOverloaded(refusal)
+                | PlacementFailure::NoPlanBound(refusal) => return refusal,
                 PlacementFailure::Unavailable
                 | PlacementFailure::PolicyDeclined(_)
                 | PlacementFailure::NoCompatiblePair { .. }
@@ -2080,14 +2082,24 @@ impl WorkerSelectionStage {
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
         let role = pair_role(failure.role).map_or("worker", role_name);
         match failure.verdict {
-            PlacementFailure::AllOverloaded(shed) => shed,
+            // Each was built where it was judged.
+            PlacementFailure::AllOverloaded(refusal) | PlacementFailure::NoPlanBound(refusal) => {
+                refusal
+            }
             PlacementFailure::Unavailable => Self::workers_unavailable(model_id),
             // The client reads the 503's usual message; the line names the
-            // policy and the role, as the HTTP PD router's does.
-            PlacementFailure::PolicyDeclined(policy) => Self::workers_unavailable_because(
-                model_id,
-                format!("Policy {policy} failed to select a {role} worker"),
-            ),
+            // policy and the role, as the HTTP PD router's does. Under Grand
+            // Central the name is the engine's, and a decline that names no
+            // side is the pair's whole.
+            PlacementFailure::PolicyDeclined(policy) => {
+                let reason = match failure.role {
+                    WorkerRole::Single => format!("Policy {policy} failed to select a pair"),
+                    WorkerRole::Prefill | WorkerRole::Decode => {
+                        format!("Policy {policy} failed to select a {role} worker")
+                    }
+                };
+                Self::workers_unavailable_because(model_id, reason)
+            }
             // Admission turns a capacity verdict into a wait before it gets here.
             PlacementFailure::PrefillAtCapacity => Self::workers_unavailable_because(
                 model_id,
@@ -2338,13 +2350,16 @@ impl WorkerSelectionStage {
     /// processes references, or none of those that do is on the side of
     /// the plan's pipeline pin. Both are the request's own 400, as the
     /// regular path answers them, not a retryable 503 over healthy workers.
+    /// A verdict for the pair's whole, as an unbound plan's, was judged
+    /// from no pool: no pool's media explains it, and it is answered as it
+    /// is.
     fn pd_pair_failure(
         &self,
         model_id: &str,
         failure: PairFailure,
         media: MediaDemands,
     ) -> Response {
-        if media.media_refs {
+        if media.media_refs && failure.role != WorkerRole::Single {
             let snapshot = self.worker_registry.get_routing_snapshot(model_id);
             let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
             let pool = match failure.role {
@@ -7321,6 +7336,59 @@ mod tests {
         );
     }
 
+    /// A pair that the policy spec in force binds no pair plan for is
+    /// refused as that for a request with media references too, whatever
+    /// its pools process: the verdict is the pair's whole, judged from no
+    /// pool. Here the one decode advertises no reference processing. Read
+    /// as the decode's role, the request was answered that no worker
+    /// processes its references, which an unbound plan is not about.
+    #[test]
+    fn an_unbound_pair_with_media_references_is_refused_as_unbound() {
+        use smg_grand_central::document::{AppliedSpec, PolicySpec};
+
+        use crate::routers::common::placement::tests::engine_on;
+
+        let model_id = "test-model-media-refs-unbound";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, advertise_refs) in [
+            ("grpc://127.0.0.1:8750", WorkerType::Prefill, true),
+            ("grpc://127.0.0.1:8751", WorkerType::Decode, false),
+        ] {
+            worker_registry
+                .register(vllm_grpc_worker(url, model_id, worker_type, advertise_refs))
+                .unwrap();
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        // A stock preset binds single requests alone.
+        let document = PolicySpec::preset("round_robin").expect("a stock preset");
+        let spec = AppliedSpec::validate(&document);
+        engine_on(&policies, spec.expect("a valid document"));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(policies),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+        let response = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs {
+                    candidate_filter: Some(ACCEPTS_MEDIA_REFS),
+                    ..Default::default()
+                },
+                None,
+                None,
+                PairDemands::default(),
+            )
+            .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
+            .expect_err("no pair plan binds the model");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            placement::NO_PLAN_BOUND_CODE
+        );
+    }
+
     /// A prefill/decode pool whose reference-processing workers the plan's
     /// pipeline pin excludes answers the request's own 400, the verdict the
     /// regular path gives, not a retryable 503 over healthy workers: an
@@ -9188,6 +9256,89 @@ mod tests {
         );
     }
 
+    /// A pair of a model that the policy spec in force binds no pair plan
+    /// for is refused by the stage's entry point with a 501 under the
+    /// cause's own code, with no retry hint, in words that name the cause,
+    /// on a fleet whose every worker is open. It is marked as reported and
+    /// written at WARN within the allowance, never at ERROR. Judged from the
+    /// pools, the client read that every worker was unavailable and was told
+    /// to come back in a second.
+    #[tokio::test]
+    async fn a_pair_the_spec_binds_no_plan_for_is_refused_501_and_written_within_the_allowance() {
+        use smg_grand_central::document::{AppliedSpec, PolicySpec};
+
+        use crate::routers::common::placement::tests::engine_on;
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
+        let registry = Arc::new(WorkerRegistry::new());
+        register_pd_workers(&registry, "test-model", 1);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        // A stock preset binds single requests alone.
+        let document = PolicySpec::preset("round_robin").expect("a stock preset");
+        let spec = AppliedSpec::validate(&document);
+        engine_on(&policies, spec.expect("a valid document"));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(policies),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        let refused = stage
+            .execute(&mut ctx)
+            .await
+            .expect_err("no pair plan binds the model");
+        assert_eq!(refused.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            placement::NO_PLAN_BOUND_CODE
+        );
+        assert_eq!(retry_after(&refused), None);
+        assert!(!is_retryable_response(&refused));
+        assert_eq!(
+            placement::refusal_reason(&refused),
+            Some("the policy spec in force binds no pair plan for model 'test-model'")
+        );
+        assert!(
+            refused.extensions().get::<ReportedRefusal>().is_some(),
+            "the refusal is marked as reported, so the pipeline and the access log keep quiet"
+        );
+
+        let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();
+        let throttle = KeyedLogThrottle::new(
+            placement::REFUSAL_LINES_PER_SECOND,
+            Duration::from_secs(60),
+            placement::REFUSAL_LOG_MODELS,
+        );
+        refusal_lines.store(0, Ordering::Relaxed);
+        for _ in 0..5 * allowance {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            let refused = stage
+                .select(&mut ctx)
+                .await
+                .expect_err("no pair plan binds the model");
+            stage.report_refusal_with(
+                &throttle,
+                "WorkerSelectionStage::execute",
+                None,
+                "test-model",
+                refused,
+            );
+        }
+        assert_eq!(refusal_lines.load(Ordering::Relaxed), allowance);
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "a refusal is not an error of the gateway"
+        );
+    }
+
     /// A model nobody serves is refused with the `model_not_found` 404,
     /// marked as reported for the loggers downstream, and written at WARN
     /// within the per-second allowance, never at ERROR: a client retrying a
@@ -9347,6 +9498,20 @@ mod tests {
         assert_eq!(
             placement::refusal_reason(&declined),
             Some("Policy cache_aware failed to select a prefill worker")
+        );
+
+        // Under Grand Central a decline may name no side: the line then
+        // says the pair.
+        let whole = stage.pair_failure(
+            "test-model",
+            PairFailure {
+                role: WorkerRole::Single,
+                verdict: PlacementFailure::PolicyDeclined("a-stage"),
+            },
+        );
+        assert_eq!(
+            placement::refusal_reason(&whole),
+            Some("Policy a-stage failed to select a pair")
         );
 
         let at_capacity = stage.pair_failure(

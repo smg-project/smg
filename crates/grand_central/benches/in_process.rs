@@ -402,6 +402,14 @@ const CELLS: &[Cell] = &[
         request: pair::request,
         ..Cell::PLAIN
     },
+    // Every prefill over its thresholds beside open decodes: the prefill
+    // side's run sheds, and the pair's default makes each pair.
+    Cell {
+        name: pair::DEFAULT,
+        document: || pair::of("round_robin"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "pair_least_load",
         document: || pair::of("least_load"),

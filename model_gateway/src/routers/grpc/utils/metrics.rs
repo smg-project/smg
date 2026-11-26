@@ -15,6 +15,7 @@ use crate::{
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
             placement::{
                 MODEL_NOT_FOUND_CODE, NO_AVAILABLE_WORKERS_CODE, NO_MEDIA_REF_CAPABLE_WORKER_CODE,
+                NO_PLAN_BOUND_CODE,
             },
         },
         error::extract_error_code_from_response,
@@ -63,7 +64,9 @@ pub(crate) fn error_type_from_status(status: StatusCode) -> &'static str {
 /// are left out on purpose: they are configuration and capability
 /// mismatches that no wait clears (no `Retry-After`), not the capacity
 /// refusals this label names, and they keep their class by status until
-/// one of their own is decided.
+/// one of their own is decided. So does the 501 for a request of a kind the
+/// policy spec in force binds no plan for (`no_policy_plan_for_model`): a
+/// verdict on the spec that no wait clears either.
 const GATEWAY_REFUSAL_CODES: &[&str] = &[
     NO_AVAILABLE_WORKERS_CODE,
     WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
@@ -130,7 +133,8 @@ pub(crate) fn mark_error_reason(response: &mut Response, reason: &'static str) {
 /// for it), the overload shed and a prefill admission queue that is full,
 /// the bound of the selection queue or of the prefill admission queue, a
 /// model nobody serves, the tenant limit, a constraint the engine could not
-/// continue under, a pool with no capable worker, an upstream call that
+/// continue under, a pool with no capable worker or a policy spec with no
+/// plan of the request's kind, an upstream call that
 /// timed out or whose connection failed before or under the call, a worker's
 /// answer that could not be read or decoded. A response with no gateway code
 /// is a worker's answer relayed as it came, classed by its status; one with
@@ -159,8 +163,13 @@ pub(crate) fn error_reason_for_response(response: &Response) -> &'static str {
         MODEL_NOT_FOUND_CODE => REASON_MODEL_NOT_FOUND,
         RATE_LIMIT_ERROR_CODE => REASON_RATE_LIMITED,
         CONSTRAINT_FAILED_CODE => REASON_CONSTRAINT_FAILED,
-        // The disaggregated routers' pair verdict (`no_compatible_pd_pair`).
-        NO_MEDIA_REF_CAPABLE_WORKER_CODE | "no_compatible_pd_pair" => REASON_NO_CAPABLE_WORKER,
+        // The disaggregated routers' pair verdict (`no_compatible_pd_pair`),
+        // and a policy spec that binds no plan of the request's kind: a
+        // configuration verdict like the two before it, and no failure of
+        // the gateway's own processing.
+        NO_MEDIA_REF_CAPABLE_WORKER_CODE | "no_compatible_pd_pair" | NO_PLAN_BOUND_CODE => {
+            REASON_NO_CAPABLE_WORKER
+        }
         REQUEST_TIMEOUT_CODE => REASON_DEADLINE,
         // The HTTP router's codes for a worker connection that failed before
         // the call (a connect fault), under it (a reset or a close before the
@@ -380,6 +389,13 @@ mod tests {
             ),
             (
                 error::service_unavailable("no_compatible_pd_pair", "no pair"),
+                REASON_NO_CAPABLE_WORKER,
+            ),
+            // A spec that binds no plan of the request's kind is a
+            // configuration verdict too: its 501 alone would read as the
+            // gateway's own processing.
+            (
+                placement::no_plan_bound("m", "pair"),
                 REASON_NO_CAPABLE_WORKER,
             ),
             (

@@ -47,15 +47,16 @@
 //! write. A standby's applier writes its leader's rows through the holder
 //! too ([`Objects::follow_at`]).
 //!
-//! **A status's write asks the word of its call's term, last under the
-//! membership lock.** A connect signal and a drain hand the holder the
-//! door's own word: the log leads the term the call was admitted under
-//! still ([`Log::leads`]). The holder asks it under the object's lock, and
-//! the store asks it again under its membership lock. A call that waited at
-//! either through the end of its term writes no status and tells the
-//! journal nothing. The store's ask is the last one. A term that ends
-//! behind that ask still writes the status. The journal then stamps it with
-//! the term its store leads at that instant, or with none where it follows.
+//! **A status is written under its call's term, or not at all.** A connect
+//! signal and a drain hand the holder the door's own word: the log leads
+//! the term the call was admitted under still ([`Log::leads`]). The holder
+//! asks it under the object's lock, and the store asks it again under its
+//! membership lock. A call that waited at either through the end of its
+//! term writes no status and tells the journal nothing. The term goes on
+//! with the word. The store tells its journal first, and the log compares
+//! the term in the take of its lock that gives the event its place. Where
+//! the log has left the term, it takes no event and the store moves
+//! nothing: no term ends between that ask and the stamp.
 //! A drain that wrote nothing asks the term once more. Where it ended, the
 //! call answers that its store does not lead the term, as a registration
 //! that can mint no life does ([`MembershipCalls::next_life`]), and
@@ -132,8 +133,8 @@ use crate::{
     },
     store::{
         membership::{self, life, FactPastBound, WorkerFactsChange},
-        MembershipChange, MemoryStore, Position, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        LeadWord, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts, WorkerPatch,
+        WorkerRow, WorkerStatus, WorkersStore,
     },
     worker_host::{
         awaits_connect, dial_address, drain, lay, lay_one, lay_ready, refresh, stated, stating,
@@ -253,24 +254,35 @@ impl MembershipCalls {
     /// The door's connect signal for a row whose checks are off, in its
     /// turn: written on the row's worker object, and the store is told
     /// ([`Objects::connect_row_under`]). It goes with the word of `term`,
-    /// the term the call was admitted under. A call whose term ended while
-    /// the write waited for a lock writes nothing. The word is asked last
-    /// under the membership lock, and the module's doc says what stays
-    /// open behind that ask.
+    /// the term the call was admitted under, and with the term itself. A
+    /// call whose term ended while the write waited for a lock writes
+    /// nothing. The store's journal takes the status only while the log
+    /// leads `term`, asked where the event takes its place.
     fn connect_row(&self, id: WorkerId, revision: u64, term: u64) {
         let leads = || self.log.leads(term).is_ok();
+        let word = Self::word(&leads, term);
         self.objects
-            .connect_row_under(&self.store, id, revision, &leads);
+            .connect_row_under(&self.store, id, revision, word);
     }
 
     /// The door's drain of a row, as [`Self::connect_row`] writes a
-    /// status, with the word of `term`. Whether the row moved: a drain
-    /// whose term ended by the last ask moves nothing, as one whose row
-    /// left the revision.
+    /// status, with the word of `term` and the term. Whether the row
+    /// moved: a drain whose term ended by its event's place moves nothing,
+    /// as one whose row left the revision.
     fn drain_row(&self, id: WorkerId, revision: u64, term: u64) -> bool {
         let leads = || self.log.leads(term).is_ok();
+        let word = Self::word(&leads, term);
         self.objects
-            .drain_row_under(&self.store, id, revision, &leads)
+            .drain_row_under(&self.store, id, revision, word)
+    }
+
+    /// The door's word for a status it writes under `term`: `leads`, its
+    /// read of the log, and the term for the store's journal.
+    fn word(leads: &dyn Fn() -> bool, term: u64) -> LeadWord<'_> {
+        LeadWord {
+            leads,
+            term: Some(term),
+        }
     }
 
     /// The door's read of the row under `id`, in its turn: the record read

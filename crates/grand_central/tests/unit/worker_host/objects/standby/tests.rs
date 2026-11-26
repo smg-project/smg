@@ -273,8 +273,8 @@ fn an_event_the_store_does_not_take_lays_nothing() {
 }
 
 /// A removal the store does not take: the object left the registry
-/// ahead of the store's word, so the row that stands is settled again
-/// and has an object when the event's write returns.
+/// ahead of the store's word, so the row is laid again as it was read
+/// off the object, and has an object when the event's write returns.
 #[test]
 fn a_removal_the_store_does_not_take_leaves_the_row_an_object() {
     let (leader, standby) = (Replica::new(), Replica::new());

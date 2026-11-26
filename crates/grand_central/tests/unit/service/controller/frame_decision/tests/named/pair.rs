@@ -26,8 +26,8 @@ use super::{
 use crate::{
     document::spec::{OverloadSpec, PolicySpec},
     engine::{
-        decision::{Decision, ShedReason},
-        framework::{Filter, PairSide},
+        decision::{Decision, PairSide, ShedReason},
+        framework::Filter,
         view::{Candidate, Constraints, RequestFacts, Role, WireModes, WorkerId},
     },
     service::{
@@ -739,4 +739,169 @@ fn a_named_pair_its_decision_refuses_is_shed_under_target_worker() {
         assert_eq!(reached(&asked(0)), Ok((ahead[0], behind[0])));
         assert_eq!(reached(&asked(2)), Ok((ahead[2], behind[2])));
     }
+}
+
+/// The ready members of `role`'s side, each beside its name. `names` says
+/// what each states for a request's hard demands: its name, its runtime
+/// and its way to decide a constraint. Its last part is the one gateway
+/// that dials it, where one alone does.
+fn stating<const N: usize>(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    role: Role,
+    names: [(&'static str, u32, u8, Option<GatewayId>); N],
+) -> [(&'static str, WorkerId); N] {
+    use super::super::stating_member;
+    use crate::engine::DemandFacts;
+
+    names.map(|(name, runtime, decoding, only)| {
+        let stated = DemandFacts {
+            runtime,
+            decoding,
+            ..DemandFacts::default()
+        };
+        let id = stating_member(store, objects, name, role, only, stated);
+        (name, id)
+    })
+}
+
+/// `order` but the worker `out`: a side's workers that a demand keeps, in
+/// the order a number counts in.
+fn but(order: &[WorkerId], out: WorkerId) -> Vec<WorkerId> {
+    order.iter().copied().filter(|&id| id != out).collect()
+}
+
+/// The numbers count among the workers that meet the frame's hard demands,
+/// each side by its role's part, as the one call counts them in a host's
+/// own process. The asking gateway dials three workers a side: one states
+/// the runtime 1 and the others the runtime 2. One decode alone states a
+/// way to decide a constraint. Another gateway alone dials a fourth worker
+/// a side, on the runtime 2: it takes no number.
+///
+/// A frame that stays on a runtime counts the workers that state it on
+/// each side, and a number past them sheds the pair under `target-worker`.
+/// A prefill is not held to the way, so that demand leaves the prefills'
+/// count as it is: the one decode that states it is each prefill's one
+/// partner. Where a demand leaves a side nobody there is none to count,
+/// and the pair is shed under the demand's own stage, as any pair is.
+///
+/// The one call:
+/// `the_numbers_count_among_the_workers_that_meet_the_requests_demands`
+/// (`N`).
+#[test]
+fn the_numbers_count_among_the_workers_that_meet_the_frames_demands() {
+    use super::super::demanding;
+
+    let store = rings();
+    let objects = holder(&store);
+    let theirs = Some(OTHER);
+    let prefills = [
+        ("p0", 1, 0, None),
+        ("p1", 2, 0, None),
+        ("p2", 2, 0, None),
+        ("p3", 2, 0, theirs),
+    ];
+    let prefills = stating(&store, &objects, Role::Prefill, prefills);
+    let decodes = [
+        ("d0", 1, 0, None),
+        ("d1", 2, 0, None),
+        ("d2", 2, 3, None),
+        ("d3", 2, 0, theirs),
+    ];
+    let decodes = stating(&store, &objects, Role::Decode, decodes);
+    // Each side's workers the asking gateway dials, in the order a number
+    // counts in.
+    let ahead = list_order(&objects, Role::Prefill, &prefills);
+    let ahead = but(&ahead, prefills[3].1);
+    let behind = list_order(&objects, Role::Decode, &decodes);
+    let behind = but(&behind, decodes[3].1);
+    let now = Instant::now();
+    let asked = |number: u32, demands: proto::Demands| {
+        let frame = demanding(pair_frame(1, Some(number)), demands);
+        reached(&served_pair(&store, &objects, frame, GATEWAY, now))
+    };
+    let none = proto::Demands::default();
+    for (number, pair) in numbered(&ahead, &behind) {
+        assert_eq!(asked(number, none), Ok(pair), "no demand, {number}");
+    }
+
+    // A pinned pair's wire: two workers a side state its runtime.
+    let wire = proto::Demands { runtime: 2, ..none };
+    let (on_ahead, on_behind) = (but(&ahead, prefills[0].1), but(&behind, decodes[0].1));
+    for (number, pair) in numbered(&on_ahead, &on_behind) {
+        assert_eq!(asked(number, wire), Ok(pair), "the runtime 2, {number}");
+    }
+    assert_eq!(asked(2, wire), Err(MISSED), "two a side");
+    let other = proto::Demands { runtime: 1, ..none };
+    let lone = (prefills[0].1, decodes[0].1);
+    assert_eq!(asked(0, other), Ok(lone), "the other runtime's one");
+    assert_eq!(asked(1, other), Err(MISSED));
+
+    // The prefills are not held to the way: all three are counted, and the
+    // one decode that states it is the reached prefill's one partner.
+    let decided = proto::Demands {
+        decoding: 3,
+        ..none
+    };
+    let one = (ahead[0], decodes[2].1);
+    assert_eq!(asked(0, decided), Ok(one), "any prefill, the one decode");
+    assert_eq!(asked(1, decided), Err(MISSED), "one decode");
+
+    // No decode states the way 4: there is no partner to count a prefill
+    // by, and the pair is shed as one that names no worker is.
+    let unmet = proto::Demands {
+        decoding: 4,
+        ..none
+    };
+    let shed = Some((ShedReason::NoEndpoints, "decoding"));
+    assert_eq!(asked(0, unmet), Err(shed));
+}
+
+/// Where the decode's side alone reads the number, the decodes' count
+/// passes over a decode that fails what a decode is held to of the frame's
+/// hard demands. The count of a pair named on both sides does the same.
+///
+/// The first decode states the runtime 1 and every other worker the
+/// runtime 2. A frame that stays on the runtime 2 counts two decodes,
+/// behind whichever prefill the decision picks. A number past them sheds
+/// the pair under `target-worker`, and a frame that states no demand
+/// counts all three.
+///
+/// The one call:
+/// `a_decode_named_alone_takes_no_number_behind_a_mask_or_a_demand` (`D`).
+#[test]
+fn a_decode_named_alone_takes_no_number_behind_a_demand() {
+    use super::super::demanding;
+
+    let store = pair_store("round_robin", RING);
+    let objects = holder(&store);
+    let prefills = [("p0", 2, 0, None), ("p1", 2, 0, None)];
+    let prefills = stating(&store, &objects, Role::Prefill, prefills);
+    let decodes = [("d0", 1, 0, None), ("d1", 2, 0, None), ("d2", 2, 0, None)];
+    let decodes = stating(&store, &objects, Role::Decode, decodes);
+    let behind = list_order(&objects, Role::Decode, &decodes);
+    let now = Instant::now();
+    // The prefills and the decodes that sixteen frames are answered.
+    let turns = |number: u32, demands: proto::Demands| {
+        let named = (1..=16).map(|n| {
+            let frame = keyed(pair_frame(n, Some(number)), u64::from(n));
+            let frame = demanding(frame, demands);
+            reached(&served_pair(&store, &objects, frame, GATEWAY, now))
+        });
+        let named: Result<Vec<(WorkerId, WorkerId)>, _> = named.collect();
+        named.map(|pairs| pairs.into_iter().unzip::<_, _, BTreeSet<_>, BTreeSet<_>>())
+    };
+    let none = proto::Demands::default();
+    for (number, &decode) in (0..).zip(&behind) {
+        let (ahead, named) = turns(number, none).expect("sixteen picks");
+        assert_eq!(named, BTreeSet::from([decode]), "no demand, {number}");
+        assert_eq!(ahead.len(), prefills.len(), "the prefills' turns");
+    }
+    let wire = proto::Demands { runtime: 2, ..none };
+    for (number, &decode) in (0..).zip(&but(&behind, decodes[0].1)) {
+        let (ahead, named) = turns(number, wire).expect("sixteen picks");
+        assert_eq!(named, BTreeSet::from([decode]), "the runtime 2, {number}");
+        assert_eq!(ahead.len(), prefills.len(), "the prefills' turns");
+    }
+    assert_eq!(turns(2, wire), Err(MISSED), "two decodes meet the demand");
 }

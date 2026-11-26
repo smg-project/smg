@@ -21,18 +21,22 @@
 //! the object leaves the registry, then the store is told. A build cannot
 //! fail, so the store is never told a change whose object was not built.
 //!
-//! A write the store does not take answers `None`: another writer moved
-//! the row under the holder's turn. The store tests that under its own
-//! lock, by the revision the holder read: a door and a standby's applier
-//! write in the holder's turn, and a caller of the store's own writes
-//! takes none.
-//! The holder then reads the row that stands under the write's key in the
-//! store, and that row alone, before it answers: the registry holds what
-//! that writer left under the key. A removal has taken its object out by
-//! then, and the row that writer left gets an object anew.
-//! A change the store took and the registry did not get, because the
-//! writer's thread ended between the two, is laid by that read where the
-//! store refuses the key's next registration.
+//! A write the store does not take answers `None` and leaves the objects
+//! as they stood. The object built for it is dropped. A removal's object
+//! left the registry ahead of the store's word: it is laid again from the
+//! row read off it. A refused write reads no row of the store.
+//!
+//! The store takes a change that fits its table, over a row that stands
+//! at the revision the holder read. It tests both under its own lock.
+//! Every product writer of a row holds the holder's turn: a door, a
+//! standby's applier and a watcher's. So the store refuses a change where
+//! its table was written around the holder, through an entry of the
+//! store's own ([`MemoryStore::follow`]). The row and the object then
+//! stand apart until a cut is laid whole ([`mod@super::standby`]).
+//!
+//! A writer's thread that ends between its two writes, the store's and
+//! the registry's, leaves a row and its object apart too. No line of the
+//! holder between the two returns early or unwraps a result.
 //!
 //! A patch tells the store the whole row read back from the object, where
 //! the store's own patch wrote the patched facts alone. The two are one
@@ -55,10 +59,7 @@ use smg_worker::registry::Generation;
 use super::Objects;
 use crate::{
     engine::view::WorkerId,
-    store::{
-        MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkersStore,
-    },
+    store::{MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow},
 };
 
 impl<G: Generation> Objects<G> {
@@ -137,9 +138,9 @@ impl<G: Generation> Objects<G> {
     /// The decided `change` and the `row` it leaves, over a row read back
     /// at the revision `seen` in the holder's turn: the row's object is
     /// built, the store is told, and the object is put in the registry. A
-    /// change the store does not take builds an object nobody sees
-    /// ([`Self::moved`]). `left` is the row a key's next life takes out,
-    /// as it was read back: the store tells the log from it.
+    /// change the store does not take builds an object nobody sees, and
+    /// nothing is laid. `left` is the row a key's next life takes out, as
+    /// it was read back: the store tells the log from it.
     fn lay_decided(
         &self,
         store: &MemoryStore,
@@ -150,7 +151,7 @@ impl<G: Generation> Objects<G> {
     ) -> Option<MembershipChange> {
         let built = self.build(row);
         if !store.follow_objects(change, Some(row.clone()), seen, left) {
-            return self.moved(store, &row.facts.key, change);
+            return None;
         }
         self.put(store, row, built);
         // The old life left with this write: the keeper forgets its row.
@@ -171,8 +172,8 @@ impl<G: Generation> Objects<G> {
 
     /// The decided removal of `row`, read back in the holder's turn: its
     /// object leaves the registry, then the store is told. Where the store
-    /// does not take it, the row that stands gets an object anew
-    /// ([`Self::moved`]): a new object under a new id in the registry. The
+    /// does not take it, the row is laid again as it was read:
+    /// a new object under a new id in the registry. The
     /// leases the store counts on the row are stated on it, and what the
     /// old object alone held is not. The store is handed `row`, and tells
     /// the log from it.
@@ -180,65 +181,11 @@ impl<G: Generation> Objects<G> {
         self.end(row.id);
         let change = MembershipChange::Removed { id: row.id };
         if !store.follow_objects(change, None, Some(row.revision), Some(&mut *row)) {
-            return self.moved(store, &row.facts.key, change);
+            self.lay(store, row);
+            return None;
         }
         self.forget_one(self.keeper_clock(), row.id);
         Some(change)
-    }
-
-    /// The store did not take a write of the row under `key`: a writer that
-    /// took no turn moved the row, or the registry never got a change the
-    /// store took. The write's own record is read, and no other: the row
-    /// that stands under the key in the store. A patch and a removal name
-    /// their row by its id, and a key holds one row: the read finds the
-    /// row under that id where it stands still, and the key's next life
-    /// where it left. The row is laid unless its object was built from it,
-    /// and an object of another life of the key gives way to it
-    /// ([`Self::put`]). A row that left and came back under its id is
-    /// another life too, made by another or admitted at another time: its
-    /// old object is ended first, so
-    /// the new one takes none of its running state. Where no row stands,
-    /// the key's object goes. So the
-    /// registry holds what stands under the key when the write answers. No
-    /// other read of the store's rows is left in a write.
-    ///
-    /// `change` is the change the store refused. The keeper forgets the
-    /// row it was decided over, where the read found that row gone, and
-    /// asks about no other: the read saw one record.
-    fn moved(
-        &self,
-        store: &MemoryStore,
-        key: &str,
-        change: MembershipChange,
-    ) -> Option<MembershipChange> {
-        let read = self.keeper_clock();
-        match store.by_key(key) {
-            Some(row) => {
-                // Another life under the id the object stands for.
-                if self.remade(&row) {
-                    self.end(row.id);
-                }
-                if !self.stands(&row) {
-                    self.lay(store, &row);
-                }
-            }
-            None => {
-                if let Some(stood) = self.row_under(key) {
-                    self.end(stood.id);
-                }
-            }
-        }
-        let over = match change {
-            MembershipChange::Replaced { old, .. } => Some(old),
-            MembershipChange::Relabelled { id }
-            | MembershipChange::Resized { id }
-            | MembershipChange::Removed { id } => Some(id),
-            MembershipChange::Registered { .. } | MembershipChange::StatusChanged { .. } => None,
-        };
-        if let Some(over) = over {
-            self.forget_one(read, over);
-        }
-        None
     }
 }
 

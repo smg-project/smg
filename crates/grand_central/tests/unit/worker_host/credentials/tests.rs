@@ -49,7 +49,7 @@ fn builds_with(
     credentials.of(address, row).as_deref() == credential
 }
 
-/// A forgetting whose read of the store begins now and finds no row.
+/// A forgetting whose pass begins now and finds no row.
 fn forget(credentials: &Credentials) {
     credentials.forget_left(credentials.taken(), |_| false);
 }

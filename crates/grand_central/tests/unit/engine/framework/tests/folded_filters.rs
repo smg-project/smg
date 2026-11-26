@@ -47,7 +47,7 @@ fn tested_rows() -> (Vec<Candidate>, Vec<u32>) {
 
 #[test]
 fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
-    use crate::stages::filters::filters_of;
+    use crate::stages::filters::tests::filters_of;
     // A request names one row tried, and the host one excluded.
     let (pool, mask) = tested_rows();
     let (mut drew, mut masked) = (0u32, 0u32);
@@ -116,7 +116,7 @@ fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
 /// lifted.
 #[test]
 fn the_namings_test_is_the_draws_own() {
-    use crate::stages::filters::filters_of;
+    use crate::stages::filters::tests::filters_of;
     let (pool, mask) = tested_rows();
     let mut refused = 0u32;
     for set in 0..32u8 {
@@ -161,7 +161,7 @@ fn the_namings_test_is_the_draws_own() {
 /// mark, whatever the request carries.
 #[test]
 fn the_namings_test_is_none_where_the_pass_alone_can_say() {
-    use crate::stages::filters::filters_of;
+    use crate::stages::filters::tests::filters_of;
     /// A filter that is shown the whole view: the default word.
     #[derive(Debug)]
     struct Whole;
@@ -234,7 +234,7 @@ fn the_namings_test_is_none_where_the_pass_alone_can_say() {
 
 #[test]
 fn a_whole_pass_by_the_folded_test_decides_as_one_asked_a_stage_at_a_time() {
-    use crate::stages::filters::filters_of;
+    use crate::stages::filters::tests::filters_of;
     // A row's shape: ready, or refused by one of four bits.
     fn shaped(rows: u32, shape: impl Fn(u32) -> u32) -> Vec<Candidate> {
         (0..rows)
@@ -368,7 +368,7 @@ fn has_room_with_a_rule_folds_into_nothing_and_still_draws_first() {
 /// the fold holds none of them.
 #[test]
 fn a_whole_pass_over_an_encode_items_set_is_asked_a_stage_at_a_time() {
-    use crate::stages::filters::filters_of;
+    use crate::stages::filters::tests::filters_of;
     let engine = engine_of(filters_of(0b11111), Box::new(Passthrough));
     assert!(engine.row_tests[0].is_some(), "the profile folds");
     // Two rows every filter keeps. The item's rule refuses the first.
@@ -488,7 +488,7 @@ fn a_whole_pass_over_an_encode_items_set_is_asked_a_stage_at_a_time() {
 /// decision. The all-vetoed rule's pick is the fold's often.
 #[test]
 fn a_folded_engine_decides_as_a_staged_one_on_scratches_that_are_kept() {
-    use crate::stages::filters::filters_of;
+    use crate::stages::filters::tests::filters_of;
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     let mut next = |n: u64| {
         state ^= state << 13;

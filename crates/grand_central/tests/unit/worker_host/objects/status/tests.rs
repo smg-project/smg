@@ -15,8 +15,8 @@ use super::{
 use crate::{
     service::replication::{Event, Log},
     store::{
-        identity, HealthPolicy, Journal, MembershipChange, Registrant, WorkerFacts, WorkerStatus,
-        WorkersStore,
+        identity, HealthPolicy, Journal, LeadWord, MembershipChange, Registrant, WorkerFacts,
+        WorkerStatus, WorkersStore,
     },
     worker_host::Members,
 };
@@ -201,15 +201,15 @@ fn a_connect_signal_and_a_drain_write_nothing_once_their_writers_word_turns() {
     let (store, objects, row) = (&leader.store, &leader.objects, leader.row);
     let epoch = store.epoch();
     for asks in [0, 1] {
-        objects.connect_row_under(store, row, 1, &holds_for(asks));
-        let drained = objects.drain_row_under(store, row, 1, &holds_for(asks));
+        objects.connect_row_under(store, row, 1, LeadWord::of(&holds_for(asks)));
+        let drained = objects.drain_row_under(store, row, 1, LeadWord::of(&holds_for(asks)));
         assert!(!drained, "a word that holds for {asks} asks");
         let stands = (leader.statuses(), store.epoch());
         assert_eq!(stands, (both(WorkerStatus::Pending), epoch), "{asks}");
     }
-    objects.connect_row_under(store, row, 1, &holds_for(2));
+    objects.connect_row_under(store, row, 1, LeadWord::of(&holds_for(2)));
     assert_eq!(leader.statuses(), both(WorkerStatus::Ready));
-    assert!(objects.drain_row_under(store, row, 1, &holds_for(2)));
+    assert!(objects.drain_row_under(store, row, 1, LeadWord::of(&holds_for(2))));
     assert_eq!(leader.statuses(), both(WorkerStatus::Draining));
     assert_eq!(store.epoch(), epoch + 2);
 }

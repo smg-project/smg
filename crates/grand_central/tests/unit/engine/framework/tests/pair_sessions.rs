@@ -1162,13 +1162,13 @@ fn a_decode_side_under_a_rule_leaves_the_prefills_buffer_to_the_prefill() {
 
 /// Beside a side its binding's sessions rule placed, the engine runs
 /// no shadow of that side, at the pair's decision and at a decode
-/// decided again: a shadow's run is put to no rule, and its bare
-/// profile beside a key's pin would say nothing true of the profile. A
-/// request with no key under the same rule is its profiles', and each
-/// run speaks. A side whose picker leaves the placement to the
-/// assignment is placed so with a key and with none: its shadow is run
-/// for no request, and the other side's is, by the live side's own
-/// profile.
+/// decided again: a shadow's run is put to no sessions rule and to no
+/// picker's assignment, and its bare profile beside a key's pin would
+/// say nothing true of the profile. A request with no key under the
+/// same rule is its profiles', and each run speaks. A side whose picker
+/// leaves the placement to the assignment is placed so with a key and
+/// with none: its shadow is run for no request, and the other side's
+/// is, by the live side's own profile.
 #[test]
 fn a_side_its_sessions_rule_placed_is_run_no_shadow() {
     let [prefills, decodes] = two_sides(&[0, 5], &[0, 5]);

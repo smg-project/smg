@@ -383,8 +383,10 @@ fn a_handle_reads_the_logs_head_and_the_writes_behind_a_mark() {
         ..handle
     };
     let write = |epoch| {
-        let id = WorkerId(epoch);
-        log.member(None, epoch, MembershipChange::Relabelled { id }, None, None);
+        let change = MembershipChange::Relabelled {
+            id: WorkerId(epoch),
+        };
+        assert!(log.member(None, None, epoch, change, None, None));
     };
     write(1);
     let mark = readiness.log_head();

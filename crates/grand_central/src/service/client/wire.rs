@@ -240,7 +240,9 @@ fn narrow<T: TryFrom<u32>>(number: u32, path: &'static str) -> Result<T, Unread>
 /// name, as the door in process names it, since a host answers by it: a
 /// window that holds too little is the request's fault and none of the
 /// pool's. Any other stage is named by the controller's own document, and
-/// reads `controller`.
+/// reads `controller`. `wires` and `vision` also name the controller's own
+/// shed of a gateway's reach and of an encode request's media, as they do
+/// in process: a frame that states no demand reads them by name too.
 fn emptied_by(stage: &str) -> &'static str {
     successors(Some(UnmetDemand::Runtime), |demand| behind(*demand))
         .map(UnmetDemand::stage)
