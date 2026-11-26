@@ -1949,11 +1949,13 @@ impl Waiting {
         });
     }
 
-    /// Writes on, the oldest first, until a turn meets a held lock. A write
-    /// that waited is a use at `tick`, the tick of the pick that writes it
-    /// on, and not at its own older one: it sets no block's last use back.
-    /// A pick named ahead of the write may hold the older tick: a pair's,
-    /// where a stage asked for the write's decision inside the pair's own.
+    /// Writes on, the oldest first, until a write that can stand meets a
+    /// held lock. A stale one ends at its turn, at a held lock too, and the
+    /// next is written on. A write that waited is a use at `tick`, the tick
+    /// of the pick that writes it on, and not at its own older one: it sets
+    /// no block's last use back. A pick named ahead of the write may hold
+    /// the older tick: a pair's, where a stage asked for the write's
+    /// decision inside the pair's own.
     fn write_on(&mut self, tick: u16) {
         while let Some(write) = self.writes.first_mut() {
             let (record, keys) = (&write.record, &write.keys);
@@ -1995,7 +1997,8 @@ fn shared(one: &[u64], other: &[u64]) -> usize {
 /// request of the thread's keys, on from the blocks the target holds, then
 /// the writes the thread keeps ([`Waiting`]). `held` says the naming found
 /// the target among the workers sent the request's deepest block. A request
-/// that meets the lock held is kept, with whatever waits behind it.
+/// that meets the lock held is kept, with whatever waits behind it. A stale
+/// one is not: it ends there, and what waits behind it is written on.
 fn write_behind(
     record: &Arc<PrefixRecord>,
     buffers: &mut Buffers,
