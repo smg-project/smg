@@ -208,6 +208,16 @@ Requests already reserved/in flight may finish when another fails; their exposur
 is already included in the cap. Each row records actual model/role/arm/domain/
 invocation/task/trial, status and known token usage, with no key/prompt.
 
+Within the guarded process, a failure publishes local STOP_PENDING before
+settlement or halt I/O. The final reservation commit and that stop publication
+use the same lock; an earlier SDK precheck cannot admit a later request after
+that local stop. Already admitted requests may still settle without refunds.
+The pinned batch runner's Ctrl+C hard-exit call is adapted only in that module:
+it attempts the ordered shared halt before preserving exit 130. Global
+`os._exit`, SDK files and legacy opt-out callers are unchanged. If both durable
+halt paths fail, cross-process stop remains NOT_ATTESTED and paid admission
+remains on hold; hard kill and host loss are not made safe by this adapter.
+
 CPU tests execute the pinned UserSimulator, NL evaluator, task wrapper and
 LiteLLM/OpenAI request chain through fake HTTP transports with socket connections
 forbidden and fixed offline keys. Synthetic two-model prices/bounds validate

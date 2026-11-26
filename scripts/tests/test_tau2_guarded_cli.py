@@ -1336,3 +1336,357 @@ else:
     assert before["audit"]["unknown"] == 1 and before["audit"]["pending"] == 0
     assert before["summary"]["calls"] == 1 and before["summary"]["halted"]
     assert guard.ledger.summary()["allocated_nusd"] == before["summary"]["allocated_nusd"]
+
+
+def test_same_process_stop_blocks_request_past_sdk_precheck(installed, monkeypatch):
+    import threading
+
+    import httpx
+
+    guard, sent = installed
+    checked, release = threading.Event(), threading.Event()
+    original_summary = guard.ledger.summary
+    original_finish, original_halt = guard.ledger.finish, guard.ledger.halt
+    errors = []
+
+    def summary():
+        value = original_summary()
+        if threading.current_thread().name == "prechecked-sibling":
+            checked.set()
+            assert release.wait(10)
+        return value
+
+    def unavailable(*args, **kwargs):
+        raise gc.BudgetError("offline both halt stores unavailable")
+
+    def handle(request):
+        sent.append(json.loads(request.content))
+        if threading.current_thread().name != "prechecked-sibling":
+            raise RuntimeError("offline lost paid response")
+        return response(request)
+
+    guard.transport_factory = lambda: httpx.MockTransport(handle)
+    monkeypatch.setattr(guard.ledger, "summary", summary)
+
+    def sibling():
+        token = gc.TASK.set(("sibling", 0))
+        try:
+            user_turn()
+        except Exception as error:
+            errors.append(error)
+        finally:
+            gc.TASK.reset(token)
+
+    thread = threading.Thread(target=sibling, name="prechecked-sibling")
+    thread.start()
+    try:
+        assert checked.wait(10)
+        monkeypatch.setattr(guard.ledger, "finish", unavailable)
+        monkeypatch.setattr(guard.ledger, "halt", unavailable)
+        token = gc.TASK.set(("lost", 0))
+        try:
+            with pytest.raises(Exception):
+                user_turn()
+        finally:
+            gc.TASK.reset(token)
+        assert guard.failed
+        monkeypatch.setattr(guard.ledger, "finish", original_finish)
+        monkeypatch.setattr(guard.ledger, "halt", original_halt)
+    finally:
+        release.set()
+        thread.join(15)
+    assert not thread.is_alive()
+    assert len(sent) == 1, "a prechecked sibling sent after the local failure"
+    assert len(errors) == 1
+    assert original_summary()["calls"] == 1
+
+
+def test_local_stop_published_before_blocked_settlement(installed, monkeypatch):
+    import threading
+
+    import httpx
+
+    guard, sent = installed
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+
+    def finish(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        raise gc.BudgetError("offline SQLite finish unavailable")
+
+    def unavailable():
+        raise gc.BudgetError("offline halt unavailable")
+
+    def lost(request):
+        sent.append(json.loads(request.content))
+        raise RuntimeError("offline response lost")
+
+    monkeypatch.setattr(guard.ledger, "finish", finish)
+    monkeypatch.setattr(guard.ledger, "halt", unavailable)
+    guard.transport_factory = lambda: httpx.MockTransport(lost)
+
+    def first():
+        token = gc.TASK.set(("blocked-finish", 0))
+        try:
+            user_turn()
+        except Exception as error:
+            errors.append(error)
+        finally:
+            gc.TASK.reset(token)
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    try:
+        assert entered.wait(10)
+        assert guard.failed, "local stop was postponed until after settlement IO"
+    finally:
+        release.set()
+        thread.join(15)
+    assert not thread.is_alive() and len(errors) == 1 and len(sent) == 1
+
+
+def test_previously_admitted_request_can_settle_after_local_stop(installed, monkeypatch):
+    import threading
+
+    import httpx
+
+    guard, sent = installed
+    admitted, release = threading.Event(), threading.Event()
+    results, errors = [], []
+
+    def waiting(request):
+        sent.append(json.loads(request.content))
+        admitted.set()  # The actual HTTP transport has already reserved.
+        assert release.wait(10)
+        return response(request)
+
+    guard.transport_factory = lambda: httpx.MockTransport(waiting)
+
+    def first():
+        token = gc.TASK.set(("already-admitted", 0))
+        try:
+            results.append(user_turn())
+        except Exception as error:
+            errors.append(error)
+        finally:
+            gc.TASK.reset(token)
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    try:
+        assert admitted.wait(10)
+        with pytest.raises(gc.BudgetError, match="offline peer failure"):
+            guard.deny("offline peer failure")
+    finally:
+        release.set()
+        thread.join(15)
+    assert not thread.is_alive() and not errors and len(results) == 1
+    audit = guard.ledger.audit()
+    assert audit["halted"] and audit["pending"] == audit["unknown"] == 0
+    assert len(audit["requests"]) == 1
+    assert audit["requests"][0]["state"] == "complete"
+    assert guard.ledger.summary()["allocated_nusd"] == 12000
+
+
+def test_pinned_batch_real_sigint_halts_before_hard_exit(configured, tmp_path):
+    policy, contexts, digest, ledger, _ = configured
+    witness = tmp_path / "pending-hardexit.json"
+    script = r"""
+import hashlib, json, os, signal, socket, sys, threading, types
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import guarded_cli as gc
+import httpx
+from tau2.runner import batch
+from tau2.user import user_simulator
+from tau2.data_model.message import AssistantMessage, SystemMessage
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("real socket forbidden")
+socket.socket.connect = forbidden
+socket.create_connection = forbidden
+os.environ["OPENAI_API_KEY"] = "offline-test-key"
+p, contexts = gc.load_policy(sys.argv[2], sys.argv[3], sys.argv[4])
+ledger = gc.Ledger(sys.argv[5], p, create=False)
+pending = threading.Event()
+original_exit = os._exit
+
+def transport(request):
+    Path(sys.argv[6]).write_text(json.dumps({
+        "pid": os.getpid(),
+        "start": Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19],
+        "audit": ledger.audit(),
+        "batch_sha256": hashlib.sha256(Path(batch.__file__).read_bytes()).hexdigest(),
+        "global_os_exit_unchanged": os._exit is original_exit,
+    }))
+    pending.set()
+    threading.Event().wait(30)
+    raise AssertionError("worker should end only with its owned process")
+
+guard = gc.Guard(ledger, contexts, arm="vllm", domain="retail",
+                 invocation_id="offline-hardexit", local_model="local-model",
+                 local_url="http://127.0.0.1:8000",
+                 transport_factory=lambda: httpx.MockTransport(transport))
+guard.install()
+assert os._exit is original_exit
+
+def unit(*args, **kwargs):
+    token = gc.TASK.set(("task0", 0))
+    try:
+        state = types.SimpleNamespace(messages=[],
+            system_messages=[SystemMessage(role="system", content="offline")],
+            flip_roles=lambda: [])
+        user = types.SimpleNamespace(llm="gpt-5.2", tools=[], llm_args={"temperature": 0.0})
+        return user_simulator.UserSimulator._generate_next_message(
+            user, AssistantMessage(role="assistant", content="offline"), state)
+    finally:
+        gc.TASK.reset(token)
+
+batch.run_unit = unit  # Only task/model execution; real batch loop/exit remain.
+task = types.SimpleNamespace(id="task0")
+result = types.SimpleNamespace(simulations=[], info=None)
+work = batch.WorkUnit(unit_id="offline/task0/t0", run_id="offline",
+                      task_id="task0", trial=0, seed=1)
+prep = types.SimpleNamespace(tasks=[task], simulation_results=result, done_runs=[],
+    user_voice_settings=None, user_persona_config=None, save_fn=None, units=[work])
+batch.prepare_batch = lambda *args, **kwargs: prep
+class Monitor:
+    def __init__(self, *args, **kwargs): pass
+    def set_results(self, *args): pass
+    def start(self): pass
+    def stop(self): pass
+batch.StatusMonitor = Monitor
+
+def interrupt():
+    if not pending.wait(15):
+        return
+    os.kill(os.getpid(), signal.SIGINT)
+
+signal.signal(signal.SIGINT, signal.default_int_handler)
+threading.Thread(target=interrupt, daemon=True).start()
+batch.run_tasks(types.SimpleNamespace(log_level="ERROR", num_trials=1,
+    workers=0, max_concurrency=1), [task])
+raise AssertionError("pinned hard exit did not happen")
+"""
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(Path(gc.__file__).parent),
+            str(policy),
+            str(contexts),
+            digest,
+            str(ledger.path),
+            str(witness),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=25,
+        env={**os.environ, "PYTHONPATH": "", "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert child.returncode == 130, child.stdout + child.stderr
+    observed = json.loads(witness.read_text())
+    assert observed["global_os_exit_unchanged"]
+    assert observed["batch_sha256"] == gc.TAU2_SHA["runner/batch.py"]
+    assert observed["audit"]["pending"] == 1
+    assert not Path(f"/proc/{observed['pid']}").exists()
+    sibling = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import guarded_cli as gc
+p, _ = gc.load_policy(sys.argv[2], sys.argv[3], sys.argv[4])
+l = gc.Ledger(sys.argv[5], p, create=False)
+try:
+ l.reserve("after-hard-exit", "smg", "openai/gpt-5.2", 10, 2,
+           num_retries=0, output_limit_verified=True)
+except gc.BudgetError as error:
+ print(json.dumps({"refused": True, "error": str(error)}))
+else:
+ print(json.dumps({"refused": False}))
+"""
+    peer = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            sibling,
+            str(Path(gc.__file__).parent),
+            str(policy),
+            str(contexts),
+            digest,
+            str(ledger.path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert peer.returncode == 0, peer.stderr
+    outcome = json.loads(peer.stdout)
+    (tmp_path / "hard-exit-result.json").write_text(
+        json.dumps(
+            {
+                "child_returncode": child.returncode,
+                "pending_witness": observed,
+                "sibling": outcome,
+                "final_audit": ledger.audit(),
+                "final_summary": ledger.summary(),
+            },
+            indent=2,
+        )
+    )
+    assert outcome["refused"], outcome
+    assert ledger.summary()["calls"] == 1
+    assert ledger.summary()["allocated_nusd"] == 12000
+    assert ledger.audit()["pending"] == 1
+
+
+def test_hard_exit_halt_failure_preserves_exit_and_unattested_reservation(
+    configured, monkeypatch, capsys
+):
+    from tau2.runner import batch
+
+    _, _, _, ledger, contexts = configured
+    exits = []
+    actual_exit = os._exit
+    fake_os = types.SimpleNamespace(_exit=exits.append)
+    monkeypatch.setattr(batch, "os", fake_os)
+    guard = gc.Guard(
+        ledger,
+        contexts,
+        arm="vllm",
+        domain="retail",
+        invocation_id="offline-failed-halt",
+        local_model="local-model",
+        local_url="http://127.0.0.1:8000",
+    )
+    guard.install()
+    try:
+        ledger.reserve(
+            "unresolved-at-exit",
+            "vllm",
+            "openai/gpt-5.2",
+            10,
+            2,
+            num_retries=0,
+            output_limit_verified=True,
+        )
+
+        def failed_halt():
+            raise gc.BudgetError("offline neither durable stop could be attested")
+
+        monkeypatch.setattr(ledger, "halt", failed_halt)
+        batch.os._exit(130)
+        assert exits == [130] and guard.failed
+        assert os._exit is actual_exit
+        assert "NOT_ATTESTED" in capsys.readouterr().err
+        assert ledger.audit()["pending"] == 1
+        assert not ledger.summary()["halted"]
+        assert ledger.summary()["allocated_nusd"] == 12000
+    finally:
+        guard.close()
+    assert batch.os is fake_os
