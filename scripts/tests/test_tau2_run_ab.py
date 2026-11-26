@@ -3,6 +3,7 @@ import importlib.util
 import json
 import random
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -435,6 +436,12 @@ def _attach_provenance(tmp_path, arm, rows, configured_seed=300):
         exit_code=0,
         results_path=str(result),
         results_sha256=hashlib.sha256(result.read_bytes()).hexdigest(),
+    )
+    arm.budget = arm.budget or run_ab.prepare_budget()
+    ledger = run_ab.budget_guard.read_descriptor(arm.budget)
+    ledger.begin_invocation(identity, arm.name, "retail")
+    ledger.complete_invocation(
+        identity, arm.name, "retail", arm.invocations["retail"]["results_sha256"]
     )
 
 
@@ -1050,6 +1057,7 @@ def test_concurrent_budget_errors_are_hard_gates_with_allow_incomplete(
 ):
     descriptor = run_ab.prepare_budget()
     ledger = run_ab.budget_guard.read_descriptor(descriptor)
+    both_completed = threading.Barrier(2, timeout=5)
 
     def score(arm, **kwargs):
         assert kwargs["budget_descriptor"] == descriptor
@@ -1060,6 +1068,8 @@ def test_concurrent_budget_errors_are_hard_gates_with_allow_incomplete(
         _attach_provenance(
             tmp_path, arm, _rows(reward=1.0 if regression and arm.name == "vllm" else 0.0)
         )
+        # This test injects a final-gate fault after both real completions.
+        both_completed.wait()
         if arm.name == "smg":
             if state == "halted":
                 ledger.halt()
@@ -1100,7 +1110,9 @@ def test_concurrent_budget_errors_are_hard_gates_with_allow_incomplete(
     )
     assert run_ab.main() == run_ab.EXIT_INCOMPLETE
     payload = json.loads(report.read_text())
-    assert set(payload["incomplete"]) == {"budget"}
+    assert set(payload["incomplete"]) == (
+        {"budget", "vllm", "smg"} if state == "deleted" else {"budget"}
+    )
     assert payload["overall"]["passk"]["delta"] == (-1.0 if regression else 0.0)
     if state == "deleted":
         assert not Path(descriptor["ledger_path"]).exists()
@@ -1259,6 +1271,7 @@ def test_infra_placeholder_does_not_bypass_existing_paid_or_process_gate(
     if gate in ("pending", "unknown"):
         proof = types.SimpleNamespace(
             summary=ledger.summary,
+            begin_invocation=ledger.begin_invocation,
             audit=lambda invocation: {
                 "pending": int(gate == "pending"),
                 "unknown": int(gate == "unknown"),
@@ -1587,3 +1600,100 @@ def test_bare_tau2_selects_its_path_environment_interpreter(monkeypatch, tmp_pat
         tau2="tau2",
     )
     assert commands[0][0] == "/qualified/bin/python"
+
+
+def test_saved_arms_cannot_relabel_one_independent_completion(tmp_path):
+    a, b = (_provenant_arm(tmp_path, name) for name in ("vllm", "smg"))
+    b.invocations["retail"] = dict(a.invocations["retail"], arm="smg")
+    b.scores = dict(a.scores)
+    output = tmp_path / "report.md"
+    args = types.SimpleNamespace(
+        out=output,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids={"retail": ["task"]},
+        seed=300,
+    )
+    assert run_ab.write_report_and_gate(a, b, ["retail"], 2, args) == run_ab.EXIT_INCOMPLETE
+    assert "inconsistent invocation provenance" in output.read_text()
+
+
+def test_result_digest_and_scores_use_one_buffer(tmp_path, monkeypatch):
+    a, b = (_provenant_arm(tmp_path, name) for name in ("vllm", "smg"))
+    target = Path(a.invocations["retail"]["results_path"])
+    original = Path.read_bytes
+    reads = []
+
+    def changing(path):
+        if path == target:
+            reads.append(True)
+            if len(reads) > 1:
+                return b"changed between reads"
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", changing)
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=False,
+        enforce_budget=True,
+        expected_task_ids={"retail": ["task"]},
+        seed=300,
+    )
+    assert run_ab.write_report_and_gate(a, b, ["retail"], 2, args) == run_ab.EXIT_OK
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("own_pending", [True, False])
+def test_timeout_halts_only_its_own_unknown_paid_work(tmp_path, monkeypatch, own_pending):
+    descriptor = run_ab.prepare_budget()
+    ledger = run_ab.budget_guard.read_descriptor(descriptor)
+
+    def timeout(cmd, **kwargs):
+        identity = cmd[cmd.index("--invocation") + 1] if own_pending else "healthy-sibling"
+        ledger.reserve(
+            "paid",
+            "vllm",
+            "openai/gpt-5.2",
+            1,
+            1,
+            num_retries=0,
+            output_limit_verified=True,
+            metadata={"invocation_id": identity, "domain": "airline"},
+        )
+        raise run_ab.subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(run_ab.subprocess, "run", timeout)
+    arm = run_ab.Arm("vllm", "http://127.0.0.1:1")
+    _run_tau2(arm, tmp_path, budget_descriptor=descriptor)
+    assert ledger.summary()["halted"] is own_pending
+    assert arm.invocations["airline"]["failure_kind"] == "timeout"
+
+
+@pytest.mark.parametrize("with_sidecar", [True, False])
+def test_actual_nightly_staging_keeps_fail_stop(tmp_path, monkeypatch, with_sidecar):
+    import os
+    import subprocess
+
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/nightly-tau2.yml"
+    lines = workflow.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if "- name: Stage results for upload" in line)
+    run = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "run: |")
+    end = next(i for i in range(run + 1, len(lines)) if lines[i].startswith("      - name:"))
+    script = "\n".join(line[10:] for line in lines[run + 1 : end])
+    ledger = tmp_path / "ledger.db"
+    ledger.write_bytes(b"owned ledger fixture")
+    sidecar = tmp_path / "ledger.db.fail-stop"
+    if with_sidecar:
+        sidecar.write_bytes(b"")
+    monkeypatch.setenv("TAU2_BUDGET_LEDGER", str(ledger))
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    subprocess.run(
+        ["/usr/bin/bash", "-c", script], cwd=tmp_path, env=os.environ.copy(), check=True, timeout=10
+    )
+    output = tmp_path / "tau2_artifact"
+    assert (output / "ledger.db").read_bytes() == ledger.read_bytes()
+    assert (output / sidecar.name).exists() is with_sidecar

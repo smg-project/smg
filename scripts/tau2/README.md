@@ -344,7 +344,10 @@ infrastructure, guarded-child failures, absent invocation provenance, or missing
 expected-task manifests, including with `--allow-incomplete`. This flag waives
 quality-only incompleteness; it cannot waive safety or result-identity failures.
 Saved comparisons retain the invocation UUID, configured seed, result SHA256,
-and original invocation result file as well as the task/trial manifest.
+and original invocation result file as well as the task/trial manifest. The original
+`results.json` must remain accessible at its recorded `results_path`. Each completed
+arm/domain/UUID/digest must also match the independent shared-ledger completion;
+reusing one invocation for two comparison arms is rejected.
 
 Budget exhaustion commits its halt while holding the reservation transaction;
 already-reserved calls may settle but no new reservation can pass. A fail-stop
@@ -355,3 +358,12 @@ must be retained with the original ledger, not deleted to resume a failed scope.
 Initialization publishes a privately initialized ledger without replacing any
 existing path; a failed initialization leaves the final ledger path available
 for an explicitly authorized retry.
+
+The ledger protocol-v2 admission fence orders reservation commits and halt
+publication across processes. A reservation committed before halt is already
+admitted and may settle; one ordered after halt cannot dispatch. The sidecar and
+SQLite halt are attempted independently. New readers/writers reject protocol-v1
+ledger configuration rather than mixing admission contracts; do not migrate or
+resume an unknown paid scope. Keep the ledger, fail-stop sidecar and its admission
+lock together for the scope lifetime. A killed invocation halts sibling admission
+only for its own pending/unknown paid requests or an unverifiable own audit.

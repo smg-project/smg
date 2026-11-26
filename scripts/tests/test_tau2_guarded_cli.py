@@ -1207,7 +1207,9 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from budget import Ledger, RunPolicy, Policy, BudgetError
 import json
-config=json.loads(open(sys.argv[2]).read())
+record=json.loads(open(sys.argv[2]).read())
+assert record['ledger_protocol'] == 2
+config=record['policy']
 config['models']={k:Policy(**v) for k,v in config['models'].items()}
 ledger=Ledger(sys.argv[3], RunPolicy(**config), create=False)
 try:

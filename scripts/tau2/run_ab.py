@@ -385,8 +385,10 @@ def run_tau2(
         return
     arm.budget = budget_descriptor
     try:
-        if budget_guard.read_descriptor(budget_descriptor).summary()["halted"]:
+        ledger = budget_guard.read_descriptor(budget_descriptor)
+        if ledger.summary()["halted"]:
             raise budget_guard.BudgetError("Shared paid budget is halted")
+        ledger.begin_invocation(invocation_id, arm.name, domain)
     except (OSError, ValueError, KeyError) as error:
         fail("invalid_budget", "budget", error)
         return
@@ -463,6 +465,17 @@ def run_tau2(
         # subprocess.run has killed/reaped its child. Even a partial result from
         # that invocation cannot establish a completed simulation domain.
         arm.timed_out.append(domain)
+        # Only this killed invocation's unsettled paid work justifies attribution.
+        try:
+            own = ledger.audit(invocation_id)
+            stop = bool(own["pending"] or own["unknown"])
+        except (OSError, ValueError, KeyError):
+            stop = True
+        if stop:
+            try:
+                ledger.halt()
+            except (OSError, ValueError) as halt_error:
+                invocation["halt_error"] = type(halt_error).__name__
         fail("timeout", "cli", error)
         return
     except OSError as error:
@@ -493,6 +506,7 @@ def run_tau2(
                 seed_identity_problem(scores, expected_task_ids, num_trials, seed)
             )
             return
+        ledger.complete_invocation(invocation_id, arm.name, domain, invocation["results_sha256"])
         arm.scores[domain] = scores
         invocation["status"] = "completed"
     except InvalidResults as error:
@@ -806,6 +820,7 @@ def write_report_and_gate(
     if getattr(args, "enforce_budget", False):
         # Legacy score files remain readable, but are not acceptance evidence
         # without the fresh invocation and its raw result bytes.
+        seen_invocations = set()
         for arm in (baseline, candidate):
             for domain in arm.scores:
                 invocation = arm.invocations.get(domain)
@@ -827,16 +842,26 @@ def write_report_and_gate(
                 if valid:
                     try:
                         path = Path(invocation["results_path"])
+                        raw = path.read_bytes()
+                        completion = budget_guard.read_descriptor(arm.budget).invocation_completion(
+                            invocation["invocation_id"]
+                        )
                         valid = (
-                            path.name == "results.json"
+                            invocation["invocation_id"] not in seen_invocations
+                            and completion
+                            == dict(
+                                arm=arm.name, domain=domain, digest=invocation["results_sha256"]
+                            )
+                            and path.name == "results.json"
                             and path.parent.name == "ab_" + invocation["invocation_id"]
-                            and hashlib.sha256(path.read_bytes()).hexdigest()
-                            == invocation["results_sha256"]
-                            and domain_scores(load_results(json.loads(path.read_bytes())), k)
+                            and hashlib.sha256(raw).hexdigest() == invocation["results_sha256"]
+                            and domain_scores(load_results(json.loads(raw)), k)
                             == arm.scores[domain]
                         )
                     except (OSError, TypeError, KeyError, ValueError):
                         valid = False
+                if valid:
+                    seen_invocations.add(invocation["invocation_id"])
                 if not valid:
                     provenance_failed = True
                     label = (
@@ -844,6 +869,7 @@ def write_report_and_gate(
                         if baseline.name != candidate.name
                         else ("baseline" if arm is baseline else "candidate")
                     )
+                    report_md += f"\n\n> Incomplete arm {label}: missing or inconsistent invocation provenance."
                     payload["incomplete"][label] = (
                         payload["incomplete"].get(label) or ""
                     ) + "; missing or inconsistent invocation provenance"

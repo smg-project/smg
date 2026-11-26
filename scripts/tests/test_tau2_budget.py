@@ -235,3 +235,116 @@ def test_exhaustion_halts_inside_the_reservation_transaction(tmp_path):
         other.reserve("small", "smg", POLICY.model, 1, 1, num_retries=0, output_limit_verified=True)
     ledger.finish("one", 1, 1)  # Previously admitted calls can still settle.
     assert ledger.audit()["pending"] == 0
+
+
+def test_halt_attempts_db_even_when_sidecar_fails(tmp_path, monkeypatch):
+    ledger = budget.Ledger(tmp_path / "budget.db", POLICY)
+    original = budget.os.open
+
+    def sidecar_failure(path, flags, *args):
+        if Path(path) == ledger.fail_stop_path:
+            raise PermissionError("owned injected sidecar failure")
+        return original(path, flags, *args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(budget.os, "open", sidecar_failure)
+        with pytest.raises(budget.BudgetError, match="halt stores"):
+            ledger.halt()
+    assert not ledger.fail_stop_path.exists()
+    assert budget.Ledger(ledger.path, POLICY, create=False).summary()["halted"]
+    with pytest.raises(budget.BudgetError):
+        reserve(ledger)
+
+
+def test_halt_keeps_sidecar_when_sqlite_fails(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    ledger = budget.Ledger(tmp_path / "budget.db", POLICY)
+
+    @contextmanager
+    def unavailable():
+        raise budget.BudgetError("owned injected DB failure")
+        yield
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ledger, "_transaction", unavailable)
+        with pytest.raises(budget.BudgetError, match="halt stores"):
+            ledger.halt()
+    assert ledger.fail_stop_path.exists()
+    with pytest.raises(budget.BudgetError):
+        reserve(budget.Ledger(ledger.path, POLICY, create=False))
+
+
+def _paused_reservation(path, ready, release, outcome):
+    from contextlib import contextmanager
+
+    ledger = budget.Ledger(path, POLICY, create=False)
+    original = ledger._transaction
+
+    @contextmanager
+    def paused():
+        with original() as db:
+            yield db
+            ready.set()
+            assert release.wait(8)
+
+    ledger._transaction = paused
+    reserve(ledger)
+    outcome.put("admitted")
+
+
+def _publish_halt(ledger, entered):
+    entered.set()
+    ledger.halt()
+
+
+def test_real_process_halt_and_commit_share_ordering_fence(tmp_path):
+    import time
+
+    path = tmp_path / "budget.db"
+    ledger = budget.Ledger(path, POLICY)
+    ctx = multiprocessing.get_context("fork")
+    ready, release, entered, outcome = ctx.Event(), ctx.Event(), ctx.Event(), ctx.Queue()
+    reserve_child = ctx.Process(target=_paused_reservation, args=(path, ready, release, outcome))
+    halt_child = ctx.Process(target=_publish_halt, args=(ledger, entered))
+    try:
+        reserve_child.start()
+        assert ready.wait(8)
+        halt_child.start()
+        assert entered.wait(8)
+        time.sleep(0.1)
+        # The prepublication reservation still owns the commit/admission fence.
+        assert halt_child.is_alive() and not ledger.fail_stop_path.exists()
+        release.set()
+        reserve_child.join(8)
+        halt_child.join(8)
+        assert reserve_child.exitcode == halt_child.exitcode == 0
+        assert outcome.get(timeout=1) == "admitted"
+        assert ledger.fail_stop_path.exists()
+        # Already admitted usage may settle after halt; a new paid call may not.
+        ledger.finish("one", 0, 0)
+        with pytest.raises(budget.BudgetError):
+            reserve(ledger, "later", "smg")
+    finally:
+        release.set()
+        for child in [reserve_child, halt_child]:
+            if child.pid is not None:
+                if child.is_alive():
+                    child.terminate()
+                child.join(8)
+        outcome.close()
+
+
+def test_protocol_v1_ledger_cannot_mix_with_new_admission(tmp_path):
+    import json
+    import sqlite3
+    from dataclasses import asdict
+
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE policy (id INTEGER PRIMARY KEY, config TEXT, halted INTEGER)")
+        db.execute(
+            "INSERT INTO policy VALUES (1, ?, 0)", (json.dumps(asdict(POLICY), sort_keys=True),)
+        )
+    with pytest.raises(budget.BudgetError, match="different policy"):
+        budget.Ledger(path, POLICY, create=False)

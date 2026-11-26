@@ -527,6 +527,9 @@ jobs:
               cp -- "$source" "$OUT/"
             fi
           done
+          if [ -n "${TAU2_BUDGET_LEDGER:-}" ] && [ -f "${TAU2_BUDGET_LEDGER}.fail-stop" ]; then
+            cp -- "${TAU2_BUDGET_LEDGER}.fail-stop" "$OUT/"
+          fi
       - name: Upload results (summary + scores + transcripts)
         if: always()
         uses: actions/upload-artifact@v7

@@ -4,9 +4,12 @@ Callers must verify complete token bounds and provider limits before reserving.
 The guarded CLI reserves at the actual paid HTTP transport boundary.
 """
 
+import fcntl
 import json
 import os
+import re
 import sqlite3
+import stat
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
@@ -99,7 +102,7 @@ class Ledger:
         self.path, self.policy, self.create = Path(path).resolve(), policy, create
         if not create and not self.path.is_file():
             raise BudgetError("Existing shared ledger required; never recreate it at acceptance")
-        self.config = json.dumps(asdict(policy), sort_keys=True)
+        self.config = json.dumps({"ledger_protocol": 2, "policy": asdict(policy)}, sort_keys=True)
         with self._transaction() as db:
             if not create:
                 self._halted(db)
@@ -115,8 +118,30 @@ class Ledger:
                 "metadata TEXT NOT NULL, model TEXT NOT NULL, "
                 "used_input INTEGER, used_output INTEGER)"
             )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS invocations "
+                "(id TEXT PRIMARY KEY, arm TEXT NOT NULL, domain TEXT NOT NULL, digest TEXT)"
+            )
             db.execute("INSERT OR IGNORE INTO policy VALUES (1, ?, 0)", (self.config,))
             self._halted(db)
+
+    @contextmanager
+    def _admission(self):
+        # All protocol-v2 reservations and halt publication use this same fence.
+        # Reservation commit is admission; earlier admitted calls may still settle.
+        path = self.path.with_name(self.path.name + ".admission-lock")
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise BudgetError("Unsafe shared admission fence")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     @contextmanager
     def _transaction(self):
@@ -197,41 +222,42 @@ class Ledger:
         if input_tokens > price.input_limit or output_tokens > price.output_limit:
             raise BudgetError("Token bounds exceed the policy")
         amount = price.cost(input_tokens, output_tokens)
-        exhausted = False
-        with self._transaction() as db:
-            if self._halted(db):
-                raise BudgetError("The shared budget is halted")
-            if db.execute("SELECT 1 FROM requests WHERE id=?", (request_id,)).fetchone():
-                raise BudgetError("Request ID already reserved")
-            calls, allocated, arm_calls = db.execute(
-                "SELECT COUNT(*), COALESCE(SUM(amount), 0), COALESCE(SUM(arm=?), 0) FROM requests",
-                (arm,),
-            ).fetchone()
-            if (
-                calls >= self.policy.calls
-                or arm_calls >= self.policy.calls_per_arm
-                or allocated + amount > self.policy.cap_nusd
-            ):
-                db.execute("UPDATE policy SET halted=1 WHERE id=1")
-                exhausted = True
-            else:
-                db.execute(
-                    "INSERT INTO requests VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL)",
-                    (
-                        request_id,
-                        arm,
-                        amount,
-                        input_tokens,
-                        output_tokens,
-                        json.dumps(metadata or {}, sort_keys=True),
-                        model,
-                    ),
-                )
-        # Raising inside the transaction would roll back the halt and release
-        # the admission lock before the caller could set it again.
-        if exhausted:
-            raise BudgetError("Shared budget exhausted")
-        return amount
+        with self._admission():
+            exhausted = False
+            with self._transaction() as db:
+                if self._halted(db):
+                    raise BudgetError("The shared budget is halted")
+                if db.execute("SELECT 1 FROM requests WHERE id=?", (request_id,)).fetchone():
+                    raise BudgetError("Request ID already reserved")
+                calls, allocated, arm_calls = db.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(amount), 0), COALESCE(SUM(arm=?), 0) FROM requests",
+                    (arm,),
+                ).fetchone()
+                if (
+                    calls >= self.policy.calls
+                    or arm_calls >= self.policy.calls_per_arm
+                    or allocated + amount > self.policy.cap_nusd
+                ):
+                    db.execute("UPDATE policy SET halted=1 WHERE id=1")
+                    exhausted = True
+                else:
+                    db.execute(
+                        "INSERT INTO requests VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL)",
+                        (
+                            request_id,
+                            arm,
+                            amount,
+                            input_tokens,
+                            output_tokens,
+                            json.dumps(metadata or {}, sort_keys=True),
+                            model,
+                        ),
+                    )
+            # Raising inside the transaction would roll back the halt and release
+            # the admission lock before the caller could set it again.
+            if exhausted:
+                raise BudgetError("Shared budget exhausted")
+            return amount
 
     def finish(self, request_id, input_tokens=None, output_tokens=None, *, outcome=None):
         problem = None
@@ -282,15 +308,71 @@ class Ledger:
         return {"calls": calls, "allocated_nusd": amount, "halted": halted}
 
     def halt(self):
-        try:
-            fd = os.open(self.fail_stop_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            pass  # Existing latch is never reset, including after DB recovery.
-        else:
-            os.close(fd)
+        failures = []
+        with self._admission():
+            # Publish before attempting SQLite: a failed DB must not lose the stop.
+            # Conversely, a failed sidecar must not skip a working DB latch.
+            try:
+                fd = os.open(self.fail_stop_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                failures.append(error)
+            else:
+                os.close(fd)
+            try:
+                with self._transaction() as db:
+                    self._halted(db)
+                    db.execute("UPDATE policy SET halted=1 WHERE id=1")
+            except (OSError, BudgetError) as error:
+                failures.append(error)
+        if failures:
+            raise BudgetError("Not all shared halt stores could be persisted") from failures[0]
+
+    def begin_invocation(self, invocation_id, arm, domain):
+        if (
+            not isinstance(invocation_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None
+            or arm not in {"vllm", "smg"}
+            or not isinstance(domain, str)
+            or not 1 <= len(domain) <= 128
+        ):
+            raise BudgetError("Invalid invocation identity")
+        with self._transaction() as db:
+            if self._halted(db):
+                raise BudgetError("The shared budget is halted")
+            db.execute(
+                "INSERT INTO invocations VALUES (?, ?, ?, NULL)", (invocation_id, arm, domain)
+            )
+
+    def complete_invocation(self, invocation_id, arm, domain, digest):
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise BudgetError("Invalid completion digest")
+        with self._transaction() as db:
+            if self._halted(db):
+                raise BudgetError("The shared budget is halted")
+            row = db.execute(
+                "SELECT arm, domain, digest FROM invocations WHERE id=?", (invocation_id,)
+            ).fetchone()
+            if row != (arm, domain, None):
+                raise BudgetError("Unregistered or reused invocation completion")
+            for state, metadata, request_arm in db.execute(
+                "SELECT state, metadata, arm FROM requests"
+            ):
+                metadata = json.loads(metadata)
+                if metadata.get("invocation_id") == invocation_id and (
+                    state != "complete" or request_arm != arm or metadata.get("domain") != domain
+                ):
+                    raise BudgetError("Invocation requests are not independently settled")
+            db.execute("UPDATE invocations SET digest=? WHERE id=?", (digest, invocation_id))
+
+    def invocation_completion(self, invocation_id):
         with self._transaction() as db:
             self._halted(db)
-            db.execute("UPDATE policy SET halted=1 WHERE id=1")
+            row = db.execute(
+                "SELECT arm, domain, digest FROM invocations WHERE id=?", (invocation_id,)
+            ).fetchone()
+        return None if row is None else dict(arm=row[0], domain=row[1], digest=row[2])
 
     def audit(self, invocation_id=None):
         with self._transaction() as db:
