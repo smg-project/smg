@@ -160,7 +160,7 @@ use std::{
         Arc, OnceLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arc_swap::Guard;
@@ -313,7 +313,9 @@ struct Working {
     /// The mark of the thread at work at the file ([`me`]); 0 for none.
     /// One thread at most works at a file: its decider, with a job at
     /// hand. It applies what is handed while it works, and once more as
-    /// it leaves.
+    /// it leaves. The file's methods alone read and write it
+    /// ([`File::begin_work`], [`File::leave_work`], [`File::may_act`],
+    /// [`File::has_worker`]).
     at_work: AtomicUsize,
 }
 
@@ -370,8 +372,10 @@ impl File {
         }
     }
 
-    /// Whether this file may hold work for a sweep.
-    pub(super) fn sweep_needed(&self, now: std::time::Instant) -> bool {
+    /// Whether this file may hold work for a sweep at `now`: its deadline
+    /// hint is reached, or its ring holds a frame. Read with no turn held
+    /// ([`MemoryStore::sweep_turn`]).
+    fn sweep_needed(&self, now: Instant) -> bool {
         self.next_due.reached(now) || self.shown.hands.waits()
     }
 
@@ -394,12 +398,6 @@ impl File {
             #[cfg(debug_assertions)]
             file: self,
         }
-    }
-
-    /// Whether the turn is free at this instant, tried.
-    #[cfg(test)]
-    pub(super) fn free(&self) -> bool {
-        self.turn.try_lock().is_some()
     }
 
     /// Takes of this file's turn since the test last cleared them.
@@ -426,6 +424,38 @@ impl File {
             #[cfg(debug_assertions)]
             file: self,
         })
+    }
+
+    /// The calling thread says it works at this file: it writes its mark
+    /// ([`me`]). One thread at most works at a file.
+    #[inline(always)]
+    fn begin_work(&self) {
+        let was = self.working.at_work.swap(me(), SeqCst);
+        debug_assert_eq!(was, 0, "one thread works at a file");
+    }
+
+    /// The thread at work at this file takes its mark back.
+    #[inline(always)]
+    fn leave_work(&self) {
+        self.working.at_work.store(0, SeqCst);
+    }
+
+    /// Whether the calling thread may act at this file: no thread is at
+    /// work there, or the caller is that thread. Asked with no turn held
+    /// it lets a caller pass a file whose decider works without a wait
+    /// for that file's turn. What an apply goes by is read under the turn
+    /// ([`MemoryStore::applied`]).
+    #[inline(always)]
+    fn may_act(&self) -> bool {
+        let worker = self.working.at_work.load(SeqCst);
+        worker == 0 || worker == me()
+    }
+
+    /// Whether a thread is at work at this file: what a hand reads where
+    /// no watch stands.
+    #[inline(always)]
+    fn has_worker(&self) -> bool {
+        self.working.at_work.load(SeqCst) != 0
     }
 }
 
@@ -878,9 +908,7 @@ impl MemoryStore {
     #[cfg(all(test, feature = "controller"))]
     pub(crate) fn working(&self) -> usize {
         let files = self.files.iter();
-        files
-            .filter(|file| file.working.at_work.load(SeqCst) != 0)
-            .count()
+        files.filter(|file| file.has_worker()).count()
     }
 
     /// The calling thread's place at its file, at work: a decider's, from
@@ -907,8 +935,7 @@ impl MemoryStore {
     /// A thread that keeps its watch over the file begins by
     /// [`Self::begin_watched`].
     fn begin(&self, at: usize) {
-        let was = self.files[at].working.at_work.swap(me(), SeqCst);
-        debug_assert_eq!(was, 0, "one thread works at a file");
+        self.files[at].begin_work();
         fence(SeqCst);
         drop(self.turn_of(at));
     }
@@ -927,8 +954,7 @@ impl MemoryStore {
     fn begin_watched(&self, at: usize) {
         let file = &self.files[at];
         let mut turn = file.take();
-        let was = file.working.at_work.swap(me(), SeqCst);
-        debug_assert_eq!(was, 0, "one thread works at a file");
+        file.begin_work();
         fence(SeqCst);
         self.applied(at, &mut turn);
     }
@@ -938,7 +964,7 @@ impl MemoryStore {
     /// follows, its look ([`Self::looked`]) or its last apply, is the
     /// leaver's half of the hand-over ([`Self::settle`]).
     fn leave(&self, at: usize) {
-        self.files[at].working.at_work.store(0, SeqCst);
+        self.files[at].leave_work();
         fence(SeqCst);
     }
 
@@ -953,7 +979,7 @@ impl MemoryStore {
     /// [`LookOutcome::Ended`] too where another thread is at work there: what
     /// waits is that thread's.
     fn looked(&self, at: usize) -> LookOutcome {
-        if !self.may_act(at) {
+        if !self.files[at].may_act() {
             return LookOutcome::Ended;
         }
         let mut turn = self.files[at].take();
@@ -978,14 +1004,25 @@ impl MemoryStore {
         turn
     }
 
-    /// Whether the calling thread may act at the file at `at`: no thread
-    /// is at work there, or the caller is that thread. Asked with no turn
-    /// held it lets a caller pass a file whose decider works without a
-    /// wait for that file's turn; what an apply goes by is read under the
-    /// turn ([`Self::applied`]).
-    pub(super) fn may_act(&self, at: usize) -> bool {
-        let worker = self.files[at].working.at_work.load(SeqCst);
-        worker == 0 || worker == me()
+    /// The turn of the file at `at` for a sweep at `now`, with everything
+    /// handed applied: the sweep's whole admission to a file. `None` where
+    /// the sweep passes the file.
+    ///
+    /// It passes a file that holds no work for it ([`File::sweep_needed`]),
+    /// and one whose decider works ([`File::may_act`]). That is read first
+    /// with no turn held, so the sweep waits for no turn of a thread at
+    /// work, and again under the turn ([`Self::applied`]). The file's
+    /// deadline is shown under the turn ahead of that second read
+    /// ([`Leases::show_due`]): a file passed there is asked again at its
+    /// deadline, not at every pass.
+    pub(super) fn sweep_turn(&self, at: usize, now: Instant) -> Option<Turn<'_>> {
+        let file = &self.files[at];
+        if !file.sweep_needed(now) || !file.may_act() {
+            return None;
+        }
+        let mut turn = file.take();
+        turn.show_due();
+        self.applied(at, &mut turn).then_some(turn)
     }
 
     /// Applies what waits at the file at `at`, under its turn, where the
@@ -995,7 +1032,7 @@ impl MemoryStore {
     /// so no thread acts as a decider beside it. The frames it finds are
     /// told under one load of the world, the apply's own ([`OneLoad`]).
     pub(super) fn applied(&self, at: usize, turn: &mut Turn<'_>) -> bool {
-        if !self.may_act(at) {
+        if !self.files[at].may_act() {
             return false;
         }
         let Behind { leases, ring } = &mut *turn.behind;
@@ -1031,7 +1068,7 @@ impl MemoryStore {
     /// instructions, by count.
     #[inline(never)]
     fn settle(&self, at: usize) -> bool {
-        if !self.may_act(at) {
+        if !self.files[at].may_act() {
             return false;
         }
         let mut turn = self.files[at].take();
@@ -1146,7 +1183,7 @@ impl MemoryStore {
         }
         // The hand's half of the hand-over ([`Self::settle`]).
         fence(SeqCst);
-        if file.working.at_work.load(SeqCst) == 0 {
+        if !file.has_worker() {
             self.settle(at);
         }
         true

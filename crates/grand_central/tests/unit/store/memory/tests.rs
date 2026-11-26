@@ -125,6 +125,80 @@ fn a_file_its_host_has_not_settled_is_asked_once_before_its_deadline() {
     assert_eq!(store.expire_where(after(1_200), |_| true).len(), 1);
 }
 
+/// The sweep passes a file whose decider works by its first read, with
+/// no turn held: it takes no turn of a thread at work. It ends the
+/// file's due lease once the decider has left.
+#[test]
+fn the_sweep_takes_no_turn_of_a_file_whose_decider_works() {
+    let store = Arc::new(MemoryStore::new());
+    let now = Instant::now();
+    let due = now + Duration::from_secs(1);
+    LeasesStore::set_term(&*store, 1);
+    let filed = store.issue_decided(waiting(now, 1, due), None, |_| {});
+    filed.expect("the lease is filed");
+    let place = store.at_work();
+    store.files[0].clear_takes();
+    let swept = std::thread::scope(|scope| {
+        let sweep = scope.spawn(|| LeasesStore::expire(&*store, due).len());
+        sweep.join().expect("the sweep returns")
+    });
+    assert_eq!(swept, 0, "the file is its decider's while it works");
+    assert_eq!(store.files[0].takes(), 0, "no turn of a thread at work");
+    drop(place);
+    assert_eq!(LeasesStore::expire(&*store, due).len(), 1);
+}
+
+/// Waits until `file`'s turn was taken `count` times since the case
+/// cleared its takes. A thread that takes the turn counts first and
+/// waits for it then.
+fn taken(file: &turn::File, count: usize) {
+    let end = Instant::now() + Duration::from_secs(30);
+    while file.takes() < count {
+        assert!(Instant::now() < end, "take {count} of the turn never came");
+        std::thread::yield_now();
+    }
+}
+
+/// A decider that begins work behind the sweep's first read is read
+/// again under the turn, and the sweep passes its file. The case holds
+/// the turn while the sweep waits for it and the decider writes its
+/// mark.
+#[test]
+fn the_sweep_passes_a_file_whose_decider_began_behind_its_first_read() {
+    let store = Arc::new(MemoryStore::new());
+    let now = Instant::now();
+    let due = now + Duration::from_secs(1);
+    LeasesStore::set_term(&*store, 1);
+    let filed = store.issue_decided(waiting(now, 1, due), None, |_| {});
+    filed.expect("the lease is filed");
+    let file = &store.files[0];
+    let held = file.take();
+    file.clear_takes();
+    let (leave, left) = mpsc::sync_channel::<()>(1);
+    let swept = std::thread::scope(|scope| {
+        // The case's own end goes with it where it fails: the
+        // decider's wait ends, and the case with it.
+        let (leave, store) = (leave, &store);
+        // The sweep reads nobody at work and waits for the turn.
+        let sweep = scope.spawn(move || LeasesStore::expire(&**store, due).len());
+        taken(file, 1);
+        // The decider writes its mark, then waits for the turn too.
+        let decider = scope.spawn(move || {
+            let place = store.at_work();
+            left.recv().expect("the case says when to leave");
+            drop(place);
+        });
+        taken(file, 2);
+        drop(held);
+        let swept = sweep.join().expect("the sweep returns");
+        leave.send(()).expect("the decider waits for the word");
+        decider.join().expect("the decider leaves");
+        swept
+    });
+    assert_eq!(swept, 0, "the file is its decider's from its mark");
+    assert_eq!(LeasesStore::expire(&*store, due).len(), 1);
+}
+
 /// Indexes that hold no index and name one block size: what a case
 /// reads an engine's hold of them by.
 #[cfg(feature = "controller")]
