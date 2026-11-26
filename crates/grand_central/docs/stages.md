@@ -24,9 +24,9 @@ No filter takes a parameter under its bare name. `has-room` alone can be written
 
 - No policy spec names an overload threshold. A worker's registration states the worker's thresholds.
 - Without them a worker takes its program's default: 8 queued requests and 0.8 active KV usage, unless the program sets others.
-- A worker of the `external` runtime takes no default. A standalone controller judges it by its registration's thresholds alone.
+- A worker of the `external` runtime takes no default when it registers. A standalone controller judges it by its registration's thresholds alone.
 - The binding's `overload` block switches that default on or off.
-- [Overload, shadows and reserved fields](../REFERENCE.md#overload-shadows-and-reserved-fields) has the rules for each host.
+- [Overload](policy-spec.md#overload) has the rules for each host.
 
 ### The host's two bits
 
