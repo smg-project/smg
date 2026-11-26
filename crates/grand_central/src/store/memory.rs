@@ -719,10 +719,16 @@ impl MemoryStore {
     /// it came. Each membership write after it is told behind the same
     /// lock, in its order. A count of sends stands where a profile that
     /// reads it is kept. One thing built new does not start empty: a count
-    /// of sends none of whose readers is kept, which the engine takes over
-    /// from the standing generation's count under the same two settings,
-    /// or else by its profile's name, or else one that is left, before the
-    /// publication ([`Engine::succeed`](crate::engine::Engine::succeed)).
+    /// of sends none of whose readers is kept. It takes over the standing
+    /// generation's count under the same two settings, or else a copy of
+    /// the sends that generation's counts hold, before the publication
+    /// ([`Engine::succeed`](crate::engine::Engine::succeed)). The
+    /// take-over is a step of the call that puts the generation in place
+    /// of the standing one, under the workers lock and the load lock. A
+    /// copy takes as long as the sends it copies, and a taker of the load
+    /// lock alone waits for it too. A send told behind a copy and ahead of
+    /// the publication enters the standing generation's counts: it is in
+    /// no copy.
     ///
     /// A decision that read its world ahead of the apply ends under that
     /// world's generation: its list's value, its lease and the stages told
@@ -833,6 +839,10 @@ impl MemoryStore {
                     offered: generation,
                 });
             }
+            // The generation is put in place inside this call, and there a
+            // count of sends built new takes over what the standing counts
+            // hold. A copy of them is so made under both locks: a taker of
+            // the load lock alone waits for it.
             let writer = &mut loads.writer;
             let (world, before) = writer.apply(spec, workers.members())?;
             #[cfg(test)]

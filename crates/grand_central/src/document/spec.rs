@@ -2133,15 +2133,14 @@ pub struct ProfileSpec {
     /// profile whose stages do not read its count of sends is refused if it
     /// sets a delay. The limit ends a send whatever the delay. The
     /// profiles of a document that set the same limit and the same delay
-    /// read one count, under the name of the first of them that reads it,
-    /// in the order of their names. A new document's count takes over the
-    /// sends of the standing count under the same limit and delay,
-    /// whichever profiles read that one. Where none stands under them, it
-    /// takes over those of the standing count under the same name, unless
-    /// a count of the new document took that one by its settings, or else
-    /// of a standing count that no count of the new document took. The
-    /// two counts share the sends: a read under the shorter of two delays
-    /// ends such a send for both. A count that finds none starts empty.
+    /// read one count. A new document's count takes over the sends of the
+    /// standing count under the same limit and delay, whichever profiles
+    /// read that one, and the two counts share them. Where none stands
+    /// under them, it takes a copy of the sends the standing counts hold,
+    /// for each rank of a worker those of the count that holds the most,
+    /// and counts each under its own limit and delay from there. A send
+    /// that every standing count has ended is in no copy. A count starts
+    /// empty where no count stands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub sent_report_delay_ms: Option<u32>,
@@ -3786,7 +3785,6 @@ fn picker_of(
         in_key_order(&mut params);
         let picker = StageBuild::built(
             &params,
-            profile,
             settings,
             sent,
             from.reports,
@@ -3933,7 +3931,6 @@ fn filtered<'a>(
         in_key_order(&mut params);
         let filter = StageBuild::built(
             &params,
-            profile,
             settings,
             sent,
             from.reports,
@@ -4190,7 +4187,6 @@ fn scored(
             in_key_order(&mut params);
             let scorer = StageBuild::built(
                 &params,
-                profile,
                 settings,
                 sent,
                 from.reports,
@@ -4401,7 +4397,7 @@ fn check_profile(
             Filtered::Built(filter) => filter,
             Filtered::Typed(stage) => {
                 let stage_at = At::new(format!("{}.filter[{index}].{}", at.0, stage.name()));
-                let count = || profile_sent(&mut sent, name, settings);
+                let count = || profile_sent(&mut sent, settings);
                 filter_of(stage, view, from.signals, count, &stage_at)?
             }
         };
@@ -4468,7 +4464,7 @@ fn check_profile(
             });
         }
         check_prefix_depth(&stage, gates, view, &stage_at)?;
-        let count = || profile_sent(&mut sent, name, settings);
+        let count = || profile_sent(&mut sent, settings);
         match scorer_of(&stage, gates, view, from.signals, count, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
