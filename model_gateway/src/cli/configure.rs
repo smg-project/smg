@@ -1120,6 +1120,18 @@ impl CliArgs {
         Ok(model_aliases)
     }
 
+    fn is_sglang_epd(&self) -> bool {
+        self.workers.epd_disaggregation && matches!(self.model.backend, Some(Backend::Sglang))
+    }
+
+    fn effective_connection_mode(&self, mode: &RoutingMode) -> ConnectionMode {
+        if self.is_sglang_epd() {
+            ConnectionMode::Grpc
+        } else {
+            Self::determine_connection_mode(&Self::startup_worker_urls(mode))
+        }
+    }
+
     /// The routing part of the configuration: what a policy document reads,
     /// the multi-router mode with it, and what the validator's routing rules
     /// read beside it (the workers' discovery and the data-parallel
@@ -1128,7 +1140,7 @@ impl CliArgs {
     /// the routing part and `--print-policy-spec` converts it alone, so the
     /// two read one routing part. No file is read here.
     fn routing_part(&self, mode: RoutingMode) -> ConfigResult<RouterConfigBuilder> {
-        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
+        let connection_mode = self.effective_connection_mode(&mode);
         Ok(RouterConfig::builder()
             .mode(mode)
             .connection_mode(connection_mode)
@@ -1183,13 +1195,8 @@ impl CliArgs {
         self.warn_ignored_companions(&prefill_urls, &encode_urls);
 
         let mode = self.routing_mode(prefill_urls, encode_urls);
-        let sglang_epd =
-            self.workers.epd_disaggregation && matches!(self.model.backend, Some(Backend::Sglang));
-        let connection_mode = if sglang_epd {
-            ConnectionMode::Grpc
-        } else {
-            Self::determine_connection_mode(&Self::startup_worker_urls(&mode))
-        };
+        let sglang_epd = self.is_sglang_epd();
+        let connection_mode = self.effective_connection_mode(&mode);
         let routing = self.routing_part(mode)?;
         let metrics = Some(MetricsConfig {
             port: self.serving.prometheus_port,
