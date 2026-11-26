@@ -1,9 +1,10 @@
-//! What is said of a lease on file, told to the engine that issued it.
+//! What is said of a lease on file, told to the stages that issued it.
 //!
 //! A dispatch, a completion or a release reaches the stages that stood
 //! when the lease was issued, on the lease's record as the store found it:
 //! the generation's own, or the ones a later generation kept of them
-//! ([`issuing`]). Whoever applies the report calls [`told`]: a decider, a
+//! ([`issuing`]). The generation asked is the one in force at the word
+//! ([`told`]). Whoever applies the report calls [`told`]: a decider, a
 //! session, the gateways' sweep.
 
 use std::{
@@ -16,7 +17,6 @@ use crate::{
         decision::Decision,
         decision_slot::DecisionSlot,
         framework::{release, Engine},
-        in_process::StoodAt,
         lease_events::{self, Hearers},
         view::WorkerId,
     },
@@ -30,15 +30,34 @@ use crate::{
 /// call panicked and was held, for the first of a streak: its host may
 /// write a line for that one.
 ///
-/// The engine told is the one of the lease's own generation, where
-/// `world` holds that generation. Under a later generation it is what that
+/// **The generation a word is told by** is the one in force at the word:
+/// the generation of the store's standing world. The caller loads `world`
+/// for this word, or once for the words it tells in a row, so a
+/// generation may start behind that load. One atomic load a word says
+/// whether `world` still holds the generation in force on the store's
+/// engine (`Loaded::still_in_force`). Where it does, the word is told by
+/// `world`, and nothing is loaded. Where a generation started since, the
+/// store's standing world is loaded for this word and the word is told
+/// by it. Between the engine's turn of an apply and the publication of
+/// that apply's world, the standing world still holds the generation
+/// before: a word said there is told by it. No lease of the new
+/// generation exists by then, for a decision reads its generation off a
+/// published world.
+///
+/// The word reads the generation off a world and never off the engine's
+/// own cell. A reader's hold of a world is never the last one: the store's
+/// writer keeps a replaced world its reader still holds. So no telling
+/// frees a replaced generation's stages on its own thread, however many
+/// generations start while it runs. A hold of the engine's cell has no
+/// such keeper.
+///
+/// The stages told are the ones of the lease's own generation, where that
+/// generation is in force. Under a later generation they are what that
 /// generation kept of the stages that stood at the issue ([`issuing`]): a
-/// stage built since never saw the issue and hears nothing of it. The
-/// caller loads `world` for this word, or once for the words it tells in
-/// a row: behind a later generation's start, a word told under such a
-/// load still reaches the lease's own engine. A dispatch also feeds the
-/// counts of sends of the
-/// generation `world` holds, whichever generation issued the lease: a
+/// stage built since never saw the issue and hears nothing of it. A lease
+/// of a generation above the one in force tells no stage: no stage of
+/// this replica booked it. A dispatch also enters the counts of sends of
+/// the generation in force, whichever generation issued the lease: a
 /// send is the host's, whatever document decided it
 /// ([`Engine::dispatched_sent`]). A count that does not know the rank
 /// the report names enters it only where `listed` says the worker
@@ -66,7 +85,7 @@ use crate::{
 /// So the dispatch of a single request its sessions rule keeps from the
 /// profile ([`LeaseRecord::untold`]) is told to the session table alone,
 /// where the key's pin moves. No count of sends takes it, under whichever
-/// generation `world` holds, and no stage hears it. Its end and its
+/// generation is in force, and no stage hears it. Its end and its
 /// release are told as any lease's.
 ///
 /// Its caller is whoever applies the report, under the turn of the leases'
@@ -94,7 +113,16 @@ pub(crate) fn told(
     // The lease's own decider acts while its event is told, whichever
     // thread applies the report.
     let _acting = by.map(DecisionSlot::enter);
-    let told = catch_unwind(AssertUnwindSafe(|| tell(world, found, said, &listed)));
+    // By the generation in force at the word: the caller's world where
+    // it holds that generation still, and the standing world otherwise.
+    let word = || {
+        if world.front().still_in_force() {
+            tell(world, found, said, &listed);
+        } else {
+            store.with_snapshot(|standing| tell(standing, found, said, &listed));
+        }
+    };
+    let told = catch_unwind(AssertUnwindSafe(word));
     let Err(payload) = told else {
         store.call_returned();
         return false;
@@ -105,57 +133,24 @@ pub(crate) fn told(
     store.call_faulted()
 }
 
-/// The engine that hears a lease's words under a world ([`issuing`]), held
-/// for the telling.
-pub(crate) enum Issuing<'a> {
-    /// The engine of the lease's own generation, which the world holds.
-    Own(&'a Engine),
-    /// What the world's generation kept of the stages that stood when the
-    /// lease was issued ([`InProcess::stood_at`]). Its session table was
-    /// made with that generation and hears nothing of the lease
-    /// ([`Engine::table_from`]). It holds the front's document while the
-    /// word is told.
-    ///
-    /// [`InProcess::stood_at`]: crate::engine::in_process::InProcess::stood_at
-    Kept(StoodAt),
-    /// No engine: the world is older than the lease.
-    Nobody,
-}
-
-impl Issuing<'_> {
-    /// The engine told, where one hears.
-    #[inline]
-    pub(crate) fn engine(&self) -> Option<&Engine> {
-        match self {
-            Self::Own(engine) => Some(engine),
-            Self::Kept(kept) => Some(kept.engine()),
-            Self::Nobody => None,
-        }
-    }
-}
-
-/// The engine that hears a lease's words under `world`. For a lease of the
-/// world's own generation it is that generation's engine. For a lease of an
-/// earlier one it is what the world's generation kept of the stages that
-/// stood when the lease was issued: a stage it built new heard no issue of
-/// the lease and hears nothing of it, no dispatch, no end, and no issue of
-/// a side a call decides later. Neither does the generation's session
-/// table, which is new with it. Nobody hears under a world older than the
-/// lease.
+/// The engine that hears a lease's words under `world`, read off the
+/// world's own hold of its generation (`Loaded::hearing`). For a lease of
+/// the world's own generation it is that generation's engine. For a lease
+/// of an earlier one it is what the world's generation kept of the stages
+/// that stood when the lease was issued, over the session table, which is
+/// the store's engine's for every generation: the lease's claim was made
+/// in it. A stage the generation built new heard no issue of the lease
+/// and hears nothing of it, no dispatch, no end, and no issue of a side a
+/// call decides later. Nobody hears a lease of a generation above the
+/// world's. On one replica none is on file: a run loads its world behind
+/// every issue on its file, and the store's generations only rise.
 #[inline]
-pub(crate) fn issuing<'a>(world: &'a StoreSnapshot, lease: &Lease) -> Issuing<'a> {
-    let spec = world.spec();
-    if lease.generation < spec.generation() {
-        return Issuing::Kept(world.front().stood_at(lease.generation));
-    }
-    if lease.generation == spec.generation() {
-        Issuing::Own(spec.engine())
-    } else {
-        Issuing::Nobody
-    }
+pub(crate) fn issuing<'a>(world: &'a StoreSnapshot, lease: &Lease) -> Option<&'a Engine> {
+    world.front().hearing(lease.generation)
 }
 
-/// What [`told`] tells, under its catch. A lease's words go by the
+/// What [`told`] tells, under its catch, by the generation `world` holds.
+/// A lease's words go by the
 /// engine's one rule over the lease as the file lends it: a single's by
 /// [`lease_events::single`] over [`Sides::with_held_single`], and a pair's
 /// by [`lease_events::pair`] over [`Sides::with_held_pair`], a side at a
@@ -163,12 +158,9 @@ pub(crate) fn issuing<'a>(world: &'a StoreSnapshot, lease: &Lease) -> Issuing<'a
 /// issue of a decode side sent with no call is dated: the store's own, at
 /// the read of the dispatch's frame. It says nothing more.
 fn tell(world: &StoreSnapshot, found: &Sides, said: Said, listed: &impl Fn(WorkerId, u16) -> bool) {
-    let spec = world.spec();
-    // The issuing engine is said by a value, which the hearers borrow.
-    let issuing = issuing(world, &found.record.lease);
     let hearers = Hearers {
-        issuing: issuing.engine(),
-        sends: spec.engine(),
+        issuing: issuing(world, &found.record.lease),
+        sends: world.spec().engine(),
         listed,
     };
     if found.decode.is_none() {

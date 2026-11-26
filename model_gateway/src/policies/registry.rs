@@ -13,7 +13,7 @@ use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
 use smg_grand_central::{
-    document::{Needs, PolicySpec},
+    document::{AppliedSpec, Needs, PolicySpec},
     engine::{Engine, InProcess, Phase},
 };
 use smg_worker::{
@@ -147,9 +147,11 @@ impl LoadBalancingPolicy for NoClassicPolicy {
 /// per-model map.
 ///
 /// Where Grand Central places every request the bits are its
-/// document's answers ([`Self::of_document`]), written where the engine is
-/// set, and no policy is asked. A second value there holds what a pair's
-/// two decisions read ([`Self::of_pairs`]).
+/// document's answers ([`Self::of_spec`]), written where the engine is
+/// set, and no policy is asked. A fifth bit then says whether a binding of
+/// the document keys by the request's own id ([`Self::REQUEST_ID`]). A
+/// second value there holds what a pair's two decisions read
+/// ([`Self::of_pairs`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TextNeeds(u8);
 
@@ -158,6 +160,13 @@ impl TextNeeds {
     const TEXT_UNDER_KEY: u8 = 1 << 1;
     const TEXT_WITH_TOKENS: u8 = 1 << 2;
     const TEXT_WITH_TOKENS_UNDER_KEY: u8 = 1 << 3;
+    /// A binding of the engine's document takes a routing key from the
+    /// request's own id. The id stands in the body, so the question a route
+    /// asks before it sends a body on unread reads this bit beside the
+    /// text's ([`Self::reads_body`]). No text question reads it
+    /// ([`Self::answer`]): a route that holds a request's body reads the id
+    /// off the request, and renders no text for it.
+    const REQUEST_ID: u8 = 1 << 4;
 
     /// What `policy` answers.
     fn of(policy: &dyn LoadBalancingPolicy) -> Self {
@@ -205,6 +214,22 @@ impl TextNeeds {
         Self::from_answers(without_tokens, with_tokens, true)
     }
 
+    /// What the document `spec` answers of a single request's body: its
+    /// text answers ([`Self::of_document`]), and [`Self::REQUEST_ID`] where
+    /// a binding of it takes a routing key from the request's own id
+    /// ([`AppliedSpec::reads_request_id`]). A route asks before it knows
+    /// the request's binding, so any binding that reads the id keeps every
+    /// body. A pair's answer holds no such bit ([`Self::of_pairs`]): the
+    /// pair routers hold a request's body already.
+    fn of_spec(spec: &AppliedSpec) -> Self {
+        let text = Self::of_document(spec.needs());
+        if spec.reads_request_id() {
+            Self(text.0 | Self::REQUEST_ID)
+        } else {
+            text
+        }
+    }
+
     /// What a pair's two decisions read of a request's text under the
     /// document `engine` runs: what some decision of the prefill phase and
     /// some decision of the decode phase may read
@@ -231,6 +256,20 @@ impl TextNeeds {
             (true, true) => Self::TEXT_WITH_TOKENS_UNDER_KEY,
         };
         self.0 & bit != 0
+    }
+
+    /// Whether a request's body is read before the request is sent on:
+    /// where a policy wants the text of a request that carries no token
+    /// ids ([`Self::answer`]), or a binding keys by the request's own id
+    /// ([`Self::REQUEST_ID`]). A valid routing key (`keyed_override`) lifts
+    /// the text's need alone: the id is read whatever the headers say.
+    fn reads_body(self, keyed_override: bool) -> bool {
+        let text = if keyed_override {
+            Self::TEXT_UNDER_KEY
+        } else {
+            Self::TEXT
+        };
+        self.0 & (text | Self::REQUEST_ID) != 0
     }
 }
 
@@ -299,7 +338,7 @@ pub struct PolicyRegistry {
     /// every request.
     engine: Arc<OnceLock<&'static InProcess>>,
 
-    /// The token trees Grand Central is lent, where its start asked
+    /// The trees Grand Central is lent, where its start asked
     /// for them ([`Self::lend_trees`]). A worker the registry lost is
     /// taken out of them by their own task
     /// ([`LentTrees::follow_removals`]).
@@ -896,7 +935,7 @@ impl PolicyRegistry {
 
     /// Hands the registry the engine the gateway started, once: a second
     /// engine is not taken. From here on the engine's document answers the
-    /// text questions ([`TextNeeds::of_document`]): the stored answer is
+    /// text questions ([`TextNeeds::of_spec`]): the stored answer is
     /// written here, and a request reads it as before. What a pair's two
     /// decisions read is stored here too, of the engine that is taken
     /// ([`TextNeeds::of_pairs`]). Both are stored again behind each spec a
@@ -995,7 +1034,7 @@ impl PolicyRegistry {
         Arc::clone(self.lent_trees.get_or_init(made))
     }
 
-    /// The token trees Grand Central is lent, where its start asked
+    /// The trees Grand Central is lent, where its start asked
     /// for them: for a case that reads what the start made.
     #[cfg(test)]
     pub(crate) fn lent_trees(&self) -> Option<Arc<LentTrees>> {
@@ -1191,7 +1230,9 @@ impl PolicyRegistry {
     /// router's live in-flight count there (see
     /// [`LoadBalancingPolicy::reconcile_in_flight`]). The worker monitor
     /// calls this at every batch of a group's load answers, for every
-    /// worker of the group.
+    /// worker of the group but a handle that left an address where another
+    /// worker counts on its own now (a handle a replacement swapped out
+    /// shares the replacement's count and is still reconciled).
     pub fn reconcile_in_flight(&self, worker: &dyn Worker) {
         if !self.classic {
             return;
@@ -1565,6 +1606,21 @@ impl PolicyRegistry {
         self.any_policy_wants_text(headers, false)
     }
 
+    /// Whether a route reads this request's body before it sends the
+    /// request on. It does where a policy routes on the request's text
+    /// ([`Self::any_policy_needs_request_text`]). Where Grand Central
+    /// places every request it also does while a binding of its document
+    /// keys by the request's own id: the id stands in the unread body too.
+    /// A valid routing-tokens hint lifts that need with the text's: such a
+    /// request is sent on unread, and the engine is handed no id for it. A
+    /// routing key lifts the text's need alone.
+    ///
+    /// A route that holds the body asks the text question instead: it
+    /// reads the id off the request, and renders no text for it.
+    pub fn any_policy_needs_request_body(&self, headers: Option<&HeaderMap>) -> bool {
+        self.read_text_needs(headers, TextNeeds::reads_body)
+    }
+
     /// [`Self::any_policy_needs_request_text`] for a request whose token ids
     /// are available: a policy that routes on the ids and reads text only
     /// without them ([`LoadBalancingPolicy::needs_request_text_with_tokens`])
@@ -1573,18 +1629,35 @@ impl PolicyRegistry {
         self.any_policy_wants_text(headers, true)
     }
 
-    /// The two text questions' shared rules: a valid routing-tokens hint
-    /// lifts the requirement, and a valid routing key under the sticky
-    /// override lifts it for the policies the override supersedes; what the
-    /// policies answer is read from [`Self::text_needs`], kept current where
-    /// a policy is added or removed, so a request walks nothing.
+    /// The two text questions, read of the stored answers under the shared
+    /// rules ([`Self::read_text_needs`]).
     fn any_policy_wants_text(&self, headers: Option<&HeaderMap>, with_tokens: bool) -> bool {
+        self.read_text_needs(headers, |needs, keyed_override| {
+            needs.answer(with_tokens, keyed_override)
+        })
+    }
+
+    /// The text questions' and the body question's shared rules: a valid
+    /// routing-tokens hint lifts the requirement, and a valid routing key
+    /// under the sticky override lifts it for the policies the override
+    /// supersedes; what the policies answer is read from
+    /// [`Self::text_needs`], kept current where a policy is added or
+    /// removed, so a request walks nothing. `read` is the asker's reading
+    /// of those answers, under such a key (its second word) or without one.
+    fn read_text_needs(
+        &self,
+        headers: Option<&HeaderMap>,
+        read: impl FnOnce(TextNeeds, bool) -> bool,
+    ) -> bool {
         if parse_routing_tokens_hint(headers).is_some() {
             return false;
         }
         let keyed_override =
             self.routing_key_override && self.resolve_routing_key(headers).is_some();
-        TextNeeds(self.text_needs.load(Ordering::Acquire)).answer(with_tokens, keyed_override)
+        read(
+            TextNeeds(self.text_needs.load(Ordering::Acquire)),
+            keyed_override,
+        )
     }
 
     /// Recompute [`Self::text_needs`] over the policies the text questions
@@ -1595,8 +1668,8 @@ impl PolicyRegistry {
     /// instead, and no policy is walked: called where the engine is set too.
     fn refresh_text_needs(&self) {
         let _one_at_a_time = self.text_needs_refresh.lock();
-        let needs = match self.document_needs() {
-            Some(needs) => TextNeeds::of_document(needs),
+        let needs = match self.engine() {
+            Some(engine) => TextNeeds::of_spec(&engine.spec()),
             None => self.policies_text_needs(),
         };
         self.text_needs.store(needs.0, Ordering::Release);
@@ -4321,6 +4394,82 @@ mod tests {
                     assert_eq!(reg.classic_made_or_asked(), 0, "{preset}");
                 }
             }
+        }
+    }
+
+    /// A document that takes a routing key from a request's own id asks for
+    /// the body of a request that carries no token ids: the id stands
+    /// there, and a route that sent the body on unread would hand the
+    /// engine no id. The answer stands under a routing key of the sticky
+    /// override, and a valid routing-tokens hint lifts the need as it
+    /// lifts a classic policy's. The stock document reads its key from
+    /// headers and asks for no body. The id is found in whichever binding
+    /// reads it: in the third row one model's, behind another model's and
+    /// ahead of the rest's, which read headers. A document whose stage
+    /// reads the text asks for the body as it asks for the text.
+    ///
+    /// No text question reads the id: the registry's, the main policy's
+    /// and the pair routers' answer for the text alone under each
+    /// document, so a route that holds a request's body renders no text
+    /// for an id.
+    #[test]
+    fn a_document_keyed_by_the_request_id_asks_for_the_body() {
+        use smg_grand_central::document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec};
+
+        use crate::routers::common::placement::tests::engine_on;
+
+        let stock = PolicySpec::preset("consistent_hashing").expect("a stock preset");
+        let binding = |model: &str, by_request_id: bool| {
+            let mut binding = stock.bindings[0].clone();
+            binding.matcher.model = model.to_string();
+            if by_request_id {
+                binding.routing_key = Some(RoutingKeySpec {
+                    sources: vec![KeySourceSpec {
+                        rid: true,
+                        ..KeySourceSpec::default()
+                    }],
+                    strip_lineage: false,
+                });
+            }
+            binding
+        };
+        let of = |bindings| {
+            let mut document = stock.clone();
+            document.bindings = bindings;
+            document
+        };
+        let some_model = vec![
+            binding("m", false),
+            binding("chat-*", true),
+            binding("*", false),
+        ];
+        let reads_text = PolicySpec::preset("cache_aware").expect("a stock preset");
+        let keyed = headers_with_routing_key("session-A");
+        let hinted = headers_with_tokens("1,2,3");
+        let asked = [None, Some(&keyed), Some(&hinted)];
+        for (name, document, id, text) in [
+            ("headers", of(vec![binding("*", false)]), false, false),
+            ("the id", of(vec![binding("*", true)]), true, false),
+            ("one model's id", of(some_model), true, false),
+            ("the text", reads_text, false, true),
+        ] {
+            let reg = PolicyRegistry::for_engine(PolicyConfig::RoundRobin, enabled_override());
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            engine_on(&reg, spec);
+            let body = asked.map(|headers| reg.any_policy_needs_request_body(headers));
+            assert_eq!(body, [id || text, id || text, false], "{name}");
+            let texts = asked.map(|headers| reg.any_policy_needs_request_text(headers));
+            assert_eq!(texts, [text, text, false], "{name}");
+            assert!(
+                !reg.any_policy_needs_request_text_with_tokens(None),
+                "{name}"
+            );
+            // The object a getter hands out answers the text question from
+            // the stored bits, and the pair routes ask the two side slots'.
+            let main = reg.get_policy_or_default("m");
+            assert_eq!(main.needs_request_text(), text, "{name}");
+            assert_eq!(reg.pair_needs_request_text(), text, "{name}");
+            assert_eq!(reg.classic_made_or_asked(), 0, "{name}");
         }
     }
 

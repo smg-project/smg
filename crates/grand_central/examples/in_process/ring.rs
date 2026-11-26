@@ -1,23 +1,25 @@
 //! The program's own hash ring.
 //!
 //! A program that routes by a ring of its own keeps one for each membership
-//! generation of a model and lends it with every request ([`LentRing`]).
-//! Under a document whose ring stage places a routing value by its text,
-//! the value goes to the worker this ring's walk reaches from where the
-//! value stands: it stays where the program's own ring policy puts it.
-//! The program places no request by a head of its prompt, so it answers no
-//! place for one ([`LentRing::head_position`], as provided) and the prefix
-//! form of the ring places such a request by its own ring. Under any other
+//! generation of a model, and lends it with every request ([`LentRing`]).
+//!
+//! Under a document whose ring stage places a routing value by its text, the
+//! value goes to the worker this ring's walk reaches from where the value
+//! stands. So it stays where the program's own ring policy puts it.
+//!
+//! The program's ring places no request by a head of its prompt, so it answers
+//! no place for one ([`LentRing::head_position`], as provided). The prefix form
+//! of the ring then places such a request by its own ring. Under any other
 //! document the engine asks the ring for an encode request's items alone.
 //!
-//! The program makes its ring with each generation and lends it always. A
-//! host whose ring is costly makes it where its document places by one: the
-//! document's needs say so (`Needs::ring`), and a gateway asks them before
-//! it reads its own ring.
+//! The program makes its ring with each generation and lends it always. A host
+//! whose ring is costly makes it only where its document places by one. The
+//! document's needs say so (`Needs::ring`), and a gateway asks them before it
+//! reads its own ring.
 //!
-//! The recipe is the program's own, and the engine reads none of it. On
-//! this ring a worker stands once, where a hash of its address puts it. A
-//! gateway's ring gives each worker many places.
+//! The recipe is the program's own, and the engine reads none of it. On this
+//! ring a worker stands once, where a hash of its address puts it. A gateway's
+//! ring gives each worker many places.
 
 use smg_grand_central::{engine::WorkerId, policies::consistent_hashing::LentRing};
 

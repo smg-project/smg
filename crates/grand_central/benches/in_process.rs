@@ -87,6 +87,8 @@ mod conversations;
 mod counting_alloc;
 #[path = "in_process/encode.rs"]
 mod encode;
+#[path = "in_process/indexed.rs"]
+mod indexed;
 #[path = "in_process/pair.rs"]
 mod pair;
 #[path = "in_process/place.rs"]
@@ -162,6 +164,11 @@ pub static MALLOC_CONF: &[u8; 100] =
 
 const MODEL: &str = "bench-model";
 
+/// The address of the list's worker at `at`.
+fn address(at: usize) -> String {
+    format!("http://worker-{at:04}:8000")
+}
+
 /// Decisions a caller makes untimed first: the buffers a thread keeps.
 const CALLER_WARM: u64 = 256;
 
@@ -193,6 +200,9 @@ struct Cell {
     /// The request of one turn of the cell's callers by the turn's seed. It
     /// is plain for every seed or for none: the bench asks it once a cell.
     request: fn(u64) -> Request<'static>,
+    /// What the cell stores behind its engine for a run's callers, ahead of
+    /// the list's first request.
+    stores: fn(&Run, &InProcess),
     /// The words the cell adds at the end of its result line.
     words: fn() -> String,
 }
@@ -200,8 +210,8 @@ struct Cell {
 impl Cell {
     /// A cell of plain requests that makes nothing behind its engine, whose
     /// callers ask the run's `decide`, which takes every run, which writes
-    /// nothing into its reports and whose line gains no word. An entry names
-    /// itself and its document.
+    /// nothing into its reports, which stores nothing for a run's callers
+    /// and whose line gains no word. An entry names itself and its document.
     const PLAIN: Self = Self {
         behind: |_| (),
         caller: None,
@@ -210,6 +220,7 @@ impl Cell {
         name: "",
         reports: |_| (),
         request: plain,
+        stores: |_, _| (),
         words: String::new,
     };
 
@@ -237,6 +248,16 @@ const CELLS: &[Cell] = &[
         words: conversations::words,
         ..Cell::PLAIN
     },
+    Cell {
+        name: "cache_aware_held",
+        document: || preset("cache_aware"),
+        behind: indexed::holds,
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        stores: conversations::held,
+        words: conversations::words,
+        ..Cell::PLAIN
+    },
     // The cache-aware preset over one prompt at every turn, under a host
     // that lends no tree. Asked by the one call (`--entry place`), a turn
     // is named its worker by the engine's record of sent prefixes. Under
@@ -245,6 +266,15 @@ const CELLS: &[Cell] = &[
     Cell {
         name: "cache_aware_one_prompt",
         document: || preset("cache_aware"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "cache_aware_indexed",
+        document: || preset("cache_aware"),
+        behind: indexed::keeps,
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        words: conversations::words,
         ..Cell::PLAIN
     },
     Cell {
@@ -388,6 +418,15 @@ const CELLS: &[Cell] = &[
         name: "pair_round_robin_later",
         document: || pair::of("round_robin"),
         request: pair::later,
+        ..Cell::PLAIN
+    },
+    // A pair under the document of three sides, its encode side under the
+    // plain ring: what a pair pays for a side it does not use, counted
+    // against `pair_round_robin`, the same two sides under the pair plan.
+    Cell {
+        name: "pair_round_robin_three_sided",
+        document: encode::ringed,
+        request: pair::request,
         ..Cell::PLAIN
     },
     Cell {
@@ -970,6 +1009,7 @@ fn main() {
         document,
         fits,
         request,
+        stores,
         ..
     } = run.cell;
     fits(&run);
@@ -980,7 +1020,7 @@ fn main() {
         "--cold-kb: this cell's callers time their own turns"
     );
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
-        .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
+        .map(|at| ready_worker(&address(at), MODEL))
         .collect();
     lend(&workers);
     if run.overloaded {
@@ -1012,6 +1052,7 @@ fn main() {
     let spec = AppliedSpec::validate(&document).expect("a valid document");
     let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(spec)));
     behind(engine);
+    stores(&run, engine);
     assert!(matches!(run.engines, 1 | 2), "one engine or two");
     // A cell whose callers make turns of their own times those turns
     // itself, and they ask one engine.

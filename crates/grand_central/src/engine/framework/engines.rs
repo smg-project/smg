@@ -359,4 +359,5 @@ fn stand_in(
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/framework/engines/tests.rs"]
 mod tests;

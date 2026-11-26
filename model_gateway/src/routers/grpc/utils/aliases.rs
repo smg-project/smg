@@ -32,7 +32,11 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// the name a downstream launcher passes for a model family whose table has no older parser
 /// (`muse` for `muse_spark`), so that the launcher's flags read with the table, or an engine's
 /// exact name for a table (`llama4_pythonic` for `llama4`, whose generic legacy name `pythonic`
-/// is in [`UNANSWERED`] while another family carries it).
+/// is in [`UNANSWERED`] while another family carries it). One row names a family, not a format:
+/// `minimax` reads with the table of the family's current line (`minimax_m3`), though the
+/// legacy reasoning parser of that name reads the M2 line's thought; a deployment of that line
+/// names its table by the table's own name, `minimax_m2`, where the registry does not list
+/// its model: alone, the name gives way to the registry ([`gives_way`]).
 pub const ALIASES: [(&str, Table); 21] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
@@ -47,7 +51,7 @@ pub const ALIASES: [(&str, Table); 21] = [
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
     ("llama4_pythonic", Table::Llama4),
-    ("minimax", Table::MinimaxM2),
+    ("minimax", Table::MinimaxM3),
     ("muse", Table::MuseSpark),
     // Command A's and Command R v01's calls, and Command A's thought. Where the table reads
     // otherwise than the legacy parsers of the two names read: `docs/tables.md`, the
@@ -123,8 +127,10 @@ pub const UNANSWERED: [(&str, &str); 9] = [
 /// the thought beside whatever read the calls. A source that names one and no tool-call parser
 /// still selects nothing while another reader is left: the registry's table reads a model it
 /// knows, and what the next source's names select reads the others. The name's table reads
-/// where nothing else does, in the place of the legacy parsers.
-pub const GIVING_WAY: [&str; 2] = ["kimi", "cohere_cmd"];
+/// where nothing else does, in the place of the legacy parsers. `minimax`, a family's name with
+/// two lines, joined them so that the registry, which tells the lines apart, reads a model of
+/// either line it lists; alone, it selected the M2 line's table before.
+pub const GIVING_WAY: [&str; 3] = ["kimi", "cohere_cmd", "minimax"];
 
 /// Whether `name` is a reasoning parser's that gives way where it stands alone
 /// (`GIVING_WAY`).

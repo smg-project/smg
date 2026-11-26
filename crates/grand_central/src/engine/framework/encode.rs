@@ -46,13 +46,13 @@
 
 use super::{
     carries_a_column, column_fits, debug_assert_cells, debug_assert_indexed, reason_of,
-    run_profile, shed, Buffers, ClassBits, Engine, PairPools, Plan, Profile, Scratch, Set,
-    ShedOver, AFFINITY_COLUMN,
+    run_profile, shed, Buffers, ClassBits, Engine, PairPools, PairSide, PairTable, Plan, Profile,
+    Scratch, Set, ShedOver, AFFINITY_COLUMN,
 };
 use crate::{
     engine::{
         decision::{Decision, ShedReason, Target, Targets, Trace, PLACES, TARGET_WORKER},
-        demands::{DemandFacts, Demands, References},
+        demands::{DemandFacts, Demands, References, UnmetDemand},
         view::{
             AffinityFacts, Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts,
             WireModes,
@@ -64,6 +64,7 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/framework/encode/tests.rs"]
 mod tests;
 
 /// The stage named when no encoder is open for the request though one that
@@ -426,16 +427,9 @@ pub(super) struct EncodeScratch {
     /// the encode pool ([`EncodeScratch::hold_opened`]), and read there
     /// alone.
     reached: Vec<u32>,
-    /// The decode classes with a registered decode: one bit a class, no
-    /// wider than the fleet.
-    decodes_of: ClassBits,
-    /// The decode classes with a registered decode that takes images.
-    vision_of: ClassBits,
-    /// Under no table, the classes of the decodes whose number the bits do
-    /// not hold, ascending.
-    far: Vec<u32>,
-    /// The same of the decodes that take images.
-    far_vision: Vec<u32>,
+    /// The decode classes with a registered decode, and those whose decode
+    /// takes images.
+    decode_classes: DecodeClasses,
     /// The prefills the encode side admits, when it does not admit all.
     prefills: Admitted,
     /// The decodes it admits, when it does not admit all.
@@ -474,6 +468,75 @@ impl EncodeScratch {
                 self.far_open.push(class);
             }
         }
+    }
+}
+
+/// The decode classes of the decodes one decision reads: the classes with a
+/// registered decode, and those whose decode takes images. It is filled from
+/// the decodes' rows under the pair table ([`Self::fill`]) and read by a
+/// class's number ([`Self::holds`], [`Self::holds_vision`]).
+///
+/// The classes stand in sets of bits no wider than the fleet. Under a table
+/// the width is the table's own, as the pair entry keeps it, and a number
+/// above it is no class of the table. Under none a class pairs by its
+/// number, whatever the number: one bit a number up to the count of the
+/// decodes, and a list for the numbers above it, which a dense numbering
+/// never names.
+#[derive(Debug, Default)]
+struct DecodeClasses {
+    /// The classes with a registered decode: one bit a class.
+    registered: ClassBits,
+    /// The classes with a registered decode that takes images.
+    vision: ClassBits,
+    /// Under no table, the classes of the decodes whose number the bits do
+    /// not hold, ascending.
+    far: Vec<u32>,
+    /// The same of the decodes that take images.
+    far_vision: Vec<u32>,
+}
+
+impl DecodeClasses {
+    /// Fills the index from `decodes`, the decodes a decision reads of a
+    /// fleet of `fleet` decodes, under `table`, and answers it filled. A
+    /// decode of no class enters none. One row's insertion records the
+    /// class and whether its decode takes images. A number the bits do not
+    /// hold is kept in the lists under no table, and is no class under one.
+    /// Both lists are sorted before the index is read.
+    #[inline(always)]
+    fn fill(&mut self, decodes: &[Candidate], fleet: usize, table: &PairTable<'_>) -> &Self {
+        let tabled = !table.is_empty();
+        let width = if tabled { table.width() } else { fleet + 1 };
+        self.registered.reset(width);
+        self.vision.reset(width);
+        self.far.clear();
+        self.far_vision.clear();
+        for row in decodes.iter().filter(|row| row.pair_class != 0) {
+            if self.registered.insert(row.pair_class) {
+                if row.vision {
+                    self.vision.insert(row.pair_class);
+                }
+            } else if !tabled {
+                self.far.push(row.pair_class);
+                if row.vision {
+                    self.far_vision.push(row.pair_class);
+                }
+            }
+        }
+        self.far.sort_unstable();
+        self.far_vision.sort_unstable();
+        self
+    }
+
+    /// Whether a registered decode is of `class`.
+    #[inline(always)]
+    fn holds(&self, class: u32) -> bool {
+        holds(&self.registered, &self.far, class)
+    }
+
+    /// Whether a registered decode that takes images is of `class`.
+    #[inline(always)]
+    fn holds_vision(&self, class: u32) -> bool {
+        holds(&self.vision, &self.far_vision, class)
     }
 }
 
@@ -841,13 +904,18 @@ impl Engine {
 
     /// [`Self::decide_encode_pair`] for a caller that judged a hard demand
     /// of the pair's two sides ahead of this call, each among its own
-    /// places. `unmet` is the stage of the demand that left a side nobody,
-    /// where one did: a request with items is shed under it with no
-    /// endpoint, behind three answers for its encoders (a gap of their
+    /// places. `unmet` is the demand that left a side nobody, and that
+    /// side, where one did: a request with items is shed under its stage
+    /// with no endpoint, for that side, behind three answers for its
+    /// encoders (a gap of their
     /// membership, none open, a saturated fleet) and ahead of the pair's.
-    /// Those three stand first, whatever its pair lacks. The encoders'
-    /// `places` answer waits behind the side's stage, as it waits behind
-    /// a gap of the pair's membership. A
+    /// Those three stand first, whatever its pair lacks. Where a list of
+    /// the pair holds no row, the request is answered there as its pair
+    /// alone is, over no candidate ([`Self::decide_over_an_empty_list`]):
+    /// with `unmet`, `cx` and `decode_cx` are the request's own
+    /// constraints, with no list's places or mask. The
+    /// encoders' `places` answer waits behind the side's stage, as it
+    /// waits behind a gap of the pair's membership. A
     /// request with no item reads no encoder: its caller sheds it ahead of
     /// this call, and `unmet` is not read for it.
     #[expect(
@@ -864,7 +932,7 @@ impl Engine {
         cx: &Constraints<'_>,
         decode_cx: &Constraints<'_>,
         encode_cx: &Constraints<'_>,
-        unmet: Option<&'static str>,
+        unmet: Option<(UnmetDemand, PairSide)>,
         scratch: &mut Scratch,
         placed: &mut EncodePlaced,
     ) -> Decision {
@@ -900,7 +968,7 @@ impl Engine {
         cx: &Constraints<'_>,
         decode_cx: &Constraints<'_>,
         encode_cx: &Constraints<'_>,
-        unmet: Option<&'static str>,
+        unmet: Option<(UnmetDemand, PairSide)>,
         scratch: &mut Scratch,
         side: &mut EncodeScratch,
         placed: &mut EncodePlaced,
@@ -1102,22 +1170,27 @@ impl Engine {
             side.far_member.sort_unstable();
             // A side of the pair that a hard demand left nobody, as this
             // call's caller judged it: said behind the encoders' own
-            // answers above and ahead of the pair's, under no profile, as
-            // the judge itself says it for a request with no item.
-            if let Some(stage) = unmet {
-                return turned_away(ShedReason::NoEndpoints, stage, unbound);
+            // answers above and ahead of the pair's, under no profile and
+            // for that side, as the judge itself says it for a request
+            // with no item. One list of the pair alone is no pair,
+            // whatever the demand left of the other: the answer is then
+            // its pair's own over no candidate, under the request's own
+            // constraints, which the caller hands for such a side.
+            if let Some((demand, lacking)) = unmet {
+                if pools.prefills.is_empty() || pools.decodes.is_empty() {
+                    let prefills = !pools.prefills.is_empty();
+                    return self.decide_over_an_empty_list(facts, pool, prefills, cx, scratch);
+                }
+                let stage = demand.stage();
+                return turned_away(ShedReason::NoEndpoints, stage, unbound).of_side(lacking);
             }
         }
         // The pairs by membership: one at all, one an encoder serves, and
         // one whose decode takes images. The request with no item that asks
         // none of them left by the early answer.
         //
-        // The decodes' classes stand in sets of bits no wider than the
-        // fleet. Under a table the width is the table's own, as the pair
-        // entry keeps it, and a number above it is no class of the table.
-        // Under none a class pairs by its number, whatever the number: one
-        // bit a number up to the count of the decodes, and a list for the
-        // numbers above it, which a dense numbering never names.
+        // The decodes' classes are read from an index of this decision's
+        // decodes ([`DecodeClasses`]).
         let class_of = |at: usize| encode.prefill_classes.get(at).copied().unwrap_or(0);
         let (mut any_pair, mut any_served, mut any_vision) = (false, false, false);
         // A request with items whose decode is not held to the ones that
@@ -1136,39 +1209,15 @@ impl Engine {
             Some(true) => (&[], &[]),
             _ => (pools.decodes, pools.prefills),
         };
-        let tabled = !pools.table.is_empty();
-        let width = if tabled {
-            pools.table.width()
-        } else {
-            pools.decodes.len() + 1
-        };
-        side.decodes_of.reset(width);
-        side.vision_of.reset(width);
-        side.far.clear();
-        side.far_vision.clear();
-        for row in decodes.iter().filter(|row| row.pair_class != 0) {
-            if side.decodes_of.insert(row.pair_class) {
-                if row.vision {
-                    side.vision_of.insert(row.pair_class);
-                }
-            } else if !tabled {
-                side.far.push(row.pair_class);
-                if row.vision {
-                    side.far_vision.push(row.pair_class);
-                }
-            }
-        }
-        side.far.sort_unstable();
-        side.far_vision.sort_unstable();
+        let decode_classes = side
+            .decode_classes
+            .fill(decodes, pools.decodes.len(), &pools.table);
         // The three answers only rise: the pass ends at the prefill
         // that gives the last of them the request reads. The third is read
         // for a request whose decode is held to the ones that take images.
         for (at, row) in prefills.iter().enumerate() {
             let listed = pools.table.of(&row.pair_class);
-            if listed
-                .iter()
-                .any(|&class| holds(&side.decodes_of, &side.far, class))
-            {
+            if listed.iter().any(|&class| decode_classes.holds(class)) {
                 any_pair = true;
                 if !needs || holds(&side.member, &side.far_member, class_of(at)) {
                     any_served = true;
@@ -1177,7 +1226,7 @@ impl Engine {
                     }
                     if listed
                         .iter()
-                        .any(|&class| holds(&side.vision_of, &side.far_vision, class))
+                        .any(|&class| decode_classes.holds_vision(class))
                     {
                         any_vision = true;
                         break;

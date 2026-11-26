@@ -342,4 +342,5 @@ fn trace(
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/framework/keyed/tests.rs"]
 mod tests;

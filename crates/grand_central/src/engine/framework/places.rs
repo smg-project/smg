@@ -118,4 +118,5 @@ pub(super) fn debug_assert_ascending(places: &[u32]) {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/framework/places/tests/mod.rs"]
 mod tests;

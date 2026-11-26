@@ -1,32 +1,42 @@
 //! A program that decides in its own process.
 //!
-//! The engine chooses the worker each request goes to, inside the program
-//! that serves the request. This example is such a program, as small as one
-//! can be. It keeps its workers in the worker crate's registry, starts the
-//! engine once from routing settings, over that registry, and serves each
-//! request by the one call the engine has for a request
-//! ([`InProcess::place`]): it keeps the placement to the request's end
-//! and says when the request went out and how it ended.
+//! The engine chooses the worker each request goes to, inside the program that
+//! serves the request. This example is such a program, as small as one can be:
 //!
-//! `program.rs` is the program. This file runs it six times, over workers
-//! that serve nothing: a send is a line on the output. The first run is over
-//! three single workers, one of which answers every send with a server
-//! error, so a request that meets it is asked again past it. The second is
-//! over pairs of a prefill worker and a decode worker: the settings' mode
-//! says so, a request lends the two lists, and the same one call names both
-//! of its workers. The third is over such a pair behind two encoders: a
-//! request lends the three lists, one that carries an item states it, and
-//! the call names the item's encoder too. The fourth is over a pair whose
-//! decode goes out behind its prefill's answer: the program asks the engine
-//! for the decode again, behind that answer. The fifth is under a policy
-//! that places a routing key by a ring: the program lends its own
-//! (`ring.rs`), and a key goes to the worker that ring puts it on. The
-//! sixth is over workers on two wires: a retry stays on the wire of the
-//! worker its request went to first.
+//! - It keeps its workers in the worker crate's registry.
+//! - It starts the engine once from routing settings, over that registry.
+//! - It serves each request by the one call the engine has for a request
+//!   ([`InProcess::place`]).
+//! - It keeps the placement to the request's end, and says when the request
+//!   went out and how it ended.
 //!
-//! `engine_load.rs` is a stage of the program's own, a scorer added in
-//! code. This file shows it once over records made by hand, as a program
-//! tests a stage of its own.
+//! `program.rs` is the program. This file runs it eight times, over workers
+//! that serve nothing: a send is a line on the output.
+//!
+//! 1. Three single workers. One answers every send with a server error, so a
+//!    request that meets it is asked again past it.
+//! 2. Pairs of a prefill worker and a decode worker. The settings' mode says
+//!    so, a request lends the two lists, and the same one call names both of
+//!    its workers.
+//! 3. Such a pair behind two encoders. A request lends the three lists, one
+//!    that carries an item states it, and the call names the item's encoder
+//!    too.
+//! 4. A pair whose decode goes out behind its prefill's answer. The program
+//!    asks the engine for the decode again, behind that answer.
+//! 5. A policy that places a routing key by a ring. The program lends its own
+//!    (`ring.rs`), and a key goes to the worker that ring puts it on.
+//! 6. Workers on two wires. A retry stays on the wire of the worker its
+//!    request went to first.
+//! 7. A worker that answers each request itself. The program states a rule of
+//!    its own with the retry, and that worker takes no further attempt of the
+//!    request.
+//! 8. A policy that sends a prompt to the worker that holds its beginning.
+//!    Each request states its prompt. The program lends its own token tree of
+//!    the prompts it sent, and keeps that tree itself.
+//!
+//! `engine_load.rs` is a stage of the program's own, a scorer added in code.
+//! This file shows it once over records made by hand, as a program tests a
+//! stage of its own.
 //!
 //! ```text
 //! cargo run -p smg-grand-central --features in-process --example in_process
@@ -43,7 +53,7 @@ use std::{error::Error, sync::Arc};
 
 use engine_load::{decided_by_engine_load, stages};
 use http::{HeaderMap, HeaderValue};
-use program::{encode_settings, pair_settings, settings, Asked, Plan, Program};
+use program::{encode_settings, pair_settings, settings, Asked, Plan, Program, OWN_ANSWER};
 use smg_grand_central::{
     document::{AppliedSpec, DecodePick, PolicySettings, PolicySpec},
     engine::{
@@ -65,6 +75,10 @@ const MODEL: &str = "model-a";
 
 /// The worker that answers every send with a server error.
 const FAILING: &str = "http://worker-1:8000";
+
+/// The worker that takes every request, runs it and fails on it: its
+/// answer is its own ([`OWN_ANSWER`]).
+const ANSWERING: &str = "http://worker-6:8000";
 
 /// A ready worker of `kind` at `address` that serves [`MODEL`], dialed over
 /// `transport`, with no health checker behind it.
@@ -90,15 +104,19 @@ fn worker(address: &str, kind: WorkerType) -> Arc<dyn Worker> {
 
 /// The example's network: a send is a line on the output.
 fn send(worker: &dyn Worker) -> u16 {
-    let status = if worker.url() == FAILING { 502 } else { 200 };
+    let status = match worker.url() {
+        FAILING => 502,
+        ANSWERING => OWN_ANSWER,
+        _ => 200,
+    };
     println!("  sent to {}, answered {status}", worker.url());
     status
 }
 
-/// The program's own scorer, asked once over records made by hand: an
-/// engine of two ranks that holds three requests on one of them, and a
-/// worker that stands alone and holds two. The request goes to the worker
-/// that stands alone, past the idle rank of the busier engine.
+/// The program's own scorer, asked once over records made by hand. One engine
+/// has two ranks and holds three requests on one of them. One worker stands
+/// alone and holds two. The request goes to the worker that stands alone, past
+/// the idle rank of the busier engine.
 fn own_stage() -> Result<(), Box<dyn Error>> {
     let mut document = PolicySpec::preset("round_robin")?;
     decided_by_engine_load(&mut document);
@@ -160,6 +178,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         model: MODEL,
         headers: None,
         items: &[],
+        tokens: None,
     };
     for request in 1..=4 {
         println!("request {request}:");
@@ -185,6 +204,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     in_turn(&asked).await?;
     by_ring().await?;
     on_one_wire(&asked).await?;
+    by_rule(&asked).await?;
+    by_tree(&asked).await?;
     own_stage()
 }
 
@@ -298,11 +319,13 @@ async fn in_turn(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The program under `consistent_hashing` over three single workers, none
-/// of them [`FAILING`], each request under a routing key its header names.
-/// The program lends its own ring with the request, so a key's requests go
-/// to the worker that ring puts the key on: the first of the ring's walk
-/// from where the key stands. No send fails here, so no request walks on.
+/// The program under `consistent_hashing` over three single workers, none of
+/// them [`FAILING`], each request under a routing key its header names.
+///
+/// The program lends its own ring with the request, so a key's requests go to
+/// the worker that ring puts the key on. That worker is the first of the
+/// ring's walk from where the key stands. No send fails here, so no request
+/// walks on.
 async fn by_ring() -> Result<(), Box<dyn Error>> {
     let settings = settings(PolicySettings::ConsistentHashing);
     let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
@@ -333,6 +356,7 @@ async fn by_ring() -> Result<(), Box<dyn Error>> {
             model: MODEL,
             headers: Some(&headers),
             items: &[],
+            tokens: None,
         };
         for _ in 0..2 {
             let answer = program.serve(&asked);
@@ -373,5 +397,113 @@ async fn on_one_wire(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
         let answer = program.serve(asked);
         println!("  the client reads {}", answer.status);
     }
+    Ok(())
+}
+
+/// The program over a worker that answers each request itself, first beside
+/// a worker that is not serving and then alone. A worker that answered a
+/// request itself takes no further attempt of it: the program states that
+/// rule of its own with each later attempt. Beside the other worker, the
+/// request's other attempts go there, and the client reads that worker's
+/// status. Alone, its answer is the client's after one send: the rule
+/// leaves the next attempt no worker, and the engine says so.
+async fn by_rule(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let fleets = [
+        (&[ANSWERING, FAILING][..], "beside one that is not serving"),
+        (&[ANSWERING][..], "alone"),
+    ];
+    for (addresses, how) in fleets {
+        let settings = settings(PolicySettings::RoundRobin);
+        let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+        let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+        let (program, task) = Program::start(plan, spec, None, send);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the engine's task runs for the life of the process"
+        )]
+        let _task = tokio::spawn(task);
+        for address in addresses {
+            let single = worker(address, WorkerType::Regular);
+            assert!(program.join(single), "a free address joins");
+        }
+        tokio::task::yield_now().await;
+        println!("a request over a worker that answers it itself, {how}:");
+        let answer = program.serve(asked);
+        match answer.unplaced {
+            Some(unplaced) => println!("  the client reads {}: {unplaced:?}", answer.status),
+            None => println!("  the client reads {}", answer.status),
+        }
+    }
+    Ok(())
+}
+
+/// The program under `cache_aware` over three single workers, none of them
+/// [`FAILING`]: a policy that sends a prompt to the worker that holds its
+/// beginning.
+///
+/// Each request states its prompt's token ids, and the program lends the
+/// engine its own token tree of the prompts it sent. So the turns of a
+/// conversation go back to the worker of its first.
+///
+/// The tree stays the program's to keep. Its own pass holds the tree to a
+/// size, by the tree's own order: the conversation matched longest ago goes
+/// first. A worker that leaves is taken out of it.
+async fn by_tree(asked: &Asked<'_>) -> Result<(), Box<dyn Error>> {
+    let policy = PolicySettings::of_label("cache_aware").ok_or("a policy of that name")?;
+    let settings = settings(policy);
+    let plan = Plan::of(&settings).ok_or("a mode the program serves")?;
+    let spec = AppliedSpec::validate(&settings.policy_document()?)?;
+    let (program, task) = Program::start(plan, spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+    let addresses = [
+        "http://worker-0:8000",
+        "http://worker-2:8000",
+        "http://worker-3:8000",
+    ];
+    for address in addresses {
+        let single = worker(address, WorkerType::Regular);
+        assert!(program.join(single), "a free address joins");
+    }
+    tokio::task::yield_now().await;
+    // A turn's prompt is the conversation so far: the turns before it, and
+    // one page of the tree more.
+    let mut said: Vec<u32> = (0..1024).collect();
+    for turn in 1..=3 {
+        println!("turn {turn} of a conversation, {} tokens:", said.len());
+        let answer = program.serve(&Asked {
+            tokens: Some(&said),
+            ..*asked
+        });
+        println!("  the client reads {}", answer.status);
+        said.extend(turn * 100_000..turn * 100_000 + 16);
+    }
+    // Another conversation shares no page with the first.
+    let other: Vec<u32> = (500_000..501_024).collect();
+    println!(
+        "the first turn of another conversation, {} tokens:",
+        other.len()
+    );
+    let answer = program.serve(&Asked {
+        tokens: Some(&other),
+        ..*asked
+    });
+    println!("  the client reads {}", answer.status);
+    let tree = program.tree(MODEL).ok_or("the model's tree")?;
+    println!(
+        "the program's tree holds {} tokens",
+        tree.total_token_size()
+    );
+    // The pass a program's own timer would run, at its settings' number.
+    program.trim(1_100);
+    let left = tree.total_token_size();
+    println!("  behind the program's pass at 1100 tokens, {left}");
+    let last = answer.sent.last().ok_or("a turn that was sent")?;
+    assert!(program.leave(last), "a worker that joined leaves");
+    let left = tree.total_token_size();
+    println!("  with {last} gone, {left}");
     Ok(())
 }

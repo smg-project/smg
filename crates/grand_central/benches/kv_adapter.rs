@@ -27,7 +27,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use kv_index::{compute_content_hash, ChainBlockMap, ChainIndex, SequenceHash, StoredBlock};
 use smg_grand_central::{
     engine::WorkerId,
-    store::{MemoryStore, Signals, WorkerFacts, WorkersStore},
+    store::{MemoryStore, Registrant, Signals, WorkerFacts},
     worker_host::{KvAdapter, KvHost, KvTables, Members, Objects},
 };
 use smg_worker::{
@@ -203,8 +203,11 @@ impl Hosted {
     fn new(workers: usize, prefix: &[KvBlock]) -> Self {
         let url = |worker: usize| format!("grpc://w{worker}:8000");
         let store = MemoryStore::new();
+        let tables = Arc::new(KvTables::default());
+        let registry = Arc::new(WorkerRegistry::<Members>::new());
+        let objects = Arc::new(Objects::new(registry).with_kv_tables(Arc::clone(&tables)));
         for worker in 0..workers {
-            store.upsert(WorkerFacts {
+            let facts = WorkerFacts {
                 key: url(worker),
                 engine: url(worker),
                 incarnation: 1,
@@ -216,12 +219,10 @@ impl Hosted {
                     ..Signals::default()
                 },
                 ..WorkerFacts::default()
-            });
+            };
+            let written = objects.upsert(&store, facts, Registrant::Control);
+            written.expect("the store takes the write");
         }
-        let tables = Arc::new(KvTables::default());
-        let registry = Arc::new(WorkerRegistry::<Members>::new());
-        let objects = Arc::new(Objects::new(registry).with_kv_tables(Arc::clone(&tables)));
-        objects.follow(&store);
         let host = KvHost::new(Arc::clone(&objects));
         let held = stored(prefix, None);
         let feeds: Vec<_> = (0..workers)

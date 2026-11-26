@@ -37,7 +37,7 @@ use crate::{
         framework::{self, DecisionScope, TieBand},
         view::{Candidate, Phase, PoolFacts, RequestFacts},
     },
-    plugins::shared::{BoundPlugin, Fallback, HalfOpen, OpenDecision},
+    plugins::shared::{BoundPlugin, Budget, Fallback, HalfOpen},
     tracking::lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     Draw,
 };
@@ -130,17 +130,16 @@ impl Open {
 
     /// What this decision's next call runs under, drawing on the thread's
     /// decision budget at the plugin's calibration.
-    fn frame<'a>(&'a mut self, budget: &'a mut OpenDecision, fuel_per_micro: u64) -> Frame<'a> {
+    fn frame<'a>(&'a mut self, budget: &'a mut Budget, fuel_per_micro: u64) -> Frame<'a> {
         Frame {
             cap: self.frame_fuel,
-            remaining_micros: &mut budget.remaining_micros,
+            budget,
             fuel_per_micro,
             frame_micros: self.frame_micros,
             now: Some(self.now),
             draw: Some(&mut self.draw),
             quiet: false,
             decision: self.decision,
-            seed_micros: budget.seed_micros,
         }
     }
 
@@ -269,9 +268,10 @@ impl PluginBinding {
         // The decision's budget is one a thread: its first open seeds it,
         // every open of the decision (each side, each plugin of every
         // runtime built over the same open decisions) draws on it.
-        let mut budget = plugin.runtime.decisions.on_this_thread();
-        let decision = budget.open(facts.budget_micros);
+        let mut on_thread = plugin.runtime.decisions.on_this_thread();
+        let decision = on_thread.open(facts.budget_micros);
         open.decision = decision;
+        let budget = on_thread.budget();
         if plugin.note_open(decision) {
             // The plugin already failed this decision (the other side of a
             // pair, another binding): its part in the decision is over, with
@@ -293,7 +293,7 @@ impl PluginBinding {
             open.bypass = true;
             return;
         }
-        if budget.remaining_micros == 0 {
+        if budget.is_spent() {
             // An earlier open of this decision spent the remainder: no frame
             // is forwarded, the stage falls back, the breaker is untouched.
             bump(&plugin.tally.budget_spent);
@@ -330,7 +330,7 @@ impl PluginBinding {
             // an armed thread reads its clock around it, which makes the two
             // one: a held `init` is no slow sample there.
             let fuel_per_micro = frame.fuel_per_micro.max(1);
-            let left = budget.remaining_micros.saturating_mul(fuel_per_micro);
+            let left = budget.fuel(fuel_per_micro);
             let init_fuel = plugin.init_fuel();
             let watched = plugin.runtime.thread_clock;
             let start = if watched && plugin.armed() {
@@ -351,12 +351,12 @@ impl PluginBinding {
             match made {
                 Ok(instance) => {
                     bump(&plugin.tally.lazy_instantiations);
-                    budget.remaining_micros = budget.remaining_micros.saturating_sub(charged);
+                    budget.draw(charged);
                     plugin.note_init(decision, own);
                     plugin.seat(&mut guard, instance);
                 }
                 Err(LoadError::Trap { .. })
-                    if left < init_fuel && charged >= budget.remaining_micros =>
+                    if left < init_fuel && charged >= budget.remaining_micros() =>
                 {
                     // The remainder clamped `init` below its own frame and
                     // the clamp ended it: the charge reached what was left
@@ -372,7 +372,7 @@ impl PluginBinding {
                     // clock reads as long here too, unless a reading says
                     // its thread did not have that time.
                     let init_micros = left.div_ceil(fuel_per_micro).max(charged);
-                    budget.remaining_micros = budget.remaining_micros.saturating_sub(init_micros);
+                    budget.draw(init_micros);
                     plugin.note_init(decision, own);
                     bump(&plugin.tally.budget_spent);
                     plugin.emptied.get_or_default().set(true);
@@ -385,7 +385,7 @@ impl PluginBinding {
                     // have ended the same under the full frame). The failure
                     // is the breaker's, the charge the decision's and part
                     // of the plugin's sample.
-                    budget.remaining_micros = budget.remaining_micros.saturating_sub(charged);
+                    budget.draw(charged);
                     plugin.note_init(decision, own);
                     plugin.fail(now);
                     open.bypass = true;
@@ -429,7 +429,7 @@ impl PluginBinding {
         let count = open.count;
         let exposure = &plugin.exposure;
         let needs = plugin.needs;
-        let frame = open.frame(&mut budget, frame.fuel_per_micro);
+        let frame = open.frame(budget, frame.fuel_per_micro);
         let constructed = plugin.call(&mut guard, frame, |inst| {
             let result = match &inst.exports {
                 Exports::Record(b) => {
@@ -488,13 +488,13 @@ impl PluginBinding {
         }
         let plugin = &self.plugin;
         let mut opens = self.opens.get_or_default().borrow_mut();
-        let mut budget = plugin.runtime.decisions.on_this_thread();
+        let mut on_thread = plugin.runtime.decisions.on_this_thread();
         // One bit a phase that was open.
         let mut closing = 0u8;
         for (phase, open) in opens.0.iter_mut().enumerate() {
             if open.is_open {
                 open.is_open = false;
-                budget.close();
+                on_thread.close();
                 closing |= 1 << phase;
             }
         }
@@ -528,17 +528,16 @@ impl PluginBinding {
                     // decision by a frame; not a latency sample. Running out
                     // of either drops the instance through the call's own
                     // fault path.
-                    let mut remaining = u64::from(DESTRUCTOR_BOUND_MICROS);
+                    let mut alone = Budget::alone(DESTRUCTOR_BOUND_MICROS);
                     let frame = Frame {
                         cap: plugin.frame.fuel_of(DESTRUCTOR_FRAME_MICROS),
-                        remaining_micros: &mut remaining,
+                        budget: &mut alone,
                         fuel_per_micro: plugin.frame.fuel_per_micro,
                         frame_micros: DESTRUCTOR_BOUND_MICROS,
                         now: Some(open.now),
                         draw: Some(&mut open.draw),
                         quiet: true,
                         decision: 0,
-                        seed_micros: 0,
                     };
                     let _ = plugin.call(&mut guard, frame, |inst| {
                         resource.resource_drop(&mut inst.store).map(Ok)
@@ -547,10 +546,10 @@ impl PluginBinding {
             }
             decision = open.decision;
             open.reset();
-            last = plugin.note_close(decision, budget.seed_micros);
+            last = plugin.note_close(decision, on_thread.budget().seed_micros());
         }
         walk.returned = true;
-        drop(budget);
+        drop(on_thread);
         // A slot this decision emptied (a call interrupted or trapped, an
         // answer outside the contract, a destructor that ran out) is rebuilt
         // once here, under the full init frame, so the next decision finds it
@@ -602,8 +601,8 @@ impl PluginBinding {
         let plugin = &self.plugin;
         let mut guard = plugin.slot().borrow_mut();
         let resource = open.live(guard.as_ref())?;
-        let mut budget = plugin.runtime.decisions.on_this_thread();
-        let frame = open.frame(&mut budget, plugin.frame.fuel_per_micro);
+        let mut on_thread = plugin.runtime.decisions.on_this_thread();
+        let frame = open.frame(on_thread.budget(), plugin.frame.fuel_per_micro);
         let answer = plugin.call(&mut guard, frame, |inst| call(inst, resource));
         Ok((answer, guard))
     }
@@ -878,15 +877,5 @@ fn bit(mask: &[u64], position: u32) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::bit;
-
-    #[test]
-    fn a_mask_reads_its_bits_and_nothing_past_its_end() {
-        let mask = [1u64 << 3, 1];
-        assert!(bit(&mask, 3));
-        assert!(bit(&mask, 64));
-        assert!(!bit(&mask, 4));
-        assert!(!bit(&mask, 200));
-    }
-}
+#[path = "../../../../tests/unit/plugins/wasm/plugin/bound/tests.rs"]
+mod tests;

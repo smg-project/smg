@@ -359,4 +359,5 @@ impl Drop for ProviderTask {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/service/controller/discovery/tests.rs"]
 mod tests;

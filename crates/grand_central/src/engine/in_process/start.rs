@@ -123,4 +123,5 @@ impl InProcess {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/start/tests.rs"]
 mod tests;

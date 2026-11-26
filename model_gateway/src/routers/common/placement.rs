@@ -436,15 +436,26 @@ impl PlacedPair {
     /// that names no decode, which the engine answers no pair's lists with.
     fn by_engine(placement: Placement<'_>, stated: Stated) -> Option<Self> {
         let routing_key = placement.routing_key;
-        let placement = placement.kept();
         let prefill = Arc::clone(&placement.worker);
         let decode = placement.decode.clone()?;
         let runtime = prefill.metadata().spec.runtime_type;
-        let (prefill_side, decode_side) = placement.sides();
+        // Each side goes into its box out of the pair as the engine hands
+        // it. Bound by itself first, or asked through `?`, a side is
+        // copied whole once more on the way.
+        let sides = placement.kept().sides();
+        let prefill_side = Box::new(sides.0);
+        #[expect(
+            clippy::question_mark,
+            reason = "asked through `?`, a side is copied whole once more on the way"
+        )]
+        let decode_side = match sides.1 {
+            Some(side) => Box::new(side),
+            None => return None,
+        };
         Some(Self {
             // A prefill's answer is asked nothing again.
             prefill: Placed::by_side(prefill, prefill_side, routing_key, Stated::nothing()),
-            decode: Placed::by_side(decode, decode_side?, routing_key, stated),
+            decode: Placed::by_side(decode, decode_side, routing_key, stated),
             runtime,
         })
     }
@@ -759,17 +770,19 @@ impl Placed {
     /// The answer for one worker of a pair Grand Central placed: the
     /// worker with its own side of the pair's placement, counted under the
     /// routing value the engine names for the pair. `stated` is what the
-    /// request stated for the engine alone at that decision.
+    /// request stated for the engine alone at that decision. The side comes
+    /// in the box the answer keeps it in: a decode that moved hands on the
+    /// box its first answer held.
     fn by_side(
         worker: Arc<dyn Worker>,
-        side: PlacementSide,
+        side: Box<PlacementSide>,
         routing_key: Option<&str>,
         stated: Stated,
     ) -> Self {
         Self {
             worker,
             engine: Some(Box::new(ByEngine {
-                side: Mutex::new(Some(Box::new(side))),
+                side: Mutex::new(Some(side)),
                 end: Mutex::default(),
                 routing_key: routing_key.map(Box::from),
                 stated,
@@ -1068,7 +1081,7 @@ impl ByEngine {
     #[inline(never)]
     #[expect(
         clippy::too_many_arguments,
-        reason = "the pair placement's own arguments, and the decode's guard"
+        reason = "the pair placement's own arguments, the decode's guard and its claim"
     )]
     fn decode_again(
         &self,
@@ -1079,6 +1092,7 @@ impl ByEngine {
         wire: Option<WireConstraint>,
         inputs: PlacementInputs<'_>,
         ahead: WorkerLoadGuard,
+        claimed: bool,
     ) -> (Option<Placed>, WorkerLoadGuard) {
         let Some(engine) = policies.engine() else {
             return (None, ahead);
@@ -1103,6 +1117,7 @@ impl ByEngine {
             &pairs,
             wire,
             None,
+            claimed.then_some(&ahead),
             inputs,
             self.stated,
             |request| {
@@ -1135,14 +1150,14 @@ impl ByEngine {
         // the request stated all the same, for a retry that states it
         // again off the answer of the attempt before ([`Placed::stated`]).
         let routing_key = self.routing_key.as_deref();
-        let moved = Placed::by_side(worker, *side, routing_key, self.stated);
+        let moved = Placed::by_side(worker, side, routing_key, self.stated);
         (Some(moved), guard)
     }
 }
 
 /// The model's hash ring as one request lends it to Grand Central
-/// ([`LentRing`]), read where the engine's document places by a ring and
-/// nowhere else.
+/// ([`LentRing`]), read where the engine's document places a request of
+/// its phases by a ring and nowhere else.
 ///
 /// A classic ring policy is handed the model's ring for every list a
 /// request is placed over: the pool's own, the part of it on a retry's
@@ -1151,7 +1166,8 @@ impl ByEngine {
 /// classic policy does ([`HashRing::find_healthy_url`]), so a routing value
 /// keeps the worker it has.
 enum ModelRing<'a> {
-    /// The document places by no ring: none is read.
+    /// The document places no request of these phases by a ring: none is
+    /// read.
     Unread,
     /// The ring of the generation the request's list is read from, once it
     /// is filled. It is borrowed from that snapshot: the request takes no
@@ -1168,16 +1184,36 @@ enum ModelRing<'a> {
 }
 
 impl<'a> ModelRing<'a> {
-    /// The ring for a request of `model_id` whose list is read from
-    /// `generation`.
+    /// Whether some decision of one of `phases` places by a ring under the
+    /// document in force
+    /// ([`needs_for_phase`](smg_grand_central::engine::Engine::needs_for_phase)).
+    /// A request names the phases it is decided in: a ring that another
+    /// phase's profile alone walks is not read for it, as the encode side's
+    /// is not for a pair. The whole document's word is read first: where no
+    /// profile places by a ring it is the one read, and no phase is asked.
+    /// Each is one word, read with no counted reference of the document.
+    fn walked_in(engine: &InProcess, phases: &[Phase]) -> bool {
+        engine.with_spec(|spec| {
+            if !spec.needs().ring {
+                return false;
+            }
+            let engine = spec.engine();
+            phases
+                .iter()
+                .any(|&phase| engine.needs_for_phase(phase).ring)
+        })
+    }
+
+    /// The ring for a request of `model_id` decided in `phases`, whose list
+    /// is read from `generation`.
     fn of(
         engine: &InProcess,
         policies: &PolicyRegistry,
         model_id: &str,
         generation: &'a ModelWorkerSnapshot,
+        phases: &[Phase],
     ) -> Self {
-        // One word of the document, read with no counted reference of it.
-        if !engine.with_spec(|spec| spec.needs().ring) {
+        if !Self::walked_in(engine, phases) {
             return Self::Unread;
         }
         match generation.hash_ring() {
@@ -1186,16 +1222,17 @@ impl<'a> ModelRing<'a> {
         }
     }
 
-    /// The ring for a request whose caller holds no snapshot: the one the
-    /// registry answers for `model_id` now, as the classic selection reads
-    /// it for such a list.
+    /// The ring for a request decided in `phases` whose caller holds no
+    /// snapshot: the one the registry answers for `model_id` now, as the
+    /// classic selection reads it for such a list.
     fn read(
         engine: &InProcess,
         policies: &PolicyRegistry,
         registry: &WorkerRegistry,
         model_id: &str,
+        phases: &[Phase],
     ) -> Self {
-        if !engine.with_spec(|spec| spec.needs().ring) {
+        if !Self::walked_in(engine, phases) {
             return Self::Unread;
         }
         Self::standing(policies.hash_ring(registry, model_id))
@@ -1482,7 +1519,7 @@ fn single_of_by_engine(
     stated: impl FnOnce() -> Stated,
 ) -> Option<Placed> {
     let stated = stated();
-    let ring = ModelRing::of(engine, policies, model_id, snapshot);
+    let ring = ModelRing::of(engine, policies, model_id, snapshot, &[Phase::Single]);
     let ring = ring.lent();
     let lent = snapshot.lent(pool);
     placed_by_engine(engine, policies, model_id, lent, ring, wire, inputs, stated)
@@ -2577,13 +2614,48 @@ impl PairAdmission for PairGates<'_> {
     }
 }
 
+/// A pair's admission ([`PairGates`]) for a decode asked again by a request
+/// that holds a claim at its decode's gate, which its route made before the
+/// prefill was sent ([`decode_again`]): the decode `claimed` counts has a
+/// room whatever its gate reads, since the room that fills the gate is the
+/// request's own. Every other worker is read as the gates read it.
+struct ClaimedGates<'a> {
+    gates: &'a PairGates<'a>,
+    claimed: &'a WorkerLoadGuard,
+}
+
+impl fmt::Debug for ClaimedGates<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaimedGates")
+            .field("gates", self.gates)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PairAdmission for ClaimedGates<'_> {
+    fn has_capacity(&self, prefill: usize) -> bool {
+        self.gates.has_capacity(prefill)
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        self.gates
+            .decodes
+            .get(decode)
+            .is_some_and(|worker| self.claimed.counts(worker))
+            || self.gates.has_room(decode)
+    }
+}
+
 /// Grand Central's request for a pair over the two pools of `pairs`,
 /// handed to `ask`: each pool's list with its cell and the index's pair
 /// classes ([`PdPairIndex::lent`]), and this gateway's two admission reads
 /// ([`PairGates`]), on the hash ring the registry answers for the model now
 /// ([`ModelRing::read`]). One function for a pair's two decisions: the
 /// first ([`pair_by_engine`]), and the decode asked again behind its
-/// prefill ([`decode_again`]), which reads no prefill's capacity.
+/// prefill ([`decode_again`]), which reads no prefill's capacity and hands
+/// the guard of its first decode as `claimed` where the request holds a
+/// claim at that decode's gate: the engine then reads the gates with that
+/// claim ([`ClaimedGates`]).
 ///
 /// What `inputs` and `stated` state of the request is handed as the engine
 /// reads it ([`place_request`]), the route's own rule among it, which the
@@ -2614,6 +2686,7 @@ fn with_pair_request<R>(
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    claimed: Option<&WorkerLoadGuard>,
     inputs: PlacementInputs<'_>,
     stated: Stated,
     ask: impl FnOnce(&mut PlaceRequest<'_>) -> R,
@@ -2624,11 +2697,19 @@ fn with_pair_request<R>(
         decodes: decode.workers,
         capacity: prefill_capacity,
     };
+    let claimed = claimed.map(|claimed| ClaimedGates {
+        gates: &gates,
+        claimed,
+    });
+    let admission: &dyn PairAdmission = match &claimed {
+        Some(claimed) => claimed,
+        None => &gates,
+    };
     let lists = PairLists {
         prefill,
         decode,
         classes,
-        admission: &gates,
+        admission,
         // No place of a list is stated. A pinned request is held to its
         // wire by its demand, a side at a time, and the engine asks the
         // route's rule of a list itself.
@@ -2646,7 +2727,8 @@ fn with_pair_request<R>(
     tried_ids(prefill.workers, inputs.tried, &mut tried);
     tried_ids(decode.workers, inputs.tried, &mut decodes_tried);
     tried.append(&mut decodes_tried);
-    let ring = ModelRing::read(engine, policies, registry, model_id);
+    let sides = [Phase::Prefill, Phase::Decode];
+    let ring = ModelRing::read(engine, policies, registry, model_id, &sides);
     let mut request = place_request(
         model_id,
         WorkerLists::Pair(lists),
@@ -2738,6 +2820,7 @@ fn pair_by_engine(
         pairs,
         wire,
         prefill_capacity,
+        None,
         inputs,
         stated,
         |request| {
@@ -2832,9 +2915,14 @@ fn pair_by_engine(
 /// stands now ([`PairsAgain`]): the route's own rule in `inputs` is asked of
 /// the decode the engine picks. What the request stated for the engine
 /// alone ([`Stated`]) is stated again as the decode's answer kept it, so a
-/// route states it once. The function answers the guard to keep, and
-/// the decode the request goes to now where that is another worker than
-/// `decode`'s:
+/// route states it once. `claimed` says whether the request holds a claim
+/// at `decode`'s admission gate, as it does on a route that claims a
+/// decode's room before it sends the prefill: the engine then reads that
+/// decode with a room whatever its gate reads, since the room that fills
+/// the gate is the request's own. A route that claims no room says `false`,
+/// and every gate is read as it stands. The function answers the guard to
+/// keep, and the decode the request goes to now where that is another
+/// worker than `decode`'s:
 ///
 /// - `(None, ahead)` wherever the first decision's decode stands: under the
 ///   classic policies, under a document that picked the decode with its
@@ -2863,7 +2951,7 @@ fn pair_by_engine(
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the pair placement's own arguments, the decode's answer and its guard"
+    reason = "the pair placement's own arguments, the decode's answer, its guard and its claim"
 )]
 pub(crate) fn decode_again(
     registry: &WorkerRegistry,
@@ -2874,10 +2962,13 @@ pub(crate) fn decode_again(
     inputs: PlacementInputs<'_>,
     decode: &Placed,
     ahead: WorkerLoadGuard,
+    claimed: bool,
 ) -> (Option<Placed>, WorkerLoadGuard) {
     match &decode.engine {
         None => (None, ahead),
-        Some(first) => first.decode_again(registry, policies, model_id, pairs, wire, inputs, ahead),
+        Some(first) => first.decode_again(
+            registry, policies, model_id, pairs, wire, inputs, ahead, claimed,
+        ),
     }
 }
 
@@ -9052,6 +9143,89 @@ pub(crate) mod tests {
         assert!(fills_the_ring("consistent_hashing"));
     }
 
+    /// The engine's request reads the model's ring for the phases it is
+    /// decided in alone. The three-sided settings' document walks a ring on
+    /// its encode side, the side's default policy, whatever its other sides
+    /// run. A pair is decided in the prefill and the decode phase: it fills
+    /// the ring where one of those two sides walks it, and not for the
+    /// encode side's sake. A single request of a gateway of many routers is
+    /// decided under the main policy: it fills the ring where that policy
+    /// walks it.
+    #[test]
+    fn the_engine_reads_the_ring_for_a_requests_own_phases() {
+        use crate::config::{RouterConfig, RoutingMode};
+
+        let ring = || Some(PolicyConfig::ConsistentHashing);
+        let turns = || Some(PolicyConfig::RoundRobin);
+        let engine_of = |main: PolicyConfig, prefill, decode, many_routers: bool| {
+            let settings = RouterConfig {
+                mode: RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![],
+                    prefill_urls: vec![],
+                    decode_urls: vec![],
+                    encode_policy: None,
+                    prefill_policy: prefill,
+                    decode_policy: decode,
+                },
+                policy: main,
+                enable_igw: many_routers,
+                ..Default::default()
+            };
+            let policies = PolicyRegistry::for_engine(
+                settings.policy.clone(),
+                settings.routing_key_override.clone(),
+            );
+            let document = settings.policy_document().expect("the settings' document");
+            let spec = AppliedSpec::validate(&document).expect("a valid document");
+            assert!(spec.needs().ring, "the encode side walks the ring");
+            engine_on(&policies, spec);
+            policies
+        };
+        let pair_fills = |prefill, decode| {
+            let registry = pd_registry(&[
+                ("grpc://p1:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://p2:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d1:1", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d2:1", WorkerType::Decode, Some("NixlConnector")),
+            ]);
+            let policies = engine_of(PolicyConfig::RoundRobin, prefill, decode, false);
+            let pairs = pairs_of(&registry, &policies);
+            let headers = keyed_headers();
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                with_headers(&headers),
+                Stated::nothing,
+            );
+            assert!(pair.is_ok(), "a pair is open");
+            assert_eq!(policies.classic_made_or_asked(), 0);
+            registry.get_routing_snapshot(MODEL).hash_ring_is_filled()
+        };
+        assert!(!pair_fills(None, None), "for the encode side's sake");
+        assert!(pair_fills(ring(), None), "the prefill side walks it");
+        assert!(pair_fills(None, ring()), "the decode side walks it");
+        let single_fills = |main: PolicyConfig| {
+            let registry = http_registry(&["http://h:1", "http://h:2"]);
+            let policies = engine_of(main, turns(), turns(), true);
+            let headers = keyed_headers();
+            pick(&registry, &policies, with_headers(&headers));
+            assert_eq!(policies.classic_made_or_asked(), 0);
+            registry.get_routing_snapshot(MODEL).hash_ring_is_filled()
+        };
+        assert!(
+            !single_fills(PolicyConfig::RoundRobin),
+            "for the encode side's sake"
+        );
+        assert!(
+            single_fills(PolicyConfig::ConsistentHashing),
+            "the main policy walks it"
+        );
+    }
+
     /// The selection metric's lines for [`MODEL`] as a recorder renders
     /// them: each line's policy label with its count.
     fn selections_by_policy(rendered: &str) -> BTreeMap<String, u64> {
@@ -10183,6 +10357,7 @@ pub(crate) mod tests {
             inputs,
             &pair.decode,
             ahead,
+            false,
         )
     }
 
@@ -10281,6 +10456,7 @@ pub(crate) mod tests {
             inputs,
             &pair.decode,
             sent,
+            false,
         );
         assert!(moved.is_none());
         assert!(guard.counts(pair.decode.worker()));
@@ -10418,6 +10594,7 @@ pub(crate) mod tests {
             inputs,
             &pair.decode,
             ahead,
+            false,
         );
         assert!(moved.is_none());
         assert!(guard.counts(pair.decode.worker()));

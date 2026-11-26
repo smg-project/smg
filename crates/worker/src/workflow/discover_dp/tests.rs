@@ -463,7 +463,7 @@ fn the_plain_worker_warning_names_the_engine_the_route_and_what_was_read() {
             "answered what is no load report",
         ),
         (
-            NativeLoads::Unreadable(FetchFailure::Deadline),
+            NativeLoads::Inconclusive(FetchFailure::Deadline),
             "gave no answer",
         ),
         (

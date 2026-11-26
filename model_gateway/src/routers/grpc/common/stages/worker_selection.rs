@@ -943,9 +943,10 @@ impl WorkerSelectionStage {
     /// prefill's answer could fail a request the first decode would have
     /// served; and its admission gate takes the request now, by one try
     /// with no wait ([`pd_admission::try_admit_decode`]). The first decode
-    /// holds with no try: its client and its claim stand. A claim tried for
-    /// a decode the engine then passes over is given back at the next try,
-    /// and at the call's end.
+    /// holds with no try: its client and its claim stand, and the engine
+    /// reads it with the room that claim holds ([`RequestAgain::claimed`]).
+    /// A claim tried for a decode the engine then passes over is given back
+    /// at the next try, and at the call's end.
     ///
     /// Answers the guard to keep, and the decode the request moved to where
     /// it moved, with its client and its gate's claim.
@@ -1021,6 +1022,7 @@ impl WorkerSelectionStage {
             inputs,
             first,
             ahead,
+            request.claimed,
         );
         let brought = brought.into_inner();
         let moved = moved.and_then(|decode| {
@@ -1234,6 +1236,9 @@ pub(crate) struct RequestAgain<'a> {
     /// The engines the request's failed attempts were sent to.
     pub tried: &'a [String],
     pub ledger: &'a AttemptLedger,
+    /// Whether the dispatch holds a claim at the first decode's admission
+    /// gate, as its load guards say.
+    pub claimed: bool,
 }
 
 /// A decode a request moved to behind its prefill: its placement's answer,

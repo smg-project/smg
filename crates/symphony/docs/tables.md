@@ -357,6 +357,10 @@ writes the thought as `<think>\n`, the reasoning, `\n</think>\n\n`, then the con
 model's to write and reach the reasoning and content streams (bellwether #17's question, as for
 Qwen3), the ones inside the block are its wrapping.
 
+A deployment whose model the registry does not list names this table by its own name: the
+gateway reads the family's name, `minimax`, with the M3 table there. A model of this line the
+registry lists keeps this table behind the family's name alone.
+
 ## MiniMax M3 (`minimax_m3`)
 
 What this table says beyond the DSML one:

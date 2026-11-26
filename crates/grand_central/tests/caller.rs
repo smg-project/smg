@@ -1,32 +1,36 @@
-//! The program of the `in_process` example, driven: a program that decides
-//! in its own process serves its requests by the one call the engine has
-//! for a request ([`InProcess::place`]).
+//! The program of the `in_process` example, driven. A program that decides in
+//! its own process serves its requests by the one call the engine has for a
+//! request ([`InProcess::place`]).
 //!
 //! The program is the example's own module (`examples/in_process/program.rs`),
-//! taken in here as it stands. A test target is a program outside the
-//! library: it reaches the crate's public names and no other. Each case
-//! starts the program over the worker crate's test workers, with that
-//! crate's test feed as its load monitor and a function of its own as its
-//! sends, serves requests through it as a route would, and reads what the
-//! client and the workers saw. No case names a stage of the document, looks
-//! inside a decision or keeps a lease.
+//! taken in here as it stands. A test target is a program outside the library:
+//! it reaches the crate's public names and no other.
 //!
-//! What the program asks of the engine stands in one place, the methods of
-//! its `Engine`. Each method beside `place` is a call the host contract
-//! still owes a program, and leaves that list with the change that pays it.
-//! A pair's decode asked again is asked of the placement `place` answered,
-//! where that placement says its decode still stands chosen.
+//! Each case starts the program over the worker crate's test workers. That
+//! crate's test feed is the program's load monitor, and a function of the
+//! case's own is the program's sends. The case serves requests through the
+//! program as a route would, and reads what the client and the workers saw. No
+//! case names a stage of the document, looks inside a decision or keeps a
+//! lease.
 //!
-//! One module a plan holds the plan's cases: a single request
-//! (`caller/single.rs`), a pair of a prefill worker and a decode worker
-//! (`caller/pair.rs`), and an encode request, whose items go to encoders
-//! ahead of its pair (`caller/encode.rs`). The example's own stage
-//! (`examples/in_process/engine_load.rs`) is taken in beside the program,
-//! and its cases decide over records made by hand (`caller/stage.rs`). The
-//! program's own ring (`examples/in_process/ring.rs`) is taken in too: its
-//! cases read the ring a generation holds and expect the sends its walk
-//! says (`caller/lent_ring.rs`). The wire a retry stays on has its cases
-//! beside them (`caller/demand.rs`).
+//! What the program asks of the engine stands in one place, its `Engine`: one
+//! call, `place`. A pair's decode asked again is asked of the placement
+//! `place` answered, where that placement says its decode still stands chosen.
+//!
+//! The cases stand in one module a subject:
+//!
+//! - `caller/single.rs`: a single request
+//! - `caller/pair.rs`: a pair of a prefill worker and a decode worker
+//! - `caller/encode.rs`: an encode request, whose items go to encoders ahead
+//!   of its pair
+//! - `caller/stage.rs`: the example's own stage
+//!   (`examples/in_process/engine_load.rs`), taken in beside the program and
+//!   decided over records made by hand
+//! - `caller/lent_ring.rs`: the program's own ring
+//!   (`examples/in_process/ring.rs`), taken in too, as a generation holds it
+//! - `caller/demand.rs`: the wire a retry stays on
+//! - `caller/rule.rs`: the route's own rule for a retry
+//! - `caller/tree.rs`: the token tree the program lends
 //!
 //! [`InProcess::place`]: smg_grand_central::engine::InProcess::place
 
@@ -52,10 +56,14 @@ mod pair;
 mod program;
 #[path = "../examples/in_process/ring.rs"]
 mod ring;
+#[path = "caller/rule.rs"]
+mod rule;
 #[path = "caller/single.rs"]
 mod single;
 #[path = "caller/stage.rs"]
 mod stage;
+#[path = "caller/tree.rs"]
+mod tree;
 
 /// The model every case serves.
 const MODEL: &str = "model-a";
@@ -80,10 +88,10 @@ fn served(_: &dyn Worker) -> u16 {
     200
 }
 
-/// The program started from `spec` over `fleet`, routing to the kinds of
-/// worker `plan` says, with `sends` as its sends: the program, its load
-/// monitor's stand-in, whose channel the engine holds, and the engine's
-/// task to spawn.
+/// The program started from `spec` over `fleet`, with `sends` as its sends,
+/// routing to the kinds of worker `plan` says. Three things come back: the
+/// program, its load monitor's stand-in, whose channel the engine holds, and
+/// the engine's task to spawn.
 fn started_as(
     plan: Plan,
     spec: AppliedSpec,

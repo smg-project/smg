@@ -12,10 +12,10 @@
 //! [`single`] and [`pair`] are the one rule of a lease's words under either
 //! host. The host says who hears ([`Hearers`]). Behind a later document's
 //! start the stages that document kept hear a lease's words, and every
-//! count of sends in force takes its dispatch, under either host: a
-//! controller builds an engine object for each document, which keeps the
-//! standing one's stages, and a host that holds its decisions keeps one
-//! engine object across its documents ([`of_host`]).
+//! count of sends in force takes its dispatch, under either host. Each
+//! keeps one engine object across its documents. A host that holds its
+//! decisions names the hearers by the document in force ([`of_host`]), and
+//! a controller by the one its store's standing world holds.
 //!
 //! A request its binding's sessions rule keeps from the profile is told to
 //! the session table at its dispatch, and to no stage ahead of its end
@@ -91,10 +91,9 @@ pub(crate) fn stages_hear(decision: &Decision, side: Side) -> bool {
 /// is which.
 pub(crate) struct Hearers<'a, L> {
     /// The engine the lease was issued under, or behind a later document's
-    /// start what that document kept of its stages: its stages hear the
-    /// lease's words, and its session table where that stood at the issue
-    /// (`Engine::table_from`). A stage built since never heard the issue,
-    /// and hears no word of the lease. `None`: no stage hears.
+    /// start what that document kept of its stages: its session table and
+    /// its stages hear the lease's words. A stage built since never heard
+    /// the issue, and hears no word of the lease. `None`: no stage hears.
     pub issuing: Option<&'a Engine>,
     /// The engine whose counts of sends take a dispatch. A send is its
     /// host's, whatever document decided it: the standing engine counts
@@ -377,4 +376,5 @@ pub(crate) fn pair<L: Fn(WorkerId, u16) -> bool + Copy>(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/engine/lease_events/tests.rs"]
 mod tests;

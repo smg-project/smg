@@ -63,12 +63,12 @@ use std::{
 use rustc_hash::FxHashMap;
 
 #[cfg(feature = "in-process")]
-use crate::engine::in_process::InProcess;
+use crate::engine::in_process::Loaded;
 use crate::{
     document::spec::{AppliedSpec, ViewLists},
     engine::view::{Role, WorkerId},
     store::{
-        applied::{Applied, EngineCounts},
+        applied::Applied,
         workers::{WorkerFacts, WorkerRow},
         GatewayId,
     },
@@ -76,6 +76,7 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "../../tests/unit/store/snapshot/tests/mod.rs"]
 mod tests;
 
 /// How long a build the membership writes left owed may wait for its
@@ -491,8 +492,9 @@ pub struct StoreSnapshot {
     /// The standing vetoes by pool, each pool's by gateway: empty while no
     /// veto stands in the store.
     vetoes: Arc<[PoolVetoes]>,
-    /// The generation this publication was made under: its engine and its
-    /// number, read with the vetoes in one load.
+    /// The generation this publication was made under: its document as the
+    /// store's engine holds it, and its number, read with the vetoes in one
+    /// load.
     spec: Arc<Applied>,
     /// The served decider reads this with the world, before following
     /// the pointer to the generation.
@@ -530,16 +532,17 @@ impl StoreSnapshot {
         &self.spec
     }
 
-    /// The front that decides under this publication's document: the
-    /// engine object whose stages the store tells the words of a lease
-    /// ([`Applied`]). Handed under the borrow of the world, as the document
-    /// is.
+    /// The store's engine with this publication's document, as one
+    /// decision reads it ([`Applied::front`]): a decision over this world
+    /// runs under the document the world was published under, whatever
+    /// document the store applied since. Handed under the borrow of the
+    /// world, as the document is.
     #[cfg(feature = "in-process")]
     #[cfg_attr(
         not(any(feature = "controller", test)),
         expect(dead_code, reason = "a controller's deciding thread asks it")
     )]
-    pub(crate) fn front(&self) -> &InProcess {
+    pub(crate) fn front(&self) -> Loaded<'_, '_> {
         self.spec.front()
     }
 
@@ -690,9 +693,10 @@ pub(super) struct Writer {
     spec: Arc<Applied>,
     /// The generation before the standing one, kept one apply longer: the
     /// publication that lets go of the last world published under it
-    /// frees no engine, the next apply does. Its whole engine stays
-    /// resident that long, its session table included, as it stood when
-    /// it was replaced.
+    /// frees no stage, the next apply does. The stages its successor did
+    /// not keep stay resident that long, with what they held when it was
+    /// replaced. The session table and the records of sent prefixes are
+    /// the engine's, one for the store's life.
     retired: Option<Arc<Applied>>,
     /// The standing members outside the standing generation's lists.
     outside: OutsideLists,
@@ -700,7 +704,8 @@ pub(super) struct Writer {
     /// order, beside the revision of its row it was read at. A
     /// membership build reads a member again only where that revision
     /// moved, so it reads the members written since the last build and
-    /// carries every other's. Empty while the generation declares no list.
+    /// carries every other's. Empty while the generation's lists name no
+    /// engine family and no zone: no member stands outside such lists.
     listed: Vec<Held>,
     /// The build before's `listed`, kept for its room.
     listed_spare: Vec<Held>,
@@ -715,9 +720,8 @@ pub(super) struct Writer {
 
 impl Writer {
     /// The write side of a store with no member, whose clock starts at
-    /// `origin`. The engine of its unbound start counts the panics it
-    /// holds into `counts`, the store's, as every engine behind it does.
-    pub(super) fn new(window: Duration, origin: Instant, counts: &EngineCounts) -> Self {
+    /// `origin`.
+    pub(super) fn new(window: Duration, origin: Instant) -> Self {
         Self {
             window,
             origin,
@@ -729,7 +733,7 @@ impl Writer {
             counts: Arc::default(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
-            spec: Arc::new(Applied::new(AppliedSpec::unbound(), origin, counts)),
+            spec: Arc::new(Applied::unbound(origin)),
             retired: None,
             outside: OutsideLists::default(),
             listed: Vec::new(),
@@ -783,26 +787,25 @@ impl Writer {
     /// store derives no pair class, and a build the membership writes left
     /// owed stays owed.
     ///
+    /// The generation is put in place of the standing one on the store's
+    /// engine first ([`Applied::next`]), which refuses the number: the
+    /// caller holds both the store's locks and asked its last word.
+    ///
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
-    /// outside the store's lock: an engine is freed by the thread that
-    /// applies, never by a decider. A world a decider holds across two
-    /// applies keeps its generation past the hand-back: the engine then
-    /// goes with that world, at the publication that lets it go.
+    /// outside the store's lock: the stages a generation's successor did
+    /// not keep are freed by the thread that applies, never by a decider.
+    /// A world a decider holds across two applies keeps its generation
+    /// past the hand-back: those stages then go with that world, at the
+    /// publication that lets it go.
     pub(super) fn apply<'a>(
         &mut self,
-        spec: Arc<Applied>,
+        spec: AppliedSpec,
         members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>,
     ) -> Result<(Arc<StoreSnapshot>, Option<Arc<Applied>>), StaleGeneration> {
-        let standing = self.spec.generation();
-        if spec.generation() <= standing {
-            return Err(StaleGeneration {
-                standing,
-                offered: spec.generation(),
-            });
-        }
         let relisted = spec.lists() != self.spec.lists();
-        let before = self.retired.replace(mem::replace(&mut self.spec, spec));
+        let next = Arc::new(self.spec.next(spec)?);
+        let before = self.retired.replace(mem::replace(&mut self.spec, next));
         if relisted {
             self.list(members);
         }
@@ -812,7 +815,8 @@ impl Writer {
     /// Read every member under the standing generation's lists and count
     /// those outside them. For an apply whose lists differ: a membership
     /// build reads the members written since the last and carries every
-    /// other's ([`Writer::relist`]).
+    /// other's ([`Writer::relist`]). Lists that name no engine family and
+    /// no zone leave no member outside: no member is read under them.
     fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, WorkerSlot)>) {
         let Self {
             spec,
@@ -821,16 +825,16 @@ impl Writer {
             ..
         } = self;
         let lists = spec.lists();
-        let listing = !lists.is_empty();
         *outside = OutsideLists::default();
         held.clear();
+        if !lists.names_a_family_or_zone() {
+            return;
+        }
         for (member, ..) in members {
             let read = Held::read(lists, member);
             outside.engines += u32::from(read.engine_outside);
             outside.zones += u32::from(read.zone_outside);
-            if listing {
-                held.push(read);
-            }
+            held.push(read);
         }
         held.sort_unstable_by_key(|held| held.id);
     }
@@ -846,13 +850,28 @@ impl Writer {
         self.listed.clear();
     }
 
+    /// How many members' reads under the standing generation's lists are
+    /// kept ([`Self::list`], [`Self::relist`]).
+    #[cfg(all(test, feature = "operator"))]
+    pub(super) fn listed(&self) -> usize {
+        self.listed.len()
+    }
+
     /// What the members of a membership build read under the standing
     /// generation's lists, and the count of those outside them: carried
     /// from the last read where a member's row stands at the revision it
     /// was read at, read again where it moved or is new. A build so reads
     /// the members written since the last. `members` stand in id order.
+    ///
+    /// Lists that name no engine family and no zone leave no member outside
+    /// them. Under such lists the pass ends at its first test: nothing was
+    /// read under them, and the apply that brought them cleared what stood
+    /// ([`Self::list`]).
     fn relist(&mut self, members: &[(WorkerId, &WorkerRow, WorkerSlot)]) {
         let lists = self.spec.lists();
+        if !lists.names_a_family_or_zone() {
+            return;
+        }
         let outgoing = mem::take(&mut self.listed);
         let mut incoming = mem::take(&mut self.listed_spare);
         incoming.clear();

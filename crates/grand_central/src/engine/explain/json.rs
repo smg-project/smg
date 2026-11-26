@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use super::DecisionRecord;
 use crate::engine::{
     decision::{Decision, LiftedVeto, ShedReason, Target},
-    framework::Engine,
+    framework::{Engine, PairSide},
     view::WorkerId,
 };
 
@@ -70,12 +70,15 @@ impl DecisionRecord {
     /// zero, a `false` and an empty list are written. The instant is the
     /// wall clock's, in microseconds since the epoch.
     ///
-    /// Three names stand beside the contract's, which has no field for
+    /// Four names stand beside the contract's, which has no field for
     /// them. `shadow` at the record is what the binding's shadow said
     /// beside the decision. `url` beside a target's `id` and a top row's
     /// `worker_id`, and `decode_url` beside a pair's `decode_id`, are what
     /// `url` answers for the worker of that id: its host's address for it,
-    /// where the host still holds one.
+    /// where the host still holds one. `side` in a shed is the side of a
+    /// pair its refusal names, `prefill` or `decode`
+    /// ([`Shed::side`](crate::engine::decision::Shed::side)): left out
+    /// where the refusal names none.
     ///
     /// A record holds no fact of its request: no id, no routing value, no
     /// session key, no header, no prompt and no credential stand in it.
@@ -112,6 +115,7 @@ impl DecisionRecord {
                     "emptied_by": shed.emptied_by,
                     "retry_after_secs": shed.retry_after_secs,
                     "wait_allowed": shed.wait_allowed,
+                    "side": shed.side.map(PairSide::as_str),
                 }),
             ),
             Decision::Queue(queue) => (
@@ -157,4 +161,5 @@ impl DecisionRecord {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/explain/json/tests.rs"]
 mod tests;

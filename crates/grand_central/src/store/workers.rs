@@ -183,13 +183,18 @@ pub struct WorkerFacts {
     pub demand_facts: DemandFacts,
 }
 
+/// The bytes of a URL: the bound of a worker's URL and of a provider's key.
+const URL_BYTES: usize = 2_048;
+/// The bytes of a label's key: its bound, and the bound of a provider's name.
+const LABEL_KEY_BYTES: usize = 128;
+
 impl WorkerFacts {
     /// A URL's bytes.
-    pub const URL_BYTES: usize = 2_048;
+    pub const URL_BYTES: usize = URL_BYTES;
     /// The bytes of a name: a runtime, a zone, a model id.
     pub const NAME_BYTES: usize = 256;
     /// A label's key, in bytes.
-    pub const LABEL_KEY_BYTES: usize = 128;
+    pub const LABEL_KEY_BYTES: usize = LABEL_KEY_BYTES;
     /// A label's value, in bytes.
     pub const LABEL_VALUE_BYTES: usize = 4_096;
     /// The labels of one row.
@@ -230,9 +235,9 @@ pub enum Registrant {
 
 impl Registrant {
     /// The bytes of a provider's name: a label key's bound.
-    pub const NAME_BYTES: usize = WorkerFacts::LABEL_KEY_BYTES;
+    pub const NAME_BYTES: usize = LABEL_KEY_BYTES;
     /// The bytes of a provider's key for one worker: a URL's bound.
-    pub const KEY_BYTES: usize = WorkerFacts::URL_BYTES;
+    pub const KEY_BYTES: usize = URL_BYTES;
 
     /// The maker `provider` is for the worker it knows by `key`, or the part
     /// that breaks its rule. The rules are checked here and nowhere else, so

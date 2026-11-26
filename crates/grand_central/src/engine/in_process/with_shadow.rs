@@ -32,7 +32,7 @@
 //! panics at that issue is held, so the decision stands and its shadow is
 //! counted. The entry that issues none answers what the shadow said, and
 //! its caller counts it behind its own filing
-//! ([`InProcess::count_shadow`]): a decision whose filing fails counts
+//! ([`Loaded::count_shadow`]): a decision whose filing fails counts
 //! none. A host reads every count in one call
 //! ([`InProcess::shadow_counts`]).
 //!
@@ -110,7 +110,7 @@ pub(super) fn issued(
     decided
 }
 
-impl InProcess {
+impl Loaded<'_, '_> {
     /// Counts what a binding's shadow said beside a decision of the entry
     /// that issues no lease ([`Self::decide_without_lease`]). It is that
     /// entry's caller's one call, made once its own filing of the
@@ -119,17 +119,23 @@ impl InProcess {
     /// all the same, as the leasing entry counts a live shed's. A caller
     /// whose filing fails calls nothing, so that decision's shadow counts
     /// none. A decision that had no shadow counts nothing.
+    ///
+    /// The word is counted under the document this value holds. Its caller
+    /// asks it of the value its decision ran under: a word is counted in
+    /// the tables of the document whose binding said it, also where
+    /// another document was put in force behind the decision.
     #[cfg_attr(
         not(any(test, feature = "controller")),
         expect(dead_code, reason = "a controller's deciding thread calls it")
     )]
-    pub(crate) fn count_shadow(&self, said: Option<Shadowed>) {
+    pub(crate) fn count_shadow(self, said: Option<Shadowed>) {
         if let Some(said) = said {
-            let document = self.in_force();
-            count(self.under(&document), said, ShadowSide::Single);
+            count(self, said, ShadowSide::Single);
         }
     }
+}
 
+impl InProcess {
     /// Tells `each` every count of the shadow decisions made under the
     /// document in force, and answers that document's number, which no
     /// other applied document of the process has. A host that adds up what
@@ -246,4 +252,5 @@ pub(super) fn count(own: Loaded<'_, '_>, said: Shadowed, asked: ShadowSide) {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/engine/in_process/with_shadow/tests.rs"]
 pub(super) mod tests;

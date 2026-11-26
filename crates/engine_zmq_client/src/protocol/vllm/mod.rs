@@ -20,6 +20,7 @@ pub mod stats;
 pub mod structured_outputs;
 
 use bytes::Bytes;
+use tracing::warn;
 
 use crate::{
     codec::{
@@ -27,6 +28,7 @@ use crate::{
     },
     error::Result,
     protocol::{
+        handshake::EngineCoreReadyResponse,
         vllm::{
             output::{
                 decode_engine_core_outputs, DpControlMessage, EngineCoreOutput, EngineCoreOutputs,
@@ -71,6 +73,50 @@ impl EngineOutput for EngineCoreOutput {
     }
 }
 
+/// How the engine of a connection reads the prompt token ids of an
+/// add-request, told by the release its ready response reports
+/// ([`EngineCoreReadyResponse::vllm_version`]). The add-request of 0.31 to
+/// 0.34 was read against the engine's source, where nothing else this client
+/// writes differs but a filled adapter request (see [`lora::LoraRequest`]);
+/// an older release, and a version that names none, keep the list every
+/// engine has been sent so far. A release above 0.34 is sent the array of
+/// 0.34, and warned about as its engine connects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VllmLayout {
+    /// A list of integers: every release before 0.34.
+    #[default]
+    TokenList,
+    /// An `int32` array in the engine's `(dtype, shape, data)` form: 0.34
+    /// and every release above it.
+    TokenArray,
+}
+
+impl VllmLayout {
+    /// The newest release whose add-request this client was read against.
+    const NEWEST_READ: (u32, u32) = (0, 34);
+
+    /// The release `version` names by its first two parts between dots, each
+    /// a number (`0.34.0rc1` names 0.34). `None` for a version that names no
+    /// release (a source tree reports `dev`).
+    fn release(version: &str) -> Option<(u32, u32)> {
+        let mut parts = version.split('.').map(str::parse::<u32>);
+        match (parts.next(), parts.next()) {
+            (Some(Ok(major)), Some(Ok(minor))) => Some((major, minor)),
+            _ => None,
+        }
+    }
+
+    /// The layout of the release `version` names: the array from 0.34 on,
+    /// the list before it. A version that names no release connects as it
+    /// always has, and is sent the list.
+    fn of_release(version: &str) -> Self {
+        match Self::release(version) {
+            Some(release) if release >= (0, 34) => Self::TokenArray,
+            _ => Self::TokenList,
+        }
+    }
+}
+
 /// The vLLM EngineCore protocol: drives [`EngineCoreRequest`] over the shared ZMQ
 /// transport and decodes [`EngineCoreOutputs`] back.
 pub struct VllmProtocol;
@@ -78,7 +124,7 @@ pub struct VllmProtocol;
 impl EngineProtocol for VllmProtocol {
     type Request = EngineCoreRequest;
     type Output = EngineCoreOutput;
-    type Layout = ();
+    type Layout = VllmLayout;
 
     fn add_frame() -> Bytes {
         EngineCoreRequestType::Add.to_frame()
@@ -117,9 +163,33 @@ impl EngineProtocol for VllmProtocol {
     /// ([`encode_with_aux_frames`]); raw features keep the encoding their
     /// producer gave them, and the text path its one allocation: the payload's
     /// buffer is sized from the prompt before the write.
-    fn encode_add(request: &Self::Request, _layout: &()) -> Result<(Vec<u8>, Vec<Bytes>)> {
+    fn encode_add(request: &Self::Request, layout: &VllmLayout) -> Result<(Vec<u8>, Vec<Bytes>)> {
         let prompt_tokens = request.prompt_token_ids.as_ref().map_or(0, Vec::len);
-        encode_with_aux_frames(request, add_request_capacity(prompt_tokens))
+        encode_with_aux_frames(
+            &request.on_wire(*layout),
+            add_request_capacity(prompt_tokens),
+        )
+    }
+
+    /// The layout of the engine's release. A release above the newest this
+    /// client was read against is sent the add-request of that one and warned
+    /// about here, once for each engine as it connects: the engine decodes an
+    /// add-request outside any handler, so one it cannot decode ends its
+    /// input thread and every later request with it.
+    fn read_layout(ready: &EngineCoreReadyResponse) -> VllmLayout {
+        let version = ready.vllm_version.as_str();
+        if VllmLayout::release(version).is_some_and(|release| release > VllmLayout::NEWEST_READ) {
+            let (major, minor) = VllmLayout::NEWEST_READ;
+            warn!(
+                vllm_version = version,
+                "the engine's vLLM release is above {major}.{minor}, the newest whose \
+                 add-request this client was read against, and is sent the add-request of \
+                 {major}.{minor}: if the release changed it, the first request the engine \
+                 cannot decode ends its input thread and every later request fails; serve it \
+                 with a servicer release that knows it"
+            );
+        }
+        VllmLayout::of_release(version)
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
@@ -158,7 +228,7 @@ impl EngineProtocol for VllmProtocol {
     }
 
     /// Decode the batch and retain its engine timestamp on each local output.
-    fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
+    fn decode_batch(frames: &[Bytes], _layout: &VllmLayout) -> Result<EngineBatch<Self::Output>> {
         // vLLM multiplexes request batches, utility replies, and DP control on
         // one wire struct; each lands in its own slot of the batch.
         match decode_engine_core_outputs(frames)? {
@@ -208,9 +278,10 @@ mod tests {
     use super::*;
     use crate::{
         codec::{
-            decode_value,
+            decode_value, hex,
             tensor::{TensorFields, WireArrayData, TENSOR_AUX_MIN_BYTES},
         },
+        mock_engine::default_ready_response,
         protocol::vllm::request::MmFeaturesPayload,
     };
 
@@ -269,7 +340,7 @@ mod tests {
 
         let request = media_request();
         let before = encode_msgpack(&request).unwrap();
-        let (payload, aux) = VllmProtocol::encode_add(&request, &()).unwrap();
+        let (payload, aux) = VllmProtocol::encode_add(&request, &VllmLayout::TokenList).unwrap();
         assert_eq!(
             aux.iter().map(Bytes::len).collect::<Vec<_>>(),
             vec![4 * TENSOR_AUX_MIN_BYTES, TENSOR_AUX_MIN_BYTES]
@@ -317,7 +388,8 @@ mod tests {
                     multimodal::MmKwargValue::Tensor(tensor()),
                 ]));
             }
-            let (payload, aux) = VllmProtocol::encode_add(&request, &()).unwrap();
+            let (payload, aux) =
+                VllmProtocol::encode_add(&request, &VllmLayout::TokenList).unwrap();
             assert!(aux.is_empty(), "size={size}");
             assert_eq!(payload, encode_msgpack(&request).unwrap());
         }
@@ -331,12 +403,12 @@ mod tests {
             panic!()
         };
         features[0].mm_position.is_embed.as_mut().unwrap().data = WireArrayData::AuxIndex(1);
-        let (payload, frames) = VllmProtocol::encode_add(&request, &()).unwrap();
+        let (payload, frames) = VllmProtocol::encode_add(&request, &VllmLayout::TokenList).unwrap();
         assert!(frames.is_empty());
         assert_eq!(payload, encode_msgpack(&request).unwrap());
         let raw = decode_value(&encode_msgpack(&request.mm_features).unwrap()).unwrap();
         request.mm_features = Some(MmFeaturesPayload::Raw(raw));
-        let (payload, frames) = VllmProtocol::encode_add(&request, &()).unwrap();
+        let (payload, frames) = VllmProtocol::encode_add(&request, &VllmLayout::TokenList).unwrap();
         assert!(frames.is_empty());
         assert_eq!(payload, encode_msgpack(&request).unwrap());
     }
@@ -345,7 +417,7 @@ mod tests {
     #[test]
     fn text_request_wire_is_unchanged() {
         let request = EngineCoreRequest::default();
-        let (payload, frames) = VllmProtocol::encode_add(&request, &()).unwrap();
+        let (payload, frames) = VllmProtocol::encode_add(&request, &VllmLayout::TokenList).unwrap();
         assert_eq!(payload, encode_msgpack(&request).unwrap());
         assert!(frames.is_empty());
     }
@@ -394,5 +466,71 @@ mod tests {
             decode_value(&payload).unwrap(),
             Value::Array(vec![Value::from(9), Value::Nil])
         );
+    }
+
+    fn ready(version: &str) -> EngineCoreReadyResponse {
+        EngineCoreReadyResponse {
+            vllm_version: version.to_string(),
+            ..default_ready_response()
+        }
+    }
+
+    /// The bytes the engine's own encoder writes for a three-token prompt on
+    /// 0.34 (`MsgpackEncoder._encode_ndarray` over the `int32` array its
+    /// frontend packs): the dtype, the shape, and the data inline as a raw
+    /// view. Behind the array header and the empty request id.
+    #[test]
+    fn a_0_34_engine_is_sent_its_prompt_as_an_int32_array() {
+        let request = EngineCoreRequest {
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..EngineCoreRequest::default()
+        };
+        let layout = VllmProtocol::read_layout(&ready("0.34.0"));
+        let (payload, frames) = VllmProtocol::encode_add(&request, &layout).unwrap();
+        let wire = hex("dc0015 a0 93 a33c6934 9103 c70c03 01000000 02000000 03000000");
+        assert_eq!(payload[..wire.len()], wire);
+        assert!(frames.is_empty());
+    }
+
+    /// A release above the newest this client was read against is not
+    /// refused: its engine connects and is sent the bytes of 0.34.
+    #[test]
+    fn a_release_above_0_34_connects_and_is_sent_the_array_of_0_34() {
+        let request = EngineCoreRequest {
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..EngineCoreRequest::default()
+        };
+        let as_0_34 = VllmProtocol::read_layout(&ready("0.34.0"));
+        let (sent_0_34, _) = VllmProtocol::encode_add(&request, &as_0_34).unwrap();
+        for version in ["0.35.0", "1.0.0"] {
+            assert!(
+                VllmProtocol::check_layouts(&ready(version)).is_ok(),
+                "{version} connects"
+            );
+            let layout = VllmProtocol::read_layout(&ready(version));
+            let (payload, frames) = VllmProtocol::encode_add(&request, &layout).unwrap();
+            assert_eq!(payload, sent_0_34, "{version} is sent the bytes of 0.34");
+            assert!(frames.is_empty(), "{version}: a short prompt goes inline");
+        }
+        // What each kind of version text is served.
+        for (version, served) in [
+            ("0.31.0", VllmLayout::TokenList),
+            ("0.33.2", VllmLayout::TokenList),
+            ("0.34.1", VllmLayout::TokenArray),
+            ("0.34.0rc1", VllmLayout::TokenArray),
+            ("0.34.0.dev12+gabc", VllmLayout::TokenArray),
+            ("0.35.0", VllmLayout::TokenArray),
+            ("1.0.0", VllmLayout::TokenArray),
+            ("dev", VllmLayout::TokenList),
+            ("tokenspeed-0.1.1", VllmLayout::TokenList),
+            ("trtllm-1.4.0", VllmLayout::TokenList),
+            ("sglang-0.5.21", VllmLayout::TokenList),
+        ] {
+            assert_eq!(
+                VllmProtocol::read_layout(&ready(version)),
+                served,
+                "{version}"
+            );
+        }
     }
 }

@@ -29,7 +29,7 @@ use crate::error::Result;
 
 /// Tensors and ndarrays are encoded with this msgpack extension type in Python.
 /// See `vllm/v1/serial_utils.py` `CUSTOM_TYPE_RAW_VIEW`.
-const CUSTOM_TYPE_RAW_VIEW: i8 = 3;
+pub(crate) const CUSTOM_TYPE_RAW_VIEW: i8 = 3;
 
 /// Total number of elements implied by `shape`, or `None` on overflow.
 pub fn checked_numel(shape: &[usize]) -> Option<usize> {

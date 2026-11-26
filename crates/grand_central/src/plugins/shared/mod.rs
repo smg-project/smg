@@ -22,7 +22,7 @@ mod stages;
 pub use config::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, Reveal};
 pub use counters::Counters;
 pub use open::OpenDecisions;
-pub(crate) use open::{own_bound, HalfOpen, OpenDecision, Part};
+pub(crate) use open::{own_bound, Budget, HalfOpen, Part};
 #[cfg(feature = "controller")]
 pub(crate) use stages::Stage;
 pub(crate) use stages::{BoundPlugin, Fallback};

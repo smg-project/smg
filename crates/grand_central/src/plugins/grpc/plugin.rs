@@ -36,7 +36,7 @@ use crate::{
     },
     plugins::shared::{
         config::{EventSet, Exposure, Failure, FrameBudget},
-        intern, own_bound, BoundPlugin, Counters, Fallback, HalfOpen, OpenDecision, Stage,
+        intern, own_bound, BoundPlugin, Budget, Counters, Fallback, HalfOpen, Stage,
     },
     service::proto,
     tracking::lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
@@ -664,15 +664,9 @@ impl PluginBinding {
 
     /// Sends the decision's frame for `asked` under what the decision has
     /// left now. What the frame costs is read when its answer is.
-    fn send(
-        &self,
-        open: &mut Open,
-        budget: &OpenDecision,
-        mut frame: proto::PluginDecide,
-        asked: u32,
-    ) {
+    fn send(&self, open: &mut Open, budget: &Budget, mut frame: proto::PluginDecide, asked: u32) {
         let inner = &self.plugin.inner;
-        let remaining = u32::try_from(budget.remaining_micros).unwrap_or(u32::MAX);
+        let remaining = budget.remaining_micros_u32();
         if remaining == 0 {
             // A pick-only ask whose decision spent its budget since the open.
             bump(&inner.tally.budget_spent);
@@ -729,9 +723,10 @@ impl PluginBinding {
             open.bypass = true;
             return;
         };
-        let mut budget = self.plugin.inner.runtime.decisions().on_this_thread();
-        let (started, wait) = self.wait(ticket, budget.remaining_micros);
-        self.take(open, ticket, started, wait, &mut budget, shown);
+        let mut on_thread = self.plugin.inner.runtime.decisions().on_this_thread();
+        let budget = on_thread.budget();
+        let (started, wait) = self.wait(ticket, budget.remaining_micros());
+        self.take(open, ticket, started, wait, budget, shown);
     }
 
     /// The wait between a frame's send and its take: this thread blocks
@@ -760,7 +755,7 @@ impl PluginBinding {
         ticket: Ticket,
         started: Instant,
         wait: Wait,
-        budget: &mut OpenDecision,
+        budget: &mut Budget,
         shown: Option<&[u32]>,
     ) {
         let inner = &self.plugin.inner;
@@ -768,13 +763,11 @@ impl PluginBinding {
         // under the decision's budget, whatever the decision had left at
         // the send. A frame that others' draws starved is not read against
         // the little it was left.
-        let seed = u32::try_from(budget.seed_micros).unwrap_or(u32::MAX);
+        let seed = budget.seed_micros_u32();
         let frame = u64::from(inner.frame.frame_micros(seed));
         match wait {
             Wait::Answered(arrived, decision) => {
-                budget.remaining_micros = budget
-                    .remaining_micros
-                    .saturating_sub(micros(arrived.saturating_duration_since(started)));
+                budget.draw(micros(arrived.saturating_duration_since(started)));
                 if inner.runtime.witness().stalled_between(ticket.at, arrived) {
                     // The I/O thread stalled while this answer was owed:
                     // the round trip holds the host's time and is no
@@ -824,11 +817,9 @@ impl PluginBinding {
                 // frame's own deadline.
                 let before_the_wait = micros(started.saturating_duration_since(ticket.at));
                 let given = u64::from(open.frame_micros)
-                    .min(before_the_wait.saturating_add(budget.remaining_micros));
+                    .min(before_the_wait.saturating_add(budget.remaining_micros()));
                 // The frame's whole grant is drawn, whatever the verdict.
-                budget.remaining_micros = budget
-                    .remaining_micros
-                    .saturating_sub(u64::from(open.frame_micros));
+                budget.draw(u64::from(open.frame_micros));
                 bump(&inner.tally.missed);
                 open.bypass = true;
                 let stalled = inner
@@ -841,7 +832,7 @@ impl PluginBinding {
                 // far and this grant reach the decision's budget.
                 let whole = given == frame;
                 let spent = inner.unit.charged(open.stamp);
-                let own = own_bound(whole, spent, given, budget.seed_micros);
+                let own = own_bound(whole, spent, given, budget.seed_micros());
                 let miss = Miss::of(stalled, own, given);
                 if miss != Miss::Held {
                     // The missed frame's part of the decision's sample is
@@ -875,9 +866,7 @@ impl PluginBinding {
                 // this thread blocked is drawn like an answered wait's: a
                 // plugin asked later in the decision is asked under the
                 // rest.
-                budget.remaining_micros = budget
-                    .remaining_micros
-                    .saturating_sub(micros(started.elapsed()));
+                budget.draw(micros(started.elapsed()));
                 open.bypass = true;
             }
         }
@@ -900,8 +889,9 @@ impl PluginBinding {
         // The decision's budget is one a thread: its first open seeds it,
         // every open of the decision (each side, each plugin of every
         // runtime built over the same open decisions) draws on it.
-        let mut budget = inner.runtime.decisions().on_this_thread();
-        open.stamp = budget.open(facts.budget_micros);
+        let mut on_thread = inner.runtime.decisions().on_this_thread();
+        open.stamp = on_thread.open(facts.budget_micros);
+        let budget = on_thread.budget();
         if inner.unit.enter(open.stamp) {
             // The plugin already failed this decision (the other side of a
             // pair, another binding): its part in the decision is over, with
@@ -923,7 +913,7 @@ impl PluginBinding {
             open.bypass = true;
             return;
         }
-        if budget.remaining_micros == 0 {
+        if budget.is_spent() {
             // An earlier open of this decision spent the remainder: no frame,
             // the stages fall back, the breaker is untouched.
             bump(&inner.tally.budget_spent);
@@ -970,14 +960,14 @@ impl PluginBinding {
         } else {
             // A filter or a scorer is asked at the open, so the native stages
             // run while the plugin computes; the pick rides the same frame.
-            self.send(&mut open, &budget, frame, bound);
+            self.send(&mut open, budget, frame, bound);
         }
     }
 
     pub(crate) fn close(&self) {
         let inner = &self.plugin.inner;
         let mut opens = self.opens.get_or_default().borrow_mut();
-        let mut budget = inner.runtime.decisions().on_this_thread();
+        let mut on_thread = inner.runtime.decisions().on_this_thread();
         // The scope is closed first: every open phase is forgotten and its
         // place in the thread's decision given back before a call that is
         // the host's own (the lane, the clock a build handed the runtime).
@@ -990,7 +980,7 @@ impl PluginBinding {
                 let unread = open.ticket.filter(|_| !open.read);
                 let stamp = open.stamp;
                 open.reset();
-                budget.close();
+                on_thread.close();
                 (unread, stamp)
             })
         });
@@ -1001,7 +991,9 @@ impl PluginBinding {
             // The plugin's last close of the decision takes its sample: its
             // round trips in it, over the decision's budget or over their
             // frames where those are the lesser.
-            inner.unit.leave(stamp, budget.seed_micros, || inner.now());
+            inner
+                .unit
+                .leave(stamp, on_thread.budget().seed_micros(), || inner.now());
         }
     }
 
@@ -1091,8 +1083,8 @@ impl PluginBinding {
                     }
                 }
                 open.named_survivors = true;
-                let budget = self.plugin.inner.runtime.decisions().on_this_thread();
-                self.send(&mut open, &budget, frame, PICK);
+                let mut on_thread = self.plugin.inner.runtime.decisions().on_this_thread();
+                self.send(&mut open, on_thread.budget(), frame, PICK);
             }
         }
         if open.asked & PICK == 0 {
@@ -1231,34 +1223,5 @@ impl BoundPlugin for PluginBinding {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Miss;
-    use crate::plugins::grpc::runtime::PROMISE_MICROS;
-
-    /// The table of a miss, row by row: the witness's excuse first, then
-    /// whose bound it was, then whether the witness can vouch for a flight
-    /// that long.
-    #[test]
-    fn the_table_of_a_miss_row_by_row() {
-        const LONG: u64 = PROMISE_MICROS + 1;
-        // Stalled, the plugin's own bound, the flight given, the verdict.
-        let table = [
-            (true, true, LONG, Miss::Held),
-            (true, false, LONG, Miss::Held),
-            (true, true, 1, Miss::Held),
-            (false, false, LONG, Miss::Clamped),
-            (false, false, 1, Miss::Clamped),
-            (false, true, LONG, Miss::Own),
-            // No longer than the promise: the thread cannot be seen late.
-            (false, true, PROMISE_MICROS, Miss::Unread),
-            (false, true, 1, Miss::Unread),
-        ];
-        for (stalled, own_bound, given, verdict) in table {
-            assert_eq!(
-                Miss::of(stalled, own_bound, given),
-                verdict,
-                "stalled {stalled}, own {own_bound}, given {given}"
-            );
-        }
-    }
-}
+#[path = "../../../tests/unit/plugins/grpc/plugin/tests.rs"]
+mod tests;

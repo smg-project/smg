@@ -61,6 +61,7 @@ use super::kv_cursor::{BatchAdmission, RankCursor};
 use crate::{engine::view::WorkerId, store::workers::WorkerRow};
 
 #[cfg(test)]
+#[path = "../../tests/unit/worker_host/kv_tables/tests.rs"]
 mod tests;
 
 /// Workers one model's index holds at once: the chain index's own ceiling.
@@ -324,9 +325,10 @@ impl Index {
 ///
 /// A row's id here is its lane's place: held from the lane's making, ahead
 /// of its first event, and free for the next row once its row leaves. The
-/// lending keeps no count of an id's takes. A reader that maps ids to rows
-/// once a table reads an id that was taken again inside that table's life
-/// as the row that held it when the table was read.
+/// chain counts each freed id it hands to the next row, and the lending
+/// answers that count ([`Self::ids_reused`]). A reader that maps ids to
+/// rows once a table reads the count ahead of the ids and again behind a
+/// lookup: once it moved, an id of the table may be another row's.
 #[cfg(feature = "controller")]
 pub(super) struct LentIndex {
     tables: Arc<KvTables>,
@@ -350,6 +352,15 @@ impl LentIndex {
         let table = self.tables.table.lock();
         let entry = table.lanes.get(&row)?;
         Arc::ptr_eq(&entry.index, &self.index).then_some(entry.worker)
+    }
+
+    /// How many times the index handed an id one row freed to the next row
+    /// that asked for one: the chain's own count, which a removal alone
+    /// does not move. A row takes its id before its lane is made
+    /// ([`KvTables::member`]), so the count moves ahead of the row's first
+    /// block. One load, and no lock.
+    pub(super) fn ids_reused(&self) -> u64 {
+        self.index.chain.ids_reused()
     }
 
     /// How many blocks the index holds under `id`.

@@ -36,6 +36,9 @@ One sheet records one rule over the policies that read no routing key themselves
 where the gateway's routing-key override places a keyed request, and what it does with a key that has two
 requests in flight on its worker.
 
+One sheet records that override on the two sides of a pair: `pair_sticky.json` holds which pair the gateway places
+a keyed request on, request after request, each side under its own pin.
+
 Two sheets record a rank of one worker and no worker: `minimum_tokens.json` holds the rank the gateway's
 minimum-tokens policy gives each request after each thing its rank cache is handed about the worker, and
 `sticky_rank.json` holds the rank the gateway pins each request of one grouped worker to by its sticky key.
@@ -59,6 +62,7 @@ crates/grand_central/tests/classic/sheets/
   pair_bound.json
   pair_runtime.json
   pair_named.json
+  pair_sticky.json
   overload.json
   bucket.json
   minimum_tokens.json
@@ -80,6 +84,7 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   routers/common/classic_pair_select_rows/classic_pair_bound_rows.rs        pair_bound.json
   routers/common/classic_pair_select_rows/classic_pair_runtime_rows.rs      pair_runtime.json
   routers/common/classic_pair_select_rows/classic_pair_named_rows.rs        pair_named.json
+  routers/common/classic_pair_select_rows/classic_pair_sticky_rows.rs       pair_sticky.json
   policies/bucket/classic_bucket_rows.rs                                    bucket.json
   routers/grpc/common/stages/request_execution/classic_sticky_rank_rows.rs  sticky_rank.json
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   retry_wire.json
@@ -153,9 +158,11 @@ the text matcher it is carried as text, each id as four hex digits. Every prompt
 blocks: sixteen token ids, or sixteen characters of a text. A picked worker holds one more request. A tree is
 written at every pick: the picked worker holds the prompt from then on. The index is written by the `stored` and
 `removed` steps alone, and a row under it stores a block before its first pick, since over an empty index the
-policy reads its tree of token ids. The replay hands the engine what each worker holds as the affinity column a
-host lends: under the index every worker's own depth, and under a tree the depth of the deepest holders alone,
-since the gateway's tree names nobody else. A row under the index is replayed by the replay's own count of
+policy reads its tree of token ids. The replay hands the engine what each worker holds as a host lends it: under
+the index the affinity column, every worker's own depth, and under a tree the rows of the tree's match, the
+deepest holders alone, since the gateway's tree names nobody else. Beside those rows it hands the match's two
+numbers, its size and the prompt's in the tree's own unit, which it derives from the row's prompts: token ids by
+whole blocks, and a text's characters one by one. A row under the index is replayed by the replay's own count of
 the blocks each worker stored. The replay builds a row's profile from the crate's `cache_aware` preset.
 It sets on the preset each number of the row's configuration that differs from the gateway's command line
 default, and a tree row names its source. So a row recorded under those defaults asks the preset as it is named.
@@ -233,6 +240,28 @@ which keeps the named side and leaves the other; the prefill side alone under th
 its own policy's pick and keeps its admission filter; and the decode side alone, where the number counts the
 partners of the prefill its policy picks, and that prefill's partners on its own runtime where a pair on one known
 runtime goes first.
+
+The rows of `pair_sticky.json` are rows of steps, under the sticky routing-key override. A row names the policy each
+side runs under, the sticky map's `assignment` and its two pools, each worker as `pair_select.json` writes it. Its
+`steps` are the sticky override sheet's, a side at a time: a request (`pick`: the `key` its header carries, the key
+of its own `id` where its caller derived one, its `model`, and the pair a failed attempt was sent to, `tried`, where
+it is a retry), a worker of a side that stops or starts being routable (`down`, `up`), the requests a side's workers
+hold (`loads`), and the requests of one key in flight on them (`held`), which is the count the override's cap reads.
+No request changes what the router holds: the steps do. A sequence row answers each request by its pair, and the
+drawn row counts how often each pair took its last request. A side runs under `power_of_two:least_requests`, or
+under `random` where a row must show that the policy was not asked. The rows hold: a key's pair kept past the
+loads, apart under two models, and under the key of its request's id, which a header's key goes ahead of; a key's
+turns and retries under one key and one count; a key seen first under each of the map's modes; each side's cap
+alone, a pick on the pinned worker again and a pick at the cap too; each side's pinned worker down and up again,
+under `delegate` and under the map's own assignment, and under `delegate` the worker placed next down in its turn,
+where the side goes back to the one before; a pinned decode that is no partner of the key's new prefill,
+one that pairs with both prefills, and a pinned prefill with no open partner; a retry, under both; and a pair of
+which one side runs under `consistent_hashing`, which reads the key itself and leaves the other side to the map.
+
+The drawn row of `pair_sticky.json` is recorded over 600,000 draws, a hundred times the 6,000 its replay makes. One
+deviation of the recording is then a tenth of a replay's. The replay's shares are held within four deviations of the
+difference of two samples of the replay's size. At a ninth that is 137 counts of 6,000, about 5.7 deviations of the
+replay's own share.
 
 The rows of `prefix_hash.json` are sequence rows and two kinds of counted row. A row names the policy's
 configuration in the gateway's own spelling: how many tokens of a prompt it hashes, the two margins of its load
@@ -348,6 +377,7 @@ directory. The sha256 is of the file as committed.
 | `pair_bound.json` | the placement of a pair behind the prefill admission's bound: every prefill at its bound with no decode ready, the prefill at its bound with the only open partner, a decode pool over its thresholds or doubted on every worker, with shedding on and off, a prefill with room and an open partner | `7526c6664e4916620fad715f204d35968568e3ee` | 8: 8 sequence, 0 drawn | `a0af115d810052da2c48dc44fdb4bb5961a6c8e24dfb189f5cbdf0714d7ed426` | `classic_pair_bound_rows.rs` |
 | `pair_runtime.json` | the placement of a pair on the wire that carries one runtime's request: a pair on one known runtime beside workers of none, its prefill at the admission's bound, not ready or over its thresholds, its decode not ready, a decode pool and a prefill pool over their thresholds on every worker, two known runtimes, a prefill with no partner on its runtime | `adf621bcfd7c1a7921435a008a58fc297eff6747` | 10: 10 sequence, 0 drawn | `4519479db78be320591b87ff32e7bf8b161c3a23aae6b1d17155641ea0b42e9b` | `classic_pair_runtime_rows.rs` |
 | `pair_named.json` | the placement of a pair whose request names its worker: both sides, the prefill side alone and the decode side alone under the hash policy, a worker not ready or over its thresholds, a number past a side's workers, the admission's bound and a decode's rooms, a pool over its thresholds on every worker, no prefill open, a retry | `4541c6c312394e13b49ae89b91c7321a78ddd270` | 23: 23 sequence, 0 drawn | `5f46e1a268d338e93e907fd7ac82c14a175b2b1160a0cc25ff404f8758bc7605` | `classic_pair_named_rows.rs` |
+| `pair_sticky.json` | the routing-key override on the two sides of a pair: a key's pair and its two pins, a key from a request's id, a key's turns and retries, a key seen first under the map's modes, each side's cap, each side's pinned worker down and the worker placed next down in its turn, a pinned decode that is no partner of the new prefill, a retry, a side under the hash policy | `0a3b3bfdf5b4a5789fc5b4b7e4ee216f84996318` | 25: 24 sequence, 1 drawn | `a5a522ce1d715fb25c0220e8d7f197e81dc9105e48893d76a8b3262541518994` | `classic_pair_sticky_rows.rs` |
 | `overload.json` | the overload verdict of one worker: the gateway's thresholds and the worker's own, a poll's answer, a poll with no report, a pushed record, an eviction | `436f0c8c5725b0a408b990003d76eaddc72c4be4` | 25 verdict rows | `29c10ee8876e53d23a824a3b7bd0481efd118e8ac5a0d2822477729f6e21283a` | `classic_overload_rows.rs` |
 | `bucket.json` | bucket: a size's range and its worker, the hand-down when that worker is not offered, the two parts of the balance rule, the window a booking leaves, the adjustment's cut, a worker that joins or leaves, a pool nobody listed | `d92647556e91a3601ef647f12ae5784df2080dc3` | 19: 18 sequence, 1 drawn | `71a533017809566486335bb9f212ea49712a833bbe5ebcbde7c5d6319ee764e4` | `classic_bucket_rows.rs` |
 | `minimum_tokens.json` | the minimum-tokens rank of one worker: a poll's answer, a rank it omits, an answer with no token capacity or no entry, a failed poll, an eviction, a worker that stands for one rank, used tokens beside context tokens | `615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc` | 18: 18 sequence, 0 drawn | `1ab41e023fa4f9b507860655a3d917aee68686479d09eaa3b1e9cf8e71d56139` | `classic_minimum_tokens_rows.rs` |
@@ -385,6 +415,7 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `pair_bound.json` | `classic_pair_select_rows::classic_pair_bound_rows` |
 | `pair_runtime.json` | `classic_pair_select_rows::classic_pair_runtime_rows` |
 | `pair_named.json` | `classic_pair_select_rows::classic_pair_named_rows` |
+| `pair_sticky.json` | `classic_pair_select_rows::classic_pair_sticky_rows` |
 | `overload.json` | `load::monitor::classic_overload_rows` |
 | `bucket.json` | `policies::bucket::classic_bucket_rows` |
 | `minimum_tokens.json` | `load::monitor::classic_minimum_tokens_rows` |
@@ -406,6 +437,9 @@ build their rows on the same bed; the pair placement sheet's filter runs them to
 whose rows draw nothing. A runtime row's bed dials its workers on the wire the row names and gives each the runtime
 it names. A named row's requests carry the row's text under the header, and its retries the two engines the row
 says a failed attempt was sent to. The
+sticky pair sheet's recorder is a fourth child on that bed, which that filter runs too, with the policy registry
+built again under the override and a fresh sticky map: each request carries its key in the routing key header or as
+the key of its id, a step writes the worker objects, and one of its rows draws. The
 overload sheet's recorder is a child of the load monitor's module, so each step enters the monitor
 through the monitor's own functions and the verdict is read off the worker the monitor wrote it on. The bucket
 sheet's recorder is a child of the policy's own module and stands in that policy's directory: the adjustment and
@@ -453,16 +487,25 @@ fails once the reason no longer holds.
 - `encode_pair.json`: all 52 rows replay. In the nine that place items by consistent hashing a key's encoder is
   not held to the recorded one: two rings place no key alike. The replay holds each key to the encoders it was
   offered and equal keys to one encoder.
-- `pair_select.json`: one row is decided apart, named by the replay with the answer the pair's decision gives. It
-  is a refusal's reason: where the only ready prefill's partners are all over their thresholds beside a free decode
-  of another transport, the gateway answers unavailable and the pair's decision names the overload veto. The other
-  39 rows replay, the four of a prefill policy that weighs load against cache affinity itself (`cache_aware`)
-  among them: the gateway lifts the overload veto for such a policy and lets it place, and a prefill profile one of
-  whose scorers says the same of itself runs with that veto lifted under a binding that steers.
+- `pair_select.json`: two rows are decided apart, each named by the replay with the answer the pair's decision
+  gives. The other 38 rows replay, a refusal by its reason and its role.
+  - One is a refusal's reason. The only ready prefill's partners are all over their thresholds beside a free
+    decode of another transport. The gateway answers unavailable, and the pair's decision names the overload veto.
+  - The other is a refusal's role. Every prefill is over its thresholds under a policy that weighs load against
+    cache affinity itself (`cache_aware`), and every decode is down. The gateway refuses for the prefill's role,
+    and the pair's decision names the decode side.
+  - Three of the 38 are of such a policy. The gateway lifts the overload veto for such a policy and lets it
+    place. A prefill profile one of whose scorers says the same of itself runs with that veto lifted under a
+    binding that steers.
 - `pair_bound.json`: none. All 8 rows replay.
 - `pair_runtime.json`: none. All 10 rows replay.
 - `pair_named.json`: none. All 23 rows replay, through the one call of a host in process. Of a refusal the replay
-  holds why, as the pair placement's does: the gateway's `declined` is the engine's shed under `target-worker`.
+  holds why and the role, as the pair placement's does. The gateway's `declined` is the engine's shed under
+  `target-worker`, and its role is the side that shed names.
+- `pair_sticky.json`: 23 rows replay, through the one call of a host in process, under the document the routing
+  settings give for the row. The other 2 are pairs of which one side runs under `consistent_hashing`: the gateway's
+  sticky map places the other side alone, the settings write no document for such a pair yet, and the replay holds
+  their refusal to the override's setting and to that side.
 - `overload.json`: none where the worker is one object for all its ranks, as the recording gateway held it. All 25
   rows replay there, verdict for verdict, through the worker crate's load monitor. The replay builds the holder of
   worker objects with the calls a controller builds its own with, and writes the row's worker into the store the

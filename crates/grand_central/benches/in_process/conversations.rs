@@ -12,10 +12,13 @@
 //!
 //! The host of the cell named `recorded` lends no tree. The engine then
 //! names a turn's holders by its own record of the prefixes it sent, and
-//! writes the record behind the pick. An engine does the same under a host
-//! that keeps an index of cache events for the model, for the workers the
-//! index does not hear: it walks a lent tree only where its host keeps no
-//! such index.
+//! writes the record behind the pick. The host of the cell named `indexed`
+//! keeps an index of cache events that holds a block (`indexed.rs`): the
+//! index then names a turn alone, and the record is neither read nor
+//! written. The index of the cell named `held` holds every conversation
+//! whole, each for one worker, and the head for every worker, ahead of the
+//! list's first request ([`held`]): it names a turn its conversation's
+//! worker and holders of the head beside it.
 //!
 //! A caller makes its prompts before its first turn, about half a kilobyte
 //! a decision, so such a cell is run with a stated `--decisions`, and stops
@@ -43,7 +46,7 @@ use smg_grand_central::engine::{
     PromptHashes, TokenKey,
 };
 
-use super::{mix, place, ruled, stretch, Host, Run, CALLER_WARM, MODEL};
+use super::{indexed, mix, place, ruled, stretch, Host, Run, CALLER_WARM, MODEL};
 
 /// A conversation's sizes in tokens: the head every prompt begins with, a
 /// conversation's first prompt, what a turn adds, and its last prompt.
@@ -167,6 +170,27 @@ pub(super) fn lends(engine: &InProcess) {
     engine
         .affinity()
         .set_indexes(Arc::new(Lends(Arc::new(tree))));
+}
+
+/// What the cell named `held` stores in its host's index for a run's
+/// callers, ahead of the list's first request ([`indexed::hold`]): each
+/// caller's conversations whole, one worker a conversation, round the list,
+/// then the head alone for a worker no conversation reached.
+pub(super) fn held(run: &Run, engine: &InProcess) {
+    let block = engine.spec().block_size().max(1) as usize;
+    assert!(block <= HEAD, "the head the prompts share holds a block");
+    let mut place = 0;
+    for caller in 0..run.callers as u64 {
+        let said = Said::by(engine, caller, CALLER_WARM + run.decisions);
+        for full in said.tokens.chunks(FULL) {
+            indexed::hold(place, full);
+            place += 1;
+        }
+    }
+    let head: Vec<u32> = (0..HEAD as u32).collect();
+    for place in 0..run.workers {
+        indexed::hold(place, &head);
+    }
 }
 
 /// One caller's turns: each carries one of the caller's conversations on,

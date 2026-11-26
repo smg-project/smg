@@ -232,6 +232,27 @@ pub fn build_watcher_config(kind: &str, label_selector: &str) -> Config {
     }
 }
 
+/// How long a read on a watch's client may stay silent before it ends in an
+/// error. The client library gave every client this bound until its 4.0
+/// release left a client with none, and a list call has no other.
+const WATCH_READ_TIMEOUT: Duration = Duration::from_secs(295);
+
+/// The client a watch runs on, from the configuration `inferred` for this
+/// process. A read that stays silent for 295 seconds ends in an error. An
+/// answer that says try later (429, 503, 504) comes back as it is: the
+/// watcher's own backoff spaces the next call, and the client sends none again
+/// by itself. Shared with the mesh's router-peer watcher.
+pub fn watch_client(inferred: kube::Config) -> Result<Client, kube::Error> {
+    Client::try_from(watch_config(inferred))
+}
+
+/// `inferred` with the two settings of a watch's client.
+fn watch_config(mut inferred: kube::Config) -> kube::Config {
+    inferred.read_timeout = Some(WATCH_READ_TIMEOUT);
+    inferred.default_retry = false;
+    inferred
+}
+
 impl Default for ServiceDiscoveryConfig {
     fn default() -> Self {
         ServiceDiscoveryConfig {
@@ -541,30 +562,25 @@ pub(super) async fn start_kubernetes_discovery(
     config: ServiceDiscoveryConfig,
     host: Arc<dyn DiscoveryHost>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
-    let _ = ring::default_provider().install_default();
-
-    let client = Client::try_default().await?;
-
-    Ok(run_service_discovery(client, config, host))
+    let inferred = kube::Config::infer()
+        .await
+        .map_err(kube::Error::InferConfig)?;
+    start_service_discovery_on(inferred, config, host)
 }
 
-/// Run discovery against an injected client. Compiled only for this crate's
-/// own integration tests, which point it at a scripted API server.
-#[cfg(feature = "test-util")]
-pub fn start_service_discovery_with_client(
-    client: Client,
+/// Run discovery on the client configuration `inferred`: the one start of the
+/// watch, so nothing runs it on a client with the client library's defaults.
+/// The crate exports it only under `test-util`, for a host's integration
+/// tests: they hand it the configuration of a scripted API server, and the
+/// watch they start runs on the client a served host's watch runs on.
+pub fn start_service_discovery_on(
+    inferred: kube::Config,
     config: ServiceDiscoveryConfig,
     host: Arc<dyn DiscoveryHost>,
-) -> task::JoinHandle<()> {
+) -> Result<task::JoinHandle<()>, kube::Error> {
     let _ = ring::default_provider().install_default();
-    run_service_discovery(client, config, host)
-}
+    let client = watch_client(inferred)?;
 
-fn run_service_discovery(
-    client: Client,
-    config: ServiceDiscoveryConfig,
-    host: Arc<dyn DiscoveryHost>,
-) -> task::JoinHandle<()> {
     if config.disaggregated_mode {
         info!(
             "Starting K8s service discovery | disaggregated mode | encode: '{}' | prefill: '{}' | decode: '{}'",
@@ -614,7 +630,7 @@ fn run_service_discovery(
         );
     });
 
-    handle
+    Ok(handle)
 }
 
 /// Wake the reconcile loop when the store changes. The initial list wakes the

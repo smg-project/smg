@@ -7,8 +7,6 @@
 
 #[cfg(test)]
 use std::sync::mpsc::{self, Receiver, SyncSender};
-#[cfg(feature = "controller")]
-use std::sync::OnceLock;
 use std::{
     collections::{HashMap, VecDeque},
     mem,
@@ -33,7 +31,7 @@ use crate::{
         view::{Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
     store::{
-        applied::{Applied, EngineCounts, EngineFaults},
+        applied::EngineFaults,
         health::{HealthSink, VetoWrite},
         journal::{Journal, Position},
         leases::{
@@ -82,7 +80,7 @@ pub struct StoreStats {
     /// ([`MemoryStore::lifecycle_faults`]): a count of its own, read
     /// beside the first.
     pub lifecycle_faults: u64,
-    /// The panics the store's engines held under their own catches, over
+    /// The panics the store's engine held under its own catches, over
     /// every document the store applied: counts of their own too.
     pub engine_faults: EngineFaults,
 }
@@ -123,9 +121,6 @@ pub struct MemoryStore {
     counts: Arc<InFlightCounts>,
     /// Where the store's clock starts.
     origin: Instant,
-    /// What every engine the store builds counts its held panics into: the
-    /// unbound start's and each applied document's ([`Applied::new`]).
-    engine_faults: EngineCounts,
     /// Where the term is told, and that a write's locks are let go; `None`
     /// for a store nobody follows. The membership writes tell through
     /// their table's own handle.
@@ -135,12 +130,6 @@ pub struct MemoryStore {
     /// the one instant the host's loop cannot have read. A lock of its own,
     /// the last taken and held for the call alone.
     wake: Mutex<Option<Wake>>,
-    /// The indexes of cache events the store's host lends its engines
-    /// ([`MemoryStore::lend_cache_indexes`]): handed once, and handed on to
-    /// the engine of each policy spec the store applies. The store holds
-    /// the engine's own trait object and names no index.
-    #[cfg(feature = "controller")]
-    indexes: OnceLock<Arc<dyn CacheIndexes>>,
 }
 
 /// The replicated rows at one place of the log's history. A controller's is
@@ -207,8 +196,7 @@ impl MemoryStore {
         // own.
         let history = Duration::from_millis(u64::from(LOAD_REPORT_CLOCK_HISTORY_MS));
         let origin = now.checked_sub(history).unwrap_or(now);
-        let engine_faults = EngineCounts::default();
-        let writer = Writer::new(window, origin, &engine_faults);
+        let writer = Writer::new(window, origin);
         let world = ArcSwap::new(writer.world());
         // The leases' file writes the counts the writer's shapes name, and
         // a membership write gives a joining member its slot in them.
@@ -227,11 +215,8 @@ impl MemoryStore {
             joined: Mutex::default(),
             counts,
             origin,
-            engine_faults,
             journal: None,
             wake: Mutex::new(None),
-            #[cfg(feature = "controller")]
-            indexes: OnceLock::new(),
         }
     }
 
@@ -717,14 +702,18 @@ impl MemoryStore {
     /// the load lock, as a membership write does: a writer's wait, never a
     /// decision's.
     ///
-    /// In a build with the `in-process` feature the generation keeps the
-    /// standing one's stage objects, with what they hold, for each profile
-    /// that did not change, as an engine does where it takes a new document
-    /// itself. A build without that feature keeps nothing: every stage is
-    /// built new. The generation's engine is built behind the workers
-    /// lock, where the standing generation cannot move. A number that does
-    /// not rise builds none: a generation the store refuses keeps nothing.
-    /// The stages it built new are then told every member once, by id
+    /// In a build with the `in-process` feature the store keeps one
+    /// engine for its life and the generation is put in force on it, by
+    /// the call a host that decides in its own process makes
+    /// (`InProcess::apply`). The session table and its pins, the records
+    /// of sent prefixes and the stage objects of each profile that did not
+    /// change stand across the apply, with what they hold. A build without
+    /// that feature keeps nothing: every stage is built new. That call
+    /// runs under both locks, behind the last word that may refuse the
+    /// generation: a generation the store does not publish is never in
+    /// force on the engine. A number that does not rise is refused behind
+    /// that word too, by the number alone, and keeps nothing. The stages
+    /// it built new are then told every member once, by id
     /// ([`Membership::Snapshot`]), under the workers lock and with the load
     /// lock let go: they start empty, and a stage kept heard each member as
     /// it came. Each membership write after it is told behind the same
@@ -734,6 +723,11 @@ impl MemoryStore {
     /// from the standing generation's count under the same two settings,
     /// or else by its profile's name, or else one that is left, before the
     /// publication ([`Engine::succeed`](crate::engine::Engine::succeed)).
+    ///
+    /// A decision that read its world ahead of the apply ends under that
+    /// world's generation: its list's value, its lease and the stages told
+    /// its issue are that generation's
+    /// ([`StoreSnapshot::spec`]).
     ///
     /// The journal is told the generation's number there too, behind the
     /// publication ([`Journal::generation`]).
@@ -790,19 +784,16 @@ impl MemoryStore {
         }
     }
 
-    /// Lend this store's engines the indexes of cache events its host
-    /// keeps, once: a later call is ignored. The engine that stands is
-    /// handed them here, and the engine of each policy spec applied from
-    /// now on where the apply publishes it. Under the membership lock, as
-    /// an apply publishes: an apply finds them here, or its engine stands
-    /// when this call hands them. The store calls nothing of what it is
-    /// handed.
+    /// Lend this store's engine the indexes of cache events its host
+    /// keeps, once: a later call is ignored, by the engine's own rule
+    /// ([`Affinity::set_indexes`](crate::engine::Affinity::set_indexes)).
+    /// The store's one engine is handed them here and keeps them under
+    /// every policy spec applied from now on: an apply builds no engine
+    /// and hands nothing on. The store keeps none of what it is handed and
+    /// calls nothing of it. The call takes no lock: every world of the
+    /// store holds the one engine, so an apply beside it loses nothing.
     #[cfg(feature = "controller")]
     pub(crate) fn lend_cache_indexes(&self, indexes: Arc<dyn CacheIndexes>) {
-        let _workers = self.workers.lock();
-        if self.indexes.set(Arc::clone(&indexes)).is_err() {
-            return;
-        }
         self.world.load().front().affinity().set_indexes(indexes);
     }
 
@@ -817,64 +808,45 @@ impl MemoryStore {
         admit: impl FnOnce() -> bool,
     ) -> Result<bool, StaleGeneration> {
         let generation = spec.generation();
-        // The writer takes a second reference: where `admit` refuses, the
-        // last one is this one, let go after the lock.
-        let built;
         let before = {
             // Taken before the lock, so dropped after it: the journal
             // wakes its readers with the membership lock let go.
             let _released = self.released();
             let workers = self.workers.lock();
-            // Behind the workers lock no apply moves the standing
-            // generation: what the new one keeps of its stages is what
-            // stands. A number that does not rise builds nothing, as an
-            // engine refuses it ahead of its keep: a refused generation
-            // keeps nothing, and is let go after the lock. The load lock is
-            // taken behind the build: a taker of that lock alone, as a
-            // scrape's counts and the read of what is due, does not wait
-            // for the build.
-            built = {
-                let world = self.world.load();
-                let standing = world.spec();
-                if generation > standing.generation() {
-                    Ok(Arc::new(Applied::after(
-                        standing,
-                        spec,
-                        self.origin,
-                        &self.engine_faults,
-                    )))
-                } else {
-                    Err(StaleGeneration {
-                        standing: standing.generation(),
-                        offered: generation,
-                    })
-                }
-            };
             let mut loads = self.loads.lock();
             // The last word, behind every lock this entry waits for: what
-            // follows is the publication.
+            // follows is the publication, or the refusal of a number that
+            // does not rise. The generation is put in force on the
+            // store's engine behind it and never ahead: the engine takes
+            // no generation back.
             if !admit() {
                 return Ok(false);
             }
-            // A number that did not rise is refused here, behind that word,
-            // as the writer refused it.
-            let spec = built.as_ref().map_err(|stale| *stale)?;
-            // The host's indexes of cache events, where it lent them: the
-            // engine holds them before a decision can reach it.
-            #[cfg(feature = "controller")]
-            if let Some(indexes) = self.indexes.get() {
-                spec.front().affinity().set_indexes(Arc::clone(indexes));
+            // Behind the workers lock no apply moves the standing
+            // generation. A number that does not rise is refused here, by
+            // the number alone. A generation refused here or by `admit`
+            // is let go after the locks: this call holds it still.
+            let standing = self.world.load().spec().generation();
+            if generation <= standing {
+                return Err(StaleGeneration {
+                    standing,
+                    offered: generation,
+                });
             }
             let writer = &mut loads.writer;
-            let (world, before) = writer.apply(Arc::clone(spec), workers.members())?;
-            spec.engine().succeed(self.world.load().spec().engine());
+            let (world, before) = writer.apply(spec, workers.members())?;
+            #[cfg(test)]
+            seam::turned();
             // The pools are published as they stood: a build the membership
             // writes left owed is left to its window, and with it the table
             // of the members no world named.
             writer.replaced(self.world.swap(world));
             drop(loads);
             // A stage the generation kept heard each member as it came.
-            Self::tell_members(&workers, |list| spec.tell_built_new(list));
+            // The world that stands is the generation's: the workers lock
+            // holds every other apply off.
+            let shown = self.world.load();
+            Self::tell_members(&workers, |list| shown.applied().tell_built_new(list));
             if let Some(journal) = &self.journal {
                 journal.generation(at, generation);
             }
@@ -940,16 +912,19 @@ impl MemoryStore {
     /// Tell every member once, by id ([`Membership::Snapshot`]), through
     /// `tell`: a snapshot tells the engine of the generation that stands,
     /// and an apply the stages its generation built new
-    /// ([`Applied::tell_built_new`]). Called under the workers lock, after
-    /// the world of those members is shown and with the load lock let go.
+    /// ([`Applied::tell_built_new`](super::applied::Applied::tell_built_new)).
+    /// Called under the workers lock, after the world of those members is
+    /// shown and with the load lock let go.
     fn tell_members(workers: &Workers, tell: impl FnOnce(&Membership<'_>)) {
         let mut members: Vec<WorkerId> = workers.rows.keys().copied().collect();
         members.sort_unstable();
         tell(&Membership::Snapshot(&members));
     }
 
-    /// Tell the engine of the world the store shows one membership word:
-    /// under the workers lock, with the load lock let go.
+    /// Tell the store's engine one membership word, through the world the
+    /// store shows: under the workers lock, with the load lock let go. The
+    /// engine tells the generation in force on it, which is the standing
+    /// one: an apply holds the workers lock.
     fn tell_engine(&self, word: &Membership<'_>) {
         self.world.load().applied().on_membership(word);
     }
@@ -1174,7 +1149,7 @@ impl MemoryStore {
         StoreStats {
             outside: loads.writer.outside(),
             lifecycle_faults: self.lifecycle_faults(),
-            engine_faults: self.engine_faults.read(),
+            engine_faults: self.world.load().applied().faults(),
         }
     }
 
@@ -1184,6 +1159,14 @@ impl MemoryStore {
     /// a generation that declares no list counts none.
     pub fn outside_lists(&self) -> OutsideLists {
         self.stats().outside
+    }
+
+    /// How many members' reads under the standing generation's lists the
+    /// store keeps: one a member under lists that name an engine family or
+    /// a zone, and none under any other.
+    #[cfg(all(test, feature = "operator"))]
+    pub(crate) fn listed_members(&self) -> usize {
+        self.loads.lock().writer.listed()
     }
 
     /// How many members the table of the ones no world lists holds.
@@ -1197,8 +1180,9 @@ impl MemoryStore {
     /// each tried.
     #[cfg(test)]
     pub(crate) fn unlocked(&self) -> bool {
+        let free = |file: &turn::File| file.try_take().is_some();
         self.workers.try_lock().is_some()
-            && self.files.iter().all(turn::File::free)
+            && self.files.iter().all(free)
             && self.loads.try_lock().is_some()
     }
 
@@ -1671,8 +1655,8 @@ impl MemoryStore {
     ///   the status the log told of its row (`Objects::copy_status`).
     ///
     /// What else reads a row's status reads the table's whole row and
-    /// goes with the table: the holder's follow, for a row a writer left
-    /// outside the holder's turn, and the store's own reads of a row.
+    /// goes with the table: the holder's read of a row a writer left
+    /// outside its turn, and the store's own reads of a row.
     pub(crate) fn told(&self) -> Told {
         let workers = self.workers.lock();
         let at = self
@@ -1804,7 +1788,7 @@ impl WorkersStore for MemoryStore {
         let standing = standing.and_then(|id| workers.rows.get(id));
         let standing = standing.map(|held| &held.row);
         let now = Instant::now();
-        let (change, row) = facts.laid_over(standing, maker, now);
+        let (change, row) = WorkerRow::laid_over(facts, standing, maker, now);
         let fits = self.decided(workers, now, change, Some(row));
         debug_assert!(fits, "a change decided under the membership lock fits");
         change
@@ -2364,6 +2348,27 @@ impl Decodes {
         }
     }
 
+    /// Whether an issue ever kept a side here. A file no decode call issued
+    /// into keeps none.
+    #[cfg(feature = "controller")]
+    fn keeps_any(&self) -> bool {
+        !self.replaced.is_empty()
+    }
+
+    /// The chosen side an issue replaced in the place `at` of the lease
+    /// under `key`, while the side that issue laid is issued or dispatched.
+    /// It is read and stays kept. `None` for a side no call issued, and for
+    /// an issued side that ended: a place keeps what an issue replaced past
+    /// its lease's end, so the side's own count of issues says whether a
+    /// call laid it.
+    #[cfg(feature = "controller")]
+    fn replaced_side(&self, at: u32, key: &Key) -> Option<DecodeSide> {
+        let issued = self.get(at, key)?;
+        let kept = self.replaced.get(at as usize)?.as_ref();
+        let (_, (first, _)) = kept.filter(|(owner, _)| owner == key)?;
+        (issued.issues != 0 && issued.side.state.is_live()).then_some(*first)
+    }
+
     /// Returns the issued, originally chosen decode at `at` and takes its saved side
     /// and deadline only if both belong to `key` and any named issue is still current.
     #[cfg(feature = "controller")]
@@ -2585,6 +2590,19 @@ impl Leases {
             return Err(DecodeRefused::DecodeStands);
         }
         Ok((held, found))
+    }
+
+    /// The chosen side a decode call's issue replaced on the lease under
+    /// `key`, as the pair's first decision filed it
+    /// ([`Decodes::replaced_side`]). A file no decode call issued into
+    /// looks no record up.
+    #[cfg(feature = "controller")]
+    fn replaced_decode(&self, key: &Key) -> Option<DecodeSide> {
+        if !self.decodes.keeps_any() {
+            return None;
+        }
+        let at = self.records.get(key)?.decode;
+        self.decodes.replaced_side(at, key)
     }
 
     /// Undoes the current decode issue if `issue` is `None` or matches, returning both prior sides.
@@ -3676,34 +3694,27 @@ impl MemoryStore {
     }
 
     /// Ends the leases past their dispatch deadline at `now`
-    /// ([`LeasesStore::expire`]): each file whose deadline hint is reached
-    /// or whose ring holds a frame takes its turn in the files' order, one
-    /// at a time, where the caller may act at the file. A decider at work
-    /// ends its own file's due leases at its issues. Each end is told under
-    /// the turn, as a frame's end is told. A file is passed too where
-    /// `settled` says no, asked under the file's turn behind everything
-    /// handed to it: a host that keeps what was said of a file's leases
-    /// beside its ring says no until it has handed that on, so no lease is
-    /// ended ahead of a dispatch said of it. The file's deadline is shown
-    /// ahead of both questions ([`Leases::show_due`]): a file passed at one
-    /// is asked again at that instant. Returns both parts of each lease as
-    /// the sweep left them.
+    /// ([`LeasesStore::expire`]). The files take their turns in their
+    /// order, one at a time. A file takes its turn where it may hold work
+    /// for a sweep and the caller may act there ([`Self::sweep_turn`]). A
+    /// decider at work ends its own file's due leases at its issues. Each
+    /// end is told under the turn, as a frame's end is told.
+    ///
+    /// A file is passed too where `settled` says no. That is asked under
+    /// the file's turn, behind everything handed to it. A host may keep
+    /// what was said of a file's leases beside its ring. It says no until
+    /// it has handed that on, so no lease is ended ahead of a dispatch
+    /// said of it. The file's deadline is shown ahead of that question
+    /// too: a file passed at it is asked again at that instant.
+    ///
+    /// Returns both parts of each lease as the sweep left them.
     pub(crate) fn expire_where(&self, now: Instant, settled: impl Fn(usize) -> bool) -> Vec<Sides> {
         let mut ended = Vec::new();
         for at in 0..self.files.len() {
-            if !self.files[at].sweep_needed(now) {
+            let Some(mut leases) = self.sweep_turn(at, now) else {
                 continue;
-            }
-            // A file whose decider works is passed with no wait for its
-            // turn; the same is read again under the turn.
-            if !self.may_act(at) {
-                continue;
-            }
-            let mut leases = self.files[at].take();
-            // Shown ahead of the questions: a file passed at one is asked
-            // again at its deadline, not at every pass.
-            leases.show_due();
-            if !self.applied(at, &mut leases) || !settled(at) {
+            };
+            if !settled(at) {
                 continue;
             }
             // The ends of one file's sweep are told under one load of
@@ -3958,210 +3969,17 @@ impl LeasesStore for MemoryStore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        engine::{decision_slot::DecisionSlot, view::WorkerId},
-        store::leases::PickRecord,
-        tracking::lease::Lease,
-    };
-
-    #[test]
-    fn the_lease_sweep_takes_only_a_file_with_a_due_lease() {
-        let store = MemoryStore::new().with_decision_slots(256);
-        let clear_takes = || store.files.iter().for_each(turn::File::clear_takes);
-        let takes = || store.files.iter().map(turn::File::takes).sum::<usize>();
-        let now = Instant::now();
-
-        clear_takes();
-        assert!(LeasesStore::expire(&store, now).is_empty());
-        assert_eq!(takes(), 0, "empty files need no turn");
-
-        LeasesStore::set_term(&store, 1);
-        let record = LeaseRecord {
-            lease: Lease::default(),
-            gateway: GatewayId(1),
-            request: 1,
-            target: WorkerId(1),
-            picked: PickRecord::default(),
-            decode: None,
-            untold: false,
-            term: 1,
-            issued_at: now,
-            dispatch_deadline: now + Duration::from_secs(1),
-            state: LeaseState::ISSUED,
-        };
-        let _acting = DecisionSlot::new(173).enter();
-        let issued = store
-            .issue_decided(record, None, |_| {})
-            .expect("the lease is filed");
-        clear_takes();
-        let ended = LeasesStore::expire(&store, record.dispatch_deadline);
-        assert_eq!(ended.len(), 1);
-        assert_eq!(ended[0].record.lease.id, issued.id);
-        assert_eq!(takes(), 1, "only the due lease's file is taken");
-    }
-
-    /// A lease issued at `now` that waits for its dispatch until `deadline`.
-    fn waiting(now: Instant, request: u64, deadline: Instant) -> LeaseRecord {
-        LeaseRecord {
-            lease: Lease::default(),
-            gateway: GatewayId(1),
-            request,
-            target: WorkerId(1),
-            picked: PickRecord::default(),
-            decode: None,
-            untold: false,
-            term: 1,
-            issued_at: now,
-            dispatch_deadline: deadline,
-            state: LeaseState::ISSUED,
-        }
-    }
-
-    /// An issue reads no clock for the hint. A new first place asks the
-    /// sweep once, the sweep reads its deadline, and no sweep takes the
-    /// file again before it. A place behind the first asks none. The file
-    /// the sweep emptied is passed.
-    #[test]
-    fn a_file_is_asked_once_and_then_at_the_deadline_the_sweep_read() {
-        let store = MemoryStore::new().with_decision_slots(256);
-        let clear_takes = || store.files.iter().for_each(turn::File::clear_takes);
-        let takes = || store.files.iter().map(turn::File::takes).sum::<usize>();
-        let now = Instant::now();
-        let after = |millis: u64| now + Duration::from_millis(millis);
-        LeasesStore::set_term(&store, 1);
-        let _acting = DecisionSlot::new(173).enter();
-        let file = |request: u64, millis: u64| {
-            let filed = store.issue_decided(waiting(now, request, after(millis)), None, |_| {});
-            filed.expect("the lease is filed")
-        };
-        file(1, 1_000);
-        clear_takes();
-        assert!(LeasesStore::expire(&store, now).is_empty());
-        assert_eq!(takes(), 1, "a new first place asks the sweep once");
-        assert!(LeasesStore::expire(&store, after(500)).is_empty());
-        assert_eq!(takes(), 1, "the sweep waits for the deadline it read");
-        file(2, 1_500);
-        clear_takes();
-        assert!(LeasesStore::expire(&store, after(500)).is_empty());
-        assert_eq!(takes(), 0, "a place behind the first asks no sweep");
-        // A lease filed with an earlier deadline of its own is a new
-        // first place: the sweep is asked ahead of the instant it read.
-        let earlier = file(3, 600);
-        clear_takes();
-        let ended = LeasesStore::expire(&store, after(700));
-        assert_eq!((ended.len(), takes()), (1, 1));
-        assert_eq!(ended[0].record.lease.id, earlier.id);
-        let ended = LeasesStore::expire(&store, after(1_000));
-        assert_eq!((ended.len(), takes()), (1, 2));
-        let ended = LeasesStore::expire(&store, after(1_500));
-        assert_eq!((ended.len(), takes()), (1, 3));
-        assert!(LeasesStore::expire(&store, after(2_000)).is_empty());
-        assert_eq!(takes(), 3, "the emptied file needs no turn");
-    }
-
-    /// The sweep shows a file's deadline ahead of its questions. A file
-    /// whose host has not settled is asked once before that instant, and
-    /// from it at every pass until the host settles.
-    #[test]
-    fn a_file_its_host_has_not_settled_is_asked_once_before_its_deadline() {
-        let store = MemoryStore::new();
-        let clear_takes = || store.files.iter().for_each(turn::File::clear_takes);
-        let takes = || store.files.iter().map(turn::File::takes).sum::<usize>();
-        let now = Instant::now();
-        let after = |millis: u64| now + Duration::from_millis(millis);
-        LeasesStore::set_term(&store, 1);
-        let filed = store.issue_decided(waiting(now, 1, after(1_000)), None, |_| {});
-        filed.expect("the lease is filed");
-        clear_takes();
-        for millis in [100, 200, 300] {
-            assert!(store.expire_where(after(millis), |_| false).is_empty());
-        }
-        assert_eq!(takes(), 1, "asked once before its deadline");
-        for millis in [1_000, 1_100] {
-            assert!(store.expire_where(after(millis), |_| false).is_empty());
-        }
-        assert_eq!(takes(), 3, "asked at every pass from its deadline");
-        assert_eq!(store.expire_where(after(1_200), |_| true).len(), 1);
-    }
-
-    /// Indexes that hold no index and name one block size: what a case
-    /// reads an engine's hold of them by.
-    #[cfg(feature = "controller")]
-    struct OneSize(u32);
-
-    #[cfg(feature = "controller")]
-    impl CacheIndexes for OneSize {
-        fn index(&self, _: &str) -> Option<Arc<dyn crate::engine::CacheIndex>> {
-            None
-        }
-
-        fn block_size(&self, _: &str) -> Option<u32> {
-            Some(self.0)
-        }
-    }
-
-    /// The preset `round_robin` at `generation`.
-    #[cfg(feature = "controller")]
-    fn round_robin(generation: u64) -> AppliedSpec {
-        use crate::document::spec::PolicySpec;
-
-        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
-        document.generation = generation;
-        AppliedSpec::validate(&document).expect("the document validates")
-    }
-
-    /// The indexes a store is lent reach the engine that stands at the
-    /// hand-over, in that call, and the engine of each policy spec applied
-    /// later, where the apply publishes it. The first lending stands: a
-    /// second is ignored, for the engine that stands and for the next one.
-    #[cfg(feature = "controller")]
-    #[test]
-    fn the_engine_that_stands_and_each_one_applied_later_hold_the_lent_indexes() {
-        let store = MemoryStore::new();
-        let size = || store.snapshot().front().affinity().block_size("m");
-        store.apply(round_robin(1)).expect("generation 1");
-        assert_eq!(size(), None, "lent none yet");
-        store.lend_cache_indexes(Arc::new(OneSize(16)));
-        assert_eq!(size(), Some(16), "the engine that stood is handed them");
-        store.apply(round_robin(2)).expect("generation 2");
-        assert_eq!(size(), Some(16), "an engine applied later holds them");
-        store.lend_cache_indexes(Arc::new(OneSize(32)));
-        assert_eq!(size(), Some(16), "the first lending stands");
-        store.apply(round_robin(3)).expect("generation 3");
-        assert_eq!(size(), Some(16), "for the next engine too");
-    }
-}
+#[path = "../../tests/unit/store/memory/tests.rs"]
+mod tests;
 
 /// A seam for the cases: a hook the writing thread runs once, where a write
 /// by the store's one body has let the workers lock go
 /// ([`MemoryStore::decided`]): a registration, a followed change, or a
 /// change the replica's worker objects decided. The store's own patch,
-/// removal and status write run none. No case reaches there from outside.
-/// In no build but the cases'.
+/// removal and status write run none. A second hook runs inside an apply
+/// of a generation, between the engine's turn and the publication of the
+/// generation's world ([`MemoryStore::apply`]). No case reaches either
+/// place from outside. In no build but the cases'.
 #[cfg(test)]
-pub(crate) mod seam {
-    use std::cell::RefCell;
-
-    type Hook = Box<dyn FnOnce()>;
-
-    thread_local! {
-        static RELEASED: RefCell<Option<Hook>> = const { RefCell::new(None) };
-    }
-
-    /// `hook` runs once, behind the workers lock of this thread's next
-    /// write by that body.
-    pub(crate) fn on_release(hook: impl FnOnce() + 'static) {
-        RELEASED.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
-    }
-
-    /// The hook runs. It is taken out first: a registration the hook
-    /// itself makes meets none.
-    pub(super) fn released() {
-        let hook = RELEASED.with(|held| held.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-}
+#[path = "../../tests/unit/store/memory/seam.rs"]
+pub(crate) mod seam;

@@ -48,6 +48,7 @@
 mod entries;
 mod log;
 #[cfg(test)]
+#[path = "../../../tests/unit/service/replication/tests.rs"]
 mod tests;
 
 pub use entries::{EntryReplication, ENTRIES};
