@@ -2347,6 +2347,27 @@ impl Decodes {
         }
     }
 
+    /// Whether an issue ever kept a side here. A file no decode call issued
+    /// into keeps none.
+    #[cfg(feature = "controller")]
+    fn keeps_any(&self) -> bool {
+        !self.replaced.is_empty()
+    }
+
+    /// The chosen side an issue replaced in the place `at` of the lease
+    /// under `key`, while the side that issue laid is issued or dispatched.
+    /// It is read and stays kept. `None` for a side no call issued, and for
+    /// an issued side that ended: a place keeps what an issue replaced past
+    /// its lease's end, so the side's own count of issues says whether a
+    /// call laid it.
+    #[cfg(feature = "controller")]
+    fn replaced_side(&self, at: u32, key: &Key) -> Option<DecodeSide> {
+        let issued = self.get(at, key)?;
+        let kept = self.replaced.get(at as usize)?.as_ref();
+        let (_, (first, _)) = kept.filter(|(owner, _)| owner == key)?;
+        (issued.issues != 0 && issued.side.state.is_live()).then_some(*first)
+    }
+
     /// Returns the issued, originally chosen decode at `at` and takes its saved side
     /// and deadline only if both belong to `key` and any named issue is still current.
     #[cfg(feature = "controller")]
@@ -2571,22 +2592,16 @@ impl Leases {
     }
 
     /// The chosen side a decode call's issue replaced on the lease under
-    /// `key`, as the pair's first decision filed it, while the side that
-    /// issue laid is issued or dispatched. It is read and stays kept. `None`
-    /// for a side no call issued, and for an issued side that ended: a
-    /// place keeps what an issue replaced past its lease's end, so the
-    /// side's own count of issues says whether a call laid it. A file no
-    /// decode call issued into looks no record up.
+    /// `key`, as the pair's first decision filed it
+    /// ([`Decodes::replaced_side`]). A file no decode call issued into
+    /// looks no record up.
     #[cfg(feature = "controller")]
     fn replaced_decode(&self, key: &Key) -> Option<DecodeSide> {
-        if self.decodes.replaced.is_empty() {
+        if !self.decodes.keeps_any() {
             return None;
         }
         let at = self.records.get(key)?.decode;
-        let issued = self.decodes.get(at, key)?;
-        let kept = self.decodes.replaced.get(at as usize)?.as_ref();
-        let (_, (first, _)) = kept.filter(|(owner, _)| owner == key)?;
-        (issued.issues != 0 && issued.side.state.is_live()).then_some(*first)
+        self.decodes.replaced_side(at, key)
     }
 
     /// Undoes the current decode issue if `issue` is `None` or matches, returning both prior sides.

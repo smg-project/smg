@@ -171,3 +171,61 @@ fn the_stores_engine_holds_the_lent_indexes_across_applies() {
     store.apply(round_robin(3)).expect("generation 3");
     assert_eq!(size(), Some(16), "under the next policy spec too");
 }
+
+/// The side an issue replaced is answered under its place and its
+/// lease's key, read and left kept, while the side that the issue laid
+/// is issued or dispatched. A place keeps what an issue replaced past
+/// its lease's end. So a lease laid in the place later reads none of
+/// it: not under another key, and not under the same key until a call
+/// issues its side. An issued side that ended answers none.
+#[cfg(feature = "controller")]
+#[test]
+fn the_side_an_issue_replaced_is_read_under_its_place_and_key_while_its_issue_stands() {
+    use crate::engine::SessionVerdict;
+
+    let key = |id: u64| (GatewayId(1), LeaseId(id));
+    let side = |target: u64, state: LeaseState| DecodeSide {
+        target: WorkerId(target),
+        picked: PickRecord::default(),
+        session: Session::NONE,
+        session_verdict: SessionVerdict::None,
+        state,
+        tokens: 0,
+        target_index: 0,
+    };
+    // A side on worker 8 as it stands in `state`, issued by `issues` calls.
+    let laid = |issues: u8, state: LeaseState| FiledDecode {
+        issues,
+        ..FiledDecode::laid(side(8, state), None)
+    };
+    let first = side(7, LeaseState::Chosen);
+    let mut decodes = Decodes::default();
+    assert!(!decodes.keeps_any(), "no issue kept a side yet");
+    // A lease ahead, so the pair's place is not the list's first.
+    decodes.lay(key(1), laid(0, LeaseState::ISSUED));
+    let at = decodes.lay(key(2), laid(1, LeaseState::ISSUED));
+    assert_eq!(decodes.replaced_side(at, &key(2)), None, "nothing kept yet");
+
+    decodes.keep(at, key(2), (first, Instant::now()));
+    assert!(decodes.keeps_any());
+    for _ in 0..2 {
+        assert_eq!(decodes.replaced_side(at, &key(2)), Some(first));
+    }
+    assert_eq!(decodes.replaced_side(0, &key(1)), None, "no issue there");
+
+    // The issued side ends where it stands, then stands dispatched.
+    let ended = LeaseState::Released(ReleaseReason::Abandoned);
+    *decodes.get_mut(at, &key(2)).expect("the pair's side") = laid(1, ended);
+    assert_eq!(decodes.replaced_side(at, &key(2)), None, "its side ended");
+    let dispatched = LeaseState::Dispatched { at: Instant::now() };
+    *decodes.get_mut(at, &key(2)).expect("the pair's side") = laid(1, dispatched);
+    assert_eq!(decodes.replaced_side(at, &key(2)), Some(first));
+
+    // The lease leaves, and the next one laid takes its place.
+    assert!(decodes.take(at, &key(2)).is_some());
+    assert_eq!(decodes.lay(key(3), laid(1, LeaseState::ISSUED)), at);
+    assert_eq!(decodes.replaced_side(at, &key(3)), None, "another key's");
+    assert!(decodes.take(at, &key(3)).is_some());
+    assert_eq!(decodes.lay(key(2), laid(0, LeaseState::ISSUED)), at);
+    assert_eq!(decodes.replaced_side(at, &key(2)), None, "never issued");
+}
