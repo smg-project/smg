@@ -987,16 +987,20 @@ async def test_materialize_batch_produces_stable_item_identities_across_batch_si
     # NativeEncoder.facade("metadata", ...) exposes item_identities and _finish cleans up.
     meta_wait = asyncio.Future()
     meta_wait.set_result({"embedding_size": 16, "token_count": 1, "embedding_dim": 8})
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.disaggregation.encoder.server",
-        SimpleNamespace(meta_registry=SimpleNamespace(wait=lambda rid: meta_wait)),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.disaggregation.encoder.runtime",
-        SimpleNamespace(send_staged_embedding=None),
-    )
+    server_mod = SimpleNamespace(meta_registry=SimpleNamespace(wait=lambda rid: meta_wait))
+    runtime_mod = SimpleNamespace(send_staged_embedding=None)
+    for name, mod in [
+        ("sglang", SimpleNamespace()),
+        ("sglang.srt", SimpleNamespace()),
+        ("sglang.srt.disaggregation", SimpleNamespace()),
+        (
+            "sglang.srt.disaggregation.encoder",
+            SimpleNamespace(server=server_mod, runtime=runtime_mod),
+        ),
+        ("sglang.srt.disaggregation.encoder.server", server_mod),
+        ("sglang.srt.disaggregation.encoder.runtime", runtime_mod),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
     fake_enc = _FakeEncoder()
     fake_enc._smg_req_item_identities = dict(sink_solo)
     owner = epd_encoder.NativeEncoder(
