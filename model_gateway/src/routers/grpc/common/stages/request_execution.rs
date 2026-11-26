@@ -742,6 +742,56 @@ fn decode_is_owed_behind_its_prefill(plan: &ExecutionPlan, workers: &WorkerSelec
             .is_some_and(|protocol| protocol.dispatch == PdDispatch::Sequential)
 }
 
+/// The pair protocol of the runtime `workers` name, or what refuses a
+/// pair's request ahead of it: a selection that is no pair's, which is the
+/// pipeline's own fault, and a runtime that speaks no disaggregated mode.
+// Always in line: one request's dispatch asks it on every pair request's
+// path, where these lines stood before a batch asked them too. Their log
+// lines keep the dispatch's name.
+#[inline(always)]
+fn pd_protocol(workers: &WorkerSelection) -> Result<PdProtocol, Response> {
+    let Some(runtime_type) = workers.disaggregated_runtime_type() else {
+        error!(
+            function = "execute_pd_dispatch",
+            "PD mode requires disaggregated worker selection"
+        );
+        return Err(error::internal_error(
+            "pd_mode_requires_disaggregated_workers",
+            "PD mode requires disaggregated worker selection",
+        ));
+    };
+    let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
+        error!(
+            function = "execute_pd_dispatch",
+            runtime_type = ?runtime_type,
+            "Runtime does not support PD disaggregated mode"
+        );
+        return Err(error::bad_request(
+            "runtime_pd_not_supported",
+            "This runtime does not support PD disaggregated mode",
+        ));
+    };
+    Ok(protocol)
+}
+
+/// What a pair's dispatch refuses of `proto_request` ahead of its
+/// prefill's send ([`execute_pd_dispatch`]): the runtime's refusals and,
+/// where the two sides go out one behind the other, the sequential plan's.
+/// A batch asks this of every sub-request ahead of its one word of the
+/// send, where that word says anything ([`PrefillAhead::sent_behind`]).
+// Out of line: a batch of a classic answer never comes here, and its
+// dispatch keeps the body it had.
+#[inline(never)]
+fn pd_refusal(
+    proto_request: &ProtoGenerateRequest,
+    workers: &WorkerSelection,
+) -> Result<(), Response> {
+    match pd_protocol(workers)?.dispatch {
+        PdDispatch::Sequential => SequentialPlan::decide(proto_request, workers).map(drop),
+        PdDispatch::Parallel => Ok(()),
+    }
+}
+
 /// Dispatch one disaggregated request in its runtime's shape.
 /// `room_residue` is the prefill rank the request's sticky key pinned its
 /// room to ([`pin_grouped_dp_prefill_room`]), which the rooms of an n>1
@@ -767,27 +817,7 @@ async fn execute_pd_dispatch(
     encode: Option<EncodeWatch>,
     behind: Option<DecodeBehindPrefill<'_>>,
 ) -> Result<ExecutionResult, Response> {
-    let Some(runtime_type) = workers.disaggregated_runtime_type() else {
-        error!(
-            function = "execute_pd_dispatch",
-            "PD mode requires disaggregated worker selection"
-        );
-        return Err(error::internal_error(
-            "pd_mode_requires_disaggregated_workers",
-            "PD mode requires disaggregated worker selection",
-        ));
-    };
-    let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
-        error!(
-            function = "execute_pd_dispatch",
-            runtime_type = ?runtime_type,
-            "Runtime does not support PD disaggregated mode"
-        );
-        return Err(error::bad_request(
-            "runtime_pd_not_supported",
-            "This runtime does not support PD disaggregated mode",
-        ));
-    };
+    let protocol = pd_protocol(workers)?;
     // Dispatch shape comes from the per-runtime PD protocol table (see
     // `PdProtocol::for_runtime`): sequential sides relay the KV handoff
     // through the router, parallel sides rendezvous on bootstrap info
@@ -800,7 +830,8 @@ async fn execute_pd_dispatch(
     // pipeline's own fault alone, a client selection that is no pair's. A
     // batch said its send once, ahead of its sub-requests' dispatches
     // ([`execute_batch_dispatch`]): for one of those the word is said
-    // already, and these refusals come behind it.
+    // already. Where that word says anything, the batch asked these
+    // refusals ahead of it ([`pd_refusal`]), so none comes behind it.
     let result = match protocol.dispatch {
         PdDispatch::Sequential => {
             let plan = SequentialPlan::decide(&proto_request, workers)?;
@@ -1179,13 +1210,22 @@ async fn execute_batch_dispatch(
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     // The batch's prefills go out with the dispatches below: the send is
-    // said here, once, ahead of the handles made of the load, and so ahead
-    // of what a sub-request's dispatch may still refuse.
+    // said here, once, ahead of the handles made of the load. Where that
+    // word says anything, for an answer of Grand Central, what a
+    // sub-request's dispatch refuses ahead of its send is asked first
+    // ([`pd_refusal`]): a batch refused there sent nothing, and its load is
+    // dropped as it was acquired. A classic answer's send says nothing and
+    // asks nothing here: its sub-requests make their refusals as before.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
         ExecutionPlanKind::Single => requests.iter().map(|_| None).collect(),
         ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
+            let refusal = || {
+                requests
+                    .iter()
+                    .try_for_each(|request| pd_refusal(request, workers))
+            };
             require_prefill_guard(prefill_guard)?
-                .sent()
+                .sent_behind(refusal)?
                 .replicate_to(requests.len())
                 .into_iter()
                 .map(Some)
@@ -6909,6 +6949,167 @@ pub(crate) mod tests {
             drop((result, guard));
             assert_eq!(heard_of(&heard), ["issued", "dispatched Single", end_heard]);
         }
+    }
+
+    /// A pair Grand Central placed, held as a pair route holds it ahead of
+    /// its prefill's send: one prefill and one decode on the KV transport
+    /// `connector`, what the hearing stage heard, the selection under the
+    /// runtime `runtime_type`, which the dispatch reads its shape from, and
+    /// the prefill's load not yet sent.
+    fn a_pair_ahead_of_its_send(
+        connector: &str,
+        runtime_type: RuntimeType,
+    ) -> (Heard, WorkerSelection, PrefillAhead) {
+        use openai_protocol::model_card::ModelCard;
+
+        use crate::{
+            config::types::PolicyConfig,
+            policies::PolicyRegistry,
+            routers::common::{
+                placement::{
+                    select_pair,
+                    tests::{hearing_pairs_on, pairs_of, MODEL},
+                    PlacedPair, PlacementInputs, Stated,
+                },
+                prefill_admission::hold_unbounded,
+                snapshot::WorkerRegistry,
+            },
+        };
+
+        let registry = WorkerRegistry::new();
+        for (url, worker_type) in [
+            ("grpc://p:1", WorkerType::Prefill),
+            ("grpc://d:1", WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .health_config(no_health_check())
+                .kv_connector(connector)
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .expect("worker registers");
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pairs_on(&policies, false);
+        let pairs = pairs_of(&registry, &policies);
+        let inputs = PlacementInputs::default();
+        let pair = select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs,
+            None,
+            None,
+            inputs,
+            Stated::nothing,
+        );
+        let Ok(pair) = pair else {
+            panic!("the engine places the pair");
+        };
+        let ((prefill, decode), ahead) = hold_unbounded(
+            pair,
+            Some("key"),
+            |pair: &PlacedPair| &pair.prefill,
+            |pair: PlacedPair| {
+                let (prefill, unsent) = pair.prefill.unsent();
+                ((prefill, pair.decode), unsent)
+            },
+        );
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode,
+            runtime_type,
+        };
+        (heard, workers, ahead)
+    }
+
+    /// A pair's dispatch says its prefill's send behind the request's
+    /// refusals, the runtime's and the sequential plan's: one request
+    /// refused there drops its load as it was acquired, and Grand Central
+    /// hears the prefill's side released. A batch refused at the same
+    /// refusals sent nothing either and is heard alike: a release, with no
+    /// dispatch and no end.
+    #[tokio::test]
+    async fn a_batch_refused_ahead_of_its_send_is_heard_as_a_release() {
+        use smg_worker::identity::basic::MORIIO_CONNECTOR;
+
+        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
+
+        let (client, engine) = mock_backend_client("m").await;
+        let clients = ClientSelection::Disaggregated {
+            prefill: client.clone(),
+            decode: client,
+        };
+        // Each refusal by a pair that meets it: a runtime with no pair
+        // protocol, and a decode whose connector the sequential plan refuses.
+        let refusals = [
+            (
+                RuntimeType::Mlx,
+                "NixlConnector",
+                "runtime_pd_not_supported",
+            ),
+            (
+                RuntimeType::Vllm,
+                MORIIO_CONNECTOR,
+                "moriio_grpc_pd_unsupported",
+            ),
+        ];
+        for (runtime_type, connector, code) in refusals {
+            for batched in [false, true] {
+                let (heard, workers, ahead) = a_pair_ahead_of_its_send(connector, runtime_type);
+                assert_eq!(heard_of(&heard), ["issued", "issued"]);
+                let ledger = AttemptLedger::default();
+                let request = || ProtoGenerateRequest::Vllm(Box::default());
+                let refused = if batched {
+                    execute_batch_dispatch(
+                        ExecutionPlanKind::PrefillDecode,
+                        vec![request(), request()],
+                        &clients,
+                        &workers,
+                        "m",
+                        Some(ahead),
+                        &ledger,
+                        Instant::now(),
+                    )
+                    .await
+                } else {
+                    let mut clients = clients.clone();
+                    execute_pd_dispatch(
+                        request(),
+                        &mut clients,
+                        &workers,
+                        "m",
+                        ahead,
+                        &ledger,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                };
+                let Err(refused) = refused else {
+                    panic!("{code}, batched {batched}: the dispatch is refused");
+                };
+                assert_eq!(
+                    refused
+                        .headers()
+                        .get(error::HEADER_X_SMG_ERROR_CODE)
+                        .unwrap(),
+                    code
+                );
+                assert_eq!(
+                    heard_of(&heard)[2..],
+                    ["released Abandoned"],
+                    "{code}, batched {batched}: the prefill's side, with no dispatch and no end"
+                );
+            }
+        }
+        engine.abort();
     }
 }
 
