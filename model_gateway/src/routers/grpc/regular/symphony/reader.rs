@@ -1444,6 +1444,62 @@ mod tests {
         assert!(outputs.ends_with(" 1"), "{outputs}");
     }
 
+    /// The reader's half of a JSON answer on a prompt that closed the thought, for the table that
+    /// leaves the thought to the model: the prompt's replay leaves the reader past the thought, so
+    /// an answer that starts with the JSON is content that parses, and a thought written ahead of
+    /// it is content too, which no longer parses as the JSON the request asked for, whether or
+    /// not the reader knows the request is held to a JSON answer. So the answer's tag admits no
+    /// thought on such a prompt (`constraint::AnswerTag`).
+    #[test]
+    fn a_thought_ahead_of_a_json_answer_is_content_on_a_prompt_that_closed_the_thought() {
+        use symphony::formats::minimax_m3;
+        let answer = r#"{"city": "Paris"}"#;
+        let thought_first = format!("<mm:think>The capital.</mm:think>{answer}");
+        for json_answer in [false, true] {
+            let content = |output: &str| {
+                let assignment = Assignment {
+                    format: Arc::new(minimax_m3()),
+                    prompt: "]~b]user\nhi[e~[\n]~b]ai\n</mm:think>".to_string(),
+                    forbids_calls: Forbids::Nothing,
+                    past_the_end: false,
+                    forcing: None,
+                    opener: None,
+                    forced_ids: None,
+                    json_answer,
+                    span: Span::none(),
+                    marked: Arc::default(),
+                };
+                let mut all: Vec<Event<'static>> = Vec::new();
+                let mut events = Events::new();
+                let mut reader =
+                    Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
+                all.extend(events.into_owned().drain());
+                let mut delta = Delta::default();
+                let mut events = Events::new();
+                reader
+                    .tail(output.to_string(), &mut delta, &mut events)
+                    .expect("read");
+                all.extend(events.into_owned().drain());
+                let mut events = Events::new();
+                reader
+                    .end(EngineFinish::Stop, who(), &mut events)
+                    .expect("ended");
+                all.extend(events.into_owned().drain());
+                content_of(&all)
+            };
+            assert_eq!(content(answer), answer, "held to JSON: {json_answer}");
+            let read = content(&thought_first);
+            assert!(
+                read.contains("The capital."),
+                "held to JSON: {json_answer}: {read}"
+            );
+            assert!(
+                serde_json::from_str::<Value>(&read).is_err(),
+                "held to JSON: {json_answer}: {read}"
+            );
+        }
+    }
+
     #[test]
     fn whitespace_before_text_or_a_call_is_the_templates_and_goes_out_once_at_most() {
         use symphony::formats::minimax_m3;

@@ -392,9 +392,14 @@ What this table says beyond the DSML one:
   default, whose generation prompt has no marker. Under `thinking_mode: disabled` the
   generation prompt ends with `</mm:think>`: the template closed the thought in the model's
   place (`Format::thought_closed`), and a forced or required call is written at once, the block
-  alone, with no thought and no second close before it. The `auto` tag and a JSON answer's tag
-  admit the thought, or a second close, in both, and an answer that writes one with thinking
-  off reads back as content, as the legacy parser's tag has it.
+  alone, with no thought and no second close before it. The `auto` tag admits the thought, or a
+  second close, in both, and an answer that writes one with thinking off reads back as content,
+  as the legacy parser's tag has it. A JSON answer's grammar takes no closed reading
+  (`Format::answer_grammar_for`): asked as on a prompt with no marker it admits them too, and
+  a thought written there comes back as content that no longer parses as the JSON the request
+  asked for (a second close alone the reader drops). A caller that read the
+  prompt closed asks the answer as after the thought (`reasoning_open` with
+  `GrammarStart::AfterReasoning`) and gets the schema alone, as the gateway does.
 - **Two states for the calls, as for DSML:** `calls` is the template's wrapping (a newline after
   `<tool_call>` and after `</invoke>`), `invoke` one call's arguments, read by the XML assembler
   (`tagged::xml`); a second invoke before the first closed ends the first,

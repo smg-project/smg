@@ -1352,9 +1352,12 @@ impl Format {
     /// model's place (`thought_closed`, [`Format::thought_closed`]): a call the request forces
     /// (`owed`) then starts at once, the tag holding no thought and no second close, since a
     /// model offered the thought again may never leave it, and then spends its tokens there and
-    /// never writes the call. The `auto` tag and a JSON answer's tag
-    /// admit the thought, or a second close, there too, as before, and an answer that writes one
-    /// with thinking off reads back as content, as the legacy parser's tag has it.
+    /// never writes the call. The `auto` tag admits the thought, or a second close, there too,
+    /// and an answer that writes one with thinking off reads back as content, as the legacy
+    /// parser's tag has it. A JSON answer's grammar takes no closed reading
+    /// (`Format::answer_grammar_for`): asked as on a prompt with no marker its tag admits them
+    /// too, and a caller that read the prompt closed asks it as after the thought
+    /// (`reasoning_open` with `GrammarStart::AfterReasoning`) and gets the schema alone.
     ///
     /// A table with the opener's row alone (Seed-OSS, whose template writes no empty thought)
     /// leaves the thought to the model too, and where its grammar starts is the engine's: after
