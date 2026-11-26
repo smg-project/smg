@@ -24,6 +24,14 @@ A gate is a test gate only where it cannot hold without `test`: the plain
 `cfg(test)`, or an `all` with such a member. An `any` with another member, or a
 `not`, gates product code too.
 
+A package in mid-move says so by a file `tests/unit/MOVING.md`. There the first
+rule is not asked: a test module that has not moved yet may stand under `src`,
+as a body, as a `mod` line with no path attribute or with one that names a file
+under `src`, or inside an inline module, and a case may stand there too. Every
+other rule binds: a pointer that names a file outside `src` names the rule's
+place, and every file under `tests/unit` is named. The last change of the move
+deletes the file.
+
 Usage: check_unit_test_layout.py [ROOT]. ROOT is the repository's folder, by
 default the one that holds this script's folder. Each fault is one line on
 standard output, and the exit code is 1 where there is one.
@@ -35,6 +43,8 @@ import sys
 from pathlib import Path
 
 UNIT = "tests/unit"
+# A package that holds this file under its `tests/unit` is in mid-move.
+MOVING = "MOVING.md"
 # Where a fault's reader finds the rule: this file, by its path in the repository.
 RULE = "scripts/check_unit_test_layout.py"
 # Folders the walk for packages does not enter, with every folder whose name
@@ -323,8 +333,11 @@ def roots_of(package):
     return product, programs
 
 
-def check_package(package, label):
-    """The faults of one bound package, each a line that begins with its place."""
+def check_package(package, label, moving=False):
+    """The faults of one bound package, each a line that begins with its place.
+
+    `moving` says the package is in mid-move: what has not moved yet is no fault.
+    """
     faults = []
     sources = {}
     product, programs = roots_of(package)
@@ -355,23 +368,28 @@ def check_package(package, label):
             if body:
                 bodies.append((at, closing(source.code, source.code.index("{", at))))
             if chain:
-                faults.append(
-                    f"{place}: a test module inside the inline module `{chain[-1]}`: that module "
-                    "becomes a file of its own, and the pointer stands at that file's first level"
-                )
+                if not moving:
+                    faults.append(
+                        f"{place}: a test module inside the inline module `{chain[-1]}`: that "
+                        "module becomes a file of its own, and the pointer stands at that file's "
+                        "first level"
+                    )
                 continue
             if body:
-                faults.append(
-                    f"{place}: a test module's body under src: it stands in a file under {UNIT}"
-                )
+                if not moving:
+                    faults.append(
+                        f"{place}: a test module's body under src: it stands in a file under {UNIT}"
+                    )
                 continue
             rule = "/".join(own + [name])
             string = path_of(attributes)
             asked = posixpath.relpath(rule + ".rs", folder)
             if string is None:
-                faults.append(
-                    f'{place}: `mod {name}` holds no path attribute: the rule\'s is #[path = "{asked}"]'
-                )
+                if not moving:
+                    faults.append(
+                        f"{place}: `mod {name}` holds no path attribute: "
+                        f'the rule\'s is #[path = "{asked}"]'
+                    )
                 continue
             # At a file's first level the compiler reads the string from the
             # file's own folder, however the file itself was loaded.
@@ -388,9 +406,10 @@ def check_package(package, label):
                     pointers.append(target)
                 continue
             if not target.startswith("tests/") or target.startswith(UNIT + "/"):
-                faults.append(
-                    f'{place}: `mod {name}` names "{string}": the rule\'s path is "{asked}"'
-                )
+                if not (moving and target.startswith("src/")):
+                    faults.append(
+                        f'{place}: `mod {name}` names "{string}": the rule\'s path is "{asked}"'
+                    )
                 continue
             if shared is None:
                 shared = loaded(package, programs, sources)
@@ -400,7 +419,7 @@ def check_package(package, label):
                     "where a test program of the package loads the same file"
                 )
         cases = [at for at in source.cases() if not any(start <= at < end for start, end in bodies)]
-        if cases:
+        if cases and not moving:
             count = "a case" if len(cases) == 1 else f"{len(cases)} cases, the first here,"
             faults.append(
                 f"{label}/{rel}:{source.line(cases[0])}: {count} under src: "
@@ -442,7 +461,8 @@ def check(root):
     faults = []
     for package in packages(root):
         if (package / UNIT).is_dir() and (package / "src").is_dir():
-            faults += check_package(package, package.relative_to(root).as_posix())
+            moving = (package / UNIT / MOVING).is_file()
+            faults += check_package(package, package.relative_to(root).as_posix(), moving)
     return faults
 
 

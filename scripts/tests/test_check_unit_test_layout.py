@@ -72,6 +72,51 @@ def test_a_case_and_a_test_modules_body_under_src_are_faults(tmp_path):
     ]
 
 
+NOT_MOVED_YET = {
+    **VIEW,
+    "src/lib.rs": "mod view;\nmod shape;\nmod wide {\n    #[cfg(test)]\n    mod tests {\n"
+    "        #[test]\n        fn inside() {}\n    }\n}\n"
+    "#[cfg(test)]\nmod tests {\n    #[test]\n    fn inside() {}\n}\n#[test]\nfn loose() {}\n"
+    '#[cfg(test)]\n#[path = "cases.rs"]\nmod cases;\n',
+    "src/cases.rs": "#[test]\nfn holds() {}\n",
+    "src/shape.rs": "#[cfg(test)]\nmod tests;\n",
+    "src/shape/tests.rs": "#[test]\nfn holds() {}\n",
+}
+
+
+def test_a_package_in_mid_move_may_hold_what_has_not_moved_yet(tmp_path):
+    assert faults(tmp_path / "plain", NOT_MOVED_YET) == [
+        "src/cases.rs:1: a case under src: a case stands in its module's file under tests/unit",
+        "src/lib.rs:4: a test module inside the inline module `wide`: that module becomes a file "
+        "of its own, and the pointer stands at that file's first level",
+        "src/lib.rs:10: a test module's body under src: it stands in a file under tests/unit",
+        'src/lib.rs:17: `mod cases` names "cases.rs": the rule\'s path is "../tests/unit/cases.rs"',
+        "src/lib.rs:15: a case under src: a case stands in its module's file under tests/unit",
+        "src/shape/tests.rs:1: a case under src: a case stands in its module's file under tests/unit",
+        "src/shape.rs:1: `mod tests` holds no path attribute: "
+        'the rule\'s is #[path = "../tests/unit/shape/tests.rs"]',
+    ]
+    moving = {
+        **NOT_MOVED_YET,
+        "tests/unit/MOVING.md": "The unit tests of this package are moving.\n",
+    }
+    assert faults(tmp_path / "moving", moving) == []
+
+
+def test_a_package_in_mid_move_is_held_to_every_other_rule(tmp_path):
+    files = {**VIEW, "tests/unit/MOVING.md": "The unit tests of this package are moving.\n"}
+    files["src/view.rs"] = "pub fn width() -> usize {\n    4\n}\n\n" + pointer(
+        "../tests/unit/view/cases.rs"
+    )
+    files["tests/unit/view/cases.rs"] = "#[test]\nfn width_is_four() {}\n"
+    assert faults(tmp_path, files) == [
+        'src/view.rs:5: `mod tests` names "../tests/unit/view/cases.rs": '
+        'the rule\'s path is "../tests/unit/view/tests.rs"',
+        f"tests/unit/view/cases.rs: {UNNAMED}",
+        f"tests/unit/view/tests.rs: {UNNAMED}",
+    ]
+
+
 def test_an_attribute_is_read_to_its_closing_bracket(tmp_path):
     wrapped = '#[expect(\n    clippy::too_many_lines,\n    reason = "one long [table]"\n)]\n'
     body = dict(VIEW)
