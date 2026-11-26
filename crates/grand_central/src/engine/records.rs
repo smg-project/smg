@@ -906,32 +906,52 @@ impl PoolRecords {
         !self.engine_ends.is_empty()
     }
 
-    /// The workers of the engines a retry tried, written into `whole`:
-    /// `tried` as its host named them, and behind them the id of every
-    /// other row of the engine that holds a tried worker's row
-    /// ([`Engines`]), each once. A retry that names one rank of a
-    /// data-parallel engine so names them all: its ranks share the engine a
-    /// failed attempt reached.
+    /// The workers of the engines a retry tried, over the lists of one
+    /// decision: `tried` as its host named them, and behind them the id of
+    /// every other row of an engine that holds a tried worker's row
+    /// ([`Engines`]), each once and each list read by its own engines. A
+    /// retry that names one rank of a data-parallel engine so names them
+    /// all: its ranks share the engine a failed attempt reached. A single
+    /// request hands its one list, a pair its two and an encode request
+    /// its three.
     ///
-    /// An id the list does not hold stays as it was named and adds nothing:
-    /// the list says nothing of its engine. Where two rows of the list
-    /// carry one id, no id has a place ([`Self::place_of`]) and nothing is
-    /// added.
+    /// Only a list where an engine holds several rows is read
+    /// ([`Self::has_ranks`]). `None` where `lists` holds no such list: the
+    /// request's own list stands, and `whole` is not asked. Else `whole`
+    /// hands the list that is written and returned. It is asked once, and
+    /// what its list held is not kept.
     ///
-    /// One binary search for each tried id, and nothing allocated once
-    /// `whole` has grown: what a retry pays, and only over a list with
-    /// such an engine ([`Self::has_ranks`]).
-    pub(crate) fn tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
+    /// An id a list does not hold stays as it was named and adds nothing
+    /// there: that list says nothing of its engine. Where two rows of a
+    /// list carry one id, no id has a place in it ([`Self::place_of`]) and
+    /// it adds nothing.
+    ///
+    /// One binary search for each tried id in each list read, and nothing
+    /// allocated once the list `whole` hands has grown: what a retry pays.
+    #[must_use]
+    pub(crate) fn tried_engines<'a>(
+        lists: impl IntoIterator<Item = &'a Self>,
+        tried: &[WorkerId],
+        whole: impl FnOnce() -> Vec<WorkerId>,
+    ) -> Option<Vec<WorkerId>> {
+        let mut ranked = lists.into_iter().filter(|list| list.has_ranks());
+        let first = ranked.next()?;
+        let mut whole = whole();
         whole.clear();
         whole.extend_from_slice(tried);
-        self.more_tried_engines(tried, whole);
+        first.add_engines_of(tried, &mut whole);
+        for list in ranked {
+            list.add_engines_of(tried, &mut whole);
+        }
+        Some(whole)
     }
 
-    /// [`Self::tried_engines`] for a further list of the same decision, as
-    /// a pair's second list is: adds to `whole` the id of every row of an
-    /// engine of this list that holds a row `tried` names, where `whole`
-    /// does not hold it yet, and takes nothing out of `whole`.
-    pub(crate) fn more_tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
+    /// One list's part of [`Self::tried_engines`]: adds to `whole` the id
+    /// of every row of an engine of this list that holds a row `tried`
+    /// names, where `whole` does not hold it yet, and takes nothing out of
+    /// `whole`. A further list of the same decision, as a pair's second
+    /// list is, so adds to what the lists before it wrote.
+    fn add_engines_of(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
         for &id in tried {
             let Some(place) = self.place_of(id) else {
                 continue;

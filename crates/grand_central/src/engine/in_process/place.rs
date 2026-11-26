@@ -95,13 +95,13 @@ use crate::{
         DerivedKeys, KeySource,
     },
     engine::{
-        decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
+        decision::{Decision, PairSide, Pick, ShedReason, Target, MAX_TARGETS},
         decision_engine::{
             AlonePick, DecideOutcome, DecisionRefused, Plain, Request, RequestMaker, TextKey,
             TokenKey, WorkerLists,
         },
         demands::Demands,
-        framework::{EncodeItems, PairSide},
+        framework::EncodeItems,
         list_cell::LentList,
         prompt_hashes::{
             prompt_bytes_of, prompt_chars_of, prompt_tokens_of, HashSeeds, PromptHashes,

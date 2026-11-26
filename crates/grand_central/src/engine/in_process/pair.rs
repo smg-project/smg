@@ -131,10 +131,12 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 use super::{overlap, signals, single, with_shadow, InProcess, Loaded, PoolMembers};
 use crate::{
     engine::{
-        decision::{shed, Decision, Pick, ShadowKind, ShedReason, Target, SUBSET_HINT, WIRES},
+        decision::{
+            shed, Decision, PairSide, Pick, ShadowKind, ShedReason, Target, SUBSET_HINT, WIRES,
+        },
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         demands::{Demands, UnmetDemand},
-        framework::{Engine, PairPools, PairSide, Scratch, ShadowRows, ShedOver},
+        framework::{Engine, PairPools, Scratch, ShadowRows, ShedOver},
         lease_events,
         list_cell::LentList,
         pair_classes::PartnerClasses,
@@ -830,15 +832,16 @@ pub(super) fn record_sides(
 
 /// The workers of the engines a retry tried: `tried` as its host named
 /// them, and behind them every other worker of an engine of one of
-/// `lists` that holds a tried worker, each list read by its own engines
-/// (`PoolRecords::tried_engines`). A pair hands its two lists and an
+/// `lists` that holds a tried worker, each list read by its own engines.
+/// The lists' records say it in one operation
+/// ([`PoolRecords::tried_engines`]). A pair hands its two lists and an
 /// encode request its three. `None` where no list holds several workers
 /// of one engine: the request's own list stands.
 ///
 /// The workers stand in the calling thread's own list ([`single::TRIED`]),
-/// which the caller puts back behind its decision: a retry allocates
-/// nothing once the list has grown. Out of line and cold: a first attempt
-/// runs none of it.
+/// taken only where a list holds such an engine. The caller puts it back
+/// behind its decision: a retry allocates nothing once the list has
+/// grown. Out of line and cold: a first attempt runs none of it.
 #[cold]
 #[inline(never)]
 pub(super) fn tried_engines(
@@ -847,17 +850,8 @@ pub(super) fn tried_engines(
     lists: &[&PoolMembers],
 ) -> Option<Vec<WorkerId>> {
     let (spec, clock) = (&engine.document.spec, &engine.clock);
-    let mut ranked = lists
-        .iter()
-        .map(|list| list.records(spec, clock))
-        .filter(|records| records.has_ranks());
-    let first = ranked.next()?;
-    let mut whole = single::TRIED.take();
-    first.tried_engines(tried, &mut whole);
-    for records in ranked {
-        records.more_tried_engines(tried, &mut whole);
-    }
-    Some(whole)
+    let records = lists.iter().map(|list| list.records(spec, clock));
+    PoolRecords::tried_engines(records, tried, || single::TRIED.take())
 }
 
 /// The record of the prefill `held` names, written alone into `rows` for

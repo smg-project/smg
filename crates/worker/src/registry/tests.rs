@@ -3631,3 +3631,40 @@ fn an_eviction_from_the_index_takes_the_handle_and_not_its_address() {
     registry.remove_worker_from_model_index("llama", &newcomer);
     assert!(registry.get_by_model("llama").is_empty());
 }
+
+/// A publish of the lists again hands every model a new value over the list
+/// it held, and the global one with them: what a host keeps beside a list
+/// starts anew. No list changes, no event is sent, and a model no worker
+/// serves stays without a value of its own.
+#[test]
+fn publishing_again_hands_every_model_a_new_value_over_its_list() {
+    let registry = WorkerRegistry::new();
+    for (url, model) in [
+        ("http://a:8080", "llama"),
+        ("http://b:8080", "llama"),
+        ("http://c:8080", "qwen"),
+    ] {
+        let worker = BasicWorkerBuilder::new(url)
+            .model(ModelCard::new(model))
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+    }
+    let models = ["llama", "qwen"];
+    let before = models.map(|model| registry.generation(model));
+    let global = registry.global_generation();
+    let mut events = registry.subscribe_events();
+
+    registry.publish_again();
+
+    for (model, was) in models.into_iter().zip(&before) {
+        let now = registry.generation(model);
+        assert!(!Arc::ptr_eq(was, &now), "{model}: a new value");
+        let same_list = Arc::ptr_eq(was.members(), now.members());
+        assert!(same_list, "{model}: over the list it held");
+    }
+    let now = registry.global_generation();
+    assert!(!Arc::ptr_eq(&global, &now), "the global value");
+    assert_eq!(now.members().len(), 3);
+    assert!(events.try_recv().is_err(), "no event");
+    assert!(registry.model_generation("phi").is_none());
+}

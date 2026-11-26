@@ -53,9 +53,9 @@ use super::{
     InProcess, Loaded, PoolMembers,
 };
 use crate::engine::{
-    decision::{Decision, ShadowKind},
+    decision::{Decision, PairSide, ShadowKind},
     decision_engine::{DecideOutcome, Request, RequestMaker},
-    framework::{Engine, PairSide, ShadowRows},
+    framework::{Engine, ShadowRows},
     records,
     shadow::{Shadow, ShadowCount, ShadowCounts, ShadowSide, Shadowed, SHADOW_ROWS},
     view::{Constraints, RequestFacts},

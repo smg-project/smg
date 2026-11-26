@@ -41,10 +41,10 @@ use super::{
     signals, single, InProcess, Loaded, PoolMembers,
 };
 use crate::engine::{
-    decision::{shed, Decision, ShedReason, Target, WIRES},
+    decision::{shed, Decision, PairSide, ShedReason, Target, WIRES},
     decision_engine::{DecideOutcome, DecisionRefused, Request, RequestMaker, WorkerLists},
     demands::{Demands, UnmetDemand},
-    framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools, PairSide},
+    framework::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts, PairPools},
     list_cell::LentList,
     records::{HeldCells, Live, PoolRecords},
     view::{Constraints, Phase, RequestFacts, Session, SessionCountedUnder},

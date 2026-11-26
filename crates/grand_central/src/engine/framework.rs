@@ -14,8 +14,8 @@ use crate::{
     document::spec::{Assignment, Needs},
     engine::{
         decision::{
-            Decision, LiftedVeto, Overlap, Pick, Placing, Shed, ShedReason, Survivors, Target,
-            Targets, Trace, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
+            Decision, LiftedVeto, Overlap, PairSide, Pick, Placing, Shed, ShedReason, Survivors,
+            Target, Targets, Trace, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
         },
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
@@ -5052,36 +5052,6 @@ pub enum FirstPartnersError {
     Lists(PairTableError),
     #[error("a first partner is no partner of its prefill class in the pair table")]
     NoPartner,
-}
-
-/// One side of a pair decision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PairSide {
-    Prefill,
-    Decode,
-}
-
-impl PairSide {
-    /// Both sides, the prefill first: the order a pair decides them in.
-    pub const BOTH: [Self; 2] = [Self::Prefill, Self::Decode];
-
-    /// The side's place in a table of the two ([`Self::BOTH`]).
-    pub(crate) const fn index(self) -> usize {
-        match self {
-            Self::Prefill => 0,
-            Self::Decode => 1,
-        }
-    }
-
-    /// The side's label.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Prefill => "prefill",
-            Self::Decode => "decode",
-        }
-    }
 }
 
 impl<'a> PairPools<'a> {
