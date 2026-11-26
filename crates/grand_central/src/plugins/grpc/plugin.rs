@@ -367,11 +367,11 @@ impl Plugin {
 
     fn lane(&self) -> &Arc<Lane> {
         self.lanes.get_or(|| {
-            Arc::new(Lane::new(
-                Arc::clone(&self.inner.peer),
-                self.inner.events(),
-                Arc::clone(self.inner.runtime.witness()),
-            ))
+            Arc::new(
+                self.inner
+                    .runtime
+                    .lane(Arc::clone(&self.inner.peer), self.inner.events()),
+            )
         })
     }
 
@@ -726,19 +726,21 @@ impl PluginBinding {
         };
         let mut on_thread = self.plugin.inner.runtime.decisions().on_this_thread();
         let budget = on_thread.budget();
-        let (started, wait) = self.wait(ticket, budget);
-        self.take(open, ticket, started, wait, budget, shown);
+        let (lane, waited) = self.wait(ticket, budget);
+        self.take(lane, open, ticket, waited, budget, shown);
     }
 
     /// The wait between a frame's send and its take: this thread blocks
     /// until the answer, the frame's deadline or the end of what the
     /// decision has left, whichever is first ([`Budget::grant_wait`]).
-    /// Says when the wait began and how it ended.
-    fn wait(&self, ticket: Ticket, budget: &Budget) -> (Instant, Wait) {
+    /// Says which lane it waited on, when the wait began and how it
+    /// ended.
+    fn wait(&self, ticket: Ticket, budget: &Budget) -> (&Lane, (Instant, Wait)) {
         let started = Instant::now();
         let until = budget.grant_wait(started, ticket.deadline);
-        let wait = self.plugin.lane().wait_answer(ticket.decision_id, until);
-        (started, wait)
+        let lane: &Lane = self.plugin.lane();
+        let wait = lane.wait_answer(ticket.decision_id, until);
+        (lane, (started, wait))
     }
 
     /// Takes what the wait over `ticket` ended with: the time this thread
@@ -750,10 +752,10 @@ impl PluginBinding {
     /// frame the thread stopped waiting for.
     fn take(
         &self,
+        lane: &Lane,
         open: &mut Open,
         ticket: Ticket,
-        started: Instant,
-        wait: Wait,
+        (started, wait): (Instant, Wait),
         budget: &mut Budget,
         shown: Option<&[u32]>,
     ) {
@@ -766,7 +768,7 @@ impl PluginBinding {
         match wait {
             Wait::Answered(arrived, decision) => {
                 budget.draw(micros(arrived.saturating_duration_since(started)));
-                if inner.runtime.witness().stalled_between(ticket.at, arrived) {
+                if lane.stalled_between(ticket.at, arrived) {
                     // The I/O thread stalled while this answer was owed:
                     // the round trip holds the host's time and is no
                     // sample. The answer is read all the same.
@@ -819,10 +821,7 @@ impl PluginBinding {
                 budget.draw(u64::from(open.frame_micros));
                 bump(&inner.tally.missed);
                 open.bypass = true;
-                let stalled = inner
-                    .runtime
-                    .witness()
-                    .stalled_between(ticket.at, Instant::now());
+                let stalled = lane.stalled_between(ticket.at, Instant::now());
                 // Whose bound the frame ran out under, asked where every
                 // kind asks: the plugin's own where the frame had its whole
                 // budget, or where the plugin's spend in the decision so
