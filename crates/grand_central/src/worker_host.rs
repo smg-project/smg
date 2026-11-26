@@ -156,7 +156,7 @@ pub(crate) use membership_writer::tests::{
 };
 #[cfg(feature = "controller")]
 pub(crate) use membership_writer::{
-    drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
+    awaits_connect, drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
 };
 pub use membership_writer::{
     MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,

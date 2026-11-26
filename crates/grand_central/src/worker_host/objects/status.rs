@@ -121,7 +121,22 @@ impl<G: Generation> Objects<G> {
     /// write calls ([`Objects`]): its caller asks its term itself, so the
     /// call hands the store no last word.
     pub fn connect_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
-        self.row_status(store, row, revision, &|| true, Write::Connect);
+        self.connect_row_under(store, row, revision, &|| true);
+    }
+
+    /// [`Self::connect_row`] under its writer's word of its lead, `leads`,
+    /// for a caller whose term can end while the write waits: asked under
+    /// the object's lock and again under the store's, as
+    /// [`Self::tell_status`] asks a driver's. Where it says no at either,
+    /// no status is written and the object stands.
+    pub(crate) fn connect_row_under(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        leads: &dyn Fn() -> bool,
+    ) {
+        self.row_status(store, row, revision, leads, Write::Connect);
     }
 
     /// The drain of the row `row`, read at `revision`, as
@@ -129,7 +144,21 @@ impl<G: Generation> Objects<G> {
     /// `store` is told. Whether the row's object moved: a row that left
     /// the revision, or left, moves nothing, and a draining object stands.
     pub fn drain_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) -> bool {
-        self.row_status(store, row, revision, &|| true, Write::Drain)
+        self.drain_row_under(store, row, revision, &|| true)
+    }
+
+    /// [`Self::drain_row`] under its writer's word of its lead, as
+    /// [`Self::connect_row_under`] takes one. A drain whose word says no
+    /// moves nothing, as one whose row left the revision: its caller asks
+    /// its term to tell the two apart.
+    pub(crate) fn drain_row_under(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        leads: &dyn Fn() -> bool,
+    ) -> bool {
+        self.row_status(store, row, revision, leads, Write::Drain)
             .is_some()
     }
 

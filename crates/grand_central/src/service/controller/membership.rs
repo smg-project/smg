@@ -41,11 +41,44 @@
 //! ([`Objects::upsert`]): the object stands when the write returns. A drain
 //! and a connect signal go through the holder too: the store is told the
 //! status first, and the object moves where the store took it
-//! ([`Objects::drain_row`], [`Objects::connect_row`]). So a decision made
-//! behind an acknowledged registration, drain or removal reads the fleet
-//! the call left, and the door follows nothing behind its write. A
-//! standby's applier writes its leader's rows through the holder too
-//! ([`Objects::follow_at`]).
+//! ([`Objects::drain_row_under`], [`Objects::connect_row_under`]). So a
+//! decision made behind an acknowledged registration, drain or removal
+//! reads the fleet the call left, and the door follows nothing behind its
+//! write. A standby's applier writes its leader's rows through the holder
+//! too ([`Objects::follow_at`]).
+//!
+//! **A status's write asks the word of its call's term, last under the
+//! membership lock.** A connect signal and a drain hand the holder the
+//! door's own word: the log leads the term the call was admitted under
+//! still ([`Log::leads`]). The holder asks it under the object's lock, and
+//! the store asks it again under its membership lock. A call that waited at
+//! either through the end of its term writes no status and tells the
+//! journal nothing. The store's ask is the last one. A term that ends
+//! behind that ask still writes the status. The journal then stamps it with
+//! the term its store leads at that instant, or with none where it follows.
+//! A drain that wrote nothing asks the term once more. Where it ended, the
+//! call answers that its store does not lead the term, as a registration
+//! that can mint no life does ([`MembershipCalls::next_life`]), and
+//! otherwise the row moved. A registration that waits answers the row as it
+//! reads behind its connect signal, written or not.
+//!
+//! **A signal that was not written is sent again by an upsert of the same
+//! registration.** Its row waits for it: its checks are off, and it is
+//! neither ready nor draining ([`awaits_connect`]). No prober moves such a
+//! row. An upsert of equal facts writes no row, moves no revision and makes
+//! no life: it sends the signal with the word of its own term, and where it
+//! waits it answers the row behind it. A rank that stands unmoved in a
+//! wider registration is sent it the same way, by the host door's routine:
+//! under an upsert, and under an add that lays the ranks it left. An add
+//! over a row that stands, or over an engine that stands whole, is refused
+//! ahead of every write and sends none. A term's start sends none.
+//!
+//! **The lock order of that word.** It takes the log's lock alone, inside
+//! the object's lock and the store's membership lock: the order a
+//! journaled write takes the three, which tells the log under the
+//! membership lock. The log holds neither a store nor an object, and what
+//! it wakes it wakes under no lock, so no holder of the log's lock takes
+//! one of the other two.
 //!
 //! **A registration that states several ranks is one write.** Each rank's
 //! facts are read by the call's own rules, a rank at a time. The host
@@ -103,9 +136,9 @@ use crate::{
         WorkerStatus, WorkersStore,
     },
     worker_host::{
-        dial_address, drain, lay, lay_one, lay_ready, refresh, stated, stating, take, Members,
-        MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects, Over,
-        Precondition, Ready, Remover, RowRevision, Stated, Turn,
+        awaits_connect, dial_address, drain, lay, lay_one, lay_ready, refresh, stated, stating,
+        take, Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects,
+        Over, Precondition, Ready, Remover, RowRevision, Stated, Turn,
     },
 };
 
@@ -219,15 +252,25 @@ impl MembershipCalls {
 
     /// The door's connect signal for a row whose checks are off, in its
     /// turn: written on the row's worker object, and the store is told
-    /// ([`Objects::connect_row`]).
-    fn connect_row(&self, id: WorkerId, revision: u64) {
-        self.objects.connect_row(&self.store, id, revision);
+    /// ([`Objects::connect_row_under`]). It goes with the word of `term`,
+    /// the term the call was admitted under. A call whose term ended while
+    /// the write waited for a lock writes nothing. The word is asked last
+    /// under the membership lock, and the module's doc says what stays
+    /// open behind that ask.
+    fn connect_row(&self, id: WorkerId, revision: u64, term: u64) {
+        let leads = || self.log.leads(term).is_ok();
+        self.objects
+            .connect_row_under(&self.store, id, revision, &leads);
     }
 
     /// The door's drain of a row, as [`Self::connect_row`] writes a
-    /// status. Whether the row moved.
-    fn drain_row(&self, id: WorkerId, revision: u64) -> bool {
-        self.objects.drain_row(&self.store, id, revision)
+    /// status, with the word of `term`. Whether the row moved: a drain
+    /// whose term ended by the last ask moves nothing, as one whose row
+    /// left the revision.
+    fn drain_row(&self, id: WorkerId, revision: u64, term: u64) -> bool {
+        let leads = || self.log.leads(term).is_ok();
+        self.objects
+            .drain_row_under(&self.store, id, revision, &leads)
     }
 
     /// The door's read of the row under `id`, in its turn: the record read
@@ -312,15 +355,17 @@ impl MembershipCalls {
     ///
     /// `ADD` (and no mode) wants the URL absent; `REPLACE` wants it standing
     /// and makes its next incarnation; `UPSERT` registers an absent URL and
-    /// lays the registration over a standing row: equal facts write nothing
+    /// lays the registration over a standing row: equal facts write no row
     /// and answer the row unmoved, a change of role, wire, models or demand
     /// facts is a new incarnation, any other change is made in place. Over a
     /// draining row an `UPSERT` is the URL's next incarnation, whatever its
     /// facts.
     ///
-    /// `wait_ready` is honoured where the checks are off (the answer is the
-    /// row after its connect signal) and refused otherwise: no handshake
-    /// runs here.
+    /// A registration whose checks are off ends with its row's connect
+    /// signal, and so does an `UPSERT` of equal facts where the row waits
+    /// for that signal still ([`awaits_connect`]). `wait_ready` is honoured
+    /// where the checks are off (the answer is the row after its connect
+    /// signal) and refused otherwise: no handshake runs here.
     pub(crate) fn register(
         &self,
         by: &Principal,
@@ -417,8 +462,19 @@ impl MembershipCalls {
                 };
                 match laid {
                     WorkerFactsChange::Unmoved => {
-                        let epoch = self.store.epoch();
-                        let at = self.place();
+                        // Equal facts write no row. A row that waits for
+                        // its connect signal still is sent it again, with
+                        // the word of this call's term: a call that waits
+                        // answers the row behind it, as a registration that
+                        // wrote does.
+                        let (mut row, mut epoch, mut at) = (row, self.store.epoch(), self.place());
+                        if awaits_connect(&row) {
+                            self.connect_row(row.id, row.revision, admitted);
+                            if request.wait_ready {
+                                (row, epoch, at) =
+                                    (self.read(row.id)?, self.store.epoch(), self.place());
+                            }
+                        }
                         let unmoved = worker_wire::relabelled(&row);
                         return Ok(told(REGISTER, by, unmoved, false, epoch, at));
                     }
@@ -440,7 +496,7 @@ impl MembershipCalls {
         // from the old incarnation. Read before the connect signal moves it.
         let carried = now.status != WorkerStatus::Pending;
         if !now.facts.health.probes {
-            self.connect_row(id, now.revision);
+            self.connect_row(id, now.revision, admitted);
             if request.wait_ready {
                 (now, epoch, at) = (self.read(id)?, self.store.epoch(), self.place());
             }
@@ -509,17 +565,19 @@ impl MembershipCalls {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(DEREGISTER, by, leading, |_| {
-            self.remove(by, &Registrant::Control, request)
+        self.call(DEREGISTER, by, leading, |term| {
+            self.remove(by, &Registrant::Control, term, request)
         })
     }
 
     /// The write of [`Self::deregister`], in the door's turn, from `maker`.
-    /// A drain is no exception: it is a write of the row.
+    /// A drain is no exception: it is a write of the row, and it goes
+    /// with the word of `admitted`, the term the call was admitted under.
     fn remove(
         &self,
         by: &Principal,
         maker: &Registrant,
+        admitted: u64,
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         let standing = self.guarded(maker, request.worker_id, request.revision)?;
@@ -530,7 +588,11 @@ impl MembershipCalls {
         } else if standing.status == WorkerStatus::Draining {
             (worker_wire::relabelled(&standing), false)
         } else {
-            if !self.drain_row(standing.id, standing.revision) {
+            if !self.drain_row(standing.id, standing.revision, admitted) {
+                // The drain wrote nothing. Where its term ended, it answers
+                // that the store does not lead the term: its row need not
+                // have moved.
+                self.check_term(admitted)?;
                 return Err(moved());
             }
             let event =
@@ -658,11 +720,11 @@ impl Turn for CallTurn<'_> {
     }
 
     fn connect(&self, id: WorkerId, revision: u64) {
-        self.door.connect_row(id, revision);
+        self.door.connect_row(id, revision, self.term);
     }
 
     fn drain(&self, id: WorkerId, revision: u64) -> bool {
-        self.door.drain_row(id, revision)
+        self.door.drain_row(id, revision, self.term)
     }
 
     fn check_term(&self) -> Result<(), MembershipWriteRefused> {
@@ -789,7 +851,14 @@ impl MembershipCalls {
                     worker_wire::replaced(old.ok_or_else(moved)?, &row, carried)
                 }
                 MembershipWriteOutcome::Unmoved(_) => {
-                    worker_wire::relabelled(old.ok_or_else(moved)?)
+                    // A rank that waited for its connect signal was sent
+                    // it again: a call that waits answers the row behind it.
+                    let old = old.ok_or_else(moved)?;
+                    if request.wait_ready && awaits_connect(old) {
+                        worker_wire::relabelled(&self.read(old.id)?)
+                    } else {
+                        worker_wire::relabelled(old)
+                    }
                 }
                 MembershipWriteOutcome::Removed(id) => {
                     let last = before.iter().find(|row| row.id == id);
@@ -972,11 +1041,11 @@ impl Turn for ReplicaTurn<'_> {
     }
 
     fn connect(&self, id: WorkerId, revision: u64) {
-        self.host.door.connect_row(id, revision);
+        self.host.door.connect_row(id, revision, self.term);
     }
 
     fn drain(&self, id: WorkerId, revision: u64) -> bool {
-        self.host.door.drain_row(id, revision)
+        self.host.door.drain_row(id, revision, self.term)
     }
 
     fn check_term(&self) -> Result<(), MembershipWriteRefused> {
@@ -1081,8 +1150,8 @@ impl MembershipWriter for ReplicaMembershipWriter {
 
 /// The call's answer at `at`, the log's place after the call, and its audit
 /// line: the call, who it was from, the worker, what the call made of it
-/// (`nothing` where it wrote none) and that place. Never the URL: it may
-/// carry a credential.
+/// (`nothing` where it wrote no row: a connect signal has no line of its
+/// own) and that place. Never the URL: it may carry a credential.
 fn told(
     call: &'static str,
     by: &Principal,

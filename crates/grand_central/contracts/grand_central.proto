@@ -874,7 +874,9 @@ message HealthPolicy {
   uint32 success_threshold = 2;
   uint32 check_interval_ms = 3;
   uint32 timeout_ms = 4;
-  // The checks are off: the worker is ready from its registration and the
+  // The checks are off: the worker is ready from its registration, where
+  // the call's term holds at the last check ahead of its connect signal,
+  // and from a MODE_UPSERT of that registration where it did not. The
   // prober never judges it. The registrant says "do not check", never
   // "healthy".
   bool disabled = 5;
@@ -928,9 +930,11 @@ message RegisterWorkerRequest {
     // INVALID_ARGUMENT first, whether the URL stands or not. A caller that
     // did not make the standing row is PERMISSION_DENIED (WorkerRow.maker).
     MODE_REPLACE = 2;
-    // Registers an absent URL. Over a standing row: equal facts write nothing
+    // Registers an absent URL. Over a standing row: equal facts write no row
     // and answer the row unmoved, a change of role, wire, models or demand
-    // facts is a new incarnation, any other change is made in place. The
+    // facts is a new incarnation, any other change is made in place. Equal
+    // facts send a worker whose checks are off its connect signal again,
+    // where it is neither ready nor draining: its status alone moves. The
     // models change when their set does: the same ids in another order are
     // written in place, and the row tells the stated order. Over a draining
     // row every registration is the URL's next incarnation, whatever its
@@ -942,8 +946,13 @@ message RegisterWorkerRequest {
   // Wait for the handshake; otherwise the row is answered PENDING and the
   // handshake's result is a StatusChanged on WatchWorkers. A worker whose
   // checks are off is ready from its registration: its wait ends in the call
-  // and the answer is the row after it. INVALID_ARGUMENT, by this field's
-  // name, where the controller runs no handshake that ends the wait.
+  // and the answer is the row after it. A call whose term ended between its
+  // write and its connect signal answers that row as it stands, PENDING for
+  // a new worker: read the status the answer holds, and send the
+  // registration again as MODE_UPSERT, which sends the signal again. As
+  // MODE_ADD it is ALREADY_EXISTS and sends none. INVALID_ARGUMENT, by this
+  // field's name, where the controller runs no handshake that ends the
+  // wait.
   bool wait_ready = 3;
 }
 
