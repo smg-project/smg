@@ -1343,6 +1343,12 @@ def test_known_unbound_real_child_exit_can_be_positively_retired(mod, tmp_path):
         or not callable(getattr(os, "pidfd_open", None))
     ):
         pytest.skip("real known-owner retirement requires Linux pidfd")
+    try:
+        probe_fd = os.pidfd_open(os.getpid(), 0)
+    except OSError as error:
+        pytest.skip(f"pidfd unavailable for real known-owner retirement: {error}")
+    else:
+        os.close(probe_fd)
     marker = f"unbound-exit-{os.getpid()}-{time.monotonic_ns()}"
     child = subprocess.Popen(
         [sys.executable, "-I", "-B", "-c", "import time;print('READY',flush=True);time.sleep(60)"],
@@ -1386,3 +1392,68 @@ def test_known_unbound_real_child_exit_can_be_positively_retired(mod, tmp_path):
         child.wait(timeout=5)
         child.stdout.close()
         child.stderr.close()
+
+
+@pytest.mark.parametrize("replacement_uid", [STRICT_UID, STRICT_UID + 1])
+def test_binding_foreign_replacement_before_open_retires_old_obligation(
+    mod, strict_tree, replacement_uid
+):
+    runtime = _Pidfds(strict_tree)
+    opens = []
+
+    def opener(pid, flags):
+        if pid == 100:
+            opens.append(pid)
+            _strict_process(
+                strict_tree, pid, uid=replacement_uid, birth=9999, marker=MARKER + "-foreign"
+            )
+        return runtime.open(pid, flags)
+
+    assert runtime.run(mod, pidfd_open=opener)
+    assert opens == [100]
+    assert (strict_tree / "100/stat").is_file()
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.now < 1.0
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("uncertainty", ["uid", "status", "marker"])
+def test_binding_unverified_handoff_closes_fd_and_keeps_old_obligation(
+    mod, strict_tree, uncertainty
+):
+    runtime = _Pidfds(strict_tree)
+    lines = []
+    checked = []
+
+    def opener(pid, flags):
+        fd = runtime.open(pid, flags)
+        if pid == 100:
+            if uncertainty == "uid":
+                _strict_process(strict_tree, pid, uid=STRICT_UID + 1, birth=1100)
+            elif uncertainty == "status":
+                (strict_tree / "100/status").write_text("unreadable identity\n")
+            else:
+                (strict_tree / "100/environ").write_bytes(b"HOME=/same-birth\0")
+        return fd
+
+    def check_unaccepted_fds():
+        rejected = {fd for fd, pid in runtime.opened.items() if pid == 100}
+        assert rejected and rejected <= runtime.closed
+        checked.append(True)
+
+    runtime.on_sleep = check_unaccepted_fds
+    assert not runtime.run(mod, pidfd_open=opener, log=lines.append)
+    assert checked and any("unbound=[(100," in line for line in lines)
+    assert all(pid != 100 for pid, _ in runtime.sent)
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert runtime.closed == set(runtime.opened)
+
+
+def test_binding_matching_handoff_keeps_verified_peer_cleanup(mod, strict_tree):
+    runtime = _Pidfds(strict_tree)
+    assert runtime.run(mod)
+    assert (100, signal.SIGTERM) in runtime.sent
+    assert (101, signal.SIGTERM) in runtime.sent
+    assert sorted(runtime.opened.values()) == [100, 101]
+    assert runtime.closed == set(runtime.opened)
