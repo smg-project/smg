@@ -883,9 +883,10 @@ pub(super) fn paired(
 /// A prefill side's shadow whose own run shed asks this step alone, with
 /// its profile in the prefill's place.
 ///
-/// `SHADOW` says who asks, and no line reads it. It gives the default and
-/// a shadow a copy each, so the default's copy is compiled into its one
-/// caller. One copy for both cost the default's decision 172 instructions.
+/// No line reads `SHADOW`. It gives the default and a shadow a copy of
+/// this step each, so the default's copy is compiled into its one caller.
+/// One copy for both costs the default's decision about 190 instructions:
+/// the bench cell `pair_default` counts them.
 pub(super) fn paired_prefill<const SHADOW: bool>(
     [prefill, decode]: [Half<'_>; 2],
     table: &PairTable<'_>,
@@ -969,8 +970,9 @@ pub(super) fn paired_prefill<const SHADOW: bool>(
 /// A decode side's shadow beside the default's pair asks this step alone,
 /// for the live pair's prefill and behind its own profile's usable rows.
 ///
-/// `SHADOW` gives each caller its own copy, as the first step's does
-/// ([`paired_prefill`]).
+/// No line reads `SHADOW`. It gives each caller its own copy, as the first
+/// step's does ([`paired_prefill`]), and the bench cell `pair_default`
+/// counts what that saves.
 pub(super) fn paired_decode<const SHADOW: bool>(
     decode: &Half<'_>,
     table: &PairTable<'_>,

@@ -37,7 +37,8 @@
 //! decode's report states a value of it (`pair_signal_cost`).
 //! `--overloaded 1` puts a pair's decodes alone over their thresholds: the
 //! rule for such a list steers a pair's decode side. A pair whose prefills
-//! are all over theirs goes to the pair's default, which no cell runs.
+//! are all over theirs goes to the pair's default: the cell `pair_default`
+//! puts them there ([`DEFAULT`]).
 //! `--refused` states what refuses every pair ([`Refused`]): the engine
 //! then names the refusal of each request, and a turn counts where it was
 //! refused the way the run states. A cell that leaves that path counts no
@@ -59,9 +60,9 @@ use std::{
 use smg_grand_central::{
     document::{AppliedSpec, Assignment, PolicySpec},
     engine::{
-        prefills_full, Decided, Decision, DecodeVerdict, Identity, InProcess, PairAdmission,
-        PairLists, PartnerClasses, Phase, PlaceRequest, Plain, Prompt, PublishedList, Request,
-        RequestMaker, ShedReason, Unplaced, WorkerLists,
+        prefills_full, Decided, Decision, DecodeVerdict, Identity, InProcess, LiftedVeto,
+        PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain, Prompt,
+        PublishedList, Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -88,6 +89,11 @@ pub(super) const NAMED: &str = "place_named";
 
 /// The header such a request carries: the first worker a side.
 const NUMBER: [(&str, &str); 1] = [("x-smg-target-worker", "0")];
+
+/// The cell whose pairs the pair's default makes. Every prefill is over its
+/// thresholds beside open decodes, so the prefill side's run sheds. A turn
+/// counts where the pair's trace names the lifted overload veto.
+pub(super) const DEFAULT: &str = "pair_default";
 
 /// Whether this run's pairs name their worker: what the result line's word
 /// says.
@@ -165,6 +171,20 @@ pub(super) fn typed(url: String, worker_type: WorkerType) -> Arc<dyn Worker> {
         .build();
     worker.set_status(WorkerStatus::Ready);
     Arc::new(worker)
+}
+
+/// Puts every worker of `side` over its thresholds and gives each requests
+/// in flight: its place plus one, the middle worker none. The rule for
+/// such a list then has loads to steer by.
+fn over(side: &[Arc<dyn Worker>]) {
+    for (at, worker) in side.iter().enumerate() {
+        worker.set_overloaded(true);
+        if at != side.len() / 2 {
+            for _ in 0..=at {
+                worker.increment_load();
+            }
+        }
+    }
 }
 
 /// A pair's host with no limit of its own: every prefill has capacity and
@@ -334,8 +354,10 @@ impl Decodes {
 
     /// One pair request of `host` by the engine's one entry: the prefill's
     /// place in its list, with both dispatches and each side's end told
-    /// where the decision is leased.
-    fn place(&self, host: &Host, seed: u64) -> Option<u32> {
+    /// where the decision is leased. Under `DEFAULTED` a turn counts where
+    /// the pair's default made the pair ([`DEFAULT`]). The test is that
+    /// cell's alone: every other cell's turn is compiled without it.
+    fn place<const DEFAULTED: bool>(&self, host: &Host, seed: u64) -> Option<u32> {
         let stated = StatedPair {
             stated: Stated {
                 host,
@@ -365,7 +387,12 @@ impl Decodes {
             };
             return (decision.pick().is_none() && stated).then_some(0);
         }
-        let target = *decided.decision.pick()?.targets.first()?;
+        let pick = decided.decision.pick()?;
+        // The default's pair says the overload veto it lifted.
+        if DEFAULTED && pick.trace.lifted != LiftedVeto::Overload {
+            return None;
+        }
+        let target = *pick.targets.first()?;
         let decode = target.pair?.decode_id;
         if decided.lease.is_some() {
             let now = *dated.get()?;
@@ -434,14 +461,12 @@ pub(super) fn runs(run: &Run) -> bool {
     if run.overloaded {
         // A pair's prefill side is put to no rule: the cell puts its decodes
         // over their thresholds and leaves its prefills open.
-        for (at, worker) in decodes.iter().enumerate() {
-            worker.set_overloaded(true);
-            if at != decodes.len() / 2 {
-                for _ in 0..=at {
-                    worker.increment_load();
-                }
-            }
-        }
+        over(&decodes);
+    }
+    if name == DEFAULT {
+        // The prefill side's run sheds over such prefills, and the pair's
+        // default makes the pair of the least load.
+        over(&prefills);
     }
     if run.refused == Refused::Partners {
         for worker in decodes.iter() {
@@ -513,6 +538,12 @@ pub(super) fn runs(run: &Run) -> bool {
     if place::asked_with_lists(run, true) {
         let open = matches!(run.refused, Refused::No | Refused::Overload);
         assert!(open, "the one call's pair is open, or shed as saturated");
+        // The one call answers workers and no trace: nothing there says
+        // which pairs the default made.
+        assert!(
+            name != DEFAULT,
+            "the default's cell asks the engine's entry"
+        );
         let rule = ruled::stated(run);
         let named = run.entry == NAMED;
         NAMES.store(named, Ordering::Relaxed);
@@ -522,13 +553,13 @@ pub(super) fn runs(run: &Run) -> bool {
         });
         return true;
     }
-    measure(
-        run,
-        &host,
-        upkeep,
-        || feed.publish(&loads),
-        converted,
-        |seed| decode_side.place(&host, seed),
-    );
+    let publish = || feed.publish(&loads);
+    if name == DEFAULT {
+        let decide = |seed| decode_side.place::<true>(&host, seed);
+        measure(run, &host, upkeep, publish, converted, decide);
+        return true;
+    }
+    let decide = |seed| decode_side.place::<false>(&host, seed);
+    measure(run, &host, upkeep, publish, converted, decide);
     true
 }
