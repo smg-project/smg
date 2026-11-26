@@ -40,11 +40,160 @@ EXIT_INCOMPLETE = 2
 # Already admitted children can remain in flight. No new scope admissions follow
 # an unconfirmed halt; restarting/reconciliation is an external owner decision.
 _SCOPE_ADMISSION = threading.Lock()
-_QUARANTINED_SCOPES: set[tuple[str, str]] = set()
+_SCOPE_STATES: dict[tuple[str, str], str] = {}
 
 
 def _scope_identity(descriptor: dict) -> tuple[str, str]:
     return (os.path.realpath(descriptor["ledger_path"]), descriptor["scope_id"])
+
+
+_QUALITY_FAILURE_KINDS = frozenset({"missing_results", "invalid_results", "incomplete_results"})
+_HARD_FAILURE_KINDS = frozenset(
+    {
+        "output_exists",
+        "nonzero_exit",
+        "launch_error",
+        "timeout",
+        "ledger_refused",
+        "invocation_budget_incomplete",
+        "invalid_budget",
+        "missing_budget",
+        "scope_quarantined",
+        "budget_unavailable",
+        "infrastructure_error_results",
+    }
+)
+_KNOWN_FAILURE_KINDS = _QUALITY_FAILURE_KINDS | _HARD_FAILURE_KINDS
+
+
+def _scope_stopping(scope):
+    return _SCOPE_STATES.get(scope, "ACTIVE") != "ACTIVE"
+
+
+def _stop_own_work(ledger, scope, invocation):
+    try:
+        own = ledger.audit(invocation["invocation_id"])
+        stop = bool(own["pending"] or own["unknown"])
+    except (OSError, ValueError, KeyError, TypeError):
+        stop = True
+    if not stop:
+        return
+    # This is the admission linearization point. IO can block or fail without
+    # reopening the scope to a sibling arm. Never hold this lock during IO.
+    with _SCOPE_ADMISSION:
+        _SCOPE_STATES[scope] = "STOP_PENDING_LOCAL"
+    invocation["scope_stop_state"] = "STOP_PENDING_LOCAL"
+    try:
+        with _SCOPE_ADMISSION:
+            _SCOPE_STATES[scope] = "HALT_IO_IN_PROGRESS"
+        ledger.halt()
+    except (OSError, ValueError) as error:
+        invocation["halt_error"] = type(error).__name__
+        state = "STOP_UNCONFIRMED_LOCAL"
+    else:
+        state = "DURABLE_STOP_CONFIRMED"
+    with _SCOPE_ADMISSION:
+        _SCOPE_STATES[scope] = state
+    invocation.update(scope_quarantined=True, scope_stop_state=state)
+
+
+def _hard_outcome(invocation):
+    return isinstance(invocation, dict) and (
+        invocation.get("failure_kind") in _HARD_FAILURE_KINDS
+        or bool(invocation.get("unscored_cases"))
+        or invocation.get("seed_identity_invalid") is True
+    )
+
+
+def _invocation_problem(arm, domain, k, seed, seen):
+    """One requested-outcome contract for live handoff and saved comparison."""
+    record = arm.invocations.get(domain)
+    if not isinstance(record, dict):
+        return "missing invocation"
+    identity = record.get("invocation_id")
+    if not (
+        record.get("arm") == arm.name
+        and record.get("domain") == domain
+        and record.get("configured_seed") == seed
+        and record.get("trial_seeds") == trial_seeds(seed, k)
+        and isinstance(identity, str)
+        and re.fullmatch(r"[0-9a-f]{32}", identity)
+        and identity not in seen
+    ):
+        return "invalid or reused invocation identity"
+    status = record.get("status")
+    try:
+        if status == "failed":
+            kind = record.get("failure_kind")
+            if kind not in _KNOWN_FAILURE_KINDS:
+                return "unknown failure outcome"
+            if kind in _QUALITY_FAILURE_KINDS:
+                if record.get("exit_code") != 0 or domain in arm.scores:
+                    return "quality-only outcome has inconsistent child/score evidence"
+                completion = budget_guard.read_descriptor(arm.budget).invocation_completion(
+                    identity
+                )
+                if completion != dict(arm=arm.name, domain=domain, digest=None):
+                    return "unregistered quality-only invocation"
+        elif status == "completed":
+            digest = record.get("results_sha256")
+            if not (
+                record.get("exit_code") == 0
+                and domain in arm.scores
+                and isinstance(digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", digest)
+            ):
+                return "missing completed score or digest"
+            path = Path(record["results_path"])
+            raw = path.read_bytes()
+            completion = budget_guard.read_descriptor(arm.budget).invocation_completion(identity)
+            if not (
+                completion == dict(arm=arm.name, domain=domain, digest=digest)
+                and path.name == "results.json"
+                and path.parent.name == "ab_" + identity
+                and hashlib.sha256(raw).hexdigest() == digest
+                and domain_scores(load_results(json.loads(raw)), k) == arm.scores[domain]
+            ):
+                return "inconsistent completed invocation provenance"
+        else:
+            return "invocation has no terminal outcome"
+    except (OSError, TypeError, KeyError, ValueError):
+        return "unavailable invocation provenance"
+    seen.add(identity)
+    return None
+
+
+def _arm_safety_exit(arm, domains, k, seed):
+    """Sequential handoff may defer quality to diff, never safety to process B."""
+    seen = set()
+    for domain in domains:
+        if _invocation_problem(arm, domain, k, seed, seen) or _hard_outcome(
+            arm.invocations.get(domain)
+        ):
+            return EXIT_INCOMPLETE
+        record = arm.invocations[domain]
+        try:
+            ledger = budget_guard.read_descriptor(arm.budget)
+            own = ledger.audit(record["invocation_id"])
+            if own["halted"] or own["pending"] or own["unknown"]:
+                _stop_own_work(ledger, _scope_identity(arm.budget), record)
+                record.update(
+                    status="failed",
+                    failure_kind="invocation_budget_incomplete",
+                    failure_stage="handoff",
+                )
+                arm.scores.pop(domain, None)
+                return EXIT_INCOMPLETE
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            record.update(
+                status="failed",
+                failure_kind="budget_unavailable",
+                failure_stage="handoff",
+                exception_type=type(error).__name__,
+            )
+            arm.scores.pop(domain, None)
+            return EXIT_INCOMPLETE
+    return EXIT_OK
 
 
 @dataclass
@@ -398,7 +547,7 @@ def run_tau2(
     try:
         scope = _scope_identity(budget_descriptor)
         with _SCOPE_ADMISSION:
-            if scope in _QUARANTINED_SCOPES:
+            if _scope_stopping(scope):
                 fail("scope_quarantined", "budget")
                 return
         ledger = budget_guard.read_descriptor(budget_descriptor)
@@ -477,26 +626,12 @@ def run_tau2(
     env["TAU2_DATA_DIR"] = str(data_dir)
 
     def stop_unsettled_own_work():
-        # A failed child cannot establish that its paid requests settled. Other
-        # invocations' healthy in-flight work does not justify attribution.
-        try:
-            own = ledger.audit(invocation_id)
-            stop = bool(own["pending"] or own["unknown"])
-        except (OSError, ValueError, KeyError, TypeError):
-            stop = True
-        if stop:
-            try:
-                ledger.halt()
-            except (OSError, ValueError) as halt_error:
-                invocation["halt_error"] = type(halt_error).__name__
-                with _SCOPE_ADMISSION:
-                    _QUARANTINED_SCOPES.add(scope)
-                invocation["scope_quarantined"] = True
+        _stop_own_work(ledger, scope, invocation)
 
     # Linearize process-local launch admission, without serializing healthy
     # subprocess runtimes. This does not revoke already admitted sibling work.
     with _SCOPE_ADMISSION:
-        if scope in _QUARANTINED_SCOPES:
+        if _scope_stopping(scope):
             fail("scope_quarantined", "budget")
             return
         invocation["launch_admitted"] = True
@@ -835,6 +970,14 @@ def save_scores(arm: Arm, path: Path) -> None:
 def load_scores(path: Path) -> Arm:
     """Rebuild an Arm (name + per-domain scores) from a file written by save_scores."""
     data = json.loads(path.read_text(encoding="utf-8"))
+    if not (
+        isinstance(data, dict)
+        and isinstance(data.get("name"), str)
+        and isinstance(data.get("scores"), dict)
+        and isinstance(data.get("invocations", {}), dict)
+        and isinstance(data.get("timed_out", []), list)
+    ):
+        raise ValueError("Saved arm outcome evidence has an invalid shape")
     return Arm(
         name=data["name"],
         base_url=data.get("base_url", ""),
@@ -864,54 +1007,21 @@ def write_report_and_gate(
         # without the fresh invocation and its raw result bytes.
         seen_invocations = set()
         for arm in (baseline, candidate):
-            for domain in arm.scores:
-                invocation = arm.invocations.get(domain)
-                valid = isinstance(invocation, dict)
-                if valid:
-                    valid = (
-                        invocation.get("arm") == arm.name
-                        and invocation.get("domain") == domain
-                        and invocation.get("status") == "completed"
-                        and invocation.get("exit_code") == 0
-                        and invocation.get("configured_seed") == getattr(args, "seed", 300)
-                        and invocation.get("trial_seeds")
-                        == trial_seeds(getattr(args, "seed", 300), k)
-                        and isinstance(invocation.get("invocation_id"), str)
-                        and re.fullmatch(r"[0-9a-f]{32}", invocation["invocation_id"]) is not None
-                        and isinstance(invocation.get("results_sha256"), str)
-                        and re.fullmatch(r"[0-9a-f]{64}", invocation["results_sha256"]) is not None
-                    )
-                if valid:
-                    try:
-                        path = Path(invocation["results_path"])
-                        raw = path.read_bytes()
-                        completion = budget_guard.read_descriptor(arm.budget).invocation_completion(
-                            invocation["invocation_id"]
-                        )
-                        valid = (
-                            invocation["invocation_id"] not in seen_invocations
-                            and completion
-                            == dict(
-                                arm=arm.name, domain=domain, digest=invocation["results_sha256"]
-                            )
-                            and path.name == "results.json"
-                            and path.parent.name == "ab_" + invocation["invocation_id"]
-                            and hashlib.sha256(raw).hexdigest() == invocation["results_sha256"]
-                            and domain_scores(load_results(json.loads(raw)), k)
-                            == arm.scores[domain]
-                        )
-                    except (OSError, TypeError, KeyError, ValueError):
-                        valid = False
-                if valid:
-                    seen_invocations.add(invocation["invocation_id"])
-                if not valid:
+            for domain in domains:
+                problem = _invocation_problem(
+                    arm, domain, k, getattr(args, "seed", 300), seen_invocations
+                )
+                if problem:
                     provenance_failed = True
                     label = (
                         arm.name
                         if baseline.name != candidate.name
                         else ("baseline" if arm is baseline else "candidate")
                     )
-                    report_md += f"\n\n> Incomplete arm {label}: missing or inconsistent invocation provenance."
+                    report_md += (
+                        f"\n\n> Incomplete arm {label}: missing or inconsistent invocation provenance "
+                        f"({domain}: {problem})."
+                    )
                     payload["incomplete"][label] = (
                         payload["incomplete"].get(label) or ""
                     ) + "; missing or inconsistent invocation provenance"
@@ -929,7 +1039,7 @@ def write_report_and_gate(
 
     exit_code = EXIT_OK
     delta = payload["overall"]["passk"]["delta"]
-    if delta is not None and delta < -args.tolerance:
+    if not payload["incomplete"] and delta is not None and delta < -args.tolerance:
         print(
             f"\nREGRESSION: {candidate.name} pass^{k} {delta * 100:.2f}pp "
             f"below {baseline.name} (tol {args.tolerance * 100:.2f}pp)",
@@ -956,21 +1066,9 @@ def write_report_and_gate(
         or provenance_failed
         or (getattr(args, "enforce_budget", False) and not getattr(args, "expected_task_ids", None))
         or any(
-            invocation.get("failure_kind")
-            in {
-                "nonzero_exit",
-                "launch_error",
-                "timeout",
-                "ledger_refused",
-                "invocation_budget_incomplete",
-                "invalid_budget",
-                "missing_budget",
-                "scope_quarantined",
-                "budget_unavailable",
-            }
+            _hard_outcome(invocation)
             for arm in (baseline, candidate)
             for invocation in arm.invocations.values()
-            if isinstance(invocation, dict)
         )
         or unscored_infrastructure
         or any(
@@ -1111,12 +1209,16 @@ def main() -> int:
     if args.diff_baseline or args.diff_candidate:
         if not (args.diff_baseline and args.diff_candidate):
             p.error("--diff-baseline and --diff-candidate must be given together")
-        baseline = load_scores(args.diff_baseline)
-        candidate = load_scores(args.diff_candidate)
-        # Requested domains are part of the expected set, so one that neither arm
-        # scored still shows up as missing instead of silently vanishing.
-        diff_domains = sorted(set(domains) | set(baseline.scores) | set(candidate.scores))
-        return write_report_and_gate(baseline, candidate, diff_domains, args.num_trials, args)
+        try:
+            baseline = load_scores(args.diff_baseline)
+            candidate = load_scores(args.diff_candidate)
+            # Requested domains are part of the expected set, so one that neither arm
+            # scored still shows up as missing instead of silently vanishing.
+            diff_domains = sorted(set(domains) | set(baseline.scores) | set(candidate.scores))
+            return write_report_and_gate(baseline, candidate, diff_domains, args.num_trials, args)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            print(f"INCOMPLETE: invalid saved comparison evidence: {error}", file=sys.stderr)
+            return EXIT_INCOMPLETE
 
     try:
         args.budget_descriptor = prepare_budget(args)
@@ -1145,12 +1247,18 @@ def main() -> int:
             budget_descriptor=args.budget_descriptor,
             tau2_python=args.tau2_python,
         )
-        save_scores(arm, args.scores_out)
+        safety_exit = _arm_safety_exit(arm, domains, args.num_trials, args.seed)
+        try:
+            save_scores(arm, args.scores_out)
+        except OSError as error:
+            print(f"INCOMPLETE: cannot save invocation evidence: {error}", file=sys.stderr)
+            return EXIT_INCOMPLETE
         print(f"[{arm.name}] scores -> {args.scores_out}: {arm.scores}")
         if arm.timed_out:
             print(f"WARNING: [{arm.name}] timed out on: {', '.join(arm.timed_out)}")
-        # Always 0: the gate runs once, on the --diff step that sees both arms.
-        return EXIT_OK
+        # Quality may be deferred to diff; safety failure must stop the real
+        # sequential parent before it launches the second arm process.
+        return safety_exit
 
     # Mode: concurrent A/B — arms serve on opposite GPU halves, so score them in
     # PARALLEL (separate servers, separate save_to dirs) to roughly halve wall-clock.

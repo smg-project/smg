@@ -1241,3 +1241,23 @@ else:
     assert child.returncode == 0, child.stderr
     assert "SIBLING_REFUSED_AT_LEDGER" in child.stdout
     assert guard.ledger.audit()["pending"] == 1
+
+
+@pytest.mark.parametrize("location", ["policy_models", "context_models", "price", "bound"])
+@pytest.mark.parametrize("bad", [None, [], 7])
+def test_unified_nested_policy_shapes_raise_budget_error(configured, location, bad):
+    policy_path, contexts_path, digest, _, contexts = configured
+    policy = json.loads(policy_path.read_text())
+    if location == "policy_models":
+        policy["models"] = bad
+    elif location == "context_models":
+        contexts["models"] = bad
+    elif location == "price":
+        policy["models"]["openai/" + next(iter(gc.MODELS.values()))] = bad
+    else:
+        contexts["models"][next(iter(gc.MODELS.values()))] = bad
+    policy_path.write_text(json.dumps(policy))
+    contexts_path.write_text(json.dumps(contexts))
+    digest = hashlib.sha256(contexts_path.read_bytes()).hexdigest()
+    with pytest.raises(gc.BudgetError):
+        gc.load_policy(policy_path, contexts_path, digest)

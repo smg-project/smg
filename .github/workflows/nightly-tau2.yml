@@ -522,14 +522,20 @@ jobs:
               cp -- "$RUNNER_TEMP/$name" "$OUT/" || copy_failed=1
             fi
           done
+          ledger_source=""
           for variable in TAU2_BUDGET_LEDGER TAU2_BUDGET_POLICY TAU2_BUDGET_CONTEXTS; do
             source="${!variable:-}"
+            if [ "$variable" = TAU2_BUDGET_LEDGER ] && [ -n "$source" ]; then
+              # Match Ledger's resolved DB identity, not a caller's symlink alias.
+              source="$(realpath -m -- "$source")" || { copy_failed=1; continue; }
+              ledger_source="$source"
+            fi
             if [ -n "$source" ] && [ -f "$source" ]; then
               cp -- "$source" "$OUT/" || copy_failed=1
             fi
           done
-          marker="${TAU2_BUDGET_LEDGER:-}.fail-stop"
-          if [ -n "${TAU2_BUDGET_LEDGER:-}" ] && { [ -e "$marker" ] || [ -L "$marker" ]; }; then
+          marker="${ledger_source}.fail-stop"
+          if [ -n "$ledger_source" ] && { [ -e "$marker" ] || [ -L "$marker" ]; }; then
             # Preserve lexical stop presence, including dangling links, without
             # reading a symlink target or any marker contents into the artifact.
             : > "$OUT/$(basename -- "$marker")" || copy_failed=1

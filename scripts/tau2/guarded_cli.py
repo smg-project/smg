@@ -122,16 +122,29 @@ def load_policy(policy_path, contexts_path, contexts_sha256):
     data = json.loads(Path(policy_path).read_text())
     if not isinstance(contexts, dict) or not isinstance(data, dict):
         raise BudgetError("Policy/context inputs must be JSON objects")
-    if contexts.get("schema_version") != 1 or set(contexts.get("models", {})) != set(
-        MODELS.values()
-    ):
+    context_models, model_prices = contexts.get("models"), data.get("models")
+    if not isinstance(context_models, dict) or not isinstance(model_prices, dict):
+        raise BudgetError("Policy/context model collections must be JSON objects")
+    if not {"cap_nusd", "calls", "calls_per_arm", "scope_id"}.issubset(data):
+        raise BudgetError("Missing shared policy limits or scope")
+    if contexts.get("schema_version") != 1 or set(context_models) != set(MODELS.values()):
         raise BudgetError("Both provider context bounds must be independently verified")
-    if set(data.get("models", {})) != {"openai/" + name for name in MODELS.values()}:
+    if set(model_prices) != {"openai/" + name for name in MODELS.values()}:
         raise BudgetError("Both user and required NL judge model policies are mandatory")
     prices = {}
     for model in MODELS.values():
         key = "openai/" + model
-        bound = contexts["models"][model]
+        bound, price = context_models[model], model_prices[key]
+        if not isinstance(bound, dict) or not isinstance(price, dict):
+            raise BudgetError("Each reviewed context bound and model price must be an object")
+        if not {
+            "service_tier",
+            "input_per_million",
+            "output_per_million",
+            "input_limit",
+            "output_limit",
+        }.issubset(price):
+            raise BudgetError("Missing explicit model price or reservation limit")
         # This is an external provider-contract input, independently reviewed and
         # hash-pinned by the operator, NOT a token-counter estimate or input_limit.
         if (
@@ -148,7 +161,6 @@ def load_policy(policy_path, contexts_path, contexts_sha256):
             or any(not isinstance(name, str) or not name for name in bound["response_models"])
         ):
             raise BudgetError("Reviewed resolved response model IDs required")
-        price = data["models"][key]
         if price.get("service_tier") != "default":
             raise BudgetError("Only explicitly priced standard service tier is qualified")
         prices[key] = Policy(

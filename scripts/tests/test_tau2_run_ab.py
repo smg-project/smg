@@ -1127,6 +1127,22 @@ def test_valid_budget_keeps_quality_only_diagnostic_flag(monkeypatch, tmp_path, 
         if name == "vllm":
             arm.scores["retail"] = run_ab.domain_scores(_rows(), 2)
             _attach_provenance(tmp_path, arm, _rows())
+        else:
+            # Quality-only means an actual registered child that returned zero
+            # without scores, not an arm with no invocation evidence at all.
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    run_ab.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0)
+                )
+                _run_tau2(
+                    arm,
+                    tmp_path,
+                    domain="retail",
+                    num_trials=2,
+                    expected_task_ids=["task"],
+                    budget_descriptor=descriptor,
+                )
+            assert arm.invocations["retail"]["failure_kind"] == "missing_results"
         path = tmp_path / (name + ".json")
         run_ab.save_scores(arm, path)
         files.append(path)
@@ -2086,3 +2102,353 @@ def test_material_healthy_foreign_work_does_not_quarantine_pair(tmp_path, monkey
         assert "scope_quarantined" not in arm.invocations["airline"]
     assert len(calls) == 2
     assert ledger.summary()["halted"] is False
+
+
+def _unified_pair(tmp_path, monkeypatch):
+    b = _provenant_arm(tmp_path, "smg")
+    monkeypatch.setattr(
+        run_ab.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0)
+    )
+    a = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(a, tmp_path, domain="retail", num_trials=2, expected_task_ids=["task"])
+    assert a.invocations["retail"]["failure_kind"] == "missing_results"
+    assert run_ab.final_budget(a, b)["pending"] == 0
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids={"retail": ["task"]},
+        seed=300,
+    )
+    return a, b, args
+
+
+@pytest.mark.parametrize("change", ["missing", "empty", "identity", "quality_control"])
+def test_unified_requested_unscored_outcome_is_not_synthesized(tmp_path, monkeypatch, change):
+    a, b, args = _unified_pair(tmp_path, monkeypatch)
+    if change == "missing":
+        a.invocations.clear()
+    elif change == "empty":
+        a.invocations["retail"] = {}
+    elif change == "identity":
+        a.invocations["retail"]["invocation_id"] = "e" * 32
+    assert run_ab.final_budget(a, b)["halted"] is False
+    assert run_ab.write_report_and_gate(a, b, ["retail"], 2, args) == (
+        0 if change == "quality_control" else 2
+    )
+
+
+def test_unified_post_budget_io_oracle_has_independently_healthy_final_budget(
+    tmp_path, monkeypatch
+):
+    b = _provenant_arm(tmp_path, "smg")
+    real = run_ab.budget_guard.read_descriptor
+    calls = []
+
+    def transient(descriptor):
+        calls.append(True)
+        if len(calls) == 2:
+            raise FileNotFoundError("only the postchild descriptor observation fails")
+        return real(descriptor)
+
+    monkeypatch.setattr(run_ab.budget_guard, "read_descriptor", transient)
+    monkeypatch.setattr(
+        run_ab.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0)
+    )
+    a = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(a, tmp_path, domain="retail", num_trials=2, expected_task_ids=["task"])
+    monkeypatch.setattr(run_ab.budget_guard, "read_descriptor", real)
+    assert a.invocations["retail"]["failure_kind"] == "budget_unavailable"
+    assert run_ab.final_budget(a, b) == {
+        "halted": False,
+        "pending": 0,
+        "unknown": 0,
+        "requests": [],
+    }
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids={"retail": ["task"]},
+        seed=300,
+    )
+    assert run_ab.write_report_and_gate(a, b, ["retail"], 2, args) == 2
+
+
+def test_unified_stop_linearizes_before_blocked_halt_io(tmp_path, monkeypatch):
+    import threading
+
+    descriptor = run_ab.prepare_budget()
+    ledger = run_ab.budget_guard.read_descriptor(descriptor)
+    entered, release = threading.Event(), threading.Event()
+    launched = []
+    errors = []
+
+    def child(cmd, **kwargs):
+        arm = cmd[cmd.index("--arm") + 1]
+        launched.append(arm)
+        if arm == "vllm":
+            ledger.reserve(
+                "owned",
+                arm,
+                "openai/gpt-5.2",
+                1,
+                1,
+                num_retries=0,
+                output_limit_verified=True,
+                metadata={"invocation_id": cmd[cmd.index("--invocation") + 1]},
+            )
+        return types.SimpleNamespace(returncode=9)
+
+    def halt(self):
+        entered.set()
+        assert release.wait(5), "owned halt barrier was not released"
+        raise OSError("ordered stores unavailable")
+
+    monkeypatch.setattr(run_ab.subprocess, "run", child)
+    monkeypatch.setattr(type(ledger), "halt", halt)
+
+    def a():
+        try:
+            _run_tau2(
+                run_ab.Arm("vllm", "http://unused.invalid"), tmp_path, budget_descriptor=descriptor
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=a)
+    thread.start()
+    try:
+        assert entered.wait(5), "A did not reach halt IO"
+        b = run_ab.Arm("smg", "http://unused.invalid")
+        done = threading.Event()
+
+        def attempt_b():
+            try:
+                _run_tau2(b, tmp_path, budget_descriptor=descriptor)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        sibling = threading.Thread(target=attempt_b)
+        sibling.start()
+        assert done.wait(2), "admission lock was held across halt IO"
+        sibling.join(2)
+        assert launched == ["vllm"]
+        assert b.invocations["airline"]["failure_kind"] == "scope_quarantined"
+        # A separate reviewed scope/ledger still admits work while A is blocked.
+        other = dict(descriptor)
+        policy = json.loads(Path(descriptor["policy_path"]).read_text())
+        policy["scope_id"] += "-independent"
+        policy_path = tmp_path / "other-policy.json"
+        policy_path.write_text(json.dumps(policy))
+        other.update(
+            policy_path=str(policy_path),
+            ledger_path=str(tmp_path / "other.db"),
+            scope_id=policy["scope_id"],
+        )
+        other_policy, _ = run_ab.budget_guard.load_policy(
+            policy_path, other["contexts_path"], other["contexts_sha256"]
+        )
+        run_ab.budget_guard.Ledger(other["ledger_path"], other_policy)
+        c = run_ab.Arm("smg", "http://unused.invalid")
+        _run_tau2(c, tmp_path, budget_descriptor=other)
+        assert launched == ["vllm", "smg"]
+        assert c.invocations["airline"]["failure_kind"] == "nonzero_exit"
+    finally:
+        release.set()
+        thread.join(5)
+        if "sibling" in locals():
+            sibling.join(5)
+    assert not thread.is_alive() and not errors
+
+
+def _unified_real_parent(tmp_path, mode, ablate=False):
+    import os
+    import subprocess
+    import textwrap
+
+    source = Path(run_ab.__file__).resolve()
+    root = source.parents[2]
+    bootstrap = tmp_path / "cli-bootstrap.py"
+    bootstrap.write_text(
+        textwrap.dedent("""\
+        import importlib.util,sys,os,json,types
+        from pathlib import Path
+        source=Path(sys.argv[1]).resolve()
+        sys.path.insert(0,str(source.parent))
+        spec=importlib.util.spec_from_file_location('actual_run_ab',source)
+        module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
+        def child(cmd,**kwargs):
+            arm=cmd[cmd.index('--arm')+1]
+            with open(os.environ['OWN_LAUNCHES'],'a') as out:out.write(arm+'\\n')
+            if os.environ['OWN_MODE']=='hard' and arm=='vllm':
+                ledger=module.budget_guard.read_descriptor(module.prepare_budget())
+                ledger.reserve('owned',arm,'openai/gpt-5.2',1,1,num_retries=0,output_limit_verified=True,metadata={'invocation_id':cmd[cmd.index('--invocation')+1]})
+                return types.SimpleNamespace(returncode=9)
+            return types.SimpleNamespace(returncode=0)
+        def no_halt(self):raise OSError('owned halt fault only in A process')
+        module.subprocess.run=child
+        if (os.environ['OWN_MODE']=='hard' and '--score-arm' in sys.argv
+            and sys.argv[sys.argv.index('--score-arm')+1].startswith('vllm=')):
+            module.budget_guard.Ledger.halt=no_halt
+        if os.environ.get('OWN_ABLATE')=='1':module._arm_safety_exit=lambda *a,**k:0
+        sys.argv=sys.argv[1:]
+        raise SystemExit(module.main())
+        """)
+    )
+    workflow = (root / ".github/workflows/nightly-tau2.yml").read_text()
+    start = workflow.index('            A_URL=$(TAU2_GPU="$GPU_A"')
+    end = workflow.index("          else", start)
+    actual = workflow[start:end]
+    descriptor = run_ab.prepare_budget()
+    manifest = tmp_path / "tau2_expected_tasks.json"
+    manifest.write_text(
+        json.dumps(
+            {"schema_version": 1, "num_trials": 2, "seed": 300, "domains": {"retail": ["task"]}}
+        )
+    )
+    import shlex
+
+    common = [
+        "--domains",
+        "retail",
+        "--num-trials",
+        "2",
+        "--expected-tasks",
+        str(manifest),
+        "--data-dir",
+        str(tmp_path),
+        "--budget-policy",
+        descriptor["policy_path"],
+        "--budget-contexts",
+        descriptor["contexts_path"],
+        "--budget-contexts-sha256",
+        descriptor["contexts_sha256"],
+        "--budget-ledger",
+        descriptor["ledger_path"],
+        "--budget-scope",
+        descriptor["scope_id"],
+    ]
+    prefix = (
+        "set -euo pipefail\nCOMMON=("
+        + shlex.join(common)
+        + ")\nGPU_A=0; DOMAINS=retail; NUM_TRIALS=2\n"
+    )
+    prefix += 'python() { "$OWN_PYTHON" -I -B "$OWN_BOOTSTRAP" "$@"; };\n'
+    prefix += 'bash() { printf "http://unused.invalid\\n"; }; gate() { "$@"; };\n'
+    env = {
+        **os.environ,
+        "RUNNER_TEMP": str(tmp_path),
+        "OWN_BOOTSTRAP": str(bootstrap),
+        "OWN_PYTHON": sys.executable,
+        "OWN_LAUNCHES": str(tmp_path / "launches"),
+        "OWN_MODE": mode,
+        "OWN_ABLATE": "1" if ablate else "0",
+    }
+    child = subprocess.run(
+        ["/usr/bin/bash", "-c", prefix + actual],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    records = (tmp_path / "launches").read_text().splitlines()
+    assert (tmp_path / "scores_vllm.json").is_file(), child.stderr
+    return child, records
+
+
+@pytest.mark.parametrize("mode", ["hard", "quality"])
+def test_unified_actual_cli_parent_propagates_hard_arm_exit(tmp_path, monkeypatch, mode):
+    run_ab.prepare_budget()
+    child, records = _unified_real_parent(tmp_path, mode)
+    assert child.returncode == 2
+    assert records == (["vllm"] if mode == "hard" else ["vllm", "smg"]), child.stderr
+
+
+@pytest.mark.parametrize("marker", ["none", "regular", "dangling", "live"])
+def test_unified_staging_uses_resolved_ledger_basename(tmp_path, monkeypatch, marker):
+    import os
+    import subprocess
+
+    root = Path(run_ab.__file__).resolve().parents[2]
+    lines = (root / ".github/workflows/nightly-tau2.yml").read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if "- name: Stage results for upload" in line)
+    run = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "run: |")
+    end = next(i for i in range(run + 1, len(lines)) if lines[i].startswith("      - name:"))
+    script = "\n".join(line[10:] for line in lines[run + 1 : end])
+    target = tmp_path / "actual.db"
+    target.write_bytes(b"owned database")
+    alias = tmp_path / "alias.db"
+    alias.symlink_to(target)
+    sidecar = tmp_path / "actual.db.fail-stop"
+    if marker == "regular":
+        sidecar.write_bytes(b"not read")
+    elif marker in {"live", "dangling"}:
+        secret = tmp_path / "private-target"
+        if marker == "live":
+            secret.write_bytes(b"must not be uploaded")
+        sidecar.symlink_to(secret)
+    env = {**os.environ, "RUNNER_TEMP": str(tmp_path), "TAU2_BUDGET_LEDGER": str(alias)}
+    child = subprocess.run(
+        ["/usr/bin/bash", "-e", "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    out = tmp_path / "tau2_artifact"
+    assert (out / "actual.db").read_bytes() == b"owned database"
+    assert not (out / "alias.db").exists()
+    captured = out / "actual.db.fail-stop"
+    assert captured.exists() is (marker != "none")
+    if marker != "none":
+        assert captured.is_file() and not captured.is_symlink() and captured.read_bytes() == b""
+
+
+def test_unified_ablation_of_budget_predicate_rejects_the_isolated_oracle(tmp_path, monkeypatch):
+    real = run_ab._hard_outcome
+    monkeypatch.setattr(
+        run_ab,
+        "_hard_outcome",
+        lambda record: (
+            False
+            if isinstance(record, dict) and record.get("failure_kind") == "budget_unavailable"
+            else real(record)
+        ),
+    )
+    with pytest.raises(AssertionError, match="0 == 2"):
+        test_unified_post_budget_io_oracle_has_independently_healthy_final_budget(
+            tmp_path, monkeypatch
+        )
+
+
+def test_unified_ablation_of_requested_record_guard_rejects_the_isolated_oracle(
+    tmp_path, monkeypatch
+):
+    real = run_ab._invocation_problem
+    monkeypatch.setattr(
+        run_ab,
+        "_invocation_problem",
+        lambda arm, domain, *args: (
+            None if domain not in arm.invocations else real(arm, domain, *args)
+        ),
+    )
+    with pytest.raises(AssertionError, match="0 == 2"):
+        test_unified_requested_unscored_outcome_is_not_synthesized(tmp_path, monkeypatch, "missing")
+
+
+def test_unified_ablation_of_cli_handoff_rejects_the_parent_oracle(tmp_path):
+    child, records = _unified_real_parent(tmp_path, "hard", ablate=True)
+    assert child.returncode == 2
+    assert records == ["vllm", "smg"]  # removing only handoff gate really launches B

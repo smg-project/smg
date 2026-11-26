@@ -394,3 +394,19 @@ Post-child budget descriptor/audit IO errors are hard failures even when quality
 diagnostics are allowed. Upload staging records lexical stop-marker presence
 (including dangling links) as an empty regular marker, without reading its target
 or contents; inability to record the marker fails staging.
+
+
+### Consumer handoff and explicit outcomes
+
+Every requested arm/domain must retain a terminal invocation identity. A missing
+record, an unavailable budget, or a safety failure is not an incomplete-quality
+waiver. The same outcome predicates guard saved comparisons and `--score-arm`:
+that command saves truthful evidence, then exits 2 on safety/provenance failure
+so the strict sequential parent stops before starting the other arm. Explicit
+quality-only failures may return 0 for handoff and are gated in the final diff.
+A scope enters STOP_PENDING_LOCAL under the admission lock before halt IO; IO
+runs outside that lock. Already admitted work is not revoked. All stopping states
+block new local admissions and require owner reconciliation. Memory cannot prove
+cross-process persistent stop if both existing stores are unavailable; paid
+resumption remains on hold in that case. Staging pairs the resolved database
+basename with its empty lexical marker, rather than a caller's symlink alias.
