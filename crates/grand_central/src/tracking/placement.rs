@@ -156,9 +156,10 @@ pub struct Placement<'a> {
     /// writes it, under the document it decided with.
     pub decode_profile: Option<&'static str>,
     /// What the pick states of the worker the request goes to
-    /// ([`Overlap`]): how many leading blocks of the request that worker
-    /// holds, of how many. A host observes its cache series from it, once
-    /// a placement that states one. A pick states it of its first target's
+    /// ([`Overlap`]): how much of the request that worker holds, of how
+    /// much. The two counts are leading blocks, or inside a lent tree the
+    /// match's tokens or chars. A host observes its cache series from it,
+    /// once a placement that states one. A pick states it of its first target's
     /// worker alone ([`Pick::overlap`](crate::engine::Pick::overlap)), so
     /// it stands here where the request goes to that worker. A single
     /// request's first target is the one such. A pair's pick states what

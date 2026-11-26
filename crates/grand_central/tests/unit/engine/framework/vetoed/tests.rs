@@ -146,6 +146,14 @@ fn shed_of(decision: &Decision) -> (ShedReason, &'static str) {
     }
 }
 
+/// [`shed_of`], and the side of a pair the shed names.
+fn sided(decision: &Decision) -> ((ShedReason, &'static str), Option<PairSide>) {
+    match decision {
+        Decision::Shed(shed) => ((shed.reason, shed.emptied_by), shed.side),
+        other => panic!("not a shed: {other:?}"),
+    }
+}
+
 /// Every preset whose stages this build carries steers a pool that is
 /// over its thresholds on every worker to the fewest requests in flight,
 /// whatever its own stages would pick, and names the next fewest as
@@ -1032,7 +1040,9 @@ fn a_pool_doubted_on_every_worker_pairs_by_load() {
 /// the limit too, and the next prefill is not taken in its place. The
 /// gateway's own selection answers both so
 /// (`model_gateway/src/routers/common/placement.rs:1467-1480`,
-/// `:1148-1153`).
+/// `:1148-1153`). Each of these sheds names the prefill side: that
+/// selection refuses for the prefill's role at the limit (`:2980-2983`,
+/// `:3048-3051`, on main `d43c7b2a9`).
 #[test]
 fn the_admission_limit_has_the_last_word_on_a_pairs_default() {
     let mut filters = vetoes();
@@ -1043,10 +1053,13 @@ fn the_admission_limit_has_the_last_word_on_a_pairs_default() {
         classed(worker, 1)
     };
     let decodes = [classed(free(0, 0), 1)];
-    let full = (ShedReason::NoEndpoints, "has-capacity");
+    let full = (
+        (ShedReason::NoEndpoints, "has-capacity"),
+        Some(PairSide::Prefill),
+    );
     for vetoed in [over(1, 0), doubted(1, 0)] {
         let prefills = [classed(free(0, 4), 1), room(vetoed)];
-        assert_eq!(shed_of(&decide_pair(&engine, &prefills, &decodes)), full);
+        assert_eq!(sided(&decide_pair(&engine, &prefills, &decodes)), full);
     }
     // So it does where every decode is over its thresholds and the rule
     // opened their class: the free prefill stands at its limit with an
@@ -1055,12 +1068,12 @@ fn the_admission_limit_has_the_last_word_on_a_pairs_default() {
     // (`:2515-2528` there on main `7526c6664e`).
     let busy = [classed(over(0, 0), 1)];
     let prefills = [classed(free(0, 4), 1), room(over(1, 0))];
-    assert_eq!(shed_of(&decide_pair(&engine, &prefills, &busy)), full);
+    assert_eq!(sided(&decide_pair(&engine, &prefills, &busy)), full);
     // Two prefills over their thresholds: the less loaded is taken, at
     // its limit and then with a slot.
     let busier = room(over(1, 5));
     let limited = decide_pair(&engine, &[classed(over(0, 4), 1), busier], &decodes);
-    assert_eq!(shed_of(&limited), full);
+    assert_eq!(sided(&limited), full);
     // That refusal names no lifted veto: no request was steered.
     assert_eq!(limited.trace().lifted, LiftedVeto::None);
     let paired = decide_pair(&engine, &[room(over(0, 4)), busier], &decodes);
@@ -1162,9 +1175,10 @@ fn a_pair_is_made_among_first_partners_while_one_is_open() {
     // keeps the request: it waits, beside a prefill with a slot and an
     // open partner.
     let full = [room(free(0, 0), 2), classed(free(1, 0), 1)];
+    let limit = (ShedReason::NoEndpoints, "has-capacity");
     assert_eq!(
-        shed_of(&decide_first(&engine, &full, &decodes)),
-        (ShedReason::NoEndpoints, "has-capacity")
+        sided(&decide_first(&engine, &full, &decodes)),
+        (limit, Some(PairSide::Prefill))
     );
     // Refused by another stage it keeps none, with a slot or at its
     // limit: the pair is made among every prefill with an open partner.

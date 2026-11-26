@@ -2367,6 +2367,7 @@ fn shed(reason: ShedReason, emptied_by: &'static str, trace: Trace) -> Decision 
         emptied_by,
         retry_after_secs: 1,
         wait_allowed: false,
+        side: None,
         trace,
     })
 }
@@ -3219,12 +3220,13 @@ pub enum Plan {
     /// The prefill profile over the open prefills, then the decode profile
     /// over the chosen prefill's partners.
     PdPair,
-    /// The encode profile named here, once per encode item over the encode
-    /// pool with the pair's EC compatibility and the request's vision demand
-    /// as the plan's own filters, then the pair as under `PdPair`: the
-    /// binding's `profile` is the prefill side and `decode_profile` the
-    /// decode side. The encode side rides the plan, so a binding keeps the
-    /// pair's two fields.
+    /// The pair as under `PdPair`, then the encode profile named here over
+    /// the open encoders of the chosen prefill's class that take the
+    /// request's media, once per encode item or once for the items taken
+    /// as one. A request with items that no encoder is open to is refused
+    /// ahead of the pair. The binding's `profile` is the prefill side and
+    /// `decode_profile` the decode side. The encode side rides the plan,
+    /// so a binding keeps the pair's two fields.
     Epd {
         /// The encode profile, by position.
         encode: u16,
@@ -8386,12 +8388,13 @@ impl Engine {
                     let mut among = takes.places().filter(listed);
                     if among.any(|c| takes.but_for_the_limit(c)) {
                         let limit = HasCapacity.name();
-                        return shed(reason_of(limit), limit, refused.trace);
+                        return shed(reason_of(limit), limit, refused.trace)
+                            .of_side(PairSide::Prefill);
                     }
                     false
                 }
-                // A picker's decline passes through.
-                _ => return prefill,
+                // A picker's decline passes through, as the prefill side's.
+                _ => return prefill.of_side(PairSide::Prefill),
             };
             if stands {
                 // The classes the prefill profile was shown stand in
@@ -8470,7 +8473,8 @@ impl Engine {
                     let mut partnered = takes.places().filter(open);
                     if partnered.any(|c| takes.but_for_the_limit(c)) {
                         let limit = HasCapacity.name();
-                        return shed(reason_of(limit), limit, prefill_shed.trace);
+                        return shed(reason_of(limit), limit, prefill_shed.trace)
+                            .of_side(PairSide::Prefill);
                     }
                     let mut routable = 0usize;
                     scratch.classes.clear();
@@ -8515,25 +8519,37 @@ impl Engine {
                                 scratch.shed_over = Some(ShedOver::Prefills);
                             }
                         }
-                        return shed(reason_of(stage), stage, prefill_shed.trace);
+                        // No prefill of the request's stands: the prefill
+                        // side is the one left with nobody, and where the
+                        // decision says the list it shed over, that list
+                        // is the prefills'.
+                        return shed(reason_of(stage), stage, prefill_shed.trace)
+                            .of_side(PairSide::Prefill);
                     }
+                    // From here a prefill stands but for its limit: where
+                    // its partners are missing or refused, the decode side
+                    // is the one left with nobody.
                     if scratch.classes.is_empty() {
-                        return shed(ShedReason::NoEndpoints, "partnered", prefill_shed.trace);
+                        return shed(ShedReason::NoEndpoints, "partnered", prefill_shed.trace)
+                            .of_side(PairSide::Decode);
                     }
                     // Their partners are the decodes of the classes they
                     // pair with.
                     pools.table.listed(&mut scratch.classes, &mut scratch.marks);
                     // An empty decode pool is that class for every prefill:
-                    // its "none" falls through to the prefill's shed.
-                    if let Some(stage) = filter(
+                    // its "none" leaves the prefill's shed standing, as the
+                    // decode side's.
+                    let refused = filter(
                         decode_profile,
                         &decode_facts,
                         decode_cx,
                         &mut scratch.decode,
                         Set::side(decodes, None, Some(&scratch.classes)),
-                    )
-                    .filter(|&stage| stage != "none")
-                    {
+                    );
+                    if refused == Some("none") {
+                        return prefill.of_side(PairSide::Decode);
+                    }
+                    if let Some(stage) = refused {
                         // The partners of the prefills that stand are
                         // refused whole. The overload veto's shed is made
                         // over the decodes where the whole decode list is
@@ -8548,11 +8564,16 @@ impl Engine {
                                 scratch.shed_over = Some(ShedOver::Decodes);
                             }
                         }
-                        return shed(reason_of(stage), stage, prefill_shed.trace);
+                        // Where the decision says the list it shed over,
+                        // that list is the decodes'.
+                        return shed(reason_of(stage), stage, prefill_shed.trace)
+                            .of_side(PairSide::Decode);
                     }
                 }
             }
-            return prefill;
+            // The prefill's own refusal stands: its picker's decline, or
+            // its stage where the decode side keeps a partner.
+            return prefill.of_side(PairSide::Prefill);
         };
         // A pick the weighing lift alone made possible says so, as a kept
         // key's pick does ([`Self::keep`]): where the veto as it stands
@@ -8689,6 +8710,8 @@ impl Engine {
             let key = prefill_facts.session();
             self.sessions.move_claim(key, claimed, WorkerId(0));
         }
+        // A prefill was picked and no decode pairs with it: the decode side
+        // is the one left with nobody.
         match last_shed {
             // The shed of the one decode a request names takes the
             // target's name.
@@ -8696,6 +8719,45 @@ impl Engine {
             Some(last) => Decision::Shed(last),
             None => shed(ShedReason::NoEndpoints, "partners", prefill_pick.trace),
         }
+        .of_side(PairSide::Decode)
+    }
+
+    /// A pair's answer over two lists of which one holds no row: one side
+    /// alone is no pair, and the engine answers over no candidate, under
+    /// the request's own constraints `cx` for both sides. `pool` holds
+    /// the prefill list's facts, and `prefills` says whether that list
+    /// holds a row. The refusal names the side of the list with none, the
+    /// prefills' first. The engine read neither list, so where its refusal
+    /// names a side it names the prefills': where that list holds a row,
+    /// the list with none is the decodes'.
+    ///
+    /// A pair's decision in process answers so ahead of the request's
+    /// demand. An encode request's answers so where its demand left the
+    /// other list nobody, with an item behind its encoders' own answers:
+    /// its caller reads the answer of its pair alone. Cold and out of
+    /// line: its code stays off the path of a pair both of whose lists
+    /// hold a row, and so does the arm that calls it.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn decide_over_an_empty_list(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        prefills: bool,
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        let none = PoolFacts {
+            generation: pool.generation,
+            ..PoolFacts::default()
+        };
+        let mut decision = self.decide_pair(facts, &none, PairPools::default(), cx, cx, scratch);
+        if let Decision::Shed(shed) = &mut decision {
+            if shed.side.is_some() && prefills {
+                shed.side = Some(PairSide::Decode);
+            }
+        }
+        decision
     }
 
     /// Whether the profile at `index` weighs load against affinity by a
@@ -9086,7 +9148,8 @@ impl Engine {
                 profile: index,
                 ..bare
             };
-            return shed(ShedReason::NoEndpoints, "prefill-gone", under);
+            // The held prefill is the side left with nobody.
+            return shed(ShedReason::NoEndpoints, "prefill-gone", under).of_side(PairSide::Prefill);
         };
         let shown = self.marks[usize::from(index)].scoped();
         if shown && !decode_cx.stalled.is_empty() {
@@ -9176,10 +9239,13 @@ impl Engine {
             let decode = std::mem::take(&mut pick.session_verdict);
             pick.targets
                 .pair_under(&target_of(prefill), decode, Placing::Stages);
-        } else if decode_cx.target_worker.is_some() {
-            return target_missed(decision);
+            return decision;
         }
-        decision
+        // The decode's run named no worker: the refusal is the decode side's.
+        if decode_cx.target_worker.is_some() {
+            decision = target_missed(decision);
+        }
+        decision.of_side(PairSide::Decode)
     }
 }
 

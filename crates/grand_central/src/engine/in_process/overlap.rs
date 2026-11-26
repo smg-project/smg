@@ -97,7 +97,7 @@ use crate::{
         prompt_hashes::PromptHashes,
         view::{
             blocks_within, fingerprint, AffinityFacts, AffinityHolder, AffinityRows, Feed,
-            HashKind, Phase, RequestFacts, WorkerId,
+            HashKind, Phase, RequestFacts, TreeMatch, WorkerId,
         },
         warm_up::WarmUpState,
     },
@@ -1251,8 +1251,11 @@ impl Table {
     /// request's prefix reaches, each holding its first `blocks` blocks, and
     /// the list's warming rows. Each list is at most the cap, ascending by
     /// row: past the cap the holders are a draw. A match under one block
-    /// names no holder. A request held to `places` is named the rows among
-    /// them, and the cap counts no other.
+    /// names its workers with no block held: its caller hands the workers
+    /// of any match that holds something, and the decision reads how much
+    /// from the match's own two numbers ([`AffinityRows::tree`]). A request
+    /// held to `places` is named the rows among them, and the cap counts no
+    /// other.
     fn name_sent(
         &self,
         sent: &[TenantId],
@@ -1273,7 +1276,7 @@ impl Table {
         warming.clear();
         let mut draw = Draw::new(facts.seed ^ HOLDERS_STREAM);
         let mut seen = 0usize;
-        for address in sent.iter().filter(|_| blocks > 0) {
+        for address in sent {
             self.rows_at(workers, address, |row| {
                 if !among(places, row) {
                     return;
@@ -2024,17 +2027,16 @@ struct Asked<'a> {
 /// reads no affinity states nothing, whether it is given no rows or the
 /// rows of its binding's shadow.
 ///
-/// A request decided inside a tree's match states what the match's rows
-/// say: the match's tokens, or the bytes of text it matched, counted in the
-/// request's blocks for a worker named among its holders, and a miss for
-/// any other. A gateway's classic cache-aware policy observes another
-/// thing of such a request, the match's share of the prompt's tokens or
-/// chars whoever it chose, so the two differ in three places. A match
-/// under one block states a miss: a prompt shorter than one block always
-/// does, where the classic policy may observe it whole. A pick that is
-/// none of the match's holders states a miss, where the classic policy
-/// observes the match's share. Past the cap the holders named are a draw,
-/// so a holder the draw left out states a miss too.
+/// A request decided inside a tree's match states the match's own two
+/// numbers for a worker named among its holders: the match's size and the
+/// request's, in the tree's unit, tokens or chars
+/// ([`OverlapSource::Tree`](crate::engine::OverlapSource::Tree)). Any
+/// other worker is a miss of the request's blocks. A gateway's classic
+/// cache-aware policy observes the same two numbers of such a request,
+/// whoever it chose, so the two differ in two places. A pick that is none
+/// of the match's holders states a miss, where the classic policy observes
+/// the match's share. Past the cap the holders named are a draw, so a
+/// holder the draw left out states a miss too.
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
@@ -2249,6 +2251,10 @@ pub(super) fn column(
 /// is the document's block size, by which the request is counted where its
 /// host counted with none.
 ///
+/// Rows a tree's match named carry the match ([`AffinityRows::tree`]), and
+/// a worker named among them is stated the match's own two numbers
+/// ([`Overlap::in_tree`]): what the classic policy's series divides.
+///
 /// The feed is handed by itself, and not the facts the decision was made
 /// over: a decision that reads no fact, as a pin's answer handed through
 /// here, then makes no copy of them for this statement.
@@ -2267,9 +2273,17 @@ pub(super) fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFact
     let Some(row) = told_target(decision).map(|target| target.position) else {
         return;
     };
-    let held = feed.entry_or_default(row);
+    // The tree is asked first: rows no tree named cost no search here.
+    let tree = match feed {
+        Feed::Named(named) => named.tree.filter(|_| named.names(row)),
+        Feed::Column(_) => None,
+    };
+    let stated = match tree {
+        Some(tree) => Overlap::in_tree(tree.matched, tree.of, false),
+        None => Overlap::held(feed.entry_or_default(row), facts.blocks(block)),
+    };
     if let Decision::Pick(pick) = decision {
-        pick.targets.state(Overlap::held(held, facts.blocks(block)));
+        pick.targets.state(stated);
     }
 }
 
@@ -2427,15 +2441,18 @@ fn sent_address<'w>(
 }
 
 /// What a tree's walk hands its match to ([`Table::decide_in_tree`]): the
-/// workers the match found and the request's blocks it holds, answered
-/// with the address the walk writes the request for, where it writes it.
-type Over<'a, 'w> = dyn FnMut(&[TenantId], u32) -> Option<&'w str> + 'a;
+/// workers the match found, the match's own two numbers and the request's
+/// whole blocks it holds, answered with the address the walk writes the
+/// request for, where it writes it.
+type Over<'a, 'w> = dyn FnMut(&[TenantId], TreeMatch, u32) -> Option<&'w str> + 'a;
 
 /// The bytes of the leading `matched` chars of `text` that lie behind its
 /// first `marker` chars: what a string tree's match holds of a prompt whose
 /// key begins with a partition's marker. A string tree counts chars, and a
 /// request of text is sized in bytes. One pass over the matched chars,
-/// which its caller makes only for a key of several bytes a char.
+/// which its caller makes only for a key of several bytes a char. A
+/// holder's entry alone reads it, for the request's whole windows: the
+/// decision divides the match's chars by the request's.
 fn bytes_behind(text: &str, marker: usize, matched: usize) -> usize {
     let matched = text.chars().take(matched);
     matched.skip(marker).map(char::len_utf8).sum()
@@ -2482,9 +2499,11 @@ impl Table {
             let facts = &*facts;
             let walk = |over: &mut Over<'_, '_>| {
                 sent.match_and_insert_with(&key.tokens, |found| {
-                    // The marker is no part of the prompt.
+                    // The marker is no part of the prompt, nor of its size.
                     let matched = found.matched_token_count.saturating_sub(key.marker);
-                    over(&found.matched_tenants, self.blocks_of(matched, facts))
+                    let of = found.input_token_count.saturating_sub(key.marker);
+                    let tree = TreeMatch::new(count(matched), count(of));
+                    over(&found.matched_tenants, tree, self.blocks_of(matched, facts))
                 });
             };
             return self.decide_in_tree(walk, sends_to, workers, facts, places, buffers, decide);
@@ -2497,15 +2516,23 @@ impl Table {
             let facts = &*facts;
             let walk = |over: &mut Over<'_, '_>| {
                 sent.match_and_insert_with(&key.text, |found| {
-                    // The match counts the marker's chars too. A key of
-                    // as many bytes as chars holds one byte a char: its
-                    // chars are its bytes, and no pass is made over it.
+                    // The match and the key count the marker's chars too.
+                    let chars = found.matched_char_count.saturating_sub(key.marker);
+                    let of = found.input_char_count.saturating_sub(key.marker);
+                    let tree = TreeMatch::new(count(chars), count(of));
+                    // A key of as many bytes as chars holds one byte a
+                    // char: its chars are its bytes, and no pass is made
+                    // over it.
                     let bytes = if found.input_char_count == key.text.len() {
-                        found.matched_char_count.saturating_sub(key.marker)
+                        chars
                     } else {
                         bytes_behind(&key.text, key.marker, found.matched_char_count)
                     };
-                    over(&found.matched_tenants, self.blocks_of_text(bytes, facts))
+                    over(
+                        &found.matched_tenants,
+                        tree,
+                        self.blocks_of_text(bytes, facts),
+                    )
                 });
             };
             return self.decide_in_tree(walk, sends_to, workers, facts, places, buffers, decide);
@@ -2550,6 +2577,7 @@ impl Table {
             warming: &buffers.warming,
             thin: self.ruled.thin,
             mean_in_flight: None,
+            tree: None,
         }
     }
 
@@ -2597,7 +2625,8 @@ impl Table {
     /// for its place: the token tree, or the string tree for a request of
     /// text. `walk` runs the tree's match by the request's entry in it and
     /// hands [`Over`] what the match found: the workers sent the deepest
-    /// prefix of the request, and how many of the request's blocks that
+    /// prefix of the request, the match's size and the request's in the
+    /// tree's own unit, and how many of the request's whole blocks that
     /// prefix holds. The decision is made over them, and the same descent
     /// writes the request for the worker it goes to, whose address `Over`
     /// answers: the first target of the pick its caller sends to
@@ -2607,9 +2636,11 @@ impl Table {
     /// used, as every match of a tree does. The record of hashed prefixes
     /// is neither read nor written.
     ///
-    /// The pick states its first target's entry of the rows the match named
-    /// ([`state`]), where the request's own profile reads affinity: the
-    /// match's blocks for a holder named, and a miss for any other worker.
+    /// The rows carry the match's two numbers ([`AffinityRows::tree`]): the
+    /// profile's prefix stage divides them as the classic policy divides a
+    /// tree's match, with no count rounded to a block. The pick states them
+    /// for a holder named ([`state`]), where the request's own profile
+    /// reads affinity, and a miss for any other worker.
     #[expect(
         clippy::too_many_arguments,
         reason = "the tree's walk, the target the caller takes, the list, the request's facts and its places, the buffers, and the decision"
@@ -2624,9 +2655,17 @@ impl Table {
         buffers: &mut Buffers,
         mut decide: impl FnMut(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
-        let mut decide_over = |holders: &[TenantId], blocks: u32| {
+        let mut decide_over = |holders: &[TenantId], tree: Option<TreeMatch>, blocks: u32| {
+            // A match of anything behind the marker names its workers, as
+            // the classic policy makes every tenant of a match a candidate.
+            // A match of nothing names nobody.
+            let found = tree.is_some_and(|tree| tree.matched > 0);
+            let holders = if found { holders } else { &[] };
             self.name_sent(holders, blocks, workers, facts, places, buffers);
-            let named = self.named_rows(buffers);
+            let named = AffinityRows {
+                tree,
+                ..self.named_rows(buffers)
+            };
             let mut decision = decide(&mut RequestFacts {
                 named: Some(named),
                 ..*facts
@@ -2635,8 +2674,8 @@ impl Table {
             decision
         };
         let mut decided = None;
-        walk(&mut |holders, blocks| {
-            let decision = decide_over(holders, blocks);
+        walk(&mut |holders, tree, blocks| {
+            let decision = decide_over(holders, Some(tree), blocks);
             let to = sent_address(workers, &decision, &sends_to);
             decided = Some(decision);
             to
@@ -2644,7 +2683,7 @@ impl Table {
         // The tree asks for the worker once, so the decision was made
         // there. Were it not asked, the request is decided here, with no
         // holder named and nothing written: its pick states a miss.
-        decided.unwrap_or_else(|| decide_over(&[], 0))
+        decided.unwrap_or_else(|| decide_over(&[], None, 0))
     }
 
     /// One decision of a profile that reads the column whole: the fill, the

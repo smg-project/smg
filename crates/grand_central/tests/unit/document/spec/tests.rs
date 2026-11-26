@@ -2032,8 +2032,9 @@ fn a_later_count_takes_the_standing_one_by_its_settings_then_by_its_name() {
 /// A later spec keeps the stage objects of each profile whose name and
 /// text did not change, and builds every other profile's anew. A count
 /// of sends stands where a profile that reads it is kept, whichever of
-/// its other readers changed, left or came. A spec that changes `view`
-/// or `signals` builds every profile anew.
+/// its other readers changed, left or came. A spec that changes
+/// `signals` builds every profile anew, and so does one that changes
+/// the view's age limit of load reports.
 #[cfg(feature = "in-process")]
 #[test]
 fn a_later_spec_keeps_the_stages_of_a_profile_whose_text_did_not_change() {
@@ -2094,6 +2095,84 @@ fn a_later_spec_keeps_the_stages_of_a_profile_whose_text_did_not_change() {
         let mut next = AppliedSpec::validate(&later).expect("a valid document");
         next.keep_from(&standing);
         assert_eq!(kept(&next, &standing), (profiles, count), "case {at}");
+    }
+}
+
+/// A later spec whose view differs in its header list alone keeps its
+/// profiles, however the list changed: it grew, it shrank, or it
+/// changed inside. Each other field of the view, changed alone, builds
+/// every profile anew, beside the same header list and beside another.
+#[cfg(feature = "in-process")]
+#[test]
+fn a_view_that_differs_in_its_header_list_alone_keeps_every_profile() {
+    let listing = |headers: &[&str]| {
+        let mut spec = doc(KEPT);
+        spec.view.headers = headers.iter().map(|name| (*name).to_owned()).collect();
+        spec
+    };
+    let applied = |spec: &PolicySpec| AppliedSpec::validate(spec).expect("a valid document");
+    // The standing list and the later one.
+    let lists: [(&[&str], &[&str]); 9] = [
+        (&["x-a"], &["x-a"]),
+        (&["x-a"], &["x-a", "x-b"]),
+        (&["x-a", "x-b"], &["x-a"]),
+        (&[], &["x-a"]),
+        (&["x-a"], &[]),
+        (&["x-a", "x-b"], &["x-b", "x-a"]),
+        (&["x-a", "x-b"], &["x-b"]),
+        (&["x-b"], &["x-a", "x-b"]),
+        (&["x-a", "x-b"], &["x-a", "x-c"]),
+    ];
+    for (at, (stood, later)) in lists.into_iter().enumerate() {
+        let standing = applied(&listing(stood));
+        let mut next = applied(&listing(later));
+        next.keep_from(&standing);
+        assert_eq!(kept(&next, &standing), ([true; 3], true), "lists {at}");
+    }
+    // Each other field of the view, changed alone.
+    type Edit = fn(&mut ViewSpec);
+    let fields: [Edit; 7] = [
+        |view| view.block_size = Some(32),
+        |view| view.boundaries = vec![64],
+        |view| view.max_block_hashes = 512,
+        |view| view.max_report_age_ms = Some(900),
+        |view| view.labels = vec!["tier".to_owned()],
+        |view| view.zones = vec!["east".to_owned()],
+        |view| view.engines = vec!["alpha".to_owned()],
+    ];
+    let standing = applied(&listing(&["x-a"]));
+    for (at, edit) in fields.into_iter().enumerate() {
+        for later in [&["x-a"][..], &["x-b", "x-a"]] {
+            let mut other = listing(later);
+            edit(&mut other.view);
+            let mut next = applied(&other);
+            next.keep_from(&standing);
+            let none = ([false; 3], false);
+            assert_eq!(kept(&next, &standing), none, "field {at} beside {later:?}");
+        }
+    }
+    // A list that keeps its count and changes a name builds anew too: each
+    // of the four other lists is compared by what it holds.
+    let full = |edit: Edit| {
+        let mut spec = listing(&["x-a"]);
+        spec.view.boundaries = vec![64];
+        spec.view.labels = vec!["tier".to_owned()];
+        spec.view.zones = vec!["east".to_owned()];
+        spec.view.engines = vec!["alpha".to_owned()];
+        edit(&mut spec.view);
+        spec
+    };
+    let swaps: [Edit; 4] = [
+        |view| view.boundaries = vec![128],
+        |view| view.labels = vec!["rank".to_owned()],
+        |view| view.zones = vec!["west".to_owned()],
+        |view| view.engines = vec!["beta".to_owned()],
+    ];
+    let standing = applied(&full(|_| {}));
+    for (at, swap) in swaps.into_iter().enumerate() {
+        let mut next = applied(&full(swap));
+        next.keep_from(&standing);
+        assert_eq!(kept(&next, &standing), ([false; 3], false), "swap {at}");
     }
 }
 

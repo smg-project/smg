@@ -214,6 +214,7 @@ fn an_encode_request_whose_rule_takes_no_worker_of_a_list_is_shed_under_its_name
         reason: ShedReason::NoEndpoints,
         emptied_by: "admits",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(engine.place(&request).err(), Some(shed));
     let asked = asked.borrow();
@@ -602,6 +603,7 @@ fn an_encode_request_shed_as_saturated_whose_rule_takes_no_worker_of_a_list_is_s
         reason: ShedReason::NoEndpoints,
         emptied_by: "admits",
         retry_after_secs: 1,
+        side: None,
     };
     assert_eq!(engine.place(&request).err(), Some(shed));
     let decodes = [0, 1].map(|at| three.id(1, at));

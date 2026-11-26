@@ -528,6 +528,34 @@ impl Default for ViewSpec {
     }
 }
 
+impl ViewSpec {
+    /// Whether this view and `other` are equal but for their header lists.
+    /// Two equal views are such a pair.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn same_but_for_headers(&self, other: &Self) -> bool {
+        // Every field stands here by its name, with no `..`. So a field
+        // added to the view does not build until this function compares it
+        // or names it as left out.
+        let Self {
+            headers: _,
+            block_size,
+            boundaries,
+            max_block_hashes,
+            max_report_age_ms,
+            labels,
+            zones,
+            engines,
+        } = self;
+        *block_size == other.block_size
+            && *boundaries == other.boundaries
+            && *max_block_hashes == other.max_block_hashes
+            && *max_report_age_ms == other.max_report_age_ms
+            && *labels == other.labels
+            && *zones == other.zones
+            && *engines == other.engines
+    }
+}
+
 /// The under-layer of a model's prefix index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -554,11 +582,11 @@ pub struct IndexSpec {
     pub ttl_s: u32,
     /// The size bound of a tree index: on a text host its characters plus
     /// 1024 for each node a worker stands on, tokens otherwise.
-    /// The crate's own store reads it for a pool whose profile
-    /// reads sent prefixes: the model's record is bound to `max_size` over
-    /// the block size placements, never under one, one a block a worker
-    /// was sent. A lowered bound is met by sweeps at the record's next
-    /// writes, and a pool whose lanes are all heard writes none.
+    /// The crate's engine reads it for a pool whose profile reads sent
+    /// prefixes: the model's record is bound to `max_size` over the block
+    /// size placements, never under one, one a block a worker was sent. A
+    /// lowered bound is met by sweeps, at the record's next writes and at
+    /// the engine's upkeep.
     #[schemars(range(min = 1))]
     pub max_size: u64,
     /// The index's sweep cadence, in seconds.
@@ -2561,8 +2589,10 @@ pub enum PlanName {
     /// The prefill profile, then the decode profile over the chosen
     /// prefill's partners; both sides named.
     PdPair,
-    /// The encode profile once per encode item, then the pair; all three
-    /// sides named.
+    /// The pair, then the encode profile over the encoders of the chosen
+    /// prefill's class, once per encode item or once for the items taken
+    /// as one; all three sides named. A request with items that no encoder
+    /// is open to is refused ahead of the pair.
     Epd,
 }
 
@@ -2695,8 +2725,11 @@ pub struct BindingSpec {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ExplainSpec {
-    /// Keep every Nth pick or shed per decider under this generation. Zero
-    /// turns sampling off and one keeps every pick and shed.
+    /// Each decider of a controller, and each calling thread in a host's
+    /// own process, keeps every Nth pick or shed it counts. The count
+    /// starts over under a new generation, and in a controller under a new
+    /// lead. Zero keeps none. In a host's own process a request is counted
+    /// only where an id names it.
     #[serde(default)]
     pub sample: u32,
 }
@@ -4321,6 +4354,11 @@ impl HashDepths {
 /// and whether the profile keeps a session key on its worker over the
 /// overload veto: the plain ring alone decides its pick. `depth` is
 /// deepened to what the built stages read of a request's block hashes.
+///
+/// The build reads four values of `view` and no header: the block size, the
+/// boundaries, the bound of block hashes and the age limit of load reports.
+/// The keep of a profile across a new header list rests on that
+/// (`AppliedSpec::keep_from`).
 fn check_profile(
     name: &str,
     p: &ProfileSpec,

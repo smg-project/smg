@@ -255,6 +255,7 @@ fn an_encoder_that_cannot_be_sent_to_takes_no_item() {
             reason: ShedReason::NoEndpoints,
             emptied_by: "encoders",
             retry_after_secs: 1,
+            side: None,
         }),
     };
     assert_eq!(program.serve(&carrying(&keys)), refused());
@@ -491,6 +492,7 @@ fn an_item_for_a_model_with_no_worker_is_refused_as_a_request_with_none_is() {
             reason: ShedReason::NoEndpoints,
             emptied_by: "none",
             retry_after_secs: 1,
+            side: None,
         }),
     };
     // No worker ever joined: the registry holds no generation of the model.

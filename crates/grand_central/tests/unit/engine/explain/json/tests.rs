@@ -82,6 +82,7 @@ fn shed() -> Decision {
         emptied_by: "healthy",
         retry_after_secs: 2,
         wait_allowed: true,
+        side: None,
         trace: Trace {
             survivors: Survivors::NOT_COUNTED,
             generation: 6,
@@ -173,11 +174,21 @@ fn a_pick_is_written_with_its_targets_its_trace_and_its_names() {
     assert_eq!(written(&record, &spec, before), wanted);
 }
 
+/// The fixture's shed as a pair's refusal that names `side`.
+fn shed_on(side: PairSide) -> Decision {
+    let Decision::Shed(mut refused) = shed() else {
+        panic!("the fixture is a shed");
+    };
+    refused.side = Some(side);
+    Decision::Shed(refused)
+}
+
 /// A shed is written with its reason in the contract's word. An option
 /// that holds no value is left out: no binding matched, the generation
 /// that decided is not the standing one, no survivor was counted, no
-/// shadow was due and none picked a worker. A zero and an empty list are
-/// written. A queue ticket is a decimal string.
+/// shadow was due and none picked a worker, and the refusal names no side
+/// of a pair. A zero and an empty list are written. A pair's refusal
+/// states the side it names. A queue ticket is a decimal string.
 #[test]
 fn a_shed_is_written_with_its_reason_and_no_unset_option() {
     let spec = standing();
@@ -203,6 +214,11 @@ fn a_shed_is_written_with_its_reason_and_no_unset_option() {
         },
     });
     assert_eq!(written(&record(shed(), None), &spec, before), wanted);
+
+    for (side, word) in [(PairSide::Prefill, "prefill"), (PairSide::Decode, "decode")] {
+        let json = written(&record(shed_on(side), None), &spec, before);
+        assert_eq!(json["decision"]["shed"]["side"], json!(word));
+    }
 
     let queue = Decision::Queue(Queue {
         ticket: u64::MAX,
@@ -281,7 +297,8 @@ fn closed(
 /// The JSON's names are the contract's at every level, for a pick and for a
 /// shed, so that the two forms cannot part unseen. Two lists are closed.
 /// The names this form adds: `shadow` at the record, `url` at a target and
-/// at a top row, `decode_url` at a pair. And the contract's fields it
+/// at a top row, `decode_url` at a pair, `side` at a shed, here a pair's
+/// refusal that names one. And the contract's fields it
 /// leaves out, held for a pick that holds every option. At the record
 /// those are the two ids of the request, which the record does not hold,
 /// and six fields that no kept record holds and the control call leaves
@@ -302,9 +319,10 @@ fn every_name_is_the_contracts_but_two_closed_lists() {
     let mut kept = record(pick(), Some(0));
     kept.shadow = Some(ShadowKind::Agreed);
     kept.shadow_target = Some(WorkerId(11));
+    let refused = record(shed_on(PairSide::Decode), None);
     let outcomes = [
         (kept, Outcome::Pick(proto::Pick::default())),
-        (record(shed(), None), Outcome::Shed(proto::Shed::default())),
+        (refused, Outcome::Shed(proto::Shed::default())),
     ];
     for (record, outcome) in outcomes {
         let json = record.json(spec.engine(), &url);
@@ -357,7 +375,11 @@ fn every_name_is_the_contracts_but_two_closed_lists() {
                 let unscored = ["contributions", "dp_rank"];
                 closed(&rows[1], row, (&["url"], &unscored), "a top row");
             }
-            Outcome::Shed(shed) => closed(&decision[&word], &shed, (&[], &[]), "a shed"),
+            Outcome::Shed(shed) => {
+                let refusal = &decision[&word];
+                assert_eq!(refusal["side"], json!("decode"));
+                closed(refusal, &shed, (&["side"], &[]), "a shed");
+            }
             Outcome::Queue(_) => panic!("no queue is asked here"),
         }
         held_to(trace, &proto::Trace::default(), &[], "a trace");

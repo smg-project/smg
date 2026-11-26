@@ -313,13 +313,18 @@ pub(crate) trait Turn {
     /// The turn's connect signal for the row `id`, read at `revision`, a
     /// row whose checks are off: ready at once, unless it drains or is
     /// ready. A door with a holder writes it on the row's worker object,
-    /// and the store is told
-    /// ([`Objects::connect_row`](super::Objects::connect_row)).
+    /// and the store is told. A turn under a term asks its log last under
+    /// the membership lock, and writes nothing where the term ended by then
+    /// ([`Objects::connect_row_under`](super::Objects::connect_row_under)).
+    /// A registration of equal facts sends it too, where its row waits for
+    /// it still ([`awaits_connect`]).
     fn connect(&self, id: WorkerId, revision: u64);
 
     /// The turn's drain of the row `id`, read at `revision`, as
-    /// [`Self::connect`] writes a status. Whether the row moved: `false`
-    /// where another writer moved it under the turn.
+    /// [`Self::connect`] writes a status
+    /// ([`Objects::drain_row_under`](super::Objects::drain_row_under)).
+    /// Whether the row moved: `false` where another writer moved it under
+    /// the turn, and where the turn's term ended ahead of the last ask.
     fn drain(&self, id: WorkerId, revision: u64) -> bool;
 
     /// Check the term ahead of a write. A registration asks before each
@@ -649,6 +654,16 @@ pub(crate) fn lay_ready(
     Ok(answer)
 }
 
+/// Whether `row` waits for its connect signal still: its checks are off,
+/// so no verdict moves it, and it stands neither ready nor draining, the
+/// two statuses that signal leaves. A registration whose signal was not
+/// written leaves such a row. The one test of it: a registration of equal
+/// facts asks it, at a control call's arm and at [`write_row`]'s, and
+/// sends the signal again.
+pub(crate) fn awaits_connect(row: &WorkerRow) -> bool {
+    !row.facts.health.probes && !matches!(row.status, WorkerStatus::Ready | WorkerStatus::Draining)
+}
+
 fn write_row(
     turn: &impl Turn,
     maker: &Registrant,
@@ -658,6 +673,14 @@ fn write_row(
     match laid {
         None | Some((_, WorkerFactsChange::Another)) => facts.incarnation = turn.life()?,
         Some((id, WorkerFactsChange::Unmoved)) => {
+            // Equal facts write no row. A row that waits for its connect
+            // signal still is sent it again, with this turn's word. The
+            // facts are the row's own: a row that is checked waits for
+            // none, and is not read again.
+            let waits = (!facts.health.probes).then(|| turn.row(id)).flatten();
+            if let Some(row) = waits.filter(awaits_connect) {
+                turn.connect(row.id, row.revision);
+            }
             let wrote = MembershipWriteOutcome::Unmoved(id);
             turn.told(wrote);
             return Ok(wrote);
@@ -750,6 +773,9 @@ pub(crate) fn drain(
         return Ok(MembershipWriteOutcome::Unmoved(row.id));
     }
     if !turn.drain(row.id, row.revision) {
+        // The drain wrote nothing. Where its term ended, it is refused as
+        // a turn that does not lead: its row need not have moved.
+        turn.check_term()?;
         return Err(MembershipWriteRefused::Moved);
     }
     Ok(MembershipWriteOutcome::Draining(row.id))

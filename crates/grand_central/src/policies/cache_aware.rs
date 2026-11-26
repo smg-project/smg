@@ -39,7 +39,8 @@ use crate::{
         prefix_pass::{keep_prefix_pass, take_prefix_pass, withdraw_prefix_pass, PrefixStageId},
         view::{
             blocks_within, mean_in_flight, units_within, AffinityFacts, AffinityRows, Candidate,
-            Feed, HashKind, LoadRow, Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
+            Feed, HashKind, LoadRow, Phase, RequestFacts, TreeMatch, Walk, WorkerId,
+            TEXT_BYTES_PER_TOKEN,
         },
         warm_up::WarmUpRule,
     },
@@ -295,10 +296,28 @@ impl Gates {
     /// the block size the request was counted with.
     fn tokens_of(&self, blocks: u32, facts: &RequestFacts<'_>) -> f32 {
         let units = blocks as f32 * self.block_size_of(facts) as f32;
-        match facts.hash_kind {
-            HashKind::Token => units,
-            HashKind::Text => units / TEXT_BYTES_PER_TOKEN as f32,
-        }
+        tokens_within(units, facts.hash_kind)
+    }
+
+    /// A lent tree's match of `matched` units in tokens, for the held
+    /// prefix's price ([`TreeMatch`]): its whole blocks of the tree's unit
+    /// at the view's block size, as the classic policy prices a tree's
+    /// match. That policy's block of text is as many characters as a block
+    /// has tokens, where a request's window of text is four times as many
+    /// bytes: the price is the one count of a tree's match still rounded.
+    fn tokens_in_tree(&self, matched: u32, kind: HashKind) -> f32 {
+        let block = self.block_size.max(1);
+        tokens_within((matched / block * block) as f32, kind)
+    }
+}
+
+/// `units` of a request hashed in `kind` in tokens: tokens, and under the
+/// text kind bytes, or a string tree's characters, at
+/// [`TEXT_BYTES_PER_TOKEN`] a token.
+fn tokens_within(units: f32, kind: HashKind) -> f32 {
+    match kind {
+        HashKind::Token => units,
+        HashKind::Text => units / TEXT_BYTES_PER_TOKEN as f32,
     }
 }
 
@@ -447,6 +466,12 @@ fn neutral(out: &mut [f32]) -> TieBand {
 /// gate `0.5`, the rest `0.0`; under the fleet KV gate every row scores
 /// alike and the load scorer decides. The values are exact, so the band is
 /// zero.
+///
+/// Rows a lent tree's match named carry the match's own two numbers
+/// ([`AffinityRows::tree`]), and the stage reads those in place of the
+/// rows' blocks: the share is the match's size over the request's in the
+/// tree's unit, nothing rounded to a block, and every row named holds the
+/// match alike, though it is under one block.
 #[derive(Debug)]
 pub struct PrefixAffinity {
     threshold: f32,
@@ -624,11 +649,68 @@ impl PrefixAffinity {
         TieBand(0.0)
     }
 
+    /// A lent tree's match as this stage reads it ([`AffinityRows::tree`]):
+    /// how much every row the match named holds, in the tree's unit, and
+    /// that prefix's price in tokens. The match is followed where the
+    /// source reads placements and its share of the request is over the
+    /// threshold ([`TreeMatch::clears`]): the two counts divided, nothing
+    /// rounded to a block, as the classic policy tests a tree's match.
+    /// Where it is not followed nobody holds anything. The pass that scores
+    /// and the word of the pick both read here.
+    fn followed(&self, tree: TreeMatch, kind: HashKind) -> (u32, f32) {
+        if self.source == AffinitySource::Index || !tree.clears(self.threshold) {
+            return (0, 0.0);
+        }
+        (tree.matched, self.gates.tokens_in_tree(tree.matched, kind))
+    }
+
+    /// The stage's scores over the rows a lent tree's match named, as the
+    /// classic policy reads a tree's match: where the match is followed
+    /// ([`Self::followed`]) every row named holds it alike, whatever its
+    /// whole blocks, and scores `1.0` under the spill gate at the match's
+    /// price. One pass: the deepest match is the tree's, and no row's
+    /// entry is read. Behind a draw each row is looked for by a search, as
+    /// [`Self::rank_drawn`] reads, and a pool read whole walks the holders
+    /// beside its rows; the score is chosen by that body's table. Out of
+    /// line, as [`Self::rank_named`] is: the passes over any other naming
+    /// keep the code they had.
+    #[inline(never)]
+    fn rank_tree(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        named: AffinityRows<'_>,
+        tree: TreeMatch,
+    ) -> TieBand {
+        let (units, price) = self.followed(tree, facts.hash_kind);
+        let avg = spill_mean(named.mean_in_flight, facts, candidates, kept);
+        // A decode worker prefills nothing again: its held prefix is not
+        // priced.
+        let held = if self.priced(facts) {
+            self.judge(units, avg);
+            price
+        } else {
+            0.0
+        };
+        let (holder, anyone) = (self.gates.spill(avg, held), self.gates.spill(avg, 0.0));
+        let (drawn, mut walk) = (named.drawn(), named.walk());
+        for (o, &i) in out.iter_mut().zip(kept) {
+            let load = facts.in_flight(&candidates[i as usize]) as f32;
+            let holds = units > 0 && if drawn { named.names(i) } else { walk.names(i) };
+            let own = usize::from(holds & !holder.over(load));
+            *o = [0.0, 0.5, 1.0, 1.0][own << 1 | usize::from(!anyone.over(load))];
+        }
+        TieBand(0.0)
+    }
+
     /// The stage's scores over the rows a host named: a holder reads its
     /// depth. The first pass walks the holders beside the kept rows where
     /// the pool is read whole; behind a draw each row is searched once
-    /// ([`Self::rank_drawn`]). Out of line: see [`Scorer::score`] of this
-    /// stage.
+    /// ([`Self::rank_drawn`]). The rows of a lent tree's match do not come
+    /// here: their one caller hands them to [`Self::rank_tree`]. Out of
+    /// line: see [`Scorer::score`] of this stage.
     #[inline(never)]
     fn rank_named(
         &self,
@@ -693,26 +775,44 @@ impl Scorer for PrefixAffinity {
     ///
     /// A request of more than 65,535 blocks halves both counts until its
     /// own fits, so the share they say stays true.
+    ///
+    /// A row a lent tree's match named is said the match's own two numbers
+    /// where the stage follows the match, in the tree's unit
+    /// ([`OverlapSource::Tree`](crate::engine::OverlapSource::Tree)), and
+    /// any other row of such a request a miss of the request's blocks.
     fn said(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], row: u32) -> Overlap {
-        let request_blocks = self.gates.request_blocks(facts);
         let held = facts.feed().entry_or_default(row);
-        let blocks = self.matched(held, self.gates.whole(facts));
-        let indexed = self.source != AffinitySource::Predictor && held.overlap_blocks == blocks;
+        let tree = facts
+            .named_alone()
+            .and_then(|named| Some((named, named.tree?)));
+        // What the row holds as the pass that decided read it, and that
+        // prefix's price in tokens.
+        let (depth, price) = match tree {
+            Some((named, tree)) if named.names(row) => self.followed(tree, facts.hash_kind),
+            Some(_) => (0, 0.0),
+            None => {
+                let blocks = self.matched(held, self.gates.whole(facts));
+                (blocks, self.gates.tokens_of(blocks, facts))
+            }
+        };
         // The pass's word is taken whichever row is asked about: it is
         // the word of one decision.
         let judged = take_prefix_pass(self.id);
-        let margin_held = blocks > 0
+        let margin_held = depth > 0
             && judged.is_some_and(|(best, mean)| {
-                best == blocks
+                best == depth
                     && candidates.get(row as usize).is_some_and(|candidate| {
                         let load = facts.in_flight(candidate) as f32;
-                        let price = self.gates.tokens_of(blocks, facts);
                         self.gates.over(load, mean, 0.0) && !self.gates.over(load, mean, price)
                     })
             });
-        // Both counts by one shift, and the source, where every statement
-        // of an overlap ends.
-        Overlap::of(blocks, indexed, request_blocks, margin_held)
+        if let Some((_, tree)) = tree.filter(|_| depth > 0) {
+            return Overlap::in_tree(depth, tree.of, margin_held);
+        }
+        let request_blocks = self.gates.request_blocks(facts);
+        let indexed = self.source != AffinitySource::Predictor && held.overlap_blocks == depth;
+        // In blocks: the source is read from the two block readings.
+        Overlap::of(depth, indexed, request_blocks, margin_held)
     }
 
     fn score_front(
@@ -816,7 +916,12 @@ impl ReadsLoad for PrefixAffinity {
         // answer out of line, so a pass over a column keeps the code it
         // had: one entry a candidate, and a kept row reads its own.
         if let Some(named) = facts.named_alone() {
-            return self.rank_named(facts, candidates, kept, out, named);
+            // The rows of a lent tree's match are scored by the match's
+            // own two numbers, any other naming by what each row holds.
+            return match named.tree {
+                Some(tree) => self.rank_tree(facts, candidates, kept, out, named, tree),
+                None => self.rank_named(facts, candidates, kept, out, named),
+            };
         }
         let column = facts.affinity;
         self.rank(facts, candidates, kept, out, Feed::Column(column), || {

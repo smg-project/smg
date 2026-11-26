@@ -13,6 +13,7 @@ use crate::service::proto;
 use crate::{
     document::spec::RulePlaced,
     engine::{
+        framework::PairSide,
         sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{Candidate, WorkerId},
     },
@@ -528,7 +529,8 @@ impl Trace {
     }
 }
 
-/// Where the blocks a pick's first target holds were read ([`Overlap`]).
+/// Where the two counts a pick states of its first target were read, and
+/// so what they count ([`Overlap`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -536,18 +538,25 @@ pub enum OverlapSource {
     /// Nothing is held, or nothing is stated.
     #[default]
     None,
-    /// The event index.
+    /// The event index: whole blocks of the request's blocks.
     Index,
-    /// What the worker was sent: the sent-prefix predictor, or the match of
-    /// a tree the host lends.
+    /// What the worker was sent, by the sent-prefix predictor: whole blocks
+    /// of the request's blocks.
     Predictor,
+    /// The match of a tree the host lends: the match's size of the
+    /// request's, in the tree's own unit and not in blocks. The unit is
+    /// tokens for a request hashed by its token ids and characters for one
+    /// hashed by its text, a host's marker in neither.
+    Tree,
 }
 
-/// What a pick states of its first target: how many leading blocks of the
-/// request the worker holds, of how many, and where they were read. A host
-/// observes its cache series from it: the share held is `blocks` over `of`,
-/// and a miss reads zero of `of`. `of` is zero only where nothing is stated
-/// ([`Overlap::NONE`]): a request counts as one block at the least.
+/// What a pick states of its first target: how much of the request the
+/// worker holds, of how much, and where the two counts were read. Under
+/// every source but a tree they are leading blocks of the request's
+/// blocks. A host observes its cache series from them: the share held is
+/// `blocks` over `of` under every source, and a miss reads zero of `of`.
+/// `of` is zero only where nothing is stated ([`Overlap::NONE`]): a request
+/// counts as one block at the least.
 ///
 /// The engine over a host's worker lists (`InProcess`) states it behind
 /// a single decision, from the first target's entry of the rows that
@@ -562,11 +571,13 @@ pub enum OverlapSource {
 /// [`Engine::decide`](crate::engine::Engine::decide) itself states nothing.
 ///
 /// A request decided inside a tree its host lends is given the rows the
-/// tree's match names, and its pick states by them: the match's tokens, or
-/// the bytes of text it matched, counted in the request's blocks for a
-/// worker named among the match's holders, and a miss for any other. Past
-/// the profile's sample the holders named are a draw. A match under one
-/// block is a miss.
+/// tree's match names. For a worker named among the match's holders its
+/// pick states the match's own two numbers ([`OverlapSource::Tree`]): the
+/// match's size of the request's, in the tree's unit, which are the two
+/// the classic policy's series divides. No count is rounded to a block, so
+/// a match under one block is stated too. A pick of any other worker states
+/// a miss of the request's blocks. Past the profile's sample the holders
+/// named are a draw.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
@@ -578,16 +589,20 @@ pub enum OverlapSource {
 #[non_exhaustive]
 pub struct Overlap {
     /// The leading blocks the worker holds: the larger of its entry's two
-    /// readings, the index's and the sent-prefix predictor's. Halved with
-    /// `of` where the request's count is past sixteen bits.
+    /// readings, the index's and the sent-prefix predictor's. Under
+    /// [`OverlapSource::Tree`] it is the size of the tree's match in the
+    /// tree's unit. Halved with `of` where the request's count is past
+    /// sixteen bits.
     pub blocks: u16,
     /// The request's blocks as the prefix stage counts them: its tokens
     /// over the block size, one at the least, and never under the block
-    /// hashes its host sent. A request of more than 65,535 halves this
-    /// count and `blocks` together until it fits, so their share stays
-    /// true.
+    /// hashes its host sent. Under [`OverlapSource::Tree`] it is the
+    /// request's size in the tree's unit. A count of more than 65,535
+    /// halves this count and `blocks` together until it fits, so their
+    /// share stays true to one part in 32,768.
     pub of: u16,
-    /// Where `blocks` was read: the index on a tie.
+    /// Where `blocks` was read, which says what the two counts count: the
+    /// index on a tie.
     pub source: OverlapSource,
     /// The held prefix's price kept the worker in front: a deepest holder
     /// that stood over the swing's margin and under the priced one, at the
@@ -608,11 +623,11 @@ impl Overlap {
 
     /// `blocks` held of a request of `request_blocks` blocks, read from the
     /// index where `indexed` and else from the predictor, with a margin's
-    /// word. Both counts are halved together, by one shift, until the
-    /// request's fits sixteen bits: the share they say stays true. Whoever
-    /// states an overlap ends here: a prefix stage's own word
+    /// word. Whoever states blocks ends here: a prefix stage's own word
     /// ([`Scorer::said`](crate::engine::Scorer::said)) and the engine over
-    /// worker lists ([`Self::held`]), so the two say one thing of one count.
+    /// worker lists ([`Self::held`]), so the two name one source for one
+    /// count. The counts are halved where every statement ends
+    /// ([`Self::halved`]).
     pub(crate) fn of(blocks: u32, indexed: bool, request_blocks: u32, margin_held: bool) -> Self {
         let source = if blocks == 0 {
             OverlapSource::None
@@ -621,10 +636,34 @@ impl Overlap {
         } else {
             OverlapSource::Predictor
         };
-        let shift = (u32::BITS - request_blocks.leading_zeros()).saturating_sub(u16::BITS);
+        Self::halved(blocks, request_blocks, source, margin_held)
+    }
+
+    /// The match of a tree a host lends, as a pick of a worker the match
+    /// named states it ([`OverlapSource::Tree`]): `matched` of the
+    /// request's `of`, both in the tree's unit, with a margin's word.
+    /// Halved as blocks are ([`Self::halved`]). A match of nothing is a
+    /// miss. A match smaller than the shift's unit states zero under the
+    /// source [`OverlapSource::Tree`]: 1 of 100,000 states 0 of 50,000.
+    pub(crate) fn in_tree(matched: u32, of: u32, margin_held: bool) -> Self {
+        let source = if matched == 0 {
+            OverlapSource::None
+        } else {
+            OverlapSource::Tree
+        };
+        Self::halved(matched, of, source, margin_held)
+    }
+
+    /// `held` of `of` read from `source`, both counts halved together, by
+    /// one shift, until the request's fits sixteen bits: the share they
+    /// say stays true to one part in 32,768. Every statement of an overlap
+    /// ends here, in blocks ([`Self::of`]) or in a tree's unit
+    /// ([`Self::in_tree`]), so a count is halved in one place.
+    fn halved(held: u32, of: u32, source: OverlapSource, margin_held: bool) -> Self {
+        let shift = (u32::BITS - of.leading_zeros()).saturating_sub(u16::BITS);
         Self {
-            blocks: u16::try_from(blocks >> shift).unwrap_or(u16::MAX),
-            of: u16::try_from(request_blocks >> shift).unwrap_or(u16::MAX),
+            blocks: u16::try_from(held >> shift).unwrap_or(u16::MAX),
+            of: u16::try_from(of >> shift).unwrap_or(u16::MAX),
             source,
             margin_held,
         }
@@ -812,6 +851,28 @@ pub struct Shed {
     pub retry_after_secs: u16,
     /// The binding's scale-from-zero budget lets the host hold the request.
     pub wait_allowed: bool,
+    /// The side of a pair this refusal is for: a host answers for that
+    /// role, as the gateway's own pair selection names a role in every
+    /// refusal. A decision fills it by its own list, the one its stages
+    /// left with nobody. The prefill side where no prefill passed its own
+    /// stages, where the prefill's own run declined, and where the
+    /// prefills stand at their admission limit. The decode side where the
+    /// prefills that passed had no decode to pair with, and where the
+    /// decode's run refused. A decode decided again names the decode
+    /// side, and the prefill side where the held prefill left its list.
+    /// Two refusals name the side of the list that selection judges
+    /// instead. A pair whose named worker's number reaches nobody
+    /// (`target-worker`) names the side it reaches nobody on, the
+    /// prefills' first. A call's shed that stands behind a route's rule
+    /// names the prefill side where none of the rule's prefills can take
+    /// the request, whichever list the decision said. An encode request
+    /// names the side of its pair that a hard demand left nobody, as its
+    /// pair alone does. `None` for a single decision, for a pair refused
+    /// before either side was read, for an encode request's other
+    /// refusals of its own pass (for its encoders, for the pairs they
+    /// serve, for a list's places), and for a refusal that came over a
+    /// link: the protocol's message has no field for it.
+    pub side: Option<PairSide>,
     pub trace: Trace,
 }
 
@@ -852,6 +913,17 @@ impl Decision {
             Self::Shed(shed) => &shed.trace,
             Self::Queue(queue) => &queue.trace,
         }
+    }
+
+    /// This decision, its refusal naming the side of a pair that was left
+    /// with nobody ([`Shed::side`]). A pick and a queue ticket pass as they
+    /// are.
+    #[must_use]
+    pub(crate) fn of_side(mut self, side: PairSide) -> Self {
+        if let Self::Shed(shed) = &mut self {
+            shed.side = Some(side);
+        }
+        self
     }
 }
 
@@ -981,6 +1053,7 @@ pub(crate) fn shed(
         emptied_by,
         retry_after_secs: 1,
         wait_allowed: false,
+        side: None,
         trace: Trace {
             seed,
             generation,

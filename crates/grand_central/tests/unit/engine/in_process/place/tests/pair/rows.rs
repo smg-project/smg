@@ -823,6 +823,18 @@ fn asked_under(
     decodes: &str,
     ruled: bool,
 ) -> (Answer, usize) {
+    let (unplaced, asked) = unplaced_under(engine, prefills, decodes, ruled);
+    (shed_of(Err(unplaced)), asked)
+}
+
+/// [`asked_under`] with the call's whole answer, which says the shed's
+/// side too.
+fn unplaced_under(
+    engine: &'static InProcess,
+    prefills: &str,
+    decodes: &str,
+    ruled: bool,
+) -> (Unplaced, usize) {
     let (prefills, decodes) = (stated(prefills), stated(decodes));
     let lists = Lists::of(prefills.len(), decodes.len());
     let classes = partners(&prefills, &decodes);
@@ -857,7 +869,7 @@ fn asked_under(
         admits: if ruled { Some(&admits) } else { None },
         ..PlaceRequest::of(MODEL, WorkerLists::Pair(pair))
     };
-    let answer = shed_of(engine.place(&request));
+    let answer = engine.place(&request).expect_err("no placement");
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
     (answer, asked.get())
 }
@@ -921,6 +933,58 @@ fn held(kind: Kind) {
 #[test]
 fn a_saturated_shed_stands_where_the_rule_takes_no_worker_of_a_list() {
     held(Kind::Stands);
+}
+
+/// A shed that stands names the side of the list the gateway's own
+/// selection judges in its row, which is the role it refuses the pair for:
+/// the prefill's where the rule takes no prefill that pairs with a decode
+/// and where no prefill it takes can take the request
+/// (`model_gateway/src/routers/common/placement.rs:2900-2918`), and the
+/// decode's where one can and the rule takes no decode (`:2943-2970`), on
+/// main `d43c7b2a9`. The three rows named here stand for the decodes, and
+/// every other for the prefills.
+///
+/// In two of those the decision itself shed over the decodes: the rule's
+/// one prefill is over its thresholds beside an idle prefill it refuses.
+/// The shed stands for the prefills there, whichever list the decision
+/// said ([`stands`](super::super::super::pair::stands)).
+#[test]
+fn a_shed_that_stands_names_the_side_of_the_list_it_stands_for() {
+    const FOR_THE_DECODES: [&str; 3] = [
+        "the decodes over; an open prefill, no decode",
+        "the decodes over; one of the rule's two prefills is under a doubt",
+        "the partners over beside a decode under its host's hold apart; the prefill, no decode",
+    ];
+    const TURNED: [&str; 2] = [
+        "the decodes over; an over prefill alone, no decode",
+        "the decodes over; the rule's one prefill is over its thresholds and under a doubt",
+    ];
+    let engine = round_robin(true);
+    let side_of = |row: &Row, ruled| match unplaced_under(engine, row.prefills, row.decodes, ruled)
+    {
+        (Unplaced::Shed { side, .. }, _) => side,
+        other => panic!("{}: a shed, and not {other:?}", row.name),
+    };
+    let mut named = 0;
+    for row in ROWS.iter().filter(|row| row.kind == Kind::Stands) {
+        let decodes = FOR_THE_DECODES.contains(&row.name);
+        named += usize::from(decodes) + usize::from(TURNED.contains(&row.name));
+        let held = if decodes {
+            PairSide::Decode
+        } else {
+            PairSide::Prefill
+        };
+        assert_eq!(side_of(row, true), Some(held), "{}", row.name);
+        // With no rule the decision's own shed is the answer, with the
+        // side the decision names.
+        let own = if TURNED.contains(&row.name) {
+            PairSide::Decode
+        } else {
+            held
+        };
+        assert_eq!(side_of(row, false), Some(own), "{}: no rule", row.name);
+    }
+    assert_eq!(named, 5, "each row named here is a row that stands");
 }
 
 /// A rule that takes no worker of a list is told by name in every other

@@ -58,6 +58,7 @@ fn record(generation: u64, binding: Option<u32>, profile: u16) -> DecisionRecord
             emptied_by: "view",
             retry_after_secs: 1,
             wait_allowed: false,
+            side: None,
             trace: Trace {
                 profile,
                 generation,

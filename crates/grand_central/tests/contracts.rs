@@ -262,7 +262,8 @@ struct ProtoMirror {
     /// position, the in-process length of a fixed array, the trace the wire
     /// hoists into `Decision`, whether a report counts resident tokens, a
     /// fingerprint the host carries of a name the wire carries, the place
-    /// of a row's engine among the engines of its host's list.
+    /// of a row's engine among the engines of its host's list, the side of
+    /// a pair a refusal names.
     host_only: &'static [&'static str],
     /// Wire fields outside the record, in the wire's order: an event's key
     /// before it, controller facts, a wire-only input, the observability
@@ -475,7 +476,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Shed",
             record: shed_record(),
-            host_only: &["trace"],
+            host_only: &["side", "trace"],
             wire_only: &[],
             wire: &[
                 ("reason", Type::Enum),

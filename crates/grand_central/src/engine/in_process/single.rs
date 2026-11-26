@@ -653,6 +653,7 @@ fn shed(
         emptied_by,
         retry_after_secs: 1,
         wait_allowed: false,
+        side: None,
         trace: Trace {
             seed: request.facts.seed,
             generation: own.document.spec.generation(),

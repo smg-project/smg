@@ -454,9 +454,14 @@ impl Log {
     /// Whether the store leads `term`, in one read under the log's lock:
     /// the log's term is `term` and the store's own writes stand under it.
     /// A refusal carries the term the log stands at, so no caller reads the
-    /// log again for its words. Three callers read it, each in its own
-    /// turn: the service's guard, the door's mint of a worker's life and
-    /// the replication's check.
+    /// log again for its words. Four callers read it, each in its own
+    /// turn: the service's guard, the replication's check, the door's check
+    /// of its term and the door's word for a status it writes. The check
+    /// runs ahead of a life's mint and of each row a registration writes or
+    /// removes, and once more behind a drain that wrote nothing. The word
+    /// is asked under an object's lock and under the store's membership
+    /// lock: this read takes the log's lock alone, and no holder of the
+    /// log's lock takes one of those two.
     pub fn leads(&self, term: u64) -> Result<(), NotLeading> {
         let ring = self.ring.lock();
         let seen = self.term.load(Ordering::Relaxed);

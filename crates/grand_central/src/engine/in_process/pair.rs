@@ -169,7 +169,8 @@ pub trait PairAdmission: fmt::Debug {
     fn has_capacity(&self, prefill: usize) -> bool;
 
     /// Whether the decode at place `decode` of the decode list has a room
-    /// that nothing waiting at its gate is in line for.
+    /// for this request: one that nothing waiting at its gate is in line
+    /// for, or the room the request holds there already.
     fn has_room(&self, decode: usize) -> bool;
 }
 
@@ -335,16 +336,16 @@ impl<'a> PairLists<'a> {
     /// that side's role is held to it, among the places its host states
     /// ([`Beside::meeting`]). `kept` takes the places, the prefills' first.
     /// `Err` names the demand that left a side nobody, the prefills'
-    /// first. An encode request's decision judges its pair's two lists
-    /// here, so a side is held one way under a pair's decision and under
-    /// its.
+    /// first, and that side. An encode request's decision judges its
+    /// pair's two lists here, so a side is held one way under a pair's
+    /// decision and under its.
     pub(super) fn sides_meeting<'s>(
         &self,
         cx: &Constraints<'s>,
         demands: Demands,
         (prefill, decode): (&PoolRecords, &PoolRecords),
         [prefill_kept, decode_kept]: [&'s mut Vec<u32>; 2],
-    ) -> Result<[Constraints<'s>; 2], UnmetDemand>
+    ) -> Result<[Constraints<'s>; 2], (UnmetDemand, PairSide)>
     where
         'a: 's,
     {
@@ -358,9 +359,10 @@ impl<'a> PairLists<'a> {
         let prefills = prefills.meeting(prefill, demands.held_by(Role::Prefill), prefill_kept);
         let decodes = side(self.decode_places, self.decode_stalled, self.decode_held);
         let decodes = decodes.meeting(decode, demands.held_by(Role::Decode), decode_kept);
-        match prefills.unmet.or(decodes.unmet) {
-            Some(unmet) => Err(unmet),
-            None => Ok([prefills.of(cx), decodes.of(cx)]),
+        match (prefills.unmet, decodes.unmet) {
+            (Some(unmet), _) => Err((unmet, PairSide::Prefill)),
+            (None, Some(unmet)) => Err((unmet, PairSide::Decode)),
+            (None, None) => Ok([prefills.of(cx), decodes.of(cx)]),
         }
     }
 
@@ -1029,7 +1031,10 @@ fn decode_session(facts: &RequestFacts<'_>) -> Session {
 /// each under a stage's name ([`not_decided`]). A side the request's
 /// demand left nobody ([`Beside::meeting`]) sheds the pair with no
 /// endpoint under that demand's stage, the prefills' first, behind what
-/// the records decline by name.
+/// the records decline by name. The refusal over no candidate names the
+/// side of the list that holds no record, the prefills' first, and a side
+/// its demand left nobody is the side its refusal names
+/// ([`Shed::side`](crate::engine::decision::Shed::side)).
 fn decide_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
@@ -1039,11 +1044,8 @@ fn decide_records(
     scratch: &mut Scratch,
 ) -> Decision {
     if pools.prefills.is_empty() || pools.decodes.is_empty() {
-        let none = PoolFacts {
-            generation: pool.generation,
-            ..PoolFacts::default()
-        };
-        return engine.decide_pair(facts, &none, PairPools::default(), cx, cx, scratch);
+        let prefills = !pools.prefills.is_empty();
+        return engine.decide_over_an_empty_list(facts, pool, prefills, cx, scratch);
     }
     if let Some((reason, stage)) = not_decided(cx) {
         return shed(reason, stage, facts.seed, pool.generation);
@@ -1052,7 +1054,12 @@ fn decide_records(
     // A side the request's demand left nobody: the prefills' first.
     if let Some(unmet) = prefills.unmet.or(decodes.unmet) {
         let stage = unmet.stage();
-        return shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation);
+        let side = if prefills.unmet.is_some() {
+            PairSide::Prefill
+        } else {
+            PairSide::Decode
+        };
+        return shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation).of_side(side);
     }
     if prefills.states_nothing() && decodes.states_nothing() {
         return engine.decide_pair(facts, pool, pools, cx, cx, scratch);
@@ -1454,7 +1461,8 @@ fn decide_decode_records(
     // The decodes the request's demand left nobody of.
     if let Some(unmet) = side.unmet.filter(|_| listed()) {
         let stage = unmet.stage();
-        return shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation);
+        return shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation)
+            .of_side(PairSide::Decode);
     }
     let first = first_decode(held);
     if side.states_nothing() {

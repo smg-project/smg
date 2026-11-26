@@ -7,7 +7,7 @@
 //! `CH` below), on main `4b41f39a7`.
 
 use super::{
-    super::target::{names_target, Counted, MISSED, TARGET},
+    super::target::{missed_on, names_target, Counted, MISSED, TARGET},
     *,
 };
 use crate::engine::DecodeRefused;
@@ -196,7 +196,11 @@ fn the_numbers_count_the_workers_that_can_be_sent_to() {
         Ok((2, 1)),
         "past the prefill that is not ready"
     );
-    assert_eq!(at(&lists, "2"), Err(MISSED), "two prefills are counted");
+    assert_eq!(
+        at(&lists, "2"),
+        Err(missed_on(PairSide::Prefill)),
+        "two prefills are counted"
+    );
 
     let lists = Lists::of(3, 3);
     lists.decodes[0].set_overloaded(true);
@@ -229,7 +233,11 @@ fn the_numbers_count_the_workers_that_can_be_sent_to() {
     };
     assert_eq!(ruled("0"), Ok((1, 0)));
     assert_eq!(ruled("1"), Ok((2, 1)));
-    assert_eq!(ruled("2"), Err(MISSED), "the rule takes two workers a side");
+    assert_eq!(
+        ruled("2"),
+        Err(missed_on(PairSide::Prefill)),
+        "the rule takes two workers a side"
+    );
 }
 
 /// A prefill is counted where it has a partner that can be sent to, and a
@@ -257,7 +265,7 @@ fn a_prefill_is_counted_where_one_of_its_partners_can_be_sent_to() {
     );
     lists.decodes[0].set_status(WorkerStatus::NotReady);
     assert_eq!(at("0"), Ok((1, 1)), "the one prefill with a partner left");
-    assert_eq!(at("1"), Err(MISSED));
+    assert_eq!(at("1"), Err(missed_on(PairSide::Prefill)));
 }
 
 /// Where a prefill that can be sent to has a first partner that can, the
@@ -280,12 +288,16 @@ fn first_partners_are_counted_alone_while_one_can_be_sent_to() {
     assert_eq!(at("0"), Ok((1, 1)), "the one pair that goes first");
     assert_eq!(
         at("1"),
-        Err(MISSED),
+        Err(missed_on(PairSide::Prefill)),
         "no second prefill has a first partner"
     );
     lists.decodes[1].set_status(WorkerStatus::NotReady);
     assert_eq!(at("0"), Ok((0, 0)), "every prefill with a partner");
-    assert_eq!(at("1"), Err(MISSED), "prefill 1 has one partner left");
+    assert_eq!(
+        at("1"),
+        Err(missed_on(PairSide::Decode)),
+        "prefill 1 has one partner left"
+    );
 }
 
 /// A named worker that is full answers as its side's own gate does. A
@@ -395,7 +407,7 @@ fn a_pair_held_to_places_is_counted_among_them() {
         named(engine, &lists, pair, number)
     };
     assert_eq!((at("0"), at("1")), (Ok((1, 0)), Ok((2, 2))));
-    assert_eq!(at("2"), Err(MISSED));
+    assert_eq!(at("2"), Err(missed_on(PairSide::Prefill)));
 }
 
 /// A pair whose number reaches no worker is shed with no endpoint under
@@ -414,8 +426,8 @@ fn a_number_that_reaches_no_pair_is_shed_under_its_own_name() {
     let lists = Lists::of(2, 2);
     let classes = lists.every();
     let at = |number: &str| named(engine, &lists, lists.under(&classes, &Open), number);
-    assert_eq!(at("one"), Err(MISSED));
-    assert_eq!(at("2"), Err(MISSED));
+    assert_eq!(at("one"), Err(missed_on(PairSide::Prefill)));
+    assert_eq!(at("2"), Err(missed_on(PairSide::Prefill)));
     assert!(at("").is_ok(), "an empty text names no worker");
 
     // The count asks the rule of the two decodes and the two prefills.
@@ -430,8 +442,68 @@ fn a_number_that_reaches_no_pair_is_shed_under_its_own_name() {
         admits: Some(&rule),
         ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
     };
+    // The pair the count reached is refused as the pick: no list was left
+    // with nobody, and the shed names no side.
     assert_eq!(placed(engine, &lists, &request), Err(MISSED));
     assert_eq!(asked.get(), 6, "one decision's two picks");
+}
+
+/// A pair shed under the worker it names says the side that worker was
+/// missed on. The prefills are counted first: a text that is no number
+/// and a number past the prefills counted miss on the prefill side, and a
+/// number that reaches a prefill and none of its partners misses on the
+/// decode side. A worker the count reached that stops being ready behind
+/// it is missed on its own side: the decision held to the two places is
+/// left nobody there, and its shed takes the target's name with that
+/// side.
+///
+/// The classic router's hash policy answers nobody for such a number
+/// (`CH:187-193`), and its pair selection refuses the pair for the role of
+/// the policy that answered so: the prefill's (`P:3044`), which it asks
+/// first, or the decode's (`P:3090`). The lines are main `d43c7b2a9`'s.
+#[test]
+fn a_pair_shed_under_its_named_worker_names_the_side_it_was_missed_on() {
+    let engine = rings();
+    let lists = Lists::of(2, 3);
+    // The first prefill pairs with the first decode alone, the second
+    // with the other two.
+    let classes = PartnerClasses::number(3, [&[0_u32][..], &[1, 2][..]]);
+    let at = |number: &str| named(engine, &lists, lists.under(&classes, &Open), number);
+    assert_eq!((at("0"), at("1")), (Ok((0, 0)), Ok((1, 2))));
+    let on_prefills = Err(missed_on(PairSide::Prefill));
+    assert_eq!(at("one"), on_prefills, "no number: the prefills' first");
+    assert_eq!(at("2"), on_prefills, "past the two prefills");
+    lists.decodes[2].set_status(WorkerStatus::NotReady);
+    let on_decodes = Err(missed_on(PairSide::Decode));
+    assert_eq!(at("1"), on_decodes, "the prefill's one partner left");
+
+    // The rule is asked of a worker as the count takes it: the worker it
+    // names here stops being ready behind that.
+    let leaving = |prefill: bool| {
+        let lists = Lists::of(2, 2);
+        let classes = lists.every();
+        let side = if prefill {
+            &lists.prefills
+        } else {
+            &lists.decodes
+        };
+        let gone = side[1].url();
+        let rule = |worker: &dyn Worker| {
+            if worker.url() == gone {
+                worker.set_status(WorkerStatus::NotReady);
+            }
+            true
+        };
+        let headers = [(TARGET, "1")];
+        let request = PlaceRequest {
+            headers: &headers,
+            admits: Some(&rule),
+            ..PlaceRequest::of(MODEL, WorkerLists::Pair(lists.under(&classes, &Open)))
+        };
+        placed(engine, &lists, &request)
+    };
+    assert_eq!(leaving(true), on_prefills, "the named prefill left");
+    assert_eq!(leaving(false), on_decodes, "the named decode left");
 }
 
 /// Where no decode can be sent to, a decode over its overload thresholds
@@ -459,7 +531,11 @@ fn a_decode_pool_all_over_its_thresholds_keeps_the_prefills_number_alone() {
     lists.decodes[0].increment_load();
     let at = |number: &str| named(engine, &lists, lists.under(&classes, &Open), number);
     assert_eq!((at("0"), at("1")), (Ok((0, 1)), Ok((1, 1))));
-    assert_eq!(at("2"), Err(MISSED), "the prefills are counted");
+    assert_eq!(
+        at("2"),
+        Err(missed_on(PairSide::Prefill)),
+        "the prefills are counted"
+    );
 
     let mut document =
         PolicySpec::pair_presets("consistent_hashing", "consistent_hashing").expect("presets");
@@ -570,10 +646,14 @@ fn the_numbers_count_among_the_workers_that_meet_the_requests_demands() {
     let wire = Demands { runtime: 2, ..none };
     assert_eq!(placed("0", wire), Ok((1, 1)), "the first on the wire");
     assert_eq!(placed("1", wire), Ok((2, 2)));
-    assert_eq!(placed("2", wire), Err(MISSED), "two a side");
+    assert_eq!(
+        placed("2", wire),
+        Err(missed_on(PairSide::Prefill)),
+        "two a side"
+    );
     let other = Demands { runtime: 1, ..none };
     assert_eq!(placed("0", other), Ok((0, 0)), "the other wire's one");
-    assert_eq!(placed("1", other), Err(MISSED));
+    assert_eq!(placed("1", other), Err(missed_on(PairSide::Prefill)));
 
     // The prefills are not held to the way: all three are counted, and
     // the one decode that states it is the reached prefill's one partner.
@@ -582,7 +662,11 @@ fn the_numbers_count_among_the_workers_that_meet_the_requests_demands() {
         ..none
     };
     assert_eq!(placed("0", decided), Ok((0, 2)), "any prefill");
-    assert_eq!(placed("1", decided), Err(MISSED), "one decode");
+    assert_eq!(
+        placed("1", decided),
+        Err(missed_on(PairSide::Decode)),
+        "one decode"
+    );
 
     // No decode states the way 4: there is no partner to count a prefill
     // by, and the pair is shed as one that names no worker is.
@@ -594,6 +678,7 @@ fn the_numbers_count_among_the_workers_that_meet_the_requests_demands() {
         reason: ShedReason::NoEndpoints,
         emptied_by: "decoding",
         retry_after_secs: 1,
+        side: Some(PairSide::Decode),
     };
     assert_eq!(placed("0", unmet), Err(shed));
 }
@@ -626,11 +711,19 @@ fn a_place_its_host_masks_takes_no_number() {
     let pair = masking(&[0], &[]);
     assert_eq!(at(pair, "0"), Ok((1, 0)), "past the masked prefill");
     assert_eq!(at(pair, "1"), Ok((2, 1)));
-    assert_eq!(at(pair, "2"), Err(MISSED), "two prefills are counted");
+    assert_eq!(
+        at(pair, "2"),
+        Err(missed_on(PairSide::Prefill)),
+        "two prefills are counted"
+    );
     let pair = masking(&[], &[0]);
     assert_eq!(at(pair, "0"), Ok((0, 1)), "past the masked decode");
     assert_eq!(at(pair, "1"), Ok((1, 2)));
-    assert_eq!(at(pair, "2"), Err(MISSED), "two decodes are counted");
+    assert_eq!(
+        at(pair, "2"),
+        Err(missed_on(PairSide::Decode)),
+        "two decodes are counted"
+    );
 
     // Every decode is masked and none is held: nobody is counted, and the
     // pair goes where the same pair goes with no named worker, to the
@@ -667,7 +760,11 @@ fn a_place_its_host_masks_takes_no_number() {
         named(engine, &lists, pair, number)
     };
     assert_eq!(at("0"), Ok((1, 2)), "its partners are not masked");
-    assert_eq!(at("1"), Err(MISSED), "one prefill is counted");
+    assert_eq!(
+        at("1"),
+        Err(missed_on(PairSide::Prefill)),
+        "one prefill is counted"
+    );
 }
 
 /// A pair that names its worker under a capped sessions rule goes to that
@@ -722,7 +819,11 @@ fn a_pair_that_names_its_worker_under_a_capped_sessions_rule_goes_there_or_nowhe
     assert_eq!(pair_of("0"), Ok((0, 0)), "at the rule's cap");
     // Pinned on the first pair, it goes to the pair it names all the same.
     assert_eq!(pair_of("1"), Ok((1, 1)), "past the session's pins");
-    assert_eq!(pair_of("3"), Err(MISSED), "three workers a side");
+    assert_eq!(
+        pair_of("3"),
+        Err(missed_on(PairSide::Prefill)),
+        "three workers a side"
+    );
 }
 
 /// A pair that names its decode is decided once. Under a document that

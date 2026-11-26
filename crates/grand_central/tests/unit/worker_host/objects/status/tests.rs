@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use smg_worker::{
     health::port::{HealthSink, ProbeAnswer},
     registry::WorkerRegistry,
@@ -173,6 +175,37 @@ fn a_status_write_at_a_revision_the_row_left_moves_nothing() {
     assert!(!objects.drain_row(store, absent, 1));
     assert_eq!(leader.statuses(), both(WorkerStatus::Pending));
     assert_eq!(store.epoch(), epoch);
+}
+
+/// A writer's word of its lead that holds for `asks` asks, and says no
+/// from the next one.
+fn holds_for(asks: usize) -> impl Fn() -> bool {
+    let left = Cell::new(asks);
+    move || left.replace(left.get().saturating_sub(1)) > 0
+}
+
+/// A connect signal and a drain under their writer's word. A word that
+/// says no under the object's lock, its first ask, writes no status,
+/// moves no object and leaves the store's epoch. So does one that
+/// turns under the store's lock, its second. A word that holds for
+/// both writes as the two public entries do.
+#[test]
+fn a_connect_signal_and_a_drain_write_nothing_once_their_writers_word_turns() {
+    let leader = Leader::new();
+    let (store, objects, row) = (&leader.store, &leader.objects, leader.row);
+    let epoch = store.epoch();
+    for asks in [0, 1] {
+        objects.connect_row_under(store, row, 1, &holds_for(asks));
+        let drained = objects.drain_row_under(store, row, 1, &holds_for(asks));
+        assert!(!drained, "a word that holds for {asks} asks");
+        let stands = (leader.statuses(), store.epoch());
+        assert_eq!(stands, (both(WorkerStatus::Pending), epoch), "{asks}");
+    }
+    objects.connect_row_under(store, row, 1, &holds_for(2));
+    assert_eq!(leader.statuses(), both(WorkerStatus::Ready));
+    assert!(objects.drain_row_under(store, row, 1, &holds_for(2)));
+    assert_eq!(leader.statuses(), both(WorkerStatus::Draining));
+    assert_eq!(store.epoch(), epoch + 2);
 }
 
 /// A connect signal counts the object's probes anew as it readies it:

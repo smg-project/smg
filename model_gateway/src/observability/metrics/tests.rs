@@ -249,6 +249,7 @@ fn a_pair_bindings_shadow_counts_are_published_by_side() {
             PlacementInputs::default(),
             &pair.decode,
             ahead,
+            false,
         );
         assert!(moved.is_none(), "the one decode stands");
         assert_eq!(scraped(), [[None; 4], agreed(1), agreed(1), agreed(1)]);

@@ -546,6 +546,9 @@ pub struct AffinityFacts {
 pub struct AffinityRows<'a> {
     /// The rows that hold a leading part of the request, ascending by row,
     /// each with what it holds. A row not named reads as holding nothing.
+    /// A row named may hold under one block, both of its counts zero: a
+    /// tree's match names every worker it found, and [`Self::tree`] says
+    /// how much they hold.
     pub holders: &'a [AffinityHolder],
     /// The pool's warming rows, ascending, by the warm-up stage's rule as
     /// the host applied it: the thin whatever the fleet's age, else the
@@ -559,11 +562,64 @@ pub struct AffinityRows<'a> {
     /// leaves `None`, which reads as the mean of the rows a stage is
     /// handed, and a debug build asserts that it did.
     pub mean_in_flight: Option<f32>,
+    /// The match the holders were named from, where a tree a host lends
+    /// named them ([`TreeMatch`]): every holder holds that match. `None`
+    /// from any other naming, whose holders say what each holds in whole
+    /// blocks. The built-in prefix stage reads the match in place of the
+    /// holders' blocks: it divides the two counts as the classic policy
+    /// divides a tree's match, and holds every row named a holder alike.
+    pub tree: Option<TreeMatch>,
+}
+
+/// The match of a tree a host lends, where it named a decision's rows
+/// ([`AffinityRows::tree`]): how much of the request the tree holds for the
+/// workers its match found, and the request's size. Both are counted in the
+/// tree's own unit, a host's marker in neither. A reader tells the unit by
+/// the request ([`RequestFacts::hash_kind`]): tokens for a request hashed
+/// by its token ids, which its host's token tree matched, and characters
+/// for a request hashed by its text, which its string tree matched. No
+/// count is rounded to a block: a match that ends inside a block is larger
+/// than its whole blocks say.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TreeMatch {
+    /// The request's leading tokens, or characters, the tree holds.
+    pub matched: u32,
+    /// The request's size, in the same unit.
+    pub of: u32,
+}
+
+impl TreeMatch {
+    /// A match of `matched` units of a request of `of`: what a lent tree's
+    /// walk makes, in the engine over a host's worker lists.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) const fn new(matched: u32, of: u32) -> Self {
+        Self { matched, of }
+    }
+
+    /// Whether the match is more than the share `threshold` of the request:
+    /// one division of the two counts in single precision, as the classic
+    /// policy tests a tree's match. A request of no size has a share of
+    /// zero.
+    #[inline]
+    pub(crate) fn clears(self, threshold: f32) -> bool {
+        let share = if self.of == 0 {
+            0.0
+        } else {
+            self.matched as f32 / self.of as f32
+        };
+        share > threshold
+    }
 }
 
 /// One row a host names as a holder: what the row's entry of a column says
 /// of what it holds, by both readings. Its age and its index size stay with
-/// the host, which ruled the warming rows from them.
+/// the host, which ruled the warming rows from them. Both counts are whole
+/// blocks of the request, so a row a tree's match names may hold none
+/// ([`AffinityRows::tree`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AffinityHolder {
@@ -598,6 +654,17 @@ impl<'a> AffinityRows<'a> {
         let found = &self.holders[at.min(last)];
         let holder = if found.row == index { found } else { &NOBODY };
         holder.facts()
+    }
+
+    /// Whether row `index` is named among the holders, whatever its whole
+    /// blocks: a tree's match names a worker that holds under one block
+    /// ([`Self::tree`]), whose entry reads as nothing held.
+    #[inline]
+    pub(crate) fn names(&self, index: u32) -> bool {
+        let at = self.holders.partition_point(|holder| holder.row < index);
+        self.holders
+            .get(at)
+            .is_some_and(|holder| holder.row == index)
     }
 
     /// One pass's reads of the rows, walked beside the rows the pass asks.
@@ -700,6 +767,12 @@ impl NamedWalk<'_> {
         self.0
             .find(index, |holder| holder.row)
             .map_or_else(AffinityFacts::default, AffinityHolder::facts)
+    }
+
+    /// Whether row `index` is named, as [`AffinityRows::names`] answers.
+    #[inline]
+    pub(crate) fn names(&mut self, index: u32) -> bool {
+        self.0.find(index, |holder| holder.row).is_some()
     }
 }
 
@@ -895,7 +968,8 @@ pub struct Candidate {
     /// The store knows no window, so a row it builds reads the bit open.
     pub has_capacity: bool,
     /// Host-supplied admission bit: the decode's running window has a room
-    /// nobody waiting at its gate is in line for. Open on a row the store
+    /// for the request, one nobody waiting at its gate is in line for or
+    /// the room the request holds there already. Open on a row the store
     /// builds, as [`Self::has_capacity`] is.
     pub has_room: bool,
     /// The zone, as a position into the spec's declared list; `0` when

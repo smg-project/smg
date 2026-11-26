@@ -153,6 +153,14 @@ fn gap(decision: &Decision) -> Option<&'static str> {
     }
 }
 
+/// The side of a pair a decision's shed names.
+fn side_of(decision: &Decision) -> Option<PairSide> {
+    match decision {
+        Decision::Shed(shed) => shed.side,
+        _ => None,
+    }
+}
+
 /// The name a decision is declined under.
 fn declined_under(decision: &Decision) -> Option<&'static str> {
     match decision {
@@ -872,7 +880,9 @@ fn an_encode_request_that_states_a_demand_is_held_to_it_a_list_at_a_time() {
 /// leaves nobody sheds the request with no endpoint: the encoders' first,
 /// under the encode pass's own word, then a side of the pair under the
 /// stage of the demand that took its last worker, the prefills' and then
-/// the decodes'. No key stays placed.
+/// the decodes'. A side of the pair is the side the shed names, as its
+/// pair alone names it, and the encoders' shed names none. No key stays
+/// placed.
 ///
 /// The request carries an item. Its references are its encoders' to meet
 /// and no side's of its pair: an encoder takes the media. Its windows are
@@ -933,9 +943,14 @@ fn a_list_the_demand_leaves_nobody_sheds_an_encode_request_under_that_demands_st
     }
     // The encoders', the prefills', the decodes': each list in turn is
     // given the worker that meets its demand.
-    for (list, stage) in [(2, "encode-media"), (0, "context-window"), (1, "decoding")] {
+    for (list, stage, side) in [
+        (2, "encode-media", None),
+        (0, "context-window", Some(PairSide::Prefill)),
+        (1, "decoding", Some(PairSide::Decode)),
+    ] {
         let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
         assert_eq!((gap(&decision), encoders.len()), (Some(stage), 0));
+        assert_eq!(side_of(&decision), side, "{stage}");
         host.says(list, |_| meeting[list]);
     }
     let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
@@ -947,7 +962,7 @@ fn a_list_the_demand_leaves_nobody_sheds_an_encode_request_under_that_demands_st
 /// judged. Such a request is a retry behind its encoders. So where no
 /// encoder is on the request's runtime it is placed on its pair all the
 /// same, and where a side of its pair holds no worker on that runtime it
-/// is shed as its pair alone is.
+/// is shed as its pair alone is, for the same side.
 ///
 /// The classic router decides a retry of an encode request as its pair
 /// alone, on the wire of the plan it kept
@@ -1000,6 +1015,96 @@ fn a_request_with_no_item_is_held_to_its_demand_as_its_pair_alone() {
         .decide(&host.engine, None, now, &mut asked(), None);
     assert_eq!(gap(&decision), Some("wires"));
     assert_eq!(gap(&decision), gap(&pair));
+    assert_eq!(side_of(&decision), Some(PairSide::Decode));
+    assert_eq!(side_of(&decision), side_of(&pair));
+    // No prefill is on it either: the prefills' side is named first.
+    host.says(0, |_| on(8));
+    let lists = host.lists(said);
+    let decision = lists.decide(&host.engine, None, now, &mut asked(), no_item, &mut placed);
+    let pair = lists
+        .pair
+        .decide(&host.engine, None, now, &mut asked(), None);
+    assert_eq!(side_of(&decision), Some(PairSide::Prefill));
+    assert_eq!(side_of(&decision), side_of(&pair));
+}
+
+/// One list of an encode request's pair that holds no worker is answered
+/// ahead of the request's demand, as its pair alone answers it: one side
+/// alone is no pair. Where a hard demand leaves the other list nobody the
+/// request is shed as its pair alone is, by reason, by stage and by side:
+/// over no candidate and for the side of the list with no worker, and not
+/// under the demand's stage for the side the demand left nobody. So it is
+/// with no item and with one, behind the encoders' own answers: where no
+/// encoder takes the item, the request is shed for its encoders first,
+/// and that refusal names no side.
+///
+/// The gateway's own pair selection names a role with no worker at all
+/// ahead of its filter, the prefill's and then the decode's (`pair_pass`
+/// in `model_gateway/src/routers/common/placement.rs`: its two tests of
+/// `prefill_pool` and of `decode_pool` for a role with no worker).
+#[test]
+fn a_pair_list_with_no_worker_is_answered_ahead_of_an_encode_requests_demand() {
+    let asked = |attempt: u8| Request {
+        id: b"",
+        facts: RequestFacts {
+            model: "model-a",
+            phase: Phase::Prefill,
+            attempt,
+            ..RequestFacts::default()
+        },
+        constraints: Constraints {
+            demands: Demands {
+                runtime: 7,
+                ..Demands::default()
+            },
+            ..Constraints::default()
+        },
+    };
+    // A refusal's reason, its stage and the side it names.
+    let named = |decision: &Decision| match decision {
+        Decision::Shed(shed) => Some((shed.reason, shed.emptied_by, shed.side)),
+        _ => None,
+    };
+    let keys = [Identity::plain("item")];
+    let one_item = EncodeItems {
+        keys: &keys,
+        ..EncodeItems::default()
+    };
+    // No prefill at all, then no decode at all. The other list's two
+    // workers are on another runtime than the request's, and the one
+    // encoder is on it: it takes the item.
+    for (prefills, decodes, side) in [(0, 2, PairSide::Prefill), (2, 0, PairSide::Decode)] {
+        let mut host = Host::of(prefills, decodes, 1);
+        host.says(usize::from(prefills == 0), |_| on(8));
+        host.says(2, |_| on(7));
+        let (encoders, classes) = ([of(1)], vec![1; prefills]);
+        let lists = host.lists((&encoders[..], &classes[..]));
+        let now = Instant::now();
+        // A request with no item is a retry behind its encoders.
+        for (items, attempt) in [(EncodeItems::default(), 1), (one_item, 0)] {
+            let said = format!("{side:?}, {} item", items.keys.len());
+            let pair = lists
+                .pair
+                .decide(&host.engine, None, now, &mut asked(attempt), None);
+            // A pair's first decision over no candidate is emptied by no stage.
+            let over_none = (ShedReason::NoEndpoints, "none", Some(side));
+            assert_eq!(named(&pair), Some(over_none), "{said}: its pair alone");
+            let (mut placed, mut request) = (EncodePlaced::new(), asked(attempt));
+            let decision = lists.decide(&host.engine, None, now, &mut request, items, &mut placed);
+            // The refusal whole, its trace too.
+            assert_eq!(decision, pair, "{said}");
+            assert!(placed.encoders().is_empty(), "{said}: no key stays placed");
+        }
+        // The one encoder on another runtime than the request's takes no
+        // item of it: the encoders' own answer stands first, under the
+        // encode pass's own word.
+        host.says(2, |_| on(8));
+        let lists = host.lists((&encoders[..], &classes[..]));
+        let (mut placed, mut request) = (EncodePlaced::new(), asked(0));
+        let decision = lists.decide(&host.engine, None, now, &mut request, one_item, &mut placed);
+        let encoders_first = (ShedReason::NoEndpoints, "encoders", None);
+        assert_eq!(named(&decision), Some(encoders_first), "{side:?}");
+    }
 }
 
 /// A request's vision is its encoders' to meet where it carries items, and

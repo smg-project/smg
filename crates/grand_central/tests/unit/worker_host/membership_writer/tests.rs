@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
@@ -8,9 +8,9 @@ use smg_worker::{
 };
 
 use super::{
-    super::found, changed, drain, lay, lay_one, refresh, refresh_stated, stating, take,
-    MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,
-    RowRevision, Stated, Turn,
+    super::found, awaits_connect, changed, drain, lay, lay_one, refresh, refresh_stated, stating,
+    take, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition,
+    Remover, RowRevision, Stated, Turn,
 };
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
@@ -21,8 +21,8 @@ use crate::{
     store::{
         membership::{self, FactPastBound},
         pairing::PairingDescriptor,
-        MembershipChange, MembershipTail, MemoryStore, Registrant, Signals, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        HealthPolicy, MembershipChange, MembershipTail, MemoryStore, Registrant, Signals,
+        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     worker_host::{kv_tables::indexed_under, Members, Objects},
 };
@@ -409,6 +409,37 @@ fn find_rows_over(
 }
 
 type Open = fn() -> (Arc<MemoryStore>, Box<dyn Rows>);
+
+/// A row waits for its connect signal where its checks are off and it
+/// stands in a status that signal moves: every one but ready and
+/// draining. A checked row waits for none, whatever it stands in.
+#[test]
+fn a_row_awaits_its_connect_signal_with_its_checks_off_unless_ready_or_draining() {
+    let row = |probes, status| WorkerRow {
+        maker: Registrant::Control,
+        id: WorkerId(1),
+        facts: WorkerFacts {
+            health: HealthPolicy {
+                probes,
+                ..HealthPolicy::default()
+            },
+            ..WorkerFacts::default()
+        },
+        status,
+        revision: 1,
+        admitted_at: Instant::now(),
+    };
+    for (status, awaits) in [
+        (WorkerStatus::Pending, true),
+        (WorkerStatus::NotReady, true),
+        (WorkerStatus::Failed, true),
+        (WorkerStatus::Ready, false),
+        (WorkerStatus::Draining, false),
+    ] {
+        assert_eq!(awaits_connect(&row(false, status)), awaits, "{status:?}");
+        assert!(!awaits_connect(&row(true, status)), "{status:?}, checked");
+    }
+}
 
 #[test]
 fn a_width_of_four_makes_four_rows_in_one_write() {

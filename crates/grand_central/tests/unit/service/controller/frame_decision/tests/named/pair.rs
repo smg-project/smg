@@ -27,7 +27,7 @@ use crate::{
     document::spec::{OverloadSpec, PolicySpec},
     engine::{
         decision::{Decision, ShedReason},
-        framework::Filter,
+        framework::{Filter, PairSide},
         view::{Candidate, Constraints, RequestFacts, Role, WireModes, WorkerId},
     },
     service::{
@@ -686,8 +686,15 @@ fn a_prefill_over_its_thresholds_opens_the_pair_under_a_profile_that_weighs() {
 /// was asked nothing. A number that reaches another pair is answered that
 /// pair.
 ///
+/// The shed names the side the worker was missed on, as the one call's
+/// does: the prefills' for a number past the prefills, which are counted
+/// first, and the side of the worker the filter refused. The side stays in
+/// this process: the answer's message has no field for it.
+///
 /// The one call: `a_number_that_reaches_no_pair_is_shed_under_its_own_name`
-/// (`N`), where the route's rule refuses the pair as the pick.
+/// (`N`), where the route's rule refuses the pair as the pick, and
+/// `a_pair_shed_under_its_named_worker_names_the_side_it_was_missed_on`
+/// (`N`) for the side.
 #[test]
 fn a_named_pair_its_decision_refuses_is_shed_under_target_worker() {
     let refused = Arc::new(Mutex::new(None));
@@ -715,14 +722,20 @@ fn a_named_pair_its_decision_refuses_is_shed_under_target_worker() {
         Ok((ahead[1], behind[1])),
         "nobody refused"
     );
+    let side_of = |answer: &Decision| match answer {
+        Decision::Shed(shed) => shed.side,
+        other => panic!("a shed, not {other:?}"),
+    };
     let past = asked(3);
     assert_eq!(shed_of(&past), MISSED, "past the workers");
     assert_eq!(made_under(&past), None, "the engine was asked nothing");
-    for side in [ahead[1], behind[1]] {
+    assert_eq!(side_of(&past), Some(PairSide::Prefill), "past the prefills");
+    for (side, left) in [(ahead[1], PairSide::Prefill), (behind[1], PairSide::Decode)] {
         *refused.lock() = Some(side);
         let answer = asked(1);
         assert_eq!(shed_of(&answer), MISSED, "its pair or none");
         assert!(made_under(&answer).is_some(), "the decision's own trace");
+        assert_eq!(side_of(&answer), Some(left), "the side its filter emptied");
         assert_eq!(reached(&asked(0)), Ok((ahead[0], behind[0])));
         assert_eq!(reached(&asked(2)), Ok((ahead[2], behind[2])));
     }

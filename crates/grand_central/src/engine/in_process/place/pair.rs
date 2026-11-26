@@ -38,7 +38,7 @@ use crate::{
     engine::{
         decision::{ShedReason, Target},
         decision_engine::DecisionRefused,
-        framework::ShedOver,
+        framework::{PairSide, ShedOver},
         in_process::{pair::shed_over, Loaded},
         list_cell::LentList,
         prefills_full,
@@ -207,10 +207,11 @@ pub(super) fn asks<'a>(
     again(request, lists, lent, call, shed, &next)
 }
 
-/// Whether a first decision's shed as saturated stands behind a rule that
-/// takes the prefills at the places `taken` and no decode, the decision
-/// having said the list `word` ([`again`]): whether the gateway's own pair
-/// selection answers its overload shed there too.
+/// The side a first decision's shed as saturated stands for behind a rule
+/// that takes the prefills at the places `taken` and no decode, the
+/// decision having said the list `word` ([`again`]): the list the gateway's
+/// own pair selection answers its overload shed over there. `None` where
+/// that selection answers no overload shed, and the shed does not stand.
 ///
 /// The rule's prefills here are the ones that pair with a decode: that
 /// selection holds no other prefill, so a rule that takes only prefills
@@ -231,13 +232,15 @@ pub(super) fn asks<'a>(
 /// the shed stands where the decision said the decodes. Where none can,
 /// it judges the rule's prefills (`:2866-2884`): the shed stands where one
 /// of them is ready and every ready one is over its thresholds, whichever
-/// list the decision said. A ready prefill under a doubt is one of that
+/// list the decision said, and it stands for the prefill side: that
+/// selection names the prefill's role there. A ready prefill under a doubt
+/// is one of that
 /// count: under its thresholds it keeps the rule's prefills from being
 /// wholly over theirs, and over them it does not
 /// (`model_gateway/src/routers/common/overload.rs:58-74`).
 #[cold]
 #[inline(never)]
-fn stands(lists: &PairLists<'_>, taken: &[u32], word: ShedOver) -> bool {
+fn stands(lists: &PairLists<'_>, taken: &[u32], word: ShedOver) -> Option<PairSide> {
     let classes = lists.classes.prefills();
     let pairs = |place: &&u32| {
         classes
@@ -246,7 +249,7 @@ fn stands(lists: &PairLists<'_>, taken: &[u32], word: ShedOver) -> bool {
     };
     let mut ruled = taken.iter().filter(pairs).peekable();
     if ruled.peek().is_none() {
-        return word == ShedOver::Prefills;
+        return (word == ShedOver::Prefills).then_some(PairSide::Prefill);
     }
     let stated = |places: &[u32], place: u32| places.binary_search(&place).is_ok();
     let (mut one_ready, mut all_over) = (false, true);
@@ -262,12 +265,12 @@ fn stands(lists: &PairLists<'_>, taken: &[u32], word: ShedOver) -> bool {
         if !state.overloaded {
             // This one can take the request: no prefill behind it is read.
             if !state.stalled && !stated(lists.prefill_stalled, place) {
-                return word == ShedOver::Decodes;
+                return (word == ShedOver::Decodes).then_some(PairSide::Decode);
             }
             all_over = false;
         }
     }
-    one_ready && all_over
+    (one_ready && all_over).then_some(PairSide::Prefill)
 }
 
 /// The call's next ask (`next`) behind one none of whose targets held, or
@@ -319,7 +322,10 @@ fn stands(lists: &PairLists<'_>, taken: &[u32], word: ShedOver) -> bool {
 /// prefill and no decode, and its prefills let the shed stand
 /// ([`stands`]): one of them can take the request and the decision shed
 /// over the decodes, or none can, one is ready and every ready one is over
-/// its thresholds. In every other case the request is shed with no
+/// its thresholds. The shed that stands names the side of the list that
+/// selection judges: the decision's own side, but the prefill side where
+/// none of the rule's prefills can take the request, whichever list the
+/// decision said. In every other case the request is shed with no
 /// endpoint under `admits`, as it is behind a first decision that picked
 /// and behind one that said no list.
 ///
@@ -428,10 +434,28 @@ pub(super) fn again<'a>(
         );
         if let Err(none) = asked {
             // The rule takes a prefill and no decode: the shed stands by
-            // what the rule's prefills are ([`stands`]).
+            // what the rule's prefills are, for the side they say
+            // ([`stands`]).
             let taken = prefills.as_deref().unwrap_or_default();
-            return Err(match over {
-                Some((shed, word)) if stands(lists, taken, word) => shed,
+            let side = over.and_then(|(_, word)| stands(lists, taken, word));
+            return Err(match (over, side) {
+                (
+                    Some((
+                        Unplaced::Shed {
+                            reason,
+                            emptied_by,
+                            retry_after_secs,
+                            ..
+                        },
+                        _,
+                    )),
+                    Some(_),
+                ) => Unplaced::Shed {
+                    reason,
+                    emptied_by,
+                    retry_after_secs,
+                    side,
+                },
                 _ => none,
             });
         }

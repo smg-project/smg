@@ -278,6 +278,153 @@ fn a_pairs_decision_takes_back_the_word_of_the_one_before() {
     assert_eq!(scratch.shed_over(), None, "behind a decline");
 }
 
+/// The side of a pair a shed names ([`Shed::side`]).
+fn side_of(decision: &Decision) -> Option<PairSide> {
+    match decision {
+        Decision::Shed(shed) => shed.side,
+        other => panic!("not shed: {other:?}"),
+    }
+}
+
+/// A pair's refusal names the side that was left with nobody. The
+/// prefill side where no prefill of the request's stands: none is
+/// listed, each is down, or each is over its thresholds with nowhere to
+/// be steered. The decode side where a prefill stands and its partners
+/// are missing or refused: no decode is of its class, none is listed,
+/// each is down, or each is over its thresholds under a binding that
+/// sheds. The decode side too where the prefill was picked and the
+/// decode's picker declined. A pair declined ahead of every profile
+/// names no side: neither list was read.
+///
+/// A decode decided again names the decode side for the partners it
+/// lacks, and the prefill side for a held prefill that left its list.
+///
+/// The gateway's own pair selection names a role in each refusal and
+/// reads the prefills first: a pool with no worker
+/// (`model_gateway/src/routers/common/placement.rs:2860-2867`), the
+/// prefills with nobody open (`:2900-2918`), then the decodes, which
+/// left the open prefills nothing to pair with (`:2943-2970`), and the
+/// decode policy's own decline (`:3090`), on main `d43c7b2a9`. It
+/// decides no decode again.
+#[test]
+fn a_pairs_refusal_names_the_side_left_with_nobody() {
+    let steering = strict_pair_engine();
+    let mut shedding = strict_pair_engine();
+    shedding.shed_when_all_vetoed(0);
+    let open = pair_row(0, 7, false, false);
+    let over = pair_row(0, 7, true, false);
+    let down = pair_row(0, 7, false, true);
+    let apart = pair_row(0, 9, false, false);
+    let names = |decision: &Decision| {
+        let stage = shed_of(decision).map(|(_, stage)| stage);
+        (stage, side_of(decision))
+    };
+    let said = |engine: &Engine, prefills: &[Candidate], decodes: &[Candidate]| {
+        names(&decide_pair(engine, prefills, decodes))
+    };
+    let (prefill, decode) = (Some(PairSide::Prefill), Some(PairSide::Decode));
+    // No prefill of the request's stands.
+    assert_eq!(said(&steering, &[], &[open]), (Some("none"), prefill));
+    assert_eq!(
+        said(&steering, &[down], &[open]),
+        (Some("healthy"), prefill)
+    );
+    let vetoed = Some("not-overloaded");
+    assert_eq!(said(&steering, &[over], &[down]), (vetoed, prefill));
+    assert_eq!(said(&shedding, &[over], &[open]), (vetoed, prefill));
+    // Both lists are down: the prefills are read first.
+    assert_eq!(
+        said(&steering, &[down], &[down]),
+        (Some("healthy"), prefill)
+    );
+    // A prefill stands, and its partners are missing or refused. The
+    // last of these prefills is of no pair class: it pairs with nobody.
+    let unpartnered = Some("partnered");
+    assert_eq!(said(&steering, &[open], &[apart]), (unpartnered, decode));
+    assert_eq!(said(&steering, &[open], &[]), (unpartnered, decode));
+    let classless = pair_row(0, 0, false, false);
+    assert_eq!(
+        said(&steering, &[classless], &[open]),
+        (unpartnered, decode)
+    );
+    assert_eq!(said(&steering, &[open], &[down]), (Some("healthy"), decode));
+    assert_eq!(said(&shedding, &[open], &[over]), (vetoed, decode));
+    // The prefill is picked, and the decode's own picker declines.
+    let declining = Profile {
+        name: "decode".into(),
+        filters: vec![Box::new(Healthy)],
+        scorers: vec![],
+        picker: Box::new(RefusesClass(7)),
+    };
+    let binding = Binding {
+        decode_profile: Some(1),
+        ..pair_binding()
+    };
+    let profiles = vec![strict_profile(), declining];
+    let declined = Engine::new(profiles, vec![binding], 1, Needs::default());
+    assert_eq!(
+        said(&declined, &[open], &[open]),
+        (Some("refuses-class"), decode)
+    );
+    // No binding: the pair is declined ahead of either list.
+    let unbound = Engine::new(vec![strict_profile()], vec![], 1, Needs::default());
+    assert_eq!(said(&unbound, &[open], &[open]), (Some("binding"), None));
+
+    // The decode decided again behind a held prefill.
+    let again = |prefills: &[Candidate], decodes: &[Candidate], held: WorkerId| {
+        let pools = PairPools {
+            prefills,
+            decodes,
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        names(&steering.decide_decode(&request(7), &pool, pools, held, None, &cx, &mut scratch))
+    };
+    let gone = WorkerId(open.id.0 + 1);
+    assert_eq!(
+        again(&[open], &[open], gone),
+        (Some("prefill-gone"), prefill)
+    );
+    assert_eq!(again(&[open], &[down], open.id), (Some("healthy"), decode));
+}
+
+/// Where a pair's decision says the list it shed over, its refusal
+/// names that list's side: the prefills are the prefill side, and the
+/// decodes the decode side. The refusal names its side where the
+/// decision says no list too: under a binding that steers, where the
+/// decision's count and the gateway's own part, and for a shed with no
+/// endpoint. So the side is not read from that word.
+#[test]
+fn a_pairs_refusal_names_the_side_of_the_list_its_decision_says() {
+    let steering = strict_pair_engine();
+    let mut shedding = strict_pair_engine();
+    shedding.shed_when_all_vetoed(0);
+    let said = |engine: &Engine, prefills: &[Candidate], decodes: &[Candidate]| {
+        let mut scratch = Scratch::new();
+        let decision = decide_pair_with(engine, prefills, decodes, &mut scratch);
+        (side_of(&decision), scratch.shed_over())
+    };
+    let open = pair_row(0, 7, false, false);
+    let over = pair_row(0, 7, true, false);
+    let down = pair_row(0, 7, false, true);
+    let (prefill, decode) = (Some(PairSide::Prefill), Some(PairSide::Decode));
+    // The two sites that say a list.
+    let prefills = Some(ShedOver::Prefills);
+    assert_eq!(said(&shedding, &[over], &[down]), (prefill, prefills));
+    let decodes = Some(ShedOver::Decodes);
+    assert_eq!(said(&shedding, &[open], &[over]), (decode, decodes));
+    // Under a binding that steers the prefills' shed says no list.
+    assert_eq!(said(&steering, &[over], &[down]), (prefill, None));
+    // The partner is over its thresholds beside an idle decode that
+    // pairs with no prefill: the two counts part, and no list is said.
+    let idle = pair_row(1, 9, false, false);
+    assert_eq!(said(&shedding, &[open], &[over, idle]), (decode, None));
+    // A shed with no endpoint says no list.
+    assert_eq!(said(&shedding, &[down], &[open]), (prefill, None));
+    assert_eq!(said(&shedding, &[open], &[down]), (decode, None));
+}
+
 #[test]
 fn a_prefill_whose_partners_fail_the_decode_filters_is_dropped_as_unpartnered() {
     // The decode side never runs for a prefill without a kept partner:
