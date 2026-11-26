@@ -65,8 +65,10 @@ use tonic_health::pb::{
     health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
 };
 
-/// Long against a loaded host: the leader of the case's start leads to its
-/// end.
+/// Long against a loaded host: the leader of a case's start leads to its
+/// end, unless the case makes it leave. A replica that left its lease
+/// holds its takes back for the duration, so it takes none again inside
+/// the case.
 fn settings() -> ElectionSettings {
     ElectionSettings {
         duration: Duration::from_secs(60),
@@ -692,7 +694,8 @@ async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() 
         assert_eq!(fresh.ended().await, Some(Code::Aborted));
 
         // So is one whose place stands under a later term, whatever floor
-        // it states: a replica that left its lease restores no standby.
+        // it states. A replica that left its lease holds its takes back for
+        // the lease's duration (`settings`), and restores no standby.
         let ahead = proto::ReplicaHello {
             term_seen: term,
             ..place(nth(5), term + 1)

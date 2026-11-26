@@ -536,7 +536,16 @@ fn run_loop(
                     // hand-over says none: a holder told its own term keeps
                     // on.
                     let above = (followed > *term).then_some(followed);
-                    match leaves(elector, above, &mut leading, &mut seen) {
+                    // The next take stands above the followed term,
+                    // whichever of the two is the higher. Where that
+                    // leaves none to take, no lease is left. The elector
+                    // is said no term at the take's own, so its rule is
+                    // asked here.
+                    let left = match term_said(Some(followed)) {
+                        Ok(()) => leaves(elector, above, &mut leading, &mut seen),
+                        Err(_) => None,
+                    };
+                    match left {
                         Some(left) => again = left.alone,
                         // A term that leaves none to take: the replica
                         // leads on as it stands.

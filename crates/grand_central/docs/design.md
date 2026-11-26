@@ -2681,6 +2681,9 @@ log. The leader then leaves the lease, and the next take stands above that term.
 hello's term is believed within a range, and the terms one process moves this way have a budget.
 The log's word is the replica's own: its take is left in its own step.
 
+A term that leaves none to take above it is refused, whichever witness shows it, and the leader
+keeps its lease.
+
 Its data stands in an in-memory store (`store/memory.rs`), in the worker crate's registry of worker
 objects and its load monitor, in the worker host's tables and in the engine's own tables:
 

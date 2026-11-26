@@ -969,19 +969,34 @@ fn a_replica_alone_takes_again_at_once_above_the_term_its_log_followed() {
     assert_eq!(text.matches(": leading").count(), 1, "{text}");
 }
 
-/// A followed term that leaves the election none to take is refused by the
-/// elector, as a word of that term is. The replica keeps the lease as it
-/// stands: the standing names it, its log leads no term, and a second
-/// warning says so. No release is written before the stop's.
-#[test]
-fn a_followed_term_that_leaves_none_to_take_keeps_the_replica_on_its_lease() {
+/// A take over a store whose log followed the last term: the next take
+/// would stand above that term, and none is left. The election refuses the
+/// followed term by the elector's rule, as a word of that term is refused.
+/// The replica keeps the lease as it stands: the standing names it, its
+/// log leads no term, and a second warning says so. No release is written
+/// before the stop's. `released` is the term the lease was released under
+/// before the take: the take is the term above it, and term 1 over no
+/// record.
+fn a_take_under_the_last_term_keeps_its_lease(released: Option<u64>) {
     let name = "b@127.0.0.1:2";
     let last = TERM_CEILING - 1;
     let store = followed(last);
+    let mut held = MemoryLease::new();
+    if let Some(term) = released {
+        let released = LeaseRecord {
+            term,
+            ..LeaseRecord::default()
+        };
+        assert_eq!(
+            held.write(None, &released).expect("a write"),
+            ConditionalWriteOutcome::Done
+        );
+    }
+    let taken = released.map_or(1, |term| term + 1);
     let (standing, mut stood) = watch::channel(ElectionObservation::default());
     let releases = Arc::new(Mutex::new(Vec::new()));
     let lease = SeesStanding {
-        lease: MemoryLease::new(),
+        lease: held,
         stood: stood.clone(),
         releases: Arc::clone(&releases),
     };
@@ -994,11 +1009,11 @@ fn a_followed_term_that_leaves_none_to_take_keeps_the_replica_on_its_lease() {
         *stood.borrow(),
         ElectionObservation {
             holder: name.to_owned(),
-            term: 1,
+            term: taken,
             looked: true,
         }
     );
-    assert_eq!(store.term(), 1);
+    assert_eq!(store.term(), taken);
     assert_eq!(store.followed(), Some(last));
     assert!(releases.lock().is_empty());
     until("the line of the lead", || looping.said(": leading"));
@@ -1007,6 +1022,22 @@ fn a_followed_term_that_leaves_none_to_take_keeps_the_replica_on_its_lease() {
     assert_eq!(text.matches("started no term").count(), 1, "{text}");
     assert_eq!(text.matches("stepped down").count(), 0, "{text}");
     assert_eq!(text.matches(": leading").count(), 1, "{text}");
+}
+
+/// A followed term above the take's that leaves the election none to take
+/// keeps the replica on its lease.
+#[test]
+fn a_followed_term_that_leaves_none_to_take_keeps_the_replica_on_its_lease() {
+    a_take_under_the_last_term_keeps_its_lease(None);
+}
+
+/// A take at the last term, the very term its log followed, keeps the
+/// replica on its lease too. The elector is said no term at the take's
+/// own, so the loop asks the elector's rule itself: a lease left there
+/// could be taken by no replica again.
+#[test]
+fn a_take_at_the_last_term_its_log_followed_keeps_the_replica_on_its_lease() {
+    a_take_under_the_last_term_keeps_its_lease(Some(TERM_CEILING - 2));
 }
 
 /// A take above the term its log followed starts its term in the log: the
