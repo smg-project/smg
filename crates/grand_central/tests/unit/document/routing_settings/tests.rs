@@ -1893,7 +1893,7 @@ fn many_routers_say_each_family_as_its_own_configuration_does() {
 #[test]
 fn one_router_and_the_encode_mode_say_the_document_they_said() {
     let named = |name: &str| Some(at_flag_defaults(name));
-    let mut said = 0;
+    let (mut said, mut manual_pairs) = (0, 0);
     for name in PRESETS {
         let modes = [
             ModeSettings::Regular,
@@ -1932,26 +1932,32 @@ fn one_router_and_the_encode_mode_say_the_document_they_said() {
                     let document = settings.policy_document();
                     assert_eq!(document, before_three_sides(&settings), "{row}");
                     said += usize::from(document.is_ok());
+                    let manual = encode_mode && name == "manual";
+                    manual_pairs += usize::from(manual && document.is_ok());
                 }
             }
         }
     }
-    assert_eq!(said, 195, "documents were said");
+    assert_eq!(said, 201, "documents were said");
+    // The encode mode under the manual policy on its prefill and its
+    // decode says six of them: of one router and of many, over each
+    // connection mode.
+    assert_eq!(manual_pairs, 6);
 }
 
 /// The plan of three sides falls back to the plan that stood before it,
 /// setting by setting: such a gateway says the document it said, and an
 /// encode request meets no binding with an encode side. Three settings
 /// fall back so. The manual policy places by its binding's one rule, so
-/// every side of a plan is manual or none is, and the encode side runs
-/// another policy. The sticky override's rule has no document on a plan
-/// of more sides than one. And a main policy the controller's check
-/// refuses leaves the plan as it leaves the encode mode's.
+/// both sides of a pair are manual or neither is. The sticky override's
+/// rule has no document on a plan of more sides than one. And a main
+/// policy the controller's check refuses leaves the plan as it leaves
+/// the encode mode's.
 #[test]
 fn many_routers_keep_the_plan_they_had_where_three_sides_have_no_document() {
     let manual = || Some(at_flag_defaults("manual"));
-    let manual_sides = many_routers(RoutingSettings {
-        mode: pair_mode(manual(), manual()),
+    let manual_side = many_routers(RoutingSettings {
+        mode: pair_mode(manual(), Some(PolicySettings::RoundRobin)),
         ..config(PolicySettings::RoundRobin)
     });
     let mut overridden = many_routers(config(PolicySettings::RoundRobin));
@@ -1983,7 +1989,7 @@ fn many_routers_keep_the_plan_they_had_where_three_sides_have_no_document() {
         _ => None,
     };
     assert_eq!(
-        refused_by(&manual_sides),
+        refused_by(&manual_side),
         Some(("policy", "manual".to_string()))
     );
     assert_eq!(
@@ -1994,7 +2000,7 @@ fn many_routers_keep_the_plan_they_had_where_three_sides_have_no_document() {
     assert!(checked.validate().is_err());
 
     for (setting, settings) in [
-        ("the manual policy on a pair's two sides", &manual_sides),
+        ("one manual side of a pair's two", &manual_side),
         ("the sticky override", &overridden),
         ("a main ring under one block", &unchecked),
     ] {
@@ -2005,23 +2011,152 @@ fn many_routers_keep_the_plan_they_had_where_three_sides_have_no_document() {
             .and_then(|document| document.bindings.first().map(|binding| binding.plan));
         assert_ne!(leads, Some(Some(PlanName::Epd)), "{setting}");
     }
-    // The manual pair keeps its two families, and the override under a
-    // policy it places keeps its refusal by the setting's name.
-    let pairs = manual_sides
-        .policy_document()
-        .expect("the plan of two families");
-    assert_eq!(pairs.bindings.len(), 2);
-    assert_eq!(pairs.bindings[0].plan, Some(PlanName::PdPair));
+    // One manual side and the override under a policy it places keep
+    // their refusals by the setting's name. The main ring keeps its two
+    // families, which the controller's check refuses where it is applied.
+    assert_eq!(refusal(&manual_side), ("policy", "manual".to_string()));
     assert_eq!(
         refusal(&overridden),
         ("routing_key_override.enabled", "true".to_string())
     );
+    let pairs = unchecked
+        .policy_document()
+        .expect("the plan of two families");
+    assert_eq!(pairs.bindings.len(), 2);
+    assert_eq!(pairs.bindings[0].plan, Some(PlanName::PdPair));
     // A label is written into the plan that stands: the pair's binding
     // stays ahead of the label's, and no refusal of three sides is its.
-    let labelled = with_labels(&manual_sides, &[("m", "random")]).expect("a labelled one");
+    let labelled = with_labels(&unchecked, &[("m", "random")]).expect("a labelled one");
     assert_eq!(labelled.bindings.len(), 3);
     assert_eq!(labelled.bindings[0], pairs.bindings[0]);
     assert_eq!(labelled.bindings[2], pairs.bindings[1]);
+}
+
+/// The manual policy on both sides of a pair runs under a plan of three
+/// sides. Its rule is the binding's one, and places the pair's two
+/// sides: the encode side places an item by its content, under its own
+/// policy. So a gateway of many routers in a pair mode plans its three
+/// sides under that policy as under any other, and the encode mode says
+/// a document, of one router as of many.
+///
+/// Both sides of the pair are manual or neither is, in the words that
+/// refusal has under a pair. A manual encode side is refused by its
+/// setting's name ahead of the document's check, with three manual
+/// sides too. A regular configuration under the manual policy plans its
+/// single requests alone.
+///
+/// The gateway's own check starts the encode mode under any policy on
+/// its prefill and its decode side, and holds the encode side to three
+/// policies, `manual` not among them
+/// (`model_gateway/src/config/validation.rs:1005-1010`, `:319-328`).
+#[test]
+fn the_manual_policy_on_both_sides_of_a_pair_runs_under_three_sides() {
+    let manual = || Some(at_flag_defaults("manual"));
+    let rule = preset("manual").bindings[0].sessions.clone();
+    assert!(rule.is_some(), "the manual preset's rule");
+    let encode_mode = |encode: Option<PolicySettings>, decode: Option<PolicySettings>| {
+        ModeSettings::EncodePrefillDecode {
+            encode_policy: encode,
+            prefill_policy: manual(),
+            decode_policy: decode,
+        }
+    };
+
+    // A pair mode of many routers: the document it said under two
+    // families, with the encode side ahead of the pair's two.
+    let pairs = many_routers(RoutingSettings {
+        mode: pair_mode(manual(), manual()),
+        ..config(PolicySettings::RoundRobin)
+    });
+    let two_families = before_three_sides(&pairs).expect("the plan of two families");
+    assert_eq!(two_families.bindings[0].plan, Some(PlanName::PdPair));
+    let three = pairs.policy_document().expect("the plan of three sides");
+    assert_eq!(three, with_encode_side(two_families));
+    assert_eq!(three.bindings[0].sessions, rule);
+    assert_eq!(validated(&three).err(), None);
+    // A label is written into that plan, between its two bindings.
+    let labelled = with_labels(&pairs, &[("m", "random")]).expect("a labelled one");
+    assert_eq!(labelled.bindings.len(), 3);
+    assert_eq!(labelled.bindings[0], three.bindings[0]);
+    assert_eq!(labelled.bindings[2], three.bindings[1]);
+
+    // The encode mode of one router: the mode's three presets, with the
+    // manual preset's rule on their one binding.
+    let one_router = RoutingSettings {
+        mode: encode_mode(None, manual()),
+        ..config(PolicySettings::RoundRobin)
+    };
+    let mut own = PolicySpec::epd_presets("consistent_hashing", "manual", "manual")
+        .expect("the mode's presets");
+    own.bindings[0].sessions.clone_from(&rule);
+    assert_eq!(one_router.policy_document().as_ref(), Ok(&own));
+    assert_eq!(validated(&own).err(), None);
+    // Of many routers the main policy's single binding stands behind it.
+    let many = many_routers(one_router.clone())
+        .policy_document()
+        .expect("the document of both families");
+    assert_eq!(many.bindings.len(), 2);
+    assert_eq!(many.bindings[0].plan, Some(PlanName::Epd));
+    assert_eq!(many.bindings[0].sessions, rule);
+    assert_eq!(many.bindings[1].sessions, None);
+    assert_eq!(validated(&many).err(), None);
+
+    // One manual side of the two, in each mode that plans three sides.
+    let one_side = [
+        RoutingSettings {
+            mode: encode_mode(None, Some(PolicySettings::RoundRobin)),
+            ..config(PolicySettings::RoundRobin)
+        },
+        many_routers(RoutingSettings {
+            mode: pair_mode(manual(), Some(PolicySettings::RoundRobin)),
+            ..config(PolicySettings::RoundRobin)
+        }),
+    ];
+    for settings in &one_side {
+        assert_eq!(
+                settings.policy_document(),
+                Err(RoutingSettingsError::UnsupportedSetting {
+                    setting: "policy",
+                    value: "manual".to_string(),
+                    reason: "the manual policy places by the binding's one session rule, so every side of a plan is manual or none is",
+                }),
+                "{:?}",
+                settings.mode
+            );
+    }
+
+    // A manual encode side, beside two manual sides and beside none.
+    for decode in [manual(), Some(PolicySettings::RoundRobin)] {
+        let encode = RoutingSettings {
+            mode: encode_mode(manual(), decode),
+            ..config(PolicySettings::RoundRobin)
+        };
+        for settings in [encode.clone(), many_routers(encode)] {
+            assert_eq!(
+                settings.policy_document(),
+                Err(RoutingSettingsError::UnsupportedSetting {
+                    setting: "encode_policy",
+                    value: "manual".to_string(),
+                    reason:
+                        "a session rule places no item: an item goes to its encoder by its content",
+                }),
+                "{:?}",
+                settings.mode
+            );
+        }
+    }
+
+    // A regular configuration under the manual policy: no plan of three
+    // sides, and the document of its single requests alone.
+    let regular = config(at_flag_defaults("manual"));
+    assert!(matches!(
+        three_sided(&many_routers(regular.clone())),
+        Ok(None)
+    ));
+    assert_eq!(
+        many_routers(regular.clone()).policy_document(),
+        regular.policy_document()
+    );
 }
 
 #[test]
@@ -2143,7 +2278,8 @@ fn a_given_document_is_compared_with_the_two_bindings_of_a_pair_mode() {
 
 #[test]
 fn many_routers_plan_one_family_where_the_other_has_no_document() {
-    // The manual policy runs on no side of a pair.
+    // A regular configuration under the manual policy plans its single
+    // requests alone.
     let manual = config(at_flag_defaults("manual"));
     assert!(manual.policy_document().is_ok());
     assert_eq!(
@@ -2296,10 +2432,10 @@ fn the_encode_mode_of_many_routers_binds_a_single_request_behind_its_sides() {
     // same sentence. Where the controller's check takes the mode's
     // own, it takes the settings', which binds a single request behind
     // the mode's sides in all but these: under the override, beside
-    // sides of the hash ring, every main policy but
-    // `consistent_hashing` and `manual` has no document for its keyed
-    // requests, and the mode is planned alone, whatever its encode
-    // side.
+    // sides that place by the key themselves, the hash ring's or the
+    // manual policy's, every main policy but `consistent_hashing` and
+    // `manual` has no document for its keyed requests, and the mode is
+    // planned alone, whatever its encode side.
     let unnamed_or_each = || std::iter::once(None).chain(PRESETS.iter().copied().map(Some));
     let mut alone_still = Vec::new();
     for main in PRESETS {
@@ -2325,14 +2461,15 @@ fn the_encode_mode_of_many_routers_binds_a_single_request_behind_its_sides() {
                     assert_eq!(validated(both).is_ok(), taken, "{named}");
                     if taken && both.bindings.len() == 1 {
                         assert_eq!(both, one, "{named}");
-                        alone_still.push((main, sides, sticky));
+                        if !alone_still.contains(&(main, sides, sticky)) {
+                            alone_still.push((main, sides, sticky));
+                        }
                     }
                 }
             }
         }
     }
-    alone_still.dedup();
-    let ring = Some("consistent_hashing");
+    let keyed_sides = [Some("consistent_hashing"), Some("manual")];
     let keyless = [
         "random",
         "round_robin",
@@ -2343,7 +2480,8 @@ fn the_encode_mode_of_many_routers_binds_a_single_request_behind_its_sides() {
         "cache_aware",
         "bucket",
     ];
-    assert_eq!(alone_still, keyless.map(|main| (main, ring, true)));
+    let planned_alone = |main| keyed_sides.map(|sides| (main, sides, true));
+    assert_eq!(alone_still, keyless.map(planned_alone).concat());
 }
 
 /// The labels of these models, each with the preset name its label

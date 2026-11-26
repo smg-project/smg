@@ -3016,22 +3016,26 @@ fn the_manual_preset_states_its_whole_rule() {
 }
 
 /// The manual picker places by a sessions rule, and a rule runs under
-/// the single plan and on the two sides of a pair: on a side of `epd`
-/// the profile is refused, with the side that names it. The built
-/// picker answers, so any picker that leaves the placement to the rule
-/// is refused the same way.
+/// the single plan and on the two sides of a pair, and places no item.
+/// So on the encode side of `epd` the profile is refused, with the side
+/// that names it, whatever the pair's two sides run. The built picker
+/// answers, so any picker that leaves the placement to the rule is
+/// refused the same way.
 #[test]
-fn the_manual_picker_under_the_epd_plan_is_not_in_this_build() {
-    let epd = doc(
-        r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"epd","profiles":{"encode":"sticky","prefill":"q","decode":"q"}}]}"#,
-    );
-    assert_eq!(
-        not_in_build(&epd),
-        (
-            "bindings[0].profiles.encode".to_string(),
-            "a picker that places by the sessions rule under the epd plan"
-        )
-    );
+fn the_manual_picker_on_the_encode_side_of_epd_is_not_in_this_build() {
+    for (prefill, decode) in [("q", "q"), ("sticky", "sticky")] {
+        let epd = doc(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","profiles":{{"q":{{"pick":"random"}},"sticky":{{"pick":"manual"}}}},"bindings":[{{"plan":"epd","profiles":{{"encode":"sticky","prefill":"{prefill}","decode":"{decode}"}}}}]}}"#
+        ));
+        assert_eq!(
+            not_in_build(&epd),
+            (
+                "bindings[0].profiles.encode".to_string(),
+                "a picker that places by the sessions rule on the encode side"
+            ),
+            "{prefill} and {decode}"
+        );
+    }
     // On a side of a pair the same profile validates, and so it does
     // under the single plan, here with no rule; the preset is the
     // profile with one.
@@ -3043,6 +3047,49 @@ fn the_manual_picker_under_the_epd_plan_is_not_in_this_build() {
         r#"{"apiVersion":"smg.policy/v1","profiles":{"sticky":{"pick":"manual"}},"bindings":[{"profile":"sticky"}]}"#,
     );
     assert!(single.validate().is_ok());
+}
+
+/// The manual picker runs on the prefill and the decode side of `epd`,
+/// as on the two sides of a pair: on both, and on either one beside a
+/// picker of its own. With no rule on its binding such a side is placed
+/// by its assignment, in the build of a host that makes the
+/// lifecycle's calls and in the build of one that makes some only.
+/// Under a rule it follows its key in the first build. The second
+/// refuses a rule under `epd` by the plan's name, whatever its sides'
+/// pickers.
+///
+/// A gateway's own check takes any policy on the prefill and the
+/// decode side of its encode mode, `manual` among them
+/// (`model_gateway/src/config/validation.rs:1005-1010`).
+#[test]
+fn the_manual_picker_runs_on_the_pairs_two_sides_of_epd() {
+    let rule = r#","sessions":{"sticky_header":"x-session-id","inflight_cap":65535}"#;
+    let epd = |prefill: &str, decode: &str, rule: &str| {
+        doc(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"q":{{"pick":"random"}},"sticky":{{"pick":"manual"}}}},"bindings":[{{"plan":"epd","profiles":{{"encode":"q","prefill":"{prefill}","decode":"{decode}"}}{rule}}}]}}"#
+        ))
+    };
+    let some = StageRegistry::builtin().without_lifecycle();
+    for (prefill, decode) in [("sticky", "sticky"), ("sticky", "q"), ("q", "sticky")] {
+        let sides = format!("{prefill} and {decode}");
+        let bare = epd(prefill, decode, "");
+        assert!(bare.validate().is_ok(), "{sides}");
+        assert!(bare.validate_in(&some, &[]).is_ok(), "{sides}");
+        let ruled = epd(prefill, decode, rule);
+        assert!(ruled.validate().is_ok(), "{sides}");
+        let refused = ruled.validate_in(&some, &[]).err();
+        assert!(
+            matches!(
+                refused,
+                Some(SpecError::BadSessions {
+                    index: 0,
+                    name: "plan",
+                    ..
+                })
+            ),
+            "{sides}: {refused:?}"
+        );
+    }
 }
 
 /// A sessions rule under the pair plan is in the build of a host that
