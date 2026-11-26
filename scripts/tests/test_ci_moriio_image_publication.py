@@ -993,6 +993,9 @@ class CurrentBoundaryControls(unittest.TestCase):
             self.assertIsInstance(error, RuntimeError)
             self.assertIn("cancel", str(error))
             self.assertTrue(ns["state"]["cleanup_verified_absent"])
+            saved = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(saved["pending_signal"], signal.SIGTERM)
+            self.assertEqual(saved["status"], "failed_or_published_incomplete_requires_readback")
 
     def test_cleanup_first_error_survives_later_receipt_error(self):
         with tempfile.TemporaryDirectory() as directory:

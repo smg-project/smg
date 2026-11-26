@@ -1091,6 +1091,12 @@ def publish(engine_checkout, output):
         state["status"] = "failed_or_published_incomplete_requires_readback"
         if failure is None:
             failure = RuntimeError("publisher cancellation pending at finalization")
+        client_control["primary_error"] = failure
+        # Best effort failure receipt; inability to write cannot replace cancellation.
+        try:
+            persist()
+        except BaseException:
+            pass
     if failure is not None:
         raise failure
     assert (
