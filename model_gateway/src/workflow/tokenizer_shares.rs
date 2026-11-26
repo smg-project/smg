@@ -27,11 +27,11 @@ use llm_tokenizer::traits::Tokenizer;
 use tokio::sync::Mutex;
 
 /// The bytes one [`FilesRead`] hashes at most. A file longer than this
-/// enters by path, size and change time alone: model weights sit beside the
-/// tokenizer files, which are far smaller (such a file rewritten in place
-/// under the same size and time reads the same). A tree whose other files
-/// sum to more is not read for sharing: the sum is taken from the sizes,
-/// before any file is opened.
+/// enters by path, size and modification time alone: model weights sit
+/// beside the tokenizer files, which are far smaller (such a file rewritten
+/// in place under the same size and time reads the same). A tree whose
+/// other files sum to more is not read for sharing: the sum is taken from
+/// the sizes, before any file is opened.
 const HASHED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A tree with more entries than this, files and directories at any depth,
@@ -41,8 +41,8 @@ const MAX_ENTRIES: usize = 256;
 /// What a load from files reads, as one hash: the source as the load was
 /// handed it, every file below the directory that holds the tokenizer (the
 /// source itself, or the directory beside a source file) by path, size,
-/// change time and bytes, and the chat template file handed in, as one more
-/// file. A load reads files beside the one it is pointed at (the
+/// modification time and bytes, and the chat template file handed in, as one
+/// more file. A load reads files beside the one it is pointed at (the
 /// tokenizer's config, a template) and in a directory below, so the whole
 /// tree stands in; and it reads how its source is spelled, so two spellings
 /// of one directory are two sources.
@@ -112,8 +112,8 @@ impl FilesRead {
             let name = path.as_os_str().as_encoded_bytes();
             hasher.update(&(name.len() as u64).to_le_bytes());
             hasher.update(name);
-            let changed = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
-            hasher.update(&changed.as_nanos().to_le_bytes());
+            let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+            hasher.update(&modified.as_nanos().to_le_bytes());
             let len = metadata.len();
             hasher.update(&len.to_le_bytes());
             if len <= HASHED_BYTES {
@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn bytes_rewritten_under_the_same_size_and_change_time_read_differently() {
+    fn bytes_rewritten_under_the_same_size_and_modification_time_read_differently() {
         let dir = tokenizer_dir();
         let file = dir.path().join("tokenizer.json");
         let before = FilesRead::of(&source(&dir), None).unwrap();
