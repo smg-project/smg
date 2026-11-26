@@ -650,9 +650,9 @@ struct ClientInner<P: EngineProtocol> {
     /// frame, for one log line when it does.
     refused: AtomicUsize,
     engines: Vec<ConnectedEngine>,
-    /// What `P` read off the engines' handshakes ([`connection_layout`]):
-    /// handed to every request it frames and every output it decodes.
-    layout: P::Layout,
+    /// What `P` read off each engine's handshake, in the order of `engines`:
+    /// an add-request is framed with the layout of the engine it goes to.
+    engine_layouts: Vec<P::Layout>,
     registry: Mutex<RequestRegistry<P::Output>>,
     routing: Mutex<RoutingState>,
     /// Rotates the selection scan start so all-zero ties (cold start, fresh
@@ -722,14 +722,16 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// [`Self::release`]. (vLLM additionally bumps its report cache because
     /// multiple client processes share its engines; this connector is the
     /// sole client of its group, so the in-flight floor already covers it.)
-    fn select_engine(&self, data_parallel_rank: Option<u32>, request_id: &str) -> Result<EngineId> {
+    ///
+    /// Returns the engine's position in `engines`, which is also its place in
+    /// `engine_layouts`.
+    fn select_engine(&self, data_parallel_rank: Option<u32>, request_id: &str) -> Result<usize> {
         match data_parallel_rank {
             Some(rank) => {
-                let engine_id = self
+                let position = self
                     .engines
                     .iter()
-                    .find(|engine| engine.engine_id.engine_index() == Some(rank))
-                    .map(|engine| engine.engine_id.clone())
+                    .position(|engine| engine.engine_id.engine_index() == Some(rank))
                     .ok_or(Error::InvalidDataParallelRank {
                         rank,
                         num_engines: self.engines.len() as u32,
@@ -740,7 +742,7 @@ impl<P: EngineProtocol> ClientInner<P> {
                     .entry(rank)
                     .or_default()
                     .insert(request_id.to_string());
-                Ok(engine_id)
+                Ok(position)
             }
             None => {
                 if self.engines.is_empty() {
@@ -779,7 +781,7 @@ impl<P: EngineProtocol> ClientInner<P> {
                         .or_default()
                         .insert(request_id.to_string());
                 }
-                Ok(engine.engine_id.clone())
+                Ok(position)
             }
         }
     }
@@ -1259,29 +1261,14 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 }
 
-/// The layout of a connection: what its engines declared for the optional
-/// output columns `P` knows and for its request decoder. The ranks of one
-/// connection run one engine build and declare one layout; a group that
-/// disagrees is read at the default layout (none of the optional columns,
-/// every tensor inline) rather than a column at the wrong position on some
-/// rank, and says so once. Every rank's declaration is logged with its id at
-/// the handshake: on a running connection that is the one place that tells
-/// which form the wire takes, and which rank fell behind when they disagree.
-fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layout {
-    // Every rank is read, and logged, before the decision: the ranks behind a
-    // disagreeing one are the ones that tell which rank fell behind.
-    let layouts: Vec<P::Layout> = engines
-        .iter()
-        .map(|engine| {
-            let layout = P::read_layout(&engine.ready_response);
-            info!(
-                engine_id = ?engine.engine_id,
-                ?layout,
-                "engine's wire layout declared at the handshake"
-            );
-            layout
-        })
-        .collect();
+/// The layout a connection's outputs are decoded with, of the `layouts` its
+/// engines declared: what they declared for the optional output columns `P`
+/// knows. The ranks of one connection run one engine build and declare one
+/// layout; a group that disagrees is read at the default layout (none of the
+/// optional columns) rather than a column at the wrong position on some
+/// rank, and says so once. Its requests need no such agreement: each is
+/// framed with the layout of the engine it goes to.
+fn connection_layout<P: EngineProtocol>(layouts: &[P::Layout]) -> P::Layout {
     let Some(first) = layouts.first() else {
         return P::Layout::default();
     };
@@ -1289,8 +1276,8 @@ fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layou
         first.clone()
     } else {
         warn!(
-            "the engines of this connection declare different layouts; the optional output \
-             columns are not read and every tensor is sent inline"
+            "the engines of this connection declare different layouts: each is sent its \
+             requests in the form it declared, and the optional output columns are not read"
         );
         P::Layout::default()
     }
@@ -1326,7 +1313,22 @@ impl<P: EngineProtocol> Client<P> {
         let lockstep = engines
             .iter()
             .any(|engine| engine.ready_response.data_parallel_size > 1);
-        let layout = connection_layout::<P>(&engines);
+        // Every rank's declaration is logged with its id at the handshake: on
+        // a running connection that is the one place that tells which form
+        // the wire takes, and which rank fell behind when they disagree.
+        let engine_layouts: Vec<P::Layout> = engines
+            .iter()
+            .map(|engine| {
+                let layout = P::read_layout(&engine.ready_response);
+                info!(
+                    engine_id = ?engine.engine_id,
+                    ?layout,
+                    "engine's wire layout declared at the handshake"
+                );
+                layout
+            })
+            .collect();
+        let layout = connection_layout::<P>(&engine_layouts);
 
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1346,7 +1348,7 @@ impl<P: EngineProtocol> Client<P> {
             writing_since: Mutex::new(None),
             refused: AtomicUsize::new(0),
             engines,
-            layout,
+            engine_layouts,
             registry: Mutex::new(RequestRegistry::default()),
             routing: Mutex::new(RoutingState::default()),
             scan_start: AtomicUsize::new(0),
@@ -1474,11 +1476,7 @@ impl<P: EngineProtocol> Client<P> {
             clippy::disallowed_methods,
             reason = "background tasks are aborted on client drop"
         )]
-        let output_task = tokio::spawn(run_output_loop::<P>(
-            output_socket,
-            out_tx,
-            inner.layout.clone(),
-        ));
+        let output_task = tokio::spawn(run_output_loop::<P>(output_socket, out_tx, layout));
         #[expect(
             clippy::disallowed_methods,
             reason = "background tasks are aborted on client drop"
@@ -1733,11 +1731,11 @@ impl<P: EngineProtocol> Client<P> {
 
         // Selection reserves the engine's in-flight slot; every failure path
         // from here to a successful hand-off must release it.
-        let engine_id = match self
+        let position = match self
             .inner
             .select_engine(P::data_parallel_rank(&request), &request_id)
         {
-            Ok(engine_id) => engine_id,
+            Ok(position) => position,
             Err(error) => {
                 self.inner.registry.lock().remove_all([request_id.as_str()]);
                 return Err(error);
@@ -1750,11 +1748,15 @@ impl<P: EngineProtocol> Client<P> {
         // while the frame waits for the engine.
         let mut guard = SubmitGuard {
             inner: &self.inner,
-            engine_id,
+            engine_id: self.inner.engines[position].engine_id.clone(),
             request_id,
             armed: true,
         };
-        let (payload, mut aux_frames) = match P::encode_add(&request, &self.inner.layout) {
+        // The ranks of a group that declare different layouts are each sent
+        // the form their own handshake declared: one sent its peer's may not
+        // decode it.
+        let layout = &self.inner.engine_layouts[position];
+        let (payload, mut aux_frames) = match P::encode_add(&request, layout) {
             Ok(encoded) => encoded,
             Err(error) => {
                 guard.take_back(false);
