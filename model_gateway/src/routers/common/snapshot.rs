@@ -403,7 +403,9 @@ impl ModelWorkerSnapshot {
     /// the gateway states of each worker ([`stated_facts`]). The engine
     /// keeps its value of the list in that cell from the list's first
     /// request on, and the value falls with this snapshot, as the list
-    /// does: a membership change publishes the next one with none.
+    /// does: a membership change publishes the next one with none. A list
+    /// of no workers is lent on with a cell of its request's own
+    /// (`placed_by_engine`), so the cell here takes no value of it.
     ///
     /// The three are one [`PublishedList`], made at the list's first
     /// lending and read from one place at every later one: a lending reads
