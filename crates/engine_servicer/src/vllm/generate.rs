@@ -303,11 +303,6 @@ async fn submit(
     if let Some(params) = ec_params.as_ref() {
         encoder_cache::check_consumer_handoff(&req, &state.model, params)?;
     }
-    // Refuse a bad salt before the media stage fetches anything. The adapter
-    // checks it again for its direct-ZMQ lane.
-    if let Some(salt) = req.cache_salt.as_deref() {
-        validate_cache_salt(salt).map_err(Status::invalid_argument)?;
-    }
     let ec_producer_side = ec_params.is_some() && encoder_cache::is_producer(&state.model);
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before anything slow: an `Abort` landing while the media is
@@ -326,6 +321,12 @@ async fn submit(
                     notice.disarm();
                 }
             })?;
+    // Refuse a bad salt before the media stage fetches anything, and after
+    // the registry, which keeps a live id from getting a notice. The adapter
+    // checks the salt again for its direct-ZMQ lane.
+    if let Some(salt) = req.cache_salt.as_deref() {
+        validate_cache_salt(salt).map_err(Status::invalid_argument)?;
+    }
     // Worker-side media: the request's references become engine features
     // and its prompt the expanded one, before the frontend duties below.
     let (processed_media, media_identity) = match process_media_refs(state, &mut req).await? {

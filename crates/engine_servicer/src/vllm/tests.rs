@@ -1311,7 +1311,8 @@ async fn a_refused_decode_side_notifies_the_engine() {
 }
 
 /// A decode side refused as a duplicate id sends no rejection notice: the id
-/// names a request that is still live, and the notice would reuse it.
+/// names a request that is still live, and the notice would reuse it. A bad
+/// salt does not change that.
 #[tokio::test]
 async fn a_duplicate_decode_side_sends_no_rejection_notice() {
     let mut h = harness(model_info(), None).await;
@@ -1325,7 +1326,17 @@ async fn a_duplicate_decode_side_sends_no_rejection_notice() {
         .expect("generate")
         .into_inner();
     recv_add(&mut h.engine_in).await;
-    let status = h.client.generate(request).await.expect_err("duplicate id");
+    let status = h
+        .client
+        .generate(request.clone())
+        .await
+        .expect_err("duplicate id");
+    assert_eq!(status.code(), Code::AlreadyExists);
+    let salted = vllm::GenerateRequest {
+        cache_salt: Some("mm:x".to_string()),
+        ..request
+    };
+    let status = h.client.generate(salted).await.expect_err("duplicate id");
     assert_eq!(status.code(), Code::AlreadyExists);
     assert_engine_idle(&mut h.engine_in).await;
     drop(stream);
