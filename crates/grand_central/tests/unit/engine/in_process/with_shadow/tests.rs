@@ -507,7 +507,7 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     let (_, said) = answer.expect("a decision");
     assert!(said.is_some(), "the shadow's word");
     assert!(
-        engine.in_force().shadow_counts.get().is_none(),
+        engine.in_force().shadow_tables().get().is_none(),
         "nothing counted yet"
     );
     assert_eq!(kinds(&engine), [0; 4]);
@@ -529,7 +529,7 @@ fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
     assert_eq!(none, None);
     unshadowed.count_shadow(none);
     assert_eq!(seen.shadows(), 0);
-    assert!(unshadowed.in_force().shadow_counts.get().is_none());
+    assert!(unshadowed.in_force().shadow_tables().get().is_none());
 }
 
 /// A shadow's word is counted in the tables of the document its decision
@@ -556,7 +556,7 @@ fn a_shadows_word_is_counted_under_the_document_its_decision_ran_under() {
     engine.apply(next).expect("a later document");
     own.count_shadow(said);
     assert_eq!(kinds(&engine), [0; 4], "the document in force said no word");
-    let counts = held.0.shadow_counts.get();
+    let counts = held.0.shadow_tables().get();
     let counts = counts.expect("the decision's document counted its word");
     let other_target = counts.of(0, ShadowSide::Single, ShadowKind::OtherTarget);
     assert_eq!(other_target.load(Ordering::Relaxed), 1);
@@ -1022,7 +1022,7 @@ fn the_shadow_counts_of_every_thread_are_read_as_one() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
     assert!(
-        engine.in_force().shadow_counts.get().is_none(),
+        engine.in_force().shadow_tables().get().is_none(),
         "no count yet"
     );
     thread::scope(|scope| {
@@ -1041,7 +1041,7 @@ fn the_shadow_counts_of_every_thread_are_read_as_one() {
 
     let (unshadowed, _) = bed_of("random", Rule::Place(0), None, |_| {});
     let _ = placed(&unshadowed, &list, request(7));
-    assert!(unshadowed.in_force().shadow_counts.get().is_none());
+    assert!(unshadowed.in_force().shadow_tables().get().is_none());
 }
 
 /// Every count a host is told of `engine` ([`InProcess::shadow_counts`]),
@@ -1082,7 +1082,10 @@ fn a_host_is_told_each_count_of_a_binding_that_names_a_shadow_and_zeros_too() {
     };
     let (engine, _) = bed_of("random", Rule::Place(0), Some(Rule::Place(1)), ahead);
     assert_eq!(told(&engine), counts_of(1, ShadowSide::Single, [0; 4]));
-    assert!(engine.in_force().shadow_counts.get().is_none(), "no table");
+    assert!(
+        engine.in_force().shadow_tables().get().is_none(),
+        "no table"
+    );
     for seed in 0..3 {
         let _ = placed(&engine, &list, request(seed));
     }
@@ -1134,7 +1137,7 @@ fn a_pairs_binding_is_told_by_each_side_that_names_a_shadow() {
     assert_eq!(told(&engine), zeros(&both));
 
     let document = engine.in_force();
-    let tables = &document.shadow_counts;
+    let tables = document.shadow_tables();
     let tables = tables.get_or_init(Box::<ShadowCounts>::default);
     let mut written = Vec::new();
     for (side, tens) in both.into_iter().zip([10, 20, 30]) {
