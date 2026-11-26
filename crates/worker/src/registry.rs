@@ -270,7 +270,9 @@ pub struct WorkerRegistry<G> {
     overload_edges: Arc<AtomicU64>,
 
     /// Per-model retry config (last write wins).
-    /// Updated when a worker with non-empty retry overrides registers.
+    /// Written when a worker registers: its settings where it carries
+    /// non-empty retry overrides, the router's own for a model whose entry no
+    /// worker's overrides back any more.
     /// Cleaned up when the last worker for a model is removed.
     /// When retries are disabled, max_retries is set to 1.
     model_retry_configs: Arc<DashMap<String, RetryConfig, FxBuildHasher>>,
@@ -1148,11 +1150,13 @@ impl<G: Generation> WorkerRegistry<G> {
     // 4. Read — config
     // ───────────────────────────────────────────────────────────────────
 
-    /// Get the per-model retry config override, if any.
+    /// Get the retry config stored for a model, if any.
     ///
-    /// Returns `None` when no worker in this model group set a retry
-    /// override. When retries are disabled for the group, the stored
-    /// `max_retries` is always 1.
+    /// Returns `None` when none was written for this model group. A stored
+    /// config is a worker's retry override, or the router's own settings
+    /// written once no worker of the group carries an override any more.
+    /// When retries are disabled for the group, the stored `max_retries` is
+    /// always 1.
     pub fn get_retry_config(&self, model_id: &str) -> Option<RetryConfig> {
         self.model_retry_configs
             .get(model_id)
@@ -1763,9 +1767,11 @@ impl<G: Generation> WorkerRegistry<G> {
 
     /// Update the retry config for a model group (last write wins).
     ///
-    /// Called during worker registration when the worker carries non-empty
-    /// retry overrides. If `enabled` is false, `max_retries` is normalised
-    /// to 1 before storage. Holds no registry locks. Emits no events.
+    /// Called during worker registration: with the worker's settings when it
+    /// carries non-empty retry overrides, or with the router's own settings
+    /// for a model whose stored config no worker's overrides back any more.
+    /// If `enabled` is false, `max_retries` is normalised to 1 before
+    /// storage. Holds no registry locks. Emits no events.
     pub fn set_model_retry_config(&self, model_id: &str, mut config: RetryConfig, enabled: bool) {
         if !enabled {
             config.max_retries = 1;

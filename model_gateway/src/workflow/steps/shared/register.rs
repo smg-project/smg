@@ -247,28 +247,69 @@ fn after_write(
     }
 
     // Update per-model retry config (last write wins).
-    // Only update if the worker has non-empty retry overrides in its spec.
+    // A worker whose spec carries retry overrides writes them for its
+    // models. One whose spec carries none takes a model that still holds an
+    // entry back to the gateway's own retry settings, unless another worker
+    // of the model carries overrides. The entry is rewritten, not removed:
+    // every reader of a model without one falls back to these settings (the
+    // gateway's disable flag is inside them).
+    let registry = &app_context.worker_registry;
     for worker in workers {
-        let resilience_spec = &worker.metadata().spec.resilience;
-        let has_retry_overrides = resilience_spec.max_retries.is_some()
-            || resilience_spec.initial_backoff_ms.is_some()
-            || resilience_spec.max_backoff_ms.is_some()
-            || resilience_spec.backoff_multiplier.is_some()
-            || resilience_spec.jitter_factor.is_some()
-            || resilience_spec.disable_retry.is_some();
-
-        if has_retry_overrides {
+        if overrides_retries(worker.as_ref()) {
             let resolved = worker.resilience();
             let retry_config = resolved.retry.clone();
             for model_id in worker_model_ids(worker) {
-                app_context.worker_registry.set_model_retry_config(
+                registry.set_model_retry_config(
                     &model_id,
                     retry_config.clone(),
                     resolved.retry_enabled,
                 );
             }
+            continue;
+        }
+        for model_id in worker_model_ids(worker) {
+            let left_behind = registry.get_retry_config(&model_id).is_some()
+                && !registry
+                    .get_by_model(&model_id)
+                    .iter()
+                    .any(|other| overrides_retries(other.as_ref()));
+            if left_behind {
+                registry.set_model_retry_config(
+                    &model_id,
+                    app_context.router_config.effective_retry_config(),
+                    true,
+                );
+                // Registrations run side by side: a worker with overrides
+                // that registered between the read and the write above had
+                // its settings written over.
+                keep_standing_override(registry, &model_id);
+            }
         }
     }
+}
+
+/// Writes the retry settings of a worker of `model_id` whose spec carries
+/// overrides, where one stands.
+fn keep_standing_override(registry: &WorkerRegistry, model_id: &str) {
+    let members = registry.get_by_model(model_id);
+    if let Some(standing) = members
+        .iter()
+        .find(|member| overrides_retries(member.as_ref()))
+    {
+        let resolved = standing.resilience();
+        registry.set_model_retry_config(model_id, resolved.retry.clone(), resolved.retry_enabled);
+    }
+}
+
+/// Whether the worker's spec carries a retry override of its own.
+fn overrides_retries(worker: &dyn Worker) -> bool {
+    let resilience_spec = &worker.metadata().spec.resilience;
+    resilience_spec.max_retries.is_some()
+        || resilience_spec.initial_backoff_ms.is_some()
+        || resilience_spec.max_backoff_ms.is_some()
+        || resilience_spec.backoff_multiplier.is_some()
+        || resilience_spec.jitter_factor.is_some()
+        || resilience_spec.disable_retry.is_some()
 }
 
 /// A test's hold on the registry step, between the engine's cancel read for
@@ -669,5 +710,217 @@ mod tests {
         );
         assert_eq!(registry.get_by_model("recreated-model").len(), 1);
         assert!(registry.get_by_model("replacement-model").is_empty());
+    }
+
+    /// A worker of `model_id` at `url` whose spec overrides the retry count,
+    /// resolved against the gateway's retry settings as a registration
+    /// resolves it.
+    fn worker_overriding_retries(
+        url: &str,
+        model_id: &str,
+        gateway: &smg_worker::settings::RetryConfig,
+        max_retries: u32,
+    ) -> Arc<dyn Worker> {
+        use openai_protocol::worker::{ResilienceUpdate, WorkerSpec};
+        use smg_worker::health::{
+            circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience,
+        };
+
+        let overrides = ResilienceUpdate {
+            max_retries: Some(max_retries),
+            ..Default::default()
+        };
+        let (resolved, _breaker) = resolve_resilience(
+            gateway,
+            &CircuitBreakerConfig::default(),
+            true,
+            true,
+            &overrides,
+        );
+        let mut spec = WorkerSpec::new(url);
+        spec.resilience = overrides;
+        Arc::new(
+            BasicWorkerBuilder::from_spec(spec)
+                .model(ModelCard::new(model_id))
+                .resilience(resolved)
+                .build(),
+        )
+    }
+
+    /// A model reads the gateway's own retry settings again once the worker
+    /// that carried a retry override is replaced by a spec without one and
+    /// no other worker of the model carries one.
+    #[tokio::test]
+    async fn a_model_reads_the_gateways_retries_once_no_worker_overrides_them() {
+        use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
+
+        let url = "http://worker:8080";
+        let registry = Arc::new(WorkerRegistry::new());
+        // A gateway whose retry settings are not the default ones: the model
+        // goes back to these, not to a default.
+        let mut router_config = RouterConfig::default();
+        router_config.retry.max_retries += 2;
+        let app_context = app_context_for_tests(router_config, Arc::clone(&registry), None);
+        let gateway = app_context.router_config.effective_retry_config();
+        let overridden = gateway.max_retries + 3;
+        let first = worker_overriding_retries(url, "model", &gateway, overridden);
+        write_batch(
+            &app_context,
+            &[Arc::clone(&first)],
+            &WorkerRegistrationMode::CreateOnly,
+            None,
+        )
+        .expect("the worker with the override registers");
+        assert_eq!(
+            registry
+                .get_retry_config("model")
+                .map(|retry| retry.max_retries),
+            Some(overridden),
+            "the model reads its worker's override"
+        );
+
+        let id = registry.get_id_by_url(url).expect("the worker has an id");
+        write_batch(
+            &app_context,
+            &[worker_at(url, "model")],
+            &replace_by_id(&id, first.revision()),
+            None,
+        )
+        .expect("a spec without an override replaces it");
+        assert_eq!(
+            registry
+                .get_retry_config("model")
+                .unwrap_or_else(|| gateway.clone()),
+            gateway,
+            "the override went with the spec that carried it"
+        );
+    }
+
+    /// The override stays while another worker of the model still carries
+    /// one.
+    #[tokio::test]
+    async fn a_model_keeps_the_retries_another_of_its_workers_still_overrides() {
+        use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
+
+        let url = "http://worker-a:8080";
+        let registry = Arc::new(WorkerRegistry::new());
+        let app_context =
+            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let gateway = app_context.router_config.effective_retry_config();
+        let overridden = gateway.max_retries + 1;
+        let first = worker_overriding_retries(url, "model", &gateway, gateway.max_retries + 3);
+        let second =
+            worker_overriding_retries("http://worker-b:8080", "model", &gateway, overridden);
+        for worker in [Arc::clone(&first), second] {
+            write_batch(
+                &app_context,
+                &[worker],
+                &WorkerRegistrationMode::CreateOnly,
+                None,
+            )
+            .expect("a worker with the override registers");
+        }
+
+        let id = registry.get_id_by_url(url).expect("the worker has an id");
+        write_batch(
+            &app_context,
+            &[worker_at(url, "model")],
+            &replace_by_id(&id, first.revision()),
+            None,
+        )
+        .expect("a spec without an override replaces the first worker");
+        assert_eq!(
+            registry
+                .get_retry_config("model")
+                .map(|retry| retry.max_retries),
+            Some(overridden),
+            "the second worker's override still stands"
+        );
+    }
+
+    /// A model whose overriding worker was removed while another of its
+    /// workers stayed reads the gateway's own retry settings again at the
+    /// next registration of one of its workers without an override.
+    #[tokio::test]
+    async fn a_model_reads_the_gateways_retries_once_its_overriding_worker_left() {
+        use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let app_context =
+            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let gateway = app_context.router_config.effective_retry_config();
+        let overriding = worker_overriding_retries(
+            "http://worker-a:8080",
+            "model",
+            &gateway,
+            gateway.max_retries + 3,
+        );
+        for worker in [overriding, worker_at("http://worker-b:8080", "model")] {
+            write_batch(
+                &app_context,
+                &[worker],
+                &WorkerRegistrationMode::CreateOnly,
+                None,
+            )
+            .expect("a worker of the model registers");
+        }
+        let id = registry
+            .get_id_by_url("http://worker-a:8080")
+            .expect("the overriding worker has an id");
+        assert!(registry.remove(&id).is_some());
+
+        write_batch(
+            &app_context,
+            &[worker_at("http://worker-c:8080", "model")],
+            &WorkerRegistrationMode::CreateOnly,
+            None,
+        )
+        .expect("another worker of the model registers");
+        assert_eq!(
+            registry
+                .get_retry_config("model")
+                .unwrap_or_else(|| gateway.clone()),
+            gateway,
+            "no worker of the model carries the override any more"
+        );
+    }
+
+    /// A worker with an override that registered while another registration
+    /// took its model back to the gateway's settings keeps its override: the
+    /// settings written over it are written back.
+    #[tokio::test]
+    async fn an_override_a_side_by_side_registration_wrote_over_is_written_back() {
+        use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let app_context =
+            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let gateway = app_context.router_config.effective_retry_config();
+        let overridden = gateway.max_retries + 3;
+        write_batch(
+            &app_context,
+            &[worker_overriding_retries(
+                "http://worker-a:8080",
+                "model",
+                &gateway,
+                overridden,
+            )],
+            &WorkerRegistrationMode::CreateOnly,
+            None,
+        )
+        .expect("the worker with the override registers");
+        // The losing order of two registrations side by side: the other one
+        // read the model's workers before this worker was among them and
+        // wrote the gateway's settings behind this worker's write.
+        registry.set_model_retry_config("model", gateway.clone(), true);
+
+        keep_standing_override(&registry, "model");
+        assert_eq!(
+            registry
+                .get_retry_config("model")
+                .map(|retry| retry.max_retries),
+            Some(overridden),
+            "the standing worker's override is in force again"
+        );
     }
 }
