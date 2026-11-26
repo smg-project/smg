@@ -1,0 +1,2240 @@
+{
+  "additional_installed_inventory": {
+    "canonical_sha256": "c0fdd696de287d063c59a1324facc192ceaf6fb01dcb8ac1fffc61331397f03c",
+    "count": 72,
+    "providers": [
+      {
+        "provider_name": "Cython",
+        "version": "3.3.0"
+      },
+      {
+        "provider_name": "Jinja2",
+        "version": "3.1.6"
+      },
+      {
+        "provider_name": "MarkupSafe",
+        "version": "3.0.3"
+      },
+      {
+        "provider_name": "PyGObject",
+        "version": "3.42.1"
+      },
+      {
+        "provider_name": "PyJWT",
+        "version": "2.3.0"
+      },
+      {
+        "provider_name": "SecretStorage",
+        "version": "3.3.1"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx1100",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx1101",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx110x",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx1150",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx1151",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx115x",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx12-0",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx1200",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx1201",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx90a",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx942",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torch-device-gfx950",
+        "version": "2.13.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torchvision-device-gfx1100",
+        "version": "0.28.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torchvision-device-gfx1101",
+        "version": "0.28.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torchvision-device-gfx1150",
+        "version": "0.28.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torchvision-device-gfx1151",
+        "version": "0.28.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torchvision-device-gfx1200",
+        "version": "0.28.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torchvision-device-gfx1201",
+        "version": "0.28.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torchvision-device-gfx90a",
+        "version": "0.28.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torchvision-device-gfx942",
+        "version": "0.28.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amd-torchvision-device-gfx950",
+        "version": "0.28.0+rocm10.0.0"
+      },
+      {
+        "provider_name": "amdsmi",
+        "version": "27.0.0+6b0e43f3"
+      },
+      {
+        "provider_name": "amdsmi",
+        "version": "27.0.0+6b0e43f3"
+      },
+      {
+        "provider_name": "blinker",
+        "version": "1.4"
+      },
+      {
+        "provider_name": "cmake",
+        "version": "3.31.10"
+      },
+      {
+        "provider_name": "cryptography",
+        "version": "3.4.8"
+      },
+      {
+        "provider_name": "dbus-python",
+        "version": "1.2.18"
+      },
+      {
+        "provider_name": "distro",
+        "version": "1.7.0"
+      },
+      {
+        "provider_name": "distro-info",
+        "version": "1.1+ubuntu0.2"
+      },
+      {
+        "provider_name": "einops",
+        "version": "0.8.2"
+      },
+      {
+        "provider_name": "filelock",
+        "version": "4.0.8"
+      },
+      {
+        "provider_name": "flydsl",
+        "version": "0.4.2"
+      },
+      {
+        "provider_name": "fsspec",
+        "version": "2026.9.0"
+      },
+      {
+        "provider_name": "httplib2",
+        "version": "0.20.2"
+      },
+      {
+        "provider_name": "importlib-metadata",
+        "version": "4.6.4"
+      },
+      {
+        "provider_name": "jeepney",
+        "version": "0.7.1"
+      },
+      {
+        "provider_name": "keyring",
+        "version": "23.5.0"
+      },
+      {
+        "provider_name": "launchpadlib",
+        "version": "1.10.16"
+      },
+      {
+        "provider_name": "lazr.restfulclient",
+        "version": "0.14.4"
+      },
+      {
+        "provider_name": "lazr.uri",
+        "version": "1.0.6"
+      },
+      {
+        "provider_name": "more-itertools",
+        "version": "8.10.0"
+      },
+      {
+        "provider_name": "mpmath",
+        "version": "1.3.0"
+      },
+      {
+        "provider_name": "networkx",
+        "version": "3.7"
+      },
+      {
+        "provider_name": "ninja",
+        "version": "1.13.2"
+      },
+      {
+        "provider_name": "numpy",
+        "version": "2.5.3"
+      },
+      {
+        "provider_name": "oauthlib",
+        "version": "3.2.0"
+      },
+      {
+        "provider_name": "packaging",
+        "version": "26.3"
+      },
+      {
+        "provider_name": "pandas",
+        "version": "3.1.1"
+      },
+      {
+        "provider_name": "pillow",
+        "version": "12.3.0"
+      },
+      {
+        "provider_name": "pip",
+        "version": "26.2.2"
+      },
+      {
+        "provider_name": "psutil",
+        "version": "7.2.2"
+      },
+      {
+        "provider_name": "pybind11",
+        "version": "3.0.4"
+      },
+      {
+        "provider_name": "pyparsing",
+        "version": "2.4.7"
+      },
+      {
+        "provider_name": "python-apt",
+        "version": "2.4.0+ubuntu4.1"
+      },
+      {
+        "provider_name": "python-dateutil",
+        "version": "4.0.0"
+      },
+      {
+        "provider_name": "rocm",
+        "version": "10.0.0"
+      },
+      {
+        "provider_name": "rocm-bootstrap",
+        "version": "0.3.0"
+      },
+      {
+        "provider_name": "setuptools",
+        "version": "79.0.1"
+      },
+      {
+        "provider_name": "six",
+        "version": "1.16.0"
+      },
+      {
+        "provider_name": "sympy",
+        "version": "1.14.0"
+      },
+      {
+        "provider_name": "typing_extensions",
+        "version": "4.16.0"
+      },
+      {
+        "provider_name": "tzdata",
+        "version": "2026.6"
+      },
+      {
+        "provider_name": "unattended-upgrades",
+        "version": "0.1"
+      },
+      {
+        "provider_name": "wadllib",
+        "version": "1.3.6"
+      },
+      {
+        "provider_name": "wheel",
+        "version": "0.48.0"
+      },
+      {
+        "provider_name": "zipp",
+        "version": "1.0.0"
+      }
+    ]
+  },
+  "compiler": {
+    "clang": {
+      "path": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/llvm/bin/clang",
+      "sha256": "d9cf832a06dbebdd74a2a9baad7499db8c72c166a188f0eaff5dd9f0a2d1f2fd",
+      "version": "AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/llvm/bin\n"
+    },
+    "hipcc": {
+      "path": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/bin/hipcc",
+      "sha256": "9892a09a9a013e3c7a79fcbc341d05eee43e08779a6194aea34a29f69a99bb24",
+      "version": "HIP version: 7.15.26333-0000000\nAMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/llvm/bin\n"
+    }
+  },
+  "devices": [],
+  "environment": {
+    "HIP_CLANG_PATH": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/llvm/bin",
+    "HIP_DEVICE_LIB_PATH": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/llvm/amdgcn/bitcode",
+    "LD_LIBRARY_PATH": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/rocm_sysdeps/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/rocm_sysdeps/lib",
+    "ROCM_PATH": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel",
+    "SDK_CORE": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core",
+    "SDK_DEV": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel"
+  },
+  "immutable_image": "rocm/vllm-ci:stack-rocm-f0ff2bd31804e4af@sha256:482e36b7f45062dbd065095c59b78f4e2f3a8e0f0c7a971f52a492618b969e0d",
+  "loader_candidates": {
+    "libamdhip64.so.7": [
+      {
+        "path": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/libamdhip64.so.7",
+        "resolved_target": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/libamdhip64.so.7.16.26361-25e14349f2",
+        "sha256": "2f5b1183ef219416a48ef5cf734d6bf570aef1c44656bcd274ae25f58c5e0255"
+      },
+      {
+        "path": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamdhip64.so.7",
+        "resolved_target": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/libamdhip64.so.7.16.26361-25e14349f2",
+        "sha256": "2f5b1183ef219416a48ef5cf734d6bf570aef1c44656bcd274ae25f58c5e0255"
+      }
+    ],
+    "libhsa-runtime64.so.1": [
+      {
+        "path": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/libhsa-runtime64.so.1",
+        "resolved_target": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/libhsa-runtime64.so.1.21.0",
+        "sha256": "8d0ee4185817979a671f9985dc65efde0be089ec30f967ed9abbb860eeece97e"
+      },
+      {
+        "path": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1",
+        "resolved_target": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1",
+        "sha256": "8d0ee4185817979a671f9985dc65efde0be089ec30f967ed9abbb860eeece97e"
+      }
+    ]
+  },
+  "machine": "x86_64",
+  "observable_native_git_heads": {
+    "aiter": null,
+    "flash-attn": null,
+    "mori": null,
+    "triton": null
+  },
+  "packages": {
+    "amd-aiter": {
+      "direct_url": {
+        "archive_info": {
+          "hash": "sha256=e1b134e346ffd0d5e5e71570ea926b59b35b3fc0936d937fbeff63ac92e1825f",
+          "hashes": {
+            "sha256": "e1b134e346ffd0d5e5e71570ea926b59b35b3fc0936d937fbeff63ac92e1825f"
+          }
+        },
+        "url": "file:///i/aiter/amd_aiter-0.1.29-cp312-cp312-linux_x86_64.whl"
+      },
+      "files_manifest": {
+        "canonical_sha256": "668a3874fb3983c2b57d07729c06662dfe1484e9068ef42183e8ca7c5404f728",
+        "count": 44824
+      },
+      "native_so": [
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_skip_nqscale.so",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale.so",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_skip_nqscale.so",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale.so",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_skip_nqscale.so",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale.so",
+        "aiter/jit/module_activation.so",
+        "aiter/jit/module_aiter_core.so",
+        "aiter/jit/module_aiter_operator.so",
+        "aiter/jit/module_aiter_unary.so",
+        "aiter/jit/module_attention.so",
+        "aiter/jit/module_attention_asm.so",
+        "aiter/jit/module_attention_ps_reduce_asm.so",
+        "aiter/jit/module_batched_gemm_a8w8.so",
+        "aiter/jit/module_batched_gemm_bf16.so",
+        "aiter/jit/module_cache.so",
+        "aiter/jit/module_causal_conv1d_fwd_split_qkv.so",
+        "aiter/jit/module_causal_conv1d_update.so",
+        "aiter/jit/module_chunk_gdr_fwd_h.so",
+        "aiter/jit/module_custom.so",
+        "aiter/jit/module_custom_all_reduce.so",
+        "aiter/jit/module_custom_all_reduce_gfx1250.so",
+        "aiter/jit/module_deepgemm.so",
+        "aiter/jit/module_deepgemm_opus.so",
+        "aiter/jit/module_dsv4_dequant_gather_k.so",
+        "aiter/jit/module_dsv4_rotate_quant.so",
+        "aiter/jit/module_f4gemm_asm.so",
+        "aiter/jit/module_fmha_v3_fwd.so",
+        "aiter/jit/module_fmha_v3_varlen_fwd.so",
+        "aiter/jit/module_fused_ar_mhc.so",
+        "aiter/jit/module_fused_qk_norm_mrope_cache_quant_shuffle.so",
+        "aiter/jit/module_fused_qk_norm_rope_cache_quant_shuffle.so",
+        "aiter/jit/module_fused_qk_rmsnorm_group_quant.so",
+        "aiter/jit/module_fused_qknorm_idxrqknorm.so",
+        "aiter/jit/module_fused_split_gdr_update.so",
+        "aiter/jit/module_gated_rmsnorm_quant.so",
+        "aiter/jit/module_gdr_decode_packed_bf16.so",
+        "aiter/jit/module_gemm_a16w16_asm.so",
+        "aiter/jit/module_gemm_a16w8_asm.so",
+        "aiter/jit/module_gemm_a4w4_asm.so",
+        "aiter/jit/module_gemm_a4w4_blockscale.so",
+        "aiter/jit/module_gemm_a4w6_asm.so",
+        "aiter/jit/module_gemm_a6w4_asm.so",
+        "aiter/jit/module_gemm_a6w6_asm.so",
+        "aiter/jit/module_gemm_a8w8.so",
+        "aiter/jit/module_gemm_a8w8_asm.so",
+        "aiter/jit/module_gemm_a8w8_blockscale.so",
+        "aiter/jit/module_gemm_a8w8_blockscale_asm.so",
+        "aiter/jit/module_gemm_a8w8_blockscale_bpreshuffle.so",
+        "aiter/jit/module_gemm_a8w8_blockscale_bpreshuffle_asm.so",
+        "aiter/jit/module_gemm_a8w8_blockscale_bpreshuffle_cktile.so",
+        "aiter/jit/module_gemm_a8w8_blockscale_cktile.so",
+        "aiter/jit/module_gemm_a8w8_bpreshuffle.so",
+        "aiter/jit/module_gemm_a8w8_bpreshuffle_cktile.so",
+        "aiter/jit/module_gemm_common.so",
+        "aiter/jit/module_groupnorm.so",
+        "aiter/jit/module_hipb_groupedgemm.so",
+        "aiter/jit/module_hipbsolgemm.so",
+        "aiter/jit/module_inverse_rope_group_quant.so",
+        "aiter/jit/module_iq2r_moe.so",
+        "aiter/jit/module_mega_mhc_stream_generic.so",
+        "aiter/jit/module_mega_mhc_stream_h5120.so",
+        "aiter/jit/module_mega_mhc_stream_h7168.so",
+        "aiter/jit/module_mhc.so",
+        "aiter/jit/module_mhc_seam_asm.so",
+        "aiter/jit/module_mla_asm.so",
+        "aiter/jit/module_mla_decode_opus.so",
+        "aiter/jit/module_mla_metadata.so",
+        "aiter/jit/module_mla_prefill_opus.so",
+        "aiter/jit/module_mla_reduce.so",
+        "aiter/jit/module_mla_sparse_prefill_asm.so",
+        "aiter/jit/module_moe_asm.so",
+        "aiter/jit/module_moe_ck2stages_b16_b16_preshuffle_on_b16_gelu_no_mulWeightStage1.so",
+        "aiter/jit/module_moe_ck2stages_b16_b16_preshuffle_on_b16_gelu_no_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_b16_b16_preshuffle_on_b16_silu_no_mulWeightStage1.so",
+        "aiter/jit/module_moe_ck2stages_b16_b16_preshuffle_on_b16_silu_no_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_1x128_mulWeightStage1.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_1x128_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_tensor_mulWeightStage1.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_tensor_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_token_mulWeightStage1.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_token_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_1x128_mulWeightStage1.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_1x128_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_1x128_mulWeightStage2_splitk.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_tensor_mulWeightStage1.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_tensor_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage1.so",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_f8_fp4x2_preshuffle_off_b16_silu_per_1x32_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_f8_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_fp4x2_fp4x2_preshuffle_off_b16_silu_per_1x32_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_fp4x2_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2.so",
+        "aiter/jit/module_moe_ck2stages_i8_i8_preshuffle_on_b16_silu_per_tensor_mulWeightStage2.so",
+        "aiter/jit/module_moe_cktile2stages.so",
+        "aiter/jit/module_moe_fmoe_asm.so",
+        "aiter/jit/module_moe_mxfp4_aux.so",
+        "aiter/jit/module_moe_opus.so",
+        "aiter/jit/module_moe_sorting.so",
+        "aiter/jit/module_moe_sorting_opus.so",
+        "aiter/jit/module_moe_topk.so",
+        "aiter/jit/module_moe_topk_ck.so",
+        "aiter/jit/module_moe_topksoftmax_asm.so",
+        "aiter/jit/module_msa_sparse_attention.so",
+        "aiter/jit/module_mxfp8fp4gemm_asm.so",
+        "aiter/jit/module_norm.so",
+        "aiter/jit/module_pa_decode_bf16_asm.so",
+        "aiter/jit/module_pa_metadata.so",
+        "aiter/jit/module_pa_mqa_logits_mxfp4_opus.so",
+        "aiter/jit/module_pos_encoding.so",
+        "aiter/jit/module_ps_metadata.so",
+        "aiter/jit/module_quant.so",
+        "aiter/jit/module_quick_all_reduce.so",
+        "aiter/jit/module_quick_reduce_scatter.so",
+        "aiter/jit/module_rmsnorm.so",
+        "aiter/jit/module_rmsnorm_quant.so",
+        "aiter/jit/module_rocsolgemm.so",
+        "aiter/jit/module_rope_1c_2d_bwd.so",
+        "aiter/jit/module_rope_1c_2d_fwd.so",
+        "aiter/jit/module_rope_1c_cached_bwd.so",
+        "aiter/jit/module_rope_1c_cached_fwd.so",
+        "aiter/jit/module_rope_1c_cached_positions_fwd.so",
+        "aiter/jit/module_rope_1c_cached_positions_offsets_fwd.so",
+        "aiter/jit/module_rope_1c_thd_bwd.so",
+        "aiter/jit/module_rope_1c_thd_fwd.so",
+        "aiter/jit/module_rope_1c_uncached_bwd.so",
+        "aiter/jit/module_rope_1c_uncached_fwd.so",
+        "aiter/jit/module_rope_2c_cached_bwd.so",
+        "aiter/jit/module_rope_2c_cached_fwd.so",
+        "aiter/jit/module_rope_2c_cached_positions_fwd.so",
+        "aiter/jit/module_rope_2c_cached_positions_offsets_fwd.so",
+        "aiter/jit/module_rope_2c_uncached_bwd.so",
+        "aiter/jit/module_rope_2c_uncached_fwd.so",
+        "aiter/jit/module_sample.so",
+        "aiter/jit/module_smoothquant.so",
+        "aiter/jit/module_sp_head_exchange.so",
+        "aiter/jit/module_top_k_per_row.so",
+        "aiter/jit/module_top_k_per_row_sampled.so",
+        "aiter/jit/module_topk_plain.so",
+        "aiter/jit/module_vsa_sparse_attention.so"
+      ],
+      "native_so_sha256": {
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_skip_nqscale.so": "550de5e6c02093d78a0df20fa8d7ba2f0af554988f936e3149346cea6852fbed",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale.so": "07810d5b739ca013622abd33fb471ca21f38c1ac65e5ebcea18ef59168f02754",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_skip_nqscale.so": "da868146e54378320f9dbe7a26097bcac0cbec81ac89d29a33455b9074cff22c",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale.so": "f2ce9825b36d2c19c1c4e20e1b500c1a842b2eb986674d0b809c632dc7cb81a4",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_skip_nqscale.so": "0c502e66aa31c1be20febb27935f38e27d51640abcf802f5a9cdeb11efcb5554",
+        "aiter/jit/mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale.so": "8a3a1ccb5ab7e2b6767b0d0fcae4ac0689469dca6894cf3526b199349a9f390b",
+        "aiter/jit/module_activation.so": "067e96565b2736c4476c4b64e8f8827dac9449313d0be8bfaac0cdff11884ffa",
+        "aiter/jit/module_aiter_core.so": "0a46c6b07cea397f1891f0c9dca742ef6250f9d6631fa537df835b915c2bf97a",
+        "aiter/jit/module_aiter_operator.so": "1cbcf3a2f63766864895f3c9e99f80db578fe0f71ef9678028dc9ef043ae337b",
+        "aiter/jit/module_aiter_unary.so": "822c5461545194c9472ff17ad5b585a99c7101bcd8c50eb9dc77e2e5437292ba",
+        "aiter/jit/module_attention.so": "6083d8c367c0df203784e9182c891493cc9fb66c05e78739bb31df72fd54df6b",
+        "aiter/jit/module_attention_asm.so": "c836afc9de13692f357f4482ca33c2633ebd3b10d53e04901393c6a889c0c068",
+        "aiter/jit/module_attention_ps_reduce_asm.so": "d8f1008e23008f07c400c4d1d4fb779967eb7453066f04ca6e101a0785b16683",
+        "aiter/jit/module_batched_gemm_a8w8.so": "01aebb1c337b2611ffdf31f2ed74d6b092d37d935eb696afc3c8b8d4f7db1f37",
+        "aiter/jit/module_batched_gemm_bf16.so": "727b79cf8b15888bba2d88281ce68efd82d931b162d69683d670041b0d9ff3d0",
+        "aiter/jit/module_cache.so": "5c65dc4d1b172b8ca6f95de604da0a76a8640357a542d4b11d0a4b2e0dd01e48",
+        "aiter/jit/module_causal_conv1d_fwd_split_qkv.so": "b8e1778bc1984d3358f8c317886d33d28acf1d6a94c7b8f79fc6f979d6f3b7c5",
+        "aiter/jit/module_causal_conv1d_update.so": "130fb5483b550b358f98434f2234fe49b1cb27e9d42fe68d742a726c06da668a",
+        "aiter/jit/module_chunk_gdr_fwd_h.so": "e8864930ff4c8bdfee7a22eee34198cad93976f609e1a2e37400859f3926a8d0",
+        "aiter/jit/module_custom.so": "f99250225a100cd2dcb660b9090549eb01a87ed872da03f2e364555a8fb37120",
+        "aiter/jit/module_custom_all_reduce.so": "88c99a586844d9b134118c450b918e58680e41e7299b7cca3143658ba622f06c",
+        "aiter/jit/module_custom_all_reduce_gfx1250.so": "7c7b46e29a39e64d6c1768f7aee60687ec5ea6716b8bfeb9e0de9c8b97a1b558",
+        "aiter/jit/module_deepgemm.so": "363139ca25d76252970cb18fd311c173fc11de63b561c8e7f6dd0e2ee5266c7b",
+        "aiter/jit/module_deepgemm_opus.so": "2abc216ee1478ada4b34c08ea01a40e27f339ac4b0fe638eb79412f8dc922b83",
+        "aiter/jit/module_dsv4_dequant_gather_k.so": "3ec81484c3be1cf150a7008663309d4015856d38d52cc5dc664a4c96d38b6abc",
+        "aiter/jit/module_dsv4_rotate_quant.so": "2f94734b69e12ee61713c711cddac122cd234f03599ac039b920e13992f12174",
+        "aiter/jit/module_f4gemm_asm.so": "a074ae652633360c5e46bc231d0baa0381474e5f1f85eef500bf8e29761bc023",
+        "aiter/jit/module_fmha_v3_fwd.so": "d434fb1b321c22e3133bd4b69d7e7aeebd941d0945a9a8299ef658633568a261",
+        "aiter/jit/module_fmha_v3_varlen_fwd.so": "8b11945ddc5cb037e2c20676612c947a6ad6f7940598fd2d40d81d246b711f79",
+        "aiter/jit/module_fused_ar_mhc.so": "faf1dad7ad4b0a8db637365ed4a06a0268731ded8ebf0fa5286cf4814a646ce5",
+        "aiter/jit/module_fused_qk_norm_mrope_cache_quant_shuffle.so": "f7a79ea3e63bfea9aa5aed4cc41ae93c7407f21f6a39f84e1a7caa27bc140eed",
+        "aiter/jit/module_fused_qk_norm_rope_cache_quant_shuffle.so": "c5e4e8daf5b25f50a4b1c436f9814320929d5d3ef779b35dec62ec301017d75d",
+        "aiter/jit/module_fused_qk_rmsnorm_group_quant.so": "fb650ef61605a1f77efa2d28c845948f9fc549473f7101a22036c8420b0804e9",
+        "aiter/jit/module_fused_qknorm_idxrqknorm.so": "a92282d572a4cd2db72d3c64f383dccbf8f61ce1787e3cd7abea619e10154a04",
+        "aiter/jit/module_fused_split_gdr_update.so": "7c0ff7ab8260800659e022243fa6d9420e25406efe93b7c6f73ac1250a906254",
+        "aiter/jit/module_gated_rmsnorm_quant.so": "dcdf5eba95380fc0cb153cebf4170e348e754696dd4dd0ca3ddb623f3680db40",
+        "aiter/jit/module_gdr_decode_packed_bf16.so": "d4ed61f879fa45cc1c9718ad27baca39930ce91aaf4af9dc4372d3a5a5386021",
+        "aiter/jit/module_gemm_a16w16_asm.so": "4a57debf6488e05f73cd8ceec1f259b4a3db910de78b1e065d014e5da392eee3",
+        "aiter/jit/module_gemm_a16w8_asm.so": "64ab556f64da33e18d369c1dd6a7500c0ca02be923750f933d1417fc17c85d1c",
+        "aiter/jit/module_gemm_a4w4_asm.so": "8202297866db374422daf66040d518ca06d774b689d0808985c8db478b9460a3",
+        "aiter/jit/module_gemm_a4w4_blockscale.so": "fd66708052c97427347a64808a6f5d62b66cb8a1cc90845fa6453c08b8e9f11b",
+        "aiter/jit/module_gemm_a4w6_asm.so": "5fa0af945122c299b3b00ba131be61ecc843dc661743dde47709d506a014cd93",
+        "aiter/jit/module_gemm_a6w4_asm.so": "fa8dfdf1aaefea4ee8361e6803c183734c76398c6649304f78f6e16534acddb1",
+        "aiter/jit/module_gemm_a6w6_asm.so": "8a3823fa6972bc19272fdef60af4b6d02356d7f8d82189d60db20c9eddbe8da5",
+        "aiter/jit/module_gemm_a8w8.so": "2d4ee6d20c69757f8cc01333af2d68eba4b7a6f31956d21f92e68808322369cc",
+        "aiter/jit/module_gemm_a8w8_asm.so": "7d3a201ada96443e0ae6bc7d805516ff04a111e0e9009284bef2ed7c61a2d389",
+        "aiter/jit/module_gemm_a8w8_blockscale.so": "8aa92ee3dd2d7ceca60ccb56c2875961d9d254e46be388eb92f8c5b17c96b751",
+        "aiter/jit/module_gemm_a8w8_blockscale_asm.so": "cf88dd106238f9fd82ff26e901809e5fbfab770a90b5be6a07875be491c38402",
+        "aiter/jit/module_gemm_a8w8_blockscale_bpreshuffle.so": "b34999b6c6f86508bdb138ee83a0cc1063a7a4603ce155128a34371ac03c21eb",
+        "aiter/jit/module_gemm_a8w8_blockscale_bpreshuffle_asm.so": "2e47ae31113b2dbc0c1d592cded63369b99ebe86a9f701106c9ee4253f9d7545",
+        "aiter/jit/module_gemm_a8w8_blockscale_bpreshuffle_cktile.so": "8083e3a6173d412bab97bbf481cc3c711dc711d4c82ae8891e077ad40a62135b",
+        "aiter/jit/module_gemm_a8w8_blockscale_cktile.so": "506a07c237744205686f4f8770e436890ce46823030ce7e0a021a53e9b90c03b",
+        "aiter/jit/module_gemm_a8w8_bpreshuffle.so": "acbad5eb9320d9eef8c162631b89f20ff7c5148ede5c3d26a2dbec3740196674",
+        "aiter/jit/module_gemm_a8w8_bpreshuffle_cktile.so": "5f57603f933dab671e8dd59f343d603ecf6b30d63fa869e547c9258bc8bf0352",
+        "aiter/jit/module_gemm_common.so": "5cba50821e7accd1493cdb9bab269e1e88f317610eea2494984734369e683438",
+        "aiter/jit/module_groupnorm.so": "add7e04924b68a6fc7353b3f5d873fe1e2e9d3b3fafe9431b16cc91b155dc254",
+        "aiter/jit/module_hipb_groupedgemm.so": "70a7c6b8ad77e5f99a1fe54d29d51f797a09764880e628b70ed73618bbb3a797",
+        "aiter/jit/module_hipbsolgemm.so": "cf6db924ff9881d5b96a3cf288d16d5df42960184e6033bebae2bbdce1d39785",
+        "aiter/jit/module_inverse_rope_group_quant.so": "c341490f015f71acf55d72ea0ad86f7901b2e3a692195df047a4716286ea151b",
+        "aiter/jit/module_iq2r_moe.so": "4a36b9554b6dcf5f3ed20e13563f5229c20cc5b2ce5e4455157b6be80ee07133",
+        "aiter/jit/module_mega_mhc_stream_generic.so": "b3ebba8a41b15a4c65fa2f5449e1b8f786db068abd7d946709379bddd83d60d1",
+        "aiter/jit/module_mega_mhc_stream_h5120.so": "b5c9302a8d283a9ab493f0f02a0e826fde577af90aa3318c3be591958eed3ea8",
+        "aiter/jit/module_mega_mhc_stream_h7168.so": "23247a5a1b54f360e0138b6aaf28efc48e060b20ef63cdcdfa7d5f6482e14f36",
+        "aiter/jit/module_mhc.so": "5a8b7b40c88f5e346d5a0a825a112069c7436856986805c98cc65d20c8df5afb",
+        "aiter/jit/module_mhc_seam_asm.so": "30fcab1c6ec90fab72756d9767ad8cb5d578d5ccc23a2975b0c205372442ae12",
+        "aiter/jit/module_mla_asm.so": "90f59489ebe80bc14ab552683472e3198bbca2203f3a5a84f46dde82ef105bef",
+        "aiter/jit/module_mla_decode_opus.so": "f723193bf8ba38c0d68b9e635c79e4841557b9ac322863659c1dd7ca0a8c5b7d",
+        "aiter/jit/module_mla_metadata.so": "aacfb42370e6b0e58a4e2830c7c47aa1cf879e5f0605c05b3892ee9b0b358da9",
+        "aiter/jit/module_mla_prefill_opus.so": "340a224435b4aa18fc8a8558c8906cae7fc5d5ca6f964d841c5ae87c439a73b4",
+        "aiter/jit/module_mla_reduce.so": "3f6fc157bccff7ca736557d238b487afde4b8e2fc404fb29c9e1c704f1118c64",
+        "aiter/jit/module_mla_sparse_prefill_asm.so": "77ebe52cf6ff659cc7499ec7aa6de4828530368c821cd69b89089719e2ce16f1",
+        "aiter/jit/module_moe_asm.so": "f0e5223cf698b41a5072c820e1ae6dc0c78754fdeef1c1e9ab914e352eac5354",
+        "aiter/jit/module_moe_ck2stages_b16_b16_preshuffle_on_b16_gelu_no_mulWeightStage1.so": "b42a86bfb4e80b99f5e6cc53f99b4cbb89767533e7ff7ab596cbcf9346b88e76",
+        "aiter/jit/module_moe_ck2stages_b16_b16_preshuffle_on_b16_gelu_no_mulWeightStage2.so": "b1f54341b16c3fcbbc8fcc7e6affac296e67c4214d4701fe20b16bccefb048b4",
+        "aiter/jit/module_moe_ck2stages_b16_b16_preshuffle_on_b16_silu_no_mulWeightStage1.so": "0df3ced3ba35c0e4f1193bcac2517198c712a8dd81b5ea4c9446605437e60484",
+        "aiter/jit/module_moe_ck2stages_b16_b16_preshuffle_on_b16_silu_no_mulWeightStage2.so": "7790b5c3d8bef48472ee9c54d9e1c56ca18889b1b7ae2b37b7f94d59d130a3a4",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_1x128_mulWeightStage1.so": "1eebc377fe2d491976d4ccc163ee752158f9c744b19d527e4ad61b69b6490bbd",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_1x128_mulWeightStage2.so": "bc733ba99c7e89841bd71fb2a1a5a288ceeb0f73edbd1a946df0e5a877012313",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_tensor_mulWeightStage1.so": "7e3b564fc79091b5f1aeabd9a5a4490e0d620c32aead294a3ce777be0f44a1d6",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_tensor_mulWeightStage2.so": "7496533b868441006e7300a9edc6ea92d12856dbb4d307db28833461bb474b24",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_token_mulWeightStage1.so": "10261ff66ebad371a3bb118e9a441cabdb8b697acc3e9d87b8b84a2de6ab7f66",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_gelu_per_token_mulWeightStage2.so": "f694b474db9c7391b5d914ce4933fb9f993b8410e92ae64f2039d57df9db6316",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_1x128_mulWeightStage1.so": "d143af9dd4ab1d337212e2fc5040f497726c773cca3d1e094edb2a0ff77270c9",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_1x128_mulWeightStage2.so": "4315b75199bd4a05e987d0e32e434a93d6cdd3c7749df622f9162c1dd1ddfa57",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_1x128_mulWeightStage2_splitk.so": "2f516b6638a28ddf583d19b32daf408e4d5a9262a13038104e346eca0ae52f4a",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_tensor_mulWeightStage1.so": "6c86559204161fdb7d37605d76aaaf158034295e6a3a00db6b027c25efe1230b",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_tensor_mulWeightStage2.so": "7045208ff9259dae9aa523f1ef5d38788f3c445a8ea68a3f3154f923dad74b39",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage1.so": "dbddc8d28a082d63f8919ee6186ca65b606b597078bf8b880c6ac1b10b4827a9",
+        "aiter/jit/module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_token_mulWeightStage2.so": "538ae0b89984b450ea34310a01507c7607c256878df8a82045f5cab569f60560",
+        "aiter/jit/module_moe_ck2stages_f8_fp4x2_preshuffle_off_b16_silu_per_1x32_mulWeightStage2.so": "d9b9f8a3432f965dd54551ecb0d1f87cc27e4e9c3c593d684f83471e07d75689",
+        "aiter/jit/module_moe_ck2stages_f8_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2.so": "2cf306adb06da1fc474f2b143b3d88dde1173fac9b3186f16e2eac762982ff4f",
+        "aiter/jit/module_moe_ck2stages_fp4x2_fp4x2_preshuffle_off_b16_silu_per_1x32_mulWeightStage2.so": "1fe346b172b33d06bf12de057073c3ea25648e4031b523d17532729c25ed3f74",
+        "aiter/jit/module_moe_ck2stages_fp4x2_fp4x2_preshuffle_on_b16_silu_per_1x32_mulWeightStage2.so": "379e5488da477fa18884c0cbeab7139204e4052b5bdf801b08f08bd98db4db4c",
+        "aiter/jit/module_moe_ck2stages_i8_i8_preshuffle_on_b16_silu_per_tensor_mulWeightStage2.so": "5204d441c34ab924e42dc59d4f7af10ce21e4c925c7dfbab849efae21d38717b",
+        "aiter/jit/module_moe_cktile2stages.so": "eba022716d9346241e5adf29f0cbf285de15c3b461eb997a0850b708403bdf3d",
+        "aiter/jit/module_moe_fmoe_asm.so": "8cd865bb56895aec85438717a2eee729f5db3dbc0481c345ef2a3814ca389614",
+        "aiter/jit/module_moe_mxfp4_aux.so": "3982b3d498c523b50b23a0ebd506271962d33703573322438d64f58cb8e8b460",
+        "aiter/jit/module_moe_opus.so": "3dcb2b8a3e9fb55fbb55505d77dedcf1e5dcd121f3b9e552cb6c7bf18202bf5f",
+        "aiter/jit/module_moe_sorting.so": "db6e6f1751603b64392d26b9da7f75a7c10c729184e204ef4cea730834a00e97",
+        "aiter/jit/module_moe_sorting_opus.so": "352ab1d5dd711c577233cbbecefe88fe784fd7608cead02cba22aabd3b556909",
+        "aiter/jit/module_moe_topk.so": "4cb3a4bdbab0d5feeb8623366cfea05cd04cc50bd836452815ff1dc036636844",
+        "aiter/jit/module_moe_topk_ck.so": "d41cbea18ad5e543dff60a77c7484d3049ff8ec3075d117b7a4f8465c360b13b",
+        "aiter/jit/module_moe_topksoftmax_asm.so": "ea8465b5c80d0623027b36ac77abc338f8daf4d986ffdf2fcab8b2209439a14e",
+        "aiter/jit/module_msa_sparse_attention.so": "c21f8acafd5fdb5aa17121efcd9ab483d41ed130c15c59fd9fa617898362b3f6",
+        "aiter/jit/module_mxfp8fp4gemm_asm.so": "a1a027e4abe0993a785cd41069bd2d1a0ffee5fc340585157f5cb3c16214c226",
+        "aiter/jit/module_norm.so": "4606bab0e911aeb7a69cb3c2dc42bb8ed5a1758b5a6a18a607e28fbd8fca9c6c",
+        "aiter/jit/module_pa_decode_bf16_asm.so": "bf9fd9adb12b142dfbd01541f7b72c1826aebf6b76b0724d6e71a01e4f12ab3c",
+        "aiter/jit/module_pa_metadata.so": "a708340831f846ff2d29cede04872edb619447ff2b2993c31ee0dd5beb215226",
+        "aiter/jit/module_pa_mqa_logits_mxfp4_opus.so": "36ec05ab8163418488f987643b172853fc19ad23e7b340b4fe016de394c03c44",
+        "aiter/jit/module_pos_encoding.so": "805cf15bffe55a668cead7c0d953cfad74bd493f9de30f4c9a4e3cc8a6693f56",
+        "aiter/jit/module_ps_metadata.so": "1f06027c86be2cf684e66f6f916d6762573c37cc21311455c48d5587ebdcddba",
+        "aiter/jit/module_quant.so": "0e56eb4036c5e60830709dcf98358bedc9d21f468412d2497e42958074ec7ed5",
+        "aiter/jit/module_quick_all_reduce.so": "9bc3eeb187f9cb5dce0ba124a226b398e6fd526e6be4eb8d6212faa94faa51c6",
+        "aiter/jit/module_quick_reduce_scatter.so": "cc78c331eeccd116cd4844b4249bf2d84ea103e8589afcd4c05c38eaecc22b5a",
+        "aiter/jit/module_rmsnorm.so": "bb22c64b4289625b0e8c58742be8723827bd00e687dd586748567a6d7a19d6ea",
+        "aiter/jit/module_rmsnorm_quant.so": "20e09018ea6b89f2adc05001c395cf0ae04dc37986248e38ba91c00c63f73c3b",
+        "aiter/jit/module_rocsolgemm.so": "53be58226114f8245fdf6f389e05313ee1b4010cdeb445bed047be036043e2f2",
+        "aiter/jit/module_rope_1c_2d_bwd.so": "11f159b3bbd461c49f88dd11123f1fc8fa25898d8b93d40d0a98bfcfd006e603",
+        "aiter/jit/module_rope_1c_2d_fwd.so": "3b89dfa61d46eb5222f94f558a61d7402e662242fad98af685d6e182a95b8e37",
+        "aiter/jit/module_rope_1c_cached_bwd.so": "d93f57aea4dd3467707bfd70c3ce92f1d27a58c9204c024b685a019fe56294ba",
+        "aiter/jit/module_rope_1c_cached_fwd.so": "975c377081e6b30646475dcaec6d2af6f6455b9c36f451db256053e14f358636",
+        "aiter/jit/module_rope_1c_cached_positions_fwd.so": "39ae592827fcac6446ea1cef1e71286d8c898e36914e85afd5c2cb98d9fae011",
+        "aiter/jit/module_rope_1c_cached_positions_offsets_fwd.so": "680bb2fecd4f3bc65b8943010891bd432de785b12d0903060a13db5b3bea13f6",
+        "aiter/jit/module_rope_1c_thd_bwd.so": "a19a33796be2103c6b2a76cd4ee9e13afa6ee8d5f55114b6eb716143396fc94b",
+        "aiter/jit/module_rope_1c_thd_fwd.so": "22d8b5415dd36d74069064f6ab04736390cb64d5e661edf1942d6211080ee6db",
+        "aiter/jit/module_rope_1c_uncached_bwd.so": "9e1462334b2c08f4a204ea47d5ca9c38d7bf1f17b414a8d4709cf4a8754736aa",
+        "aiter/jit/module_rope_1c_uncached_fwd.so": "cea17651e5fb3eeed0264197ac002f7893c4446f56a26a59722b1ae18b8e55da",
+        "aiter/jit/module_rope_2c_cached_bwd.so": "0874d565bb18e37efaa8df15c4703bad856c04b0ca105a35d341dd01676adee6",
+        "aiter/jit/module_rope_2c_cached_fwd.so": "33d3d279b71fdabe9c4e68c479190f0c40f82005343083664f9dec0881f7434d",
+        "aiter/jit/module_rope_2c_cached_positions_fwd.so": "45e7b835a790e05909b3d6806b9826a549e8ecd7f59473e23009e75ae9c3f2cf",
+        "aiter/jit/module_rope_2c_cached_positions_offsets_fwd.so": "40287a93b77034096f46312cda736b39445c1eaa2d90414c69e1f0beb7a92ab2",
+        "aiter/jit/module_rope_2c_uncached_bwd.so": "c6ab5c636f9547741974d1bce061c657c17512be14acc53bb19f6e6144398537",
+        "aiter/jit/module_rope_2c_uncached_fwd.so": "752d2c788a27860085c26511700a27ba0c06b39a5b781fafa38c77749a504d48",
+        "aiter/jit/module_sample.so": "77e4a015b76fb86afb255625ccbf8344c468efb40787e04c60a21a9731e51f29",
+        "aiter/jit/module_smoothquant.so": "729ede83a3137847518e809a18dbcebb0773d3f46d970d318351db96e20902c7",
+        "aiter/jit/module_sp_head_exchange.so": "f3c6ce16ab4c084c479808c9327df1e993308cc2d768d4fe842ba2b1d2dcec36",
+        "aiter/jit/module_top_k_per_row.so": "ca6e00b4a65a82bd5292d7db154ed2b21d4dc329a18609719ec456509bb4bec1",
+        "aiter/jit/module_top_k_per_row_sampled.so": "495f137bbdd66b9c47f05146a00b5ce4bf94ce519bf5523cb413c00969c33ef6",
+        "aiter/jit/module_topk_plain.so": "71ea6a8d588b94dc1b4a778fc066181fdb6c80836703ec99612e71a954a0aa6b",
+        "aiter/jit/module_vsa_sparse_attention.so": "ccd21720c3bbc8c4b8e4eb4a1b121d8545db7c5339dec95b51d5fe73efbecb1e"
+      },
+      "provider_name": "amd-aiter",
+      "version": "0.1.29"
+    },
+    "flash-attn": {
+      "direct_url": {
+        "archive_info": {
+          "hash": "sha256=352a4f3fd345fe7cc3713645dbe03726b7bb26e4b81c46596350cfdab752d6a8",
+          "hashes": {
+            "sha256": "352a4f3fd345fe7cc3713645dbe03726b7bb26e4b81c46596350cfdab752d6a8"
+          }
+        },
+        "url": "file:///i/fa/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl"
+      },
+      "files_manifest": {
+        "canonical_sha256": "1151e5f1b71134179559d7652618693deececeefc3e78faa9aa42641e43b4325",
+        "count": 109
+      },
+      "native_so": [
+        "flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so"
+      ],
+      "native_so_sha256": {
+        "flash_attn_2_cuda.cpython-312-x86_64-linux-gnu.so": "9070ee962c1d83df8e8f3f4b7ae970521a62806bc1db67757d6859048f18da3e"
+      },
+      "provider_name": "flash_attn",
+      "version": "2.8.3"
+    },
+    "mori": {
+      "direct_url": {
+        "archive_info": {
+          "hash": "sha256=377b5abc02174de97dc093587e8a8081951e22fbe8d81793e02bf7343de1b39a",
+          "hashes": {
+            "sha256": "377b5abc02174de97dc093587e8a8081951e22fbe8d81793e02bf7343de1b39a"
+          }
+        },
+        "url": "file:///i/mori/amd_mori-1.2.3.post1-cp312-cp312-linux_x86_64.whl"
+      },
+      "files_manifest": {
+        "canonical_sha256": "d80c8d787dade86450da7101f124dec5ef0ce78010070094b5480a4c47021b7f",
+        "count": 1156
+      },
+      "native_so": [
+        "mori/cco/cco.cpython-312-x86_64-linux-gnu.so",
+        "mori/libmori_application.so",
+        "mori/libmori_cco.so",
+        "mori/libmori_collective.so",
+        "mori/libmori_io.so",
+        "mori/libmori_jit.so",
+        "mori/libmori_metrics.so",
+        "mori/libmori_ops.so",
+        "mori/libmori_ops_v2.so",
+        "mori/libmori_pybinds.so",
+        "mori/libmori_shmem.so",
+        "mori/mori_torch_symm.cpython-312-x86_64-linux-gnu.so"
+      ],
+      "native_so_sha256": {
+        "mori/cco/cco.cpython-312-x86_64-linux-gnu.so": "b5e4620ea91b19f52700e9fad4a22aa16398748267876b3fd82e26310040ec8e",
+        "mori/libmori_application.so": "3246a8807d52e297f1bcf846735b343f45218cd115c95df5194e297d6079dd92",
+        "mori/libmori_cco.so": "026c0a1553a4e864585bdce095fa71d36a36be14ad17540c658d039690bc1336",
+        "mori/libmori_collective.so": "ba952ec9f1245be5d3529b08b285cd24067fa39a957a9b3c0ad6172b1f093297",
+        "mori/libmori_io.so": "f5310568ea61182d1a3d4a7ebd9b9dec0c55ebee6c0fb3ac72a4d064622c0b5b",
+        "mori/libmori_jit.so": "30c417dc2ec5ffb31a95c5de1be1035e302407d970d441b38333c317948cd980",
+        "mori/libmori_metrics.so": "87cb697b9020ae62a5bc783b9d5e4fd9317cd779f1702d9413a6de6ea54f5c7c",
+        "mori/libmori_ops.so": "0f30de3b3747be512e9f6bb12622b159b972bf9008d74820a5b8a9624cc42cac",
+        "mori/libmori_ops_v2.so": "b6022ae2cefdcfa145b6e14d5a1115a87593b1480e17c7c092b40b9bcad096b2",
+        "mori/libmori_pybinds.so": "550b66a5cac48328f42f3498b0cd20da19b4fbc40670b2f4e207fc5c6326e8d2",
+        "mori/libmori_shmem.so": "bb99cff280d349a91ae3da69b4ab31fbc33b11461821f9fbd73e9ea1831ab8cd",
+        "mori/mori_torch_symm.cpython-312-x86_64-linux-gnu.so": "6568997c0dc38b67bd3a3b7f571f7ab23bd23497068a70cc59593c2a7c5e4cc8"
+      },
+      "provider_name": "amd_mori",
+      "version": "1.2.3.post1"
+    },
+    "rocm-sdk-core": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "414d59777861df7f9a4fe9709052a8a92e3c20b2c8583c8731e4ca98f5202873",
+        "count": 3066
+      },
+      "native_so": [
+        "_rocm_sdk_core/lib/host-math/lib/libamd.so.3",
+        "_rocm_sdk_core/lib/host-math/lib/libcamd.so.3",
+        "_rocm_sdk_core/lib/host-math/lib/libccolamd.so.3",
+        "_rocm_sdk_core/lib/host-math/lib/libcholmod.so.5",
+        "_rocm_sdk_core/lib/host-math/lib/libcolamd.so.3",
+        "_rocm_sdk_core/lib/host-math/lib/librocm-openblas.so.0",
+        "_rocm_sdk_core/lib/host-math/lib/librocm-openblas64.so.0",
+        "_rocm_sdk_core/lib/host-math/lib/libsuitesparseconfig.so.7",
+        "_rocm_sdk_core/lib/libamd_comgr.so.3",
+        "_rocm_sdk_core/lib/libamd_smi.so.27",
+        "_rocm_sdk_core/lib/libamdhip64.so.7",
+        "_rocm_sdk_core/lib/libcltrace.so",
+        "_rocm_sdk_core/lib/libgoamdsmi_shim64.so.1",
+        "_rocm_sdk_core/lib/libhipfile.so.0",
+        "_rocm_sdk_core/lib/libhiprtc-builtins.so.7",
+        "_rocm_sdk_core/lib/libhiprtc.so.7",
+        "_rocm_sdk_core/lib/libhsa-amd-aqlprofile64.so.1",
+        "_rocm_sdk_core/lib/libhsa-runtime64.so.1",
+        "_rocm_sdk_core/lib/libhsa_hotswap_rocjitsu.so",
+        "_rocm_sdk_core/lib/liboam.so.1",
+        "_rocm_sdk_core/lib/librocdecode.so.1",
+        "_rocm_sdk_core/lib/librocdxg.so.1",
+        "_rocm_sdk_core/lib/librocjpeg.so.1",
+        "_rocm_sdk_core/lib/librocm-core.so.1",
+        "_rocm_sdk_core/lib/librocm-dbgapi.so.0",
+        "_rocm_sdk_core/lib/librocm-debug-agent.so.2",
+        "_rocm_sdk_core/lib/librocm_kpack.so.0",
+        "_rocm_sdk_core/lib/librocm_smi64.so.1",
+        "_rocm_sdk_core/lib/librocprof-trace-decoder.so.0.2",
+        "_rocm_sdk_core/lib/librocprofiler-register.so.0",
+        "_rocm_sdk_core/lib/librocprofiler-sdk-attach.so.1",
+        "_rocm_sdk_core/lib/librocprofiler-sdk-rocattach.so.1",
+        "_rocm_sdk_core/lib/librocprofiler-sdk-rocpd.so.1",
+        "_rocm_sdk_core/lib/librocprofiler-sdk-roctx.so.1",
+        "_rocm_sdk_core/lib/librocprofiler-sdk.so.1",
+        "_rocm_sdk_core/lib/libroctracer64.so.4",
+        "_rocm_sdk_core/lib/libroctx64.so.4",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.asan-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.dyndd-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.hwasan-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.hwasan_aliases-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.memprof-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.nsan-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.scudo_standalone-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.tsan-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.ubsan_minimal-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.ubsan_standalone-x86_64.so",
+        "_rocm_sdk_core/lib/llvm/lib/libLLVM.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libLLVMOffload.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libMLIR.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libMLIRExecutionEngineShared.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libarcher.so",
+        "_rocm_sdk_core/lib/llvm/lib/libclang-cpp.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libclang.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_apfloat_wrappers.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_arm_runner_utils.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_arm_sme_abi_stubs.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_async_runtime.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_c_runner_utils.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_float16_utils.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_runner_utils.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libomp.so",
+        "_rocm_sdk_core/lib/llvm/lib/libomptarget.so.23.0git",
+        "_rocm_sdk_core/lib/llvm/lib/libunwind.so.1",
+        "_rocm_sdk_core/lib/opencl/libamdocl64.so.2",
+        "_rocm_sdk_core/lib/python3.10/site-packages/rocpd/libpyrocpd.cpython-310-x86_64-linux-gnu.so",
+        "_rocm_sdk_core/lib/python3.10/site-packages/roctx/libpyroctx.cpython-310-x86_64-linux-gnu.so",
+        "_rocm_sdk_core/lib/python3.11/site-packages/rocpd/libpyrocpd.cpython-311-x86_64-linux-gnu.so",
+        "_rocm_sdk_core/lib/python3.11/site-packages/roctx/libpyroctx.cpython-311-x86_64-linux-gnu.so",
+        "_rocm_sdk_core/lib/python3.12/site-packages/rocpd/libpyrocpd.cpython-312-x86_64-linux-gnu.so",
+        "_rocm_sdk_core/lib/python3.12/site-packages/roctx/libpyroctx.cpython-312-x86_64-linux-gnu.so",
+        "_rocm_sdk_core/lib/python3.13/site-packages/rocpd/libpyrocpd.cpython-313-x86_64-linux-gnu.so",
+        "_rocm_sdk_core/lib/python3.13/site-packages/roctx/libpyroctx.cpython-313-x86_64-linux-gnu.so",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_asm.so.1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_blkid.so.1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_cap.so.2",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_dw.so.1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so.1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_expat.so.1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_formw.so.6",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_gallium_drv_video.so",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_gmp.so.10",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_menuw.so.6",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_mnl.so.0",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_mount.so.1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_mpfr.so.6",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_ncursesw.so.6",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_3.so.200",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_genl_3.so.200",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_idiag_3.so.200",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_nf_3.so.200",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_route_3.so.200",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_xfrm_3.so.200",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so.1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_panelw.so.6",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_psx.so.2",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_sqlite3.so",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_va-drm.so.2",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_va.so.2",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1",
+        "_rocm_sdk_core/lib/rocprofiler-sdk/libgotcha.so.3",
+        "_rocm_sdk_core/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so.1",
+        "_rocm_sdk_core/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1",
+        "_rocm_sdk_core/lib/rocprofiler-sdk/librocprofv3-list-avail.so.1",
+        "_rocm_sdk_core/lib/roctracer/libfile_plugin.so",
+        "_rocm_sdk_core/lib/roctracer/libhip_stats.so",
+        "_rocm_sdk_core/lib/roctracer/libroctracer_tool.so",
+        "_rocm_sdk_core/share/opencl/ocltst/liboclperf.so",
+        "_rocm_sdk_core/share/opencl/ocltst/liboclruntime.so",
+        "_rocm_sdk_core/share/roctracer/test/libcodeobj_test.so"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_core/lib/host-math/lib/libamd.so.3": "21ec7d19b07b127415ea39a4e0d3ed811c8ce62775fc03be955804b20c95c7d2",
+        "_rocm_sdk_core/lib/host-math/lib/libcamd.so.3": "a2a6421a41f9a7d6725d582b869b1974f7152ccdc149101fe8ff6416a3c6b4f8",
+        "_rocm_sdk_core/lib/host-math/lib/libccolamd.so.3": "51009a141ee3d60db6ad6fa8807eafd604964dbd9ac44671ddd02d806a7cb457",
+        "_rocm_sdk_core/lib/host-math/lib/libcholmod.so.5": "c08c8fcd0649dcb48bee36d6d5faeb39cdc76061fe5c6a55ea1f75179bcea093",
+        "_rocm_sdk_core/lib/host-math/lib/libcolamd.so.3": "d154a720c87a10d6f5a049e81a94633ba61b7633bf9b5d6e014d6680c6c601f9",
+        "_rocm_sdk_core/lib/host-math/lib/librocm-openblas.so.0": "9cece27317b59d70fc6737185757f2c1d0eb76f6fa01bafd7cbc40a064d0839a",
+        "_rocm_sdk_core/lib/host-math/lib/librocm-openblas64.so.0": "9a98e26296be3cac483b5f14c1bdb00d6140dfb2df66972136931258bc55f401",
+        "_rocm_sdk_core/lib/host-math/lib/libsuitesparseconfig.so.7": "cc51423d5e9ac2eee884a3752d101d7a3109e3d7d311f44d492687c4469cda08",
+        "_rocm_sdk_core/lib/libamd_comgr.so.3": "f18da4b1298b9c6f3eaa595365fb234922e6a5784861e6612f92eedde47331da",
+        "_rocm_sdk_core/lib/libamd_smi.so.27": "473ca05d6c3e94b06165c4cda23b977f053960ec107f596267ac0ebeeda8b74c",
+        "_rocm_sdk_core/lib/libamdhip64.so.7": "2f5b1183ef219416a48ef5cf734d6bf570aef1c44656bcd274ae25f58c5e0255",
+        "_rocm_sdk_core/lib/libcltrace.so": "b74643fc4fb49de8b801e4f46d0f85ea4a934cebc80f7591db149d8458287c59",
+        "_rocm_sdk_core/lib/libgoamdsmi_shim64.so.1": "e3bc0d25fcd11860ee5ed05e82ccd71f2af92ab4aab33cda212820dd52d09a69",
+        "_rocm_sdk_core/lib/libhipfile.so.0": "566962f0049615dad2d47e9ad26c7d3d63d3c5ecf6bd97bf8e2b360b574b7416",
+        "_rocm_sdk_core/lib/libhiprtc-builtins.so.7": "a73a99e378b7a7ab902c7ba458a7fcf586ac4bab86c4fcab822481278a78446e",
+        "_rocm_sdk_core/lib/libhiprtc.so.7": "151d8d6e52315b4dc0ed93ae6a8eeb627add6ac6c9dca5f980c324a5f2207776",
+        "_rocm_sdk_core/lib/libhsa-amd-aqlprofile64.so.1": "0001175c61c8ad3491e75a12a056697261b6ffe86b3bdd65c153834602f1b686",
+        "_rocm_sdk_core/lib/libhsa-runtime64.so.1": "8d0ee4185817979a671f9985dc65efde0be089ec30f967ed9abbb860eeece97e",
+        "_rocm_sdk_core/lib/libhsa_hotswap_rocjitsu.so": "f1d4ed00a7be5d91027a56f05ce02abd31dc8d69ec8049fb471ba576285d44a3",
+        "_rocm_sdk_core/lib/liboam.so.1": "98621f07350524495df4aae475ae3af26685c8059b298a620ecb1d55c42b14e1",
+        "_rocm_sdk_core/lib/librocdecode.so.1": "a32926989c7d3236ca85af4d629d8bb9fe3da09ca62e74fdf40ff2467084502a",
+        "_rocm_sdk_core/lib/librocdxg.so.1": "0de8e26350933754d3d9ead9446c39e04792a2bef68d1b6df97950d07312b9d6",
+        "_rocm_sdk_core/lib/librocjpeg.so.1": "20f0fd6d49d8f57bf4f327c9d6fbd91c0f5246a68ebcb896c206dedb9cddfa30",
+        "_rocm_sdk_core/lib/librocm-core.so.1": "c68e5ff262f09bd6526638b2f5cf2a8e3c0378720c2751b5c5a9b6043bb98696",
+        "_rocm_sdk_core/lib/librocm-dbgapi.so.0": "ffdfcc6152692ff63956029c4ed312c6004b9c8eea3783eb0efdf0bb87832a0c",
+        "_rocm_sdk_core/lib/librocm-debug-agent.so.2": "75c3b80b7ba8125207dacc787f398f6949801d47ee5f06c130cd49263447a962",
+        "_rocm_sdk_core/lib/librocm_kpack.so.0": "fc0e0284de21f72abada2eeba340ed9bd69ddadb299940bcbf9c2f8b95f3fbae",
+        "_rocm_sdk_core/lib/librocm_smi64.so.1": "0b3fb066abf6285adcbfb7d2dd3814d9058bee9032663a2ac1a2f26c72c2828a",
+        "_rocm_sdk_core/lib/librocprof-trace-decoder.so.0.2": "09a09ce2cfa8c1e5c614fcdbd961284b85da38f9f901783b9c86e3b3fdefbcc9",
+        "_rocm_sdk_core/lib/librocprofiler-register.so.0": "5c1090a94786d3618a3f72fac2a4982e259014817c7c160bac95c1bf56d765ae",
+        "_rocm_sdk_core/lib/librocprofiler-sdk-attach.so.1": "34f0e57f4054949b9393e00b16eb44655eed4558b957740c2568fd873a8b6156",
+        "_rocm_sdk_core/lib/librocprofiler-sdk-rocattach.so.1": "05f5a6d9659f47bff5de6d7f39ce8e469a96a6e840215317dfbc2ab9eff45c92",
+        "_rocm_sdk_core/lib/librocprofiler-sdk-rocpd.so.1": "a81b42dc5c0b4dc9c605efbbbf458708974009f829c400f63835d4e613de9267",
+        "_rocm_sdk_core/lib/librocprofiler-sdk-roctx.so.1": "838f7a5716987de5fbb827cd145b23fedf4e76410e981343adfa00468a4c5eb8",
+        "_rocm_sdk_core/lib/librocprofiler-sdk.so.1": "4f72942e2506d854ca9a302582df61f02bc2e66a011aa4e7755c5148f954c923",
+        "_rocm_sdk_core/lib/libroctracer64.so.4": "de72fa0b626c3fb1b88368aea70b9337eebb354fdb567e0777068f463a6a5fcf",
+        "_rocm_sdk_core/lib/libroctx64.so.4": "14ce403f9c3a3c42603e2655ed9baa4404edcd0876aca2f86ecd1035421702aa",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.asan-x86_64.so": "3ae20e0b14a70c5dcb97dcaa8d0043e02ce48255b677399511dab1b9abc59ebb",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.dyndd-x86_64.so": "c8815b1e77eaed3719fa914e3252718c929ee150afe1d0ebca26be5e26530e16",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.hwasan-x86_64.so": "a9f319ab07eeae8cac32c08ff849ac23acff610660a1fa3f0ec9a1304f6b625e",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.hwasan_aliases-x86_64.so": "e829b2636c2eed221ee6b2204ac4793980ab42d552fae4337a6ce0f19438b92b",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.memprof-x86_64.so": "ca2157f2926a08226288e4fef72c8abed0ae51bfbcd714c60c6e57315125f123",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.nsan-x86_64.so": "a943314619dd91b7e4f376c7ba8514cc78d231b23813ac27dc8e4a397b8035b3",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.scudo_standalone-x86_64.so": "2dfa9c7d24e6ef4857203ce17d4a991400dffb62fc36bf0d8c196de08ad17feb",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.tsan-x86_64.so": "33f45b26ed25c9e83cb0a57a8e028c3a61d9e5a1ce7bc1e9789e7ecab28beb95",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.ubsan_minimal-x86_64.so": "0600addc2d807dceff300e27230a649cd205b5fd3a98b26de5553abd51f258ba",
+        "_rocm_sdk_core/lib/llvm/lib/clang/23/lib/linux/libclang_rt.ubsan_standalone-x86_64.so": "1bcf1f844f060042b8fc637783f8a699f87eca046af04ba478756b2d62f6c55f",
+        "_rocm_sdk_core/lib/llvm/lib/libLLVM.so.23.0git": "2c66b0bd3190c42e51dccee627e81fb5d6d6b57d631b10959c5967acc2bbe1ae",
+        "_rocm_sdk_core/lib/llvm/lib/libLLVMOffload.so.23.0git": "6b26d1246f3bc7435cbf6126f169141184f753820ba60adf94a84e506e0908cc",
+        "_rocm_sdk_core/lib/llvm/lib/libMLIR.so.23.0git": "521fad43112a981986295104d53863e34b5b50781f65fdf8316999b26464fd54",
+        "_rocm_sdk_core/lib/llvm/lib/libMLIRExecutionEngineShared.so.23.0git": "5a9308ae3c18ab384b8e3f82cd967586dce15d8685b6b056f421af48f77dd882",
+        "_rocm_sdk_core/lib/llvm/lib/libarcher.so": "3386a91b2d8c6e25f84d0cc045621a3918cb28428454de87ec240cb0a6fc2c0c",
+        "_rocm_sdk_core/lib/llvm/lib/libclang-cpp.so.23.0git": "9fd457eede5fd689edb3ce8302b3fcc80be336915d487a46c434dd0fc3e7582c",
+        "_rocm_sdk_core/lib/llvm/lib/libclang.so.23.0git": "f58e6191fe9ccfa14fd6348b90948f4a63e6cb1635315ce76f89544c06684a75",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_apfloat_wrappers.so.23.0git": "99f74f8500b4d1bd8fad1de2c1339672bf8dcae57d518f0249a1c69bb516c2ee",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_arm_runner_utils.so.23.0git": "8ad2a6df8a5f5a9df157debf8e4861eae44e3b08f0ada71b199087d8e576e031",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_arm_sme_abi_stubs.so.23.0git": "383307c1dabe4197e2430d77044f627996ee21b1464531d296383ad0b87f0e2a",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_async_runtime.so.23.0git": "6a9d90f8d5b0d998daf87bfc2cc6399979abed64d629991709077e64950897cd",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_c_runner_utils.so.23.0git": "adb233797505d1970ac664e73ca465dc82b7043d25ab7f9049beb86d39b19b5b",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_float16_utils.so.23.0git": "1ed7962c58fcab7570cc8e4540111ab1f620057ca5968926e5e9cdd9a169b18d",
+        "_rocm_sdk_core/lib/llvm/lib/libmlir_runner_utils.so.23.0git": "95c52db56f857059c6d8d3c3f9cced61260c5df737488b49480afe52ffefda3b",
+        "_rocm_sdk_core/lib/llvm/lib/libomp.so": "ce8ede9d19ed228073c6cd0dba8a6ee5779d5a92f5c1519c126e67fe24190d3b",
+        "_rocm_sdk_core/lib/llvm/lib/libomptarget.so.23.0git": "16b650805cc43ec0c7f5b6cb632e526fedefd444e907ca98bef5bb9405a12e82",
+        "_rocm_sdk_core/lib/llvm/lib/libunwind.so.1": "a052c402ebe3930568631f2271010a96fdcf1313995322bf5feefe508801bfdb",
+        "_rocm_sdk_core/lib/opencl/libamdocl64.so.2": "4aa4708e4b993477296af2f452a00aa505f54b4a40fc6daaa1bcf3dbb3c08b9b",
+        "_rocm_sdk_core/lib/python3.10/site-packages/rocpd/libpyrocpd.cpython-310-x86_64-linux-gnu.so": "ceec2af839b69412cde11c3c3228e0efea01265731544aed7634d67a03d7546f",
+        "_rocm_sdk_core/lib/python3.10/site-packages/roctx/libpyroctx.cpython-310-x86_64-linux-gnu.so": "19409b89a5fba5295559ecec9751bfa58c1ac03016b6eb92aa11c67e3b1df544",
+        "_rocm_sdk_core/lib/python3.11/site-packages/rocpd/libpyrocpd.cpython-311-x86_64-linux-gnu.so": "9bbbedd9671a8bfd049911e2195de9e7cde363a0638ef966ab287846dac6ffba",
+        "_rocm_sdk_core/lib/python3.11/site-packages/roctx/libpyroctx.cpython-311-x86_64-linux-gnu.so": "ad35145a733b5ae864e5c53b21f2fc11d64c1422e167e949c077cb41c7a9919b",
+        "_rocm_sdk_core/lib/python3.12/site-packages/rocpd/libpyrocpd.cpython-312-x86_64-linux-gnu.so": "af232d1122455049bb19cf570bfee1ef13cd2dc622b1a3e0eacebdba073e6db7",
+        "_rocm_sdk_core/lib/python3.12/site-packages/roctx/libpyroctx.cpython-312-x86_64-linux-gnu.so": "23803fd8a68f3823f77a2ce83857970c0c05f037652b48dcdf378dde636af389",
+        "_rocm_sdk_core/lib/python3.13/site-packages/rocpd/libpyrocpd.cpython-313-x86_64-linux-gnu.so": "8df0c861c9931c5808c6cb37fce15d9b813c92a62c59c0605e65a550fd01b56f",
+        "_rocm_sdk_core/lib/python3.13/site-packages/roctx/libpyroctx.cpython-313-x86_64-linux-gnu.so": "83890f989ea8b810ee3bca6fef9825b75d95ea0e405a6b6e0e3c516b5687d570",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_asm.so.1": "01b8e75c5690e7a16adddda2b68b0ddd7626a5be26f3e66b8a5903fa53d8fd69",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_blkid.so.1": "0f8753ae5230a98cf67461bd47b648727c08cdd7d2000116a96a8f7bdf2e1d57",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so": "37a39b12a7e6e9f480d10e5e139b9aedbe5824e63b6b9e12a16837baee608602",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_cap.so.2": "6871c213492e1ce4a1879ddc5a6a3f08dbe69bf7d687af4c8c15f8b732bf840d",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2": "b715ae24e1d62e407ffceca56b546e8a35abe37ac50878cbb16fa8b93d9c9fd5",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1": "163acff64693b08e0f88fcaee4745f67134e38a45886fed21f6ed317dab2d1c9",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_dw.so.1": "8abfa6a917816a0c3c4593b4fc4ed6cc3c7a5e4221e8610ced7bddbdce02325e",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so.1": "692dd9fe3575a45df78b319ad0e2a58ee36814958771dd810d5d91f9616c6d8f",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_expat.so.1": "bb1d8f0efe426deef8aa19337d7b686f8f3340a303893470db86c752d33266e2",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_formw.so.6": "acae3040a0c29d24ed384809fc249dae25f5d1115d2d2ec6c33f64c7802b1787",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_gallium_drv_video.so": "11b4af5e3e498feefe67761a3a1f031860a181c57ab0a0579919b4858348626d",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_gmp.so.10": "fbbf412d1c1a15c7c98778f11a56502deecbeb23384beec9235f2e77c9398af8",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5": "d17f947bfe3947db5aefee897f6d32dfe98c73bf80b477764ba7f4107594a671",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_menuw.so.6": "00f7284b163c6d82c8bc4839c776467e06776de49c4aff4292d41331d020f498",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_mnl.so.0": "655dd505f51e4f1521d0906f3f9f4236067f7cd4d1e8425e11d61d7c2c8f1bef",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_mount.so.1": "7731c04a54d2054a0df10f4c125d9cc09326e979946769bf0d3732e2bf745ee0",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_mpfr.so.6": "99dfcf2ac94dfa729d7edc89428aec7905e4edb1af565eb65e29f75746d2236a",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_ncursesw.so.6": "64ac51912f700b012f22743e9f7c2d043bca8d29f75f07b3a15797b0b9ee93fb",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_3.so.200": "1d0214a1317e419c07186f39bb8317d237ddccea87cf8c1057d90c43465032d2",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_genl_3.so.200": "7b6e8c7592bf22237e47b6432ecf9d4fa94885d3f0a32615fffb87e54a762c76",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_idiag_3.so.200": "a26e6719dd20f82a5a9ad7df2a35562f03525f0b253d916b50da4f4fc10931d1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_nf_3.so.200": "c19f86823cee66a18a006c9e13c66294956fca4729940d234f64f67c1fee2481",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_route_3.so.200": "2837536541e49bc8b00fa66d2c9076ca8fe0e304d916289c2bea0c5745641a28",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_xfrm_3.so.200": "6139453dead48028656fe4602b21e9b542eab03a82781f18bb74d415e781d15c",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so.1": "26fffd0f85369950b834cfb8f56fa9e1ea4804be8bbc40db98b788c554802bc3",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_panelw.so.6": "88ae0d76bb0300ed8273d828541d0cf6d40269ecfecc388d58dfe20dc8485662",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_psx.so.2": "bf9d482693e30d343d12d977f224e0cf4f66bd2a1c3b52ad80c71993568925a1",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_sqlite3.so": "c740ce45ed1dbe5492d2583fa6db692a888937e4dccd4760103e9b8a3e9802e7",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_va-drm.so.2": "fe5eed1fb6cdf78f76ba14d0405153400322337a028f5b6e57e1b8fff9ad4679",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_va.so.2": "a91d40aaed815cfe7ffbee9613949d20f8f883d03081a73db15462e9c9e9dc87",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1": "e1d7568f4a0b77eeab26f30cc9d2794dfe7ffd14e34b4ae55a9f80bc4f94ba7a",
+        "_rocm_sdk_core/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1": "fc3edd0b74fa071079b0095abe7b3f41418ca39be138f4ec0c57d0640a0b2d8b",
+        "_rocm_sdk_core/lib/rocprofiler-sdk/libgotcha.so.3": "962f418f64e63666eaac637ac3e8ba7cd371c3dc08d3b58667f39cd78293e167",
+        "_rocm_sdk_core/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so.1": "ff8f91c8282a3ecc59332694399e935f426188b008aafcd602c46f5ae7fc7c89",
+        "_rocm_sdk_core/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1": "45e06e46136af6f15bbc2cb1c621d70faa2e716e5634e4fef3d83ff658043231",
+        "_rocm_sdk_core/lib/rocprofiler-sdk/librocprofv3-list-avail.so.1": "a0ffcc7aa9e6e50c23f7a065b575bb85c62ab17a3437d15d5ef2f1bfc64b229c",
+        "_rocm_sdk_core/lib/roctracer/libfile_plugin.so": "a81ac4c8f1d7356ba508d50111eba0f491473ac5864eecc2d01f7c6672b37cdd",
+        "_rocm_sdk_core/lib/roctracer/libhip_stats.so": "0c4311c6def26e295fc05abf53b559ee8bb24ad6dcf4ff83aeab896c69294c2f",
+        "_rocm_sdk_core/lib/roctracer/libroctracer_tool.so": "2420001affa4ed3b4d1e835076d14111f5453c38498d20f9e518f501e737ce82",
+        "_rocm_sdk_core/share/opencl/ocltst/liboclperf.so": "607ac8ec5170b00eebed1a362582f86b9750f758afcc35e35fdadfc8c368ad56",
+        "_rocm_sdk_core/share/opencl/ocltst/liboclruntime.so": "c945514d9171be3130cf558ad9ff3372dbc42b1280a807f2c115f9c1a828c23a",
+        "_rocm_sdk_core/share/roctracer/test/libcodeobj_test.so": "c8d555c1a95f7a680c31c3b4c3143de030cd2eb0673e4f92f127352d83b83c8f"
+      },
+      "provider_name": "rocm-sdk-core",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-devel": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "150c095fe782af16c2751c2b55a8326496af6076b7b2391ce13dbdb99eeeb63c",
+        "count": 17208
+      },
+      "native_so": [
+        "_rocm_sdk_devel/lib/hipdnn_plugins/engines/libhip_kernel_provider.so",
+        "_rocm_sdk_devel/lib/hipdnn_plugins/engines/libhipblaslt_plugin.so",
+        "_rocm_sdk_devel/lib/hipdnn_plugins/engines/libmiopen_plugin.so",
+        "_rocm_sdk_devel/lib/host-math/lib/libamd.so",
+        "_rocm_sdk_devel/lib/host-math/lib/libamd.so.3",
+        "_rocm_sdk_devel/lib/host-math/lib/libamd.so.3.3.3",
+        "_rocm_sdk_devel/lib/host-math/lib/libcamd.so",
+        "_rocm_sdk_devel/lib/host-math/lib/libcamd.so.3",
+        "_rocm_sdk_devel/lib/host-math/lib/libcamd.so.3.3.3",
+        "_rocm_sdk_devel/lib/host-math/lib/libccolamd.so",
+        "_rocm_sdk_devel/lib/host-math/lib/libccolamd.so.3",
+        "_rocm_sdk_devel/lib/host-math/lib/libccolamd.so.3.3.4",
+        "_rocm_sdk_devel/lib/host-math/lib/libcholmod.so",
+        "_rocm_sdk_devel/lib/host-math/lib/libcholmod.so.5",
+        "_rocm_sdk_devel/lib/host-math/lib/libcholmod.so.5.3.0",
+        "_rocm_sdk_devel/lib/host-math/lib/libcolamd.so",
+        "_rocm_sdk_devel/lib/host-math/lib/libcolamd.so.3",
+        "_rocm_sdk_devel/lib/host-math/lib/libcolamd.so.3.3.4",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas.so",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas.so.0",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas.so.0.3",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas64.so",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas64.so.0",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas64.so.0.3",
+        "_rocm_sdk_devel/lib/host-math/lib/libsuitesparseconfig.so",
+        "_rocm_sdk_devel/lib/host-math/lib/libsuitesparseconfig.so.7",
+        "_rocm_sdk_devel/lib/host-math/lib/libsuitesparseconfig.so.7.8.3",
+        "_rocm_sdk_devel/lib/libMIOpen.so",
+        "_rocm_sdk_devel/lib/libMIOpen.so.1",
+        "_rocm_sdk_devel/lib/libMIOpen.so.1.0",
+        "_rocm_sdk_devel/lib/libamd_comgr.so",
+        "_rocm_sdk_devel/lib/libamd_comgr.so.3",
+        "_rocm_sdk_devel/lib/libamd_comgr.so.3.3.0",
+        "_rocm_sdk_devel/lib/libamd_smi.so",
+        "_rocm_sdk_devel/lib/libamd_smi.so.27",
+        "_rocm_sdk_devel/lib/libamd_smi.so.27.0.0",
+        "_rocm_sdk_devel/lib/libamdhip64.so",
+        "_rocm_sdk_devel/lib/libamdhip64.so.7",
+        "_rocm_sdk_devel/lib/libamdhip64.so.7.15.26333-0000000",
+        "_rocm_sdk_devel/lib/libcltrace.so",
+        "_rocm_sdk_devel/lib/libgoamdsmi_shim64.so",
+        "_rocm_sdk_devel/lib/libgoamdsmi_shim64.so.1",
+        "_rocm_sdk_devel/lib/libgoamdsmi_shim64.so.1.0",
+        "_rocm_sdk_devel/lib/libhipblas.so",
+        "_rocm_sdk_devel/lib/libhipblas.so.3",
+        "_rocm_sdk_devel/lib/libhipblas.so.3.6",
+        "_rocm_sdk_devel/lib/libhipblaslt.so",
+        "_rocm_sdk_devel/lib/libhipblaslt.so.1",
+        "_rocm_sdk_devel/lib/libhipblaslt.so.1.4",
+        "_rocm_sdk_devel/lib/libhipdnn_backend.so",
+        "_rocm_sdk_devel/lib/libhipfft.so",
+        "_rocm_sdk_devel/lib/libhipfft.so.0",
+        "_rocm_sdk_devel/lib/libhipfft.so.0.1",
+        "_rocm_sdk_devel/lib/libhipfftw.so",
+        "_rocm_sdk_devel/lib/libhipfftw.so.0",
+        "_rocm_sdk_devel/lib/libhipfftw.so.0.1",
+        "_rocm_sdk_devel/lib/libhipfile.so",
+        "_rocm_sdk_devel/lib/libhipfile.so.0",
+        "_rocm_sdk_devel/lib/libhipfile.so.0.4.0",
+        "_rocm_sdk_devel/lib/libhiprand.so",
+        "_rocm_sdk_devel/lib/libhiprand.so.1",
+        "_rocm_sdk_devel/lib/libhiprand.so.1.1",
+        "_rocm_sdk_devel/lib/libhiprtc-builtins.so",
+        "_rocm_sdk_devel/lib/libhiprtc-builtins.so.7",
+        "_rocm_sdk_devel/lib/libhiprtc-builtins.so.7.15.26333-0000000",
+        "_rocm_sdk_devel/lib/libhiprtc.so",
+        "_rocm_sdk_devel/lib/libhiprtc.so.7",
+        "_rocm_sdk_devel/lib/libhiprtc.so.7.15.26333-0000000",
+        "_rocm_sdk_devel/lib/libhipsolver.so",
+        "_rocm_sdk_devel/lib/libhipsolver.so.1",
+        "_rocm_sdk_devel/lib/libhipsolver.so.1.3",
+        "_rocm_sdk_devel/lib/libhipsparse.so",
+        "_rocm_sdk_devel/lib/libhipsparse.so.4",
+        "_rocm_sdk_devel/lib/libhipsparse.so.4.7.0",
+        "_rocm_sdk_devel/lib/libhipsparselt.so",
+        "_rocm_sdk_devel/lib/libhipsparselt.so.0",
+        "_rocm_sdk_devel/lib/libhipsparselt.so.0.2",
+        "_rocm_sdk_devel/lib/libhsa-amd-aqlprofile64.so",
+        "_rocm_sdk_devel/lib/libhsa-amd-aqlprofile64.so.1",
+        "_rocm_sdk_devel/lib/libhsa-amd-aqlprofile64.so.1.0.0",
+        "_rocm_sdk_devel/lib/libhsa-runtime64.so",
+        "_rocm_sdk_devel/lib/libhsa-runtime64.so.1",
+        "_rocm_sdk_devel/lib/libhsa-runtime64.so.1.21.0",
+        "_rocm_sdk_devel/lib/libhsa_hotswap_rocjitsu.so",
+        "_rocm_sdk_devel/lib/liboam.so",
+        "_rocm_sdk_devel/lib/liboam.so.1",
+        "_rocm_sdk_devel/lib/liboam.so.1.0",
+        "_rocm_sdk_devel/lib/liborigami.so",
+        "_rocm_sdk_devel/lib/liborigami.so.1",
+        "_rocm_sdk_devel/lib/liborigami.so.1.0",
+        "_rocm_sdk_devel/lib/librccl.so",
+        "_rocm_sdk_devel/lib/librccl.so.1",
+        "_rocm_sdk_devel/lib/librccl.so.1.0",
+        "_rocm_sdk_devel/lib/librocblas.so",
+        "_rocm_sdk_devel/lib/librocblas.so.5",
+        "_rocm_sdk_devel/lib/librocblas.so.5.6",
+        "_rocm_sdk_devel/lib/librocdecode.so",
+        "_rocm_sdk_devel/lib/librocdecode.so.1",
+        "_rocm_sdk_devel/lib/librocdecode.so.1.9.0",
+        "_rocm_sdk_devel/lib/librocdxg.so",
+        "_rocm_sdk_devel/lib/librocdxg.so.1",
+        "_rocm_sdk_devel/lib/librocdxg.so.1.1.0",
+        "_rocm_sdk_devel/lib/librocfft.so",
+        "_rocm_sdk_devel/lib/librocfft.so.0",
+        "_rocm_sdk_devel/lib/librocfft.so.0.1",
+        "_rocm_sdk_devel/lib/librocjitsu.so",
+        "_rocm_sdk_devel/lib/librocjpeg.so",
+        "_rocm_sdk_devel/lib/librocjpeg.so.1",
+        "_rocm_sdk_devel/lib/librocjpeg.so.1.7.0",
+        "_rocm_sdk_devel/lib/librocm-core.so",
+        "_rocm_sdk_devel/lib/librocm-core.so.1",
+        "_rocm_sdk_devel/lib/librocm-core.so.1.0.100000",
+        "_rocm_sdk_devel/lib/librocm-dbgapi.so",
+        "_rocm_sdk_devel/lib/librocm-dbgapi.so.0",
+        "_rocm_sdk_devel/lib/librocm-dbgapi.so.0.80.0",
+        "_rocm_sdk_devel/lib/librocm-debug-agent.so",
+        "_rocm_sdk_devel/lib/librocm-debug-agent.so.2",
+        "_rocm_sdk_devel/lib/librocm-debug-agent.so.2.1.0",
+        "_rocm_sdk_devel/lib/librocm_kpack.so",
+        "_rocm_sdk_devel/lib/librocm_kpack.so.0",
+        "_rocm_sdk_devel/lib/librocm_kpack.so.0.1.0",
+        "_rocm_sdk_devel/lib/librocm_smi64.so",
+        "_rocm_sdk_devel/lib/librocm_smi64.so.1",
+        "_rocm_sdk_devel/lib/librocm_smi64.so.1.0",
+        "_rocm_sdk_devel/lib/librocprof-trace-decoder.so",
+        "_rocm_sdk_devel/lib/librocprof-trace-decoder.so.0.2",
+        "_rocm_sdk_devel/lib/librocprof-trace-decoder.so.0.2.0",
+        "_rocm_sdk_devel/lib/librocprofiler-register.so",
+        "_rocm_sdk_devel/lib/librocprofiler-register.so.0",
+        "_rocm_sdk_devel/lib/librocprofiler-register.so.0.6.0",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-attach.so",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-attach.so.1",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-attach.so.1.3.5",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocattach.so",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocattach.so.1",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocattach.so.1.3.5",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocpd.so",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocpd.so.1",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocpd.so.1.3.5",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-roctx.so",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-roctx.so.1",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-roctx.so.1.3.5",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk.so",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk.so.1",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk.so.1.3.5",
+        "_rocm_sdk_devel/lib/librocrand.so",
+        "_rocm_sdk_devel/lib/librocrand.so.1",
+        "_rocm_sdk_devel/lib/librocrand.so.1.1",
+        "_rocm_sdk_devel/lib/librocroller.so",
+        "_rocm_sdk_devel/lib/librocroller.so.1",
+        "_rocm_sdk_devel/lib/librocroller.so.1.0.0",
+        "_rocm_sdk_devel/lib/librocsolver.so",
+        "_rocm_sdk_devel/lib/librocsolver.so.0",
+        "_rocm_sdk_devel/lib/librocsolver.so.0.11",
+        "_rocm_sdk_devel/lib/librocsparse.so",
+        "_rocm_sdk_devel/lib/librocsparse.so.1",
+        "_rocm_sdk_devel/lib/librocsparse.so.1.0",
+        "_rocm_sdk_devel/lib/libroctracer64.so",
+        "_rocm_sdk_devel/lib/libroctracer64.so.4",
+        "_rocm_sdk_devel/lib/libroctracer64.so.4.1.0",
+        "_rocm_sdk_devel/lib/libroctx64.so",
+        "_rocm_sdk_devel/lib/libroctx64.so.4",
+        "_rocm_sdk_devel/lib/libroctx64.so.4.1.0",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.asan-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.dyndd-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.hwasan-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.hwasan_aliases-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.memprof-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.nsan-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.scudo_standalone-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.tsan-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.ubsan_minimal-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.ubsan_standalone-x86_64.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVM-23git.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVM.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVM.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVMOffload.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVMOffload.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libMLIR.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libMLIR.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libMLIRExecutionEngineShared.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libMLIRExecutionEngineShared.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libarcher.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang-cpp.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang-cpp.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang.so.23.0.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libgomp.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libgomp.so.1",
+        "_rocm_sdk_devel/lib/llvm/lib/libiomp5.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_apfloat_wrappers.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_apfloat_wrappers.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_arm_runner_utils.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_arm_runner_utils.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_arm_sme_abi_stubs.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_arm_sme_abi_stubs.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_async_runtime.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_async_runtime.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_c_runner_utils.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_c_runner_utils.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_float16_utils.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_float16_utils.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_runner_utils.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_runner_utils.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libomp.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libomptarget.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libomptarget.so.23.0git",
+        "_rocm_sdk_devel/lib/llvm/lib/libunwind.so",
+        "_rocm_sdk_devel/lib/llvm/lib/libunwind.so.1",
+        "_rocm_sdk_devel/lib/llvm/lib/libunwind.so.1.0",
+        "_rocm_sdk_devel/lib/opencl/libamdocl64.so",
+        "_rocm_sdk_devel/lib/opencl/libamdocl64.so.",
+        "_rocm_sdk_devel/lib/opencl/libamdocl64.so.2",
+        "_rocm_sdk_devel/lib/python3.10/site-packages/rocpd/libpyrocpd.cpython-310-x86_64-linux-gnu.so",
+        "_rocm_sdk_devel/lib/python3.10/site-packages/roctx/libpyroctx.cpython-310-x86_64-linux-gnu.so",
+        "_rocm_sdk_devel/lib/python3.11/site-packages/rocpd/libpyrocpd.cpython-311-x86_64-linux-gnu.so",
+        "_rocm_sdk_devel/lib/python3.11/site-packages/roctx/libpyroctx.cpython-311-x86_64-linux-gnu.so",
+        "_rocm_sdk_devel/lib/python3.12/site-packages/rocpd/libpyrocpd.cpython-312-x86_64-linux-gnu.so",
+        "_rocm_sdk_devel/lib/python3.12/site-packages/roctx/libpyroctx.cpython-312-x86_64-linux-gnu.so",
+        "_rocm_sdk_devel/lib/python3.13/site-packages/rocpd/libpyrocpd.cpython-313-x86_64-linux-gnu.so",
+        "_rocm_sdk_devel/lib/python3.13/site-packages/roctx/libpyroctx.cpython-313-x86_64-linux-gnu.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libasm.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libblkid.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libbz2.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libcap.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libdrm.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libdrm_amdgpu.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libdw.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libelf.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libexpat.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libformw.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libgallium_drv_video.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libgmp.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/liblzma.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libmenuw.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libmnl.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libmount.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libmpfr.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libncursesw.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-3.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-genl-3.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-idiag-3.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-nf-3.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-route-3.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-xfrm-3.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnuma.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libpanelw.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libpsx.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_asm.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_blkid.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_cap.so.2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_dw.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_expat.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_formw.so.6",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_gallium_drv_video.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_gmp.so.10",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5.8.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_menuw.so.6",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_mnl.so.0",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_mount.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_mpfr.so.6",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_ncursesw.so.6",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_3.so.200",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_genl_3.so.200",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_idiag_3.so.200",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_nf_3.so.200",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_route_3.so.200",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_xfrm_3.so.200",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_panelw.so.6",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_psx.so.2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_sqlite3.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va-drm.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va-drm.so.2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va-drm.so.2.2200.0",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va.so.2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va.so.2.2200.0",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1.3.2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1.5.7",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libsqlite3.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libva-drm.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libva.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libz.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libzstd.so",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/radeonsi_drv_video.so",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/libgotcha.so",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/libgotcha.so.3",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/libgotcha.so.3.0.0",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so.1",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so.1.3.5",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1.3.5",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofv3-list-avail.so",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofv3-list-avail.so.1",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofv3-list-avail.so.1.3.5",
+        "_rocm_sdk_devel/lib/roctracer/libfile_plugin.so",
+        "_rocm_sdk_devel/lib/roctracer/libhip_stats.so",
+        "_rocm_sdk_devel/lib/roctracer/libroctracer_tool.so",
+        "_rocm_sdk_devel/share/hipblaslt/tensilelite/rocisa/_rocisa.abi3.so",
+        "_rocm_sdk_devel/share/hipblaslt/tensilelite/rocisa/libstinkytofu.so.0",
+        "_rocm_sdk_devel/share/hipblaslt/tensilelite/rocisa/libstinkytofu.so.0.1.0",
+        "_rocm_sdk_devel/share/opencl/ocltst/liboclperf.so",
+        "_rocm_sdk_devel/share/opencl/ocltst/liboclruntime.so",
+        "_rocm_sdk_devel/share/roctracer/test/libcodeobj_test.so"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_devel/lib/hipdnn_plugins/engines/libhip_kernel_provider.so": "c651b0f59e23fca2c869a5ae8ab6e4511f06d5d2b6853df4403ec77380d1e31c",
+        "_rocm_sdk_devel/lib/hipdnn_plugins/engines/libhipblaslt_plugin.so": "af62f7d6306fc828510173ac7cbf070e3d35d74d85e516769fb443d5832130e9",
+        "_rocm_sdk_devel/lib/hipdnn_plugins/engines/libmiopen_plugin.so": "15c0a87f35dcf7c146f8d19125be5aa00b93328a567c910e38bb7ebf727c6ea0",
+        "_rocm_sdk_devel/lib/host-math/lib/libamd.so": "21ec7d19b07b127415ea39a4e0d3ed811c8ce62775fc03be955804b20c95c7d2",
+        "_rocm_sdk_devel/lib/host-math/lib/libamd.so.3": "21ec7d19b07b127415ea39a4e0d3ed811c8ce62775fc03be955804b20c95c7d2",
+        "_rocm_sdk_devel/lib/host-math/lib/libamd.so.3.3.3": "21ec7d19b07b127415ea39a4e0d3ed811c8ce62775fc03be955804b20c95c7d2",
+        "_rocm_sdk_devel/lib/host-math/lib/libcamd.so": "a2a6421a41f9a7d6725d582b869b1974f7152ccdc149101fe8ff6416a3c6b4f8",
+        "_rocm_sdk_devel/lib/host-math/lib/libcamd.so.3": "a2a6421a41f9a7d6725d582b869b1974f7152ccdc149101fe8ff6416a3c6b4f8",
+        "_rocm_sdk_devel/lib/host-math/lib/libcamd.so.3.3.3": "a2a6421a41f9a7d6725d582b869b1974f7152ccdc149101fe8ff6416a3c6b4f8",
+        "_rocm_sdk_devel/lib/host-math/lib/libccolamd.so": "51009a141ee3d60db6ad6fa8807eafd604964dbd9ac44671ddd02d806a7cb457",
+        "_rocm_sdk_devel/lib/host-math/lib/libccolamd.so.3": "51009a141ee3d60db6ad6fa8807eafd604964dbd9ac44671ddd02d806a7cb457",
+        "_rocm_sdk_devel/lib/host-math/lib/libccolamd.so.3.3.4": "51009a141ee3d60db6ad6fa8807eafd604964dbd9ac44671ddd02d806a7cb457",
+        "_rocm_sdk_devel/lib/host-math/lib/libcholmod.so": "c08c8fcd0649dcb48bee36d6d5faeb39cdc76061fe5c6a55ea1f75179bcea093",
+        "_rocm_sdk_devel/lib/host-math/lib/libcholmod.so.5": "c08c8fcd0649dcb48bee36d6d5faeb39cdc76061fe5c6a55ea1f75179bcea093",
+        "_rocm_sdk_devel/lib/host-math/lib/libcholmod.so.5.3.0": "c08c8fcd0649dcb48bee36d6d5faeb39cdc76061fe5c6a55ea1f75179bcea093",
+        "_rocm_sdk_devel/lib/host-math/lib/libcolamd.so": "d154a720c87a10d6f5a049e81a94633ba61b7633bf9b5d6e014d6680c6c601f9",
+        "_rocm_sdk_devel/lib/host-math/lib/libcolamd.so.3": "d154a720c87a10d6f5a049e81a94633ba61b7633bf9b5d6e014d6680c6c601f9",
+        "_rocm_sdk_devel/lib/host-math/lib/libcolamd.so.3.3.4": "d154a720c87a10d6f5a049e81a94633ba61b7633bf9b5d6e014d6680c6c601f9",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas.so": "9cece27317b59d70fc6737185757f2c1d0eb76f6fa01bafd7cbc40a064d0839a",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas.so.0": "9cece27317b59d70fc6737185757f2c1d0eb76f6fa01bafd7cbc40a064d0839a",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas.so.0.3": "9cece27317b59d70fc6737185757f2c1d0eb76f6fa01bafd7cbc40a064d0839a",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas64.so": "9a98e26296be3cac483b5f14c1bdb00d6140dfb2df66972136931258bc55f401",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas64.so.0": "9a98e26296be3cac483b5f14c1bdb00d6140dfb2df66972136931258bc55f401",
+        "_rocm_sdk_devel/lib/host-math/lib/librocm-openblas64.so.0.3": "9a98e26296be3cac483b5f14c1bdb00d6140dfb2df66972136931258bc55f401",
+        "_rocm_sdk_devel/lib/host-math/lib/libsuitesparseconfig.so": "cc51423d5e9ac2eee884a3752d101d7a3109e3d7d311f44d492687c4469cda08",
+        "_rocm_sdk_devel/lib/host-math/lib/libsuitesparseconfig.so.7": "cc51423d5e9ac2eee884a3752d101d7a3109e3d7d311f44d492687c4469cda08",
+        "_rocm_sdk_devel/lib/host-math/lib/libsuitesparseconfig.so.7.8.3": "cc51423d5e9ac2eee884a3752d101d7a3109e3d7d311f44d492687c4469cda08",
+        "_rocm_sdk_devel/lib/libMIOpen.so": "8de9fab9711fea11d6bd6d4bcd7d1897fedb3be2d4a84fcd4e4d6ae6b643b183",
+        "_rocm_sdk_devel/lib/libMIOpen.so.1": "8de9fab9711fea11d6bd6d4bcd7d1897fedb3be2d4a84fcd4e4d6ae6b643b183",
+        "_rocm_sdk_devel/lib/libMIOpen.so.1.0": "8de9fab9711fea11d6bd6d4bcd7d1897fedb3be2d4a84fcd4e4d6ae6b643b183",
+        "_rocm_sdk_devel/lib/libamd_comgr.so": "f18da4b1298b9c6f3eaa595365fb234922e6a5784861e6612f92eedde47331da",
+        "_rocm_sdk_devel/lib/libamd_comgr.so.3": "f18da4b1298b9c6f3eaa595365fb234922e6a5784861e6612f92eedde47331da",
+        "_rocm_sdk_devel/lib/libamd_comgr.so.3.3.0": "f18da4b1298b9c6f3eaa595365fb234922e6a5784861e6612f92eedde47331da",
+        "_rocm_sdk_devel/lib/libamd_smi.so": "473ca05d6c3e94b06165c4cda23b977f053960ec107f596267ac0ebeeda8b74c",
+        "_rocm_sdk_devel/lib/libamd_smi.so.27": "473ca05d6c3e94b06165c4cda23b977f053960ec107f596267ac0ebeeda8b74c",
+        "_rocm_sdk_devel/lib/libamd_smi.so.27.0.0": "473ca05d6c3e94b06165c4cda23b977f053960ec107f596267ac0ebeeda8b74c",
+        "_rocm_sdk_devel/lib/libamdhip64.so": "2f5b1183ef219416a48ef5cf734d6bf570aef1c44656bcd274ae25f58c5e0255",
+        "_rocm_sdk_devel/lib/libamdhip64.so.7": "2f5b1183ef219416a48ef5cf734d6bf570aef1c44656bcd274ae25f58c5e0255",
+        "_rocm_sdk_devel/lib/libamdhip64.so.7.15.26333-0000000": "2f5b1183ef219416a48ef5cf734d6bf570aef1c44656bcd274ae25f58c5e0255",
+        "_rocm_sdk_devel/lib/libcltrace.so": "b74643fc4fb49de8b801e4f46d0f85ea4a934cebc80f7591db149d8458287c59",
+        "_rocm_sdk_devel/lib/libgoamdsmi_shim64.so": "e3bc0d25fcd11860ee5ed05e82ccd71f2af92ab4aab33cda212820dd52d09a69",
+        "_rocm_sdk_devel/lib/libgoamdsmi_shim64.so.1": "e3bc0d25fcd11860ee5ed05e82ccd71f2af92ab4aab33cda212820dd52d09a69",
+        "_rocm_sdk_devel/lib/libgoamdsmi_shim64.so.1.0": "e3bc0d25fcd11860ee5ed05e82ccd71f2af92ab4aab33cda212820dd52d09a69",
+        "_rocm_sdk_devel/lib/libhipblas.so": "fd9e8587412b456e9da10b1be67917376f6088ff8f61c5b132b1e15504883567",
+        "_rocm_sdk_devel/lib/libhipblas.so.3": "fd9e8587412b456e9da10b1be67917376f6088ff8f61c5b132b1e15504883567",
+        "_rocm_sdk_devel/lib/libhipblas.so.3.6": "fd9e8587412b456e9da10b1be67917376f6088ff8f61c5b132b1e15504883567",
+        "_rocm_sdk_devel/lib/libhipblaslt.so": "726921b73776933606610d0d812fcbe4d448423b16057352f7c9902b152cda38",
+        "_rocm_sdk_devel/lib/libhipblaslt.so.1": "726921b73776933606610d0d812fcbe4d448423b16057352f7c9902b152cda38",
+        "_rocm_sdk_devel/lib/libhipblaslt.so.1.4": "726921b73776933606610d0d812fcbe4d448423b16057352f7c9902b152cda38",
+        "_rocm_sdk_devel/lib/libhipdnn_backend.so": "bdb1c199a79975906259569369285f346f35576ed5863210a4786ed68240355d",
+        "_rocm_sdk_devel/lib/libhipfft.so": "9b261169782986f64637849d8ed00a2bf6521573286e24199587505230c5b57f",
+        "_rocm_sdk_devel/lib/libhipfft.so.0": "9b261169782986f64637849d8ed00a2bf6521573286e24199587505230c5b57f",
+        "_rocm_sdk_devel/lib/libhipfft.so.0.1": "9b261169782986f64637849d8ed00a2bf6521573286e24199587505230c5b57f",
+        "_rocm_sdk_devel/lib/libhipfftw.so": "aff8aff7581bb50da105cf49f621bb632e6af3ea74b54f329b19aa8d425e368e",
+        "_rocm_sdk_devel/lib/libhipfftw.so.0": "aff8aff7581bb50da105cf49f621bb632e6af3ea74b54f329b19aa8d425e368e",
+        "_rocm_sdk_devel/lib/libhipfftw.so.0.1": "aff8aff7581bb50da105cf49f621bb632e6af3ea74b54f329b19aa8d425e368e",
+        "_rocm_sdk_devel/lib/libhipfile.so": "566962f0049615dad2d47e9ad26c7d3d63d3c5ecf6bd97bf8e2b360b574b7416",
+        "_rocm_sdk_devel/lib/libhipfile.so.0": "566962f0049615dad2d47e9ad26c7d3d63d3c5ecf6bd97bf8e2b360b574b7416",
+        "_rocm_sdk_devel/lib/libhipfile.so.0.4.0": "566962f0049615dad2d47e9ad26c7d3d63d3c5ecf6bd97bf8e2b360b574b7416",
+        "_rocm_sdk_devel/lib/libhiprand.so": "0a986e44a23fff6f5f9107c4e63eaee71c51af760d9253fd8c23c858dc4bde1e",
+        "_rocm_sdk_devel/lib/libhiprand.so.1": "0a986e44a23fff6f5f9107c4e63eaee71c51af760d9253fd8c23c858dc4bde1e",
+        "_rocm_sdk_devel/lib/libhiprand.so.1.1": "0a986e44a23fff6f5f9107c4e63eaee71c51af760d9253fd8c23c858dc4bde1e",
+        "_rocm_sdk_devel/lib/libhiprtc-builtins.so": "a73a99e378b7a7ab902c7ba458a7fcf586ac4bab86c4fcab822481278a78446e",
+        "_rocm_sdk_devel/lib/libhiprtc-builtins.so.7": "a73a99e378b7a7ab902c7ba458a7fcf586ac4bab86c4fcab822481278a78446e",
+        "_rocm_sdk_devel/lib/libhiprtc-builtins.so.7.15.26333-0000000": "a73a99e378b7a7ab902c7ba458a7fcf586ac4bab86c4fcab822481278a78446e",
+        "_rocm_sdk_devel/lib/libhiprtc.so": "151d8d6e52315b4dc0ed93ae6a8eeb627add6ac6c9dca5f980c324a5f2207776",
+        "_rocm_sdk_devel/lib/libhiprtc.so.7": "151d8d6e52315b4dc0ed93ae6a8eeb627add6ac6c9dca5f980c324a5f2207776",
+        "_rocm_sdk_devel/lib/libhiprtc.so.7.15.26333-0000000": "151d8d6e52315b4dc0ed93ae6a8eeb627add6ac6c9dca5f980c324a5f2207776",
+        "_rocm_sdk_devel/lib/libhipsolver.so": "7e1517c8e2c4f6dd72d99cf649aa91de67682fc34917662432bc4f9f130c65c5",
+        "_rocm_sdk_devel/lib/libhipsolver.so.1": "7e1517c8e2c4f6dd72d99cf649aa91de67682fc34917662432bc4f9f130c65c5",
+        "_rocm_sdk_devel/lib/libhipsolver.so.1.3": "7e1517c8e2c4f6dd72d99cf649aa91de67682fc34917662432bc4f9f130c65c5",
+        "_rocm_sdk_devel/lib/libhipsparse.so": "c9a68218b1fc3a265840b99c440e0f38925a8ec2c54e1c30c951d9ebf53c4c9d",
+        "_rocm_sdk_devel/lib/libhipsparse.so.4": "c9a68218b1fc3a265840b99c440e0f38925a8ec2c54e1c30c951d9ebf53c4c9d",
+        "_rocm_sdk_devel/lib/libhipsparse.so.4.7.0": "c9a68218b1fc3a265840b99c440e0f38925a8ec2c54e1c30c951d9ebf53c4c9d",
+        "_rocm_sdk_devel/lib/libhipsparselt.so": "4d4a26edc5f4913811733777acc3e5d5520a5fe50c91559240fa142013f458f5",
+        "_rocm_sdk_devel/lib/libhipsparselt.so.0": "4d4a26edc5f4913811733777acc3e5d5520a5fe50c91559240fa142013f458f5",
+        "_rocm_sdk_devel/lib/libhipsparselt.so.0.2": "4d4a26edc5f4913811733777acc3e5d5520a5fe50c91559240fa142013f458f5",
+        "_rocm_sdk_devel/lib/libhsa-amd-aqlprofile64.so": "0001175c61c8ad3491e75a12a056697261b6ffe86b3bdd65c153834602f1b686",
+        "_rocm_sdk_devel/lib/libhsa-amd-aqlprofile64.so.1": "0001175c61c8ad3491e75a12a056697261b6ffe86b3bdd65c153834602f1b686",
+        "_rocm_sdk_devel/lib/libhsa-amd-aqlprofile64.so.1.0.0": "0001175c61c8ad3491e75a12a056697261b6ffe86b3bdd65c153834602f1b686",
+        "_rocm_sdk_devel/lib/libhsa-runtime64.so": "8d0ee4185817979a671f9985dc65efde0be089ec30f967ed9abbb860eeece97e",
+        "_rocm_sdk_devel/lib/libhsa-runtime64.so.1": "8d0ee4185817979a671f9985dc65efde0be089ec30f967ed9abbb860eeece97e",
+        "_rocm_sdk_devel/lib/libhsa-runtime64.so.1.21.0": "8d0ee4185817979a671f9985dc65efde0be089ec30f967ed9abbb860eeece97e",
+        "_rocm_sdk_devel/lib/libhsa_hotswap_rocjitsu.so": "f1d4ed00a7be5d91027a56f05ce02abd31dc8d69ec8049fb471ba576285d44a3",
+        "_rocm_sdk_devel/lib/liboam.so": "98621f07350524495df4aae475ae3af26685c8059b298a620ecb1d55c42b14e1",
+        "_rocm_sdk_devel/lib/liboam.so.1": "98621f07350524495df4aae475ae3af26685c8059b298a620ecb1d55c42b14e1",
+        "_rocm_sdk_devel/lib/liboam.so.1.0": "98621f07350524495df4aae475ae3af26685c8059b298a620ecb1d55c42b14e1",
+        "_rocm_sdk_devel/lib/liborigami.so": "b11dd37b06f94fd504dfbb352b7541fb5e72796d426d5c8479fe519ed363099c",
+        "_rocm_sdk_devel/lib/liborigami.so.1": "b11dd37b06f94fd504dfbb352b7541fb5e72796d426d5c8479fe519ed363099c",
+        "_rocm_sdk_devel/lib/liborigami.so.1.0": "b11dd37b06f94fd504dfbb352b7541fb5e72796d426d5c8479fe519ed363099c",
+        "_rocm_sdk_devel/lib/librccl.so": "b35fceb7d28ec201ee2b5b96c6070d7323aa2fd9b606664372e4e833056de7f2",
+        "_rocm_sdk_devel/lib/librccl.so.1": "b35fceb7d28ec201ee2b5b96c6070d7323aa2fd9b606664372e4e833056de7f2",
+        "_rocm_sdk_devel/lib/librccl.so.1.0": "b35fceb7d28ec201ee2b5b96c6070d7323aa2fd9b606664372e4e833056de7f2",
+        "_rocm_sdk_devel/lib/librocblas.so": "c27e2252cc7a4b6e174601a180a169822dcf15a29e634046daecb61498e3bd2a",
+        "_rocm_sdk_devel/lib/librocblas.so.5": "c27e2252cc7a4b6e174601a180a169822dcf15a29e634046daecb61498e3bd2a",
+        "_rocm_sdk_devel/lib/librocblas.so.5.6": "c27e2252cc7a4b6e174601a180a169822dcf15a29e634046daecb61498e3bd2a",
+        "_rocm_sdk_devel/lib/librocdecode.so": "a32926989c7d3236ca85af4d629d8bb9fe3da09ca62e74fdf40ff2467084502a",
+        "_rocm_sdk_devel/lib/librocdecode.so.1": "a32926989c7d3236ca85af4d629d8bb9fe3da09ca62e74fdf40ff2467084502a",
+        "_rocm_sdk_devel/lib/librocdecode.so.1.9.0": "a32926989c7d3236ca85af4d629d8bb9fe3da09ca62e74fdf40ff2467084502a",
+        "_rocm_sdk_devel/lib/librocdxg.so": "0de8e26350933754d3d9ead9446c39e04792a2bef68d1b6df97950d07312b9d6",
+        "_rocm_sdk_devel/lib/librocdxg.so.1": "0de8e26350933754d3d9ead9446c39e04792a2bef68d1b6df97950d07312b9d6",
+        "_rocm_sdk_devel/lib/librocdxg.so.1.1.0": "0de8e26350933754d3d9ead9446c39e04792a2bef68d1b6df97950d07312b9d6",
+        "_rocm_sdk_devel/lib/librocfft.so": "d23db910e05d31b778e58d75c4249bcbe27fce9d971b115ad86a368b163c9346",
+        "_rocm_sdk_devel/lib/librocfft.so.0": "d23db910e05d31b778e58d75c4249bcbe27fce9d971b115ad86a368b163c9346",
+        "_rocm_sdk_devel/lib/librocfft.so.0.1": "d23db910e05d31b778e58d75c4249bcbe27fce9d971b115ad86a368b163c9346",
+        "_rocm_sdk_devel/lib/librocjitsu.so": "5b95ab26b43948559791d3a29596773e5d89869b3991b5c58ccde1949aa74d7d",
+        "_rocm_sdk_devel/lib/librocjpeg.so": "20f0fd6d49d8f57bf4f327c9d6fbd91c0f5246a68ebcb896c206dedb9cddfa30",
+        "_rocm_sdk_devel/lib/librocjpeg.so.1": "20f0fd6d49d8f57bf4f327c9d6fbd91c0f5246a68ebcb896c206dedb9cddfa30",
+        "_rocm_sdk_devel/lib/librocjpeg.so.1.7.0": "20f0fd6d49d8f57bf4f327c9d6fbd91c0f5246a68ebcb896c206dedb9cddfa30",
+        "_rocm_sdk_devel/lib/librocm-core.so": "c68e5ff262f09bd6526638b2f5cf2a8e3c0378720c2751b5c5a9b6043bb98696",
+        "_rocm_sdk_devel/lib/librocm-core.so.1": "c68e5ff262f09bd6526638b2f5cf2a8e3c0378720c2751b5c5a9b6043bb98696",
+        "_rocm_sdk_devel/lib/librocm-core.so.1.0.100000": "c68e5ff262f09bd6526638b2f5cf2a8e3c0378720c2751b5c5a9b6043bb98696",
+        "_rocm_sdk_devel/lib/librocm-dbgapi.so": "ffdfcc6152692ff63956029c4ed312c6004b9c8eea3783eb0efdf0bb87832a0c",
+        "_rocm_sdk_devel/lib/librocm-dbgapi.so.0": "ffdfcc6152692ff63956029c4ed312c6004b9c8eea3783eb0efdf0bb87832a0c",
+        "_rocm_sdk_devel/lib/librocm-dbgapi.so.0.80.0": "ffdfcc6152692ff63956029c4ed312c6004b9c8eea3783eb0efdf0bb87832a0c",
+        "_rocm_sdk_devel/lib/librocm-debug-agent.so": "75c3b80b7ba8125207dacc787f398f6949801d47ee5f06c130cd49263447a962",
+        "_rocm_sdk_devel/lib/librocm-debug-agent.so.2": "75c3b80b7ba8125207dacc787f398f6949801d47ee5f06c130cd49263447a962",
+        "_rocm_sdk_devel/lib/librocm-debug-agent.so.2.1.0": "75c3b80b7ba8125207dacc787f398f6949801d47ee5f06c130cd49263447a962",
+        "_rocm_sdk_devel/lib/librocm_kpack.so": "fc0e0284de21f72abada2eeba340ed9bd69ddadb299940bcbf9c2f8b95f3fbae",
+        "_rocm_sdk_devel/lib/librocm_kpack.so.0": "fc0e0284de21f72abada2eeba340ed9bd69ddadb299940bcbf9c2f8b95f3fbae",
+        "_rocm_sdk_devel/lib/librocm_kpack.so.0.1.0": "fc0e0284de21f72abada2eeba340ed9bd69ddadb299940bcbf9c2f8b95f3fbae",
+        "_rocm_sdk_devel/lib/librocm_smi64.so": "0b3fb066abf6285adcbfb7d2dd3814d9058bee9032663a2ac1a2f26c72c2828a",
+        "_rocm_sdk_devel/lib/librocm_smi64.so.1": "0b3fb066abf6285adcbfb7d2dd3814d9058bee9032663a2ac1a2f26c72c2828a",
+        "_rocm_sdk_devel/lib/librocm_smi64.so.1.0": "0b3fb066abf6285adcbfb7d2dd3814d9058bee9032663a2ac1a2f26c72c2828a",
+        "_rocm_sdk_devel/lib/librocprof-trace-decoder.so": "09a09ce2cfa8c1e5c614fcdbd961284b85da38f9f901783b9c86e3b3fdefbcc9",
+        "_rocm_sdk_devel/lib/librocprof-trace-decoder.so.0.2": "09a09ce2cfa8c1e5c614fcdbd961284b85da38f9f901783b9c86e3b3fdefbcc9",
+        "_rocm_sdk_devel/lib/librocprof-trace-decoder.so.0.2.0": "09a09ce2cfa8c1e5c614fcdbd961284b85da38f9f901783b9c86e3b3fdefbcc9",
+        "_rocm_sdk_devel/lib/librocprofiler-register.so": "5c1090a94786d3618a3f72fac2a4982e259014817c7c160bac95c1bf56d765ae",
+        "_rocm_sdk_devel/lib/librocprofiler-register.so.0": "5c1090a94786d3618a3f72fac2a4982e259014817c7c160bac95c1bf56d765ae",
+        "_rocm_sdk_devel/lib/librocprofiler-register.so.0.6.0": "5c1090a94786d3618a3f72fac2a4982e259014817c7c160bac95c1bf56d765ae",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-attach.so": "34f0e57f4054949b9393e00b16eb44655eed4558b957740c2568fd873a8b6156",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-attach.so.1": "34f0e57f4054949b9393e00b16eb44655eed4558b957740c2568fd873a8b6156",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-attach.so.1.3.5": "34f0e57f4054949b9393e00b16eb44655eed4558b957740c2568fd873a8b6156",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocattach.so": "05f5a6d9659f47bff5de6d7f39ce8e469a96a6e840215317dfbc2ab9eff45c92",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocattach.so.1": "05f5a6d9659f47bff5de6d7f39ce8e469a96a6e840215317dfbc2ab9eff45c92",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocattach.so.1.3.5": "05f5a6d9659f47bff5de6d7f39ce8e469a96a6e840215317dfbc2ab9eff45c92",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocpd.so": "a81b42dc5c0b4dc9c605efbbbf458708974009f829c400f63835d4e613de9267",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocpd.so.1": "a81b42dc5c0b4dc9c605efbbbf458708974009f829c400f63835d4e613de9267",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-rocpd.so.1.3.5": "a81b42dc5c0b4dc9c605efbbbf458708974009f829c400f63835d4e613de9267",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-roctx.so": "838f7a5716987de5fbb827cd145b23fedf4e76410e981343adfa00468a4c5eb8",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-roctx.so.1": "838f7a5716987de5fbb827cd145b23fedf4e76410e981343adfa00468a4c5eb8",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk-roctx.so.1.3.5": "838f7a5716987de5fbb827cd145b23fedf4e76410e981343adfa00468a4c5eb8",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk.so": "4f72942e2506d854ca9a302582df61f02bc2e66a011aa4e7755c5148f954c923",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk.so.1": "4f72942e2506d854ca9a302582df61f02bc2e66a011aa4e7755c5148f954c923",
+        "_rocm_sdk_devel/lib/librocprofiler-sdk.so.1.3.5": "4f72942e2506d854ca9a302582df61f02bc2e66a011aa4e7755c5148f954c923",
+        "_rocm_sdk_devel/lib/librocrand.so": "64d8a4088f9776f8d20d1a2c6d8b53c30a0d79c30456c7b0d4155677e91cba48",
+        "_rocm_sdk_devel/lib/librocrand.so.1": "64d8a4088f9776f8d20d1a2c6d8b53c30a0d79c30456c7b0d4155677e91cba48",
+        "_rocm_sdk_devel/lib/librocrand.so.1.1": "64d8a4088f9776f8d20d1a2c6d8b53c30a0d79c30456c7b0d4155677e91cba48",
+        "_rocm_sdk_devel/lib/librocroller.so": "85f257817e8ac6abc7b257fcf1f67e175bfcc1c0406a8ef9bef6c1be1b103e6a",
+        "_rocm_sdk_devel/lib/librocroller.so.1": "85f257817e8ac6abc7b257fcf1f67e175bfcc1c0406a8ef9bef6c1be1b103e6a",
+        "_rocm_sdk_devel/lib/librocroller.so.1.0.0": "85f257817e8ac6abc7b257fcf1f67e175bfcc1c0406a8ef9bef6c1be1b103e6a",
+        "_rocm_sdk_devel/lib/librocsolver.so": "1539b069c349c44f867ce3b84b1c3c0eee6df773c8e77b7d1d12136d79295e70",
+        "_rocm_sdk_devel/lib/librocsolver.so.0": "1539b069c349c44f867ce3b84b1c3c0eee6df773c8e77b7d1d12136d79295e70",
+        "_rocm_sdk_devel/lib/librocsolver.so.0.11": "1539b069c349c44f867ce3b84b1c3c0eee6df773c8e77b7d1d12136d79295e70",
+        "_rocm_sdk_devel/lib/librocsparse.so": "016c3089303a9f7e91897f5be1adae0cfaf774cec88d42431519a707b388eeb5",
+        "_rocm_sdk_devel/lib/librocsparse.so.1": "016c3089303a9f7e91897f5be1adae0cfaf774cec88d42431519a707b388eeb5",
+        "_rocm_sdk_devel/lib/librocsparse.so.1.0": "016c3089303a9f7e91897f5be1adae0cfaf774cec88d42431519a707b388eeb5",
+        "_rocm_sdk_devel/lib/libroctracer64.so": "de72fa0b626c3fb1b88368aea70b9337eebb354fdb567e0777068f463a6a5fcf",
+        "_rocm_sdk_devel/lib/libroctracer64.so.4": "de72fa0b626c3fb1b88368aea70b9337eebb354fdb567e0777068f463a6a5fcf",
+        "_rocm_sdk_devel/lib/libroctracer64.so.4.1.0": "de72fa0b626c3fb1b88368aea70b9337eebb354fdb567e0777068f463a6a5fcf",
+        "_rocm_sdk_devel/lib/libroctx64.so": "14ce403f9c3a3c42603e2655ed9baa4404edcd0876aca2f86ecd1035421702aa",
+        "_rocm_sdk_devel/lib/libroctx64.so.4": "14ce403f9c3a3c42603e2655ed9baa4404edcd0876aca2f86ecd1035421702aa",
+        "_rocm_sdk_devel/lib/libroctx64.so.4.1.0": "14ce403f9c3a3c42603e2655ed9baa4404edcd0876aca2f86ecd1035421702aa",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.asan-x86_64.so": "3ae20e0b14a70c5dcb97dcaa8d0043e02ce48255b677399511dab1b9abc59ebb",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.dyndd-x86_64.so": "c8815b1e77eaed3719fa914e3252718c929ee150afe1d0ebca26be5e26530e16",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.hwasan-x86_64.so": "a9f319ab07eeae8cac32c08ff849ac23acff610660a1fa3f0ec9a1304f6b625e",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.hwasan_aliases-x86_64.so": "e829b2636c2eed221ee6b2204ac4793980ab42d552fae4337a6ce0f19438b92b",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.memprof-x86_64.so": "ca2157f2926a08226288e4fef72c8abed0ae51bfbcd714c60c6e57315125f123",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.nsan-x86_64.so": "a943314619dd91b7e4f376c7ba8514cc78d231b23813ac27dc8e4a397b8035b3",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.scudo_standalone-x86_64.so": "2dfa9c7d24e6ef4857203ce17d4a991400dffb62fc36bf0d8c196de08ad17feb",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.tsan-x86_64.so": "33f45b26ed25c9e83cb0a57a8e028c3a61d9e5a1ce7bc1e9789e7ecab28beb95",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.ubsan_minimal-x86_64.so": "0600addc2d807dceff300e27230a649cd205b5fd3a98b26de5553abd51f258ba",
+        "_rocm_sdk_devel/lib/llvm/lib/clang/23/lib/linux/libclang_rt.ubsan_standalone-x86_64.so": "1bcf1f844f060042b8fc637783f8a699f87eca046af04ba478756b2d62f6c55f",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVM-23git.so": "2c66b0bd3190c42e51dccee627e81fb5d6d6b57d631b10959c5967acc2bbe1ae",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVM.so": "2c66b0bd3190c42e51dccee627e81fb5d6d6b57d631b10959c5967acc2bbe1ae",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVM.so.23.0git": "2c66b0bd3190c42e51dccee627e81fb5d6d6b57d631b10959c5967acc2bbe1ae",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVMOffload.so": "6b26d1246f3bc7435cbf6126f169141184f753820ba60adf94a84e506e0908cc",
+        "_rocm_sdk_devel/lib/llvm/lib/libLLVMOffload.so.23.0git": "6b26d1246f3bc7435cbf6126f169141184f753820ba60adf94a84e506e0908cc",
+        "_rocm_sdk_devel/lib/llvm/lib/libMLIR.so": "521fad43112a981986295104d53863e34b5b50781f65fdf8316999b26464fd54",
+        "_rocm_sdk_devel/lib/llvm/lib/libMLIR.so.23.0git": "521fad43112a981986295104d53863e34b5b50781f65fdf8316999b26464fd54",
+        "_rocm_sdk_devel/lib/llvm/lib/libMLIRExecutionEngineShared.so": "5a9308ae3c18ab384b8e3f82cd967586dce15d8685b6b056f421af48f77dd882",
+        "_rocm_sdk_devel/lib/llvm/lib/libMLIRExecutionEngineShared.so.23.0git": "5a9308ae3c18ab384b8e3f82cd967586dce15d8685b6b056f421af48f77dd882",
+        "_rocm_sdk_devel/lib/llvm/lib/libarcher.so": "3386a91b2d8c6e25f84d0cc045621a3918cb28428454de87ec240cb0a6fc2c0c",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang-cpp.so": "9fd457eede5fd689edb3ce8302b3fcc80be336915d487a46c434dd0fc3e7582c",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang-cpp.so.23.0git": "9fd457eede5fd689edb3ce8302b3fcc80be336915d487a46c434dd0fc3e7582c",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang.so": "f58e6191fe9ccfa14fd6348b90948f4a63e6cb1635315ce76f89544c06684a75",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang.so.23.0.0git": "f58e6191fe9ccfa14fd6348b90948f4a63e6cb1635315ce76f89544c06684a75",
+        "_rocm_sdk_devel/lib/llvm/lib/libclang.so.23.0git": "f58e6191fe9ccfa14fd6348b90948f4a63e6cb1635315ce76f89544c06684a75",
+        "_rocm_sdk_devel/lib/llvm/lib/libgomp.so": "ce8ede9d19ed228073c6cd0dba8a6ee5779d5a92f5c1519c126e67fe24190d3b",
+        "_rocm_sdk_devel/lib/llvm/lib/libgomp.so.1": "ce8ede9d19ed228073c6cd0dba8a6ee5779d5a92f5c1519c126e67fe24190d3b",
+        "_rocm_sdk_devel/lib/llvm/lib/libiomp5.so": "ce8ede9d19ed228073c6cd0dba8a6ee5779d5a92f5c1519c126e67fe24190d3b",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_apfloat_wrappers.so": "99f74f8500b4d1bd8fad1de2c1339672bf8dcae57d518f0249a1c69bb516c2ee",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_apfloat_wrappers.so.23.0git": "99f74f8500b4d1bd8fad1de2c1339672bf8dcae57d518f0249a1c69bb516c2ee",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_arm_runner_utils.so": "8ad2a6df8a5f5a9df157debf8e4861eae44e3b08f0ada71b199087d8e576e031",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_arm_runner_utils.so.23.0git": "8ad2a6df8a5f5a9df157debf8e4861eae44e3b08f0ada71b199087d8e576e031",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_arm_sme_abi_stubs.so": "383307c1dabe4197e2430d77044f627996ee21b1464531d296383ad0b87f0e2a",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_arm_sme_abi_stubs.so.23.0git": "383307c1dabe4197e2430d77044f627996ee21b1464531d296383ad0b87f0e2a",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_async_runtime.so": "6a9d90f8d5b0d998daf87bfc2cc6399979abed64d629991709077e64950897cd",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_async_runtime.so.23.0git": "6a9d90f8d5b0d998daf87bfc2cc6399979abed64d629991709077e64950897cd",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_c_runner_utils.so": "adb233797505d1970ac664e73ca465dc82b7043d25ab7f9049beb86d39b19b5b",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_c_runner_utils.so.23.0git": "adb233797505d1970ac664e73ca465dc82b7043d25ab7f9049beb86d39b19b5b",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_float16_utils.so": "1ed7962c58fcab7570cc8e4540111ab1f620057ca5968926e5e9cdd9a169b18d",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_float16_utils.so.23.0git": "1ed7962c58fcab7570cc8e4540111ab1f620057ca5968926e5e9cdd9a169b18d",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_runner_utils.so": "95c52db56f857059c6d8d3c3f9cced61260c5df737488b49480afe52ffefda3b",
+        "_rocm_sdk_devel/lib/llvm/lib/libmlir_runner_utils.so.23.0git": "95c52db56f857059c6d8d3c3f9cced61260c5df737488b49480afe52ffefda3b",
+        "_rocm_sdk_devel/lib/llvm/lib/libomp.so": "ce8ede9d19ed228073c6cd0dba8a6ee5779d5a92f5c1519c126e67fe24190d3b",
+        "_rocm_sdk_devel/lib/llvm/lib/libomptarget.so": "16b650805cc43ec0c7f5b6cb632e526fedefd444e907ca98bef5bb9405a12e82",
+        "_rocm_sdk_devel/lib/llvm/lib/libomptarget.so.23.0git": "16b650805cc43ec0c7f5b6cb632e526fedefd444e907ca98bef5bb9405a12e82",
+        "_rocm_sdk_devel/lib/llvm/lib/libunwind.so": "a052c402ebe3930568631f2271010a96fdcf1313995322bf5feefe508801bfdb",
+        "_rocm_sdk_devel/lib/llvm/lib/libunwind.so.1": "a052c402ebe3930568631f2271010a96fdcf1313995322bf5feefe508801bfdb",
+        "_rocm_sdk_devel/lib/llvm/lib/libunwind.so.1.0": "a052c402ebe3930568631f2271010a96fdcf1313995322bf5feefe508801bfdb",
+        "_rocm_sdk_devel/lib/opencl/libamdocl64.so": "4aa4708e4b993477296af2f452a00aa505f54b4a40fc6daaa1bcf3dbb3c08b9b",
+        "_rocm_sdk_devel/lib/opencl/libamdocl64.so.": "4aa4708e4b993477296af2f452a00aa505f54b4a40fc6daaa1bcf3dbb3c08b9b",
+        "_rocm_sdk_devel/lib/opencl/libamdocl64.so.2": "4aa4708e4b993477296af2f452a00aa505f54b4a40fc6daaa1bcf3dbb3c08b9b",
+        "_rocm_sdk_devel/lib/python3.10/site-packages/rocpd/libpyrocpd.cpython-310-x86_64-linux-gnu.so": "ceec2af839b69412cde11c3c3228e0efea01265731544aed7634d67a03d7546f",
+        "_rocm_sdk_devel/lib/python3.10/site-packages/roctx/libpyroctx.cpython-310-x86_64-linux-gnu.so": "19409b89a5fba5295559ecec9751bfa58c1ac03016b6eb92aa11c67e3b1df544",
+        "_rocm_sdk_devel/lib/python3.11/site-packages/rocpd/libpyrocpd.cpython-311-x86_64-linux-gnu.so": "9bbbedd9671a8bfd049911e2195de9e7cde363a0638ef966ab287846dac6ffba",
+        "_rocm_sdk_devel/lib/python3.11/site-packages/roctx/libpyroctx.cpython-311-x86_64-linux-gnu.so": "ad35145a733b5ae864e5c53b21f2fc11d64c1422e167e949c077cb41c7a9919b",
+        "_rocm_sdk_devel/lib/python3.12/site-packages/rocpd/libpyrocpd.cpython-312-x86_64-linux-gnu.so": "af232d1122455049bb19cf570bfee1ef13cd2dc622b1a3e0eacebdba073e6db7",
+        "_rocm_sdk_devel/lib/python3.12/site-packages/roctx/libpyroctx.cpython-312-x86_64-linux-gnu.so": "23803fd8a68f3823f77a2ce83857970c0c05f037652b48dcdf378dde636af389",
+        "_rocm_sdk_devel/lib/python3.13/site-packages/rocpd/libpyrocpd.cpython-313-x86_64-linux-gnu.so": "8df0c861c9931c5808c6cb37fce15d9b813c92a62c59c0605e65a550fd01b56f",
+        "_rocm_sdk_devel/lib/python3.13/site-packages/roctx/libpyroctx.cpython-313-x86_64-linux-gnu.so": "83890f989ea8b810ee3bca6fef9825b75d95ea0e405a6b6e0e3c516b5687d570",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libasm.so": "01b8e75c5690e7a16adddda2b68b0ddd7626a5be26f3e66b8a5903fa53d8fd69",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libblkid.so": "0f8753ae5230a98cf67461bd47b648727c08cdd7d2000116a96a8f7bdf2e1d57",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libbz2.so": "37a39b12a7e6e9f480d10e5e139b9aedbe5824e63b6b9e12a16837baee608602",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libcap.so": "6871c213492e1ce4a1879ddc5a6a3f08dbe69bf7d687af4c8c15f8b732bf840d",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libdrm.so": "b715ae24e1d62e407ffceca56b546e8a35abe37ac50878cbb16fa8b93d9c9fd5",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libdrm_amdgpu.so": "163acff64693b08e0f88fcaee4745f67134e38a45886fed21f6ed317dab2d1c9",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libdw.so": "8abfa6a917816a0c3c4593b4fc4ed6cc3c7a5e4221e8610ced7bddbdce02325e",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libelf.so": "692dd9fe3575a45df78b319ad0e2a58ee36814958771dd810d5d91f9616c6d8f",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libexpat.so": "bb1d8f0efe426deef8aa19337d7b686f8f3340a303893470db86c752d33266e2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libformw.so": "acae3040a0c29d24ed384809fc249dae25f5d1115d2d2ec6c33f64c7802b1787",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libgallium_drv_video.so": "11b4af5e3e498feefe67761a3a1f031860a181c57ab0a0579919b4858348626d",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libgmp.so": "fbbf412d1c1a15c7c98778f11a56502deecbeb23384beec9235f2e77c9398af8",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/liblzma.so": "d17f947bfe3947db5aefee897f6d32dfe98c73bf80b477764ba7f4107594a671",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libmenuw.so": "00f7284b163c6d82c8bc4839c776467e06776de49c4aff4292d41331d020f498",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libmnl.so": "655dd505f51e4f1521d0906f3f9f4236067f7cd4d1e8425e11d61d7c2c8f1bef",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libmount.so": "7731c04a54d2054a0df10f4c125d9cc09326e979946769bf0d3732e2bf745ee0",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libmpfr.so": "99dfcf2ac94dfa729d7edc89428aec7905e4edb1af565eb65e29f75746d2236a",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libncursesw.so": "64ac51912f700b012f22743e9f7c2d043bca8d29f75f07b3a15797b0b9ee93fb",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-3.so": "1d0214a1317e419c07186f39bb8317d237ddccea87cf8c1057d90c43465032d2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-genl-3.so": "7b6e8c7592bf22237e47b6432ecf9d4fa94885d3f0a32615fffb87e54a762c76",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-idiag-3.so": "a26e6719dd20f82a5a9ad7df2a35562f03525f0b253d916b50da4f4fc10931d1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-nf-3.so": "c19f86823cee66a18a006c9e13c66294956fca4729940d234f64f67c1fee2481",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-route-3.so": "2837536541e49bc8b00fa66d2c9076ca8fe0e304d916289c2bea0c5745641a28",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnl-xfrm-3.so": "6139453dead48028656fe4602b21e9b542eab03a82781f18bb74d415e781d15c",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libnuma.so": "26fffd0f85369950b834cfb8f56fa9e1ea4804be8bbc40db98b788c554802bc3",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libpanelw.so": "88ae0d76bb0300ed8273d828541d0cf6d40269ecfecc388d58dfe20dc8485662",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libpsx.so": "bf9d482693e30d343d12d977f224e0cf4f66bd2a1c3b52ad80c71993568925a1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_asm.so.1": "01b8e75c5690e7a16adddda2b68b0ddd7626a5be26f3e66b8a5903fa53d8fd69",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_blkid.so.1": "0f8753ae5230a98cf67461bd47b648727c08cdd7d2000116a96a8f7bdf2e1d57",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so": "37a39b12a7e6e9f480d10e5e139b9aedbe5824e63b6b9e12a16837baee608602",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_cap.so.2": "6871c213492e1ce4a1879ddc5a6a3f08dbe69bf7d687af4c8c15f8b732bf840d",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2": "b715ae24e1d62e407ffceca56b546e8a35abe37ac50878cbb16fa8b93d9c9fd5",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1": "163acff64693b08e0f88fcaee4745f67134e38a45886fed21f6ed317dab2d1c9",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_dw.so.1": "8abfa6a917816a0c3c4593b4fc4ed6cc3c7a5e4221e8610ced7bddbdce02325e",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so.1": "692dd9fe3575a45df78b319ad0e2a58ee36814958771dd810d5d91f9616c6d8f",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_expat.so.1": "bb1d8f0efe426deef8aa19337d7b686f8f3340a303893470db86c752d33266e2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_formw.so.6": "acae3040a0c29d24ed384809fc249dae25f5d1115d2d2ec6c33f64c7802b1787",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_gallium_drv_video.so": "11b4af5e3e498feefe67761a3a1f031860a181c57ab0a0579919b4858348626d",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_gmp.so.10": "fbbf412d1c1a15c7c98778f11a56502deecbeb23384beec9235f2e77c9398af8",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5": "d17f947bfe3947db5aefee897f6d32dfe98c73bf80b477764ba7f4107594a671",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5.8.1": "d17f947bfe3947db5aefee897f6d32dfe98c73bf80b477764ba7f4107594a671",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_menuw.so.6": "00f7284b163c6d82c8bc4839c776467e06776de49c4aff4292d41331d020f498",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_mnl.so.0": "655dd505f51e4f1521d0906f3f9f4236067f7cd4d1e8425e11d61d7c2c8f1bef",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_mount.so.1": "7731c04a54d2054a0df10f4c125d9cc09326e979946769bf0d3732e2bf745ee0",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_mpfr.so.6": "99dfcf2ac94dfa729d7edc89428aec7905e4edb1af565eb65e29f75746d2236a",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_ncursesw.so.6": "64ac51912f700b012f22743e9f7c2d043bca8d29f75f07b3a15797b0b9ee93fb",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_3.so.200": "1d0214a1317e419c07186f39bb8317d237ddccea87cf8c1057d90c43465032d2",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_genl_3.so.200": "7b6e8c7592bf22237e47b6432ecf9d4fa94885d3f0a32615fffb87e54a762c76",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_idiag_3.so.200": "a26e6719dd20f82a5a9ad7df2a35562f03525f0b253d916b50da4f4fc10931d1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_nf_3.so.200": "c19f86823cee66a18a006c9e13c66294956fca4729940d234f64f67c1fee2481",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_route_3.so.200": "2837536541e49bc8b00fa66d2c9076ca8fe0e304d916289c2bea0c5745641a28",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_nl_xfrm_3.so.200": "6139453dead48028656fe4602b21e9b542eab03a82781f18bb74d415e781d15c",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so.1": "26fffd0f85369950b834cfb8f56fa9e1ea4804be8bbc40db98b788c554802bc3",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_panelw.so.6": "88ae0d76bb0300ed8273d828541d0cf6d40269ecfecc388d58dfe20dc8485662",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_psx.so.2": "bf9d482693e30d343d12d977f224e0cf4f66bd2a1c3b52ad80c71993568925a1",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_sqlite3.so": "c740ce45ed1dbe5492d2583fa6db692a888937e4dccd4760103e9b8a3e9802e7",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va-drm.so": "fe5eed1fb6cdf78f76ba14d0405153400322337a028f5b6e57e1b8fff9ad4679",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va-drm.so.2": "fe5eed1fb6cdf78f76ba14d0405153400322337a028f5b6e57e1b8fff9ad4679",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va-drm.so.2.2200.0": "fe5eed1fb6cdf78f76ba14d0405153400322337a028f5b6e57e1b8fff9ad4679",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va.so": "a91d40aaed815cfe7ffbee9613949d20f8f883d03081a73db15462e9c9e9dc87",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va.so.2": "a91d40aaed815cfe7ffbee9613949d20f8f883d03081a73db15462e9c9e9dc87",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_va.so.2.2200.0": "a91d40aaed815cfe7ffbee9613949d20f8f883d03081a73db15462e9c9e9dc87",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1": "e1d7568f4a0b77eeab26f30cc9d2794dfe7ffd14e34b4ae55a9f80bc4f94ba7a",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1.3.2": "e1d7568f4a0b77eeab26f30cc9d2794dfe7ffd14e34b4ae55a9f80bc4f94ba7a",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1": "fc3edd0b74fa071079b0095abe7b3f41418ca39be138f4ec0c57d0640a0b2d8b",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1.5.7": "fc3edd0b74fa071079b0095abe7b3f41418ca39be138f4ec0c57d0640a0b2d8b",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libsqlite3.so": "c740ce45ed1dbe5492d2583fa6db692a888937e4dccd4760103e9b8a3e9802e7",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libva-drm.so": "fe5eed1fb6cdf78f76ba14d0405153400322337a028f5b6e57e1b8fff9ad4679",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libva.so": "a91d40aaed815cfe7ffbee9613949d20f8f883d03081a73db15462e9c9e9dc87",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libz.so": "e1d7568f4a0b77eeab26f30cc9d2794dfe7ffd14e34b4ae55a9f80bc4f94ba7a",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/libzstd.so": "fc3edd0b74fa071079b0095abe7b3f41418ca39be138f4ec0c57d0640a0b2d8b",
+        "_rocm_sdk_devel/lib/rocm_sysdeps/lib/radeonsi_drv_video.so": "11b4af5e3e498feefe67761a3a1f031860a181c57ab0a0579919b4858348626d",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/libgotcha.so": "962f418f64e63666eaac637ac3e8ba7cd371c3dc08d3b58667f39cd78293e167",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/libgotcha.so.3": "962f418f64e63666eaac637ac3e8ba7cd371c3dc08d3b58667f39cd78293e167",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/libgotcha.so.3.0.0": "962f418f64e63666eaac637ac3e8ba7cd371c3dc08d3b58667f39cd78293e167",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so": "ff8f91c8282a3ecc59332694399e935f426188b008aafcd602c46f5ae7fc7c89",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so.1": "ff8f91c8282a3ecc59332694399e935f426188b008aafcd602c46f5ae7fc7c89",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so.1.3.5": "ff8f91c8282a3ecc59332694399e935f426188b008aafcd602c46f5ae7fc7c89",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so": "45e06e46136af6f15bbc2cb1c621d70faa2e716e5634e4fef3d83ff658043231",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1": "45e06e46136af6f15bbc2cb1c621d70faa2e716e5634e4fef3d83ff658043231",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1.3.5": "45e06e46136af6f15bbc2cb1c621d70faa2e716e5634e4fef3d83ff658043231",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofv3-list-avail.so": "a0ffcc7aa9e6e50c23f7a065b575bb85c62ab17a3437d15d5ef2f1bfc64b229c",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofv3-list-avail.so.1": "a0ffcc7aa9e6e50c23f7a065b575bb85c62ab17a3437d15d5ef2f1bfc64b229c",
+        "_rocm_sdk_devel/lib/rocprofiler-sdk/librocprofv3-list-avail.so.1.3.5": "a0ffcc7aa9e6e50c23f7a065b575bb85c62ab17a3437d15d5ef2f1bfc64b229c",
+        "_rocm_sdk_devel/lib/roctracer/libfile_plugin.so": "a81ac4c8f1d7356ba508d50111eba0f491473ac5864eecc2d01f7c6672b37cdd",
+        "_rocm_sdk_devel/lib/roctracer/libhip_stats.so": "0c4311c6def26e295fc05abf53b559ee8bb24ad6dcf4ff83aeab896c69294c2f",
+        "_rocm_sdk_devel/lib/roctracer/libroctracer_tool.so": "2420001affa4ed3b4d1e835076d14111f5453c38498d20f9e518f501e737ce82",
+        "_rocm_sdk_devel/share/hipblaslt/tensilelite/rocisa/_rocisa.abi3.so": "c02cd343ae648dfd59b4d1a62e217519b8fe5b3a9b6dec235a0a702a204afdf5",
+        "_rocm_sdk_devel/share/hipblaslt/tensilelite/rocisa/libstinkytofu.so.0": "47038deebed374d517c4b622ce1f9831d06836a604cf3b74b984fbe11b78b167",
+        "_rocm_sdk_devel/share/hipblaslt/tensilelite/rocisa/libstinkytofu.so.0.1.0": "47038deebed374d517c4b622ce1f9831d06836a604cf3b74b984fbe11b78b167",
+        "_rocm_sdk_devel/share/opencl/ocltst/liboclperf.so": "607ac8ec5170b00eebed1a362582f86b9750f758afcc35e35fdadfc8c368ad56",
+        "_rocm_sdk_devel/share/opencl/ocltst/liboclruntime.so": "c945514d9171be3130cf558ad9ff3372dbc42b1280a807f2c115f9c1a828c23a",
+        "_rocm_sdk_devel/share/roctracer/test/libcodeobj_test.so": "c8d555c1a95f7a680c31c3b4c3143de030cd2eb0673e4f92f127352d83b83c8f"
+      },
+      "provider_name": "rocm-sdk-devel",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-device-gfx1100": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "5df0dcdca81b2666624fed6577d1ac3a470ff2b02ee39bfea7f50881bde22381",
+        "count": 262
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1100/Kernels.so-000-gfx1100.hsaco",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1100.so",
+        "_rocm_sdk_libraries/lib/rocblas/library/Kernels.so-000-gfx1100.hsaco"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1100/Kernels.so-000-gfx1100.hsaco": "2d794da865195cade85cd19a5e346ab95a1fc4b4a12284eb92f0c1159264641c",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1100.so": "f88c19d12dd23e37ce52a3f773ba64969829c0103252c69748d9f79d4e0295b0",
+        "_rocm_sdk_libraries/lib/rocblas/library/Kernels.so-000-gfx1100.hsaco": "f27166124b39e9610b56c8364d393429efed3569f0cd3332576809ba4ee23c64"
+      },
+      "provider_name": "rocm-sdk-device-gfx1100",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-device-gfx1101": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "c72bda62a12b6d1a466d7dad58396542e4330d9c957029e4fcc5bff450f85b03",
+        "count": 276
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1101/Kernels.so-000-gfx1101.hsaco",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1101.so",
+        "_rocm_sdk_libraries/lib/rocblas/library/Kernels.so-000-gfx1101.hsaco"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1101/Kernels.so-000-gfx1101.hsaco": "d4817386fc37bb41c1c6b5c036f0c9e6b239b99e2fd1b9422f9a2f4559ba6320",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1101.so": "000a0edbd74c2e601395e4877d70e31c9d4530ce4df57d362b31c1e93c5ab678",
+        "_rocm_sdk_libraries/lib/rocblas/library/Kernels.so-000-gfx1101.hsaco": "8f0c01df79bdda1284fb330811e850db01863373f146f61632ac2b441910c457"
+      },
+      "provider_name": "rocm-sdk-device-gfx1101",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-device-gfx1150": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "c39867b95425f19d80513b22f12652657b080e84a25396829d1a61b36a4fbc6e",
+        "count": 261
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1150/Kernels.so-000-gfx1150.hsaco",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1150.so",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx1150/Kernels.so-000-gfx1150.hsaco"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1150/Kernels.so-000-gfx1150.hsaco": "a8ec8830dde32f84d64557384edc607cda5ebbca5f8cfece673c4c565689c8be",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1150.so": "dc32c3047885b0a7618d0c9a3f239710cb7fb5773fb581f802d99b646db00a06",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx1150/Kernels.so-000-gfx1150.hsaco": "04a33658b56029f97a90a0eba50c76bd801e17f159530db5402271ac20613d82"
+      },
+      "provider_name": "rocm-sdk-device-gfx1150",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-device-gfx1151": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "fec9a29d461bcfafccddb5b0216f63d6a9c2c43c321999f36778d368ac30208a",
+        "count": 262
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1151/Kernels.so-000-gfx1151.hsaco",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1151.so",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx1151/Kernels.so-000-gfx1151.hsaco"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1151/Kernels.so-000-gfx1151.hsaco": "9ca0891bb92a7bd8f87a86f1fe7e781915f72992531ab9ca5ee156f47bc59a5b",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1151.so": "d6c17dd295ae5a606fc19e5d7c6d535af66cef384803399500e04f057b83c780",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx1151/Kernels.so-000-gfx1151.hsaco": "6f3f42ee338a29d5fd3066dc5a8645a275e4f28dd07e70264c4fa7abb51aa0dc"
+      },
+      "provider_name": "rocm-sdk-device-gfx1151",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-device-gfx1200": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "41afe4c820007b9b08de0a876ac4951c285c6f9985c7551fec5c29fd7873556b",
+        "count": 404
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1200/Kernels.so-000-gfx1200.hsaco",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1200.so",
+        "_rocm_sdk_libraries/lib/rocblas/library/Kernels.so-000-gfx1200.hsaco"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1200/Kernels.so-000-gfx1200.hsaco": "6706cca4f034187c1e432235c10f9c059eba10f0694e8c6e3611403a69a7df45",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1200.so": "217c2b97bf00d576eb9cf449215b75847fac1dfc85582c03169f88f86ddc68d0",
+        "_rocm_sdk_libraries/lib/rocblas/library/Kernels.so-000-gfx1200.hsaco": "a34db261594eedefb9644d2205217b9f361043a14d69bcdf7736c535e44ea1b1"
+      },
+      "provider_name": "rocm-sdk-device-gfx1200",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-device-gfx1201": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "a4799ab0715692867720b66437a4e92de16e297ec8f734e7efadfb457aed47e2",
+        "count": 416
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1201/Kernels.so-000-gfx1201.hsaco",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1201.so",
+        "_rocm_sdk_libraries/lib/rocblas/library/Kernels.so-000-gfx1201.hsaco"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx1201/Kernels.so-000-gfx1201.hsaco": "307d73b6ea0f3b82f24bf90f282d53944213b10b7b9048e0717490011fb58583",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx1201.so": "8523b303e5ed0be463d034a73aff54c582964b45cc481bec7bc3badc6e95f0fd",
+        "_rocm_sdk_libraries/lib/rocblas/library/Kernels.so-000-gfx1201.hsaco": "a7bf5c2379ff224e7c91b2d64f04888447e203e9ff1112b2c6c500abf97e14b5"
+      },
+      "provider_name": "rocm-sdk-device-gfx1201",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-device-gfx90a": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "4fd526171a42112835b795c80fe6da2526ceb9b9a012edcfb8c43ff2f001bdac",
+        "count": 714
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx90a/Kernels.so-000-gfx90a.hsaco",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx90a.so",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx90a/Kernels.so-000-gfx90a-xnack+.hsaco",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx90a/Kernels.so-000-gfx90a-xnack-.hsaco"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx90a/Kernels.so-000-gfx90a.hsaco": "2ddce0022ba2e4533709e5e47b3807f1d5d324bcee354f065dccc09f24f63872",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx90a.so": "5fde5dad0322137c84ea986a09cd67c546d3f8c24955701872244299a4cefb45",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx90a/Kernels.so-000-gfx90a-xnack+.hsaco": "fb33a81acb94233d24dcdbbdf08c2d215b046c655b82a550e33c9bf8ceef277c",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx90a/Kernels.so-000-gfx90a-xnack-.hsaco": "7f1eb9c1fd2b6ee969dd35984745a6f69df7fd999edd33f961271428b32457e5"
+      },
+      "provider_name": "rocm-sdk-device-gfx90a",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-device-gfx942": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "e46774ac4954b603e41a011724ae7993df6e8a13bfcc2e246baf8eecaee28bf5",
+        "count": 1654
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx942/Kernels.so-000-gfx942.hsaco",
+        "_rocm_sdk_libraries/lib/hipsparselt/library/gfx942/Kernels.so-000-gfx942.hsaco",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx942.so",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx942/Kernels.so-000-gfx942.hsaco"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx942/Kernels.so-000-gfx942.hsaco": "f0389e54d66cff373188d46efaf5adc596d4182ce923dc06c1c563c65a38951c",
+        "_rocm_sdk_libraries/lib/hipsparselt/library/gfx942/Kernels.so-000-gfx942.hsaco": "01950bf54a75efb75cef572cecace4c62f1ced4da29dfa26dffe126c733c14ef",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx942.so": "2d47d4d101204f3858d4c42b6229e7d2feba58fb3ffe58a39d79f827a30024ad",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx942/Kernels.so-000-gfx942.hsaco": "ad07cdd46d7650ebe46017c7e7047046ddec875085330382940543c8897f6c9e"
+      },
+      "provider_name": "rocm-sdk-device-gfx942",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-device-gfx950": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "ffc632c506abb14f80384a22bf429007d1653e8513b0b0d21ec0b4e6ba0172ec",
+        "count": 1018
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx950/Kernels.so-000-gfx950.hsaco",
+        "_rocm_sdk_libraries/lib/hipsparselt/library/gfx950/Kernels.so-000-gfx950.hsaco",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx950.so",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx950/Kernels.so-000-gfx950.hsaco"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipblaslt/library/gfx950/Kernels.so-000-gfx950.hsaco": "7a78a10a7bde91a5844146eacb6c6baf44e2deb20e1728da359b21d8e8bf83bb",
+        "_rocm_sdk_libraries/lib/hipsparselt/library/gfx950/Kernels.so-000-gfx950.hsaco": "e0782dddca1391f539b2b8977c85198ecb50e21f97e332031b035ea2fbae62e3",
+        "_rocm_sdk_libraries/lib/libMIOpenCKGroupedConv_gfx950.so": "9589eaaec3ed2fda8a0c94a9c2e2cec0adf65e078494139edb11882bdfed8fdc",
+        "_rocm_sdk_libraries/lib/rocblas/library/gfx950/Kernels.so-000-gfx950.hsaco": "5164eae3fc61c373a9a160413c9da54b4c28909deab3c089d1dfbbfc718287a9"
+      },
+      "provider_name": "rocm-sdk-device-gfx950",
+      "version": "10.0.0"
+    },
+    "rocm-sdk-libraries": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "09c98e54819c2b5bc36c889a3021e413047c0c969b8ca2832d216d81463ad8cd",
+        "count": 35
+      },
+      "native_so": [
+        "_rocm_sdk_libraries/lib/hipdnn_plugins/engines/libhip_kernel_provider.so",
+        "_rocm_sdk_libraries/lib/hipdnn_plugins/engines/libhipblaslt_plugin.so",
+        "_rocm_sdk_libraries/lib/hipdnn_plugins/engines/libmiopen_plugin.so",
+        "_rocm_sdk_libraries/lib/libMIOpen.so.1",
+        "_rocm_sdk_libraries/lib/libhipblas.so.3",
+        "_rocm_sdk_libraries/lib/libhipblaslt.so.1",
+        "_rocm_sdk_libraries/lib/libhipdnn_backend.so",
+        "_rocm_sdk_libraries/lib/libhipfft.so.0",
+        "_rocm_sdk_libraries/lib/libhipfftw.so.0",
+        "_rocm_sdk_libraries/lib/libhiprand.so.1",
+        "_rocm_sdk_libraries/lib/libhipsolver.so.1",
+        "_rocm_sdk_libraries/lib/libhipsparse.so.4",
+        "_rocm_sdk_libraries/lib/libhipsparselt.so.0",
+        "_rocm_sdk_libraries/lib/liborigami.so.1",
+        "_rocm_sdk_libraries/lib/librccl.so.1",
+        "_rocm_sdk_libraries/lib/librocblas.so.5",
+        "_rocm_sdk_libraries/lib/librocfft.so.0",
+        "_rocm_sdk_libraries/lib/librocrand.so.1",
+        "_rocm_sdk_libraries/lib/librocroller.so.1",
+        "_rocm_sdk_libraries/lib/librocsolver.so.0",
+        "_rocm_sdk_libraries/lib/librocsparse.so.1",
+        "_rocm_sdk_libraries/share/hipblaslt/tensilelite/rocisa/_rocisa.abi3.so",
+        "_rocm_sdk_libraries/share/hipblaslt/tensilelite/rocisa/libstinkytofu.so.0"
+      ],
+      "native_so_sha256": {
+        "_rocm_sdk_libraries/lib/hipdnn_plugins/engines/libhip_kernel_provider.so": "c651b0f59e23fca2c869a5ae8ab6e4511f06d5d2b6853df4403ec77380d1e31c",
+        "_rocm_sdk_libraries/lib/hipdnn_plugins/engines/libhipblaslt_plugin.so": "af62f7d6306fc828510173ac7cbf070e3d35d74d85e516769fb443d5832130e9",
+        "_rocm_sdk_libraries/lib/hipdnn_plugins/engines/libmiopen_plugin.so": "15c0a87f35dcf7c146f8d19125be5aa00b93328a567c910e38bb7ebf727c6ea0",
+        "_rocm_sdk_libraries/lib/libMIOpen.so.1": "8de9fab9711fea11d6bd6d4bcd7d1897fedb3be2d4a84fcd4e4d6ae6b643b183",
+        "_rocm_sdk_libraries/lib/libhipblas.so.3": "fd9e8587412b456e9da10b1be67917376f6088ff8f61c5b132b1e15504883567",
+        "_rocm_sdk_libraries/lib/libhipblaslt.so.1": "726921b73776933606610d0d812fcbe4d448423b16057352f7c9902b152cda38",
+        "_rocm_sdk_libraries/lib/libhipdnn_backend.so": "bdb1c199a79975906259569369285f346f35576ed5863210a4786ed68240355d",
+        "_rocm_sdk_libraries/lib/libhipfft.so.0": "9b261169782986f64637849d8ed00a2bf6521573286e24199587505230c5b57f",
+        "_rocm_sdk_libraries/lib/libhipfftw.so.0": "aff8aff7581bb50da105cf49f621bb632e6af3ea74b54f329b19aa8d425e368e",
+        "_rocm_sdk_libraries/lib/libhiprand.so.1": "0a986e44a23fff6f5f9107c4e63eaee71c51af760d9253fd8c23c858dc4bde1e",
+        "_rocm_sdk_libraries/lib/libhipsolver.so.1": "7e1517c8e2c4f6dd72d99cf649aa91de67682fc34917662432bc4f9f130c65c5",
+        "_rocm_sdk_libraries/lib/libhipsparse.so.4": "c9a68218b1fc3a265840b99c440e0f38925a8ec2c54e1c30c951d9ebf53c4c9d",
+        "_rocm_sdk_libraries/lib/libhipsparselt.so.0": "4d4a26edc5f4913811733777acc3e5d5520a5fe50c91559240fa142013f458f5",
+        "_rocm_sdk_libraries/lib/liborigami.so.1": "b11dd37b06f94fd504dfbb352b7541fb5e72796d426d5c8479fe519ed363099c",
+        "_rocm_sdk_libraries/lib/librccl.so.1": "b35fceb7d28ec201ee2b5b96c6070d7323aa2fd9b606664372e4e833056de7f2",
+        "_rocm_sdk_libraries/lib/librocblas.so.5": "c27e2252cc7a4b6e174601a180a169822dcf15a29e634046daecb61498e3bd2a",
+        "_rocm_sdk_libraries/lib/librocfft.so.0": "d23db910e05d31b778e58d75c4249bcbe27fce9d971b115ad86a368b163c9346",
+        "_rocm_sdk_libraries/lib/librocrand.so.1": "64d8a4088f9776f8d20d1a2c6d8b53c30a0d79c30456c7b0d4155677e91cba48",
+        "_rocm_sdk_libraries/lib/librocroller.so.1": "85f257817e8ac6abc7b257fcf1f67e175bfcc1c0406a8ef9bef6c1be1b103e6a",
+        "_rocm_sdk_libraries/lib/librocsolver.so.0": "1539b069c349c44f867ce3b84b1c3c0eee6df773c8e77b7d1d12136d79295e70",
+        "_rocm_sdk_libraries/lib/librocsparse.so.1": "016c3089303a9f7e91897f5be1adae0cfaf774cec88d42431519a707b388eeb5",
+        "_rocm_sdk_libraries/share/hipblaslt/tensilelite/rocisa/_rocisa.abi3.so": "c02cd343ae648dfd59b4d1a62e217519b8fe5b3a9b6dec235a0a702a204afdf5",
+        "_rocm_sdk_libraries/share/hipblaslt/tensilelite/rocisa/libstinkytofu.so.0": "47038deebed374d517c4b622ce1f9831d06836a604cf3b74b984fbe11b78b167"
+      },
+      "provider_name": "rocm-sdk-libraries",
+      "version": "10.0.0"
+    },
+    "torch": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "31a846b038c0168eddef11b72cc88c6fb71e95cf100555084ccfa458e3eaa0c4",
+        "count": 12482
+      },
+      "native_so": [
+        "torch/_C.cpython-312-x86_64-linux-gnu.so",
+        "torch/lib/libaoti_custom_ops.so",
+        "torch/lib/libaotriton_v2.so",
+        "torch/lib/libaotriton_v2.so.0.13.0",
+        "torch/lib/libbackend_with_compiler.so",
+        "torch/lib/libc10.so",
+        "torch/lib/libc10_hip.so",
+        "torch/lib/libc10d_hip_test.so",
+        "torch/lib/libcaffe2_nvrtc.so",
+        "torch/lib/libjitbackend_test.so",
+        "torch/lib/libshm.so",
+        "torch/lib/libtorch.so",
+        "torch/lib/libtorch_cpu.so",
+        "torch/lib/libtorch_global_deps.so",
+        "torch/lib/libtorch_hip.so",
+        "torch/lib/libtorch_python.so",
+        "torch/lib/libtorch_rocshmem.so",
+        "torch/lib/libtorchbind_test.so"
+      ],
+      "native_so_sha256": {
+        "torch/_C.cpython-312-x86_64-linux-gnu.so": "c3728f80af617b3e261294ca9823bf7723051444170e6cecf702b670a6ab1961",
+        "torch/lib/libaoti_custom_ops.so": "1ff139da44f46c811b5360059fb3e59b3633f25b655331f7c9550f71f80962b1",
+        "torch/lib/libaotriton_v2.so": "5c86bb88693f71aaa869ff7931ec7fd2c3e9f1e11c51865c546957be25a60d48",
+        "torch/lib/libaotriton_v2.so.0.13.0": "5c86bb88693f71aaa869ff7931ec7fd2c3e9f1e11c51865c546957be25a60d48",
+        "torch/lib/libbackend_with_compiler.so": "2ec797f64356d1e34478fe9f3f8795388c05d8f8c92d9161b259b5b6fe6ee6b7",
+        "torch/lib/libc10.so": "dae4c0b4f23ae0b635b8cfc23a72f7e2a98fddfe83808863431b8735db37b383",
+        "torch/lib/libc10_hip.so": "26eb764752e6733a6ebb574b2a5540690f7492e0e5bd4afd6d1b4e06d7feb1a9",
+        "torch/lib/libc10d_hip_test.so": "482c656dde12b1c70449e57052588a77dac547f18763f4a2e0ab5274d4975d2b",
+        "torch/lib/libcaffe2_nvrtc.so": "730c12f6c0f10cf60691a85779804ac65c466beeae3bbfd201e5cbfae4c30c54",
+        "torch/lib/libjitbackend_test.so": "472024f64ab9057934201d290b4c069997637f2f5e697908daaf311d14832b6a",
+        "torch/lib/libshm.so": "494ae88e7f6c70f0b1c1dcdf7928cc277f4bb5d0d91b8d25e13dc8d9c7212bab",
+        "torch/lib/libtorch.so": "5fd34982da4218f1b38a6d69b1b4fa29d3001f5fd99ad1859e9206e825ebd8a1",
+        "torch/lib/libtorch_cpu.so": "863160af5b30edc4c164165663a6ed43b3b99ca3577728a0aa911e1b6c53f25f",
+        "torch/lib/libtorch_global_deps.so": "dbb8e073b2a7f67e3cbbd05623e26fc557a87786de317e7608747c8a3011eb64",
+        "torch/lib/libtorch_hip.so": "a37740cc5c4f802bc475eb8572a4226e8ae99e0069a4c57095b781afa6708efa",
+        "torch/lib/libtorch_python.so": "4824f09c51568604bddae4ee7e3d517d929aa60cf324d13aba70d02d0111e01f",
+        "torch/lib/libtorch_rocshmem.so": "5bf8c21e72adff235f66f53380addb624385ee059a7b74138bbbaf5abf463b7a",
+        "torch/lib/libtorchbind_test.so": "8b00ac6bac6d1070e1974a0cf443d7a6f602d5d1fa1672428180851d7802cc16"
+      },
+      "provider_name": "torch",
+      "version": "2.13.0+rocm10.0.0"
+    },
+    "torchaudio": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "e1fd8454a9234c7e94b7884a462e6136a646758b875edad115996bd6d97fd746",
+        "count": 87
+      },
+      "native_so": [
+        "torchaudio/lib/_torchaudio.abi3.so",
+        "torchaudio/lib/libtorchaudio.abi3.so"
+      ],
+      "native_so_sha256": {
+        "torchaudio/lib/_torchaudio.abi3.so": "6443fb8fd5eabd085d42e52429ba7e99609f989df114efd7b1bc1420003df8fa",
+        "torchaudio/lib/libtorchaudio.abi3.so": "e87e25f089ce9dcc4706be61f7279f6ff219147fd2ab106133d0501c7bf9ac36"
+      },
+      "provider_name": "torchaudio",
+      "version": "2.11.0+rocm10.0.0"
+    },
+    "torchvision": {
+      "direct_url": null,
+      "files_manifest": {
+        "canonical_sha256": "e4432e6abef35a2d58782379e9860e65dc9862f0cafb0fbe31b0b8233e2baf6b",
+        "count": 194
+      },
+      "native_so": [
+        "torchvision/_C.so",
+        "torchvision/image.so"
+      ],
+      "native_so_sha256": {
+        "torchvision/_C.so": "874b7425b93f3982c5b0c5c5a7689c3dcb92640a69069890e8306b8ea6e5b8dc",
+        "torchvision/image.so": "19557434a08c993c03e27e882f4990b55b55deb5dcffb8bbf87d65f69f4be1be"
+      },
+      "provider_name": "torchvision",
+      "version": "0.28.0+rocm10.0.0"
+    },
+    "triton": {
+      "direct_url": {
+        "archive_info": {
+          "hash": "sha256=5e269177e18be355d52f60564885fa083bab14629ed53d1af919536d068aadbc",
+          "hashes": {
+            "sha256": "5e269177e18be355d52f60564885fa083bab14629ed53d1af919536d068aadbc"
+          }
+        },
+        "url": "file:///i/triton/triton-3.8.0%2Bgit669b31ac-cp312-cp312-linux_x86_64.whl"
+      },
+      "files_manifest": {
+        "canonical_sha256": "0e3f9e1cfc330202a61154dd187b2242b8588859a86bee271d01a87d03c4dbce",
+        "count": 422
+      },
+      "native_so": [
+        "triton/_C/libproton.so",
+        "triton/_C/libtriton.so",
+        "triton/backends/nvidia/lib/cupti-blackwell/libcheckpoint.so",
+        "triton/backends/nvidia/lib/cupti-blackwell/libcupti.so",
+        "triton/backends/nvidia/lib/cupti-blackwell/libcupti.so.13",
+        "triton/backends/nvidia/lib/cupti-blackwell/libcupti.so.2026.2.0",
+        "triton/backends/nvidia/lib/cupti-blackwell/libnvperf_host.so",
+        "triton/backends/nvidia/lib/cupti-blackwell/libnvperf_target.so",
+        "triton/backends/nvidia/lib/cupti-blackwell/libpcsamplingutil.so",
+        "triton/backends/nvidia/lib/cupti/libcheckpoint.so",
+        "triton/backends/nvidia/lib/cupti/libcupti.so",
+        "triton/backends/nvidia/lib/cupti/libcupti.so.12",
+        "triton/backends/nvidia/lib/cupti/libcupti.so.2025.1.1",
+        "triton/backends/nvidia/lib/cupti/libnvperf_host.so",
+        "triton/backends/nvidia/lib/cupti/libnvperf_target.so",
+        "triton/backends/nvidia/lib/cupti/libpcsamplingutil.so",
+        "triton/instrumentation/libGPUInstrumentationTestLib.so"
+      ],
+      "native_so_sha256": {
+        "triton/_C/libproton.so": "8fde76ad806c4710494641e27c995cba84da2017f6017d53d49e1430e9969c0b",
+        "triton/_C/libtriton.so": "a175e2a5351de012c400aa7832d5505d71acdd6a101ea9a87b113402c92f7784",
+        "triton/backends/nvidia/lib/cupti-blackwell/libcheckpoint.so": "70d3fcd4313285dce82b61c1d6522481785380d295b66db364bcf379e23e09cf",
+        "triton/backends/nvidia/lib/cupti-blackwell/libcupti.so": "9a3b31386acf7412f51bc451e25bcd90d1b9d0be312bdda92c12af02068c47f4",
+        "triton/backends/nvidia/lib/cupti-blackwell/libcupti.so.13": "9a3b31386acf7412f51bc451e25bcd90d1b9d0be312bdda92c12af02068c47f4",
+        "triton/backends/nvidia/lib/cupti-blackwell/libcupti.so.2026.2.0": "9a3b31386acf7412f51bc451e25bcd90d1b9d0be312bdda92c12af02068c47f4",
+        "triton/backends/nvidia/lib/cupti-blackwell/libnvperf_host.so": "ad2403255878935136c6ee52484a0592d4194282c3f3defec44ec5570088ec32",
+        "triton/backends/nvidia/lib/cupti-blackwell/libnvperf_target.so": "84f977d311dc9e8ea2602755ad708f6fbcb9b508ade6fcdb33846b3aae7850e9",
+        "triton/backends/nvidia/lib/cupti-blackwell/libpcsamplingutil.so": "1cc572ca2f493c9534f70be06ce67be1e7ee575925b439ba53ae48c0a432b0c1",
+        "triton/backends/nvidia/lib/cupti/libcheckpoint.so": "06ba82bd09237b934cf16da2172ed5943c582caa35c79b52cfcfeb0ff71f7250",
+        "triton/backends/nvidia/lib/cupti/libcupti.so": "fccdc5fcc7c32f8cf4b3ed9b17f7f187a185a6fa0a5bcc06e3434cbd1687c808",
+        "triton/backends/nvidia/lib/cupti/libcupti.so.12": "fccdc5fcc7c32f8cf4b3ed9b17f7f187a185a6fa0a5bcc06e3434cbd1687c808",
+        "triton/backends/nvidia/lib/cupti/libcupti.so.2025.1.1": "fccdc5fcc7c32f8cf4b3ed9b17f7f187a185a6fa0a5bcc06e3434cbd1687c808",
+        "triton/backends/nvidia/lib/cupti/libnvperf_host.so": "609f54063c253daff6efba79fe49252fdd2324308ab0ffb991cc125d3e9a1eab",
+        "triton/backends/nvidia/lib/cupti/libnvperf_target.so": "2f10e1109fc341a57434c28e4006b45a89247801e20f5ace135c302c173e0770",
+        "triton/backends/nvidia/lib/cupti/libpcsamplingutil.so": "e6fa2783077974fb2765bfa9cbaebf980736df74eebf994c59c7596988aec83b",
+        "triton/instrumentation/libGPUInstrumentationTestLib.so": "8cf2b21c7d15de11ff6a26221c62ef90a8de8a4d768e2c4a5ec5454fc7416397"
+      },
+      "provider_name": "triton",
+      "version": "3.8.0+git669b31ac"
+    }
+  },
+  "projection": "Compact observed receipt, not a complete SBOM. Raw receipt is not bundled. Canonical digests use sorted-key compact ASCII JSON.",
+  "python": "3.12.16",
+  "raw_receipt": {
+    "bytes": 13808834,
+    "sha256": "274fa608d2e613a9e365835ed5b32e0a113e38ce144b5fe2b2b585a71f0a8a7b"
+  },
+  "rdma_core_material": {
+    "files": {
+      "/usr/include/infiniband/arch.h": {
+        "resolved_target": "/usr/include/infiniband/arch.h",
+        "sha256": "2f8418d93883f28facd4579a33761cb79b42af157b928b4755fca5b1f6cd1042"
+      },
+      "/usr/include/infiniband/efadv.h": {
+        "resolved_target": "/usr/include/infiniband/efadv.h",
+        "sha256": "01792050df562c3ff60dc91ebfef7c0c0ebcad9c55e7a0bff00163710bcd7d28"
+      },
+      "/usr/include/infiniband/ib_user_ioctl_verbs.h": {
+        "resolved_target": "/usr/include/infiniband/ib_user_ioctl_verbs.h",
+        "sha256": "872a61fc6e9b1146b4ab0cc6759d9b84c686ca5d7b507952c859f815f145d371"
+      },
+      "/usr/include/infiniband/mlx4dv.h": {
+        "resolved_target": "/usr/include/infiniband/mlx4dv.h",
+        "sha256": "9f4ec9e4b02a9240da3b92ca32eb6cd29e28d24bfd71b8ddd4f531757a078417"
+      },
+      "/usr/include/infiniband/mlx5_api.h": {
+        "resolved_target": "/usr/include/infiniband/mlx5_api.h",
+        "sha256": "41717808a09f24d6d017a936a0656e2f970cf9ecd96ec83cbd34a3bd1b6ba2ee"
+      },
+      "/usr/include/infiniband/mlx5_user_ioctl_verbs.h": {
+        "resolved_target": "/usr/include/infiniband/mlx5_user_ioctl_verbs.h",
+        "sha256": "75ec38a50eb9cda67e7ca8d9aae8a03f1d0a56bd346641fb3810c1166370abe0"
+      },
+      "/usr/include/infiniband/mlx5dv.h": {
+        "resolved_target": "/usr/include/infiniband/mlx5dv.h",
+        "sha256": "11903a8063f267e9a2c3e35ffb919797869fa4230eed342c04fbf67f1a6d1c71"
+      },
+      "/usr/include/infiniband/opcode.h": {
+        "resolved_target": "/usr/include/infiniband/opcode.h",
+        "sha256": "11d7fe74da2c98d8e7ae4df7d6ca57023d73dd0af6bb004b7810ded1695adf43"
+      },
+      "/usr/include/infiniband/sa-kern-abi.h": {
+        "resolved_target": "/usr/include/infiniband/sa-kern-abi.h",
+        "sha256": "ab9a6ca0495dedb45fae9634ca5e4d592f24c68c55f584804d5f69abb0e374b5"
+      },
+      "/usr/include/infiniband/sa.h": {
+        "resolved_target": "/usr/include/infiniband/sa.h",
+        "sha256": "b5d6ed3c389584460792d7c4cada1c25dfbdf19e6259227d84dde259e13d134f"
+      },
+      "/usr/include/infiniband/tm_types.h": {
+        "resolved_target": "/usr/include/infiniband/tm_types.h",
+        "sha256": "c15d540f2ad545c2ebcda8eba2424d31e5bc2999e571809f9f1ad61ccb892406"
+      },
+      "/usr/include/infiniband/verbs.h": {
+        "resolved_target": "/usr/include/infiniband/verbs.h",
+        "sha256": "fc11ce5377887daa379b217d40f7c756525a47f2fea6fcf9bcf2e0fa13ded128"
+      },
+      "/usr/include/infiniband/verbs_api.h": {
+        "resolved_target": "/usr/include/infiniband/verbs_api.h",
+        "sha256": "6d37f6f7f417e87cc2c3ba8c0220d6d56f11b54ee4665ce8553500d65d076554"
+      },
+      "/usr/include/rdma/bnxt_re-abi.h": {
+        "resolved_target": "/usr/include/rdma/bnxt_re-abi.h",
+        "sha256": "aa6d33b555971d6e6dab58f8d73e33e895b6cd3cf36402994e02ad71a46de52e"
+      },
+      "/usr/include/rdma/cxgb4-abi.h": {
+        "resolved_target": "/usr/include/rdma/cxgb4-abi.h",
+        "sha256": "be0aaa5c3ad06e1f5ad9a0fef1b48e963922ca532882569ef3b724b9c80832c6"
+      },
+      "/usr/include/rdma/efa-abi.h": {
+        "resolved_target": "/usr/include/rdma/efa-abi.h",
+        "sha256": "883cb1f94fc2ead81aa895acda31b398952dffe20aeb1d67baccd50bb93324e7"
+      },
+      "/usr/include/rdma/hfi/hfi1_ioctl.h": {
+        "resolved_target": "/usr/include/rdma/hfi/hfi1_ioctl.h",
+        "sha256": "479f9b58412de214b165b3cd636139ab702d070b257c3fc2aa6ceb39bb5923ad"
+      },
+      "/usr/include/rdma/hfi/hfi1_user.h": {
+        "resolved_target": "/usr/include/rdma/hfi/hfi1_user.h",
+        "sha256": "29775b7b4f8e60c971d6295863b106c0f19a97ed8cf918250209c9fdf4c66f8b"
+      },
+      "/usr/include/rdma/hns-abi.h": {
+        "resolved_target": "/usr/include/rdma/hns-abi.h",
+        "sha256": "bcfe9611414834654d0e2e70104c7bdf903e39aaf5788438644acac512cb5fd3"
+      },
+      "/usr/include/rdma/ib_user_ioctl_cmds.h": {
+        "resolved_target": "/usr/include/rdma/ib_user_ioctl_cmds.h",
+        "sha256": "ab9bce912c9f6c7500db652b07ad256c8fa5c5f1aab52ace2d0af72c0e90b431"
+      },
+      "/usr/include/rdma/ib_user_ioctl_verbs.h": {
+        "resolved_target": "/usr/include/rdma/ib_user_ioctl_verbs.h",
+        "sha256": "872a61fc6e9b1146b4ab0cc6759d9b84c686ca5d7b507952c859f815f145d371"
+      },
+      "/usr/include/rdma/ib_user_mad.h": {
+        "resolved_target": "/usr/include/rdma/ib_user_mad.h",
+        "sha256": "f97b63202ac4f4f34a00ce843f807ba8cdf8daa64119f682dea2e610c27a6f42"
+      },
+      "/usr/include/rdma/ib_user_sa.h": {
+        "resolved_target": "/usr/include/rdma/ib_user_sa.h",
+        "sha256": "c9c568dcd436cfc13e35fec0e4598abd654c17b7580c96d1e85f46b36414191b"
+      },
+      "/usr/include/rdma/ib_user_verbs.h": {
+        "resolved_target": "/usr/include/rdma/ib_user_verbs.h",
+        "sha256": "ddcfe6800781a8f91fc3b7a3e4e794d51c6bfd62800a8b7784933b285148adfe"
+      },
+      "/usr/include/rdma/irdma-abi.h": {
+        "resolved_target": "/usr/include/rdma/irdma-abi.h",
+        "sha256": "cfb3594d38b6a95cb33320ca5a9448d9423302975758d57d157b15617b8e8f9f"
+      },
+      "/usr/include/rdma/mlx4-abi.h": {
+        "resolved_target": "/usr/include/rdma/mlx4-abi.h",
+        "sha256": "805805cb12adcec4075e1efbc3077529443197a8713b719f140bb82cb4c1706f"
+      },
+      "/usr/include/rdma/mlx5-abi.h": {
+        "resolved_target": "/usr/include/rdma/mlx5-abi.h",
+        "sha256": "702207ef8debae5ef98a7a2e0150625cb00678a092686aea297d65ccd983babe"
+      },
+      "/usr/include/rdma/mlx5_user_ioctl_cmds.h": {
+        "resolved_target": "/usr/include/rdma/mlx5_user_ioctl_cmds.h",
+        "sha256": "2012f6c2abbf1930dd636edcca81151edf4604d0ecb93d618a931af7c604c2d0"
+      },
+      "/usr/include/rdma/mlx5_user_ioctl_verbs.h": {
+        "resolved_target": "/usr/include/rdma/mlx5_user_ioctl_verbs.h",
+        "sha256": "75ec38a50eb9cda67e7ca8d9aae8a03f1d0a56bd346641fb3810c1166370abe0"
+      },
+      "/usr/include/rdma/mthca-abi.h": {
+        "resolved_target": "/usr/include/rdma/mthca-abi.h",
+        "sha256": "3c26b6617a6107599faa3c1b35eeda04d108233249d9bdc6070f0d2089284d59"
+      },
+      "/usr/include/rdma/ocrdma-abi.h": {
+        "resolved_target": "/usr/include/rdma/ocrdma-abi.h",
+        "sha256": "ce386be004c73032746d2a56867f3533f74b1c56b9e03c19a39c0c7a04681b4a"
+      },
+      "/usr/include/rdma/qedr-abi.h": {
+        "resolved_target": "/usr/include/rdma/qedr-abi.h",
+        "sha256": "f675f2460f445d9ee03e93e68f3cd0faadb3d469613a1fab51e57be5c047cb2b"
+      },
+      "/usr/include/rdma/rdma_netlink.h": {
+        "resolved_target": "/usr/include/rdma/rdma_netlink.h",
+        "sha256": "4476a0cbe5ba8984586bd4df09fdb098ff4377c3ff75d7015b3a543083483ad9"
+      },
+      "/usr/include/rdma/rdma_user_cm.h": {
+        "resolved_target": "/usr/include/rdma/rdma_user_cm.h",
+        "sha256": "146e1cd05ebb62270a402f8b1c535c8bfce7b047239386acd0bb366f7bb9f026"
+      },
+      "/usr/include/rdma/rdma_user_ioctl.h": {
+        "resolved_target": "/usr/include/rdma/rdma_user_ioctl.h",
+        "sha256": "612d3491dc13b73b1324fc98845b4fa514a2e9c4cf35284e9be66f2fc10165f0"
+      },
+      "/usr/include/rdma/rdma_user_ioctl_cmds.h": {
+        "resolved_target": "/usr/include/rdma/rdma_user_ioctl_cmds.h",
+        "sha256": "ae3749da87eda31d157811244b14459ea802c6210f283273a127f332ee091f9c"
+      },
+      "/usr/include/rdma/rdma_user_rxe.h": {
+        "resolved_target": "/usr/include/rdma/rdma_user_rxe.h",
+        "sha256": "f0eadad2a0905741f446f9c28180cd87da6e20b7eb7792496ff81d5f8c123a7b"
+      },
+      "/usr/include/rdma/rvt-abi.h": {
+        "resolved_target": "/usr/include/rdma/rvt-abi.h",
+        "sha256": "f577ef13f54fa591f5717a2100bb0a079ce8f8c8a7f47109b1c69efd98e9554a"
+      },
+      "/usr/include/rdma/siw-abi.h": {
+        "resolved_target": "/usr/include/rdma/siw-abi.h",
+        "sha256": "8d9dee5166bb1529226c4921d08360db2c355aeda8a73077ccee81c337d64169"
+      },
+      "/usr/include/rdma/vmw_pvrdma-abi.h": {
+        "resolved_target": "/usr/include/rdma/vmw_pvrdma-abi.h",
+        "sha256": "ce29e9623d0adbc5c933120e1eeec9a2fb54f4794d79afc353a877e58f9fa016"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.39.0",
+        "sha256": "b146f9c3dbbcd51fe67461bef2674b57c9daeda3e890ff5eb965391b2482bbd1"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs.so.1": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.39.0",
+        "sha256": "b146f9c3dbbcd51fe67461bef2674b57c9daeda3e890ff5eb965391b2482bbd1"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.39.0": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.39.0",
+        "sha256": "b146f9c3dbbcd51fe67461bef2674b57c9daeda3e890ff5eb965391b2482bbd1"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libbnxt_re-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libbnxt_re-rdmav34.so",
+        "sha256": "1b0bcfb4558155a3fb347c81d9e806345ad6a0f25e6823ee4e5ab2e1abe6b8a0"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libcxgb4-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libcxgb4-rdmav34.so",
+        "sha256": "45692f1bfbd565a133abc2bc379048d417f99e7bf276bb50b10aba6fee4a2efb"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libefa-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libefa.so.1.1.39.0",
+        "sha256": "6755e6d289a9705ca64ea857e9c95013890552735a375b5ad5402409fa8208e0"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libhfi1verbs-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libhfi1verbs-rdmav34.so",
+        "sha256": "03ea1b8b8b71b747c7eab82d66834ad98032953b3ea0d1c3e48bba36fdcf01b5"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libhns-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libhns-rdmav34.so",
+        "sha256": "9dd8a707dcea37582d3130822ce81d290658ce658b13e5e28c6abf14bb96475d"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libipathverbs-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libipathverbs-rdmav34.so",
+        "sha256": "ae886b7934b4e6659ef20ce27ed12e232cc81e8d0870315eb621d3115d7dd8c6"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libirdma-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libirdma-rdmav34.so",
+        "sha256": "d87f2ed0691fcc436f00b5bfdc3d16c259fa82d376f7fb497e7b66b9303f9cdd"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libmlx4-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libmlx4.so.1.0.39.0",
+        "sha256": "a68e4389c8e000a9a18c9ed6709d62f254c6d24e88a2d34d76eb5e934f7630b1"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libmlx5-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libmlx5.so.1.22.39.0",
+        "sha256": "547b6da45ff417713770d92b5b836509a4e95969ad2277a0de8291651b90e423"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libmthca-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libmthca-rdmav34.so",
+        "sha256": "51076023439370a930de3d38a633dc8d9a56bd859c20948d5dbfca8d9c4e2123"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libocrdma-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libocrdma-rdmav34.so",
+        "sha256": "dfe3c1412baeed6cb67d605ba7935bf2b5017aa1311c4b84a8d08315e8e81a32"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libqedr-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libqedr-rdmav34.so",
+        "sha256": "79e5b7017c0238f188e2762cd2c667b0f784edcd734a2ec47302c3cfdb3b613f"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/librxe-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/librxe-rdmav34.so",
+        "sha256": "1487e0e5a26dc02d3a9abf9e6820225f47ba6a532d525e92680b20976e12007b"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libsiw-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libsiw-rdmav34.so",
+        "sha256": "02b312aad60121dc6b15a33bc21d1e7ffdaa0970406d13293c52a97ff7660ff0"
+      },
+      "/usr/lib/x86_64-linux-gnu/libibverbs/libvmw_pvrdma-rdmav34.so": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/libibverbs/libvmw_pvrdma-rdmav34.so",
+        "sha256": "21fb7ad8126465979d7a41777aeb7be2a0ed8be8538c8a912c2d67fcf482d29b"
+      },
+      "/usr/lib/x86_64-linux-gnu/librdmacm.so.1": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/librdmacm.so.1.3.39.0",
+        "sha256": "a13b17f217647c4106986243b2dfb70c8fb5e07f22c4caef0399f1db161fae35"
+      },
+      "/usr/lib/x86_64-linux-gnu/librdmacm.so.1.3.39.0": {
+        "resolved_target": "/usr/lib/x86_64-linux-gnu/librdmacm.so.1.3.39.0",
+        "sha256": "a13b17f217647c4106986243b2dfb70c8fb5e07f22c4caef0399f1db161fae35"
+      }
+    },
+    "observable_source_git_head": null,
+    "scope": "Actual library/header/provider bytes; no inference from distro package version or source tag."
+  },
+  "recipe_records": {
+    "/app/versions.txt": "BASE_IMAGE: ubuntu:22.04@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401\nPYTHON_VERSION: 3.12\nROCM_SDK_VERSION: 10.0.0\nTORCH_VERSION: 2.13.0+rocm10.0.0\nTORCHAUDIO_VERSION: 2.11.0+rocm10.0.0\nTORCHVISION_VERSION: 0.28.0+rocm10.0.0\nPYTORCH_ROCM_ARCH: gfx90a;gfx942;gfx950;gfx1100;gfx1101;gfx1200;gfx1201;gfx1150;gfx1151\nAITER_ROCM_ARCH: gfx942;gfx950\nTRITON_BRANCH: 669b31ac\nTRITON_REPO: https://github.com/ROCm/triton.git\nFA_BRANCH: 0e60e394\nFA_REPO: https://github.com/Dao-AILab/flash-attention.git\nAITER_BRANCH: v0.1.29\nAITER_REPO: https://github.com/ROCm/aiter.git\nMORI_BRANCH: v1.2.3.post1\nMORI_REPO: https://github.com/ROCm/mori.git\nROCM_SYSTEMS_REPO: https://github.com/ROCm/rocm-systems.git\nROCM_RUNTIME_COMMIT: 25e14349f2606a6b95c4ccd45eb92a1835646cf2\nTRITON_VERSION: 3.8.0+git669b31ac\nPYBIND11_VERSION: 3.0.4\n",
+    "/etc/rocm-constraints.txt": "pybind11==3.0.4\ntorch==2.13.0+rocm10.0.0\ntorchaudio==2.11.0+rocm10.0.0\ntorchvision==0.28.0+rocm10.0.0\ntriton==3.8.0+git669b31ac\n"
+  },
+  "schema": 1,
+  "soabi": "cpython-312-x86_64-linux-gnu"
+}

@@ -1,0 +1,20 @@
+{
+  "actual_SCM_version": "0.34.0rc1.dev203+gf9e4ca965",
+  "all_exported_git_blobs_verified": 9173,
+  "base_import_version": "0.34.0rc1.dev203+gf9e4ca965",
+  "describe": "v0.34.0rc0-203-gf9e4ca9653da9bd731c8b5bf83483cb2083c8dc9",
+  "distance": 203,
+  "gitlinks": [],
+  "head": "f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9",
+  "installed_distribution_version": "0.34.0rc1.dev203+gf9e4ca965.rocm100",
+  "metadata": "node: f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9\nnode-date: 2026-11-11T04:59:56+00:00\ndescribe-name: v0.34.0rc0-203-gf9e4ca9653da9bd731c8b5bf83483cb2083c8dc9\n",
+  "metadata_sha256": "27feefb2855b7896963c1bf6bab54ad55960bf1f63925c62464906687f78aeff",
+  "platform_suffix_source": "f9 setup.py get_vllm_version ROCm suffix; no pretend-version override",
+  "raw_receipt_sha256": "fb3e7b4dc44a77111e1c0ae72afd948dfce4e21f3fef417142316cae721e6e85",
+  "source_URL": "https://github.com/chunfangamd/vllm/commit/f9e4ca9653da9bd731c8b5bf83483cb2083c8dc9",
+  "tag": "v0.34.0rc0",
+  "tag_ancestor_verified": true,
+  "tag_commit": "34b780fe66bdf3df173358774eb4f29f684b8368",
+  "tree": "d6f385d091f1c45a5ca836fd6c44a57d9051ecf0",
+  "version_calculation": "Existingvenv setuptools_scm same get_version+git_describe_command as Dockerfile version-calc; CPU metadata only, no vLLM install/build/native/GPU."
+}

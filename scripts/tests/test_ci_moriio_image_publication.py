@@ -1,0 +1,593 @@
+import ast
+import importlib.util
+import inspect
+import io
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import unittest
+import urllib.request
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+spec = importlib.util.spec_from_file_location(
+    "publication", ROOT / "scripts/ci_moriio_image_publication.py"
+)
+p = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(p)
+
+
+def exercise_bake_processes(source, directory):
+    """Execute the real command closure/call sites; mock only the process boundary.
+
+    Buildx's context read is implicit inside cwd; the only extra grant is the
+    exact recipe directory. No Docker or network process runs in this test.
+    """
+    tree = ast.parse(textwrap.dedent(source))
+    publish = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "publish")
+    command = next(
+        n for n in publish.body if isinstance(n, ast.FunctionDef) and n.name == "command"
+    )
+    bake_assignment = next(
+        n
+        for n in ast.walk(publish)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "bake" for t in n.targets)
+    )
+    phases = {"bake_plan", "full_build", "publish_cached_target"}
+    calls = [
+        n
+        for n in ast.walk(publish)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "command"
+        and n.args
+        and isinstance(n.args[0], ast.Constant)
+        and n.args[0].value in phases
+    ]
+    assert len(calls) == 3
+    calls.sort(key=lambda node: node.lineno)
+    output = Path(directory)
+    context = output / "source"
+    context.mkdir()
+    observed = []
+
+    def fake_popen(argv, **kwargs):
+        if "bake" in argv:
+            grants = {
+                Path(a.removeprefix("--allow=fs.read="))
+                for a in argv
+                if a.startswith("--allow=fs.read=")
+            }
+            assert grants == {p.RECIPE}, "Do not widen the recipe read grant"
+            cwd = Path(kwargs.get("cwd") or p.ROOT)
+            if not context.is_relative_to(cwd) and not any(
+                context.is_relative_to(g) for g in grants
+            ):
+                raise PermissionError(
+                    "Owned source context is outside cwd and precise recipe grant"
+                )
+            assert cwd == context
+        else:
+            assert kwargs.get("cwd") is None, "Preflight/cleanup cannot require the exported source"
+        observed.append((argv, kwargs.get("cwd")))
+        process = mock.Mock(pid=2**30, returncode=0, stdin=None, stdout=None, stderr=None)
+        process.communicate.return_value = (b"{}", None)
+        return process
+
+    namespace = dict(
+        p.__dict__,
+        deadline=time.monotonic() + 30,
+        output=output,
+        env={"CONTEXT": str(context)},
+        event=lambda *_args, **_kwargs: None,
+        state={"events": []},
+        docker=["docker"],
+        builder="owned-test-builder",
+        image="candidate",
+        metadata=output / "metadata.json",
+    )
+    control = next(
+        n
+        for n in publish.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "client_control" for t in n.targets)
+    )
+    module = ast.Module(body=[control, command, bake_assignment], type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(module), "<actual publisher command boundary>", "exec"),
+        namespace,
+    )
+    with (
+        mock.patch.object(p.subprocess, "Popen", side_effect=fake_popen),
+        mock.patch.object(p.os, "killpg", side_effect=ProcessLookupError) as kill,
+    ):
+        for call in calls:
+            eval(compile(ast.Expression(call), "<actual bake invocation>", "eval"), namespace)
+        # The source may not exist during early diagnosis or final cleanup.
+        shutil.rmtree(context)
+        namespace["command"]("metadata_without_source", ["docker", "info"])
+        namespace["command"]("cleanup_without_source", ["docker", "inspect", "owned"])
+        assert all(call.args[1] == 0 for call in kill.call_args_list)
+    return observed
+
+
+class PublicationControls(unittest.TestCase):
+    def test_bake_context_is_readable_from_all_three_actual_process_invocations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = exercise_bake_processes(inspect.getsource(p.publish), directory)
+            self.assertEqual(len(calls), 5)
+            self.assertEqual([cwd for _, cwd in calls[:3]], [Path(directory) / "source"] * 3)
+            self.assertEqual([cwd for _, cwd in calls[3:]], [None, None])
+
+    def test_actual_recipe_manifest_and_material_pins(self):
+        self.assertEqual(len(p.check_recipe()), 64)
+        self.assertEqual(len(p.CONTEXTS), 3)
+
+    def test_pr_cannot_reach_output_or_docker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "new"
+            with mock.patch.dict(
+                os.environ,
+                {"GITHUB_REPOSITORY": "smg-project/smg", "GITHUB_EVENT_NAME": "pull_request"},
+            ):
+                with (
+                    mock.patch.object(p.subprocess, "Popen") as start,
+                    self.assertRaises(AssertionError),
+                ):
+                    p.publish(Path(directory), out)
+                start.assert_not_called()
+                self.assertFalse(out.exists())
+
+    def test_foreign_repository_cannot_publish(self):
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "foreign/smg"}):
+            with (
+                mock.patch.object(p.subprocess, "Popen") as start,
+                self.assertRaises(AssertionError),
+            ):
+                p.publish(Path("/unused"), Path("/unused"))
+            start.assert_not_called()
+
+    def test_wrong_main_ref_cannot_publish(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GITHUB_REPOSITORY": "smg-project/smg",
+                "GITHUB_EVENT_NAME": "push",
+                "GITHUB_REF": "refs/heads/proposal",
+            },
+        ):
+            with (
+                mock.patch.object(p.subprocess, "Popen") as start,
+                self.assertRaises(AssertionError),
+            ):
+                p.publish(Path("/unused"), Path("/unused"))
+            start.assert_not_called()
+
+    def v2(self, directory, swap="0", memory=None, cpu=None):
+        root = Path(directory)
+        leaf = root / "owned"
+        leaf.mkdir()
+        (leaf / "cpu.max").write_text(cpu or f"{p.QUOTA} {p.PERIOD}")
+        (leaf / "memory.max").write_text(memory or str(p.MEMORY))
+        (leaf / "memory.swap.max").write_text(swap)
+        member = Path(f"/proc/{os.getpid()}/cgroup").read_text()
+        return member, {"unified": (leaf, root)}
+
+    def test_v2_exact_kernel_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(p, "cgroup_paths", return_value=self.v2(directory)):
+                result = p.limits(os.getpid())
+                self.assertEqual(result["controllers"][0]["swap"], "0")
+
+    def test_v2_extra_swap_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(p, "cgroup_paths", return_value=self.v2(directory, swap="1")):
+                with self.assertRaises(AssertionError):
+                    p.limits(os.getpid())
+
+    def test_worker_ancestor_capacity_is_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                p, "cgroup_paths", return_value=self.v2(directory, memory=str(p.MEMORY - 1))
+            ):
+                with self.assertRaises(AssertionError):
+                    p.limits(os.getpid(), capacity=True)
+
+    def test_v1_memory_memsw_total(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            leaf = root / "owned"
+            leaf.mkdir()
+            for name, value in {
+                "cpu.cfs_quota_us": p.QUOTA,
+                "cpu.cfs_period_us": p.PERIOD,
+                "memory.limit_in_bytes": p.MEMORY,
+                "memory.memsw.limit_in_bytes": p.MEMORY,
+            }.items():
+                (leaf / name).write_text(str(value))
+            member = Path(f"/proc/{os.getpid()}/cgroup").read_text()
+            with mock.patch.object(
+                p,
+                "cgroup_paths",
+                return_value=(member, {"cpu": (leaf, root), "memory": (leaf, root)}),
+            ):
+                p.limits(os.getpid())
+                (leaf / "memory.memsw.limit_in_bytes").write_text(str(p.MEMORY + 1))
+                with self.assertRaises(AssertionError):
+                    p.limits(os.getpid())
+
+    def test_redirect_does_not_forward_registry_bearer_to_cdn(self):
+        request = urllib.request.Request(
+            "https://ghcr.io/v2/repo/blobs/sha256:a", headers={"Authorization": "Bearer fake"}
+        )
+        redirected = p.RegistryRedirect().redirect_request(
+            request, None, 307, "", {}, "https://cdn.example/blob?fake=1"
+        )
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_redirect_http_is_rejected(self):
+        request = urllib.request.Request("https://ghcr.io/v2/repo/manifests/a")
+        with self.assertRaises(AssertionError):
+            p.RegistryRedirect().redirect_request(
+                request, None, 307, "", {}, "http://cdn.example/blob"
+            )
+
+    def test_registry_raw_config_digest_not_version_string(self):
+        config = json.dumps(
+            {"os": "linux", "architecture": "amd64", "rootfs": {"diff_ids": ["sha256:layer"]}}
+        ).encode()
+        manifest = json.dumps(
+            {
+                "config": {"digest": "sha256:" + p.digest(config)},
+                "layers": [{"digest": "sha256:layer"}],
+            }
+        ).encode()
+        token = mock.MagicMock()
+        token.__enter__.return_value = io.BytesIO(b'{"token":"fake"}')
+        with (
+            mock.patch.object(p, "registry_open", return_value=token),
+            mock.patch.object(p, "registry_get", side_effect=[manifest, config]),
+        ):
+            result = p.image_identity(
+                "ghcr.io/smg-project/smg", "sha256:" + p.digest(manifest), p.time.monotonic() + 30
+            )
+            self.assertEqual(result["config_sha256"], p.digest(config))
+        with (
+            mock.patch.object(p, "registry_open", return_value=token),
+            mock.patch.object(p, "registry_get", side_effect=[manifest, config + b"\n"]),
+        ):
+            token.__enter__.return_value = io.BytesIO(b'{"token":"fake"}')
+            with self.assertRaises(AssertionError):
+                p.image_identity(
+                    "ghcr.io/smg-project/smg",
+                    "sha256:" + p.digest(manifest),
+                    p.time.monotonic() + 30,
+                )
+
+    def test_expired_registry_deadline_stops_before_network(self):
+        with (
+            mock.patch.object(p.urllib.request, "build_opener") as opener,
+            self.assertRaises(AssertionError),
+        ):
+            p.registry_open(urllib.request.Request("https://ghcr.io/token"), p.time.monotonic() - 1)
+        opener.assert_not_called()
+
+
+def actual_client_namespace(directory, hook=None):
+    """Compile the exact production closures; only external faults are injected."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(p.publish)))
+    publish = tree.body[0]
+    nodes = [
+        node
+        for node in publish.body
+        if (isinstance(node, ast.FunctionDef) and node.name in {"event", "command", "interrupted"})
+        or (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "client_control" for t in node.targets)
+        )
+    ]
+    output = Path(directory)
+    namespace = dict(
+        p.__dict__,
+        deadline=time.monotonic() + 15,
+        output=output,
+        record=output / "result.json",
+        state={"events": []},
+        env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
+            "<actual publisher client closures>",
+            "exec",
+        ),
+        namespace,
+    )
+    actual_event = namespace["event"]
+
+    def event(phase, **extra):
+        if hook:
+            hook(phase, extra, namespace)
+        actual_event(phase, **extra)
+
+    namespace["event"] = event
+    return namespace
+
+
+class OwnedClientLifecycle(unittest.TestCase):
+    def run_owned(
+        self, directory, namespace, code, *, during_popen=None, after_communicate=None, until=None
+    ):
+        """Every child is ours; even an old/failing implementation is safely reaped."""
+        born = []
+        popen = subprocess.Popen
+        handlers = {
+            sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)
+        }
+        for sig in handlers:
+            signal.signal(sig, namespace["interrupted"])
+
+        def start(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            born.append(child)
+            if after_communicate:
+                communicate = child.communicate
+
+                def completed(*args, **kwargs):
+                    result = communicate(*args, **kwargs)
+                    after_communicate()
+                    return result
+
+                child.communicate = completed
+            if during_popen:
+                during_popen()
+            return child
+
+        try:
+            with mock.patch.object(p.subprocess, "Popen", side_effect=start):
+                return namespace["command"](
+                    "client",
+                    [sys.executable, "-I", "-S", "-B", "-c", code],
+                    until=until,
+                    capture=True,
+                )
+        finally:
+            for sig, old in handlers.items():
+                signal.signal(sig, old)
+            observations = []
+            for child in born:
+                live = child.poll() is None
+                observations.append(
+                    {"PID": child.pid, "live_after_command": live, "returncode": child.returncode}
+                )
+                # Cleanup belongs to this test, and cannot certify the production path.
+                if live:
+                    self.assertEqual(os.getpgid(child.pid), child.pid)
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=3)
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(child.pid, 0)
+                if child.stdout:
+                    child.stdout.close()
+                if child.stderr:
+                    child.stderr.close()
+            print(json.dumps({"owned_client_observations": observations}))
+            self.assertTrue(all(not item["live_after_command"] for item in observations))
+
+    def assert_closed(self, namespace):
+        client = namespace["state"]["clients"][-1]
+        self.assertTrue(client["reaped"])
+        self.assertIs(client["PG_gone"], True)
+        self.assertTrue(client["pipes_closed"])
+        self.assertFalse(client["cleanup_unknown"])
+
+    def test_running_event_failure_reaps_actual_client(self):
+        def fail(phase, _extra, _namespace):
+            if phase.endswith("_running"):
+                raise OSError("injected durable HANDLE event failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, fail)
+            with self.assertRaisesRegex(OSError, "HANDLE"):
+                self.run_owned(directory, ns, "import time; time.sleep(30)")
+            self.assert_closed(ns)
+
+    def test_signals_between_actual_popen_and_handle_are_deferred_then_reaped(self):
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM):
+            with self.subTest(signal=sig), tempfile.TemporaryDirectory() as directory:
+                ns = actual_client_namespace(directory)
+                with self.assertRaisesRegex(RuntimeError, "cancellation pending"):
+                    self.run_owned(
+                        directory,
+                        ns,
+                        "import time; time.sleep(30)",
+                        during_popen=lambda: os.kill(os.getpid(), sig),
+                    )
+                self.assert_closed(ns)
+                self.assertEqual(ns["client_control"]["pending_signal"], sig)
+
+    def test_completed_communicate_delivers_pending_before_direct_consumer(self):
+        publish = ast.parse(textwrap.dedent(inspect.getsource(p.publish))).body[0]
+        direct_consumer = next(
+            node
+            for node in ast.walk(publish)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "export_source"
+        )
+        for sig in (signal.SIGTERM, signal.SIGALRM):
+            with self.subTest(signal=sig), tempfile.TemporaryDirectory() as directory:
+                ns = actual_client_namespace(directory)
+                ns["engine_checkout"] = Path(directory)
+                consumer = mock.Mock()
+                ns["export_source"] = consumer
+                with self.assertRaisesRegex(RuntimeError, "cancellation pending"):
+                    self.run_owned(
+                        directory,
+                        ns,
+                        "print('completed')",
+                        after_communicate=lambda: os.kill(os.getpid(), sig),
+                    )
+                    exec(
+                        compile(
+                            ast.fix_missing_locations(
+                                ast.Module(body=[direct_consumer], type_ignores=[])
+                            ),
+                            "<actual next direct consumer>",
+                            "exec",
+                        ),
+                        ns,
+                    )
+                consumer.assert_not_called()
+                self.assert_closed(ns)
+                self.assertTrue(ns["state"]["clients"][-1]["pending_cancel_delivered"])
+
+    def test_pending_before_admission_never_spawns(self):
+        def cancel(phase, _extra, ns):
+            if phase.endswith("_submitted"):
+                ns["interrupted"](signal.SIGTERM, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, cancel)
+            with mock.patch.object(p.subprocess, "Popen") as spawn:
+                with self.assertRaisesRegex(RuntimeError, "cancellation pending"):
+                    ns["command"]("client", ["not-executed"])
+                spawn.assert_not_called()
+            self.assertFalse(ns["state"]["clients"][-1]["Popen_attempted"])
+            self.assert_closed(ns)
+
+    def test_healthy_actual_child_capture_and_unblocked_exec_signals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            result = self.run_owned(
+                directory,
+                ns,
+                "import json,signal; print(json.dumps(sorted(int(s) for s in "
+                "signal.pthread_sigmask(signal.SIG_BLOCK, []))))",
+            )
+            blocked = json.loads(result)
+            self.assertTrue(
+                all(sig not in blocked for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM))
+            )
+            self.assert_closed(ns)
+
+    def test_deadline_timeout_reaps_actual_client(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            before = time.monotonic()
+            with self.assertRaisesRegex(AssertionError, "deadline expired"):
+                self.run_owned(directory, ns, "import time; time.sleep(30)", until=before + 3.15)
+            self.assertLess(time.monotonic() - before, 3)
+            self.assert_closed(ns)
+
+    def test_nonzero_actual_child_is_failure_and_reaped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with self.assertRaisesRegex(AssertionError, "failed"):
+                self.run_owned(directory, ns, "raise SystemExit(7)")
+            self.assertEqual(ns["state"]["clients"][-1]["returncode"], 7)
+            self.assert_closed(ns)
+
+    def test_cleanup_phase_runs_bounded_owned_child_despite_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            ns["client_control"]["cleaning"] = True
+            ns["interrupted"](signal.SIGTERM, None)
+            self.assertEqual(self.run_owned(directory, ns, "print('cleanup')"), b"cleanup\n")
+            self.assert_closed(ns)
+
+    def test_outside_command_signals_still_raise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with self.assertRaisesRegex(RuntimeError, "publisher interrupted"):
+                ns["interrupted"](signal.SIGTERM, None)
+
+    def test_actual_export_source_direct_git_still_interrupted(self):
+        # Real export_source -> check_output/run/communicate, only the external
+        # Git executable is replaced by our harmless sleeping Python child.
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            born = []
+            popen = subprocess.Popen
+            previous = signal.getsignal(signal.SIGALRM)
+
+            def harmless_git(*args, **kwargs):
+                self.assertEqual(args[0][0], "git")
+                kwargs["start_new_session"] = True
+                child = popen(
+                    [sys.executable, "-I", "-S", "-B", "-c", "import time; time.sleep(30)"],
+                    **kwargs,
+                )
+                born.append(child)
+                return child
+
+            signal.signal(signal.SIGALRM, ns["interrupted"])
+            started = time.monotonic()
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0.05)
+                with mock.patch.object(p.subprocess, "Popen", side_effect=harmless_git):
+                    with self.assertRaisesRegex(RuntimeError, "publisher interrupted"):
+                        p.export_source(Path(directory), Path(directory) / "source")
+                self.assertLess(time.monotonic() - started, 2)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+                live = [child for child in born if child.poll() is None]
+                for child in born:
+                    if child.poll() is None:
+                        self.assertEqual(os.getpgid(child.pid), child.pid)
+                        os.killpg(child.pid, signal.SIGKILL)
+                    child.wait(timeout=3)
+                    with self.assertRaises(ProcessLookupError):
+                        os.killpg(child.pid, 0)
+                self.assertEqual(live, [])
+
+    def test_constructor_without_process_object_remains_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory)
+            with mock.patch.object(p.subprocess, "Popen", side_effect=OSError("constructor")):
+                with self.assertRaisesRegex(OSError, "constructor"):
+                    ns["command"]("client", ["not-executed"])
+            client = ns["state"]["clients"][-1]
+            self.assertTrue(client["Popen_attempted"])
+            self.assertFalse(client["reaped"])
+            self.assertIsNone(client["PG_gone"])
+            self.assertTrue(client["cleanup_unknown"])
+            self.assertTrue(ns["state"]["owned_client_cleanup_unknown"])
+
+    def test_pre_spawn_event_error_has_closed_no_spawn_receipt(self):
+        def fail(phase, _extra, _namespace):
+            if phase.endswith("_submitted"):
+                raise OSError("pre-spawn event")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, fail)
+            with mock.patch.object(p.subprocess, "Popen") as spawn:
+                with self.assertRaisesRegex(OSError, "pre-spawn"):
+                    ns["command"]("client", ["not-executed"])
+                spawn.assert_not_called()
+            self.assert_closed(ns)
+
+    def test_returned_receipt_failure_preserves_closed_actual_child(self):
+        def fail(phase, _extra, _namespace):
+            if phase.endswith("_returned"):
+                raise OSError("returned receipt")
+
+        with tempfile.TemporaryDirectory() as directory:
+            ns = actual_client_namespace(directory, fail)
+            with self.assertRaisesRegex(OSError, "returned receipt"):
+                self.run_owned(directory, ns, "print('finite')")
+            self.assert_closed(ns)
+
+
+if __name__ == "__main__":
+    unittest.main()
