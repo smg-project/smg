@@ -148,7 +148,7 @@ Validate a `PolicySpec` to get an `Engine`. Call `Engine::decide` with request f
 
 A host that keeps one `InProcess` for its life gives it a later document with `InProcess::apply`. The call refuses a document whose generation is not above the standing one. The next decision runs under the new document, and a decision under way ends under the one it began under.
 
-The session table and the record of sent prompts stand across the call. The stages of a profile whose name and text did not change stand too, with what they hold. That holds where the new document changes neither `signals` nor `view`, or changes `view` in its header list alone. The paragraph "What a new document keeps" of [Updating a document](#updating-a-document) has the rules, a tally of sends among them.
+The session table and the record of sent prompts stand across the call. The stages of a profile whose name and text did not change stand too, with what they hold. That holds where the new document changes no `signals`, and its `view` is the same or differs in its header list alone. The paragraph "What a new document keeps" of [Updating a document](#updating-a-document) has the rules, a tally of sends among them.
 
 Every other stage starts empty, and is told the workers that stand in the registry the host handed before the call returns. A stage that stands is told none of them again. A stage that keeps load reports is told each worker's report at the engine task's next upkeep.
 

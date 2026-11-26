@@ -2151,6 +2151,29 @@ fn a_view_that_differs_in_its_header_list_alone_keeps_every_profile() {
             assert_eq!(kept(&next, &standing), none, "field {at} beside {later:?}");
         }
     }
+    // A list that keeps its count and changes a name builds anew too: each
+    // of the four other lists is compared by what it holds.
+    let full = |edit: Edit| {
+        let mut spec = listing(&["x-a"]);
+        spec.view.boundaries = vec![64];
+        spec.view.labels = vec!["tier".to_owned()];
+        spec.view.zones = vec!["east".to_owned()];
+        spec.view.engines = vec!["alpha".to_owned()];
+        edit(&mut spec.view);
+        spec
+    };
+    let swaps: [Edit; 4] = [
+        |view| view.boundaries = vec![128],
+        |view| view.labels = vec!["rank".to_owned()],
+        |view| view.zones = vec!["west".to_owned()],
+        |view| view.engines = vec!["beta".to_owned()],
+    ];
+    let standing = applied(&full(|_| {}));
+    for (at, swap) in swaps.into_iter().enumerate() {
+        let mut next = applied(&full(swap));
+        next.keep_from(&standing);
+        assert_eq!(kept(&next, &standing), ([false; 3], false), "swap {at}");
+    }
 }
 
 /// Three profiles for a case of the keep: `p` and `q` read one count of

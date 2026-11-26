@@ -124,9 +124,13 @@ fn a_picker_kept_across_a_new_header_list_is_shown_its_rows_place() {
         let headers: Vec<Header<'_>> = listed.filter_map(stated).collect();
         let mut request = facts(1);
         request.headers = &headers;
+        // This call's own frame: a picker that sent none would leave the
+        // frame of the call before as the last one.
+        let before = served.frames();
         let decision = decide_with(spec.engine(), &request, &candidates);
         assert!(lead(&decision).is_some(), "a pick");
         let seen = served.seen();
+        assert_eq!(seen.frames.len(), before + 1, "one frame of this call");
         let frame = seen.frames.last().expect("a frame");
         let sent = frame.request.as_ref().expect("the request");
         sent.headers.clone()

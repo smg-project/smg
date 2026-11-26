@@ -373,7 +373,7 @@ places adds the override's headers, beside a main policy whose binding lists non
 (`consistent_hashing`).
 
 Section 5.1 keeps every profile across a view that differs in its header list alone. So a label
-that comes or goes resets nothing of another model's policy, wherever its headers stand in the
+that comes or goes resets no stage of another model's profile, wherever its headers stand in the
 list.
 
 A `cache_aware` label also writes the document's `index` block where the settings wrote none. Where
