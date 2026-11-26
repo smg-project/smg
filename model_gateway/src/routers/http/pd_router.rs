@@ -5097,9 +5097,36 @@ mod tests {
         );
     }
 
+    /// The request end of a caller whose server ends the wait by the clock
+    /// (`past_the_request_end`): a minute, longer than a busy test binary
+    /// holds a thread, so the end is never met in real time.
+    const HELD_REQUEST_END: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Moves the caller's clock past `HELD_REQUEST_END`, by hand and at once
+    /// (a current-thread runtime): a request timeout up to that end fires
+    /// where the server stands, in every run, and no real second is waited.
+    async fn past_the_request_end() {
+        struct Resumed;
+        impl Drop for Resumed {
+            fn drop(&mut self) {
+                tokio::time::resume();
+            }
+        }
+        tokio::time::pause();
+        let _resumed = Resumed;
+        tokio::time::advance(HELD_REQUEST_END + std::time::Duration::from_secs(1)).await;
+    }
+
     /// A server whose answer's head and first bytes leave at once and whose
     /// body then breaks off, on every path and method: a worker that dies
-    /// mid-answer.
+    /// mid-answer. The cut comes past a request end of up to
+    /// `HELD_REQUEST_END` on the caller's clock (`past_the_request_end`): a
+    /// caller that reads the cut against such a request timeout reads the
+    /// timeout in every run, not only where a busy test binary holds its
+    /// thread. It needs a current-thread runtime whose clock runs: on a
+    /// multi-thread runtime, or with the clock paused already
+    /// (`start_paused = true`), `tokio::time::pause` panics in the server's
+    /// connection task and the caller is told nothing of it.
     pub(super) async fn spawn_cut_body_stub() -> String {
         let app = axum::Router::new().fallback(axum::routing::any(|| async {
             let head = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
@@ -5108,6 +5135,7 @@ mod tests {
             let cut = futures_util::stream::once(async {
                 // The head and the first bytes are read before the cut.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                past_the_request_end().await;
                 Err::<Bytes, std::io::Error>(std::io::Error::other("the engine went away"))
             });
             (
@@ -5158,6 +5186,43 @@ mod tests {
 
         const BAD_GATEWAY: StatusCode = StatusCode::BAD_GATEWAY;
         const GATEWAY_TIMEOUT: StatusCode = StatusCode::GATEWAY_TIMEOUT;
+
+        // A row that owes a timeout does not wait for it: its server moves
+        // the clock past the request's end where the row owes the timeout.
+        // This one takes the request and never answers.
+        async fn spawn_silent_stub() -> String {
+            let app = axum::Router::new().fallback(axum::routing::any(|| async {
+                past_the_request_end().await;
+                std::future::pending::<StatusCode>().await
+            }));
+            spawn_stub(app).await
+        }
+        // This one's head and first bytes leave at once and its body never
+        // ends. The clock moves once the caller had 64 turns of the test's
+        // one thread to read them: turns, not time, which a held thread
+        // cannot reorder. The count rests on the loopback handing the head
+        // over within those turns (each one poll of the driver, no wait):
+        // were it handed over later, the timeout would be read at the send
+        // and the row would miss its line.
+        async fn spawn_stalled_stub() -> String {
+            let app = axum::Router::new().fallback(axum::routing::any(|| async {
+                let head = futures_util::stream::iter([Ok::<_, std::io::Error>(
+                    Bytes::from_static(b"{\"partial\":"),
+                )]);
+                let stall = futures_util::stream::once(async {
+                    for _ in 0..64 {
+                        tokio::task::yield_now().await;
+                    }
+                    past_the_request_end().await;
+                    std::future::pending::<Result<Bytes, std::io::Error>>().await
+                });
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    Body::from_stream(head.chain(stall)),
+                )
+            }));
+            spawn_stub(app).await
+        }
 
         // (the line's words, the call, the failing server, the answer)
         let rows = [
@@ -5224,17 +5289,34 @@ mod tests {
             ),
         ];
 
-        let client = Arc::new(
+        // No row waits out a real timeout. A busy test binary holds a thread
+        // for longer than a second (its log capture is one lock), and a cut,
+        // a refused connect, a healthy side's answer or a stalled side's head
+        // read behind the hold was read as the request's timeout. Every
+        // worker has a request end, as a registered worker's client has: a
+        // worker that owes a timeout has it a minute away, where its server
+        // meets it by the clock; every other worker has it ten times as far,
+        // past the clock step of any row.
+        let timed = Arc::new(
             http_client_builder()
-                .timeout(std::time::Duration::from_secs(1))
+                .timeout(HELD_REQUEST_END)
                 .build()
                 .unwrap(),
         );
-        let worker_at = |url: String, worker_type: WorkerType| -> Arc<dyn Worker> {
+        let far = Arc::new(
+            http_client_builder()
+                .timeout(HELD_REQUEST_END * 10)
+                .build()
+                .unwrap(),
+        );
+        let worker_at = |url: String,
+                         worker_type: WorkerType,
+                         client: &Arc<reqwest::Client>|
+         -> Arc<dyn Worker> {
             let worker = BasicWorkerBuilder::new(url)
                 .worker_type(worker_type)
                 .runtime_type(RuntimeType::Sglang)
-                .http_client(Arc::clone(&client))
+                .http_client(Arc::clone(client))
                 .build();
             worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
             Arc::new(worker)
@@ -5243,28 +5325,23 @@ mod tests {
         let mut wrong = Vec::new();
         let mut lines_wanted = Vec::new();
         for (what, call, server, status) in rows {
+            let client = match server {
+                Silent | Stalled => &timed,
+                Unreachable | Cut => &far,
+            };
             let (url, _refused) = match server {
                 Unreachable => {
                     let refused = RefusedAddress::reserve();
                     (refused.http_url(), Some(refused))
                 }
-                Silent => (
-                    spawn_delayed_stub(
-                        StatusCode::OK,
-                        json!({}),
-                        std::time::Duration::from_secs(10),
-                    )
-                    .await
-                    .0,
-                    None,
-                ),
+                Silent => (spawn_silent_stub().await, None),
                 Cut => (spawn_cut_body_stub().await, None),
-                Stalled => (spawn_stalled_body_stub().await, None),
+                Stalled => (spawn_stalled_stub().await, None),
             };
             let registered = format!("{url}?token=s3cret");
             let answered = match call {
                 ProxiedGet => {
-                    let worker = worker_at(registered, WorkerType::Prefill);
+                    let worker = worker_at(registered, WorkerType::Prefill, client);
                     PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX)
                         .await
                         .status()
@@ -5276,13 +5353,13 @@ mod tests {
                         Decode => (healthy, registered),
                     };
                     let router = single_attempt_router();
-                    for (url, worker_type) in [
-                        (prefill_url, WorkerType::Prefill),
-                        (decode_url, WorkerType::Decode),
+                    for (url, worker_type, failing) in [
+                        (prefill_url, WorkerType::Prefill, matches!(side, Prefill)),
+                        (decode_url, WorkerType::Decode, matches!(side, Decode)),
                     ] {
-                        router
-                            .worker_registry
-                            .register_or_replace(worker_at(url, worker_type));
+                        let client = if failing { client } else { &far };
+                        let worker = worker_at(url, worker_type, client);
+                        router.worker_registry.register_or_replace(worker);
                     }
                     let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
                     let request = serde_json::from_value(json!({
