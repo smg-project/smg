@@ -987,11 +987,14 @@ async def test_materialize_batch_produces_stable_item_identities_across_batch_si
     # NativeEncoder.facade("metadata", ...) exposes item_identities and _finish cleans up.
     meta_wait = asyncio.Future()
     meta_wait.set_result({"embedding_size": 16, "token_count": 1, "embedding_dim": 8})
+    server_mod = SimpleNamespace(meta_registry=SimpleNamespace(wait=lambda rid: meta_wait))
+    # facade() imports ``server`` from the package, so the package is stubbed as well.
     monkeypatch.setitem(
         sys.modules,
-        "sglang.srt.disaggregation.encoder.server",
-        SimpleNamespace(meta_registry=SimpleNamespace(wait=lambda rid: meta_wait)),
+        "sglang.srt.disaggregation.encoder",
+        SimpleNamespace(server=server_mod),
     )
+    monkeypatch.setitem(sys.modules, "sglang.srt.disaggregation.encoder.server", server_mod)
     monkeypatch.setitem(
         sys.modules,
         "sglang.srt.disaggregation.encoder.runtime",
