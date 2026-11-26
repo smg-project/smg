@@ -84,15 +84,6 @@ impl Budget {
         }
     }
 
-    /// A budget seeded with `micros`, for a case of a kind that closes a
-    /// decision under one.
-    #[cfg(all(test, feature = "controller"))]
-    pub(crate) fn seeded(micros: u32) -> Self {
-        let mut budget = Self::default();
-        budget.seed(micros);
-        budget
-    }
-
     /// Seeds the budget from the request's: a decision's first open.
     fn seed(&mut self, micros: u32) {
         self.remaining_micros = u64::from(micros);

@@ -1,5 +1,16 @@
 use super::{reaches_the_budget, Budget, OpenDecisions, Part};
 
+impl Budget {
+    /// A budget seeded with `micros`, for a case of a kind that closes a
+    /// decision under one.
+    #[cfg(feature = "controller")]
+    pub(in crate::plugins) fn seeded(micros: u32) -> Self {
+        let mut budget = Self::default();
+        budget.seed(micros);
+        budget
+    }
+}
+
 /// What is left of a budget, and the budget as seeded.
 fn left_and_seed(budget: &Budget) -> (u64, u64) {
     (budget.remaining_micros, budget.seed_micros)
