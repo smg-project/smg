@@ -252,15 +252,22 @@ def _strict_owned(
     return OwnedProcess(pid, after[1], uid, after[2])
 
 
-def _strict_census(proc_root: str) -> tuple[dict[int, int], bool]:
-    """Record all listed PID births; a vanished entry makes this pass incomplete."""
+def _strict_census(
+    proc_root: str, on_unresolved: Callable[[int, Exception], None]
+) -> tuple[dict[int, int], bool]:
+    """Record readable PID births without certifying an incomplete census."""
     found: dict[int, int] = {}
     complete = True
     for name in sorted(os.listdir(proc_root)):
         if not name.isdigit():
             continue
         pid = int(name)
-        observed = _strict_stat(proc_root, pid)
+        try:
+            observed = _strict_stat(proc_root, pid)
+        except (OSError, ValueError) as error:
+            on_unresolved(pid, error)
+            complete = False
+            continue
         if observed is None:
             complete = False
         else:
@@ -339,6 +346,11 @@ def reap_strict(
     clean = False
     reported_unresolved: set[int] = set()
 
+    def report_unresolved(pid: int, error: Exception) -> None:
+        if pid not in reported_unresolved:
+            log(f"strict unresolved pid {pid}: {type(error).__name__}: {error}")
+            reported_unresolved.add(pid)
+
     def retire(pid: int) -> None:
         _, fd = handles.pop(pid)
         close(fd)
@@ -384,7 +396,7 @@ def reap_strict(
         for _ in range(max_scans):
             if _strict_ancestors(proc_root, me) != protected:
                 raise ValueError("cleanup process ancestor chain changed")
-            census_before, before_complete = _strict_census(proc_root)
+            census_before, before_complete = _strict_census(proc_root, report_unresolved)
             observed: list[OwnedProcess] = []
             unresolved_observation = False
             for pid in sorted(census_before):
@@ -395,9 +407,7 @@ def reap_strict(
                         proc_root, pid, owner_uid, entry, group_exited=group_exited
                     )
                 except (OSError, ValueError) as error:
-                    if pid not in reported_unresolved:
-                        log(f"strict unresolved pid {pid}: {type(error).__name__}: {error}")
-                        reported_unresolved.add(pid)
+                    report_unresolved(pid, error)
                     # Complete the scan and bind independently verified peers,
                     # even before the first handle exists. This pass can
                     # never count as quiet, even for an unbound process.
@@ -458,7 +468,7 @@ def reap_strict(
                     log(f"strict signal {sig} pid {pid} uid {owner_uid} birth {process.starttime}")
             if clock() > deadline:
                 raise TimeoutError("strict cleanup observation deadline reached")
-            census_after, after_complete = _strict_census(proc_root)
+            census_after, after_complete = _strict_census(proc_root, report_unresolved)
             if clock() > deadline:
                 raise TimeoutError("strict cleanup final census exceeded deadline")
             stable = before_complete and after_complete and census_before == census_after

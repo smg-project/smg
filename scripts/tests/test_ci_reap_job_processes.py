@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -527,10 +528,7 @@ def test_strict_incomplete_owned_observation_is_failure_without_signal(mod, stri
         path.write_text("malformed\n")
     assert not runtime.run(mod)
     assert all(pid != 100 for pid, _ in runtime.sent)
-    if file != "stat":
-        assert (101, signal.SIGTERM) in runtime.sent
-    else:
-        assert runtime.sent == []  # The incomplete birth census still fails closed.
+    assert (101, signal.SIGTERM) in runtime.sent
     assert runtime.closed == set(runtime.opened)
 
 
@@ -666,8 +664,8 @@ def test_strict_final_census_cannot_certify_success_after_deadline(mod, strict_t
     original = mod._strict_census
     calls = []
 
-    def slow_final_census(root):
-        found = original(root)
+    def slow_final_census(root, on_unresolved):
+        found = original(root, on_unresolved)
         calls.append(True)
         if len(calls) == 4:
             runtime.now = 20.5
@@ -716,8 +714,6 @@ def test_strict_fixed_deadline_does_not_shorten_a_late_workers_grace(mod, strict
     reason="requires Linux process pidfds",
 )
 def test_strict_zombie_main_thread_cannot_hide_live_threads(mod, tmp_path):
-    import select
-
     child = None
     fd = None
     marker = f"e2e-zombie-main-{os.getpid()}-{time.time_ns()}"
@@ -915,3 +911,83 @@ def test_strict_nul_only_environment_never_establishes_quiet_cleanup(mod, strict
     assert runtime.sent == []
     assert runtime.now <= 20.4 + 1e-9
     assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("file", ["environ", "stat"])
+def test_strict_initially_unresolved_exit_can_finish_cleanly(mod, strict_tree, file):
+    runtime = _Pidfds(strict_tree)
+    _strict_process(strict_tree, 102, birth=1102)
+    (strict_tree / "102" / file).write_bytes(b"")
+    runtime.on_sleep = lambda: runtime.remove(102)
+    assert runtime.run(mod)
+    assert all(pid != 102 for pid, _ in runtime.sent)
+    assert {(100, signal.SIGTERM), (101, signal.SIGTERM)} <= set(runtime.sent)
+    assert runtime.closed == set(runtime.opened)
+
+
+@pytest.mark.parametrize("pid", [99, 102])
+def test_strict_unreadable_census_keeps_cleaning_verified_peers(mod, strict_tree, monkeypatch, pid):
+    runtime = _Pidfds(strict_tree)
+    _strict_process(strict_tree, pid, birth=2000 + pid)
+    unreadable = strict_tree / str(pid) / "stat"
+    original = open
+
+    def denied(path, *args, **kwargs):
+        if os.fspath(path) == str(unreadable):
+            raise PermissionError(13, "census stat unreadable", str(unreadable))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", denied)
+    lines = []
+    assert not runtime.run(mod, log=lines.append)
+    assert all(target != pid for target, _ in runtime.sent)
+    assert {(100, signal.SIGTERM), (101, signal.SIGTERM)} <= set(runtime.sent)
+    assert runtime.closed == set(runtime.opened)
+    assert sum("PermissionError" in line and str(pid) in line for line in lines) == 1
+
+
+@pytest.mark.parametrize("preserve_environment", [False, True])
+def test_strict_real_retitled_process_retains_marker_only_with_spt_noenv(
+    mod, tmp_path, preserve_environment
+):
+    pytest.importorskip("setproctitle")
+    import select
+
+    marker = f"spt-{os.getpid()}-{time.monotonic_ns()}"
+    env = {**os.environ, "E2E_JOB_MARKER": marker}
+    env.pop("SPT_NOENV", None)
+    if preserve_environment:
+        env["SPT_NOENV"] = "1"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import setproctitle,time; setproctitle.setproctitle('smg::router'); "
+            "print('READY',flush=True); time.sleep(60)",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert select.select([child.stdout], [], [], 5)[0], "retitled child did not start"
+        assert child.stdout.readline() == "READY\n"
+        observed = Path(f"/proc/{child.pid}/environ").read_bytes()
+        assert (f"E2E_JOB_MARKER={marker}".encode() in observed) is preserve_environment
+        # Real procfs and pidfds, with discovery restricted to this test's child
+        # and protected ancestors. Never expose unrelated host PIDs to cleanup.
+        view = tmp_path / "proc"
+        view.mkdir()
+        for pid in {1, child.pid, *mod._strict_ancestors("/proc", os.getpid())}:
+            (view / str(pid)).symlink_to(f"/proc/{pid}", target_is_directory=True)
+        assert mod.reap_strict(marker, grace=0.1, proc_root=str(view)) is preserve_environment
+        if preserve_environment:
+            assert child.wait(timeout=5) == -signal.SIGTERM
+        else:
+            assert child.poll() is None
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
