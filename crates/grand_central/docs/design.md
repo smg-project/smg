@@ -755,9 +755,16 @@ request goes to.
   none.
 - **[built]** A request given as text is decided the same way in the string tree its host lends,
   where the host names the request's entry by its text (`RequestMaker::text_key`). The tree is
-  asked for whatever the model's index holds: an index speaks of token blocks. A match is
-  counted as the bytes of text it holds, in the request's windows. The gateway lends its string
-  trees, and names a request's entry there by classic's own key.
+  asked for whatever the model's index holds: an index speaks of token blocks. The gateway lends
+  its string trees, and names a request's entry there by classic's own key.
+- **[built]** A decision inside a lent tree reads the match by its own two numbers: its size and
+  the request's, in the tree's unit, tokens or characters, a partition's marker in neither. The
+  built-in prefix stage divides them as classic does, with nothing rounded to a block. Where the
+  share is over the stage's threshold every worker of the match is a holder, though the match is
+  under one block. The held prefix's price counts the match's whole blocks, as classic's does. A
+  pick of any worker the match named states the two numbers, whatever the share, and names the
+  tree as where they came from. A holder's row still counts the request's whole blocks, a text's
+  windows in bytes: a host's own stage or a plugin's reads those.
 - **[built]** Where no lent tree decides a single request, one record names its holders. Which
   one is by the prefix stages of its profile and by the request:
   - no stage reads the index's holders (`source: predictor`): the hash table, for every worker
@@ -812,7 +819,8 @@ for every worker of its list.
 A prefill-decode pair is lent no tree: each of its sides
 reads the hash table, and the index where its model has one, by the side's own list, worker by
 worker: on a request with token ids the index speaks for each worker it holds a block for, and
-the hash table for every other. An encode
+the hash table for every other, or for every worker under a side's profile that reads the hash
+table alone. An encode
 request's pair reads them the same way. A controller is to
 keep trees of its own **[planned]**, and section 11 says what its contract must hold for that. On
 main a controller's engine reads its hash table, and the index of cache events that its worker
@@ -1946,7 +1954,7 @@ pub struct Placement<'a> {               // built, see part 3
     pub routing_key: Option<&'a str>,    // the key the document derived, for the in-flight counters
     pub profile: &'static str,           // the label of the profile that picked, for the host's own counts
     pub decode_profile: Option<&'static str>, // a pair's decode side's profile, by its label
-    pub overlap: Overlap,                // how many leading blocks of the request the worker it goes to holds, of how many
+    pub overlap: Overlap,                // how much of the request the worker it goes to holds, of how much: leading blocks, or a lent tree's tokens or characters
     // private: the lease: a pair's always, a single request's only where the document takes a lease event (section 6)
 }
 
@@ -2406,10 +2414,17 @@ request ──> route (HTTP or gRPC, any family)
   they already take. A route names the answer's type and makes its load guard from the answer, in the places it made one before.
 
   The gateway observes classic's match ratio series from a placement that states what share of the
-  request's blocks its worker holds (`Placement::overlap`). It observes once for a single request,
+  request its worker holds (`Placement::overlap`), in blocks, or inside a lent tree in the tree's
+  tokens or characters, as classic divides a tree's match. It observes once for a single request,
   and once for a pair, of its prefill. A pick states that share only where its own profile reads who
   holds the prompt, whatever the profile's name. Classic observes a `cache_aware` selection that it
   decides by events or in a tree, so both sides of a pair where both make such a selection.
+
+  For a request of more than 65,535 tokens or characters a pick states both numbers halved
+  together, until the request's fits sixteen bits. The share they state is then within one part in
+  32,768 of the match's. The stage's own test divides the match's numbers, which are not halved. So
+  the series can count such a request in the next bucket, where the match's share lies that close
+  to a bucket's edge.
 
   Where the engine places no worker for a request, the gateway names the client's answer itself,
   by classic's own judgement of the pool. The engine's word for the refusal goes to a log line

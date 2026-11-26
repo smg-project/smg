@@ -248,6 +248,13 @@ fn an_entry_is_stated_by_its_larger_reading_of_the_requests_blocks() {
         );
     }
     assert_ne!(Overlap::held(entry(0, 0), 8), Overlap::NONE);
+    // A lent tree's match is stated in the tree's own unit, and halved
+    // as blocks are: 200,000 chars are two bits past sixteen.
+    let in_tree = |matched: u32, of: u32| Overlap::in_tree(matched, of, false);
+    assert_eq!(in_tree(40, 100), stated(40, 100, OverlapSource::Tree));
+    let halved = stated(17_500, 50_000, OverlapSource::Tree);
+    assert_eq!(in_tree(70_000, 200_000), halved);
+    assert_eq!(in_tree(0, 100), stated(0, 100, OverlapSource::None));
 }
 
 /// The word of who placed a pick costs the pick no byte: it sits in the

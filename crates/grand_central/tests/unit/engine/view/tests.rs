@@ -98,12 +98,14 @@ fn a_ready_record_can_be_sent_to_and_is_an_engine_of_its_own() {
 /// places there two more. A text's two lengths are one word: its
 /// characters fill what was spare, and its bytes take the word. The
 /// word that says the request's own id handed its session key is one
-/// byte of what is spare. A field the facts gain beyond the spare
+/// byte of what is spare. The match of a lent tree that named the rows
+/// is two counts beside them, one word more
+/// ([`AffinityRows::tree`]). A field the facts gain beyond the spare
 /// bytes moves this number and carries the decision bench's cells
 /// that copy the facts (`benches/decision.rs`).
 #[test]
 fn a_requests_facts_take_the_pinned_bytes() {
-    assert_eq!(size_of::<RequestFacts<'_>>(), 320);
+    assert_eq!(size_of::<RequestFacts<'_>>(), 328);
 }
 
 #[test]
@@ -340,6 +342,19 @@ fn rows_named_in_the_columns_place_read_what_each_holds() {
         (held.overlap_blocks, held.predicted_blocks)
     });
     assert_eq!(read, [(0, 0), (9, 0), (0, 0), (3, 7), (0, 0)]);
+    // A row is named whatever it holds: a tree's match names a row of
+    // no whole block, whose entry reads as nothing held.
+    let rows = facts.named.expect("rows named");
+    let named = [0, 1, 2, 4, 511].map(|index| rows.names(index));
+    assert_eq!(named, [false, true, false, true, false]);
+    let mut walk = rows.walk();
+    let walked = [0, 1, 4, 2].map(|index| walk.names(index));
+    assert_eq!(walked, [false, true, true, false]);
+    // A tree's match clears a threshold by one division of its two
+    // counts, and a request of no size clears none.
+    assert!(TreeMatch::new(31, 100).clears(0.3));
+    assert!(!TreeMatch::new(3, 10).clears(0.3));
+    assert!(!TreeMatch::new(0, 0).clears(0.0));
     let nobody = RequestFacts {
         named: Some(AffinityRows::default()),
         ..RequestFacts::default()

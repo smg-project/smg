@@ -977,6 +977,7 @@ fn named<'a>(holders: &'a [AffinityHolder], warming: &'a [u32], thin: bool) -> A
         warming,
         thin,
         mean_in_flight: None,
+        tree: None,
     }
 }
 
@@ -1469,6 +1470,131 @@ fn a_row_nobody_named_holds_nothing_and_a_long_request_keeps_its_share() {
     };
     let said = stage.said(&longer, &pool, 0);
     assert_eq!((said.blocks, said.of), (8_750, 37_500));
+}
+
+/// The rows a lent tree's match named: `holders`, and the match's two
+/// numbers.
+fn in_tree(holders: &[AffinityHolder], matched: u32, of: u32) -> AffinityRows<'_> {
+    AffinityRows {
+        tree: Some(TreeMatch::new(matched, of)),
+        ..named(holders, &[], false)
+    }
+}
+
+/// Rows a lent tree's match named are scored by the match's own share:
+/// its size over the request's, nothing rounded to a block. Where the
+/// share is over the threshold every row named is a holder, though its
+/// whole blocks would not clear, or are none. At the threshold, or
+/// with nobody named, nobody is. The same rows with no tree's match are
+/// read by their whole blocks, as before. Behind a draw the scores are
+/// the same, and a source that reads the index alone follows no tree.
+///
+/// The classic policy follows a tree's match where its share is over
+/// `cache_threshold` and makes every tenant of it a candidate
+/// (`select_worker_with_tokens` and `select_matched_candidate` in
+/// `model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn rows_a_trees_match_named_are_scored_by_the_matchs_share() {
+    let stage = affinity(None);
+    let pool = rows(&[candidate(0, 0, 0), candidate(1, 0, 0), candidate(2, 0, 0)]);
+    // One whole block of the request's sixteen, and no whole block.
+    let sent = |row, predicted_blocks| AffinityHolder {
+        row,
+        overlap_blocks: 0,
+        predicted_blocks,
+    };
+    let holders = [sent(0, 1), sent(2, 0)];
+    let facts = facts(16);
+    let alike = [0.5, 0.5, 0.5];
+    let over = scores_named(&stage, &facts, &pool, in_tree(&holders, 31, 100));
+    assert_eq!(over, [1.0, 0.5, 1.0]);
+    // Three of ten is the default threshold, and not over it.
+    let at = scores_named(&stage, &facts, &pool, in_tree(&holders, 3, 10));
+    assert_eq!(at, alike);
+    let nobody = scores_named(&stage, &facts, &pool, in_tree(&[], 31, 100));
+    assert_eq!(nobody, alike);
+    // No tree's match: one block of sixteen is under the threshold.
+    let blocks = scores_named(&stage, &facts, &pool, named(&holders, &[], false));
+    assert_eq!(blocks, alike);
+    let drawn = AffinityRows {
+        mean_in_flight: Some(0.0),
+        ..in_tree(&holders, 31, 100)
+    };
+    assert_eq!(scores_named(&stage, &facts, &pool, drawn), over);
+    let params = PrefixAffinityParams {
+        source: Some(AffinitySource::Index),
+        ..PrefixAffinityParams::default()
+    };
+    let indexed = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)));
+    let unread = scores_named(&indexed, &facts, &pool, in_tree(&holders, 31, 100));
+    assert_eq!(unread, alike);
+}
+
+/// A tree's match is priced at its whole blocks of the tree's unit, a
+/// text's chars at four a token: the one count of a tree's match that
+/// is rounded, as the classic policy prices it
+/// (`select_matched_candidate` and `tree_request` in
+/// `model_gateway/src/policies/cache_aware.rs`). So a loaded holder of
+/// eight blocks is kept by its price, and one of a match under one
+/// block is not. The stage says the match's two numbers of a row the
+/// match named, where it follows the match, and a miss of the request's
+/// blocks of any other row.
+#[test]
+fn a_trees_match_is_priced_in_whole_blocks_and_said_in_its_own_unit() {
+    let gates = Gates::of(None, None, Some(16));
+    assert_eq!(gates.tokens_in_tree(40, HashKind::Token), 32.0);
+    assert_eq!(gates.tokens_in_tree(40, HashKind::Text), 8.0);
+    assert_eq!(gates.tokens_in_tree(15, HashKind::Token), 0.0);
+
+    let stage = affinity(Some(SpillParams {
+        rel: Some(1.1),
+        prefix_margin_tokens: Some(8),
+        ..SpillParams::default()
+    }));
+    let pool = rows(&[
+        candidate(0, 10, 0),
+        candidate(1, 0, 0),
+        candidate(2, 0, 0),
+        candidate(3, 0, 0),
+    ]);
+    let holders = [AffinityHolder {
+        row: 0,
+        overlap_blocks: 0,
+        predicted_blocks: 0,
+    }];
+    let said = |matched: u32, of: u32, row: u32| {
+        let facts = RequestFacts {
+            named: Some(in_tree(&holders, matched, of)),
+            ..facts(16)
+        };
+        let mut out = vec![0.0; 4];
+        stage.score(&facts, &pool, &kept(4), &mut out);
+        (out, stage.said(&facts, &pool, row))
+    };
+    let tree = |blocks: u16, of: u16, margin_held: bool| Overlap {
+        blocks,
+        of,
+        source: OverlapSource::Tree,
+        margin_held,
+    };
+    // Eight whole blocks are sixteen requests' worth: over the swing's
+    // margin of four, and under the priced one.
+    let (scores, word) = said(128, 256, 0);
+    assert_eq!(scores, [1.0, 0.5, 0.5, 0.5]);
+    assert_eq!(word, tree(128, 256, true));
+    // Fifteen tokens of forty clear the threshold and are no whole
+    // block: nothing is priced, and the loaded holder spills.
+    let (scores, word) = said(15, 40, 0);
+    assert_eq!(scores, [0.0, 0.5, 0.5, 0.5]);
+    assert_eq!(word, tree(15, 40, false));
+    // A row the match did not name, and a match the stage does not
+    // follow: a miss of the request's sixteen blocks.
+    let miss = Overlap {
+        of: 16,
+        ..Overlap::default()
+    };
+    assert_eq!(said(128, 256, 1).1, miss);
+    assert_eq!(said(30, 100, 0).1, miss);
 }
 
 /// One holder over the swing's margin and under the priced one: the

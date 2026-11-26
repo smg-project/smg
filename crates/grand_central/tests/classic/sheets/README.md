@@ -158,9 +158,11 @@ the text matcher it is carried as text, each id as four hex digits. Every prompt
 blocks: sixteen token ids, or sixteen characters of a text. A picked worker holds one more request. A tree is
 written at every pick: the picked worker holds the prompt from then on. The index is written by the `stored` and
 `removed` steps alone, and a row under it stores a block before its first pick, since over an empty index the
-policy reads its tree of token ids. The replay hands the engine what each worker holds as the affinity column a
-host lends: under the index every worker's own depth, and under a tree the depth of the deepest holders alone,
-since the gateway's tree names nobody else. A row under the index is replayed by the replay's own count of
+policy reads its tree of token ids. The replay hands the engine what each worker holds as a host lends it: under
+the index the affinity column, every worker's own depth, and under a tree the rows of the tree's match, the
+deepest holders alone, since the gateway's tree names nobody else. Beside those rows it hands the match's two
+numbers, its size and the prompt's in the tree's own unit, which it derives from the row's prompts: token ids by
+whole blocks, and a text's characters one by one. A row under the index is replayed by the replay's own count of
 the blocks each worker stored. The replay builds a row's profile from the crate's `cache_aware` preset.
 It sets on the preset each number of the row's configuration that differs from the gateway's command line
 default, and a tree row names its source. So a row recorded under those defaults asks the preset as it is named.

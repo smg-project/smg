@@ -320,6 +320,8 @@ struct Named {
     holders: Vec<(u32, u32, u32)>,
     warming: Vec<u32>,
     thin: bool,
+    /// The match of the lent tree that named the rows, where one did.
+    tree: Option<TreeMatch>,
 }
 
 fn picked(position: u32, id: WorkerId) -> Decision {
@@ -528,6 +530,7 @@ impl Bed {
                         .collect(),
                     warming: rows.warming.to_vec(),
                     thin: rows.thin,
+                    tree: rows.tree,
                 });
                 match target {
                     Some(position) => picked(position, self.ids[position as usize]),
@@ -595,13 +598,19 @@ impl Bed {
     /// partition's marker. Decided by picking the worker at `target`, which
     /// writes the request for it, or by a shed, which writes nothing.
     fn keyed(&self, key: &[u32], marker: usize, target: Option<u32>) -> Vec<(u32, u32, u32)> {
+        self.keyed_whole(key, marker, target).holders
+    }
+
+    /// [`Self::keyed`], with the tree's match the rows carry beside the
+    /// holders.
+    fn keyed_whole(&self, key: &[u32], marker: usize, target: Option<u32>) -> Named {
         let hashes = hashed(&key[marker..]);
         let key = TokenKey {
             tokens: Cow::Borrowed(key),
             marker,
         };
         let named = self.decide_keyed(&request(&hashes, 7, NOW), Some(key), target);
-        named.expect("rows named").holders
+        named.expect("rows named")
     }
 
     /// The holders a request of text is named whose host names `key` as its
@@ -609,6 +618,12 @@ impl Bed {
     /// a partition's marker. Decided by picking the worker at `target`,
     /// which writes the request for it, or by a shed, which writes nothing.
     fn worded(&self, key: &str, marker: usize, target: Option<u32>) -> Vec<(u32, u32, u32)> {
+        self.worded_whole(key, marker, target).holders
+    }
+
+    /// [`Self::worded`], with the tree's match the rows carry beside the
+    /// holders.
+    fn worded_whole(&self, key: &str, marker: usize, target: Option<u32>) -> Named {
         let behind = key
             .char_indices()
             .nth(marker)
@@ -620,7 +635,7 @@ impl Bed {
         };
         let facts = request(&hashes, 7, NOW);
         let named = self.decide_entered(&facts, None, (None, Some(entry)), target);
-        named.expect("rows named").holders
+        named.expect("rows named")
     }
 
     /// The list's column for `facts` at `phase`, and what its fill read of
@@ -1275,7 +1290,8 @@ fn conversations_alike_past_the_hashed_blocks_are_named_their_own_workers() {
 
 /// The naming of a cache partition is the host's. An entry named behind a
 /// partition's marker shares no prefix with another partition's nor with a
-/// plain one, and the marker is no part of the blocks a worker is named by.
+/// plain one, and the marker is no part of the blocks a worker is named by,
+/// nor of the match's two numbers.
 #[test]
 fn a_hosts_marker_keeps_two_partitions_apart() {
     let (affinity, _) = lending(false);
@@ -1288,14 +1304,17 @@ fn a_hosts_marker_keeps_two_partitions_apart() {
     };
     let asked = tokens(1_000, 4);
     assert!(bed.keyed(&under(1, &asked), marker, Some(2)).is_empty());
-    assert_eq!(bed.keyed(&under(1, &asked), marker, None), [(2, 0, 4)]);
+    let named = bed.keyed_whole(&under(1, &asked), marker, None);
+    assert_eq!(named.holders, [(2, 0, 4)]);
+    assert_eq!(named.tree, Some(TreeMatch::new(64, 64)));
     assert!(bed.keyed(&under(2, &asked), marker, None).is_empty());
     assert!(bed.keyed(&asked, 0, None).is_empty());
     // Another prompt of the partition shares the marker alone, and a
-    // marker is no block of a prompt.
-    assert!(bed
-        .keyed(&under(1, &tokens(5_000, 4)), marker, None)
-        .is_empty());
+    // marker is no block of a prompt: a match of nothing, of the prompt's
+    // own sixty-four tokens.
+    let named = bed.keyed_whole(&under(1, &tokens(5_000, 4)), marker, None);
+    assert!(named.holders.is_empty());
+    assert_eq!(named.tree, Some(TreeMatch::new(0, 64)));
 }
 
 /// Many callers at once lose no write: each of sixty-four callers holds a
@@ -1470,12 +1489,15 @@ fn the_entry_is_asked_for_once_and_only_where_the_host_lends_a_tree() {
 /// tree. A pick writes the whole text for its worker, a later request that
 /// begins alike is named that worker by the windows the two share, the
 /// deepest holders alone are named, a shed writes nothing and a worker its
-/// host took out of the tree is named no more. The record of hashed
-/// windows stays empty.
+/// host took out of the tree is named no more. A text under one window is
+/// named the worker it was sent to as well, with no window held. The
+/// record of hashed windows stays empty.
 ///
 /// The classic policy matches and writes its string tree for a request
 /// that holds no token ids (`select_worker_with_text` in
-/// `model_gateway/src/policies/cache_aware.rs`).
+/// `model_gateway/src/policies/cache_aware.rs`), and makes every tenant of
+/// a match a candidate whatever its blocks (`select_matched_candidate`
+/// there).
 #[test]
 fn a_string_tree_names_the_worker_a_text_was_sent_to() {
     let (affinity, tree) = lending_text(false);
@@ -1495,10 +1517,11 @@ fn a_string_tree_names_the_worker_a_text_was_sent_to() {
     // The tree is the host's to keep: it takes out a worker that left.
     tree.remove_tenant_all(&TenantId::from(address(3)));
     assert_eq!(bed.worded(&longer, 0, None), [(1, 0, 4)]);
-    // A text under one window names nobody, and is decided all the same.
+    // A text under one window is named the worker it was sent to, which
+    // holds no whole window of it: the match's own numbers say how much.
     let short = &text(7_000, 1)[..WINDOW - 1];
     assert!(bed.worded(short, 0, Some(2)).is_empty());
-    assert!(bed.worded(short, 0, None).is_empty());
+    assert_eq!(bed.worded(short, 0, None), [(2, 0, 0)]);
     // A host that names no entry reads the record of hashed windows, which
     // no request above wrote.
     assert!(bed.holders(&worded(&asked), NOW).is_empty());
@@ -3602,6 +3625,10 @@ fn a_pick_states_its_workers_entry_of_the_rows_the_engine_named() {
     assert_eq!(bed.states(&facts, 2), holds(4, 4, OverlapSource::Index));
     assert_eq!(bed.states(&facts, 5), holds(2, 4, OverlapSource::Index));
     assert_eq!(bed.states(&facts, 0), holds(0, 4, OverlapSource::None));
+    // The rows the index named carry no tree's match: whole blocks.
+    let named = bed.decide(&facts, None).expect("rows named");
+    assert_eq!(named.holders.len(), 2);
+    assert_eq!(named.tree, None);
     // That pick wrote nothing: the index decides the request alone.
     assert_eq!(bed.states(&facts, 0), holds(0, 4, OverlapSource::None));
     assert_eq!(bed.stated(&facts, None, shed()), Overlap::NONE);
@@ -3673,6 +3700,7 @@ fn a_pick_states_its_workers_entry_of_the_rows_its_host_named() {
             warming: &[],
             thin: false,
             mean_in_flight: None,
+            tree: None,
         }),
         ..request(&asked, 7, NOW)
     };
@@ -3716,43 +3744,49 @@ fn stated_in_tree(bed: &Bed, key: &[u32], row: u32) -> Overlap {
     answered_in_tree(bed, key, picked(row, bed.ids[row as usize]))
 }
 
-/// A request decided inside its host's token tree states its pick's entry
-/// of the rows the tree's match named, as a pick over the engine's own rows
-/// does. A prompt the tree holds for nobody is a miss of the request's
-/// blocks. Once the tree holds it for a worker, a pick of that worker states
-/// the match's tokens counted in the request's blocks, read as sent. A
-/// longer prompt that begins with it states the blocks the two share, of
-/// its own.
+/// A request decided inside its host's token tree states the match's own
+/// two numbers for a pick of a worker the match named: the tokens the tree
+/// holds of the prompt and the prompt's tokens, read from the tree. A
+/// prompt the tree holds for nobody is a miss of the request's blocks. A
+/// longer prompt that begins with one the tree holds states the tokens the
+/// two share, of its own. The classic policy's series divides the same two
+/// numbers (`log_tree_decision` in
+/// `model_gateway/src/policies/cache_aware.rs`).
 #[test]
-fn a_pick_made_inside_a_hosts_token_tree_states_the_matchs_blocks() {
+fn a_pick_made_inside_a_hosts_token_tree_states_the_matchs_tokens() {
     let (affinity, _tree) = lending(false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
     let asked = tokens(1_000, 4);
     let miss = holds(0, 4, OverlapSource::None);
     assert_eq!(stated_in_tree(&bed, &asked, 1), miss);
-    // That pick wrote the prompt for its worker, and the match names it.
-    assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4)]);
-    let sent = holds(4, 4, OverlapSource::Predictor);
+    // That pick wrote the prompt for its worker, and the match names it:
+    // sixty-four tokens of sixty-four.
+    let named = bed.keyed_whole(&asked, 0, None);
+    assert_eq!(named.holders, [(1, 0, 4)]);
+    assert_eq!(named.tree, Some(TreeMatch::new(64, 64)));
+    let sent = holds(64, 64, OverlapSource::Tree);
     assert_eq!(stated_in_tree(&bed, &asked, 1), sent);
     let longer = tokens(1_000, 6);
-    let shared = holds(4, 6, OverlapSource::Predictor);
+    let shared = holds(64, 96, OverlapSource::Tree);
     assert_eq!(stated_in_tree(&bed, &longer, 1), shared);
     // No entry named: the record of hashed prefixes, which nothing wrote.
+    // Its rows carry no tree's match, and are read in whole blocks.
     let hashes = hashed(&asked);
     assert_eq!(bed.states(&request(&hashes, 7, NOW), 1), miss);
+    let named = bed.decide(&request(&hashes, 7, NOW), None);
+    assert_eq!(named.expect("rows named").tree, None);
 }
 
-/// A request of text decided inside its host's string tree states its
-/// pick's entry of the rows the tree's match named, as one decided inside
-/// the token tree does
-/// ([`a_pick_made_inside_a_hosts_token_tree_states_the_matchs_blocks`]): a
-/// miss while the tree holds the text for nobody, then the bytes the match
-/// holds counted in the request's windows, read as sent. A longer text
-/// that begins with it states the windows the two share, of its own, and a
-/// text of several bytes a char states its windows too. A pick that is
-/// none of the match's holders states a miss.
+/// A request of text decided inside its host's string tree states the
+/// match's own two numbers, as one decided inside the token tree does
+/// ([`a_pick_made_inside_a_hosts_token_tree_states_the_matchs_tokens`]): a
+/// miss while the tree holds the text for nobody, then the chars the tree
+/// holds of the text and the text's chars. A longer text that begins with
+/// it states the chars the two share, of its own. A text of several bytes
+/// a char states its chars, where its holder's row counts its windows in
+/// bytes. A pick that is none of the match's holders states a miss.
 #[test]
-fn a_pick_made_inside_a_hosts_string_tree_states_the_matchs_windows() {
+fn a_pick_made_inside_a_hosts_string_tree_states_the_matchs_chars() {
     let (affinity, _tree) = lending_text(false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
     let stated = |key: &str, row: u32| {
@@ -3765,15 +3799,17 @@ fn a_pick_made_inside_a_hosts_string_tree_states_the_matchs_windows() {
         bed.stated_entered(&request(&hashes, 7, NOW), (None, Some(entry)), answer)
     };
     let miss = holds(0, 4, OverlapSource::None);
-    let sent = holds(4, 4, OverlapSource::Predictor);
-    for (first, fill) in [(1_000, '.'), (2_000, '語')] {
+    // A window is sixty-four chars of one byte, and twenty-four where its
+    // fill is a char of three.
+    for (first, fill, window) in [(1_000, '.', 64), (2_000, '語', 24)] {
         let asked = text_of(first, 4, fill);
         assert_eq!(stated(&asked, 1), miss, "{fill}");
         // That pick wrote the text for its worker, and the match names it.
         assert_eq!(bed.worded(&asked, 0, None), [(1, 0, 4)], "{fill}");
+        let sent = holds(4 * window, 4 * window, OverlapSource::Tree);
         assert_eq!(stated(&asked, 1), sent, "{fill}");
         let longer = text_of(first, 6, fill);
-        let shared = holds(4, 6, OverlapSource::Predictor);
+        let shared = holds(4 * window, 6 * window, OverlapSource::Tree);
         assert_eq!(stated(&longer, 1), shared, "{fill}");
         // The match names the first worker alone, and the pick is the second.
         assert_eq!(stated(&asked, 2), miss, "{fill}");
@@ -3785,9 +3821,9 @@ fn a_pick_made_inside_a_hosts_string_tree_states_the_matchs_windows() {
 
 /// A pick that is none of the match's holders states a miss of the
 /// request's blocks, whatever the match holds for another worker: the pick
-/// states its own worker's entry. A gateway's classic policy observes the
-/// match's share of such a request, whoever it chose
-/// (`model_gateway/src/policies/cache_aware.rs:3103-3123`).
+/// states what its own worker holds. A gateway's classic policy observes
+/// the match's share of such a request, whoever it chose
+/// (`log_tree_decision` in `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_pick_that_is_no_holder_of_a_trees_match_states_a_miss() {
     let (affinity, _tree) = lending(false);
@@ -3800,21 +3836,25 @@ fn a_pick_that_is_no_holder_of_a_trees_match_states_a_miss() {
     assert_eq!(stated_in_tree(&bed, &asked, 2), miss);
     // The descent wrote the prompt for the second too: both hold it now.
     assert_eq!(bed.keyed(&asked, 0, None), [(1, 0, 4), (2, 0, 4)]);
-    let sent = holds(4, 4, OverlapSource::Predictor);
+    let sent = holds(64, 64, OverlapSource::Tree);
     assert_eq!(stated_in_tree(&bed, &asked, 2), sent);
     assert_eq!(stated_in_tree(&bed, &asked, 1), sent);
 }
 
-/// A match under one block states a miss: the match is counted in the
-/// request's blocks, and a match of less than one names no holder. Under a
-/// tree of four-token pages, a prompt that shares its first eight tokens
-/// with one the tree holds states a miss of its own four blocks. A prompt
-/// shorter than one block always states a miss, even once the tree holds
-/// every token of it for the worker picked. A gateway's classic policy
-/// divides the tokens matched by the prompt's tokens, and observes that
-/// last request whole (`model_gateway/src/policies/cache_aware.rs:3103-3123`).
+/// A match under one block names its workers and states the match: the
+/// tree's own two numbers are rounded to no block. Under a tree of
+/// four-token pages, a prompt that shares its first eight tokens with one
+/// the tree holds is named that worker with no block held, and a pick of it
+/// states eight tokens of sixty-four. A prompt shorter than one block
+/// states a miss of its one block while the tree holds it for another
+/// worker, and every token of it once the tree holds it for the worker
+/// picked. A gateway's classic policy divides the tokens matched by the
+/// prompt's tokens (`select_worker_with_tokens` in
+/// `model_gateway/src/policies/cache_aware.rs`), makes every tenant of the
+/// match a candidate whatever its blocks (`select_matched_candidate`), and
+/// observes the same division (`log_tree_decision`).
 #[test]
-fn a_trees_match_under_one_block_states_a_miss() {
+fn a_trees_match_under_one_block_names_its_workers_and_states_the_match() {
     const PAGE: usize = 4;
     let (affinity, tree) = lending_by(PAGE, false);
     let bed = Bed::new(affinity, preset("cache_aware"), 4);
@@ -3826,12 +3866,15 @@ fn a_trees_match_under_one_block_states_a_miss() {
     // Eight tokens of the prompt held, and then another prompt's.
     let mut branch = asked[..2 * PAGE].to_vec();
     branch.extend(tokens(5_000, 4).into_iter().skip(2 * PAGE));
-    assert!(bed.keyed(&branch, 0, None).is_empty(), "no holder is named");
+    let named = bed.keyed_whole(&branch, 0, None);
+    assert_eq!(named.holders, [(1, 0, 0)], "named, with no block held");
+    assert_eq!(named.tree, Some(TreeMatch::new(8, 64)));
     assert_eq!(
         stated_in_tree(&bed, &branch, 1),
-        holds(0, 4, OverlapSource::None)
+        holds(8, 64, OverlapSource::Tree)
     );
-    // Three whole pages, and under one block.
+    // Three whole pages, and under one block. The tree holds them for the
+    // first worker, and the pick is another.
     let short = &asked[..3 * PAGE];
     let none = holds(0, 1, OverlapSource::None);
     assert_eq!(stated_in_tree(&bed, short, 3), none);
@@ -3839,16 +3882,78 @@ fn a_trees_match_under_one_block_states_a_miss() {
     assert!(held
         .get(&address(3))
         .is_some_and(|&held| held >= short.len()));
-    assert_eq!(stated_in_tree(&bed, short, 3), none);
+    let whole = holds(12, 12, OverlapSource::Tree);
+    assert_eq!(stated_in_tree(&bed, short, 3), whole);
+    // A prompt the tree holds nothing of carries a match of nothing, and
+    // names nobody.
+    let named = bed.keyed_whole(&tokens(9_000, 4), 0, None);
+    assert!(named.holders.is_empty());
+    assert_eq!(named.tree, Some(TreeMatch::new(0, 64)));
+}
+
+/// A string tree's match is carried in chars, a partition's marker in
+/// neither count, and no count is rounded to a window. A text of forty
+/// chars is under one window: once the tree holds it for a worker, its rows
+/// name that worker with no window held and carry forty of forty, and a
+/// pick of it states them. A text that shares its first hundred chars with
+/// one the tree holds, a window and a part of the next, carries a hundred
+/// of its own three hundred behind a marker of eighteen chars, where its
+/// holder's row counts one whole window. A text of three bytes a char
+/// carries its chars, where its holder's row counts its bytes. The classic
+/// policy divides the chars its tree matched by the text's chars, both
+/// behind the marker (`select_worker_with_text` in
+/// `model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn a_string_trees_match_is_carried_in_chars_behind_the_marker() {
+    let (affinity, _tree) = lending_text(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let short = "a".repeat(40);
+    assert!(bed.worded(&short, 0, Some(2)).is_empty());
+    let named = bed.worded_whole(&short, 0, None);
+    assert_eq!(named.holders, [(2, 0, 0)], "named, with no window held");
+    assert_eq!(named.tree, Some(TreeMatch::new(40, 40)));
+    let stated = |row: u32| {
+        let hashes = worded(&short);
+        let entry = TextKey {
+            text: Cow::Borrowed(short.as_str()),
+            marker: 0,
+        };
+        let answer = picked(row, bed.ids[row as usize]);
+        bed.stated_entered(&request(&hashes, 7, NOW), (None, Some(entry)), answer)
+    };
+    assert_eq!(stated(2), holds(40, 40, OverlapSource::Tree));
+    assert_eq!(stated(1), holds(0, 1, OverlapSource::None));
+
+    // Behind a marker of eighteen chars, one byte each.
+    let under = |prompt: &str| format!("\u{1}{:016x}\u{1}{prompt}", 1);
+    let marker = 18;
+    let stored = "b".repeat(100);
+    assert!(bed.worded(&under(&stored), marker, Some(1)).is_empty());
+    let asked = format!("{stored}{}", "c".repeat(200));
+    let named = bed.worded_whole(&under(&asked), marker, None);
+    assert_eq!(
+        named.holders,
+        [(1, 0, 1)],
+        "one whole window of a hundred bytes"
+    );
+    assert_eq!(named.tree, Some(TreeMatch::new(100, 300)));
+
+    // Thirty chars of three bytes: ninety bytes are one whole window.
+    let stored = "語".repeat(30);
+    assert!(bed.worded(&stored, 0, Some(3)).is_empty());
+    let asked = format!("{stored}{}", "d".repeat(30));
+    let named = bed.worded_whole(&asked, 0, None);
+    assert_eq!(named.holders, [(3, 0, 1)]);
+    assert_eq!(named.tree, Some(TreeMatch::new(30, 60)));
 }
 
 /// A holder the sample's draw leaves out states a miss. Eight workers hold
 /// the prompt in the tree, and under a sample of four a decision is named
-/// four of them. A pick of one of the four states the match's blocks. A
+/// four of them. A pick of one of the four states the match's tokens. A
 /// pick of one the draw left out states a miss of the request's blocks,
 /// though the tree holds the prompt for it. A gateway's classic policy
-/// counts every tenant of the match
-/// (`model_gateway/src/policies/cache_aware.rs:3103-3123`).
+/// counts every tenant of the match (`log_tree_decision` in
+/// `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_holder_the_samples_draw_leaves_out_states_a_miss() {
     let (affinity, _tree) = lending(false);
@@ -3886,7 +3991,7 @@ fn a_holder_the_samples_draw_leaves_out_states_a_miss() {
             let stated = returned.pick().map(Pick::overlap).unwrap_or_default();
             assert_eq!(named.len(), 4, "seed {seed}: the sample");
             if named.contains(&row) {
-                let sent = holds(4, 4, OverlapSource::Predictor);
+                let sent = holds(64, 64, OverlapSource::Tree);
                 assert_eq!(stated, sent, "seed {seed}, row {row}: named");
                 named_picks += 1;
             } else {
@@ -3899,11 +4004,10 @@ fn a_holder_the_samples_draw_leaves_out_states_a_miss() {
     assert!(named_picks > 0 && left_out > 0, "both kinds were picked");
 }
 
-/// A tree pick is counted by the document's block size where the request
-/// states its tokens and no hash of them: the match in the request's
-/// blocks, and the request itself. Sixty-four tokens are four blocks of
-/// sixteen. Once the tree holds the prompt for a worker, a pick of it
-/// states four of four.
+/// A miss inside a tree is counted by the document's block size where the
+/// request states its tokens and no hash of them: sixty-four tokens are
+/// four blocks of sixteen. Once the tree holds the prompt for a worker, a
+/// pick of it states the match's tokens, which no block size counts.
 #[test]
 fn a_tree_pick_of_a_request_with_no_hashes_is_counted_by_the_documents_block() {
     let (affinity, _tree) = lending(false);
@@ -3923,7 +4027,7 @@ fn a_tree_pick_of_a_request_with_no_hashes_is_counted_by_the_documents_block() {
     let answer = picked(1, bed.ids[1]);
     let miss = holds(0, 4, OverlapSource::None);
     assert_eq!(bed.stated(&facts, Some(key()), answer), miss);
-    let sent = holds(4, 4, OverlapSource::Predictor);
+    let sent = holds(64, 64, OverlapSource::Tree);
     assert_eq!(bed.stated(&facts, Some(key()), answer), sent);
 }
 
