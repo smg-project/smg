@@ -294,13 +294,21 @@ def _paused_reservation(path, ready, release, outcome):
 
 
 def _publish_halt(ledger, entered):
-    entered.set()
+    original_flock = budget.fcntl.flock
+
+    def observed_flock(fd, operation):
+        if operation == budget.fcntl.LOCK_EX:
+            # Signal only after the actual descriptor observes the held lock.
+            with pytest.raises(BlockingIOError):
+                original_flock(fd, operation | budget.fcntl.LOCK_NB)
+            entered.set()
+        return original_flock(fd, operation)
+
+    budget.fcntl.flock = observed_flock
     ledger.halt()
 
 
 def test_real_process_halt_and_commit_share_ordering_fence(tmp_path):
-    import time
-
     path = tmp_path / "budget.db"
     ledger = budget.Ledger(path, POLICY)
     ctx = multiprocessing.get_context("fork")
@@ -312,7 +320,6 @@ def test_real_process_halt_and_commit_share_ordering_fence(tmp_path):
         assert ready.wait(8)
         halt_child.start()
         assert entered.wait(8)
-        time.sleep(0.1)
         # The prepublication reservation still owns the commit/admission fence.
         assert halt_child.is_alive() and not ledger.fail_stop_path.exists()
         release.set()
@@ -348,3 +355,101 @@ def test_protocol_v1_ledger_cannot_mix_with_new_admission(tmp_path):
         )
     with pytest.raises(budget.BudgetError, match="different policy"):
         budget.Ledger(path, POLICY, create=False)
+
+
+@pytest.mark.parametrize("fault", ["open", "close"])
+def test_current_halt_fence_failure_still_stops_scope(tmp_path, monkeypatch, fault):
+    ledger = budget.Ledger(tmp_path / "current.db", POLICY)
+    original_open, original_close = budget.os.open, budget.os.close
+    marker_fds = set()
+
+    def fail_open(path, flags, *args):
+        if fault == "open" and Path(path).name.endswith(".admission-lock"):
+            raise PermissionError("owned admission open failure")
+        fd = original_open(path, flags, *args)
+        if Path(path) == ledger.fail_stop_path:
+            marker_fds.add(fd)
+        return fd
+
+    def fail_close(fd):
+        original_close(fd)
+        if fault == "close" and fd in marker_fds:
+            marker_fds.remove(fd)
+            raise OSError("owned sidecar close error after actual close")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(budget.os, "open", fail_open)
+        patch.setattr(budget.os, "close", fail_close)
+        with pytest.raises(budget.BudgetError):
+            ledger.halt()
+    assert ledger.fail_stop_path.exists()
+    # Check DB independently of the sidecar: a remaining marker alone is not enough.
+    import sqlite3
+
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT halted FROM policy").fetchone() == (1,)
+    with pytest.raises(budget.BudgetError):
+        reserve(budget.Ledger(ledger.path, POLICY, create=False), "sibling", "smg")
+
+
+def _current_failed_fence_halt(ledger, contended, outcome):
+    import sqlite3
+    from contextlib import contextmanager
+
+    original = ledger._transaction
+
+    @contextmanager
+    def bad_fence():
+        raise PermissionError("owned bad admission lock")
+        yield
+
+    @contextmanager
+    def observed_transaction():
+        # Prove an actual SQLite writer conflicts before the parent may release it.
+        with sqlite3.connect(ledger.path, timeout=0) as probe:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                probe.execute("BEGIN IMMEDIATE")
+        contended.set()
+        with original() as db:
+            yield db
+
+    ledger._admission = bad_fence
+    ledger._transaction = observed_transaction
+    try:
+        ledger.halt()
+    except budget.BudgetError:
+        outcome.put("fallback error retained")
+
+
+def test_current_halt_fallback_does_not_publish_ahead_of_writer(tmp_path):
+    ledger = budget.Ledger(tmp_path / "fallback.db", POLICY)
+    ctx = multiprocessing.get_context("fork")
+    ready, release, contended = ctx.Event(), ctx.Event(), ctx.Event()
+    result, halt_result = ctx.Queue(), ctx.Queue()
+    first = ctx.Process(target=_paused_reservation, args=(ledger.path, ready, release, result))
+    second = ctx.Process(target=_current_failed_fence_halt, args=(ledger, contended, halt_result))
+    try:
+        first.start()
+        assert ready.wait(8)
+        second.start()
+        assert contended.wait(8)
+        assert not ledger.fail_stop_path.exists()
+        release.set()
+        first.join(8)
+        second.join(8)
+        assert first.exitcode == second.exitcode == 0
+        assert result.get(timeout=1) == "admitted"
+        assert halt_result.get(timeout=1) == "fallback error retained"
+        assert ledger.fail_stop_path.exists()
+        ledger.finish("one", 0, 0)
+        with pytest.raises(budget.BudgetError):
+            reserve(ledger, "later", "smg")
+    finally:
+        release.set()
+        for child in (first, second):
+            if child.pid is not None:
+                if child.is_alive():
+                    child.terminate()
+                child.join(8)
+        result.close()
+        halt_result.close()

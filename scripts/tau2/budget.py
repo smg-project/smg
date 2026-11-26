@@ -309,9 +309,8 @@ class Ledger:
 
     def halt(self):
         failures = []
-        with self._admission():
-            # Publish before attempting SQLite: a failed DB must not lose the stop.
-            # Conversely, a failed sidecar must not skip a working DB latch.
+
+        def publish_sidecar():
             try:
                 fd = os.open(self.fail_stop_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
@@ -319,15 +318,40 @@ class Ledger:
             except OSError as error:
                 failures.append(error)
             else:
-                os.close(fd)
-            try:
-                with self._transaction() as db:
-                    self._halted(db)
-                    db.execute("UPDATE policy SET halted=1 WHERE id=1")
-            except (OSError, BudgetError) as error:
-                failures.append(error)
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    failures.append(error)
+
+        entered = False
+        try:
+            with self._admission():
+                entered = True
+                publish_sidecar()
+                try:
+                    with self._transaction() as db:
+                        self._halted(db)
+                        db.execute("UPDATE policy SET halted=1 WHERE id=1")
+                except (OSError, BudgetError) as error:
+                    failures.append(error)
+        except (OSError, BudgetError) as error:
+            failures.append(error)
+            if not entered:
+                # SQLite's writer transaction is an independent ordering fence.
+                # It waits for prior reservations to commit before publication.
+                # If neither fence can be acquired, do not pretend an unordered
+                # marker established the reservation-commit guarantee.
+                try:
+                    with self._transaction() as db:
+                        self._halted(db)
+                        db.execute("UPDATE policy SET halted=1 WHERE id=1")
+                        publish_sidecar()
+                except (OSError, BudgetError) as fallback_error:
+                    failures.append(fallback_error)
         if failures:
-            raise BudgetError("Not all shared halt stores could be persisted") from failures[0]
+            raise BudgetError(
+                "Not all shared halt stores or ordering paths succeeded"
+            ) from failures[0]
 
     def begin_invocation(self, invocation_id, arm, domain):
         if (

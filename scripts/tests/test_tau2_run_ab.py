@@ -1272,6 +1272,7 @@ def test_infra_placeholder_does_not_bypass_existing_paid_or_process_gate(
         proof = types.SimpleNamespace(
             summary=ledger.summary,
             begin_invocation=ledger.begin_invocation,
+            halt=ledger.halt,
             audit=lambda invocation: {
                 "pending": int(gate == "pending"),
                 "unknown": int(gate == "unknown"),
@@ -1697,3 +1698,148 @@ def test_actual_nightly_staging_keeps_fail_stop(tmp_path, monkeypatch, with_side
     output = tmp_path / "tau2_artifact"
     assert (output / "ledger.db").read_bytes() == ledger.read_bytes()
     assert (output / sidecar.name).exists() is with_sidecar
+
+
+def test_current_unhalted_completion_refusal_cannot_be_waived(tmp_path, monkeypatch):
+    candidate = _provenant_arm(tmp_path, "smg")
+    descriptor = candidate.budget
+    ledger = run_ab.budget_guard.read_descriptor(descriptor)
+
+    def successful_child(command, **kwargs):
+        destination = tmp_path / "simulations" / command[command.index("--save-to") + 1]
+        destination.mkdir(parents=True)
+        (destination / "results.json").write_text(
+            json.dumps(
+                {
+                    "simulations": [
+                        {
+                            "task_id": row["task_id"],
+                            "trial": row["trial"],
+                            "seed": row["seed"],
+                            "reward_info": {"reward": row["reward"]},
+                        }
+                        for row in _rows()
+                    ]
+                }
+            )
+        )
+        return types.SimpleNamespace(returncode=0)
+
+    def refused(self, *args):
+        raise run_ab.budget_guard.BudgetError("owned unhalted completion refusal")
+
+    monkeypatch.setattr(run_ab.subprocess, "run", successful_child)
+    monkeypatch.setattr(run_ab.budget_guard.Ledger, "complete_invocation", refused)
+    baseline = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(
+        baseline,
+        tmp_path,
+        domain="retail",
+        num_trials=2,
+        expected_task_ids=["task"],
+        budget_descriptor=descriptor,
+    )
+    assert not ledger.summary()["halted"]
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=tmp_path / "current.json",
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids={"retail": ["task"]},
+        seed=300,
+    )
+    assert (
+        run_ab.write_report_and_gate(baseline, candidate, ["retail"], 2, args)
+        == run_ab.EXIT_INCOMPLETE
+    )
+    assert baseline.invocations["retail"]["failure_kind"] == "ledger_refused"
+    assert baseline.invocations["retail"]["failure_stage"] == "budget"
+
+
+@pytest.mark.parametrize("mode", ["own", "foreign", "audit_error"])
+def test_current_nonzero_child_audits_only_owned_paid_work(tmp_path, monkeypatch, mode):
+    descriptor = run_ab.prepare_budget()
+    ledger = run_ab.budget_guard.read_descriptor(descriptor)
+
+    def killed_child(command, **kwargs):
+        identity = command[command.index("--invocation") + 1] if mode == "own" else "sibling"
+        ledger.reserve(
+            "paid",
+            "vllm",
+            "openai/gpt-5.2",
+            1,
+            1,
+            num_retries=0,
+            output_limit_verified=True,
+            metadata={"invocation_id": identity, "domain": "airline"},
+        )
+        return types.SimpleNamespace(returncode=-9)
+
+    if mode == "audit_error":
+        original_audit = run_ab.budget_guard.Ledger.audit
+
+        def unavailable(self, invocation_id=None):
+            if invocation_id is not None:
+                raise run_ab.budget_guard.BudgetError("owned audit unavailable")
+            return original_audit(self, invocation_id)
+
+        monkeypatch.setattr(run_ab.budget_guard.Ledger, "audit", unavailable)
+    monkeypatch.setattr(run_ab.subprocess, "run", killed_child)
+    arm = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(arm, tmp_path, budget_descriptor=descriptor)
+    assert arm.invocations["airline"]["failure_kind"] == "nonzero_exit"
+    assert ledger.summary()["halted"] is (mode != "foreign")
+
+
+@pytest.mark.parametrize("reuse", [True, False])
+def test_current_same_arm_uuid_reuse_has_independent_control(tmp_path, reuse):
+    a, b = (_provenant_arm(tmp_path, "vllm") for _ in range(2))
+    if reuse:
+        b.invocations["retail"] = dict(a.invocations["retail"])
+        b.scores = dict(a.scores)
+    args = types.SimpleNamespace(
+        out=tmp_path / "same-arm.md",
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=True,
+        enforce_budget=True,
+        expected_task_ids={"retail": ["task"]},
+        seed=300,
+    )
+    assert run_ab.write_report_and_gate(a, b, ["retail"], 2, args) == (
+        run_ab.EXIT_INCOMPLETE if reuse else run_ab.EXIT_OK
+    )
+    assert ("inconsistent invocation provenance" in args.out.read_text()) is reuse
+
+
+def test_current_staging_copies_marker_after_policy_copy_error(tmp_path, monkeypatch):
+    import os
+    import subprocess
+
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/nightly-tau2.yml"
+    lines = workflow.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if "- name: Stage results for upload" in line)
+    run = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "run: |")
+    end = next(i for i in range(run + 1, len(lines)) if lines[i].startswith("      - name:"))
+    script = "\n".join(line[10:] for line in lines[run + 1 : end])
+    ledger, policy = tmp_path / "ledger.db", tmp_path / "policy.json"
+    ledger.write_bytes(b"owned ledger")
+    policy.write_bytes(b"owned policy")
+    sidecar = tmp_path / "ledger.db.fail-stop"
+    sidecar.write_bytes(b"owned marker")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv("TAU2_BUDGET_LEDGER", str(ledger))
+    monkeypatch.setenv("TAU2_BUDGET_POLICY", str(policy))
+    monkeypatch.setenv("FAIL_COPY", str(policy))
+    # Actual extracted workflow, actual copies except one explicit owned fault.
+    prefix = 'cp() { if [ "$2" = "$FAIL_COPY" ]; then return 23; fi; /usr/bin/cp "$@"; };\n'
+    child = subprocess.run(
+        ["/usr/bin/bash", "-c", prefix + script],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        check=False,
+        timeout=10,
+    )
+    assert (tmp_path / "tau2_artifact" / sidecar.name).read_bytes() == b"owned marker"
+    assert child.returncode != 0

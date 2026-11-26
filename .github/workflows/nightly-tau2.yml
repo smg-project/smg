@@ -516,20 +516,22 @@ jobs:
           # This directory contains only this workflow's staged output.
           rm -rf -- "$OUT"
           mkdir -p "$OUT"
+          copy_failed=0
           for name in tau2_ab.md tau2_ab.json tau2_expected_tasks.json tau2_transcripts.tgz; do
             if [ -f "$RUNNER_TEMP/$name" ]; then
-              cp -- "$RUNNER_TEMP/$name" "$OUT/"
+              cp -- "$RUNNER_TEMP/$name" "$OUT/" || copy_failed=1
             fi
           done
           for variable in TAU2_BUDGET_LEDGER TAU2_BUDGET_POLICY TAU2_BUDGET_CONTEXTS; do
             source="${!variable:-}"
             if [ -n "$source" ] && [ -f "$source" ]; then
-              cp -- "$source" "$OUT/"
+              cp -- "$source" "$OUT/" || copy_failed=1
             fi
           done
           if [ -n "${TAU2_BUDGET_LEDGER:-}" ] && [ -f "${TAU2_BUDGET_LEDGER}.fail-stop" ]; then
-            cp -- "${TAU2_BUDGET_LEDGER}.fail-stop" "$OUT/"
+            cp -- "${TAU2_BUDGET_LEDGER}.fail-stop" "$OUT/" || copy_failed=1
           fi
+          exit "$copy_failed"
       - name: Upload results (summary + scores + transcripts)
         if: always()
         uses: actions/upload-artifact@v7

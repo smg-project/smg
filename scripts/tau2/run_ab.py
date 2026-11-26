@@ -459,23 +459,28 @@ def run_tau2(
     # look for them regardless of any inherited $TAU2_DATA_DIR or whether tau2 is
     # installed editable vs into site-packages.
     env["TAU2_DATA_DIR"] = str(data_dir)
-    try:
-        proc = subprocess.run(cmd, env=env, check=False, timeout=(run_timeout or None))
-    except subprocess.TimeoutExpired as error:
-        # subprocess.run has killed/reaped its child. Even a partial result from
-        # that invocation cannot establish a completed simulation domain.
-        arm.timed_out.append(domain)
-        # Only this killed invocation's unsettled paid work justifies attribution.
+
+    def stop_unsettled_own_work():
+        # A failed child cannot establish that its paid requests settled. Other
+        # invocations' healthy in-flight work does not justify attribution.
         try:
             own = ledger.audit(invocation_id)
             stop = bool(own["pending"] or own["unknown"])
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError, TypeError):
             stop = True
         if stop:
             try:
                 ledger.halt()
             except (OSError, ValueError) as halt_error:
                 invocation["halt_error"] = type(halt_error).__name__
+
+    try:
+        proc = subprocess.run(cmd, env=env, check=False, timeout=(run_timeout or None))
+    except subprocess.TimeoutExpired as error:
+        # subprocess.run has killed/reaped its child. Even a partial result from
+        # that invocation cannot establish a completed simulation domain.
+        arm.timed_out.append(domain)
+        stop_unsettled_own_work()
         fail("timeout", "cli", error)
         return
     except OSError as error:
@@ -483,6 +488,7 @@ def run_tau2(
         return
     invocation["exit_code"] = proc.returncode
     if proc.returncode != 0:
+        stop_unsettled_own_work()
         # Do not interpret a generic process exit as an API/provider failure or
         # accept partial files the failed command happened to write.
         fail("nonzero_exit", "cli")
@@ -492,6 +498,7 @@ def run_tau2(
         # required settled here. The GLOBAL pending/halt gate runs after join/diff.
         own = budget_guard.read_descriptor(budget_descriptor).audit(invocation_id)
         if own["pending"] or own["unknown"]:
+            stop_unsettled_own_work()
             fail("invocation_budget_incomplete", "budget")
             return
         if results_json.is_symlink() or results_json.parent.is_symlink():
@@ -531,6 +538,8 @@ def run_tau2(
             scored_case_diagnostics=error.scored,
         )
         fail("infrastructure_error_results", "results", error)
+    except budget_guard.BudgetError as error:
+        fail("ledger_refused", "budget", error)
     except FileNotFoundError as error:
         fail("missing_results", "results", error)
     except (OSError, KeyError, ValueError, TypeError) as error:
@@ -914,7 +923,14 @@ def write_report_and_gate(
         or provenance_failed
         or (getattr(args, "enforce_budget", False) and not getattr(args, "expected_task_ids", None))
         or any(
-            invocation.get("failure_kind") in {"nonzero_exit", "launch_error", "timeout"}
+            invocation.get("failure_kind")
+            in {
+                "nonzero_exit",
+                "launch_error",
+                "timeout",
+                "ledger_refused",
+                "invocation_budget_incomplete",
+            }
             for arm in (baseline, candidate)
             for invocation in arm.invocations.values()
             if isinstance(invocation, dict)

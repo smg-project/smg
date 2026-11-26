@@ -367,3 +367,19 @@ ledger configuration rather than mixing admission contracts; do not migrate or
 resume an unknown paid scope. Keep the ledger, fail-stop sidecar and its admission
 lock together for the scope lifetime. A killed invocation halts sibling admission
 only for its own pending/unknown paid requests or an unverifiable own audit.
+
+
+A child that exits nonzero is audited using its own invocation identity, just as
+for an invocation timeout. Pending or unknown own work (including an unavailable
+audit) attempts a shared stop; a clean own audit leaves healthy siblings alone.
+A ledger refusal during completion is a hard paid-budget error, not a waivable
+malformed-results diagnostic.
+
+If the admission lock cannot be entered, halt attempts an independent SQLite
+writer transaction before publishing the marker. This preserves ordering with
+already admitted reservations. If neither ordering fence is obtainable, halt
+raises and cannot attest a persisted cross-process stop; do not resume paid work
+from that failed scope without reconciling its retained evidence. Failure while
+closing the marker is still reported, and does not skip the database stop attempt.
+Evidence staging attempts each available copy, including the fail-stop marker,
+before returning a failure for any unsuccessful copy.
