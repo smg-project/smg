@@ -237,8 +237,12 @@ impl Refused {
 /// no room they do not fill), and a document is built from it alone: nothing
 /// a document builds is past the bounds either.
 ///
-/// The values are JSON's: a tagged value, a number JSON does not write and
-/// a key written twice are each refused by name.
+/// The values are JSON's: a value or a key under a local tag, a number JSON
+/// does not write and a key written twice are each refused by name. A
+/// global tag is read as YAML reads it, by the parser and ahead of this
+/// read: one of the four that type a scalar types it or refuses its text,
+/// any other leaves a scalar its text, and none changes a list, a map or a
+/// key.
 ///
 /// What an apply holds beside the file is found by run and bounded by no
 /// form: a search of the heaviest shapes finds at most 367 to 406 bytes for
@@ -257,12 +261,31 @@ impl Refused {
 ///
 /// The parser has a limit of its own, a hundred aliases followed for each
 /// node a file writes: a small nest of aliases meets it before either bound
-/// and is refused in the parser's words.
+/// and is refused in the parser's words. It bounds a nest too, in its own
+/// words: a list reads 128 deep, and a map that holds a key 127 deep, the
+/// JSON form's depth, because a key's read holds one level.
 pub(super) fn read_yaml(document: &[u8]) -> Result<Value, String> {
     let left = Left::whole();
     Weighed(&left)
         .deserialize(serde_yaml::Deserializer::from_slice(document))
-        .map_err(|error| error.to_string())
+        .map_err(|error| worded(error.to_string()))
+}
+
+/// A refusal of the YAML read, with a key that is a list or a map refused
+/// as it was where the parser's string entry read a key: it wants a key of
+/// text. A key is asked of the enum entry ([`Key`]), which words such a key
+/// as wanting a tag, and a writer who adds one is refused again.
+///
+/// The rewording is by the parser's whole phrase, for each of the two
+/// kinds: a document that writes that phrase as text of its own has it
+/// reworded in a refusal that quotes the text.
+fn worded(refusal: String) -> String {
+    ["sequence", "map"].iter().fold(refusal, |refusal, kind| {
+        refusal.replace(
+            &format!("invalid type: {kind}, expected a YAML tag starting with '!'"),
+            &format!("invalid type: {kind}, expected a key of text"),
+        )
+    })
 }
 
 /// Reads a JSON document once, into the values it reads as, by the visitor
@@ -395,13 +418,11 @@ impl<'de> Visitor<'de> for Weighed<'_> {
         Ok(Value::String(text.to_owned()))
     }
 
-    /// A tagged value, refused by its tag: JSON has no form for one.
+    /// A value under a local tag, refused by the tag's name: JSON has no
+    /// form for one. A global tag does not come here: the parser reads it.
     fn visit_enum<A: EnumAccess<'de>>(self, tagged: A) -> Result<Value, A::Error> {
         let (tag, _) = tagged.variant::<String>()?;
-        Err(de::Error::custom(format_args!(
-            "the tag `!{}` is none JSON writes: take the tag out",
-            tag.trim_start_matches('!')
-        )))
+        Err(local_tag(&tag))
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
@@ -458,15 +479,29 @@ impl<'de> Visitor<'de> for Weighed<'_> {
     }
 }
 
+/// The refusal of a local tag by its name, a value's and a key's in the same
+/// words.
+fn local_tag<E: de::Error>(tag: &str) -> E {
+    E::custom(format_args!(
+        "the tag `!{}` is none JSON writes: take the tag out",
+        tag.trim_start_matches('!')
+    ))
+}
+
 /// A map's key, read as its text: a key that looks like a number is its
-/// digits.
+/// digits. A key under a local tag is refused by the tag's name, as a value
+/// under one is.
+///
+/// A parser's string entry hands a key's text and no tag. So a key is asked
+/// of the enum entry, the one entry that hands a key's tag over, and what
+/// that entry hands is read by [`KeyVariant`].
 struct Key<'a>(&'a Left);
 
 impl<'de> DeserializeSeed<'de> for Key<'_> {
     type Value = String;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<String, D::Error> {
-        deserializer.deserialize_str(self)
+        deserializer.deserialize_enum("", &[], self)
     }
 }
 
@@ -477,10 +512,48 @@ impl<'de> Visitor<'de> for Key<'_> {
         formatter.write_str("a key of text")
     }
 
+    fn visit_enum<A: EnumAccess<'de>>(self, key: A) -> Result<String, A::Error> {
+        key.variant_seed(KeyVariant(self.0)).map(|(text, _)| text)
+    }
+
     fn visit_str<E: de::Error>(self, text: &str) -> Result<String, E> {
         self.0.hold(KEY)?;
         self.0.read(text.len())?;
         Ok(text.to_owned())
+    }
+}
+
+/// A key as a parser's enum entry hands it over, asked for a newtype struct
+/// to tell the two things it may be. A key with no local tag is the
+/// document's own reader, still in front of the key: the string entry reads
+/// its text ([`Key`]). A key under a local tag is the tag's name, and that
+/// is the refusal.
+struct KeyVariant<'a>(&'a Left);
+
+impl<'de> DeserializeSeed<'de> for KeyVariant<'_> {
+    type Value = String;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<String, D::Error> {
+        deserializer.deserialize_newtype_struct("", self)
+    }
+}
+
+impl<'de> Visitor<'de> for KeyVariant<'_> {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a key of text")
+    }
+
+    fn visit_newtype_struct<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<String, D::Error> {
+        deserializer.deserialize_str(Key(self.0))
+    }
+
+    fn visit_str<E: de::Error>(self, tag: &str) -> Result<String, E> {
+        Err(local_tag(tag))
     }
 }
 

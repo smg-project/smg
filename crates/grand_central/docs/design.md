@@ -399,9 +399,13 @@ one of them.
 
 A gateway reads the supplied file by the crate's one read of a document (`Format::read`), the read an apply and a controller's file pass. A file named `.json` is read as JSON, any other name as YAML (`Format::of`). Either form is read into values first, and the document is built from those values by one typed read.
 
-So a YAML document reads as JSON does. Text that looks like a number, a boolean or a null is written in quotes. A key with nothing under it is refused where a list or a map must stand. A list item with nothing in it is refused in a list of the spec's own. A local tag, such as `!mine`, is refused on a value, and on a key it is read as if it were not written.
+So a YAML document reads as JSON does. Text that looks like a number, a boolean or a null is written in quotes. A key with nothing under it is refused where a list or a map must stand. A list item with nothing in it is refused in a list of the spec's own.
 
 A key with nothing under it reads as a key left out where the field may be null. A binding's `profile`, `plan`, `overload`, `routing_key`, `sessions`, `shadow`, `canary` and `admission` may be.
+
+A local tag, as `!mine`, is refused by its name on a value, a list, a map and a key. A global tag is read as YAML reads it. On a scalar `!!int`, `!!float`, `!!bool` and `!!null` type it, or refuse it where its text is none. Any other global tag reads a scalar as its text. A global tag on a list, a map or a key changes nothing.
+
+These rules are the reader's, `Format::read`. A program that reads the spec's type with a YAML library of its own gets that library's reading, and none of the reader's bounds.
 
 A number reads one way in both forms and in every build: a whole number of 64 bits as itself, and any other as the nearest double. The crate's manifest asks the JSON library for its exact reading (`float_roundtrip`). A field of single precision takes the number by a cast, so one that rounds past the largest single reads as infinite there and the spec's check refuses it by its field.
 
