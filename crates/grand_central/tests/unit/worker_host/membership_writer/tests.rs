@@ -18,11 +18,12 @@ use crate::{
         demands::DemandFacts,
         view::{Role, WireModes, WorkerId},
     },
+    service::replication::{Event, Log},
     store::{
         membership::{self, FactPastBound},
         pairing::PairingDescriptor,
-        HealthPolicy, MembershipChange, MembershipTail, MemoryStore, Registrant, Signals,
-        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        HealthPolicy, MembershipChange, MemoryStore, Position, Registrant, Signals, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     worker_host::{kv_tables::indexed_under, Members, Objects},
 };
@@ -502,13 +503,44 @@ fn check_bad_label(open: Open) {
 #[test]
 fn a_worker_that_comes_back_narrower_loses_the_ranks_it_no_longer_states() {
     check_narrower(local_door).expect("four ranks, then two");
+    // Once more through a door whose store is journaled: the log tells
+    // each of the four changes by its kind.
+    let log = Arc::new(Log::new(64));
+    let store = Arc::new(MemoryStore::journaled(Arc::clone(&log) as _));
+    let door = StoreDoor::new(Arc::clone(&store));
+    let (old, epoch) = narrower(&store, &door).expect("four ranks, then two");
+    let mut told = Vec::new();
+    log.read(Position::default(), Log::BATCH, &mut told)
+        .expect("the log holds its start");
+    let changes = told.iter().filter_map(|entry| match entry.event {
+        Event::Member {
+            epoch: at, change, ..
+        } if at > epoch => Some(change),
+        _ => None,
+    });
+    assert_eq!(
+        changes.collect::<Vec<_>>(),
+        [
+            MembershipChange::Resized { id: old[0].id },
+            MembershipChange::Resized { id: old[1].id },
+            MembershipChange::Removed { id: old[2].id },
+            MembershipChange::Removed { id: old[3].id },
+        ]
+    );
 }
 
 fn check_narrower(open: Open) -> Result<(), &'static str> {
     let (store, door) = open();
+    narrower(&store, &*door).map(drop)
+}
+
+/// A worker of four ranks comes back with two, through `door` over
+/// `store`. The four rows it had, by rank, and the epoch its second
+/// registration started behind.
+fn narrower(store: &MemoryStore, door: &dyn Rows) -> Result<(Vec<WorkerRow>, u64), &'static str> {
     let maker = Registrant::Control;
     let four = ranked(4);
-    find_rows(&*door, &maker, &four).map_err(|_| "registered four ranks")?;
+    find_rows(door, &maker, &four).map_err(|_| "registered four ranks")?;
     let old: Vec<_> = four
         .iter()
         .map(|facts| store.by_key(&facts.key).ok_or("the old rank"))
@@ -525,7 +557,7 @@ fn check_narrower(open: Open) -> Result<(), &'static str> {
     let epoch = store.epoch();
     let two = ranked(2);
     assert_eq!(
-        find_rows(&*door, &maker, &two),
+        find_rows(door, &maker, &two),
         Ok(vec![
             MembershipWriteOutcome::InPlace(old[0].id),
             MembershipWriteOutcome::InPlace(old[1].id),
@@ -533,21 +565,8 @@ fn check_narrower(open: Open) -> Result<(), &'static str> {
             MembershipWriteOutcome::Removed(old[3].id),
         ])
     );
-    let MembershipTail::Changes(changes) = store.changes_since(epoch) else {
-        return Err("four changes after this epoch");
-    };
-    assert_eq!(
-        changes
-            .into_iter()
-            .map(|(_, change)| change)
-            .collect::<Vec<_>>(),
-        [
-            MembershipChange::Resized { id: old[0].id },
-            MembershipChange::Resized { id: old[1].id },
-            MembershipChange::Removed { id: old[2].id },
-            MembershipChange::Removed { id: old[3].id },
-        ]
-    );
+    // Four writes and no more: each moves the epoch by one.
+    assert_eq!(store.epoch(), epoch + 4, "four changes after this epoch");
     for row in &old[..2] {
         let resized = store.get(row.id).ok_or("the resized rank")?;
         assert_eq!(resized.facts.dp_size, 2);
@@ -557,7 +576,7 @@ fn check_narrower(open: Open) -> Result<(), &'static str> {
         .iter()
         .all(|facts| store.by_key(&facts.key).is_none()));
     assert_eq!(store.by_key(&alias.key).map(|row| row.facts), Some(alias));
-    Ok(())
+    Ok((old, epoch))
 }
 
 #[test]

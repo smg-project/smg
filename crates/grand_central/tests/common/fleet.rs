@@ -67,11 +67,12 @@ use smg_grand_central::{
             register_worker_request::Mode, worker_event::Event, Completed, Dispatched, LeaderInfo,
             Side, Welcome,
         },
+        replication::{Event as Logged, Log},
     },
     stages::StageRegistry,
     store::{
-        GatewayId, HealthPolicy, LeaseState, MembershipChange, MembershipTail, MemoryStore,
-        Registrant, Signals, WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, HealthPolicy, LeaseState, MembershipChange, MemoryStore, Position, Registrant,
+        Signals, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::LeaseId,
     worker_host::{KvTables, Members, Objects},
@@ -1933,27 +1934,40 @@ impl Harness {
         .map_err(|error| error.to_string())
     }
 
-    /// A place in the store's membership, for [`Harness::moved`].
-    pub fn mark(&self) -> u64 {
-        self.store.epoch()
+    /// A place in the controller's membership log, for [`Harness::moved`].
+    pub fn mark(&self) -> Position {
+        self.replica.readiness.log_head()
     }
 
     /// Each status of a fleet's row the store moved since `mark`, in the
-    /// order written: the store's own word of it, whoever probes.
-    pub fn moved(&self, mark: u64) -> Result<Vec<Moved>, String> {
-        let MembershipTail::Changes(changes) = self.store.changes_since(mark) else {
-            return Err(format!("the store's tail no longer reaches {mark}"));
-        };
-        Ok(changes
-            .into_iter()
-            .filter_map(|(_, change)| match change {
-                MembershipChange::StatusChanged { id, from, to } => {
-                    let &(engine, _) = self.members.get(&id)?;
-                    Some(Moved { engine, from, to })
+    /// order written: the controller's log of it, whoever probes. It reads
+    /// to the log's head as the call finds it, and no write behind that.
+    pub fn moved(&self, mark: Position) -> Result<Vec<Moved>, String> {
+        let head = self.mark();
+        let (mut at, mut moved, mut batch) = (mark, Vec::new(), Vec::new());
+        while at != head {
+            let read = self.replica.readiness.log_after(at, Log::BATCH, &mut batch);
+            read.map_err(|_| format!("the controller's log no longer holds {at:?}"))?;
+            if batch.is_empty() {
+                break;
+            }
+            for entry in &batch {
+                if let Logged::Member {
+                    change: MembershipChange::StatusChanged { id, from, to },
+                    ..
+                } = entry.event
+                {
+                    if let Some(&(engine, _)) = self.members.get(&id) {
+                        moved.push(Moved { engine, from, to });
+                    }
                 }
-                _ => None,
-            })
-            .collect())
+                at = entry.at;
+                if at == head {
+                    break;
+                }
+            }
+        }
+        Ok(moved)
     }
 
     /// Ends the feeds, the held requests, the engines and the controller,

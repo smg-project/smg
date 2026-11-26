@@ -16,8 +16,8 @@ use tokio::sync::broadcast::Receiver;
 use super::*;
 use crate::{
     store::{
-        GatewayId, MembershipChange, MembershipTail, MemoryStore, Overload, Registrant,
-        WorkerFacts, WorkerPatch, WorkerStatus,
+        GatewayId, MembershipChange, MemoryStore, Overload, Registrant, WorkerFacts, WorkerPatch,
+        WorkerStatus,
     },
     worker_host::{kv_tables, object, HealthAdapter, KeptCredential, Members, SoleLead},
 };
@@ -1999,14 +1999,6 @@ impl WorkersStore for Late {
 
     fn all_rows(&self) -> (u64, Vec<WorkerRow>) {
         self.store.all_rows()
-    }
-
-    fn history(&self) -> u64 {
-        self.store.history()
-    }
-
-    fn changes_since(&self, epoch: u64) -> MembershipTail {
-        self.store.changes_since(epoch)
     }
 }
 

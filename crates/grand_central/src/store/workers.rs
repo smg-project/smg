@@ -411,24 +411,13 @@ impl MembershipChange {
     }
 }
 
-/// A watcher's tail since the epoch it last saw.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MembershipTail {
-    /// The changes after the epoch, each with the epoch it made.
-    Changes(Vec<(u64, MembershipChange)>),
-    /// The epoch is past the store's buffer: re-read a snapshot, then tail
-    /// from its epoch (a lagged registry subscriber reconciles the same way
-    /// today).
-    SnapshotRequired,
-}
-
-/// The membership store's write side and its watch.
+/// The membership store's write side.
 ///
 /// Every write moves the store's epoch; a write of a row's facts moves the
-/// row's revision, a status change does not. A watcher
-/// reads a snapshot with its epoch, then the changes since it; past the
-/// store's buffer it is told to snapshot again, and it snapshots again
-/// where the store took another store's rows ([`Self::history`]). The
+/// row's revision, a status change does not. The store keeps no log of
+/// its changes. A journaled store tells each write to its journal
+/// ([`Journal::member`](super::Journal::member)), and a watcher reads
+/// the journal's log. A
 /// snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,
 /// reachability), never a pool list.
@@ -496,22 +485,6 @@ pub trait WorkersStore: Send + Sync {
 
     /// Every row with the epoch it stands at.
     fn all_rows(&self) -> (u64, Vec<WorkerRow>);
-
-    /// The changes after `epoch`, or the instruction to snapshot again.
-    fn changes_since(&self, epoch: u64) -> MembershipTail;
-
-    /// Which history of rows the store holds: it moves when the rows are
-    /// replaced from a snapshot
-    /// ([`MemoryStore::restore_from`](super::MemoryStore::restore_from) or
-    /// [`MemoryStore::watch_from`](super::MemoryStore::watch_from)).
-    /// An epoch names a place in one history, and a row
-    /// under one id and one revision may state other facts in the next, so
-    /// a watcher that keeps its place keeps this beside it and starts again
-    /// from a snapshot, trusting nothing it held, when it moves. A store
-    /// that never takes another's rows stays at `0`.
-    fn history(&self) -> u64 {
-        0
-    }
 
     /// Takes the count the store's host keeps for the row `id`
     /// ([`HostCount`]): the store keeps it equal to the count its leases
