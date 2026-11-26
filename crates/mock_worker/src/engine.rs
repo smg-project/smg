@@ -440,6 +440,10 @@ pub struct EngineParams {
     /// stream shaped for a gateway that parses the engine's tokens (a channel
     /// header, say). Empty by default.
     pub output_prefix: Vec<u32>,
+    /// What the engine sends for each id of its synthetic draw, the draw's
+    /// ids in order: the ids the tokenizer the worker serves decodes. `None`
+    /// sends the id drawn.
+    pub output_table: Option<Arc<[u32]>>,
     /// The data-parallel rank this engine stamps on its KV-event batches
     /// (`KvEventBatch.dp_rank`): 0 for a single-rank engine, the rank's index
     /// for one of a gRPC worker's `--grpc-dp-size` ranks.
@@ -569,6 +573,7 @@ impl Default for EngineParams {
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
             output_prefix: Vec::new(),
+            output_table: None,
             dp_rank: 0,
             kv_cache_groups: vec![KvCacheGroup::full_attention()],
             pass_time_scale: 1.0,
@@ -3164,7 +3169,7 @@ impl SchedulerState {
             .output_prefix
             .get(r.generated as usize)
             .copied()
-            .unwrap_or_else(|| next_token(r));
+            .unwrap_or_else(|| next_token(r, p.output_table.as_deref()));
         r.generated += 1;
         r.output_ids.push(token_id);
         r.rolling_hash = fnv_step(r.rolling_hash, token_id);
@@ -3513,14 +3518,49 @@ fn prompt_blocks(ids: &[u32], block_size: usize) -> (Vec<u64>, u64, Vec<u32>) {
     (keys, h, pending)
 }
 
+/// The synthetic output ids: the draw takes one of `OUTPUT_ID_COUNT` ids
+/// from `OUTPUT_ID_FIRST` on.
+const OUTPUT_ID_FIRST: u32 = 100;
+const OUTPUT_ID_COUNT: u32 = 30_000;
+
 /// A synthetic output token derived from the configured identity and position.
 /// Prompt-seeded requests can intentionally share both prompt and decode blocks.
-fn next_token(r: &RunningReq) -> u32 {
+/// Under `sent` ([`EngineParams::output_table`]) the id drawn gives way to the
+/// one the table holds in its place.
+fn next_token(r: &RunningReq, sent: Option<&[u32]>) -> u32 {
     let mixed = r
         .token_seed
         .wrapping_add(r.generated)
         .wrapping_mul(2_654_435_761);
-    100 + (mixed % 30_000)
+    let slot = mixed % OUTPUT_ID_COUNT;
+    sent.and_then(|sent| sent.get(slot as usize))
+        .copied()
+        .unwrap_or(OUTPUT_ID_FIRST + slot)
+}
+
+/// The table of [`EngineParams::output_table`] for a vocabulary, where
+/// `decodes` says whether a gateway gets text for an id. An id of the draw
+/// that decodes stays the id sent, so an output keeps the ids it has without
+/// the table wherever they decode; one that does not (an id outside the
+/// vocabulary, a special token, an end-of-sequence id) gives way to an id
+/// that does. `None` where every id of the draw decodes, and where none does:
+/// the engine then sends the id drawn.
+pub(crate) fn output_table(decodes: impl Fn(u32) -> bool) -> Option<Arc<[u32]>> {
+    let drawn = OUTPUT_ID_FIRST..OUTPUT_ID_FIRST + OUTPUT_ID_COUNT;
+    let decoded: Vec<u32> = drawn.clone().filter(|&id| decodes(id)).collect();
+    if decoded.is_empty() || decoded.len() == drawn.len() {
+        return None;
+    }
+    let mut spare = decoded.iter().copied().cycle();
+    let mut decoded_ids = decoded.iter().copied().peekable();
+    Some(
+        drawn
+            .map(|id| match decoded_ids.next_if_eq(&id) {
+                Some(id) => id,
+                None => spare.next().unwrap_or(id),
+            })
+            .collect(),
+    )
 }
 
 fn ewma(prev: f64, sample: f64, alpha: f64) -> f64 {
@@ -4370,6 +4410,61 @@ mod tests {
             tokens[3..].iter().all(|id| (100..30_100).contains(id)),
             "the synthetic ids follow the prefix: {tokens:?}"
         );
+    }
+
+    /// Under a table the engine sends, for each id it draws, the id the
+    /// table holds: an id that decodes stays, one that does not gives way to
+    /// one that does. With no table the ids are the ids drawn.
+    #[test]
+    fn the_output_is_drawn_from_the_ids_that_decode() {
+        let output = |p: &EngineParams| {
+            let mut st = SchedulerState::new();
+            let (r, mut rx) = req("drawn", vec![7; 4], 64);
+            st.enqueue(r, p);
+            let mut tokens = Vec::new();
+            for _ in 0..100_000 {
+                let step = st.step(p);
+                for (tx, ev) in step.sends {
+                    let _ = tx.send(ev);
+                }
+                while let Ok(ev) = rx.try_recv() {
+                    if let GenEvent::Token { token_id, .. } = ev {
+                        tokens.push(token_id);
+                    }
+                }
+                if tokens.len() == 64 {
+                    break;
+                }
+            }
+            tokens
+        };
+        let drawn = output(&EngineParams::default());
+        assert_eq!(drawn.len(), 64);
+        assert!(
+            drawn.iter().any(|id| !(100..5_104).contains(id)),
+            "the draw leaves a small vocabulary: {drawn:?}"
+        );
+
+        // A vocabulary of 5,104 ids whose id 4,000 is a special token.
+        let decodes = |id: u32| id < 5_104 && id != 4_000;
+        let table = output_table(decodes).expect("a table");
+        assert_eq!(table.len(), 30_000);
+        assert!(table.iter().all(|&id| decodes(id)));
+        for id in (100..5_104).filter(|&id| decodes(id)) {
+            assert_eq!(table[id as usize - 100], id, "an id that decodes stays");
+        }
+        let sent = output(&EngineParams {
+            output_table: Some(table),
+            ..EngineParams::default()
+        });
+        assert_eq!(sent.len(), 64);
+        assert!(sent.iter().all(|&id| decodes(id)), "{sent:?}");
+        for (drawn, sent) in drawn.iter().zip(&sent) {
+            assert!(!decodes(*drawn) || drawn == sent, "{drawn} became {sent}");
+        }
+
+        assert!(output_table(|_| true).is_none(), "every id decodes");
+        assert!(output_table(|_| false).is_none(), "no id decodes");
     }
 
     /// Run passes until the given request emits its first Token, returning the

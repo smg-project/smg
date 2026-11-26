@@ -261,8 +261,14 @@ experiments against it transfer to engines:
   decode blocks too. Request IDs still identify cancellation and records.
   The default `request-id` mode preserves existing stress workloads. This option
   applies to the realistic engine; canned and scripted responses are unchanged.
-  Synthetic output remains in the existing token range 100–30099; a benchmark
-  must separately verify those IDs against its pinned tokenizer and special IDs.
+  Synthetic output remains in the existing token range 100–30099. Where
+  `--tokenizer` names local tokenizer files, an ID of that range gives way to
+  another when the tokenizer does not decode it to text on its own (an ID
+  outside its vocabulary, a special token, a part of a character) or it is an
+  end-of-sequence ID; the other IDs stay as drawn. A tokenizer that decodes
+  no ID of the range leaves the output as drawn, as does a worker with no
+  local tokenizer: a benchmark must then separately verify those IDs against
+  its pinned tokenizer and special IDs.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
