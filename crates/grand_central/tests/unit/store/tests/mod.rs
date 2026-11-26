@@ -271,12 +271,17 @@ fn snapshot_sort_does_not_hold_the_workers_lock() {
 #[cfg(feature = "worker-host")]
 #[test]
 fn a_told_status_says_what_happened_and_the_status_that_stands() {
-    use super::HealthWrite::{Moved, NoRow, Stale, Stood};
+    use super::{
+        HealthWrite::{Moved, NoRow, Stale, Stood},
+        LeadWord,
+    };
 
     let store = MemoryStore::new();
     let id = store.upsert(facts("http://w:8000", 1)).id();
     let revision = || WorkersStore::get(&store, id).expect("the row").revision;
-    let told = |status, revision, leads: bool| store.status_told(id, status, revision, &|| leads);
+    let told = |status, revision, leads: bool| {
+        store.status_told(id, status, revision, LeadWord::of(&|| leads))
+    };
     // A status the row holds already stands, and nothing is written.
     let epoch = store.epoch();
     assert_eq!(
@@ -304,6 +309,83 @@ fn a_told_status_says_what_happened_and_the_status_that_stands() {
     let last = revision();
     store.remove(id, last).expect("removed");
     assert_eq!(told(WorkerStatus::NotReady, last, true), NoRow);
+}
+
+/// A status told under a term goes to the journal ahead of the table's
+/// move. Under the term the log leads, the event tells the epoch the
+/// table then takes, and the row with its new status. Under a term the
+/// log left, the journal takes no event and nothing moved: the status,
+/// the table's epoch and the log's head stand. A word that names no term
+/// writes there, as before.
+#[cfg(feature = "worker-host")]
+#[test]
+fn a_status_under_a_term_is_journaled_under_it_or_moves_nothing() {
+    use super::{
+        HealthWrite::{Moved, Stale},
+        LeadWord,
+    };
+    use crate::service::replication::{Entry, Event};
+
+    let log = Arc::new(Log::new(8));
+    let journal: Arc<Log> = Arc::clone(&log);
+    let store = MemoryStore::journaled(journal);
+    store.set_term(3);
+    let id = store.upsert(facts("http://w:8000", 1)).id();
+    let revision = WorkersStore::get(&store, id).expect("the row").revision;
+    let under = |status: WorkerStatus, term: u64| {
+        let word = LeadWord {
+            leads: &|| true,
+            term: Some(term),
+        };
+        store.status_told(id, status, revision, word)
+    };
+    let stands = || WorkersStore::get(&store, id).expect("the row").status;
+    // Under the term the log leads.
+    let before = log.head();
+    let ready = Moved {
+        from: WorkerStatus::Pending,
+        to: WorkerStatus::Ready,
+    };
+    assert_eq!(under(WorkerStatus::Ready, 3), ready);
+    let mut told: Vec<Entry> = Vec::new();
+    log.read(before, 2, &mut told).expect("the place stands");
+    let [Entry {
+        at,
+        event:
+            Event::Member {
+                epoch,
+                row: Some(row),
+                ..
+            },
+    }] = told.as_slice()
+    else {
+        panic!("one status event: {told:?}");
+    };
+    assert_eq!((at.term, *epoch), (3, store.epoch()));
+    assert_eq!(
+        (row.status, stands()),
+        (WorkerStatus::Ready, WorkerStatus::Ready)
+    );
+    // The log leaves the term by a later take.
+    store.set_term(4);
+    let (epoch, head) = (store.epoch(), log.head());
+    assert_eq!(under(WorkerStatus::NotReady, 3), Stale);
+    assert_eq!(
+        (stands(), store.epoch(), log.head()),
+        (WorkerStatus::Ready, epoch, head)
+    );
+    // A word that names no term is journaled as the store's own.
+    let told = store.status_told(id, WorkerStatus::NotReady, revision, LeadWord::FREE);
+    assert!(told.moved().is_some());
+    assert_eq!(
+        (stands(), store.epoch()),
+        (WorkerStatus::NotReady, epoch + 1)
+    );
+    let next = Position {
+        seq: head.seq + 1,
+        term: 4,
+    };
+    assert_eq!(log.head(), next);
 }
 
 #[test]
@@ -2579,11 +2661,13 @@ impl Journal for WaitsAtRestart {
     fn member(
         &self,
         _: Option<Position>,
+        _: Option<u64>,
         _: u64,
         _: MembershipChange,
         _: Option<&WorkerRow>,
         _: Option<&WorkerRow>,
-    ) {
+    ) -> bool {
+        true
     }
 
     fn term_rose(&self, _: u64) {}
@@ -5989,11 +6073,13 @@ fn an_applys_time_under_the_stores_locks_measured() {
         fn member(
             &self,
             _: Option<Position>,
+            _: Option<u64>,
             _: u64,
             _: MembershipChange,
             _: Option<&WorkerRow>,
             _: Option<&WorkerRow>,
-        ) {
+        ) -> bool {
+            true
         }
 
         fn term_rose(&self, _: u64) {}

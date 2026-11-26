@@ -15,7 +15,7 @@ use crate::{
     },
     stages::registry,
     store::{
-        LeasesStore, MembershipChange, Registrant, WorkerFacts, WorkerRow, WorkerStatus,
+        LeadWord, LeasesStore, MembershipChange, Registrant, WorkerFacts, WorkerRow, WorkerStatus,
         WorkersStore,
     },
 };
@@ -1194,12 +1194,13 @@ impl Journal for AtTheCut {
     fn member(
         &self,
         at: Option<Position>,
+        term: Option<u64>,
         epoch: u64,
         change: MembershipChange,
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
-    ) {
-        self.log.member(at, epoch, change, row, left);
+    ) -> bool {
+        self.log.member(at, term, epoch, change, row, left)
     }
 
     fn term_rose(&self, term: u64) {
@@ -1582,7 +1583,8 @@ fn a_copy_behind_a_status_tell_holds_the_told_status_at_its_place() {
     assert_eq!(row.status, WorkerStatus::Pending);
     // The store's entry a holder's tell ends in, with no turn here.
     let ready = WorkerStatus::Ready;
-    leader.store.status_told(id, ready, row.revision, &|| true);
+    let word = LeadWord::FREE;
+    leader.store.status_told(id, ready, row.revision, word);
     let (behind, held) = first_copy(&leader, &objects);
     assert!(behind.seq > before.seq, "the tell moved the place");
     let told = WorkerRow {

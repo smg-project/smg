@@ -25,13 +25,15 @@ impl Journal for Told {
     fn member(
         &self,
         _: Option<Position>,
+        _: Option<u64>,
         _: u64,
         change: MembershipChange,
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
-    ) {
+    ) -> bool {
         self.0.lock().push((change, row.cloned(), left.cloned()));
         *self.1.lock() = left.map(|left| std::ptr::from_ref(left).addr());
+        true
     }
 
     fn generation(&self, _: Option<Position>, _: u64) {}

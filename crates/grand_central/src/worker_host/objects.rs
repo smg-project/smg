@@ -260,7 +260,8 @@ impl Held {
 /// controller's door, whose term can end while a status waits for a lock,
 /// writes one through the crate's `connect_row_under` and
 /// `drain_row_under`, which ask its word of its term under the object's
-/// lock and the store's. A leader's write through these calls is told to
+/// lock and the store's, and hand the term to the store's journal with the
+/// status. A leader's write through these calls is told to
 /// its log, and its standbys and watchers are sent it as they are sent a
 /// registration call's. A host that does not lead must not write: such a
 /// write lands in its own store alone, its leader's next event no longer

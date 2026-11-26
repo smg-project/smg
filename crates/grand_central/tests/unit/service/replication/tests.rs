@@ -351,11 +351,13 @@ impl Journal for Told {
     fn member(
         &self,
         _: Option<Position>,
+        _: Option<u64>,
         _: u64,
         _: MembershipChange,
         _: Option<&WorkerRow>,
         _: Option<&WorkerRow>,
-    ) {
+    ) -> bool {
+        true
     }
 
     fn term_rose(&self, term: u64) {

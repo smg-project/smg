@@ -457,13 +457,20 @@ impl Log {
     /// log again for its words. Four callers read it, each in its own
     /// turn: the service's guard, the replication's check, the door's check
     /// of its term and the door's word for a status it writes. The check
-    /// runs ahead of a life's mint and of each row a registration writes or
-    /// removes, and once more behind a drain that wrote nothing. The word
-    /// is asked under an object's lock and under the store's membership
-    /// lock: this read takes the log's lock alone, and no holder of the
-    /// log's lock takes one of those two.
+    /// runs ahead of a life's mint, of each row a registration writes or
+    /// removes and of a refresh's write, and once more behind a drain that
+    /// wrote nothing. The word is asked under an object's lock and under
+    /// the store's membership lock: this read takes the log's lock alone,
+    /// and no holder of the log's lock takes one of those two. A write
+    /// that names its term meets the same test once more, in the take of
+    /// the log's lock that gives its event a place ([`Journal::member`]).
     pub fn leads(&self, term: u64) -> Result<(), NotLeading> {
         let ring = self.ring.lock();
+        self.leads_in(&ring, term)
+    }
+
+    /// [`Log::leads`] under a hold of the log's lock.
+    fn leads_in(&self, ring: &Ring, term: u64) -> Result<(), NotLeading> {
         let seen = self.term.load(Ordering::Relaxed);
         if seen < term {
             Err(NotLeading::NotYet)
@@ -589,15 +596,26 @@ impl Log {
     /// its own lead and no snapshot follows: the row stands as a write of
     /// the store's own under that term, so the log holds what the tables
     /// hold. A term's start wrote no row, and is let go there too.
-    fn push(&self, by: Option<Position>, event: Event) {
+    ///
+    /// `under` is the term the write is made under, where its writer names
+    /// one. The log asks it here, in the take of its lock that gives the
+    /// event its place: no term ends between this ask and the stamp. Where
+    /// the store does not lead that term, nothing is appended, no
+    /// applier's hold ends, and the answer is no. Every other write
+    /// answers yes, one that is let go too: its store moves its tables as
+    /// it did.
+    fn push(&self, by: Option<Position>, under: Option<u64>, event: Event) -> bool {
         let mut ring = self.ring.lock();
+        if under.is_some_and(|term| self.leads_in(&ring, term).is_err()) {
+            return false;
+        }
         let held = ring.adopting.take();
         let lands = by.filter(|at| held == Some(*at));
         // The hold ended before the applier's write: it is let go, or it
         // stands as the store's own.
         if let (Some(at), None) = (by, lands) {
             if !self.took_since(&ring, at) || matches!(event, Event::Term) {
-                return;
+                return true;
             }
         }
         let at = match lands {
@@ -614,7 +632,7 @@ impl Log {
                     // A generation applied under no term takes no place:
                     // the take that starts a term tells the standing one.
                     if matches!(event, Event::Generation { .. }) {
-                        return;
+                        return true;
                     }
                     // Its number is the write's whole name: past the head,
                     // and past every own write a restart left above it.
@@ -624,6 +642,7 @@ impl Log {
             }
         };
         self.append(&mut ring, at, event);
+        true
     }
 
     /// The term of a write of the store's own: the log's while the store
@@ -869,26 +888,29 @@ impl Journal for Log {
     fn member(
         &self,
         at: Option<Position>,
+        term: Option<u64>,
         epoch: u64,
         change: MembershipChange,
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
-    ) {
+    ) -> bool {
         // The rows are copied before the log's lock is taken.
         let copy = |row: &WorkerRow| Arc::new(row.clone());
         self.push(
             at,
+            term,
             Event::Member {
                 epoch,
                 change,
                 row: row.map(copy),
                 left: left.map(copy),
             },
-        );
+        )
     }
 
     fn generation(&self, at: Option<Position>, generation: u64) {
-        self.push(at, Event::Generation { generation });
+        // A generation names no term: it is never refused.
+        self.push(at, None, Event::Generation { generation });
     }
 
     fn term_rose(&self, term: u64) {
@@ -909,7 +931,7 @@ impl Journal for Log {
     }
 
     fn term_followed(&self, at: Position) {
-        self.push(Some(at), Event::Term);
+        self.push(Some(at), None, Event::Term);
     }
 
     fn head(&self) -> Position {

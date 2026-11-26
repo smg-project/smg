@@ -939,8 +939,8 @@ message HealthPolicy {
   uint32 check_interval_ms = 3;
   uint32 timeout_ms = 4;
   // The checks are off: the worker is ready from its registration, where
-  // the call's term holds at the last check ahead of its connect signal,
-  // and from a MODE_UPSERT of that registration where it did not. The
+  // the call's term holds through its connect signal, and from a
+  // MODE_UPSERT of that registration where it did not. The
   // prober never judges it. The registrant says "do not check", never
   // "healthy".
   bool disabled = 5;

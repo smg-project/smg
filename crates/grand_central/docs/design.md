@@ -3112,16 +3112,23 @@ the worker registry's own health machine, which moves the object. The code that 
 objects then tells the store the status that stands, under the object's own lock, through one
 entry that asks the writer's lead under the membership lock. A move the store takes no word
 of is taken back in that same turn of the object's lock: the object takes the status its
-record holds or, where no record stands for it, the status it left. A registration call's
-connect signal and its drain go through
-that entry too, with the word of the call's term. The store is told first, and the object
-moves where the store took the status. The store asks the word last under its membership
-lock. A term that ends behind that ask still writes the status. The journal then stamps it
-with the term its store leads at that instant, or with none where it follows. A call whose
-term ended while its write waited writes no status, and its drain answers that the replica
-does not lead that term. A connect signal that was not written is sent again by an upsert of
-the same registration: equal facts write no record, and the signal goes with the word of that
-call's own term, to a worker whose checks are off and which is neither ready nor draining.
+record holds or, where no record stands for it, the status it left.
+
+A registration call's connect signal and its drain go through that entry too, with the word
+of the call's term. The store is told first, and the object moves where the store took the
+status. The store tells the journal first, with the call's term. The journal compares that
+term in the same turn of its lock that stamps the event. Where the log has left the term, it
+takes no event, and the store moves nothing.
+
+A probe's verdict names no term. Its writer's lead is asked last under the membership lock.
+The journal stamps the status behind that ask, with the term its store leads then or with
+none.
+
+The log's term is as fresh as the election's last word to it. A call whose term ended while
+its write waited writes no status, and its drain answers that the replica does not lead that
+term. A connect signal that was not written is sent again by an upsert of the same
+registration. Equal facts write no record. The signal goes with the word of that call's own
+term, to a worker whose checks are off and which is neither ready nor draining.
 
 The locks in their order: the object's own, then the store's membership lock. No
 holder of the store's lock takes an object's, and no decision takes one.
