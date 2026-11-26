@@ -78,7 +78,9 @@ def test_thinking_token_budget_reaches_scheduler_as_an_integer(convert, budget):
     assert convert(pb.SamplingParams()).custom_params is None
 
 
-def test_thinking_token_budget_is_refused_on_an_unconfigured_worker(convert):
-    convert.__self__._supports_thinking_token_budget = False
+def test_thinking_token_budget_is_refused_on_an_unconfigured_worker(servicer_mod):
+    implementation = servicer_mod.SGLangSchedulerServicer
+    servicer = implementation.__new__(implementation)
+    servicer.server_args = SimpleNamespace()
     with pytest.raises(ValueError, match="thinking_token_budget"):
-        convert(pb.SamplingParams(thinking_token_budget=0))
+        servicer._convert_sampling_params(pb.SamplingParams(thinking_token_budget=0))
